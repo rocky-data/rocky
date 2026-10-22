@@ -5990,6 +5990,94 @@
         },
         "type": "object"
       },
+      "ConnectorLoadInfo": {
+        "description": "The child connector part of a `rocky load --connector` result.",
+        "properties": {
+          "adopted_prior_claim": {
+            "description": "True when this run took over an expired in-flight claim. A prior run may then have promoted its batch before it crashed, and this run may load a duplicate batch.",
+            "type": "boolean"
+          },
+          "attempts": {
+            "description": "Attempts that ran, counting the successful one. 0 when skipped.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "bytes": {
+            "description": "Bytes in the verified batch.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "commit_seq_after": {
+            "description": "Batches committed after this run. Equal to `commit_seq_before` unless `status` is `loaded`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "commit_seq_before": {
+            "description": "Batches committed before this run.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "egress_hosts": {
+            "description": "The hosts the manifest declares. Declared, not enforced.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "error": {
+            "description": "Why the run failed. Present only when `status` is `failed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "description": "Files in the verified batch.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "The `[connector.<name>]` key.",
+            "type": "string"
+          },
+          "rows": {
+            "description": "Rows in the verified batch.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ConnectorLoadStatus"
+          }
+        },
+        "required": [
+          "adopted_prior_claim",
+          "attempts",
+          "bytes",
+          "commit_seq_after",
+          "commit_seq_before",
+          "egress_hosts",
+          "files",
+          "name",
+          "rows",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ConnectorLoadStatus": {
+        "description": "How a `rocky load --connector` run ended: `loaded` (the batch is in the target table and the connector state is saved), `skipped` (another run holds the claim for this batch, so nothing ran) or `failed` (see `error`).",
+        "enum": [
+          "loaded",
+          "skipped",
+          "failed"
+        ],
+        "type": "string"
+      },
       "ConnectorTargetConfig": {
         "additionalProperties": false,
         "description": "`target` of a connector: the table it fills.",
@@ -12489,6 +12577,17 @@
         "properties": {
           "command": {
             "type": "string"
+          },
+          "connector": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectorLoadInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set by `rocky load --connector`: what the child connector run did. Absent for a load from a directory."
           },
           "duration_ms": {
             "format": "uint64",

@@ -428,7 +428,13 @@ export type { FulfillOutput } from "./fulfill";
 export type { GcCandidateOutput, GcCheckOutput, GcRebuildCostOutput, GcReportOutput } from "./gc";
 export type { GcApplyOutput, GcEvictedOutput, GcRefusedOutput } from "./gc_apply";
 export type { GcPlanOutput } from "./gc_plan";
-export type { ContractResult, LoadFileOutput, LoadOutput } from "./load";
+export type {
+  ConnectorLoadInfo,
+  ConnectorLoadStatus,
+  ContractResult,
+  LoadFileOutput,
+  LoadOutput,
+} from "./load";
 export type { PolicyCheckOutput } from "./policy_check";
 export type { PolicyFreezeOutput } from "./policy_freeze";
 export type { PolicyTestOutput, PolicyTestResult } from "./policy_test";

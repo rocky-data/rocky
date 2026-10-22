@@ -314,6 +314,16 @@ impl StateEnvelope {
     }
 }
 
+/// What the state store keeps for one connector: the saved state and the
+/// number of batches committed so far.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorStateRecord {
+    /// The state the connector last returned.
+    pub envelope: StateEnvelope,
+    /// Batches committed. The next claim key names this number.
+    pub commit_seq: u64,
+}
+
 /// The local directory behind a `file://` output URI.
 ///
 /// `file://./x` and `file://x` are relative to `config_dir`. `file:///x` is

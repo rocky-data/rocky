@@ -3,7 +3,19 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, conint
+
+
+class ConnectorLoadStatus(StrEnum):
+    """
+    How a `rocky load --connector` run ended: `loaded` (the batch is in the target table and the connector state is saved), `skipped` (another run holds the claim for this batch, so nothing ran) or `failed` (see `error`).
+    """
+
+    loaded = "loaded"
+    skipped = "skipped"
+    failed = "failed"
 
 
 class ContractViolation(BaseModel):
@@ -14,6 +26,54 @@ class ContractViolation(BaseModel):
     column: str
     message: str
     rule: str
+
+
+class ConnectorLoadInfo(BaseModel):
+    """
+    The child connector part of a `rocky load --connector` result.
+    """
+
+    adopted_prior_claim: bool
+    """
+    True when this run took over an expired in-flight claim. A prior run may then have promoted its batch before it crashed, and this run may load a duplicate batch.
+    """
+    attempts: conint(ge=0)
+    """
+    Attempts that ran, counting the successful one. 0 when skipped.
+    """
+    bytes: conint(ge=0)
+    """
+    Bytes in the verified batch.
+    """
+    commit_seq_after: conint(ge=0)
+    """
+    Batches committed after this run. Equal to `commit_seq_before` unless `status` is `loaded`.
+    """
+    commit_seq_before: conint(ge=0)
+    """
+    Batches committed before this run.
+    """
+    egress_hosts: list[str]
+    """
+    The hosts the manifest declares. Declared, not enforced.
+    """
+    error: str | None = None
+    """
+    Why the run failed. Present only when `status` is `failed`.
+    """
+    files: conint(ge=0)
+    """
+    Files in the verified batch.
+    """
+    name: str
+    """
+    The `[connector.<name>]` key.
+    """
+    rows: conint(ge=0)
+    """
+    Rows in the verified batch.
+    """
+    status: ConnectorLoadStatus
 
 
 class ContractResult(BaseModel):
@@ -52,6 +112,10 @@ class LoadOutput(BaseModel):
     """
 
     command: str
+    connector: ConnectorLoadInfo | None = None
+    """
+    Set by `rocky load --connector`: what the child connector run did. Absent for a load from a directory.
+    """
     duration_ms: conint(ge=0)
     files: list[LoadFileOutput]
     files_failed: conint(ge=0)

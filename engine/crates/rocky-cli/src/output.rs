@@ -5977,6 +5977,51 @@ pub struct LoadOutput {
     pub total_bytes: u64,
     pub files: Vec<LoadFileOutput>,
     pub duration_ms: u64,
+    /// Set by `rocky load --connector`: what the child connector run did.
+    /// Absent for a load from a directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector: Option<ConnectorLoadInfo>,
+}
+
+/// How a `rocky load --connector` run ended: `loaded` (the batch is in the
+/// target table and the connector state is saved), `skipped` (another run
+/// holds the claim for this batch, so nothing ran) or `failed` (see `error`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorLoadStatus {
+    Loaded,
+    Skipped,
+    Failed,
+}
+
+/// The child connector part of a `rocky load --connector` result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ConnectorLoadInfo {
+    /// The `[connector.<name>]` key.
+    pub name: String,
+    pub status: ConnectorLoadStatus,
+    /// Attempts that ran, counting the successful one. 0 when skipped.
+    pub attempts: u32,
+    /// Files in the verified batch.
+    pub files: usize,
+    /// Rows in the verified batch.
+    pub rows: u64,
+    /// Bytes in the verified batch.
+    pub bytes: u64,
+    /// Batches committed before this run.
+    pub commit_seq_before: u64,
+    /// Batches committed after this run. Equal to `commit_seq_before` unless
+    /// `status` is `loaded`.
+    pub commit_seq_after: u64,
+    /// True when this run took over an expired in-flight claim. A prior run
+    /// may then have promoted its batch before it crashed, and this run may
+    /// load a duplicate batch.
+    pub adopted_prior_claim: bool,
+    /// The hosts the manifest declares. Declared, not enforced.
+    pub egress_hosts: Vec<String>,
+    /// Why the run failed. Present only when `status` is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A single file result within `LoadOutput`.

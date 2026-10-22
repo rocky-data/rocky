@@ -282,6 +282,22 @@ const ENVIRONMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("environ
 ///
 /// **Replicated** (NOT in [`LOCAL_ONLY_TABLE_NAMES`]), like [`ENVIRONMENTS`].
 const PUBLISH_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("publish_history");
+/// Saved state of child connectors (schema v34): one
+/// [`crate::connector::ConnectorStateRecord`] per connector, keyed by the
+/// connector name. Written only by [`StateStore::connector_commit`], which
+/// checks `commit_seq` and writes in one transaction.
+///
+/// **Replicated** (NOT in [`LOCAL_ONLY_TABLE_NAMES`]): every pod must see the
+/// same saved state and sequence. The `commit_seq` fence is only as strong as
+/// the state sync's snapshot compare-and-set. Under
+/// `concurrency_control = "off"` the run lock is the only guard.
+const CONNECTOR_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("connector_state");
+/// The schema version that added [`CONNECTOR_STATE`].
+const CONNECTOR_STATE_SINCE_SCHEMA_VERSION: u32 = 34;
+/// The table a read-only open tolerates being absent, and only in a store
+/// stamped below [`CONNECTOR_STATE_SINCE_SCHEMA_VERSION`]. The reader maps it
+/// to "no saved state", which is the truth for such a store.
+const READ_ONLY_TOLERATED_ABSENT_BEFORE_V34: &[&str] = &["connector_state"];
 /// The schema version that added [`ENVIRONMENTS`] and [`PUBLISH_HISTORY`].
 const ENVIRONMENT_TABLES_SINCE_SCHEMA_VERSION: u32 = 32;
 /// Tables a read-only open tolerates being absent, and only in a store
@@ -432,6 +448,7 @@ const SNAPSHOT_TABLE_REGISTRY: &[(&str, TableShape)] = &[
     ("product_approvals", TableShape::StrBytes),
     ("environments", TableShape::StrBytes),
     ("publish_history", TableShape::StrBytes),
+    ("connector_state", TableShape::StrBytes),
     ("metadata", TableShape::StrStr),
 ];
 
@@ -990,6 +1007,23 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   [`SchemaMismatchPolicy::Recreate`] starts a fresh local store and never
 ///   uploads it.
 ///
+/// - **v34** — adds the [`CONNECTOR_STATE`] table: the saved state and the
+///   committed batch count of each child connector. Pure additive table change
+///   (the v32 shape). The table replicates. Guarded by
+///   `test_v33_opens_and_creates_connector_state_table`.
+///
+///   **On upgrade.** A v33 store opened read-write is stamped v34 in place and
+///   gets the empty table; every record is kept. A read-only open of a store
+///   stamped below v34 tolerates the table being absent and reads it as "no
+///   saved state" ([`READ_ONLY_TOLERATED_ABSENT_BEFORE_V34`]); a store stamped
+///   v34 that lacks it is refused. Remote state carries forward from the `v33/`
+///   key ([`crate::state_sync`]); the first upload creates the `v34/` key and
+///   the `v33/` key is never written.
+///
+///   **On rollback.** The version check runs at OPEN, so a v33 binary refuses
+///   a v34 store. A v33 binary uses the `v33/` remote key and never sees the
+///   connector state a v34 pod saved.
+///
 /// # Fields added without a bump
 ///
 /// A serde-additive field needs no bump when an older binary that ignores it
@@ -1058,7 +1092,7 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   `None`, which means "not recorded". Guarded by
 ///   `test_pre_delivery_timing_model_execution_forward_deserializes_to_none`
 ///   and `test_pre_queued_ms_run_record_forward_deserializes_to_none`.
-const CURRENT_SCHEMA_VERSION: u32 = 33;
+const CURRENT_SCHEMA_VERSION: u32 = 34;
 
 /// Errors from the embedded redb state store.
 #[derive(Error)]
@@ -1178,6 +1212,29 @@ pub enum StateError {
     /// An environment or publish request was refused before any write.
     #[error(transparent)]
     Environment(#[from] crate::environments::EnvironmentError),
+
+    /// A connector commit found a different `commit_seq` than the run's claim
+    /// named. Another run committed first. Nothing was written.
+    #[error(
+        "connector `{name}`: expected commit sequence {expected}, found {found}; another run \
+         committed a batch since this run took its claim. Nothing was written"
+    )]
+    ConnectorCommitConflict {
+        name: String,
+        expected: u64,
+        found: u64,
+    },
+
+    /// A connector's saved state is over the size limit. Nothing was written.
+    #[error(
+        "connector `{name}`: the saved state is {size} bytes, over the {limit} byte limit. \
+         Nothing was written"
+    )]
+    ConnectorStateTooLarge {
+        name: String,
+        size: usize,
+        limit: usize,
+    },
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -1806,6 +1863,7 @@ impl StateStore {
             PRODUCT_APPROVALS.name(),
             ENVIRONMENTS.name(),
             PUBLISH_HISTORY.name(),
+            CONNECTOR_STATE.name(),
         ]
     }
 
@@ -1884,11 +1942,17 @@ impl StateStore {
         // version condition matters: a v32+ store missing them is damaged.
         let tolerate_env_tables =
             found.is_some_and(|v| v < ENVIRONMENT_TABLES_SINCE_SCHEMA_VERSION);
+        // The same rule for the v34 connector table.
+        let tolerate_connector_table =
+            found.is_some_and(|v| v < CONNECTOR_STATE_SINCE_SCHEMA_VERSION);
         let missing: Vec<String> = Self::table_names()
             .into_iter()
             .filter(|name| !present.contains(*name))
             .filter(|name| {
                 !(tolerate_env_tables && READ_ONLY_TOLERATED_ABSENT_BEFORE_V32.contains(name))
+            })
+            .filter(|name| {
+                !(tolerate_connector_table && READ_ONLY_TOLERATED_ABSENT_BEFORE_V34.contains(name))
             })
             .map(str::to_string)
             .collect();
@@ -2009,6 +2073,7 @@ impl StateStore {
             let _table = txn.open_table(PRODUCT_APPROVALS)?;
             let _table = txn.open_table(ENVIRONMENTS)?;
             let _table = txn.open_table(PUBLISH_HISTORY)?;
+            let _table = txn.open_table(CONNECTOR_STATE)?;
         }
         // Construction-time commit: this runs on the raw `db` handle before any
         // `StateStore` (and thus any `write_epoch`) exists, so it deliberately
@@ -9444,6 +9509,105 @@ pub fn validate_namespace(ns: &str) -> Result<&str, rocky_sql::validation::Valid
 /// surfaces a clean error to the user.
 fn sanitize_namespace(ns: &str) -> Option<&str> {
     validate_namespace(ns).ok()
+}
+
+// --- Child connector state (schema v34) -----------------------------------
+
+impl StateStore {
+    /// The saved state and commit count of connector `name`, or `None` when
+    /// it has never committed. A store stamped below v34 opened read-only has
+    /// no table and answers `None`.
+    pub fn connector_state_get(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::connector::ConnectorStateRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(CONNECTOR_STATE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StateError::Table(e)),
+        };
+        match table.get(name)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Save a connector's new state and advance its commit count by one.
+    /// Returns the new count.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::ConnectorCommitConflict`] when the stored count is not
+    /// `expected_seq` (a connector that never committed has count 0), and
+    /// [`StateError::ConnectorStateTooLarge`] when the state value is over
+    /// [`crate::connector::MAX_STATE_BYTES`]. Nothing is written in either case.
+    pub fn connector_commit(
+        &self,
+        name: &str,
+        expected_seq: u64,
+        envelope: &crate::connector::StateEnvelope,
+    ) -> Result<u64, StateError> {
+        self.connector_commit_with_files(name, expected_seq, envelope, "", &[])
+    }
+
+    /// [`connector_commit`](Self::connector_commit), and one `loaded_files`
+    /// row per `(file_path, record)` under the pipeline key `pipeline`, in the
+    /// same write transaction.
+    pub fn connector_commit_with_files(
+        &self,
+        name: &str,
+        expected_seq: u64,
+        envelope: &crate::connector::StateEnvelope,
+        pipeline: &str,
+        files: &[(String, LoadedFileRecord)],
+    ) -> Result<u64, StateError> {
+        let size = envelope.value_size();
+        if size > crate::connector::MAX_STATE_BYTES {
+            return Err(StateError::ConnectorStateTooLarge {
+                name: name.to_string(),
+                size,
+                limit: crate::connector::MAX_STATE_BYTES,
+            });
+        }
+        let txn = self.db.begin_write()?;
+        let new_seq = {
+            let mut table = txn.open_table(CONNECTOR_STATE)?;
+            let found = match table.get(name)? {
+                Some(v) => {
+                    serde_json::from_slice::<crate::connector::ConnectorStateRecord>(v.value())?
+                        .commit_seq
+                }
+                None => 0,
+            };
+            let conflict = || StateError::ConnectorCommitConflict {
+                name: name.to_string(),
+                expected: expected_seq,
+                found,
+            };
+            if found != expected_seq {
+                return Err(conflict());
+            }
+            let new_seq = found.checked_add(1).ok_or_else(conflict)?;
+            let record = crate::connector::ConnectorStateRecord {
+                envelope: envelope.clone(),
+                commit_seq: new_seq,
+            };
+            let bytes = serde_json::to_vec(&record)?;
+            table.insert(name, bytes.as_slice())?;
+            if !files.is_empty() {
+                let mut loaded = txn.open_table(LOADED_FILES)?;
+                for (file_path, file_record) in files {
+                    let key = loaded_file_key(pipeline, file_path);
+                    let bytes = serde_json::to_vec(file_record)?;
+                    loaded.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+            new_seq
+        };
+        self.commit_write(txn)?;
+        Ok(new_seq)
+    }
 }
 
 // --- Environments and publish history (RV1-P2, schema v32) -----------------
@@ -17802,7 +17966,10 @@ mod tests {
         assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(32));
 
         drop(StateStore::open(&path).unwrap());
-        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(33));
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
         let rows = StateStore::open(&path)
             .unwrap()
             .list_policy_decisions()
@@ -19015,7 +19182,10 @@ mod tests {
         // v33 adds `PolicyDecisionRecord::approval` (C2-P0), a serde-additive
         // field that changes what an older binary counts. NO table change;
         // guarded by `test_v32_opens_and_stamps_v33_keeping_rows`.
-        const EXPECTED_VERSION: u32 = 33;
+        // v34 adds the `connector_state` table (child connectors) — a new
+        // table, so it IS in EXPECTED_TABLES below; guarded by
+        // `test_v33_opens_and_creates_connector_state_table`. It replicates.
+        const EXPECTED_VERSION: u32 = 34;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
@@ -19039,6 +19209,7 @@ mod tests {
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
+            "connector_state",
             "dag_snapshots",
             "discover_snapshots",
             "environments",
@@ -20120,5 +20291,208 @@ mod private_mode_tests {
         let ns_dir = dir.path().join(STATE_NAMESPACE_DIR);
         assert_eq!(resolved.path.parent().unwrap(), ns_dir);
         assert_eq!(mode_of(&ns_dir).unwrap(), 0o700);
+    }
+}
+
+#[cfg(test)]
+mod connector_state_tests {
+    use super::*;
+    use crate::connector::{MAX_STATE_BYTES, StateEnvelope};
+
+    fn envelope(cursor: u64) -> StateEnvelope {
+        StateEnvelope {
+            schema_version: 1,
+            value: serde_json::json!({ "cursor": cursor }),
+        }
+    }
+
+    /// Make the store at `path` look like one a v33 binary wrote: stamped
+    /// `33`, without the connector table.
+    fn force_pre_v34_store(path: &Path) {
+        force_schema_version(path, "33");
+        let db = Database::open(path).expect("reopen to drop the v34 table");
+        let txn = db.begin_write().expect("write txn");
+        txn.delete_table(CONNECTOR_STATE)
+            .expect("drop connector_state");
+        txn.commit().expect("commit");
+    }
+
+    #[test]
+    fn commits_advance_the_sequence_and_keep_the_latest_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        assert!(store.connector_state_get("c").unwrap().is_none());
+        assert_eq!(store.connector_commit("c", 0, &envelope(2)).unwrap(), 1);
+        assert_eq!(store.connector_commit("c", 1, &envelope(4)).unwrap(), 2);
+        let record = store.connector_state_get("c").unwrap().unwrap();
+        assert_eq!(record.commit_seq, 2);
+        assert_eq!(record.envelope.value["cursor"], 4);
+        assert!(
+            store.connector_state_get("other").unwrap().is_none(),
+            "connectors do not share a row"
+        );
+    }
+
+    /// Mutation: drop the `found != expected_seq` check and the second commit
+    /// succeeds.
+    #[test]
+    fn a_commit_with_the_wrong_sequence_is_refused_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.connector_commit("c", 0, &envelope(2)).unwrap();
+        for stale in [0, 2, 99] {
+            match store.connector_commit("c", stale, &envelope(9)) {
+                Err(StateError::ConnectorCommitConflict {
+                    expected, found, ..
+                }) => {
+                    assert_eq!((expected, found), (stale, 1));
+                }
+                other => panic!("expected a conflict for {stale}, got {other:?}"),
+            }
+        }
+        let record = store.connector_state_get("c").unwrap().unwrap();
+        assert_eq!(record.commit_seq, 1);
+        assert_eq!(record.envelope.value["cursor"], 2, "state unchanged");
+    }
+
+    /// Mutation: drop the size check and the oversized commit succeeds.
+    #[test]
+    fn a_state_over_one_mebibyte_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let big = StateEnvelope {
+            schema_version: 1,
+            value: serde_json::Value::String("x".repeat(MAX_STATE_BYTES)),
+        };
+        assert!(matches!(
+            store.connector_commit("c", 0, &big),
+            Err(StateError::ConnectorStateTooLarge { .. })
+        ));
+        assert!(store.connector_state_get("c").unwrap().is_none());
+        let fits = StateEnvelope {
+            schema_version: 1,
+            value: serde_json::Value::String("x".repeat(MAX_STATE_BYTES - 2)),
+        };
+        store.connector_commit("c", 0, &fits).unwrap();
+    }
+
+    #[test]
+    fn a_commit_writes_one_loaded_file_row_per_file_in_the_same_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let record = LoadedFileRecord {
+            loaded_at: chrono::Utc::now(),
+            rows_loaded: 2,
+            bytes_read: 10,
+            duration_ms: 0,
+            file_hash: None,
+        };
+        let files = vec![
+            ("/s/a.parquet".to_string(), record.clone()),
+            ("/s/b.parquet".to_string(), record),
+        ];
+        store
+            .connector_commit_with_files("c", 0, &envelope(1), "connector:c", &files)
+            .unwrap();
+        assert_eq!(store.list_loaded_files("connector:c").unwrap().len(), 2);
+        // A refused commit writes no file rows either.
+        assert!(
+            store
+                .connector_commit_with_files("c", 0, &envelope(1), "connector:c", &files[..1])
+                .is_err()
+        );
+        assert_eq!(store.list_loaded_files("connector:c").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_v33_opens_and_creates_connector_state_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_loaded_file(
+                    "p",
+                    "f",
+                    &LoadedFileRecord {
+                        loaded_at: chrono::Utc::now(),
+                        rows_loaded: 1,
+                        bytes_read: 1,
+                        duration_ms: 0,
+                        file_hash: None,
+                    },
+                )
+                .unwrap();
+        }
+        force_pre_v34_store(&path);
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(33));
+
+        drop(StateStore::open(&path).unwrap());
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        let store = StateStore::open(&path).unwrap();
+        assert!(store.connector_state_get("c").unwrap().is_none());
+        assert!(
+            store.get_loaded_file("p", "f").unwrap().is_some(),
+            "records kept"
+        );
+        store.connector_commit("c", 0, &envelope(1)).unwrap();
+    }
+
+    /// Mutation: drop the tolerance and this open is refused.
+    #[test]
+    fn test_v33_store_read_only_open_tolerates_the_missing_connector_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        force_pre_v34_store(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let store = StateStore::open_read_only(&path).expect("a v33 store opens read-only");
+        assert!(store.connector_state_get("c").unwrap().is_none());
+        drop(store);
+        assert!(before == std::fs::read(&path).unwrap(), "read-only wrote");
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(33));
+    }
+
+    /// The tolerance is keyed on the stamp: a v34 store without the table is
+    /// damaged and is refused read-only.
+    #[test]
+    fn test_v34_store_missing_connector_table_read_only_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            assert!(txn.delete_table(CONNECTOR_STATE).unwrap());
+            txn.commit().unwrap();
+        }
+        match StateStore::open_read_only(&path).map(|_| ()) {
+            Err(StateError::ReadOnlyNeedsInit { missing, .. }) => {
+                assert_eq!(missing, vec!["connector_state".to_string()]);
+            }
+            other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
+        }
+    }
+
+    /// The table replicates: a snapshot that excludes the local-only tables
+    /// still carries it.
+    #[test]
+    fn the_snapshot_carries_connector_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.connector_commit("c", 0, &envelope(7)).unwrap();
+        let dest = dir.path().join("snapshot.redb");
+        store
+            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
+            .unwrap();
+        let snapshot = StateStore::open(&dest).unwrap();
+        let record = snapshot.connector_state_get("c").unwrap().unwrap();
+        assert_eq!(record.commit_seq, 1);
+        assert_eq!(record.envelope.value["cursor"], 7);
+        assert!(!LOCAL_ONLY_TABLE_NAMES.contains(&"connector_state"));
     }
 }

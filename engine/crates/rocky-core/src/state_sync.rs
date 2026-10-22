@@ -1721,6 +1721,30 @@ impl LedgerSeamSession {
         unreachable!("ledger-seam attempt loop always returns within the for body")
     }
 
+    /// Run a read against the shared state, writing nothing. Local reads the
+    /// ledger file, or an empty store when the file does not exist yet. A
+    /// remote backend downloads the shared blob first, then reads it. Nothing
+    /// is uploaded.
+    ///
+    /// Like [`read_environment`][Self::read_environment], it skips config
+    /// resolution and the writer check, so it is for reads only.
+    ///
+    /// # Errors
+    ///
+    /// Download and store errors. A failed download is an error and not an
+    /// empty answer: the caller must not act on state it could not read.
+    pub async fn read_state<T>(
+        &self,
+        read: impl FnOnce(&StateStore) -> Result<T, crate::state::StateError>,
+    ) -> Result<T, StateSyncError> {
+        if !matches!(self.cfg.backend, StateBackend::Local) {
+            let _authority =
+                download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await?;
+        }
+        let store = StateStore::open_read_only_or_empty(&self.state_path)?;
+        Ok(read(&store)?)
+    }
+
     /// Read one environment's head from the shared state, writing nothing.
     /// Local reads the ledger file; a remote backend downloads the shared
     /// blob first (one GET), then reads it. Nothing is uploaded.
@@ -10782,5 +10806,89 @@ mod private_mode_tests {
         write_state_bytes(&fresh, b"bytes").await.unwrap();
         assert_eq!(mode_of(&fresh).unwrap(), 0o600);
         assert_eq!(std::fs::read(&fresh).unwrap(), b"bytes");
+    }
+}
+
+#[cfg(test)]
+mod connector_commit_tests {
+    use super::*;
+    use crate::connector::{ConnectorStateRecord, StateEnvelope};
+    use crate::test_harness::CrossPodHarness;
+
+    fn envelope(cursor: u64) -> StateEnvelope {
+        StateEnvelope {
+            schema_version: 1,
+            value: serde_json::json!({ "cursor": cursor }),
+        }
+    }
+
+    /// Commit through the ledger seam, the way `rocky load --connector` does.
+    async fn commit(
+        cfg: &StateConfig,
+        path: &Path,
+        expected_seq: u64,
+        cursor: u64,
+    ) -> Result<u64, StateSyncError> {
+        let session = LedgerSeamSession::new(cfg, path, false);
+        let env = envelope(cursor);
+        session
+            .execute(|store, _generation| {
+                let result = store
+                    .connector_commit("demo", expected_seq, &env)
+                    .map_err(StateSyncError::from);
+                Box::pin(async move { result })
+            })
+            .await
+    }
+
+    async fn saved(cfg: &StateConfig, path: &Path) -> Option<ConnectorStateRecord> {
+        LedgerSeamSession::new(cfg, path, false)
+            .read_state(|store| store.connector_state_get("demo"))
+            .await
+            .unwrap()
+    }
+
+    /// Two pods read commit sequence 0 and both try to commit batch 1. The
+    /// second is refused with the typed conflict, and the remote keeps the
+    /// first one's state. Mutation: drop the sequence check in
+    /// `connector_commit_with_files` and the second commit lands.
+    #[tokio::test]
+    async fn a_commit_is_refused_when_another_pod_moved_the_sequence() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut h = CrossPodHarness::new_s3_like();
+        h.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        h.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+
+        // Both pods read the sequence before either commits.
+        assert!(saved(&h.pod_a.cfg, &h.pod_a.state_path).await.is_none());
+        assert!(saved(&h.pod_b.cfg, &h.pod_b.state_path).await.is_none());
+
+        assert_eq!(
+            commit(&h.pod_b.cfg, &h.pod_b.state_path, 0, 10)
+                .await
+                .unwrap(),
+            1
+        );
+        match commit(&h.pod_a.cfg, &h.pod_a.state_path, 0, 99).await {
+            Err(StateSyncError::State(crate::state::StateError::ConnectorCommitConflict {
+                expected,
+                found,
+                ..
+            })) => assert_eq!((expected, found), (0, 1)),
+            other => panic!("expected the typed conflict, got {other:?}"),
+        }
+
+        let remote = saved(&h.pod_a.cfg, &h.pod_a.state_path).await.unwrap();
+        assert_eq!(remote.commit_seq, 1);
+        assert_eq!(remote.envelope.value["cursor"], 10, "the winner's state");
+
+        // The loser can commit its batch on top, once it has read sequence 1.
+        assert_eq!(
+            commit(&h.pod_a.cfg, &h.pod_a.state_path, 1, 20)
+                .await
+                .unwrap(),
+            2
+        );
     }
 }
