@@ -142,6 +142,19 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    # A real Valkey server, so the live idempotency tests (compare-and-set
+    # take-over, owner-checked finalize, the EVAL probe) run instead of
+    # skipping. Pinned by the digest of the `valkey/valkey:8` image index.
+    services:
+      valkey:
+        image: valkey/valkey:8@sha256:640c5e62cea04b6d6f2084232651d0cc70362d31f4f805e7be94dbed6855e8f2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -198,6 +211,14 @@ jobs:
         # are deliberately NOT added — they would bury a real intermittent
         # hang, which is the defect #1405 exists to keep visible.
         run: cargo nextest run --all-features --no-fail-fast
+      # Without `ROCKY_TEST_VALKEY_URL` the live Valkey tests pass by skipping,
+      # so the step above proves nothing about them. This step sets it and
+      # runs only them (already built; nextest fails if the filter matches
+      # no test). Only the idempotency tests are pointed at the server.
+      - name: Run live Valkey idempotency tests
+        env:
+          ROCKY_TEST_VALKEY_URL: redis://localhost:6379
+        run: cargo nextest run -p rocky-core --all-features --no-fail-fast --no-tests=fail -E 'test(/idempotency::tests::live_/)'
 
   clippy:
     name: Clippy
