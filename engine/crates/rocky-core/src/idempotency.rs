@@ -403,7 +403,7 @@ impl IdempotencyBackend {
                 prefix,
                 mirror_to_redb,
             } => {
-                let result = valkey_check_and_claim(url, prefix, &entry, now).await?;
+                let result = valkey_check_and_claim(url, prefix, &entry).await?;
                 if let (true, IdempotencyCheck::Proceed | IdempotencyCheck::AdoptStale { .. }) =
                     (*mirror_to_redb, &result)
                     && let Some(store) = state_store
@@ -687,7 +687,6 @@ async fn valkey_check_and_claim(
     url: &str,
     prefix: &str,
     entry: &IdempotencyEntry,
-    now: DateTime<Utc>,
 ) -> Result<IdempotencyCheck, IdempotencyError> {
     if url.is_empty() {
         return Err(IdempotencyError::Config(
