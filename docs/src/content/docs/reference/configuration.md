@@ -784,7 +784,7 @@ Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backend
 
 Rocky's built-in sweep deletes idempotency stamps from the local `state.redb` after `retention_days`. Rocky does not sweep expired stamps in an `s3` / `gcs` bucket today, so they stay until a later run takes the key over. Configure a bucket-native lifecycle rule to remove them. It also keeps GC running when no Rocky process is active.
 
-Both rules below match the default `state.s3_prefix` / `state.gcs_prefix` of `rocky/state/`. Adjust the prefix if you've overridden it. The rule's age must be larger than both `[state.idempotency] retention_days` and `in_flight_ttl_hours` (converted to days). A shorter rule can delete a live `InFlight` claim, and then two runs with the same key can proceed. It must also not remove a stamp that should still dedup. The examples below use 30 days, which fits the defaults (30 days and 24 hours); raise the age if you raise either setting.
+Both rules below match the default `state.s3_prefix` / `state.gcs_prefix` of `rocky/state/`. Adjust the prefix if you've overridden it. The rule's age must be at least `[state.idempotency] retention_days` and larger than `in_flight_ttl_hours` (converted to days). A shorter rule can delete a live `InFlight` claim, and then two runs with the same key can proceed. It must also not remove a stamp that should still dedup. The examples below use 30 days, which fits the defaults (30 days and 24 hours); raise the age if you raise either setting.
 
 **S3, `s3api put-bucket-lifecycle-configuration` payload:**
 
@@ -835,7 +835,7 @@ gcloud storage buckets update "gs://$ROCKY_STATE_BUCKET" \
 **Operational notes:**
 
 - **Bucket lifecycle does not replace `[state.idempotency] retention_days`.** The local redb mirror on each pod still has its own copy of the stamp; Rocky's sweep is what evicts that. Bucket lifecycle handles the durable copy.
-- **In-flight claims (`InFlight`) are TTL-bounded by `in_flight_ttl_hours`, not by the lifecycle rule.** The rule's age must exceed `in_flight_ttl_hours` as well as `retention_days`, or it can delete a live claim and let two runs proceed.
+- **In-flight claims (`InFlight`) are TTL-bounded by `in_flight_ttl_hours`, not by the lifecycle rule.** The rule's age must be larger than `in_flight_ttl_hours` and at least `retention_days`, or it can delete a live claim and let two runs proceed.
 - **Tiered backends already serve hits from Valkey first.** A bucket lifecycle that's slightly behind `retention_days` is harmless; Valkey's own TTL evicts the hot copy long before the cold S3/GCS copy expires.
 
 ### State namespacing

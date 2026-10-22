@@ -93,7 +93,10 @@ impl SqlDialect for DuckDbSqlDialect {
     }
 
     fn insert_into(&self, target: &str, select_sql: &str) -> String {
-        format!("INSERT INTO {target}\n{select_sql}")
+        // `BY NAME` matches SELECT columns to target columns by name, so a
+        // projection ordered differently from the target cannot write values
+        // into the wrong columns (#2465).
+        format!("INSERT INTO {target} BY NAME\n{select_sql}")
     }
 
     /// Render a DuckDB-native `MERGE INTO ... USING ... WHEN MATCHED ... WHEN NOT MATCHED`.
@@ -113,9 +116,8 @@ impl SqlDialect for DuckDbSqlDialect {
     ///    supported` for `t.col = s.col`. The target column stays unqualified
     ///    (`col = s.col`); the source side keeps its alias.
     ///
-    /// DuckDB *does* accept `INSERT *` shorthand in the `WHEN NOT MATCHED`
-    /// branch — the live regression test in this module exercises that path
-    /// end-to-end, so the wildcard insert is safe to keep.
+    /// `INSERT *` is positional in DuckDB. Use `INSERT BY NAME` so reordered
+    /// source columns cannot be written into the wrong target columns.
     fn merge_into(
         &self,
         target: &str,
@@ -168,7 +170,7 @@ impl SqlDialect for DuckDbSqlDialect {
              USING (\n{source_sql}\n) AS s\n\
              ON {on_clause}\n\
              WHEN MATCHED THEN {update_clause}\n\
-             WHEN NOT MATCHED THEN INSERT *"
+             WHEN NOT MATCHED THEN INSERT BY NAME"
         ))
     }
 
@@ -283,7 +285,7 @@ impl SqlDialect for DuckDbSqlDialect {
         Ok(vec![
             "BEGIN".into(),
             format!("DELETE FROM {target} WHERE {partition_filter}"),
-            format!("INSERT INTO {target}\n{select_sql}"),
+            format!("INSERT INTO {target} BY NAME\n{select_sql}"),
             "COMMIT".into(),
         ])
     }
@@ -845,48 +847,62 @@ mod tests {
         assert!(result.is_err(), "injection in update_columns must error");
     }
 
-    /// Live regression: the MERGE SQL produced by `merge_into` must execute
-    /// successfully against a real DuckDB instance. The previous form
-    /// (`UPDATE SET t.<col> = s.<col>`) passed every string-content unit test
-    /// but failed at execute time with `Parser Error: Qualified column names
-    /// in UPDATE .. SET not supported`. This test catches that regression by
-    /// actually running the MERGE against an in-memory DuckDB.
+    /// Live regression: DuckDB's positional `INSERT *` corrupts values when
+    /// the source projection orders same-typed columns differently from the
+    /// target. `INSERT BY NAME` must preserve the column mapping and retries.
+    /// Executing the generated SQL also covers DuckDB's parser rejection of
+    /// qualified update assignments.
     #[test]
-    fn test_merge_executes_against_live_duckdb() {
+    fn test_merge_insert_by_name_executes_against_live_duckdb() {
         use crate::DuckDbConnector;
         let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
 
-        // Target seeded with 2 rows (id=1 'old', id=2 'unchanged').
-        // Source delta: id=1 update + id=3 insert.
         conn.execute_sql(
-            "CREATE TABLE tgt (id INTEGER, name VARCHAR, status VARCHAR);\n\
-             INSERT INTO tgt VALUES (1, 'old',  'active'), (2, 'keep', 'active');\n\
-             CREATE TABLE src (id INTEGER, name VARCHAR, status VARCHAR);\n\
-             INSERT INTO src VALUES (1, 'new', 'active'), (3, 'fresh', 'active');",
+            "CREATE TABLE tgt (id INTEGER, amount INTEGER, note VARCHAR);\n\
+             INSERT INTO tgt VALUES (1, 10, 'preserve this'), (2, 20, 'untouched');\n\
+             CREATE TABLE src (amount INTEGER, id INTEGER, note VARCHAR);\n\
+             INSERT INTO src VALUES (110, 1, 'source note'), (300, 3, 'inserted');",
         )
         .expect("seed target+source");
 
         let merge_sql = dialect()
             .merge_into(
                 "tgt",
-                "SELECT id, name, status FROM src",
+                "SELECT amount, id, note FROM src",
                 &["id".into()],
-                &ColumnSelection::Explicit(vec!["name".into(), "status".into()]),
+                &ColumnSelection::Explicit(vec!["amount".into()]),
             )
             .expect("build MERGE SQL");
 
-        // Pre-fix this fails with `Parser Error: Qualified column names in
-        // UPDATE .. SET not supported`. Post-fix it succeeds.
         conn.execute_sql(&merge_sql).expect("MERGE must execute");
 
         let after = conn
-            .execute_sql("SELECT id, name FROM tgt ORDER BY id")
+            .execute_sql("SELECT id, amount, note FROM tgt ORDER BY id")
             .expect("query post-MERGE");
-        // Expected: id=1 updated to 'new', id=2 unchanged, id=3 inserted.
         assert_eq!(after.rows.len(), 3, "MERGE should leave 3 rows in target");
-        assert_eq!(after.rows[0][1].as_str(), Some("new"));
-        assert_eq!(after.rows[1][1].as_str(), Some("keep"));
-        assert_eq!(after.rows[2][1].as_str(), Some("fresh"));
+        assert_eq!(after.rows[0][0].as_str(), Some("1"));
+        assert_eq!(after.rows[0][1].as_str(), Some("110"));
+        assert_eq!(after.rows[0][2].as_str(), Some("preserve this"));
+        assert_eq!(after.rows[1][0].as_str(), Some("2"));
+        assert_eq!(after.rows[1][1].as_str(), Some("20"));
+        assert_eq!(after.rows[1][2].as_str(), Some("untouched"));
+        assert_eq!(after.rows[2][0].as_str(), Some("3"));
+        assert_eq!(after.rows[2][1].as_str(), Some("300"));
+        assert_eq!(after.rows[2][2].as_str(), Some("inserted"));
+
+        conn.execute_sql(&merge_sql)
+            .expect("repeated MERGE must execute");
+        let repeated = conn
+            .execute_sql("SELECT id, amount, note FROM tgt ORDER BY id")
+            .expect("query after repeated MERGE");
+        assert_eq!(
+            repeated.rows, after.rows,
+            "repeated MERGE must be idempotent"
+        );
+        assert!(
+            merge_sql.ends_with("WHEN NOT MATCHED THEN INSERT BY NAME"),
+            "generated SQL must use DuckDB's name-based insert: {merge_sql}"
+        );
     }
 
     #[test]
@@ -1002,5 +1018,111 @@ mod tests {
         let target = vec![col("amount", "INT")];
         let result = detect_drift(&table, &source, &target, &d);
         assert_eq!(result.action, DriftAction::AlterColumnTypes);
+    }
+
+    /// Target `(id, amount, note)`, SELECT ordered `amount, id, note`: a
+    /// positional INSERT swaps `id` and `amount` (#2465).
+    fn seed_reorder_fixture(conn: &crate::DuckDbConnector) {
+        conn.execute_sql(
+            "CREATE TABLE tgt (id INTEGER, amount INTEGER, note VARCHAR);\n\
+             INSERT INTO tgt VALUES (1, 10, 'old');\n\
+             CREATE TABLE src (id INTEGER, amount INTEGER, note VARCHAR);\n\
+             INSERT INTO src VALUES (2, 20, 'new');",
+        )
+        .expect("seed");
+    }
+
+    fn cell_i64(v: &serde_json::Value, what: &str) -> i64 {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or_else(|| panic!("{what}: unexpected cell {v:?}"))
+    }
+
+    fn assert_reordered_rows(conn: &crate::DuckDbConnector) {
+        let after = conn
+            .execute_sql("SELECT id, amount, note FROM tgt ORDER BY id")
+            .expect("query");
+        let got: Vec<(i64, i64, String)> = after
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    cell_i64(&r[0], "id"),
+                    cell_i64(&r[1], "amount"),
+                    r[2].as_str().expect("note").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, 10, "old".to_string()), (2, 20, "new".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_insert_into_by_name_with_reordered_select_live_duckdb() {
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        seed_reorder_fixture(&conn);
+        // delete_insert shape: clear the incoming partition, then insert.
+        conn.execute_sql("DELETE FROM tgt WHERE id = 2")
+            .expect("delete");
+        let sql = dialect().insert_into("tgt", "SELECT amount, id, note FROM src");
+        conn.execute_sql(&sql).expect("insert must execute");
+        assert_reordered_rows(&conn);
+    }
+
+    #[test]
+    fn test_insert_overwrite_partition_by_name_with_reordered_select_live_duckdb() {
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        seed_reorder_fixture(&conn);
+        let stmts = dialect()
+            .insert_overwrite_partition("tgt", "id = 2", "SELECT amount, id, note FROM src")
+            .expect("build statements");
+        for s in &stmts {
+            conn.execute_sql(s).expect("statement must execute");
+        }
+        assert_reordered_rows(&conn);
+    }
+
+    /// CTAS renames a repeated output name (`a.id, b.id`) to `id_1`. An
+    /// unaliased `INSERT ... BY NAME` of the same SELECT then fails (#2467).
+    #[test]
+    fn test_insert_into_by_name_duplicate_select_name_live_duckdb() {
+        use crate::DuckDbConnector;
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_sql(
+            "CREATE TABLE a (id INTEGER);\n\
+             INSERT INTO a VALUES (1);\n\
+             CREATE TABLE b (id INTEGER);\n\
+             INSERT INTO b VALUES (2);\n\
+             CREATE TABLE tgt AS SELECT a.id, b.id FROM a JOIN b ON TRUE;",
+        )
+        .expect("seed");
+        let cols = conn
+            .execute_sql("SELECT column_name FROM information_schema.columns WHERE table_name = 'tgt' ORDER BY ordinal_position")
+            .expect("columns");
+        let names: Vec<&str> = cols.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["id", "id_1"]);
+
+        let unaliased = dialect().insert_into("tgt", "SELECT a.id, b.id FROM a JOIN b ON TRUE");
+        let err = conn
+            .execute_sql(&unaliased)
+            .expect_err("unaliased duplicate names must fail");
+        assert!(
+            err.to_string().contains("Duplicate column name"),
+            "unexpected error: {err}"
+        );
+
+        let aliased =
+            dialect().insert_into("tgt", "SELECT a.id, b.id AS id_1 FROM a JOIN b ON TRUE");
+        conn.execute_sql(&aliased)
+            .expect("aliased insert must execute");
+        let after = conn.execute_sql("SELECT id, id_1 FROM tgt").expect("query");
+        assert_eq!(after.rows.len(), 2);
+        for r in &after.rows {
+            assert_eq!((cell_i64(&r[0], "id"), cell_i64(&r[1], "id_1")), (1, 2));
+        }
     }
 }

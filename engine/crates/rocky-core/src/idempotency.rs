@@ -20,10 +20,10 @@
 //!
 //! | Backend | Primitive |
 //! |---|---|
-//! | [`StateBackend::Local`] | redb write transaction inside the existing `state.redb.lock` file lock |
+//! | [`StateBackend::Local`] | redb write transaction inside the existing `state.redb.lock` file lock; claim, take-over and finalize are each one transaction |
 //! | [`StateBackend::Valkey`] / [`StateBackend::Tiered`] | Valkey `SET NX EX` on `{prefix}idempotency:<key>`; a stale claim is taken over, and finalize written, by Lua `EVAL` scripts that compare the stored value first. The server must allow `EVAL` ([`IdempotencyError::ScriptingUnavailable`]) |
-//! | [`StateBackend::S3`] | S3 `PutObject` with `If-None-Match: "*"` |
-//! | [`StateBackend::Gcs`] | GCS `insertObject` with `x-goog-if-generation-match: 0` |
+//! | [`StateBackend::S3`] | S3 `PutObject` with `If-None-Match: "*"`; take-over and finalize are conditional on the ETag, so exactly one adopter wins |
+//! | [`StateBackend::Gcs`] | GCS `insertObject` with `x-goog-if-generation-match: 0`; take-over and finalize are conditional on the generation, so exactly one adopter wins |
 //!
 //! The `s3` / `gcs` backends route through [`IdempotencyBackend::ObjectStore`]
 //! using the conditional-PUT primitives in the table above — every
