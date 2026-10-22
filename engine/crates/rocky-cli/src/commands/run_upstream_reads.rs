@@ -125,27 +125,21 @@ impl UpstreamReadsAcc {
 }
 
 /// Whether `read_table` (`catalog.schema.table`, as the warehouse reports
-/// it) is the model's own target. A target with no catalog resolves against
-/// the adapter's default catalog; with none known, schema and table decide.
-/// DuckDB folds identifier case, so names compare case-insensitively.
+/// it) is the model's own target. The one matcher lives in
+/// [`rocky_core::cost_split::read_matches_target`], which the monthly cost
+/// split also uses.
 fn is_own_target(
     read_table: &str,
     target: &rocky_ir::TargetRef,
     default_catalog: Option<&str>,
 ) -> bool {
-    let mut parts = read_table.splitn(3, '.');
-    let (Some(catalog), Some(schema), Some(table)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let target_catalog = if target.catalog.is_empty() {
-        default_catalog
-    } else {
-        Some(target.catalog.as_str())
-    };
-    schema.eq_ignore_ascii_case(&target.schema)
-        && table.eq_ignore_ascii_case(&target.table)
-        && target_catalog.is_none_or(|expected| expected.eq_ignore_ascii_case(catalog))
+    rocky_core::cost_split::read_matches_target(
+        read_table,
+        &target.catalog,
+        &target.schema,
+        &target.table,
+        default_catalog,
+    )
 }
 
 /// Run one model statement. When `acc` is recording the statement is
