@@ -361,6 +361,9 @@ struct TableError {
     error: String,
     /// Index into the original tables_to_process vec (for retry).
     task_index: Option<usize>,
+    /// For the one entry a fail-fast model phase produced: the model it stands
+    /// for, so its run record can take that model's measured attempts (#2470).
+    model: Option<String>,
     /// Coarse classification of the failure for the public JSON output.
     /// Set by walking the typed connector-error chain on `e` before the
     /// error is stringified; defaults to `Unknown` when no connector
@@ -917,14 +920,18 @@ fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_error
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     output.tables_failed = recorded_failed_count + table_errors.len();
-    output
-        .errors
-        .extend(table_errors.iter().map(|e| TableErrorOutput {
+    for e in table_errors {
+        let entry = TableErrorOutput {
             asset_key: e.asset_key.clone(),
             error: e.error.clone(),
             failure_kind: e.failure_kind,
             cooldown_seconds: e.cooldown_seconds,
-        }));
+        };
+        match &e.model {
+            Some(model) => output.push_model_error(entry, model),
+            None => output.errors.push(entry),
+        }
+    }
     output.status = output.derive_run_status();
 }
 
@@ -4149,7 +4156,7 @@ pub async fn run_with_explicit_contracts(
                 // tripped breaker) reports its real kind and cooldown here
                 // too, instead of hard-coding `Unknown`.
                 let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
-                output.errors.push(crate::output::TableErrorOutput {
+                output.push_fail_fast_error(crate::output::TableErrorOutput {
                     asset_key: vec![target_model.unwrap_or("<selection>").to_string()],
                     error: format!("{e:#}"),
                     failure_kind,
@@ -6795,6 +6802,7 @@ pub async fn run_with_explicit_contracts(
                 tables_to_process.len()
             ),
             task_index: None,
+            model: None,
             failure_kind: crate::output::FailureKind::Unknown,
             cooldown_seconds: None,
         });
@@ -7126,6 +7134,7 @@ pub async fn run_with_explicit_contracts(
                     asset_key: vec![],
                     error: msg,
                     task_index: Some(idx),
+                    model: None,
                     failure_kind,
                     cooldown_seconds,
                 });
@@ -7159,6 +7168,7 @@ pub async fn run_with_explicit_contracts(
                     asset_key: vec![],
                     error: msg,
                     task_index: None,
+                    model: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
                 });
@@ -7501,6 +7511,7 @@ pub async fn run_with_explicit_contracts(
                             asset_key: vec![],
                             error: msg,
                             task_index: Some(idx),
+                            model: None,
                             failure_kind,
                             cooldown_seconds,
                         });
@@ -7888,6 +7899,7 @@ pub async fn run_with_explicit_contracts(
                         asset_key: vec![pipeline_name.to_string()],
                         error: format!("{e:#}"),
                         task_index: None,
+                        model: output.fail_fast_model.take(),
                         failure_kind,
                         cooldown_seconds,
                     });
@@ -7912,6 +7924,7 @@ pub async fn run_with_explicit_contracts(
                     asset_key: vec!["<freeze>".to_string()],
                     error: msg,
                     task_index: None,
+                    model: None,
                     failure_kind: crate::output::FailureKind::Unknown,
                     cooldown_seconds: None,
                 });
@@ -12107,12 +12120,15 @@ fn record_contained_cause(
 ) {
     let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(err);
     output.tables_failed += 1;
-    output.errors.push(crate::output::TableErrorOutput {
-        asset_key: vec![model_name.to_string()],
-        error: format!("{err:#}"),
-        failure_kind,
-        cooldown_seconds,
-    });
+    output.push_model_error(
+        crate::output::TableErrorOutput {
+            asset_key: vec![model_name.to_string()],
+            error: format!("{err:#}"),
+            failure_kind,
+            cooldown_seconds,
+        },
+        model_name,
+    );
     containment.poison(model_name);
 }
 
@@ -12401,7 +12417,7 @@ pub(crate) async fn execute_backfill_set(
                 Err(e) => {
                     let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                     output.tables_failed += 1;
-                    output.errors.push(crate::output::TableErrorOutput {
+                    output.push_fail_fast_error(crate::output::TableErrorOutput {
                         asset_key: vec!["backfill".to_string()],
                         error: format!("{e:#}"),
                         failure_kind,
@@ -20252,6 +20268,7 @@ async fn process_completed_result(
                 asset_key: vec![],
                 error: msg,
                 task_index: Some(idx),
+                model: None,
                 failure_kind,
                 cooldown_seconds,
             });
@@ -20282,6 +20299,7 @@ async fn process_completed_result(
                 asset_key: vec![],
                 error: msg,
                 task_index: None,
+                model: None,
                 failure_kind: FailureKind::Unknown,
                 cooldown_seconds: None,
             });
@@ -26687,6 +26705,7 @@ auto_create_schemas = true
             owned_shadow_objects: vec![],
             failed_attempts: Default::default(),
             fail_fast_model: None,
+            error_models: Default::default(),
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -34830,6 +34849,7 @@ backend = "local"
             asset_key: vec![asset.to_string()],
             error: format!("copy of {asset} failed"),
             task_index: None,
+            model: None,
             failure_kind: crate::output::FailureKind::QueryRejected,
             cooldown_seconds: None,
         }
@@ -38374,7 +38394,7 @@ backend = "local"
 
             // What `run` does with the `Err`: one `<selection>` error entry.
             out.tables_failed += 1;
-            out.errors.push(crate::output::TableErrorOutput {
+            out.push_fail_fast_error(crate::output::TableErrorOutput {
                 asset_key: vec!["<selection>".to_string()],
                 error: "boom".to_string(),
                 failure_kind: crate::output::FailureKind::Unknown,
@@ -50798,6 +50818,7 @@ timestamp_column = "ts"
                     asset_key: vec![],
                     error: "earlier failure".to_string(),
                     task_index: None,
+                    model: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
                 })

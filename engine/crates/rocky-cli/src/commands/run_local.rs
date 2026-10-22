@@ -288,7 +288,7 @@ pub async fn run_transformation(
                     let (failure_kind, cooldown_seconds) =
                         crate::output::classify_anyhow_error_with_cooldown(&e);
                     output.tables_failed += 1;
-                    output.errors.push(crate::output::TableErrorOutput {
+                    output.push_fail_fast_error(crate::output::TableErrorOutput {
                         asset_key: vec!["<runtime>".to_string()],
                         error: format!("{e:#}"),
                         failure_kind,
@@ -2344,6 +2344,57 @@ auto_create_schemas = true
         )
         .await
         .map(|_| ())
+    }
+
+    /// A model that scans ~5M rows and fails on the last one: slow enough
+    /// that a measured duration is not zero.
+    const SLOW_FAILING_SQL: &str = "SELECT CAST(s AS INTEGER) AS v FROM \
+        (SELECT CASE WHEN range = 4999999 THEN 'x' ELSE '1' END AS s FROM range(5000000))";
+
+    /// Run a project whose one model fails, through the real `run()` entry
+    /// point, and return the stored run record's entry for that model.
+    async fn stored_failed_model(
+        pipeline: Option<&str>,
+        model_filter: Option<&str>,
+    ) -> rocky_core::state::ModelExecution {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+        write_model(&models_dir, "bad", SLOW_FAILING_SQL, &[]);
+        write_config(dir, &db, "");
+
+        let _ = try_run(&dir.join("rocky.toml"), &state_path, pipeline, model_filter).await;
+
+        let store = StateStore::open_read_only(&state_path).expect("state store");
+        let runs = store.list_runs(1).expect("list runs");
+        let record = runs.first().expect("the failed run is stored");
+        assert_eq!(
+            record.models_executed.len(),
+            1,
+            "{:?}",
+            record.models_executed
+        );
+        record.models_executed[0].clone()
+    }
+
+    /// #2470: a transformation pipeline that stops at its first failure
+    /// (`<runtime>` entry) still stores the failed model's measured time.
+    #[tokio::test]
+    async fn transformation_pipeline_failure_keeps_the_failed_models_duration() {
+        let m = stored_failed_model(Some("t"), None).await;
+        assert_eq!(m.status, "failed");
+        assert!(m.duration_ms > 0, "duration lost: {m:?}");
+    }
+
+    /// #2470: the same through the model-only entry point (`--model`).
+    #[tokio::test]
+    async fn model_only_failure_keeps_the_failed_models_duration() {
+        let m = stored_failed_model(None, Some("bad")).await;
+        assert_eq!(m.status, "failed");
+        assert!(m.duration_ms > 0, "duration lost: {m:?}");
     }
 
     /// #1292, red-team finding: a named pipeline whose configured models root
