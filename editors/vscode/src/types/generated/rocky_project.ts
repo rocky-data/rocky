@@ -470,6 +470,12 @@ export interface RockyConfig {
    */
   classifications?: ClassificationsConfig;
   /**
+   * `[connector.<name>]` — child connectors run by `rocky load --connector <name>`. Empty by default, and the key is not serialized when empty, so a project without connectors keeps its config snapshot byte-identical. See [`crate::connector::ConnectorConfig`].
+   */
+  connector?: {
+    [k: string]: ConnectorConfig;
+  };
+  /**
    * Project-level contract settings (`[contracts]`). Today this is `strict`: refuse a contract column whose declared type Rocky cannot check. See [`ContractsConfig`].
    */
   contracts?: ContractsConfig;
@@ -1067,6 +1073,121 @@ export interface ClassificationsConfig {
    * Classification tags that are allowed to appear in a model's `[classification]` block without a corresponding `[mask]` strategy.
    */
   allow_unmasked?: string[];
+}
+/**
+ * `[connector.<name>]`: one child connector.
+ *
+ * ```toml [connector.stripe_charges] manifest   = "connectors/stripe/connector.toml" output_uri = "file://./.rocky/landing/stripe" secrets    = ["STRIPE_API_KEY"] target     = { catalog = "raw", schema = "stripe", table = "charges" } ```
+ */
+export interface ConnectorConfig {
+  /**
+   * Optional data contract, checked on the staging table before the rows reach the target. The same type load pipelines use.
+   */
+  contract?: ContractConfig | null;
+  /**
+   * Limits for one attempt. The smaller of this and the manifest's limits wins for each key.
+   */
+  limits?: ConnectorLimitsConfig;
+  /**
+   * Path to the connector's `connector.toml`, relative to the directory that holds `rocky.toml`.
+   */
+  manifest: string;
+  /**
+   * Where the connector writes. Only `file://` is supported. A relative path is relative to the directory that holds `rocky.toml`. Each attempt gets its own new directory inside it.
+   */
+  output_uri: string;
+  /**
+   * How many times to run the connector again after a failed attempt. Default 1. At most 10.
+   */
+  retries?: number;
+  /**
+   * Names of environment variables to hand to the connector. Rocky reads the values from its own environment. The child sees no other variable except `PATH`, `LANG`, `HOME`, `TMPDIR` and `ROCKY_RUN_ID`.
+   */
+  secrets?: string[];
+  /**
+   * The table the rows land in.
+   */
+  target: ConnectorTargetConfig;
+}
+/**
+ * Data contract configuration — enforced at copy/load time.
+ */
+export interface ContractConfig {
+  /**
+   * Type changes that are allowed (widening only).
+   */
+  allowed_type_changes?: AllowedTypeChange[];
+  /**
+   * Column names that must never be removed from the target.
+   */
+  protected_columns?: string[];
+  /**
+   * Columns that must exist with specific types.
+   */
+  required_columns?: RequiredColumn[];
+  [k: string]: unknown;
+}
+/**
+ * A permitted type widening (e.g., INT to BIGINT) that won't trigger a violation.
+ */
+export interface AllowedTypeChange {
+  from: string;
+  to: string;
+  [k: string]: unknown;
+}
+/**
+ * A column that must exist in the source with a specific type.
+ */
+export interface RequiredColumn {
+  name: string;
+  nullable?: boolean;
+  /**
+   * Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type string here that the normalizer does not recognise is reported in `ContractResult::warnings` and not compared — it is yours to correct, and presence and nullability still apply. An unrecognised *landed* type is different: it refuses the load (#1721).
+   */
+  type: string;
+  [k: string]: unknown;
+}
+/**
+ * The four limits for one attempt. Every key is optional.
+ */
+export interface ConnectorLimitsConfig {
+  /**
+   * CPU seconds one attempt may use. Default: no limit.
+   */
+  cpu_time_secs?: number | null;
+  /**
+   * Address-space bytes. Default: no limit. Linux enforces it. macOS often refuses the limit, and Rocky then runs the child without it.
+   */
+  memory_bytes?: number | null;
+  /**
+   * Bytes one attempt may write in total. Default 5 GiB.
+   */
+  output_bytes?: number | null;
+  /**
+   * Wall-clock seconds one attempt may run. Default 3600.
+   */
+  wall_time_secs?: number | null;
+}
+/**
+ * `target` of a connector: the table it fills.
+ */
+export interface ConnectorTargetConfig {
+  /**
+   * Name of the warehouse adapter (a key under `[adapter.*]`).
+   */
+  adapter?: string;
+  /**
+   * Target catalog.
+   */
+  catalog: string;
+  /**
+   * Target schema.
+   */
+  schema: string;
+  /**
+   * Target table.
+   */
+  table: string;
 }
 /**
  * `[contracts]` — project-level contract settings.
@@ -2144,44 +2265,6 @@ export interface LoadPipelineConfig {
    * Target table location.
    */
   target: LoadTargetConfig;
-  [k: string]: unknown;
-}
-/**
- * Data contract configuration — enforced at copy/load time.
- */
-export interface ContractConfig {
-  /**
-   * Type changes that are allowed (widening only).
-   */
-  allowed_type_changes?: AllowedTypeChange[];
-  /**
-   * Column names that must never be removed from the target.
-   */
-  protected_columns?: string[];
-  /**
-   * Columns that must exist with specific types.
-   */
-  required_columns?: RequiredColumn[];
-  [k: string]: unknown;
-}
-/**
- * A permitted type widening (e.g., INT to BIGINT) that won't trigger a violation.
- */
-export interface AllowedTypeChange {
-  from: string;
-  to: string;
-  [k: string]: unknown;
-}
-/**
- * A column that must exist in the source with a specific type.
- */
-export interface RequiredColumn {
-  name: string;
-  nullable?: boolean;
-  /**
-   * Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type string here that the normalizer does not recognise is reported in `ContractResult::warnings` and not compared — it is yours to correct, and presence and nullability still apply. An unrecognised *landed* type is different: it refuses the load (#1721).
-   */
-  type: string;
   [k: string]: unknown;
 }
 /**

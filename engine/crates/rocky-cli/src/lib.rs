@@ -1,5 +1,6 @@
 pub mod api;
 pub mod commands;
+pub mod connector;
 pub mod deprecation;
 pub mod error_reporter;
 pub mod models_loader;

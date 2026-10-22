@@ -462,6 +462,11 @@ pub enum ConfigError {
     )]
     ResidencyRegionMissing { field: String },
 
+    /// A `[connector.<name>]` block breaks a rule. `detail` says which, in
+    /// plain words.
+    #[error("[connector.{name}]: {detail}")]
+    ConnectorInvalid { name: String, detail: String },
+
     /// A `region` label is set but is not lowercase letters, digits and
     /// hyphens, starting with a letter or digit. Checked whether or not
     /// `[residency] enforce` is on: labels compare as exact text, so `"EU"`
@@ -3452,6 +3457,17 @@ pub struct RockyConfig {
     /// config snapshot byte-identical. See [`ResidencyConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub residency: Option<ResidencyConfig>,
+
+    /// `[connector.<name>]` — child connectors run by `rocky load
+    /// --connector <name>`. Empty by default, and the key is not serialized
+    /// when empty, so a project without connectors keeps its config
+    /// snapshot byte-identical. See [`crate::connector::ConnectorConfig`].
+    #[serde(
+        default,
+        rename = "connector",
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
+    pub connectors: IndexMap<String, crate::connector::ConnectorConfig>,
 }
 
 /// `[run]` — opt-in tuning for the model-skip gate.
@@ -9089,6 +9105,46 @@ pub fn config_path_if_present(path: &Path) -> Result<Option<&Path>, ConfigError>
     }
 }
 
+/// Validate every `[connector.<name>]` block.
+///
+/// A block is refused when: the name is not a plain identifier; `output_uri`
+/// is not `file://` (`s3://` and `gs://` are named as not supported yet);
+/// `retries` is above 10; a limit is 0; a `secrets` entry is not an
+/// environment variable name, is one Rocky sets itself, or repeats; the
+/// target schema or table is not a plain identifier; the target adapter is
+/// not declared; or the target adapter is BigQuery, which refuses local
+/// Parquet files.
+///
+/// Part of [`CONFIG_VALIDATORS`], so `rocky validate` and every command that
+/// loads the config agree. A secret whose variable is unset is NOT checked
+/// here: that is an error at run time.
+pub fn validate_connectors(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (name, connector) in &config.connectors {
+        let mut push = |detail: String| {
+            errors.push(ConfigError::ConnectorInvalid {
+                name: name.clone(),
+                detail,
+            });
+        };
+        for problem in crate::connector::check_connector_block(name, connector, Path::new(".")) {
+            push(problem);
+        }
+        let adapter_name = &connector.target.adapter;
+        match config.adapters.get(adapter_name) {
+            None => push(format!(
+                "target.adapter `{adapter_name}` is not declared under [adapter.*]"
+            )),
+            Some(adapter) if adapter.adapter_type == "bigquery" => push(format!(
+                "target.adapter `{adapter_name}` is BigQuery, which does not accept local \
+                 Parquet files; point the connector at another warehouse"
+            )),
+            Some(_) => {}
+        }
+    }
+    errors
+}
+
 /// A validator in the [`CONFIG_VALIDATORS`] chain: pure, panic-free, and
 /// independent of every other validator's outcome.
 type ConfigValidator = fn(&RockyConfig) -> Vec<ConfigError>;
@@ -9124,6 +9180,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_residency,
     validate_cost_prices,
     validate_source_sync,
+    validate_connectors,
 ];
 
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
@@ -18959,5 +19016,93 @@ region = "{target_region}"
             "\n[ai]\nregion = \"us\"\n\n[residency]\nallow = [{ from = \"eu\", to = \"us\" }]\n",
         ));
         assert!(ai_cross_region_labels(&allowed).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod connector_validation_tests {
+    use super::*;
+
+    fn parse(body: &str) -> RockyConfig {
+        parse_rocky_config_str(&format!(
+            "[adapter.default]\ntype = \"duckdb\"\n\n[adapter.bq]\ntype = \"bigquery\"\n\n{body}"
+        ))
+        .expect("config parses")
+    }
+
+    fn errors(body: &str) -> Vec<String> {
+        validate_connectors(&parse(body))
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    const GOOD: &str = r#"
+[connector.stripe_charges]
+manifest = "connectors/stripe/connector.toml"
+output_uri = "file://./.rocky/landing/stripe"
+secrets = ["STRIPE_API_KEY"]
+target = { catalog = "raw", schema = "stripe", table = "charges" }
+"#;
+
+    #[test]
+    fn a_good_connector_block_passes_and_takes_the_defaults() {
+        assert!(errors(GOOD).is_empty());
+        let config = parse(GOOD);
+        let connector = &config.connectors["stripe_charges"];
+        assert_eq!(connector.retries, 1);
+        assert_eq!(connector.target.adapter, "default");
+        assert!(connector.limits.is_unset());
+    }
+
+    #[test]
+    fn a_config_without_connectors_serializes_no_connector_key() {
+        let json = serde_json::to_string(&parse("")).unwrap();
+        assert!(!json.contains("connector"), "{json}");
+    }
+
+    #[test]
+    fn retries_above_ten_are_refused() {
+        let body = GOOD.replace("secrets", "retries = 11\nsecrets");
+        let errs = errors(&body);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("retries"), "{errs:?}");
+    }
+
+    #[test]
+    fn cloud_output_uris_are_refused_as_not_supported_yet() {
+        for uri in ["s3://bucket/x", "gs://bucket/x"] {
+            let body = GOOD.replace("file://./.rocky/landing/stripe", uri);
+            let errs = errors(&body);
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert!(errs[0].contains("not supported yet"), "{errs:?}");
+        }
+    }
+
+    #[test]
+    fn a_bigquery_target_is_refused() {
+        let body = GOOD.replace("target = {", "target = { adapter = \"bq\",");
+        let errs = errors(&body);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("BigQuery"), "{errs:?}");
+    }
+
+    #[test]
+    fn an_undeclared_target_adapter_is_refused() {
+        let body = GOOD.replace("target = {", "target = { adapter = \"nope\",");
+        assert!(errors(&body)[0].contains("not declared"));
+    }
+
+    #[test]
+    fn a_secret_may_not_shadow_what_rocky_sets() {
+        let body = GOOD.replace("STRIPE_API_KEY", "HOME");
+        assert!(errors(&body)[0].contains("HOME"));
+    }
+
+    #[test]
+    fn an_unknown_connector_key_is_a_parse_error() {
+        let body = GOOD.replace("secrets", "surprise = 1\nsecrets");
+        let result = parse_rocky_config_str(&format!("[adapter]\ntype = \"duckdb\"\n{body}"));
+        assert!(result.is_err());
     }
 }

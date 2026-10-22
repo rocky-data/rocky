@@ -89,6 +89,13 @@ pub fn signal_group(pgid: u32, signal: libc::c_int) -> std::io::Result<()> {
     }
 }
 
+/// Send `SIGKILL` to process group `pgid`. The same rules as
+/// [`signal_group`]: the group must be led by a child that is not reaped yet.
+#[cfg(unix)]
+pub fn kill_group(pgid: u32) -> std::io::Result<()> {
+    signal_group(pgid, libc::SIGKILL)
+}
+
 /// Whether the child `pid` has exited, without reaping it (`WNOWAIT`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn leader_has_exited(pid: u32) -> bool {
@@ -128,8 +135,9 @@ pub fn leader_has_exited(_pid: u32) -> bool {
 /// for a graceful stop. Disarm the guard once the child is reaped, because
 /// after the reap its id may name another process group.
 ///
-/// Nothing in Rocky constructs this guard yet. It is kept for the next slice
-/// (1b), which wraps spawned children with it.
+/// Child connectors wrap every spawned program with this guard, so that
+/// dropping the run (for example on Ctrl-C) never leaves the program's
+/// group running.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct GroupKillGuard {

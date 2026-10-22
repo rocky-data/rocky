@@ -301,6 +301,58 @@ class ConcurrencyMode1(StrEnum):
     adaptive = "adaptive"
 
 
+class ConnectorLimitsConfig(BaseModel):
+    """
+    The four limits for one attempt. Every key is optional.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    cpu_time_secs: conint(ge=0) | None = None
+    """
+    CPU seconds one attempt may use. Default: no limit.
+    """
+    memory_bytes: conint(ge=0) | None = None
+    """
+    Address-space bytes. Default: no limit. Linux enforces it. macOS often refuses the limit, and Rocky then runs the child without it.
+    """
+    output_bytes: conint(ge=0) | None = None
+    """
+    Bytes one attempt may write in total. Default 5 GiB.
+    """
+    wall_time_secs: conint(ge=0) | None = None
+    """
+    Wall-clock seconds one attempt may run. Default 3600.
+    """
+
+
+class ConnectorTargetConfig(BaseModel):
+    """
+    `target` of a connector: the table it fills.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    adapter: str | None = "default"
+    """
+    Name of the warehouse adapter (a key under `[adapter.*]`).
+    """
+    catalog: str
+    """
+    Target catalog.
+    """
+    schema_: str = Field(..., alias="schema")
+    """
+    Target schema.
+    """
+    table: str
+    """
+    Target table.
+    """
+
+
 class ContractsConfig(BaseModel):
     """
     `[contracts]` — project-level contract settings.
@@ -3333,6 +3385,46 @@ class ChecksConfig(BaseModel):
     """
 
 
+class ConnectorConfig(BaseModel):
+    """
+    `[connector.<name>]`: one child connector.
+
+    ```toml [connector.stripe_charges] manifest   = "connectors/stripe/connector.toml" output_uri = "file://./.rocky/landing/stripe" secrets    = ["STRIPE_API_KEY"] target     = { catalog = "raw", schema = "stripe", table = "charges" } ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    contract: ContractConfig | None = None
+    """
+    Optional data contract, checked on the staging table before the rows reach the target. The same type load pipelines use.
+    """
+    limits: ConnectorLimitsConfig | None = None
+    """
+    Limits for one attempt. The smaller of this and the manifest's limits wins for each key.
+    """
+    manifest: str
+    """
+    Path to the connector's `connector.toml`, relative to the directory that holds `rocky.toml`.
+    """
+    output_uri: str
+    """
+    Where the connector writes. Only `file://` is supported. A relative path is relative to the directory that holds `rocky.toml`. Each attempt gets its own new directory inside it.
+    """
+    retries: conint(ge=0) | None = None
+    """
+    How many times to run the connector again after a failed attempt. Default 1. At most 10.
+    """
+    secrets: list[str] | None = None
+    """
+    Names of environment variables to hand to the connector. Rocky reads the values from its own environment. The child sees no other variable except `PATH`, `LANG`, `HOME`, `TMPDIR` and `ROCKY_RUN_ID`.
+    """
+    target: ConnectorTargetConfig
+    """
+    The table the rows land in.
+    """
+
+
 class DiscoveryConfig(BaseModel):
     """
     Discovery configuration within a pipeline source.
@@ -4201,6 +4293,10 @@ class RockyConfig(BaseModel):
     )
     """
     Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings.
+    """
+    connector: dict[str, ConnectorConfig] | None = None
+    """
+    `[connector.<name>]` — child connectors run by `rocky load --connector <name>`. Empty by default, and the key is not serialized when empty, so a project without connectors keeps its config snapshot byte-identical. See [`crate::connector::ConnectorConfig`].
     """
     contracts: ContractsConfig | None = Field({"strict": False}, validate_default=True)
     """
