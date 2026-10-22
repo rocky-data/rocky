@@ -12515,13 +12515,15 @@ pub struct ProductMonthCost {
 /// Executions the monthly report could not measure. Counts, never amounts.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostNotMeasured {
-    /// Production executions that failed and recorded no time.
+    /// Production executions that failed and recorded no time; their compute
+    /// is lost. One that wrote its table is still a version.
     pub failed_executions: u64,
     /// Tables whose storage before their first measurement this month is
     /// unknown, because run history does not reach back far enough.
     pub storage_unknown_tables: u64,
     /// Distinct table names (lowercased, as the read named them, so `c.s.t`
     /// and `s.t` count twice). A name is counted when at least one read of it
+    /// this month
     /// found no earlier recorded build: a source Rocky does not build, a
     /// table that matches two models, or a table built before the history
     /// Rocky keeps or before the reader began. The same name can also be

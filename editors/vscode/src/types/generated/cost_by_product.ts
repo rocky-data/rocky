@@ -88,7 +88,7 @@ export interface CostAmount {
  */
 export interface CostNotMeasured {
   /**
-   * Production executions that failed and recorded no time.
+   * Production executions that failed and recorded no time; their compute is lost. One that wrote its table is still a version.
    */
   failed_executions: number;
   /**
@@ -96,7 +96,7 @@ export interface CostNotMeasured {
    */
   storage_unknown_tables: number;
   /**
-   * Distinct table names (lowercased, as the read named them, so `c.s.t` and `s.t` count twice). A name is counted when at least one read of it found no earlier recorded build: a source Rocky does not build, a table that matches two models, or a table built before the history Rocky keeps or before the reader began. The same name can also be charged for later reads. The cost of an unlinked read is not split.
+   * Distinct table names (lowercased, as the read named them, so `c.s.t` and `s.t` count twice). A name is counted when at least one read of it this month found no earlier recorded build: a source Rocky does not build, a table that matches two models, or a table built before the history Rocky keeps or before the reader began. The same name can also be charged for later reads. The cost of an unlinked read is not split.
    */
   unattributed_read_tables: number;
   [k: string]: unknown;

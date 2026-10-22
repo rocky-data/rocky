@@ -1384,7 +1384,39 @@ fn a_zero_ms_volume_failed_build_is_still_a_version() {
     // The reader is linked to the failed build, so the good build's 100 ms
     // has no reader. It would be 0 if the reader were linked to the good one.
     assert_eq!(ms(&split.unallocated), 100);
-    assert_eq!(split.not_measured.failed_executions, 0);
+    assert_eq!(split.not_measured.failed_executions, 1);
+    assert!(split.invariant_violations().is_empty());
+}
+
+#[test]
+fn a_zero_ms_failed_partition_with_a_target_merges_into_the_run_version() {
+    // One run: a good partition, then a 0 ms failed partition with a target
+    // and no recorded reads. They are one version (the failed one is counted
+    // but adds no second node), so the later reader is charged all 100 ms.
+    let mut failed = exec("raw", oct(5, 2, 10), 0);
+    failed.status = "failed".to_string();
+    let runs = vec![
+        run(
+            "r",
+            oct(5, 2, 0),
+            production(),
+            vec![exec("raw", oct(5, 2, 0), 100), failed],
+        ),
+        run(
+            "reader",
+            oct(5, 2, 30),
+            production(),
+            vec![reads(
+                exec("fct_refunds", oct(5, 2, 30), 0),
+                &[("raw", Some(10), 1)],
+            )],
+        ),
+    ];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, oct(20, 0, 0)));
+    assert_eq!(split.not_measured.failed_executions, 1);
+    assert_eq!(upstream_of(&split, "C"), [("raw".to_string(), 100)]);
+    assert_eq!(ms(&split.unallocated), 0);
     assert!(split.invariant_violations().is_empty());
 }
 

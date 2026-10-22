@@ -1030,7 +1030,7 @@ rocky cost --month 2026-10 --by product
 
 The month follows the project's `[schedule].timezone` (default `UTC`). An execution belongs to the month in which it started, even when its run started earlier. The current month is month-to-date. Storage counts up to now.
 
-**What counts.** Production runs only. Shadow and branch runs are real compute, so Rocky reports them in `shadow_branch`, outside the total. A failed execution that recorded no time is counted in `not_measured.failed_executions` and is never read as free. A failed execution that did record time keeps that time, but it is never a version that readers link to: the last good build keeps its readers. Entries that are not models (`<verify_after>`, `<compile>`) are not counted.
+**What counts.** Production runs only. Shadow and branch runs are real compute, so Rocky reports them in `shadow_branch`, outside the total. A failed execution that recorded no time is counted in `not_measured.failed_executions` and is never read as free. A failed execution that did record time keeps that time. If it wrote its table (a volume-check breach), it is a version and its readers are charged for it; it is also counted in `failed_executions` when it recorded no time. A failed execution that wrote no table is never a version: its time goes to the owner as `kept`, or to `<unallocated>`, and the last good build keeps its readers. Entries that are not models (`<verify_after>`, `<compile>`) are not counted.
 
 **How a cost is split.** Each time a model builds a table, that build is one version of the table. The version's model time, and the storage it occupies until the next build, are split across the later executions that read it. The split follows what each reader scanned.
 

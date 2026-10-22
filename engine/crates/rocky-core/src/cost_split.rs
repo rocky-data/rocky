@@ -304,12 +304,11 @@ pub fn execution_compute_ms(exec: &ModelExecution) -> u128 {
     }
 }
 
-/// An execution that failed and recorded no time, and wrote no table. Its
-/// compute is lost upstream of this module; it is counted, never read as
-/// free. A failed execution with a recorded target (a volume breach) replaced
-/// the table, so it is a version even at 0 ms.
+/// An execution that failed and recorded no time. Its compute is lost
+/// upstream of this module; it is counted, never read as free. One that
+/// wrote its table (a volume breach) is still a version.
 fn is_unmeasured_failure(exec: &ModelExecution) -> bool {
-    exec.status == "failed" && execution_compute_ms(exec) == 0 && exec.output_target.is_none()
+    exec.status == "failed" && execution_compute_ms(exec) == 0
 }
 
 /// Byte-hours one measured size occupies over `[from, to)`, rounded down.
@@ -409,13 +408,15 @@ pub struct SplitInput<'a> {
 /// Executions the split could not measure. Counts, never amounts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NotMeasured {
-    /// Production executions that failed and recorded no time.
+    /// Production executions that failed and recorded no time; their compute
+    /// is lost. One that wrote its table is still a version.
     pub failed_executions: u64,
     /// Tables whose storage before their first measurement this month is
     /// unknown, because history does not reach back far enough.
     pub storage_unknown_tables: u64,
     /// Distinct table names (lowercased, as the read named them, so `c.s.t`
     /// and `s.t` count twice). A name is counted when at least one read of it
+    /// this month
     /// found no earlier recorded build: a source Rocky does not build, a
     /// table that matches two models, or a table built before the history
     /// Rocky keeps or before the reader began. The same name can also be
@@ -601,7 +602,10 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                     if !is_synthetic_name(&model) {
                         out.not_measured.failed_executions += 1;
                     }
-                    continue;
+                    // With no target it wrote no table: not a version.
+                    if exec.output_target.is_none() {
+                        continue;
+                    }
                 }
                 // A version is an execution that replaced the table, so it needs
                 // a recorded target. A volume breach fails the run but writes

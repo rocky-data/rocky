@@ -69,7 +69,7 @@
       "description": "Executions the monthly report could not measure. Counts, never amounts.",
       "properties": {
         "failed_executions": {
-          "description": "Production executions that failed and recorded no time.",
+          "description": "Production executions that failed and recorded no time; their compute is lost. One that wrote its table is still a version.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -81,7 +81,7 @@
           "type": "integer"
         },
         "unattributed_read_tables": {
-          "description": "Distinct table names (lowercased, as the read named them, so `c.s.t` and `s.t` count twice). A name is counted when at least one read of it found no earlier recorded build: a source Rocky does not build, a table that matches two models, or a table built before the history Rocky keeps or before the reader began. The same name can also be charged for later reads. The cost of an unlinked read is not split.",
+          "description": "Distinct table names (lowercased, as the read named them, so `c.s.t` and `s.t` count twice). A name is counted when at least one read of it this month found no earlier recorded build: a source Rocky does not build, a table that matches two models, or a table built before the history Rocky keeps or before the reader began. The same name can also be charged for later reads. The cost of an unlinked read is not split.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
