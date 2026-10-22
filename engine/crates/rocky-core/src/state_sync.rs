@@ -1745,6 +1745,10 @@ impl LedgerSeamSession {
     /// # Errors
     ///
     /// [`StateSyncError::CasUnsupported`] and [`StateSyncError::CasRequired`].
+    /// This check is strict: a marker check that cannot finish also fails,
+    /// with the transfer or timeout error (for example
+    /// [`StateSyncError::Timeout`] or an object-store error). The caller
+    /// should retry later.
     pub async fn preflight_writer(&self) -> Result<(), StateSyncError> {
         if matches!(self.cfg.backend, StateBackend::Local) {
             return Ok(());

@@ -354,10 +354,21 @@ async fn preflight<'a>(params: &ConnectorLoadParams<'a>) -> Result<Preflight<'a>
     )
     .preflight_writer()
     .await
-    .context(
-        "the state backend refuses this writer before anything runs; fix [state] \
-         concurrency_control, or use the setting the other writers use",
-    )?;
+    .map_err(|e| {
+        use rocky_core::state_sync::StateSyncError;
+        match e {
+            e @ (StateSyncError::CasRequired { .. } | StateSyncError::CasUnsupported { .. }) => {
+                anyhow::Error::new(e).context(
+                    "the state backend refuses this writer before anything runs; fix [state] \
+                     concurrency_control, or use the setting the other writers use",
+                )
+            }
+            e => anyhow::Error::new(e).context(
+                "the state backend refuses this writer because the marker check could not \
+                 complete. Rocky stops rather than risk loading a batch twice. Retry later",
+            ),
+        }
+    })?;
     // The saved state is read BEFORE the claim: the claim key names the
     // commit sequence this run will extend.
     let saved = read_saved_state(params.loaded, params.state_path, params.name).await?;

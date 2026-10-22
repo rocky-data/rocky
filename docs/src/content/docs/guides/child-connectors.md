@@ -184,7 +184,7 @@ Delivery is at least once. It is not exactly once.
 - Rocky does not send the promote after the claim expires. That is a failure before the promote, so the claim is freed.
 - If a claim from a finished run exists but the saved state did not move, the run fails. The state may have been reset or restored.
 - The promote and the state commit are two writes. If Rocky crashes between them, the rows are in the table but the state did not move. The claim stays in flight on purpose. Until it expires, a new run with the same key skips. After it expires, the next run adopts the claim, logs a warning, and loads the batch again. The output field `adopted_prior_claim` is `true` in that case.
-- The state commit is refused if `commit_seq` moved since the claim. This fence is only as strong as the compare-and-swap of the remote state store. With `concurrency_control = "off"`, there is no such fence, and the idempotency claim on the batch key is the only guard against two runs.
+- The state commit is refused if `commit_seq` moved since the claim. This fence is only as strong as the compare-and-swap of the remote state store. With `concurrency_control = "off"`, Rocky still makes the `commit_seq` check, but not atomically with the upload, so two runs can both pass it. The idempotency claim on the batch key is then the only guard against two runs.
 - The claim lives for `wall_time_secs` times `retries + 1`, plus one hour, rounded up to whole hours. The minimum is 1 hour.
 - With the default local state backend, the claim lives in the local state file. It guards runs that share that file. For runs on many machines, use a remote state backend that supports idempotency claims.
 
@@ -196,7 +196,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 - Rocky keeps the scratch directory of a successful run and never cleans it up. Remove old ones from `output_uri` by hand.
 - Staging tables from a crashed run stay in the warehouse. The name is `<table>__rocky_stg_<run id>`. Rocky does not clean up old staging tables yet. Drop them by hand.
 - Only `file://` output is supported.
-- A Ctrl-C or `SIGTERM` while the program runs stops the program group and fails the run. Rocky frees the claim. A signal that arrives while Rocky stages the batch is refused before the promote. Rocky drops the staging table and frees the claim. Only a signal that arrives after Rocky sent the promote lets the state commit finish.
+- A Ctrl-C or `SIGTERM` while the program runs stops the program group and fails the run. Rocky frees the claim. A signal that arrives while Rocky stages the batch makes Rocky stop before the promote. Rocky drops the staging table and frees the claim. Only a signal that arrives after Rocky sent the promote lets the state commit finish.
 
 ## JSON output
 
