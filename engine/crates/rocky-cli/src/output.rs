@@ -6756,11 +6756,17 @@ impl RunOutput {
             .collect();
 
         for (idx, err) in self.errors.iter().enumerate() {
-            let model_name = err
-                .asset_key
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "<unknown>".to_string());
+            // A run that stopped at its first failure reports one entry under
+            // an entry-point placeholder (`<runtime>`, `<selection>`, a
+            // pipeline name, `backfill`); the execution is recorded under the
+            // failed model's own name, as contained mode does. The JSON
+            // `asset_key` is not touched.
+            let model_name = self.error_models.get(&idx).cloned().unwrap_or_else(|| {
+                err.asset_key
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            });
             if volume_failed.contains(model_name.as_str()) {
                 continue;
             }

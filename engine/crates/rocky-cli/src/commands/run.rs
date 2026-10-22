@@ -38413,6 +38413,7 @@ backend = "local"
             assert_eq!(record.models_executed.len(), 1);
             assert_eq!(record.models_executed[0].status, "failed");
             assert_eq!(record.models_executed[0].duration_ms, 1234);
+            assert_eq!(record.models_executed[0].model_name, "bad");
         }
     }
 

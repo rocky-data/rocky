@@ -2346,8 +2346,7 @@ auto_create_schemas = true
         .map(|_| ())
     }
 
-    /// A model that scans ~5M rows and fails on the last one: slow enough
-    /// that a measured duration is not zero.
+    /// A model that scans ~5M rows and fails on the last one.
     const SLOW_FAILING_SQL: &str = "SELECT CAST(s AS INTEGER) AS v FROM \
         (SELECT CASE WHEN range = 4999999 THEN 'x' ELSE '1' END AS s FROM range(5000000))";
 
@@ -2381,20 +2380,21 @@ auto_create_schemas = true
     }
 
     /// #2470: a transformation pipeline that stops at its first failure
-    /// (`<runtime>` entry) still stores the failed model's measured time.
+    /// (`<runtime>` entry) stores the record under the failed model's own
+    /// name, not the placeholder, so its measurement lands on that model.
     #[tokio::test]
-    async fn transformation_pipeline_failure_keeps_the_failed_models_duration() {
+    async fn transformation_pipeline_failure_is_recorded_under_the_models_name() {
         let m = stored_failed_model(Some("t"), None).await;
         assert_eq!(m.status, "failed");
-        assert!(m.duration_ms > 0, "duration lost: {m:?}");
+        assert_eq!(m.model_name, "bad");
     }
 
     /// #2470: the same through the model-only entry point (`--model`).
     #[tokio::test]
-    async fn model_only_failure_keeps_the_failed_models_duration() {
+    async fn model_only_failure_is_recorded_under_the_models_name() {
         let m = stored_failed_model(None, Some("bad")).await;
         assert_eq!(m.status, "failed");
-        assert!(m.duration_ms > 0, "duration lost: {m:?}");
+        assert_eq!(m.model_name, "bad");
     }
 
     /// #1292, red-team finding: a named pipeline whose configured models root
