@@ -269,6 +269,16 @@ rocky load [flags]
 rocky load --source-dir data/dropbox/ --format parquet
 ```
 
+### Column mapping
+
+Into a table that already exists, the DuckDB loader maps file columns to table columns by name, not by position. Column order in the file does not matter. This holds for Parquet, JSONL and CSV with a header.
+
+- A table column the file lacks gets its default, or `NULL`.
+- A file column the table lacks is an error. The message names the column.
+- A CSV with no header has no names. It maps by position: column 1 of the file goes to column 1 of the table.
+
+Other warehouses may map differently. Check that adapter's page.
+
 :::caution[`--truncate` empties the target once per file, not once per command]
 Rocky loads the files one at a time, in sorted filename order. `--truncate` deletes every row of the target before each file. When several files share one target table, **only the last file's rows survive**.
 
