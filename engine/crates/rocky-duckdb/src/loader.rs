@@ -96,6 +96,33 @@ fn format_target(target: &TableRef) -> AdapterResult<String> {
     }
 }
 
+/// Quote `s` as a SQL string literal.
+fn sql_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Build the query that checks whether the target table exists.
+///
+/// It matches the schema as well as the table name, so a same-named table in
+/// another schema does not count. An empty schema means DuckDB's current
+/// schema, which is where an unqualified `CREATE TABLE` puts the table. The
+/// catalog is always the current one, because `format_target` never emits a
+/// catalog. Names compare case-insensitively, as unquoted DuckDB identifiers do.
+fn table_exists_sql(schema: &str, table: &str) -> String {
+    let schema_expr = if schema.is_empty() {
+        "current_schema()".to_string()
+    } else {
+        sql_literal(schema)
+    };
+    format!(
+        "SELECT 1 FROM information_schema.tables \
+         WHERE table_catalog = current_database() \
+         AND lower(table_schema) = lower({schema_expr}) \
+         AND lower(table_name) = lower({})",
+        sql_literal(table)
+    )
+}
+
 /// Render a [`LoadSource`] as a SQL path string suitable for DuckDB COPY/read
 /// functions. Local paths use `Path::display()`; cloud URIs pass through.
 fn source_path_str(source: &LoadSource) -> String {
@@ -253,6 +280,8 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
     ) -> AdapterResult<LoadResult> {
         let format = resolve_format(source, options)?;
         let target_ref = format_target(target)?;
+        let schema = target.schema.clone();
+        let table = target.table.clone();
         // Only local files have filesystem metadata; cloud sources report 0.
         let file_size = match source {
             LoadSource::LocalFile(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or_default(),
@@ -275,10 +304,7 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
 
             // Check whether the target table already exists.
             let table_exists = conn
-                .execute_sql(&format!(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name = '{}'",
-                    target_ref.split('.').next_back().unwrap_or(&target_ref)
-                ))
+                .execute_sql(&table_exists_sql(&schema, &table))
                 .map(|r| !r.rows.is_empty())
                 .unwrap_or(false);
 
@@ -565,6 +591,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.rows_loaded, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Table-exists check matches the schema (#2475)
+    // ------------------------------------------------------------------
+
+    fn target_in(schema: &str, table: &str) -> TableRef {
+        TableRef {
+            catalog: String::new(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_named_table_in_another_schema_does_not_hide_the_target() {
+        let adapter = loader();
+        exec(&adapter, "CREATE SCHEMA other");
+        exec(&adapter, "CREATE TABLE other.t2 (a INTEGER, b VARCHAR)");
+        let f = csv_file("a,b\n1,x\n2,y\n");
+        for t in [target_in("main", "t2"), target_in("", "t2")] {
+            exec(&adapter, "DROP TABLE IF EXISTS main.t2");
+            let r = adapter
+                .load(&local(f.path()), &t, &LoadOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(r.rows_loaded, 2);
+            assert_eq!(rows(&adapter, "SELECT count(*) FROM main.t2")[0][0], "2");
+            assert_eq!(rows(&adapter, "SELECT count(*) FROM other.t2")[0][0], "0");
+        }
+    }
+
+    #[tokio::test]
+    async fn target_in_a_non_default_schema_is_created_then_appended() {
+        let adapter = loader();
+        exec(&adapter, "CREATE SCHEMA s1");
+        exec(&adapter, "CREATE TABLE main.t3 (a INTEGER, b VARCHAR)");
+        let f = csv_file("a,b\n1,x\n");
+        let t = target_in("s1", "t3");
+        adapter
+            .load(&local(f.path()), &t, &LoadOptions::default())
+            .await
+            .unwrap();
+        adapter
+            .load(&local(f.path()), &t, &LoadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM s1.t3")[0][0], "2");
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM main.t3")[0][0], "0");
+    }
+
+    #[tokio::test]
+    async fn existing_target_still_appends() {
+        let adapter = loader();
+        let f = csv_file("a,b\n1,x\n");
+        let t = target_in("main", "t4");
+        for _ in 0..2 {
+            adapter
+                .load(&local(f.path()), &t, &LoadOptions::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM main.t4")[0][0], "2");
+    }
+
+    #[test]
+    fn table_exists_sql_escapes_quotes() {
+        let sql = table_exists_sql("", "a'b");
+        assert!(sql.contains("'a''b'"));
     }
 
     // ------------------------------------------------------------------
