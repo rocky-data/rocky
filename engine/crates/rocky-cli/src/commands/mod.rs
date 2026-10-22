@@ -149,7 +149,7 @@ pub use compile::{
 };
 pub use completions::run_completions;
 pub use compliance::{compute_compliance, run_compliance};
-pub use cost::{CostGroupBy, compute_cost, run_cost};
+pub use cost::{CostGroupBy, compute_cost, compute_month_cost, run_cost};
 pub use dag::{dag_output, run_dag};
 pub use discover::discover;
 pub use docs::{DocsFormat, run_docs};

@@ -123,6 +123,7 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "product_approve": "product_approve.schema.json",
     "product_status": "product_status.schema.json",
     "product_list": "product_list.schema.json",
+    "cost_by_product": "cost_by_product.schema.json",
     "product_journal": "product_journal.schema.json",
     "fulfill": "fulfill.schema.json",
 }

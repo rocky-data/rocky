@@ -33,13 +33,18 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rocky_core::config::load_optional_project_config;
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
+use rocky_core::cost_split;
 use rocky_core::state::{
     ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore, StoredBytesBasis, UnrecordedScope,
 };
 
-use crate::output::{CostGroup, CostOutput, PerModelCostHistorical};
+use crate::output::{
+    AllocatedUpstreamCost, CostAmount, CostGroup, CostNotMeasured, CostOutput, CostUnit,
+    PerModelCostHistorical, ProductMonthCost, ProductMonthCostOutput, SharedNotChargedCost,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -520,14 +525,34 @@ pub fn compute_cost(
     Ok(output)
 }
 
+/// Execute `rocky cost`: one run (`target`), or one month split by product
+/// (`month` with `by = "product"`).
 pub fn run_cost(
     state_path: &Path,
     config_path: &Path,
-    target: &str,
+    target: Option<&str>,
     model_filter: Option<&str>,
     by: Option<&str>,
+    month: Option<&str>,
     json: bool,
 ) -> Result<()> {
+    if let Some(month) = month {
+        anyhow::ensure!(
+            target.is_none() && model_filter.is_none(),
+            "--month reports a whole month; it cannot be combined with a run id or --model"
+        );
+        anyhow::ensure!(
+            by.is_some_and(|by| by.eq_ignore_ascii_case("product")),
+            "--month needs --by product"
+        );
+        return run_month_cost(state_path, config_path, month, json);
+    }
+    if by.is_some_and(|by| by.eq_ignore_ascii_case("product")) {
+        anyhow::bail!("--by product needs --month YYYY-MM");
+    }
+    let target = target.context(
+        "pass a run id or `latest`, or report a month with `--month YYYY-MM --by product`",
+    )?;
     let group_by = by.map(CostGroupBy::parse).transpose()?;
     let output = compute_cost(state_path, config_path, target, model_filter, group_by)?;
 
@@ -535,6 +560,467 @@ pub fn run_cost(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         print_table(&output);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `rocky cost --month YYYY-MM --by product`
+// ---------------------------------------------------------------------------
+
+/// Parse `--month` as `YYYY-MM`.
+fn parse_month(raw: &str) -> Result<(i32, u32)> {
+    let bad = || anyhow::anyhow!("--month '{raw}' is not a month — expected YYYY-MM, e.g. 2026-10");
+    let (year, month) = raw.split_once('-').ok_or_else(bad)?;
+    if year.len() != 4 || month.len() != 2 {
+        return Err(bad());
+    }
+    let year: i32 = year.parse().map_err(|_| bad())?;
+    let month: u32 = month.parse().map_err(|_| bad())?;
+    if !(1..=12).contains(&month) {
+        return Err(bad());
+    }
+    Ok((year, month))
+}
+
+/// Whether run history reaches back far enough to cover `window_start`, as
+/// far as the retention policy can tell.
+///
+/// Retention keeps rows younger than `max_age_days`, plus the newest
+/// `min_runs_kept`. A month that began longer ago than that may have lost
+/// runs, and the few rows `min_runs_kept` leaves behind look like a quiet
+/// month. The scan starts one day before the month (a run can start before
+/// the month and have executions inside it), so that day counts.
+fn history_is_complete(
+    retention: &rocky_core::retention::StateRetentionConfig,
+    window_start: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    use rocky_core::retention::StateRetentionDomain;
+    if !retention.applies_to_domain(StateRetentionDomain::History) {
+        return true;
+    }
+    let oldest_kept = now - chrono::Duration::days(i64::from(retention.max_age_days));
+    window_start - chrono::Duration::days(1) >= oldest_kept
+}
+
+/// Model name to the models that declare it as a dependency, from the
+/// compiled model graph of every transformation pipeline. A graph that does
+/// not load adds a warning and leaves its models without declared children:
+/// the report then cannot tell a reader that recorded nothing from a model
+/// that is not a reader.
+fn declared_children(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    config_path: &Path,
+    warnings: &mut Vec<String>,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut children: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let Some(cfg) = cfg else {
+        return children;
+    };
+    for (name, pipeline) in &cfg.pipelines {
+        let Some(tx) = pipeline.as_transformation() else {
+            continue;
+        };
+        let dir = match crate::models_loader::resolve_models_dir(&tx.models, config_path) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => continue,
+            Err(error) => {
+                warnings.push(format!(
+                    "pipeline {name}: its models directory cannot be resolved ({error:#}); \
+                     its declared dependencies are unknown"
+                ));
+                continue;
+            }
+        };
+        let (models, errors) =
+            crate::models_loader::load_project_models_partial(&dir, Some(&cfg.freshness));
+        for error in errors {
+            warnings.push(format!(
+                "pipeline {name}: some models did not load ({error:#}); their declared \
+                 dependencies are unknown"
+            ));
+        }
+        match crate::selection::project_from_models(
+            models,
+            &rocky_core::run_vars::RunVars::default(),
+        ) {
+            Ok(project) => {
+                for node in &project.dag_nodes {
+                    for dependency in &node.depends_on {
+                        children
+                            .entry(dependency.clone())
+                            .or_default()
+                            .insert(node.name.clone());
+                    }
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "pipeline {name}: the model graph does not resolve ({error:#}); its declared \
+                 dependencies are unknown"
+            )),
+        }
+    }
+    children
+}
+
+/// Narrow a figure to the JSON width. [`check_fits_u64`] has already refused
+/// any report with a larger figure, so the fallback is never taken.
+fn to_u64(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Refuse a report whose figures do not fit the 64-bit JSON integers, rather
+/// than print a clipped number that no longer adds up.
+fn check_fits_u64(split: &cost_split::MonthSplit) -> Result<()> {
+    let limit = u128::from(u64::MAX);
+    let mut largest = split
+        .measured_total
+        .values()
+        .chain(split.shadow_branch.values())
+        .chain(split.unallocated.values())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    for row in split.products.values() {
+        for value in row
+            .built
+            .values()
+            .chain(row.kept.values())
+            .chain(row.owner_residual.values())
+        {
+            largest = largest.max(*value);
+        }
+        for a in &row.allocated_upstream {
+            largest = largest.max(a.amount).max(a.of_total);
+        }
+        for s in &row.shared_not_charged {
+            largest = largest.max(s.amount);
+        }
+    }
+    anyhow::ensure!(
+        largest <= limit,
+        "a figure in this month is larger than 2^64 - 1 and cannot be reported exactly"
+    );
+    Ok(())
+}
+
+fn amounts_out(amounts: &cost_split::Amounts) -> Vec<CostAmount> {
+    amounts
+        .iter()
+        .filter(|(_, value)| **value > 0)
+        .map(|(unit, value)| CostAmount {
+            unit: (*unit).into(),
+            amount: to_u64(*value),
+        })
+        .collect()
+}
+
+fn product_out(
+    product: &str,
+    output_model: &str,
+    row: &cost_split::ProductSplit,
+) -> ProductMonthCost {
+    let charged: cost_split::Amounts = cost_split::Unit::ALL
+        .into_iter()
+        .map(|unit| (unit, row.charged(unit)))
+        .collect();
+    ProductMonthCost {
+        product: product.to_string(),
+        output_model: output_model.to_string(),
+        built: amounts_out(&row.built),
+        kept: amounts_out(&row.kept),
+        owner_residual: amounts_out(&row.owner_residual),
+        allocated_upstream: row
+            .allocated_upstream
+            .iter()
+            .map(|a| AllocatedUpstreamCost {
+                table: a.table.clone(),
+                unit: a.unit.into(),
+                basis: a.basis.into(),
+                amount: to_u64(a.amount),
+                of_total: to_u64(a.of_total),
+                low_confidence: a.low_confidence,
+                provisional: a.provisional,
+            })
+            .collect(),
+        shared_not_charged: row
+            .shared_not_charged
+            .iter()
+            .map(|s| SharedNotChargedCost {
+                table: s.table.clone(),
+                reader: s.reader.clone(),
+                unit: s.unit.into(),
+                basis: s.basis.into(),
+                amount: to_u64(s.amount),
+            })
+            .collect(),
+        charged: amounts_out(&charged),
+    }
+}
+
+/// The typed payload behind `rocky cost --month YYYY-MM --by product`.
+///
+/// Splits one month of production cost across the products in `products/`,
+/// in physical units (see [`rocky_core::cost_split`]). It reads run history
+/// only; the month is cut in the project's `[schedule].timezone`, and each
+/// execution belongs to the month of its own start. `now` is passed in so a
+/// caller can pin it: storage accrues to the earlier of `now` and the end of
+/// the month.
+///
+/// A split that breaks its own invariant is an error, never printed.
+pub fn compute_month_cost(
+    state_path: &Path,
+    config_path: &Path,
+    month: &str,
+    now: DateTime<Utc>,
+) -> Result<ProductMonthCostOutput> {
+    let (year, month_number) = parse_month(month)?;
+    let cfg = load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let timezone = cfg
+        .as_ref()
+        .map_or_else(|| "UTC".to_string(), |c| c.schedule.timezone.clone());
+    let window = cost_split::month_bounds_in_zone(year, month_number, &timezone).map_err(
+        |error| match error {
+            cost_split::MonthBoundsError::UnknownTimeZone => {
+                anyhow::anyhow!("[schedule].timezone '{timezone}' is not an IANA time zone name")
+            }
+            cost_split::MonthBoundsError::NoSuchMonth => {
+                anyhow::anyhow!("--month '{month}' is outside the range of dates Rocky handles")
+            }
+        },
+    )?;
+    let retention = cfg
+        .as_ref()
+        .map(|c| c.state.retention.clone())
+        .unwrap_or_default();
+    let history_complete = history_is_complete(&retention, window.start, now);
+
+    let mut warnings = Vec::new();
+    let root = crate::commands::product::product_command_root(config_path);
+    let (owners, problems) = crate::commands::product::product_owners_in(&root);
+    // A spec that did not load owns no model in this report: its cost is not
+    // charged to the product.
+    warnings.extend(problems);
+    let children = declared_children(cfg.as_ref(), config_path, &mut warnings);
+
+    let store = StateStore::open_read_only_or_empty(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    // A run can start before the month and hold executions inside it, so the
+    // scan reaches one day back. Anything older is the known limit.
+    let runs =
+        store.list_runs_matching_since(window.start - chrono::Duration::days(1), |_| true)?;
+
+    // Models whose last build before the month is needed: every owned model,
+    // every model run in the scan, and every model the graph names, so a table
+    // built before the month and only read in it still has its storage.
+    let mut wanted: std::collections::BTreeSet<String> = owners.keys().cloned().collect();
+    for (parent, kids) in &children {
+        wanted.insert(parent.clone());
+        wanted.extend(kids.iter().cloned());
+    }
+    for run in &runs {
+        for exec in &run.models_executed {
+            wanted.insert(exec.rocky_model_name().to_string());
+        }
+    }
+    let carry_in = store.last_measured_builds_before(&wanted, window.start, |r| {
+        r.counts_as_production(UnrecordedScope::Count)
+    })?;
+    let carry_in: Vec<ModelExecution> = carry_in.into_values().collect();
+
+    let split = cost_split::split_month(&cost_split::SplitInput {
+        window,
+        as_of: now,
+        runs: &runs,
+        carry_in: &carry_in,
+        history_complete,
+        owners: &owners,
+        declared_children: &children,
+        default_catalog: None,
+    });
+    let broken = split.invariant_violations();
+    anyhow::ensure!(
+        broken.is_empty(),
+        "the monthly split does not add up for {} — this is a bug in Rocky, not in your data",
+        broken
+            .iter()
+            .map(|u| u.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    check_fits_u64(&split)?;
+    let model_of: std::collections::BTreeMap<&str, &str> = owners
+        .iter()
+        .map(|(model, product)| (product.as_str(), model.as_str()))
+        .collect();
+    let products = split
+        .products
+        .iter()
+        .map(|(product, row)| {
+            product_out(
+                product,
+                model_of.get(product.as_str()).copied().unwrap_or(""),
+                row,
+            )
+        })
+        .collect();
+
+    Ok(ProductMonthCostOutput {
+        version: VERSION.to_string(),
+        command: "cost_by_product".to_string(),
+        month: format!("{year:04}-{month_number:02}"),
+        timezone,
+        month_start: window.start.to_rfc3339(),
+        month_end: window.end.to_rfc3339(),
+        as_of: now.to_rfc3339(),
+        history_complete,
+        products,
+        unallocated: amounts_out(&split.unallocated),
+        shadow_branch: amounts_out(&split.shadow_branch),
+        measured_total: amounts_out(&split.measured_total),
+        not_measured: CostNotMeasured {
+            failed_executions: split.not_measured.failed_executions,
+            storage_unknown_tables: split.not_measured.storage_unknown_tables,
+            unattributed_read_tables: split.not_measured.unattributed_read_tables,
+        },
+        warnings,
+    })
+}
+
+fn amount_cell(amounts: &[CostAmount], unit: CostUnit) -> String {
+    amounts
+        .iter()
+        .find(|a| a.unit == unit)
+        .map_or_else(|| "-".to_string(), |a| a.amount.to_string())
+}
+
+fn print_month_table(output: &ProductMonthCostOutput) {
+    println!(
+        "month: {} ({}, {} to {})",
+        output.month, output.timezone, output.month_start, output.month_end
+    );
+    println!("as_of: {}", output.as_of);
+    if !output.history_complete {
+        println!(
+            "history_complete: false — state retention may have swept runs this month needs; \
+             every figure below is partial"
+        );
+    }
+    for warning in &output.warnings {
+        println!("warning: {warning}");
+    }
+    println!();
+    println!("model time, ms (built is a memo: it is not summed)");
+    println!(
+        "  {:<24}  {:>12}  {:>12}  {:>12}  {:>12}",
+        "product", "built", "kept", "from others", "charged"
+    );
+    let from_others = |p: &ProductMonthCost| -> u64 {
+        p.allocated_upstream
+            .iter()
+            .filter(|a| a.unit == CostUnit::ComputeMs)
+            .map(|a| a.amount)
+            .sum()
+    };
+    for p in &output.products {
+        println!(
+            "  {:<24}  {:>12}  {:>12}  {:>12}  {:>12}",
+            p.product,
+            amount_cell(&p.built, CostUnit::ComputeMs),
+            amount_cell(&p.kept, CostUnit::ComputeMs),
+            from_others(p),
+            amount_cell(&p.charged, CostUnit::ComputeMs),
+        );
+    }
+    println!(
+        "  {:<24}  {:>12}  {:>12}  {:>12}  {:>12}",
+        "<unallocated>",
+        "",
+        "",
+        "",
+        amount_cell(&output.unallocated, CostUnit::ComputeMs)
+    );
+    println!(
+        "  {:<24}  {:>12}  {:>12}  {:>12}  {:>12}",
+        "measured total",
+        "",
+        "",
+        "",
+        amount_cell(&output.measured_total, CostUnit::ComputeMs)
+    );
+    println!(
+        "  shadow and branch (outside the total): {}",
+        amount_cell(&output.shadow_branch, CostUnit::ComputeMs)
+    );
+    for (unit, label) in [
+        (CostUnit::StorageByteHoursDataFiles, "data files"),
+        (
+            CostUnit::StorageByteHoursAllocatedBlocks,
+            "allocated blocks, an estimate",
+        ),
+    ] {
+        if !output.measured_total.iter().any(|a| a.unit == unit) {
+            continue;
+        }
+        println!();
+        println!("storage, byte-hours ({label})");
+        println!("  {:<24}  {:>16}  {:>16}", "product", "kept", "charged");
+        for p in &output.products {
+            println!(
+                "  {:<24}  {:>16}  {:>16}",
+                p.product,
+                amount_cell(&p.kept, unit),
+                amount_cell(&p.charged, unit)
+            );
+        }
+        println!(
+            "  {:<24}  {:>16}  {:>16}",
+            "<unallocated>",
+            "",
+            amount_cell(&output.unallocated, unit)
+        );
+        println!(
+            "  {:<24}  {:>16}  {:>16}",
+            "measured total",
+            "",
+            amount_cell(&output.measured_total, unit)
+        );
+    }
+    println!();
+    println!(
+        "not measured: {} failed executions with no recorded time, {} tables with unknown early storage",
+        output.not_measured.failed_executions, output.not_measured.storage_unknown_tables
+    );
+    println!(
+        "{} tables were read that name no model with a recorded build; their cost is not split",
+        output.not_measured.unattributed_read_tables
+    );
+    if output
+        .products
+        .iter()
+        .flat_map(|p| &p.allocated_upstream)
+        .any(|a| a.provisional)
+    {
+        println!("some shares are provisional: a later reader can still change them");
+    }
+}
+
+/// Execute `rocky cost --month YYYY-MM --by product`.
+pub fn run_month_cost(
+    state_path: &Path,
+    config_path: &Path,
+    month: &str,
+    json: bool,
+) -> Result<()> {
+    let output = compute_month_cost(state_path, config_path, month, Utc::now())?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print_month_table(&output);
     }
     Ok(())
 }
@@ -1142,7 +1628,7 @@ mod tests {
         let cfg = dir.path().join("rocky.toml");
         std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
 
-        let err = run_cost(&state_path, &cfg, "latest", None, None, true)
+        let err = run_cost(&state_path, &cfg, Some("latest"), None, None, None, true)
             .expect_err("a present but unloadable rocky.toml must refuse `rocky cost`");
         let rendered = format!("{err:#}");
         assert!(
@@ -1171,7 +1657,7 @@ mod tests {
                 .is_none(),
             "no config → no pricing parameters, as before"
         );
-        run_cost(&state_path, &cfg, "latest", None, None, true)
+        run_cost(&state_path, &cfg, Some("latest"), None, None, None, true)
             .expect("a missing rocky.toml must not refuse `rocky cost`");
 
         std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
@@ -1212,5 +1698,253 @@ mod tests {
             .total_cost_usd
             .expect("the rollup must carry a dollar figure");
         assert!(cost > 0.0, "priced run must cost something: {cost}");
+    }
+
+    // ----- `--month YYYY-MM --by product` -----
+
+    use crate::commands::product::tests::api_fixture_project;
+    use rocky_core::state::{RecordedTarget, UpstreamRead, UpstreamReads};
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    /// An execution that started at `start`, ran `ms`, and wrote
+    /// `main.<name>`.
+    fn exec_at(name: &str, start: DateTime<Utc>, ms: u64) -> ModelExecution {
+        let mut e = sample_exec(name, "success", ms, None, None);
+        e.started_at = start;
+        e.finished_at = start + chrono::Duration::milliseconds(ms as i64);
+        e.output_target = Some(RecordedTarget {
+            model: name.to_string(),
+            catalog: String::new(),
+            schema: "main".to_string(),
+            table: name.to_string(),
+        });
+        e
+    }
+
+    fn reading(mut e: ModelExecution, table: &str, est_bytes: u64) -> ModelExecution {
+        e.upstream_reads = Some(UpstreamReads {
+            reads: vec![UpstreamRead {
+                table: format!("memory.main.{table}"),
+                rows_scanned: 10,
+                projected_columns: Vec::new(),
+                est_bytes: Some(est_bytes),
+            }],
+            unattributed_scans: 0,
+        });
+        e
+    }
+
+    fn amount(amounts: &[CostAmount], unit: CostUnit) -> u64 {
+        amounts
+            .iter()
+            .find(|a| a.unit == unit)
+            .map_or(0, |a| a.amount)
+    }
+
+    #[test]
+    fn month_cost_charges_the_product_that_reads_an_unowned_table() {
+        let dir = TempDir::new().unwrap();
+        let (_root, config, state_path) = api_fixture_project(dir.path());
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let start = at(2026, 10, 5, 2, 0);
+            store
+                .record_run(&sample_run_at(
+                    "run-1",
+                    start,
+                    vec![
+                        exec_at("raw", start, 1_000),
+                        reading(
+                            exec_at("revenue_daily", start + chrono::Duration::minutes(1), 400),
+                            "raw",
+                            10,
+                        ),
+                    ],
+                ))
+                .unwrap();
+        }
+        let out =
+            compute_month_cost(&state_path, &config, "2026-10", at(2026, 11, 2, 0, 0)).unwrap();
+        assert_eq!(out.command, "cost_by_product");
+        assert_eq!(out.month, "2026-10");
+        assert_eq!(out.timezone, "UTC");
+        assert!(out.history_complete);
+        assert_eq!(out.products.len(), 1);
+        let product = &out.products[0];
+        assert_eq!(product.product, "revenue_daily");
+        assert_eq!(amount(&product.built, CostUnit::ComputeMs), 400);
+        assert_eq!(amount(&product.kept, CostUnit::ComputeMs), 400);
+        assert_eq!(product.allocated_upstream.len(), 1);
+        assert_eq!(product.allocated_upstream[0].table, "raw");
+        assert_eq!(product.allocated_upstream[0].amount, 1_000);
+        assert_eq!(amount(&product.charged, CostUnit::ComputeMs), 1_400);
+        assert_eq!(amount(&out.measured_total, CostUnit::ComputeMs), 1_400);
+        assert!(out.unallocated.is_empty());
+
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["command"], "cost_by_product");
+        assert_eq!(json["products"][0]["charged"][0]["unit"], "compute_ms");
+    }
+
+    /// Two stores hold the same in-month rows. One keeps a year of history.
+    /// In the other, retention swept to the newest three runs: the month then
+    /// looks quiet, and the report must say its history is not complete
+    /// rather than print the smaller number as if it were the month.
+    #[test]
+    fn month_cost_says_so_when_retention_may_have_swept_the_month() {
+        let record_march = |state_path: &Path| {
+            let store = StateStore::open(state_path).unwrap();
+            for (day, id) in [(5, "a"), (10, "b"), (20, "c"), (28, "d")] {
+                let start = at(2025, 3, day, 2, 0);
+                store
+                    .record_run(&sample_run_at(
+                        id,
+                        start,
+                        vec![exec_at("revenue_daily", start, 100)],
+                    ))
+                    .unwrap();
+            }
+            store
+        };
+        let now = at(2025, 4, 25, 0, 0);
+
+        let full_dir = TempDir::new().unwrap();
+        let (_root, full_config, full_state) = api_fixture_project(full_dir.path());
+        drop(record_march(&full_state));
+        let full = compute_month_cost(&full_state, &full_config, "2025-03", now).unwrap();
+        assert!(full.history_complete, "365 days reach back to March");
+        assert_eq!(amount(&full.measured_total, CostUnit::ComputeMs), 400);
+
+        let swept_dir = TempDir::new().unwrap();
+        let (_root, swept_config, swept_state) = api_fixture_project(swept_dir.path());
+        let mut config_text = std::fs::read_to_string(&swept_config).unwrap();
+        config_text.push_str("\n[state.retention]\nmax_age_days = 20\nmin_runs_kept = 3\n");
+        std::fs::write(&swept_config, config_text).unwrap();
+        {
+            let store = record_march(&swept_state);
+            let cfg = load_optional_project_config(Some(&swept_config))
+                .unwrap()
+                .unwrap();
+            store.sweep_retention(&cfg.state.retention).unwrap();
+            assert_eq!(
+                store.list_runs(100).unwrap().len(),
+                3,
+                "the sweep leaves the newest three runs"
+            );
+        }
+        let swept = compute_month_cost(&swept_state, &swept_config, "2025-03", now).unwrap();
+        assert!(
+            !swept.history_complete,
+            "20 days of history cannot cover a month that began 55 days ago"
+        );
+        assert_eq!(
+            amount(&swept.measured_total, CostUnit::ComputeMs),
+            300,
+            "three runs survive and look like a quiet month"
+        );
+    }
+
+    #[test]
+    fn two_specs_naming_one_output_model_warn_instead_of_dropping_one() {
+        let dir = TempDir::new().unwrap();
+        let (root, _config, _state) = api_fixture_project(dir.path());
+        let other = "[product]\nname = \"other\"\nintent = \"a second owner\"\n\n\
+                     [product.source]\ntables = [\"c.s.t\"]\n\n\
+                     [product.output]\nmodel = \"revenue_daily\"\ngrain = [\"id\"]\n\
+                     columns = [ { name = \"id\", type = \"Int64\", nullable = false } ]\n\n\
+                     [product.trust]\nagent = \"propose_only\"\n";
+        std::fs::write(root.join("products/other.toml"), other).unwrap();
+        let (owners, problems) = crate::commands::product::product_owners_in(&root);
+        assert_eq!(owners.len(), 1, "one owner keeps the model");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("both name output model revenue_daily")),
+            "{problems:?}"
+        );
+    }
+
+    /// A table built before the month and only read in it still has its
+    /// storage in the report, because the model graph names it.
+    #[test]
+    fn month_cost_finds_the_carry_in_of_a_table_only_the_graph_names() {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let dir = TempDir::new().unwrap();
+        let (root, config, state_path) = api_fixture_project(dir.path());
+        let sidecar = |deps: &str, table: &str| {
+            format!(
+                "{deps}[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"main\"\ntable = \"{table}\"\n"
+            )
+        };
+        let models = root.join("models");
+        std::fs::write(models.join("raw_t.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(models.join("raw_t.toml"), sidecar("", "raw_t")).unwrap();
+        std::fs::write(models.join("revenue_daily.sql"), "SELECT id FROM raw_t\n").unwrap();
+        std::fs::write(
+            models.join("revenue_daily.toml"),
+            sidecar("depends_on = [\"raw_t\"]\n\n", "revenue_daily"),
+        )
+        .unwrap();
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let mut raw = exec_at("raw_t", at(2026, 9, 20, 0, 0), 5);
+            raw.stored_bytes = Some(StoredBytes {
+                bytes: 3_600_000,
+                basis: StoredBytesBasis::DataFiles,
+            });
+            store
+                .record_run(&sample_run_at("sep", at(2026, 9, 20, 0, 0), vec![raw]))
+                .unwrap();
+            let start = at(2026, 10, 5, 2, 0);
+            store
+                .record_run(&sample_run_at(
+                    "oct",
+                    start,
+                    vec![reading(exec_at("revenue_daily", start, 10), "raw_t", 10)],
+                ))
+                .unwrap();
+        }
+        let out =
+            compute_month_cost(&state_path, &config, "2026-10", at(2026, 11, 2, 0, 0)).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        // 31 days * 24 h * 3,600,000 bytes.
+        assert_eq!(
+            amount(&out.measured_total, CostUnit::StorageByteHoursDataFiles),
+            744 * 3_600_000
+        );
+        assert_eq!(out.not_measured.unattributed_read_tables, 0);
+    }
+
+    #[test]
+    fn month_cost_arguments_are_checked() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state.redb");
+        let cfg = dir.path().join("rocky.toml");
+        let go = |target, by, month| run_cost(&state, &cfg, target, None, by, month, true);
+
+        let msg = |r: Result<()>| format!("{:#}", r.unwrap_err());
+        assert!(msg(go(None, None, Some("2026-10"))).contains("--month needs --by product"));
+        assert!(
+            msg(go(Some("latest"), Some("product"), Some("2026-10")))
+                .contains("cannot be combined")
+        );
+        assert!(msg(go(None, Some("product"), None)).contains("--by product needs --month"));
+        assert!(msg(go(None, None, None)).contains("pass a run id"));
+        assert!(msg(go(None, Some("product"), Some("2026-13"))).contains("YYYY-MM"));
+        assert!(msg(go(None, Some("product"), Some("26-10"))).contains("YYYY-MM"));
+    }
+
+    #[test]
+    fn a_figure_wider_than_u64_is_refused() {
+        let unit = cost_split::Unit::ALL[0];
+        let mut split = cost_split::MonthSplit::default();
+        split.measured_total.insert(unit, u128::from(u64::MAX));
+        assert!(check_fits_u64(&split).is_ok());
+        split.unallocated.insert(unit, u128::from(u64::MAX) + 1);
+        assert!(check_fits_u64(&split).is_err());
     }
 }

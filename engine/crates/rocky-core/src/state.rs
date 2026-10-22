@@ -4694,6 +4694,22 @@ impl StateStore {
         &self,
         limit: usize,
         window: usize,
+        weigh: impl FnMut(RunRecord) -> Option<(usize, T)>,
+    ) -> Result<Vec<T>, StateError> {
+        self.scan_runs_newest_first_since(limit, window, None, weigh)
+    }
+
+    /// [`Self::scan_runs_newest_first`] that also stops at the first run whose
+    /// `started_at` is older than `cutoff`.
+    ///
+    /// Pass 1 already holds every run's `started_at`, so the cutoff costs no
+    /// extra decoding: the walk ends at the first key older than `cutoff`
+    /// and never decodes the runs behind it. Pass 1 itself is still O(rows).
+    fn scan_runs_newest_first_since<T>(
+        &self,
+        limit: usize,
+        window: usize,
+        cutoff: Option<chrono::DateTime<chrono::Utc>>,
         mut weigh: impl FnMut(RunRecord) -> Option<(usize, T)>,
     ) -> Result<Vec<T>, StateError> {
         if limit == 0 || window == 0 {
@@ -4723,8 +4739,13 @@ impl StateStore {
         let mut kept = Vec::with_capacity(limit.min(keys.len()));
         let mut weight = 0usize;
         let mut decoded = 0usize;
-        for (_, run_id) in keys {
+        for (started_at, run_id) in keys {
             if weight >= limit || decoded >= window {
+                break;
+            }
+            // Keys are newest first, so the first run older than the cutoff
+            // ends the walk.
+            if cutoff.is_some_and(|cutoff| started_at < cutoff) {
                 break;
             }
             if let Some(value) = table.get(run_id.as_str())? {
@@ -4788,6 +4809,95 @@ impl StateStore {
         keep: impl Fn(&RunRecord) -> bool,
     ) -> Result<Vec<RunRecord>, StateError> {
         self.scan_runs_newest_first(limit, window, |run| keep(&run).then_some((1, run)))
+    }
+
+    /// Every run that started at or after `cutoff` and satisfies `keep`,
+    /// newest first.
+    ///
+    /// A time bound, not a count bound: the walk stops at the first run older
+    /// than `cutoff` and decodes nothing behind it. A busy project's recent
+    /// runs cannot crowd out the ones in range, and a quiet project's old runs
+    /// are never decoded. Pass 1 still parses every row's ordering key (see
+    /// [`Self::list_runs_matching`]).
+    ///
+    /// The bound is on the **run's** `started_at`. An execution inside a run
+    /// can start later than the run did, so a caller that wants the
+    /// executions of a window must pick a `cutoff` early enough to cover the
+    /// longest run it accepts, and then filter the executions itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn list_runs_matching_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        keep: impl Fn(&RunRecord) -> bool,
+    ) -> Result<Vec<RunRecord>, StateError> {
+        self.scan_runs_newest_first_since(usize::MAX, usize::MAX, Some(cutoff), |run| {
+            keep(&run).then_some((1, run))
+        })
+    }
+
+    /// For each model in `models`, its newest execution that started before
+    /// `before`, in a run `keep` accepts, and that recorded stored bytes.
+    ///
+    /// The carry-in of a storage report: a table that was not rebuilt this
+    /// month still occupies space, and its size is the last measurement taken
+    /// before the month began. Models never measured are absent from the
+    /// result. Models are matched by [`ModelExecution::rocky_model_name`].
+    ///
+    /// One newest-first walk serves every model, and it stops once each model
+    /// has been found. A model that was never measured makes the walk reach
+    /// the oldest run. A run that started at or after `before` holds no
+    /// execution that started before it, so it is skipped (still decoded).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn last_measured_builds_before(
+        &self,
+        models: &std::collections::BTreeSet<String>,
+        before: chrono::DateTime<chrono::Utc>,
+        keep: impl Fn(&RunRecord) -> bool,
+    ) -> Result<std::collections::BTreeMap<String, ModelExecution>, StateError> {
+        let mut found: std::collections::BTreeMap<String, ModelExecution> =
+            std::collections::BTreeMap::new();
+        if models.is_empty() {
+            return Ok(found);
+        }
+        // Each run weighs the number of models it newly resolved, so the walk
+        // ends when every model has been found.
+        self.scan_runs_newest_first(models.len(), usize::MAX, |run| {
+            if run.started_at >= before || !keep(&run) {
+                return None;
+            }
+            let mut newly: Vec<(String, ModelExecution)> = Vec::new();
+            for exec in run.models_executed {
+                let name = exec.rocky_model_name().to_string();
+                if !models.contains(&name)
+                    || found.contains_key(&name)
+                    || exec.started_at >= before
+                    || exec.stored_bytes.is_none()
+                {
+                    continue;
+                }
+                // Several executions of one model in a run (partitions): the
+                // last one to finish is the table's current state.
+                match newly.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, held)) if held.finished_at < exec.finished_at => *held = exec,
+                    Some(_) => {}
+                    None => newly.push((name, exec)),
+                }
+            }
+            if newly.is_empty() {
+                return None;
+            }
+            for (name, exec) in &newly {
+                found.insert(name.clone(), exec.clone());
+            }
+            Some((newly.len(), ()))
+        })?;
+        Ok(found)
     }
 
     /// Get execution history for a specific model across runs, newest first.

@@ -1567,6 +1567,7 @@ from .types_generated import (  # noqa: E402, F401
     ProductJournalOutput,
     ProductListEntry,
     ProductListOutput,
+    ProductMonthCostOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
     ProfileColumnStats,
@@ -1707,6 +1708,7 @@ RockyOutput = (
     | MetricsResult
     | OptimizeResult
     | CostOutput
+    | ProductMonthCostOutput
     | BackfillOutput
     | AiResult
     | AiSyncResult
@@ -1763,6 +1765,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "metrics": MetricsResult,
     "optimize": OptimizeResult,
     "cost": CostOutput,
+    "cost_by_product": ProductMonthCostOutput,
     "backfill": BackfillOutput,
     "ai": AiResult,
     "ai_sync": AiSyncResult,

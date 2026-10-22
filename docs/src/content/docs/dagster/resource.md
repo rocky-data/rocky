@@ -385,6 +385,7 @@ These methods follow the same pattern. Each one wraps the CLI command of the sam
 | `catalog(*, out=None)` | `rocky catalog` (writes files to disk) |
 | `dag(*, column_lineage=False, models_dir=None)` | `rocky dag` |
 | `cost(run_id="latest")` | `rocky cost <run-id>` |
+| `cost_by_product(month)` | `rocky cost --month <month> --by product` |
 | `ai_contract(model, *, save=False)` | `rocky ai-contract` |
 | `freshness(*, pipeline=None)` | `rocky freshness`. Map the result with [`freshness_check_results`](/dagster/freshness/#freshness_check_resultsoutput) |
 | `state_health(*, probe_write=False)` | state-store snapshot. See [Health checks](/dagster/health/#state-backend-health) |

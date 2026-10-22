@@ -1062,6 +1062,40 @@ def test_product_compile_approve_status_argv_and_typed_parse():
     assert status.journal_rows == 1
 
 
+def test_cost_by_product_argv_and_typed_parse():
+    """``cost_by_product`` shells ``cost --month <m> --by product`` and parses
+    the physical-unit split."""
+    from rocky_sdk.types import ProductMonthCostOutput
+
+    payload = {
+        "version": "1.89.0",
+        "command": "cost_by_product",
+        "month": "2026-10",
+        "timezone": "UTC",
+        "month_start": "2026-10-01T00:00:00+00:00",
+        "month_end": "2026-11-01T00:00:00+00:00",
+        "as_of": "2026-11-02T00:00:00+00:00",
+        "history_complete": False,
+        "products": [],
+        "unallocated": [{"unit": "compute_ms", "amount": 7}],
+        "shadow_branch": [],
+        "measured_total": [{"unit": "compute_ms", "amount": 7}],
+        "not_measured": {
+            "failed_executions": 1,
+            "storage_unknown_tables": 0,
+            "unattributed_read_tables": 0,
+        },
+    }
+    client = _client()
+    with patch.object(client, "run_cli", return_value=json.dumps(payload)) as run_cli:
+        report = client.cost_by_product("2026-10")
+    assert run_cli.call_args[0][0] == ["cost", "--month", "2026-10", "--by", "product"]
+    assert isinstance(report, ProductMonthCostOutput)
+    assert report.history_complete is False
+    assert report.unallocated[0].amount == 7
+    assert report.not_measured.failed_executions == 1
+
+
 def test_product_list_argv_and_typed_parse():
     """``product_list`` shells ``product list`` with no positional and parses
     the sorted row set; an empty project is an empty list, not an error."""
