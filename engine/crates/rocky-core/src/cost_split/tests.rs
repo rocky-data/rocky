@@ -1355,6 +1355,64 @@ fn a_volume_failed_build_replaced_the_table_so_later_readers_pay_for_it() {
 }
 
 #[test]
+fn a_zero_ms_volume_failed_build_is_still_a_version() {
+    let mut failed = exec("raw", oct(5, 2, 20), 0);
+    failed.status = "failed".to_string();
+    assert!(failed.output_target.is_some());
+    let runs = vec![
+        run(
+            "good",
+            oct(5, 2, 0),
+            production(),
+            vec![exec("raw", oct(5, 2, 0), 100)],
+        ),
+        run(
+            "volume",
+            oct(5, 2, 20),
+            production(),
+            vec![
+                failed,
+                reads(
+                    exec("fct_refunds", oct(5, 2, 30), 0),
+                    &[("raw", Some(10), 1)],
+                ),
+            ],
+        ),
+    ];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, oct(20, 0, 0)));
+    // The reader is linked to the failed build, so the good build's 100 ms
+    // has no reader. It would be 0 if the reader were linked to the good one.
+    assert_eq!(ms(&split.unallocated), 100);
+    assert_eq!(split.not_measured.failed_executions, 0);
+    assert!(split.invariant_violations().is_empty());
+}
+
+#[test]
+fn a_read_before_every_version_of_its_model_is_counted_unattributed() {
+    let runs = vec![
+        run(
+            "early",
+            oct(5, 2, 0),
+            production(),
+            vec![reads(
+                exec("fct_ltv", oct(5, 2, 0), 0),
+                &[("raw", Some(10), 1)],
+            )],
+        ),
+        run(
+            "late",
+            oct(6, 2, 0),
+            production(),
+            vec![exec("raw", oct(6, 2, 0), 100)],
+        ),
+    ];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, oct(20, 0, 0)));
+    assert_eq!(split.not_measured.unattributed_read_tables, 1);
+}
+
+#[test]
 fn a_failed_execution_does_not_close_the_declared_child_window() {
     // fct_ltv ran without recorded reads after the good build and after a
     // failed rebuild. It still forces owner-pays on the good version.

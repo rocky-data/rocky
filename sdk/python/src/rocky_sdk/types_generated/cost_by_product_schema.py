@@ -23,7 +23,7 @@ class CostNotMeasured(BaseModel):
     """
     unattributed_read_tables: conint(ge=0)
     """
-    Distinct table names (lowercased, as the read named them, so `c.s.t` and `s.t` count twice) read this month that link to no recorded build: a source Rocky does not build, a table that matches two models, or a table built before the history Rocky keeps or before the reader began. Their cost is not split.
+    Distinct table names (lowercased, as the read named them, so `c.s.t` and `s.t` count twice). A name is counted when at least one read of it found no earlier recorded build: a source Rocky does not build, a table that matches two models, or a table built before the history Rocky keeps or before the reader began. The same name can also be charged for later reads. The cost of an unlinked read is not split.
     """
 
 

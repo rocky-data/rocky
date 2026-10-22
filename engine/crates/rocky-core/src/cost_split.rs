@@ -304,10 +304,12 @@ pub fn execution_compute_ms(exec: &ModelExecution) -> u128 {
     }
 }
 
-/// An execution that failed and recorded no time. Its compute is lost
-/// upstream of this module; it is counted, never read as free.
+/// An execution that failed and recorded no time, and wrote no table. Its
+/// compute is lost upstream of this module; it is counted, never read as
+/// free. A failed execution with a recorded target (a volume breach) replaced
+/// the table, so it is a version even at 0 ms.
 fn is_unmeasured_failure(exec: &ModelExecution) -> bool {
-    exec.status == "failed" && execution_compute_ms(exec) == 0
+    exec.status == "failed" && execution_compute_ms(exec) == 0 && exec.output_target.is_none()
 }
 
 /// Byte-hours one measured size occupies over `[from, to)`, rounded down.
@@ -413,10 +415,11 @@ pub struct NotMeasured {
     /// unknown, because history does not reach back far enough.
     pub storage_unknown_tables: u64,
     /// Distinct table names (lowercased, as the read named them, so `c.s.t`
-    /// and `s.t` count twice) that in-month executions read but that link to
-    /// no recorded version: a source Rocky does not build, a table that
-    /// matches two models, or a table built before the history Rocky keeps
-    /// or before the reader began. Their cost is not split.
+    /// and `s.t` count twice). A name is counted when at least one read of it
+    /// found no earlier recorded build: a source Rocky does not build, a
+    /// table that matches two models, or a table built before the history
+    /// Rocky keeps or before the reader began. The same name can also be
+    /// charged for later reads. The cost of an unlinked read is not split.
     pub unattributed_read_tables: u64,
 }
 
@@ -799,7 +802,9 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
             let Some(&version) = chain[..cut].iter().rev().find(|&&i| rank[i] < rank[reader])
             else {
                 // The model has versions, but none had finished before this
-                // read: the table it hit was built before recorded history.
+                // read: the table it hit was built before recorded history,
+                // or its carry-in was skipped (retention swept it, or it
+                // recorded no stored bytes).
                 unattributed_tables.insert(read.table.to_ascii_lowercase());
                 continue;
             };
