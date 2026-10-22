@@ -3,9 +3,18 @@
 //! Leverages DuckDB's native bulk-load capabilities instead of row-by-row
 //! INSERT:
 //!
-//! - **CSV:** `COPY <target> FROM '<path>' (HEADER, DELIMITER '<d>')`
-//! - **Parquet:** `COPY <target> FROM '<path>' (FORMAT PARQUET)`
-//! - **JSONL:** `CREATE TABLE <target> AS SELECT * FROM read_json_auto('<path>')`
+//! - **CSV with a header:** `INSERT INTO <target> BY NAME SELECT * FROM read_csv(...)`
+//! - **CSV without a header:** `COPY <target> FROM '<path>' (HEADER false, DELIMITER '<d>')`
+//! - **Parquet:** `INSERT INTO <target> BY NAME SELECT * FROM read_parquet('<path>')`
+//! - **JSONL:** `INSERT INTO <target> BY NAME SELECT * FROM read_json_auto('<path>')`
+//!
+//! Into an existing table, every format that carries column names binds by
+//! name, not by position (#2466). A plain `COPY` or `INSERT ... SELECT *`
+//! maps by position, so a file whose columns are in a different order than
+//! the table puts same-typed values in the wrong columns. A table column the
+//! file lacks gets its default, or `NULL`. A file column the table lacks is
+//! an error that names the column. A CSV without a header has no names, so it
+//! stays positional.
 //!
 //! Cloud URIs (`s3://`, `gs://`) are passed through verbatim — DuckDB's httpfs
 //! extension handles them natively when loaded at runtime.
@@ -87,6 +96,33 @@ fn format_target(target: &TableRef) -> AdapterResult<String> {
     }
 }
 
+/// Quote `s` as a SQL string literal.
+fn sql_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Build the query that checks whether the target table exists.
+///
+/// It matches the schema as well as the table name, so a same-named table in
+/// another schema does not count. An empty schema means DuckDB's current
+/// schema, which is where an unqualified `CREATE TABLE` puts the table. The
+/// catalog is always the current one, because `format_target` never emits a
+/// catalog. Names compare case-insensitively, as unquoted DuckDB identifiers do.
+fn table_exists_sql(schema: &str, table: &str) -> String {
+    let schema_expr = if schema.is_empty() {
+        "current_schema()".to_string()
+    } else {
+        sql_literal(schema)
+    };
+    format!(
+        "SELECT 1 FROM information_schema.tables \
+         WHERE table_catalog = current_database() \
+         AND lower(table_schema) = lower({schema_expr}) \
+         AND lower(table_name) = lower({})",
+        sql_literal(table)
+    )
+}
+
 /// Render a [`LoadSource`] as a SQL path string suitable for DuckDB COPY/read
 /// functions. Local paths use `Path::display()`; cloud URIs pass through.
 fn source_path_str(source: &LoadSource) -> String {
@@ -126,6 +162,28 @@ fn validate_csv_delimiter(c: char) -> AdapterResult<char> {
     }
 }
 
+/// Read the header row of a CSV as column names. Types are not inferred
+/// (`all_varchar`), so this fails only on an unreadable file.
+fn csv_header_columns(
+    conn: &DuckDbConnector,
+    source: &LoadSource,
+    options: &LoadOptions,
+) -> AdapterResult<Vec<String>> {
+    let path_str = source_path_str(source);
+    let path_str = validate_sql_path_literal(&path_str)?;
+    let delim = validate_csv_delimiter(options.csv_delimiter)?;
+    let qr = conn
+        .execute_sql(&format!(
+            "DESCRIBE SELECT * FROM read_csv('{path_str}', header = true, delim = '{delim}', all_varchar = true)"
+        ))
+        .map_err(AdapterError::new)?;
+    Ok(qr
+        .rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_str()).map(str::to_owned))
+        .collect())
+}
+
 /// Build the COPY/read SQL for loading a source into a target table.
 ///
 /// The caller is responsible for handling `create_table` and `truncate_first`
@@ -135,6 +193,7 @@ fn load_sql(
     target_ref: &str,
     format: FileFormat,
     options: &LoadOptions,
+    csv_header: &[String],
 ) -> AdapterResult<String> {
     let path_str = source_path_str(source);
     let path_str = validate_sql_path_literal(&path_str)?;
@@ -146,18 +205,44 @@ fn load_sql(
                 "HEADER false"
             };
             let delim = validate_csv_delimiter(options.csv_delimiter)?;
-            Ok(format!(
-                "COPY {target_ref} FROM '{path_str}' (DELIMITER '{delim}', {header})"
-            ))
+            if options.csv_has_header {
+                // Header names exist, so bind by name: `COPY t ("a", "b")`
+                // maps file column N to the named table column. Plain COPY
+                // keeps DuckDB's type and date-format detection (a second
+                // load of `13/02/2024` dates must still parse) and keeps text
+                // like `007` as text. A table column not listed gets its
+                // default, or NULL. A listed column the table lacks is a
+                // DuckDB error that names it.
+                if csv_header.is_empty() {
+                    return Err(AdapterError::msg(
+                        "CSV header has no columns; cannot bind columns by name",
+                    ));
+                }
+                let cols = csv_header
+                    .iter()
+                    .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Ok(format!(
+                    "COPY {target_ref} ({cols}) FROM '{path_str}' (DELIMITER '{delim}', {header})"
+                ))
+            } else {
+                // No header means no column names to bind by. This load stays
+                // positional: file column N goes to table column N.
+                Ok(format!(
+                    "COPY {target_ref} FROM '{path_str}' (DELIMITER '{delim}', {header})"
+                ))
+            }
         }
         FileFormat::Parquet => Ok(format!(
-            "COPY {target_ref} FROM '{path_str}' (FORMAT PARQUET)"
+            "INSERT INTO {target_ref} BY NAME SELECT * FROM read_parquet('{path_str}')"
         )),
         FileFormat::JsonLines => {
             // COPY ... FROM does not support JSONL; use read_json_auto which
-            // handles newline-delimited JSON natively.
+            // handles newline-delimited JSON natively. BY NAME: key order in
+            // JSONL is free, so a positional insert swaps same-typed columns.
             Ok(format!(
-                "INSERT INTO {target_ref} SELECT * FROM read_json_auto('{path_str}')"
+                "INSERT INTO {target_ref} BY NAME SELECT * FROM read_json_auto('{path_str}')"
             ))
         }
     }
@@ -195,6 +280,8 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
     ) -> AdapterResult<LoadResult> {
         let format = resolve_format(source, options)?;
         let target_ref = format_target(target)?;
+        let schema = target.schema.clone();
+        let table = target.table.clone();
         // Only local files have filesystem metadata; cloud sources report 0.
         let file_size = match source {
             LoadSource::LocalFile(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or_default(),
@@ -217,10 +304,7 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
 
             // Check whether the target table already exists.
             let table_exists = conn
-                .execute_sql(&format!(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name = '{}'",
-                    target_ref.split('.').next_back().unwrap_or(&target_ref)
-                ))
+                .execute_sql(&table_exists_sql(&schema, &table))
                 .map(|r| !r.rows.is_empty())
                 .unwrap_or(false);
 
@@ -242,7 +326,12 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
                 //
                 // The `create_table` branch above needs no wrapper: `CREATE
                 // TABLE ... AS SELECT` is already a single statement.
-                let load = load_sql(&source, &target_ref, format, &options)?;
+                let csv_header = if format == FileFormat::Csv && options.csv_has_header {
+                    csv_header_columns(&conn, &source, &options)?
+                } else {
+                    Vec::new()
+                };
+                let load = load_sql(&source, &target_ref, format, &options, &csv_header)?;
                 let sql = if truncate_first {
                     format!("BEGIN TRANSACTION; DELETE FROM {target_ref}; {load}; COMMIT")
                 } else {
@@ -505,6 +594,324 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Table-exists check matches the schema (#2475)
+    // ------------------------------------------------------------------
+
+    fn target_in(schema: &str, table: &str) -> TableRef {
+        TableRef {
+            catalog: String::new(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_named_table_in_another_schema_does_not_hide_the_target() {
+        let adapter = loader();
+        exec(&adapter, "CREATE SCHEMA other");
+        exec(&adapter, "CREATE TABLE other.t2 (a INTEGER, b VARCHAR)");
+        let f = csv_file("a,b\n1,x\n2,y\n");
+        for t in [target_in("main", "t2"), target_in("", "t2")] {
+            exec(&adapter, "DROP TABLE IF EXISTS main.t2");
+            let r = adapter
+                .load(&local(f.path()), &t, &LoadOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(r.rows_loaded, 2);
+            assert_eq!(rows(&adapter, "SELECT count(*) FROM main.t2")[0][0], "2");
+            assert_eq!(rows(&adapter, "SELECT count(*) FROM other.t2")[0][0], "0");
+        }
+    }
+
+    #[tokio::test]
+    async fn target_in_a_non_default_schema_is_created_then_appended() {
+        let adapter = loader();
+        exec(&adapter, "CREATE SCHEMA s1");
+        exec(&adapter, "CREATE TABLE main.t3 (a INTEGER, b VARCHAR)");
+        let f = csv_file("a,b\n1,x\n");
+        let t = target_in("s1", "t3");
+        adapter
+            .load(&local(f.path()), &t, &LoadOptions::default())
+            .await
+            .unwrap();
+        adapter
+            .load(&local(f.path()), &t, &LoadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM s1.t3")[0][0], "2");
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM main.t3")[0][0], "0");
+    }
+
+    #[tokio::test]
+    async fn existing_target_still_appends() {
+        let adapter = loader();
+        let f = csv_file("a,b\n1,x\n");
+        let t = target_in("main", "t4");
+        for _ in 0..2 {
+            adapter
+                .load(&local(f.path()), &t, &LoadOptions::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM main.t4")[0][0], "2");
+    }
+
+    #[test]
+    fn table_exists_sql_escapes_quotes() {
+        let sql = table_exists_sql("", "a'b");
+        assert!(sql.contains("'a''b'"));
+    }
+
+    // ------------------------------------------------------------------
+    // Column binding into an existing table (#2466)
+    // ------------------------------------------------------------------
+
+    fn no_create() -> LoadOptions {
+        LoadOptions {
+            create_table: false,
+            ..Default::default()
+        }
+    }
+
+    fn exec(adapter: &DuckDbLoaderAdapter, sql: &str) {
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        guard.execute_statement(sql).unwrap();
+    }
+
+    /// Result rows as strings. SQL NULL shows as `null`.
+    fn rows(adapter: &DuckDbLoaderAdapter, sql: &str) -> Vec<Vec<String>> {
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let qr = guard.execute_sql(sql).unwrap();
+        qr.rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| v.to_string())
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn jsonl_file(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::with_suffix(".jsonl").unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn jsonl_into_existing_table_binds_by_name() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.pair (k VARCHAR, v VARCHAR)");
+        // Keys come in the opposite order to the table's columns.
+        let f =
+            jsonl_file("{\"v\":\"value1\",\"k\":\"key1\"}\n{\"v\":\"value2\",\"k\":\"key2\"}\n");
+        adapter
+            .load(&local(f.path()), &target("pair"), &no_create())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&adapter, "SELECT k, v FROM main.pair ORDER BY k"),
+            vec![vec!["key1", "value1"], vec!["key2", "value2"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_missing_target_column_gets_default_or_null() {
+        let adapter = loader();
+        exec(
+            &adapter,
+            "CREATE TABLE main.defs (a VARCHAR, b VARCHAR, c INTEGER DEFAULT 5)",
+        );
+        let f = jsonl_file("{\"a\":\"A1\"}\n");
+        adapter
+            .load(&local(f.path()), &target("defs"), &no_create())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&adapter, "SELECT a, b, c FROM main.defs"),
+            vec![vec!["A1", "null", "5"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_extra_file_column_is_an_error_naming_the_column() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.narrow (a VARCHAR)");
+        let f = jsonl_file("{\"a\":\"A1\",\"stray\":\"x\"}\n");
+        let err = adapter
+            .load(&local(f.path()), &target("narrow"), &no_create())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stray"), "error should name the column: {err}");
+        assert!(rows(&adapter, "SELECT * FROM main.narrow").is_empty());
+    }
+
+    #[tokio::test]
+    async fn csv_with_header_into_existing_table_binds_by_name() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.pair (k VARCHAR, v VARCHAR)");
+        // Header order is the reverse of the table's. `007` must stay text.
+        let f = csv_file("v,k\nvalue1,007\nvalue2,key2\n");
+        adapter
+            .load(&local(f.path()), &target("pair"), &no_create())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&adapter, "SELECT k, v FROM main.pair ORDER BY v"),
+            vec![vec!["007", "value1"], vec!["key2", "value2"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn csv_with_header_casts_to_target_types_and_fills_missing_columns() {
+        let adapter = loader();
+        exec(
+            &adapter,
+            "CREATE TABLE main.typed (d DATE, n INTEGER, note VARCHAR, c INTEGER DEFAULT 5)",
+        );
+        let f = csv_file("n,d\n1,2024-01-02\n");
+        adapter
+            .load(&local(f.path()), &target("typed"), &no_create())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(
+                &adapter,
+                "SELECT CAST(d AS VARCHAR), n, note, c FROM main.typed"
+            ),
+            vec![vec!["2024-01-02", "1", "null", "5"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn csv_with_header_matches_names_case_insensitively() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.pair (k VARCHAR, v VARCHAR)");
+        let f = csv_file("V,K\nvalue1,key1\n");
+        adapter
+            .load(&local(f.path()), &target("pair"), &no_create())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&adapter, "SELECT k, v FROM main.pair"),
+            vec![vec!["key1", "value1"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn csv_non_iso_dates_and_timestamps_append_on_a_second_load() {
+        let adapter = loader();
+        // First load creates the table; DuckDB detects the date format.
+        let first = csv_file("id,d,ts\n1,13/02/2024,13/02/2024 10:30:00\n");
+        adapter
+            .load(
+                &local(first.path()),
+                &target("dates"),
+                &LoadOptions::default(),
+            )
+            .await
+            .unwrap();
+        // Second load appends into the table the first one created. Day 01
+        // is ambiguous alone; the format must still be read as day/month.
+        let second = csv_file("ts,d,id\n01/02/2024 08:00:00,01/02/2024,2\n");
+        adapter
+            .load(&local(second.path()), &target("dates"), &no_create())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(
+                &adapter,
+                "SELECT id, CAST(d AS VARCHAR), CAST(ts AS VARCHAR) FROM main.dates ORDER BY id"
+            ),
+            vec![
+                vec!["1", "2024-02-13", "2024-02-13 10:30:00"],
+                vec!["2", "2024-02-01", "2024-02-01 08:00:00"],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn csv_extra_file_column_is_an_error_naming_the_column() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.narrow (a VARCHAR)");
+        let f = csv_file("a,stray\nA1,x\n");
+        let err = adapter
+            .load(&local(f.path()), &target("narrow"), &no_create())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stray"), "error should name the column: {err}");
+    }
+
+    #[tokio::test]
+    async fn csv_without_header_stays_positional() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.pair (k VARCHAR, v VARCHAR)");
+        let f = csv_file("first,second\n");
+        let opts = LoadOptions {
+            create_table: false,
+            csv_has_header: false,
+            ..Default::default()
+        };
+        adapter
+            .load(&local(f.path()), &target("pair"), &opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&adapter, "SELECT k, v FROM main.pair"),
+            vec![vec!["first", "second"]]
+        );
+    }
+
+    fn parquet_file(adapter: &DuckDbLoaderAdapter, select: &str) -> NamedTempFile {
+        let f = NamedTempFile::with_suffix(".parquet").unwrap();
+        exec(
+            adapter,
+            &format!(
+                "COPY ({select}) TO '{}' (FORMAT PARQUET)",
+                f.path().display()
+            ),
+        );
+        f
+    }
+
+    #[tokio::test]
+    async fn parquet_into_existing_table_binds_by_name() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.pair (k VARCHAR, v VARCHAR)");
+        let f = parquet_file(&adapter, "SELECT 'value1' AS v, 'key1' AS k");
+        adapter
+            .load(&local(f.path()), &target("pair"), &no_create())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&adapter, "SELECT k, v FROM main.pair"),
+            vec![vec!["key1", "value1"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_extra_file_column_is_an_error_naming_the_column() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.narrow (a VARCHAR)");
+        let f = parquet_file(&adapter, "SELECT 'A1' AS a, 'x' AS stray");
+        let err = adapter
+            .load(&local(f.path()), &target("narrow"), &no_create())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stray"), "error should name the column: {err}");
+    }
+
+    // ------------------------------------------------------------------
     // Format detection
     // ------------------------------------------------------------------
 
@@ -639,17 +1046,60 @@ mod tests {
     #[test]
     fn test_load_sql_csv() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
-        let sql = load_sql(&src, "main.t", FileFormat::Csv, &LoadOptions::default()).unwrap();
-        assert!(sql.contains("COPY main.t FROM '/tmp/data.csv'"));
-        assert!(sql.contains("HEADER"));
-        assert!(sql.contains("DELIMITER ','"));
+        let hdr = vec!["b".to_string(), "we\"ird".to_string()];
+        let sql = load_sql(
+            &src,
+            "main.t",
+            FileFormat::Csv,
+            &LoadOptions::default(),
+            &hdr,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "COPY main.t (\"b\", \"we\"\"ird\") FROM '/tmp/data.csv' (DELIMITER ',', HEADER)"
+        );
+        assert!(
+            load_sql(
+                &src,
+                "main.t",
+                FileFormat::Csv,
+                &LoadOptions::default(),
+                &[]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_load_sql_csv_without_header_stays_positional() {
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
+        let opts = LoadOptions {
+            csv_has_header: false,
+            ..Default::default()
+        };
+        let sql = load_sql(&src, "main.t", FileFormat::Csv, &opts, &[]).unwrap();
+        assert_eq!(
+            sql,
+            "COPY main.t FROM '/tmp/data.csv' (DELIMITER ',', HEADER false)"
+        );
     }
 
     #[test]
     fn test_load_sql_parquet() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.parquet"));
-        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default()).unwrap();
-        assert_eq!(sql, "COPY main.t FROM '/tmp/data.parquet' (FORMAT PARQUET)");
+        let sql = load_sql(
+            &src,
+            "main.t",
+            FileFormat::Parquet,
+            &LoadOptions::default(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO main.t BY NAME SELECT * FROM read_parquet('/tmp/data.parquet')"
+        );
     }
 
     #[test]
@@ -660,19 +1110,27 @@ mod tests {
             "main.t",
             FileFormat::JsonLines,
             &LoadOptions::default(),
+            &[],
         )
         .unwrap();
         assert!(sql.contains("read_json_auto"));
-        assert!(sql.contains("INSERT INTO main.t"));
+        assert!(sql.contains("INSERT INTO main.t BY NAME SELECT"));
     }
 
     #[test]
     fn test_load_sql_cloud_uri() {
         let src = LoadSource::CloudUri("s3://bucket/data.parquet".into());
-        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default()).unwrap();
+        let sql = load_sql(
+            &src,
+            "main.t",
+            FileFormat::Parquet,
+            &LoadOptions::default(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             sql,
-            "COPY main.t FROM 's3://bucket/data.parquet' (FORMAT PARQUET)"
+            "INSERT INTO main.t BY NAME SELECT * FROM read_parquet('s3://bucket/data.parquet')"
         );
     }
 
@@ -680,7 +1138,16 @@ mod tests {
     fn load_sql_rejects_quote_bearing_path() {
         // A path containing a single quote would break out of the '...' literal.
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/a'); DROP TABLE x; --.csv"));
-        assert!(load_sql(&src, "main.t", FileFormat::Csv, &LoadOptions::default()).is_err());
+        assert!(
+            load_sql(
+                &src,
+                "main.t",
+                FileFormat::Csv,
+                &LoadOptions::default(),
+                &[]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -690,7 +1157,7 @@ mod tests {
             csv_delimiter: '\'',
             ..Default::default()
         };
-        assert!(load_sql(&src, "main.t", FileFormat::Csv, &opts).is_err());
+        assert!(load_sql(&src, "main.t", FileFormat::Csv, &opts, &[]).is_err());
     }
 
     #[test]

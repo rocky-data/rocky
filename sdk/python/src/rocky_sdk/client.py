@@ -83,6 +83,7 @@ from rocky_sdk.types import (
     ProductCompileOutput,
     ProductJournalOutput,
     ProductListOutput,
+    ProductMonthCostOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
     ProfileOutput,
@@ -1900,6 +1901,23 @@ class RockyClient:
     def cost(self, run_id: str = "latest") -> CostOutput:
         """Run ``rocky cost <run_id>`` and return historical cost attribution."""
         return _parse_rocky_json(self.run_cli(["cost", run_id]), CostOutput, command="cost")
+
+    def cost_by_product(self, month: str) -> ProductMonthCostOutput:
+        """Run ``rocky cost --month <month> --by product``.
+
+        One calendar month of production cost (``YYYY-MM``, cut in the
+        project's ``[schedule].timezone``), split across data products in
+        physical units: model time in milliseconds and stored byte-hours. No
+        money. For every unit, the sum of each product's ``charged`` plus
+        ``unallocated`` equals ``measured_total``. Check ``history_complete``
+        before trusting a total: ``False`` means state retention may have
+        swept runs the month needs.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["cost", "--month", month, "--by", "product"]),
+            ProductMonthCostOutput,
+            command="cost_by_product",
+        )
 
     # ------------------------------------------------------------------ #
     # AI Level 3 commands                                                #

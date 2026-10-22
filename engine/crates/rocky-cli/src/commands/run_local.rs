@@ -288,7 +288,7 @@ pub async fn run_transformation(
                     let (failure_kind, cooldown_seconds) =
                         crate::output::classify_anyhow_error_with_cooldown(&e);
                     output.tables_failed += 1;
-                    output.errors.push(crate::output::TableErrorOutput {
+                    output.push_fail_fast_error(crate::output::TableErrorOutput {
                         asset_key: vec!["<runtime>".to_string()],
                         error: format!("{e:#}"),
                         failure_kind,
@@ -2344,6 +2344,101 @@ auto_create_schemas = true
         )
         .await
         .map(|_| ())
+    }
+
+    /// A model that scans ~5M rows and fails on the last one.
+    const SLOW_FAILING_SQL: &str = "SELECT CAST(s AS INTEGER) AS v FROM \
+        (SELECT CASE WHEN range = 4999999 THEN 'x' ELSE '1' END AS s FROM range(5000000))";
+
+    /// Run a project whose one model fails, through the real `run()` entry
+    /// point, and return the stored run record's entry for that model.
+    async fn stored_failed_model(
+        pipeline: Option<&str>,
+        model_filter: Option<&str>,
+        select: bool,
+    ) -> rocky_core::state::ModelExecution {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+        write_model(&models_dir, "bad", SLOW_FAILING_SQL, &[]);
+        write_config(dir, &db, "");
+
+        let config_path = dir.join("rocky.toml");
+        let _ = if select {
+            // `--select` (a multi-model selection) takes the model-only arm
+            // with no single target model, so the error entry is keyed
+            // `<selection>`: only the attribution can name the model.
+            let defer = DeferOptions {
+                selected_models: Some(std::collections::BTreeSet::from(["bad".to_string()])),
+                ..DeferOptions::default()
+            };
+            super::super::run::run(
+                &config_path,
+                std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                None,
+                None,
+                &state_path,
+                None,
+                false,
+                Some(models_dir.as_path()),
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &defer,
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+                &rocky_core::config::PrincipalRef::unnamed(),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            try_run(&config_path, &state_path, pipeline, model_filter).await
+        };
+
+        let store = StateStore::open_read_only(&state_path).expect("state store");
+        let runs = store.list_runs(1).expect("list runs");
+        let record = runs.first().expect("the failed run is stored");
+        assert_eq!(
+            record.models_executed.len(),
+            1,
+            "{:?}",
+            record.models_executed
+        );
+        record.models_executed[0].clone()
+    }
+
+    /// #2470: a transformation pipeline that stops at its first failure
+    /// (`<runtime>` entry) stores the record under the failed model's own
+    /// name, not the placeholder, so its measurement lands on that model.
+    #[tokio::test]
+    async fn transformation_pipeline_failure_is_recorded_under_the_models_name() {
+        let m = stored_failed_model(Some("t"), None, false).await;
+        assert_eq!(m.status, "failed");
+        assert_eq!(m.model_name, "bad");
+    }
+
+    /// #2470: the same through the model-only entry point with a selection
+    /// (`--select`), whose error entry is keyed `<selection>`.
+    #[tokio::test]
+    async fn selection_failure_is_recorded_under_the_models_name() {
+        let m = stored_failed_model(None, None, true).await;
+        assert_eq!(m.status, "failed");
+        assert_eq!(m.model_name, "bad");
     }
 
     /// #1292, red-team finding: a named pipeline whose configured models root

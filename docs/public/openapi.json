@@ -777,6 +777,51 @@
         ],
         "type": "object"
       },
+      "AllocatedUpstreamCost": {
+        "description": "What a product paid for one table it reads, in one unit.",
+        "properties": {
+          "amount": {
+            "description": "What this product was charged.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "basis": {
+            "$ref": "#/components/schemas/CostSplitBasis"
+          },
+          "low_confidence": {
+            "description": "The scan was so small that the proportions say little.",
+            "type": "boolean"
+          },
+          "of_total": {
+            "description": "The whole cost that was split, so `amount / of_total` is the share.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "provisional": {
+            "description": "The table has not been rebuilt since, in a month that is not over: a later reader can still change this share.",
+            "type": "boolean"
+          },
+          "table": {
+            "description": "The model whose table was read.",
+            "type": "string"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/CostUnit"
+          }
+        },
+        "required": [
+          "amount",
+          "basis",
+          "low_confidence",
+          "of_total",
+          "provisional",
+          "table",
+          "unit"
+        ],
+        "type": "object"
+      },
       "AllowedTypeChange": {
         "description": "A permitted type widening (e.g., INT to BIGINT) that won't trigger a violation.",
         "properties": {
@@ -6234,6 +6279,25 @@
         },
         "type": "object"
       },
+      "CostAmount": {
+        "description": "A whole-number amount in one [`CostUnit`].",
+        "properties": {
+          "amount": {
+            "description": "Whole units. Milliseconds, or byte-hours rounded down per interval.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/CostUnit"
+          }
+        },
+        "required": [
+          "amount",
+          "unit"
+        ],
+        "type": "object"
+      },
       "CostEstimateSource": {
         "description": "Where a `rocky plan` cost estimate came from.",
         "oneOf": [
@@ -6348,6 +6412,35 @@
           "estimated_bytes",
           "estimated_cost_usd",
           "estimated_rows"
+        ],
+        "type": "object"
+      },
+      "CostNotMeasured": {
+        "description": "Executions the monthly report could not measure. Counts, never amounts.",
+        "properties": {
+          "failed_executions": {
+            "description": "Production executions that failed and recorded no time; their compute is lost. One that wrote its table is still a version.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "storage_unknown_tables": {
+            "description": "Tables whose storage before their first measurement this month is unknown, because run history does not reach back far enough.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unattributed_read_tables": {
+            "description": "Distinct table names (lowercased, as the read named them, so `c.s.t` and `s.t` count twice). A name is counted when at least one read of it this month found no earlier recorded build: a source Rocky does not build, a table that matches two models, or a table built before the history Rocky keeps or before the reader began. The same name can also be charged for later reads. The cost of an unlinked read is not split.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "failed_executions",
+          "storage_unknown_tables",
+          "unattributed_read_tables"
         ],
         "type": "object"
       },
@@ -6513,6 +6606,25 @@
           }
         },
         "type": "object"
+      },
+      "CostSplitBasis": {
+        "description": "How a table version's cost was split across the models that read it.",
+        "enum": [
+          "bytes",
+          "estimated_bytes",
+          "rows_scanned_unweighted",
+          "owner_pays"
+        ],
+        "type": "string"
+      },
+      "CostUnit": {
+        "description": "A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.",
+        "enum": [
+          "compute_ms",
+          "storage_byte_hours_data_files",
+          "storage_byte_hours_allocated_blocks"
+        ],
+        "type": "string"
       },
       "CronCheck": {
         "description": "How a pipeline's cron compares with its latest start.\n\nChecked in this order; the first that applies wins.",
@@ -10338,7 +10450,7 @@
           },
           "in_flight_ttl_hours": {
             "default": 24,
-            "description": "Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. Applies only to backends whose in-flight lock does not carry a server-side TTL — Valkey providers set `EX` directly on `SET NX`, so this field is informational for them. Read when a run claims the key and stamped on that claim: changing it later does not change a claim already made.",
+            "description": "Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. On `valkey` and `tiered` it sets the key's expiry on the server (`EX`), and the server decides when the claim is gone. On the other backends Rocky compares the claim's own expiry with the clock. Read when a run claims the key and stamped on that claim: changing it later does not change a claim already made.",
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
@@ -18212,6 +18324,161 @@
         ],
         "type": "object"
       },
+      "ProductMonthCost": {
+        "description": "One product's month inside [`ProductMonthCostOutput`].",
+        "properties": {
+          "allocated_upstream": {
+            "description": "What the product pays for tables it reads.",
+            "items": {
+              "$ref": "#/components/schemas/AllocatedUpstreamCost"
+            },
+            "type": "array"
+          },
+          "built": {
+            "description": "What the product's own executions cost, before any split. A memo for reading `kept` beside it: it is never summed and is not part of the invariant.",
+            "items": {
+              "$ref": "#/components/schemas/CostAmount"
+            },
+            "type": "array"
+          },
+          "charged": {
+            "description": "What the product is charged: `kept` plus `allocated_upstream`.",
+            "items": {
+              "$ref": "#/components/schemas/CostAmount"
+            },
+            "type": "array"
+          },
+          "kept": {
+            "description": "The part of `built` the product still pays after other products pay for what they read.",
+            "items": {
+              "$ref": "#/components/schemas/CostAmount"
+            },
+            "type": "array"
+          },
+          "output_model": {
+            "description": "The model the product owns.",
+            "type": "string"
+          },
+          "owner_residual": {
+            "description": "The part of `kept` that came back from readers outside every product.",
+            "items": {
+              "$ref": "#/components/schemas/CostAmount"
+            },
+            "type": "array"
+          },
+          "product": {
+            "type": "string"
+          },
+          "shared_not_charged": {
+            "description": "Shares of the product's tables that readers did not pay.",
+            "items": {
+              "$ref": "#/components/schemas/SharedNotChargedCost"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "allocated_upstream",
+          "built",
+          "charged",
+          "kept",
+          "output_model",
+          "owner_residual",
+          "product",
+          "shared_not_charged"
+        ],
+        "type": "object"
+      },
+      "ProductMonthCostOutput": {
+        "description": "`rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units. No money.\n\nFor every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation.",
+        "properties": {
+          "as_of": {
+            "description": "The instant the report was computed. Storage accrues to the earlier of this and `month_end`.",
+            "type": "string"
+          },
+          "command": {
+            "description": "`\"cost_by_product\"`.",
+            "type": "string"
+          },
+          "history_complete": {
+            "description": "Whether run history reaches back far enough to cover the month. When false, state retention may have swept runs the month needs, and every figure is partial.",
+            "type": "boolean"
+          },
+          "measured_total": {
+            "description": "Everything measured in production this month.",
+            "items": {
+              "$ref": "#/components/schemas/CostAmount"
+            },
+            "type": "array"
+          },
+          "month": {
+            "description": "The month, `YYYY-MM`, in `timezone`.",
+            "type": "string"
+          },
+          "month_end": {
+            "description": "First instant of the next month, UTC (RFC 3339).",
+            "type": "string"
+          },
+          "month_start": {
+            "description": "First instant of the month, UTC (RFC 3339).",
+            "type": "string"
+          },
+          "not_measured": {
+            "$ref": "#/components/schemas/CostNotMeasured"
+          },
+          "products": {
+            "description": "One entry per product that owns a model, sorted by name.",
+            "items": {
+              "$ref": "#/components/schemas/ProductMonthCost"
+            },
+            "type": "array"
+          },
+          "shadow_branch": {
+            "description": "Shadow and branch compute. Real spend, but not production.",
+            "items": {
+              "$ref": "#/components/schemas/CostAmount"
+            },
+            "type": "array"
+          },
+          "timezone": {
+            "description": "The IANA time zone the month is cut in: the project's `[schedule].timezone`.",
+            "type": "string"
+          },
+          "unallocated": {
+            "description": "Cost of tables no product owns that no measured reader took.",
+            "items": {
+              "$ref": "#/components/schemas/CostAmount"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          },
+          "warnings": {
+            "description": "Things that make the report less complete than it looks: a product spec that did not load, a model graph that could not be read.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "as_of",
+          "command",
+          "history_complete",
+          "measured_total",
+          "month",
+          "month_end",
+          "month_start",
+          "not_measured",
+          "products",
+          "shadow_branch",
+          "timezone",
+          "unallocated",
+          "version"
+        ],
+        "type": "object"
+      },
       "ProductSpec": {
         "additionalProperties": false,
         "description": "The `[product]` table.",
@@ -23706,6 +23973,39 @@
           "Info"
         ],
         "type": "string"
+      },
+      "SharedNotChargedCost": {
+        "description": "A share of an owned table's cost that a reader did not pay.",
+        "properties": {
+          "amount": {
+            "description": "The reader's share. It stays with the table's owner.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "basis": {
+            "$ref": "#/components/schemas/CostSplitBasis"
+          },
+          "reader": {
+            "description": "The model that read it.",
+            "type": "string"
+          },
+          "table": {
+            "description": "The owned model whose table was read.",
+            "type": "string"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/CostUnit"
+          }
+        },
+        "required": [
+          "amount",
+          "basis",
+          "reader",
+          "table",
+          "unit"
+        ],
+        "type": "object"
       },
       "SignatureAlgorithm": {
         "description": "Algorithm tag for an [`ApprovalSignature`].\n\nThe discriminator is on disk from day one so future \"real\" cryptographic signing variants slot in without migrating existing artifacts.",

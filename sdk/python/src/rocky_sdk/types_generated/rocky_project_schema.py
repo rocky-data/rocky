@@ -875,7 +875,7 @@ class IdempotencyConfig(BaseModel):
     """
     in_flight_ttl_hours: conint(ge=0) | None = 24
     """
-    Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. Applies only to backends whose in-flight lock does not carry a server-side TTL — Valkey providers set `EX` directly on `SET NX`, so this field is informational for them. Read when a run claims the key and stamped on that claim: changing it later does not change a claim already made.
+    Hours after which an `InFlight` entry is treated as a crashed-pod corpse and adopted by a fresh caller. Default 24. On `valkey` and `tiered` it sets the key's expiry on the server (`EX`), and the server decides when the claim is gone. On the other backends Rocky compares the claim's own expiry with the clock. Read when a run claims the key and stamped on that claim: changing it later does not change a claim already made.
     """
     retention_days: conint(ge=0) | None = 30
     """

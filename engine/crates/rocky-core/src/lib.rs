@@ -16,6 +16,7 @@ pub mod connector;
 pub mod consumers;
 pub mod contracts;
 pub mod cost;
+pub mod cost_split;
 pub mod credential_url;
 pub mod cross_engine;
 pub mod dag_executor;

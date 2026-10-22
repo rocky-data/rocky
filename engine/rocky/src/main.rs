@@ -2405,18 +2405,25 @@ enum Command {
     /// still emits durations and byte counts, with `cost_usd` set to
     /// `null`.
     Cost {
-        /// Run id or the literal `latest`
-        target: String,
+        /// Run id or the literal `latest`. Omit it with `--month`.
+        #[arg(required_unless_present = "month", conflicts_with = "month")]
+        target: Option<String>,
         /// Filter to a single model within the run
-        #[arg(long)]
+        #[arg(long, conflicts_with = "month")]
         model: Option<String>,
         /// Roll the per-model cost up by a dimension: `tenant` (the
         /// discover-time schema-pattern `{tenant}` component) or
         /// `model`. Adds a `groups` array to the output; `per_model`
         /// is always present regardless. Omit for the flat per-model
-        /// view.
+        /// view. With `--month`, the only value is `product`.
         #[arg(long, value_name = "DIMENSION")]
         by: Option<String>,
+        /// Report one calendar month (`YYYY-MM`, cut in the project's
+        /// `[schedule].timezone`) instead of one run, split across data
+        /// products in physical units: model time in milliseconds and
+        /// stored byte-hours. Needs `--by product`. No money.
+        #[arg(long, value_name = "YYYY-MM", requires = "by")]
+        month: Option<String>,
     },
 
     /// Inventory Rocky-managed artifacts eligible for reclamation.
@@ -5935,12 +5942,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Trace { target, model } => {
             rocky_cli::commands::run_trace(&state_path, &target, model.as_deref(), json)
         }
-        Command::Cost { target, model, by } => rocky_cli::commands::run_cost(
+        Command::Cost {
+            target,
+            model,
+            by,
+            month,
+        } => rocky_cli::commands::run_cost(
             &state_path,
             &cli.config,
-            &target,
+            target.as_deref(),
             model.as_deref(),
             by.as_deref(),
+            month.as_deref(),
             json,
         ),
         Command::Gc {

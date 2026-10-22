@@ -71,7 +71,7 @@ mod profile;
 mod profile_storage;
 mod publish_ir;
 mod replay;
-mod resilience;
+pub(crate) mod resilience;
 mod restore;
 mod retention_status;
 mod reuse_decision;
@@ -154,7 +154,7 @@ pub use connector_load::{
     ConnectorLoadOutcome, ConnectorLoadParams, claim_key, claim_ttl_hours, execute_connector_load,
     run_connector_load,
 };
-pub use cost::{CostGroupBy, compute_cost, run_cost};
+pub use cost::{CostGroupBy, compute_cost, compute_month_cost, run_cost};
 pub use dag::{dag_output, run_dag};
 pub use discover::discover;
 pub use docs::{DocsFormat, run_docs};
