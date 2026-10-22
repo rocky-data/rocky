@@ -429,6 +429,45 @@ fn an_unowned_model_passes_what_it_received_down_the_chain() {
 }
 
 #[test]
+fn a_reader_that_starts_a_millisecond_before_the_recorded_finish_still_read_it() {
+    // A duration is rounded to whole milliseconds, so the recorded finish of
+    // `raw` (5 ms after its start) can fall just after `fct_ltv` began.
+    let start = oct(5, 2, 0);
+    let runs = vec![run(
+        "r",
+        start,
+        production(),
+        vec![
+            exec("raw", start, 5),
+            reads(
+                exec("fct_ltv", start + Duration::milliseconds(4), 1),
+                &[("raw", Some(10), 1)],
+            ),
+        ],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(upstream_of(&split, "B"), [("raw".to_string(), 5)]);
+    assert_eq!(ms(&split.unallocated), 0);
+
+    // Well before the finish is not a read of this version.
+    let runs = vec![run(
+        "r",
+        start,
+        production(),
+        vec![
+            exec("raw", start, 50),
+            reads(
+                exec("fct_ltv", start + Duration::milliseconds(4), 1),
+                &[("raw", Some(10), 1)],
+            ),
+        ],
+    )];
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(ms(&split.unallocated), 50);
+}
+
+#[test]
 fn an_unowned_table_nobody_reads_is_unallocated() {
     let runs = vec![run(
         "r",

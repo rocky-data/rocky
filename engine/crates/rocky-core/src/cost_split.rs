@@ -68,6 +68,12 @@ pub const LOW_CONFIDENCE_MIN_ROWS: u128 = 1_000;
 
 const MS_PER_HOUR: u128 = 3_600_000;
 
+/// A recorded finish time is a start time plus a duration rounded to whole
+/// milliseconds, so it can run a little past the instant a reader that
+/// started right after really saw. A reader counts as having seen a version
+/// when the version finished no later than this long after the reader began.
+const CLOCK_SLACK: Duration = Duration::milliseconds(2);
+
 /// What a figure counts. Units are never added to each other, and the two
 /// storage bases are never added together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -701,7 +707,8 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                 continue;
             };
             // The newest version that had finished when this execution began.
-            let cut = chain.partition_point(|&i| nodes[i].finished_at <= node.started_at);
+            let cut =
+                chain.partition_point(|&i| nodes[i].finished_at <= node.started_at + CLOCK_SLACK);
             let Some(&version) = chain[..cut].iter().rev().find(|&&i| rank[i] < rank[reader])
             else {
                 continue;
@@ -933,8 +940,8 @@ fn plan_for(
                     candidate.in_month
                         && candidate.reads.is_none()
                         && rank[i] > rank[index]
-                        && candidate.started_at >= node.finished_at
-                        && until.is_none_or(|u| candidate.started_at < u)
+                        && candidate.started_at + CLOCK_SLACK >= node.finished_at
+                        && until.is_none_or(|u| candidate.started_at + CLOCK_SLACK < u)
                 })
             })
         });
