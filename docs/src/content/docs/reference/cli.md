@@ -271,7 +271,7 @@ rocky load --source-dir data/dropbox/ --format parquet
 
 ### Column mapping
 
-Into a table that already exists, the DuckDB loader maps file columns to table columns by name, not by position. Column order in the file does not matter. This holds for Parquet, JSONL and CSV with a header.
+Into a table that already exists, the DuckDB loader maps file columns to table columns by name, not by position. Column order in the file does not matter. This holds for Parquet, JSONL and CSV with a header. A header CSV loads with `COPY t ("col", ...)` and the names from its header row, so DuckDB still detects date and timestamp formats. Names match without regard to case.
 
 - A table column the file lacks gets its default, or `NULL`.
 - A file column the table lacks is an error. The message names the column.
