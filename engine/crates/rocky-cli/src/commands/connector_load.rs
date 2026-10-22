@@ -616,6 +616,10 @@ async fn drive(
                     return Err(failure.error);
                 }
                 FailureStage::PromoteIssued => {
+                    progress.files.iter_mut().for_each(|f| {
+                        f.rows_loaded = 0;
+                        f.bytes_read = 0;
+                    });
                     // The promote statement was sent, so the rows may be in
                     // the table. Like a failed commit, this leaves the claim
                     // in flight: a retry would load the batch again.

@@ -200,8 +200,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 
 ## JSON output
 
-`rocky load --connector <name> --output json` prints the usual load document with an extra `connector` object. The batch totals are in the usual `files_loaded`, `files_failed`, `total_rows` and `total_bytes` fields. If staging fails, every file has an `error`, `files_loaded` is 0 and `files_failed` is the file count.
-
+`rocky load --connector <name> --output json` prints the usual load document with an extra `connector` object. The batch totals are in the usual `files_loaded`, `files_failed`, `total_rows` and `total_bytes` fields. If staging or the promote fails, every file is reported failed with zero rows and bytes: every file has an `error`, `files_loaded` is 0 and `files_failed` is the file count. After a promote failure some rows may already be in the table.
 
 | Field | Meaning |
 |---|---|

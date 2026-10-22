@@ -27,10 +27,8 @@ use rocky_core::connector::StateEnvelope;
 use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck};
 use rocky_core::state::StateStore;
 
-// Far in the future, so the real clock the promote gate reads is always
-// before every claim expiry.
 fn t0() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 10, 22, 8, 0, 0).unwrap()
+    Utc.with_ymd_and_hms(2026, 10, 22, 8, 0, 0).unwrap()
 }
 
 fn ids(values: &[i64]) -> ArrayRef {
@@ -169,6 +167,7 @@ target = {{ catalog = "", schema = "main", table = "events" }}
         let state_path = self.state_path();
         let mut params = ConnectorLoadParams::new(&config_path, &loaded, &state_path, "demo");
         params.now = now;
+        params.promote_now = now;
         params.output_poll = Duration::from_millis(100);
         execute_connector_load(&params).await
     }
@@ -794,6 +793,8 @@ async fn a_failed_promote_keeps_the_claim_and_does_not_roll_back_drift() {
     assert_eq!(output.files_loaded, 0);
     assert_eq!(output.files_failed, output.files.len());
     assert!(output.files_failed > 0);
+    assert_eq!(output.total_rows, 0);
+    assert_eq!(output.total_bytes, 0);
     assert_eq!(project.row_count(), Some(0), "no rows landed");
     assert!(
         has_column(&project, "extra"),
