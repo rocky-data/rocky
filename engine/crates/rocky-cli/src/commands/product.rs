@@ -233,16 +233,20 @@ fn scan_specs_in(root: &Path) -> (Vec<ParsedSpec>, Vec<String>) {
 pub(crate) fn product_owners_in(
     root: &Path,
 ) -> (std::collections::BTreeMap<String, String>, Vec<String>) {
-    let (specs, problems) = scan_specs_in(root);
-    let owners = specs
-        .iter()
-        .map(|parsed| {
-            (
-                parsed.output_model().to_string(),
-                parsed.product().name.clone(),
-            )
-        })
-        .collect();
+    let (specs, mut problems) = scan_specs_in(root);
+    let mut owners: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for parsed in &specs {
+        let model = parsed.output_model().to_string();
+        let product = parsed.product().name.clone();
+        if let Some(first) = owners.get(&model) {
+            problems.push(format!(
+                "products {first} and {product} both name output model {model}; \
+                 {first} keeps it and {product} owns no model"
+            ));
+        } else {
+            owners.insert(model, product);
+        }
+    }
     (owners, problems)
 }
 

@@ -1030,7 +1030,7 @@ rocky cost --month 2026-10 --by product
 
 The month follows the project's `[schedule].timezone` (default `UTC`). An execution belongs to the month in which it started, even when its run started earlier. The current month is month-to-date. Storage counts up to now.
 
-**What counts.** Production runs only. Shadow and branch runs are real compute, so Rocky reports them in `shadow_branch`, outside the total. A model that failed records no time. Rocky counts those executions in `not_measured.failed_executions` and never reads them as free.
+**What counts.** Production runs only. Shadow and branch runs are real compute, so Rocky reports them in `shadow_branch`, outside the total. A failed execution that recorded no time is counted in `not_measured.failed_executions` and is never read as free. A failed execution that did record time keeps that time, but it is never a version that readers link to: the last good build keeps its readers. Entries that are not models (`<verify_after>`, `<compile>`) are not counted.
 
 **How a cost is split.** Each time a model builds a table, that build is one version of the table. The version's model time, and the storage it occupies until the next build, are split across the later executions that read it. The split follows what each reader scanned.
 
@@ -1068,7 +1068,8 @@ A product that builds a table for others can show a `kept` of `0` while `built` 
 - The command scans runs that started up to one day before the month. A run that started earlier, with executions inside the month, is missed.
 - Egress and AI tokens are not measured, so they do not appear.
 - A reader that ran on an adapter that records no reads (anything but DuckDB) is invisible. The cost of its tables goes to the owner, or to `unallocated`.
-- Storage is the size measured right after each build. A table that Rocky did not build this month still counts, from its last build before the month. Before the first build of a table, with enough history, its storage is zero.
+- Storage is the size measured right after each build. A table that Rocky did not build this month still counts, from its last measured build before the month, but only when that build is still in the state store and the table is known: an owned model, a model the scan ran, or a model named in the model graph. A table that is read but has no recorded build is counted in `not_measured.unattributed_read_tables` and its cost is not split. Retention can remove an old build, and `history_complete` does not flag that case. Before the first build of a table, with enough history, its storage is zero.
+- The several executions of one model in one run (for example, partitions) count as one version. A model that changes its target during the month still resolves under both names. Shadow and branch runs never decide where a model's table is.
 - Byte-hours are rounded down for each interval. Storage on the `allocated_blocks` basis (a DuckDB estimate) and on the `data_files` basis are separate units. Rocky does not add them.
 
 ### Adapter coverage

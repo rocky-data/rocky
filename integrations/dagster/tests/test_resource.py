@@ -2210,7 +2210,11 @@ def test_cost_by_product_forwards_the_month_and_parses_the_split():
                 "unallocated": [{"unit": "compute_ms", "amount": 5}],
                 "shadow_branch": [],
                 "measured_total": [{"unit": "compute_ms", "amount": 5}],
-                "not_measured": {"failed_executions": 0, "storage_unknown_tables": 0},
+                "not_measured": {
+                    "failed_executions": 0,
+                    "storage_unknown_tables": 0,
+                    "unattributed_read_tables": 0,
+                },
             }
         )
 

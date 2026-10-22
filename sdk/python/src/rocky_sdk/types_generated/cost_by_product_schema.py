@@ -21,6 +21,10 @@ class CostNotMeasured(BaseModel):
     """
     Tables whose storage before their first measurement this month is unknown, because run history does not reach back far enough.
     """
+    unattributed_read_tables: conint(ge=0)
+    """
+    Distinct tables read this month that name no model with a recorded build: a source Rocky does not build, or a table built before the history Rocky keeps. Their cost is not split.
+    """
 
 
 class CostSplitBasis(StrEnum):

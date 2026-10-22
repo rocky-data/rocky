@@ -1080,7 +1080,11 @@ def test_cost_by_product_argv_and_typed_parse():
         "unallocated": [{"unit": "compute_ms", "amount": 7}],
         "shadow_branch": [],
         "measured_total": [{"unit": "compute_ms", "amount": 7}],
-        "not_measured": {"failed_executions": 1, "storage_unknown_tables": 0},
+        "not_measured": {
+            "failed_executions": 1,
+            "storage_unknown_tables": 0,
+            "unattributed_read_tables": 0,
+        },
     }
     client = _client()
     with patch.object(client, "run_cli", return_value=json.dumps(payload)) as run_cli:

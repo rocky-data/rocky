@@ -95,6 +95,10 @@ export interface CostNotMeasured {
    * Tables whose storage before their first measurement this month is unknown, because run history does not reach back far enough.
    */
   storage_unknown_tables: number;
+  /**
+   * Distinct tables read this month that name no model with a recorded build: a source Rocky does not build, or a table built before the history Rocky keeps. Their cost is not split.
+   */
+  unattributed_read_tables: number;
   [k: string]: unknown;
 }
 /**

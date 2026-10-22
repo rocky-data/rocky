@@ -665,8 +665,45 @@ fn declared_children(
     children
 }
 
+/// Narrow a figure to the JSON width. [`check_fits_u64`] has already refused
+/// any report with a larger figure, so the fallback is never taken.
 fn to_u64(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Refuse a report whose figures do not fit the 64-bit JSON integers, rather
+/// than print a clipped number that no longer adds up.
+fn check_fits_u64(split: &cost_split::MonthSplit) -> Result<()> {
+    let limit = u128::from(u64::MAX);
+    let mut largest = split
+        .measured_total
+        .values()
+        .chain(split.shadow_branch.values())
+        .chain(split.unallocated.values())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    for row in split.products.values() {
+        for value in row
+            .built
+            .values()
+            .chain(row.kept.values())
+            .chain(row.owner_residual.values())
+        {
+            largest = largest.max(*value);
+        }
+        for a in &row.allocated_upstream {
+            largest = largest.max(a.amount).max(a.of_total);
+        }
+        for s in &row.shared_not_charged {
+            largest = largest.max(s.amount);
+        }
+    }
+    anyhow::ensure!(
+        largest <= limit,
+        "a figure in this month is larger than 2^64 - 1 and cannot be reported exactly"
+    );
+    Ok(())
 }
 
 fn amounts_out(amounts: &cost_split::Amounts) -> Vec<CostAmount> {
@@ -764,9 +801,9 @@ pub fn compute_month_cost(
     let mut warnings = Vec::new();
     let root = crate::commands::product::product_command_root(config_path);
     let (owners, problems) = crate::commands::product::product_owners_in(&root);
-    warnings.extend(problems.into_iter().map(|p| {
-        format!("{p}: the model it owns has no owner in this report, so its cost is not charged to the product")
-    }));
+    // A spec that did not load owns no model in this report: its cost is not
+    // charged to the product.
+    warnings.extend(problems);
     let children = declared_children(cfg.as_ref(), config_path, &mut warnings);
 
     let store = StateStore::open_read_only_or_empty(state_path)
@@ -776,7 +813,14 @@ pub fn compute_month_cost(
     let runs =
         store.list_runs_matching_since(window.start - chrono::Duration::days(1), |_| true)?;
 
+    // Models whose last build before the month is needed: every owned model,
+    // every model run in the scan, and every model the graph names, so a table
+    // built before the month and only read in it still has its storage.
     let mut wanted: std::collections::BTreeSet<String> = owners.keys().cloned().collect();
+    for (parent, kids) in &children {
+        wanted.insert(parent.clone());
+        wanted.extend(kids.iter().cloned());
+    }
     for run in &runs {
         for exec in &run.models_executed {
             wanted.insert(exec.rocky_model_name().to_string());
@@ -808,6 +852,7 @@ pub fn compute_month_cost(
             .join(", ")
     );
 
+    check_fits_u64(&split)?;
     let model_of: std::collections::BTreeMap<&str, &str> = owners
         .iter()
         .map(|(model, product)| (product.as_str(), model.as_str()))
@@ -840,6 +885,7 @@ pub fn compute_month_cost(
         not_measured: CostNotMeasured {
             failed_executions: split.not_measured.failed_executions,
             storage_unknown_tables: split.not_measured.storage_unknown_tables,
+            unattributed_read_tables: split.not_measured.unattributed_read_tables,
         },
         warnings,
     })
@@ -948,6 +994,10 @@ fn print_month_table(output: &ProductMonthCostOutput) {
     println!(
         "not measured: {} failed executions with no recorded time, {} tables with unknown early storage",
         output.not_measured.failed_executions, output.not_measured.storage_unknown_tables
+    );
+    println!(
+        "{} tables were read that name no model with a recorded build; their cost is not split",
+        output.not_measured.unattributed_read_tables
     );
     if output
         .products
@@ -1795,6 +1845,78 @@ mod tests {
             300,
             "three runs survive and look like a quiet month"
         );
+    }
+
+    #[test]
+    fn two_specs_naming_one_output_model_warn_instead_of_dropping_one() {
+        let dir = TempDir::new().unwrap();
+        let (root, _config, _state) = api_fixture_project(dir.path());
+        let other = "[product]\nname = \"other\"\nintent = \"a second owner\"\n\n\
+                     [product.source]\ntables = [\"c.s.t\"]\n\n\
+                     [product.output]\nmodel = \"revenue_daily\"\ngrain = [\"id\"]\n\
+                     columns = [ { name = \"id\", type = \"Int64\", nullable = false } ]\n\n\
+                     [product.trust]\nagent = \"propose_only\"\n";
+        std::fs::write(root.join("products/other.toml"), other).unwrap();
+        let (owners, problems) = crate::commands::product::product_owners_in(&root);
+        assert_eq!(owners.len(), 1, "one owner keeps the model");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("both name output model revenue_daily")),
+            "{problems:?}"
+        );
+    }
+
+    /// A table built before the month and only read in it still has its
+    /// storage in the report, because the model graph names it.
+    #[test]
+    fn month_cost_finds_the_carry_in_of_a_table_only_the_graph_names() {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let dir = TempDir::new().unwrap();
+        let (root, config, state_path) = api_fixture_project(dir.path());
+        let sidecar = |deps: &str, table: &str| {
+            format!(
+                "{deps}[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"main\"\ntable = \"{table}\"\n"
+            )
+        };
+        let models = root.join("models");
+        std::fs::write(models.join("raw_t.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(models.join("raw_t.toml"), sidecar("", "raw_t")).unwrap();
+        std::fs::write(models.join("revenue_daily.sql"), "SELECT id FROM raw_t\n").unwrap();
+        std::fs::write(
+            models.join("revenue_daily.toml"),
+            sidecar("depends_on = [\"raw_t\"]\n\n", "revenue_daily"),
+        )
+        .unwrap();
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let mut raw = exec_at("raw_t", at(2026, 9, 20, 0, 0), 5);
+            raw.stored_bytes = Some(StoredBytes {
+                bytes: 3_600_000,
+                basis: StoredBytesBasis::DataFiles,
+            });
+            store
+                .record_run(&sample_run_at("sep", at(2026, 9, 20, 0, 0), vec![raw]))
+                .unwrap();
+            let start = at(2026, 10, 5, 2, 0);
+            store
+                .record_run(&sample_run_at(
+                    "oct",
+                    start,
+                    vec![reading(exec_at("revenue_daily", start, 10), "raw_t", 10)],
+                ))
+                .unwrap();
+        }
+        let out =
+            compute_month_cost(&state_path, &config, "2026-10", at(2026, 11, 2, 0, 0)).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        // 31 days * 24 h * 3,600,000 bytes.
+        assert_eq!(
+            amount(&out.measured_total, CostUnit::StorageByteHoursDataFiles),
+            744 * 3_600_000
+        );
+        assert_eq!(out.not_measured.unattributed_read_tables, 0);
     }
 
     #[test]

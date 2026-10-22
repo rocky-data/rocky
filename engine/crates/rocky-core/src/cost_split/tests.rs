@@ -301,7 +301,8 @@ fn assert_f1(split: &MonthSplit) {
         split.not_measured,
         NotMeasured {
             failed_executions: 1,
-            storage_unknown_tables: 0
+            storage_unknown_tables: 0,
+            unattributed_read_tables: 0
         }
     );
     assert!(split.invariant_violations().is_empty());
@@ -1147,4 +1148,314 @@ fn random_largest_remainder_splits_sum_exactly() {
             assert_eq!(parts.iter().sum::<u128>(), amount);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Targets, failed builds, partitions, carry-in
+// ---------------------------------------------------------------------------
+
+fn in_schema(mut e: ModelExecution, schema: &str) -> ModelExecution {
+    if let Some(target) = e.output_target.as_mut() {
+        target.schema = schema.to_string();
+    }
+    e
+}
+
+fn reads_table(mut e: ModelExecution, table: &str, est_bytes: u64) -> ModelExecution {
+    e.upstream_reads = Some(UpstreamReads {
+        reads: vec![UpstreamRead {
+            table: table.to_string(),
+            rows_scanned: 1,
+            projected_columns: Vec::new(),
+            est_bytes: Some(est_bytes),
+        }],
+        unattributed_scans: 0,
+    });
+    e
+}
+
+#[test]
+fn a_shadow_run_with_another_target_does_not_move_the_table() {
+    // The shadow run of `raw` is the oldest execution and wrote elsewhere.
+    // Production reads of `main.raw` must still resolve, in any input order.
+    let shadow = run(
+        "shadow",
+        oct(1, 0, 0),
+        Some(RunScope::Shadow { schema: None }),
+        vec![in_schema(exec("raw", oct(1, 0, 0), 10), "main_shadow")],
+    );
+    let branch = run(
+        "branch",
+        oct(2, 0, 0),
+        Some(RunScope::Branch {
+            name: "b".to_string(),
+        }),
+        vec![in_schema(exec("raw", oct(2, 0, 0), 10), "branch_x")],
+    );
+    let prod = run(
+        "prod",
+        oct(5, 2, 0),
+        production(),
+        vec![
+            exec("raw", oct(5, 2, 0), 1_000),
+            reads(exec("fct_ltv", oct(5, 3, 0), 0), &[("raw", Some(10), 1)]),
+        ],
+    );
+    let (o, c) = (owners(), BTreeMap::new());
+    for runs in [
+        vec![shadow.clone(), branch.clone(), prod.clone()],
+        vec![prod.clone(), branch.clone(), shadow.clone()],
+        vec![branch, prod, shadow],
+    ] {
+        let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+        assert_eq!(upstream_of(&split, "B"), [("raw".to_string(), 1_000)]);
+        assert_eq!(ms(&split.unallocated), 0);
+        assert_eq!(ms(&split.shadow_branch), 20);
+    }
+}
+
+#[test]
+fn a_model_that_changes_target_mid_month_resolves_both_names() {
+    let runs = vec![
+        run(
+            "early",
+            oct(3, 2, 0),
+            production(),
+            vec![
+                in_schema(exec("raw", oct(3, 2, 0), 100), "old"),
+                reads_table(exec("fct_ltv", oct(3, 3, 0), 0), "memory.old.raw", 10),
+            ],
+        ),
+        run(
+            "late",
+            oct(10, 2, 0),
+            production(),
+            vec![
+                in_schema(exec("raw", oct(10, 2, 0), 200), "new"),
+                reads_table(exec("fct_ltv", oct(10, 3, 0), 0), "memory.new.raw", 10),
+            ],
+        ),
+    ];
+    let (o, c) = (owners(), BTreeMap::new());
+    let mut reversed = runs.clone();
+    reversed.reverse();
+    for runs in [runs, reversed] {
+        let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+        assert_eq!(upstream_of(&split, "B"), [("raw".to_string(), 300)]);
+        assert_eq!(ms(&split.unallocated), 0);
+    }
+}
+
+#[test]
+fn a_failed_execution_keeps_its_time_but_is_never_a_version() {
+    let failed_with_time = |target: bool| {
+        let mut e = exec("raw", oct(5, 2, 20), 30);
+        e.status = "failed".to_string();
+        if !target {
+            e.output_target = None;
+        }
+        e
+    };
+    for with_target in [true, false] {
+        let runs = vec![
+            run(
+                "good",
+                oct(5, 2, 0),
+                production(),
+                vec![
+                    exec("raw", oct(5, 2, 0), 100),
+                    reads(exec("fct_ltv", oct(5, 2, 10), 0), &[("raw", Some(10), 1)]),
+                ],
+            ),
+            run(
+                "bad",
+                oct(5, 2, 20),
+                production(),
+                vec![
+                    failed_with_time(with_target),
+                    reads(
+                        exec("fct_refunds", oct(5, 2, 30), 0),
+                        &[("raw", Some(10), 1)],
+                    ),
+                ],
+            ),
+        ];
+        let (o, c) = (owners(), BTreeMap::new());
+        let split = split_month(&input(&runs, &[], &o, &c, oct(20, 0, 0)));
+        // The good build's 100 ms is read by both. The failed build's 30 ms
+        // had no reader and stays unallocated (raw has no owner).
+        assert_eq!(upstream_of(&split, "B"), [("raw".to_string(), 50)]);
+        assert_eq!(upstream_of(&split, "C"), [("raw".to_string(), 50)]);
+        assert_eq!(ms(&split.unallocated), 30);
+        // The failed build did not close the good version's window.
+        assert!(split.products["B"].allocated_upstream[0].provisional);
+        assert!(split.invariant_violations().is_empty());
+    }
+}
+
+#[test]
+fn a_failed_execution_does_not_close_the_declared_child_window() {
+    // fct_ltv ran without recorded reads after the good build and after a
+    // failed rebuild. It still forces owner-pays on the good version.
+    let mut bad = exec("fct_orders", oct(5, 2, 5), 7);
+    bad.status = "failed".to_string();
+    let runs = vec![run(
+        "r",
+        oct(5, 2, 0),
+        production(),
+        vec![
+            exec("fct_orders", oct(5, 2, 0), 100),
+            bad,
+            reads(
+                exec("fct_refunds", oct(5, 2, 10), 0),
+                &[("fct_orders", Some(10), 1)],
+            ),
+            exec("fct_ltv", oct(5, 2, 30), 0),
+        ],
+    )];
+    let (o, c) = (owners(), children());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(ms(&split.products["A"].kept), 107);
+    assert!(split.products["C"].allocated_upstream.is_empty());
+}
+
+#[test]
+fn partitions_of_one_run_form_one_version() {
+    let runs = vec![run(
+        "r",
+        oct(5, 2, 0),
+        production(),
+        vec![
+            exec("raw", oct(5, 2, 0), 10),
+            exec("raw", oct(5, 2, 1), 10),
+            exec("raw", oct(5, 2, 2), 10),
+            reads(exec("fct_ltv", oct(5, 3, 0), 0), &[("raw", Some(10), 1)]),
+        ],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    // Linking only to the last partition would charge B 10 and leave 20.
+    assert_eq!(upstream_of(&split, "B"), [("raw".to_string(), 30)]);
+    assert_eq!(ms(&split.unallocated), 0);
+}
+
+#[test]
+fn a_synthetic_failure_entry_is_not_counted_as_a_failed_model() {
+    let runs = vec![run(
+        "r",
+        oct(5, 2, 0),
+        production(),
+        vec![
+            failed("<verify_after>", oct(5, 2, 0)),
+            failed("<compile>", oct(5, 2, 0)),
+            failed("fct_ltv", oct(5, 2, 0)),
+        ],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(split.not_measured.failed_executions, 1);
+}
+
+#[test]
+fn a_table_read_with_no_recorded_build_is_counted_not_dropped() {
+    let runs = vec![run(
+        "r",
+        oct(5, 2, 0),
+        production(),
+        vec![reads_table(
+            exec("fct_ltv", oct(5, 3, 0), 40),
+            "memory.main.Ghost",
+            10,
+        )],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(split.not_measured.unattributed_read_tables, 1);
+    assert_eq!(split.products["B"].charged(Unit::ComputeMs), 40);
+    assert!(split.invariant_violations().is_empty());
+}
+
+#[test]
+fn a_carry_in_makes_the_read_table_resolve_and_its_storage_count() {
+    const DF: StoredBytesBasis = StoredBytesBasis::DataFiles;
+    let carry = [stored(
+        exec("raw", utc(2026, 9, 20, 0, 0, 0), 0),
+        3_600_000,
+        DF,
+    )];
+    let runs = vec![run(
+        "r",
+        oct(5, 2, 0),
+        production(),
+        vec![reads(
+            exec("fct_ltv", oct(5, 3, 0), 0),
+            &[("raw", Some(10), 1)],
+        )],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let with = split_month(&input(&runs, &carry, &o, &c, after_october()));
+    assert_eq!(with.not_measured.unattributed_read_tables, 0);
+    // 31 days * 24 h * 3,600,000 bytes, charged to the only reader.
+    assert_eq!(storage(&with.measured_total), 744 * 3_600_000);
+    assert_eq!(
+        with.products["B"]
+            .allocated_upstream
+            .iter()
+            .filter(|a| a.unit == Unit::StorageDataFiles)
+            .map(|a| a.amount)
+            .sum::<u128>(),
+        744 * 3_600_000
+    );
+    // Without the carry-in the table is invisible, and the report says so.
+    let without = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(storage(&without.measured_total), 0);
+    assert_eq!(without.not_measured.unattributed_read_tables, 1);
+}
+
+#[test]
+fn storage_matches_an_independent_interval_loop() {
+    // Three measurements of one table in two bases. There is no carry-in and
+    // history is complete, so storage starts at the first build.
+    let measurements = [
+        (oct(2, 0, 0), 3_600_000u64, StoredBytesBasis::DataFiles),
+        (oct(10, 12, 0), 7_200_000, StoredBytesBasis::AllocatedBlocks),
+        (oct(20, 6, 0), 1_800_000, StoredBytesBasis::DataFiles),
+    ];
+    let runs: Vec<RunRecord> = measurements
+        .iter()
+        .enumerate()
+        .map(|(i, (at, bytes, basis))| {
+            run(
+                &format!("r{i}"),
+                *at,
+                production(),
+                vec![stored(exec("fct_orders", *at, 0), *bytes, *basis)],
+            )
+        })
+        .collect();
+
+    // Independent loop, in whole minutes.
+    let end = utc(2026, 11, 1, 0, 0, 0);
+    let (mut data_files, mut blocks) = (0u128, 0u128);
+    for (i, (at, bytes, basis)) in measurements.iter().enumerate() {
+        let until = measurements.get(i + 1).map_or(end, |next| next.0);
+        let minutes = u128::try_from((until - *at).num_minutes()).unwrap();
+        let byte_hours = u128::from(*bytes) * minutes / 60;
+        match basis {
+            StoredBytesBasis::DataFiles => data_files += byte_hours,
+            StoredBytesBasis::AllocatedBlocks => blocks += byte_hours,
+        }
+    }
+    assert_eq!(data_files, 204 * 3_600_000 + 282 * 1_800_000);
+    assert_eq!(blocks, 234 * 7_200_000);
+
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(storage(&split.measured_total), data_files);
+    assert_eq!(
+        split.measured_total.get(&Unit::StorageAllocatedBlocks),
+        Some(&blocks)
+    );
+    assert_eq!(storage(&split.products["A"].kept), data_files);
+    assert!(split.invariant_violations().is_empty());
 }

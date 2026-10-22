@@ -6230,11 +6230,18 @@
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
+          },
+          "unattributed_read_tables": {
+            "description": "Distinct tables read this month that name no model with a recorded build: a source Rocky does not build, or a table built before the history Rocky keeps. Their cost is not split.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
           }
         },
         "required": [
           "failed_executions",
-          "storage_unknown_tables"
+          "storage_unknown_tables",
+          "unattributed_read_tables"
         ],
         "type": "object"
       },

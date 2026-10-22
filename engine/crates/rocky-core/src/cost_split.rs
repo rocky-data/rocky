@@ -327,16 +327,36 @@ pub fn largest_remainder(amount: u128, weights: &[u128]) -> Vec<u128> {
     let mut scaled: Vec<u128> = weights.to_vec();
     let mut total: u128 = scaled.iter().sum();
     // Only proportions matter, so shrink the weights until the product fits.
+    // Each pass halves every weight above 1, so the loop ends once all weights
+    // are 0 or 1. It also stops when no weight can shrink further.
     while total > 0 && amount.checked_mul(total).is_none() {
+        let mut shrank = false;
         for w in &mut scaled {
-            if *w > 0 {
-                *w = (*w >> 1).max(1);
+            if *w > 1 {
+                *w >>= 1;
+                shrank = true;
             }
         }
         total = scaled.iter().sum();
+        if !shrank {
+            break;
+        }
     }
     if total == 0 {
         return vec![0; weights.len()];
+    }
+    if amount.checked_mul(total).is_none() {
+        // Amounts above u128::MAX / (number of weights) cannot occur with
+        // millisecond or byte-hour figures. Give the whole amount to the
+        // heaviest weight so the parts still add up.
+        let heaviest = weights
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, w)| (**w, std::cmp::Reverse(*index)))
+            .map_or(0, |(index, _)| index);
+        let mut parts = vec![0; weights.len()];
+        parts[heaviest] = amount;
+        return parts;
     }
     let mut parts: Vec<u128> = Vec::with_capacity(scaled.len());
     let mut remainders: Vec<(u128, usize)> = Vec::with_capacity(scaled.len());
@@ -392,6 +412,10 @@ pub struct NotMeasured {
     /// Tables whose storage before their first measurement this month is
     /// unknown, because history does not reach back far enough.
     pub storage_unknown_tables: u64,
+    /// Distinct tables that in-month executions read but that name no model
+    /// with a recorded version: a source Rocky does not build, or a table
+    /// built before the history Rocky keeps. Their cost is not split.
+    pub unattributed_read_tables: u64,
 }
 
 /// What a product paid for one table it reads.
@@ -501,8 +525,13 @@ impl MonthSplit {
 
 /// One version of one model's table: a production execution in the month, or
 /// the carry-in measurement before it.
-struct Node<'a> {
+struct Node {
     model: String,
+    /// Whether readers can link to this node: a successful execution that
+    /// recorded the table it wrote. A failed execution keeps its time but is
+    /// never a version, so it cannot take readers from the last good build or
+    /// close a window.
+    is_version: bool,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     /// An execution that started in the month. Only these read tables and
@@ -512,7 +541,7 @@ struct Node<'a> {
     /// The stored size right after this version was written.
     measured: Option<(u64, StoredBytesBasis)>,
     /// The upstream reads the execution recorded. `None` means not measured.
-    reads: Option<&'a [UpstreamRead]>,
+    reads: Option<Vec<UpstreamRead>>,
 }
 
 struct Edge {
@@ -549,27 +578,63 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
             .then(a.run_id.cmp(&b.run_id))
     });
 
-    let mut nodes: Vec<Node<'_>> = Vec::new();
+    let mut nodes: Vec<Node> = Vec::new();
     for run in runs {
         let production = run.counts_as_production(UnrecordedScope::Count);
         let not_production = run.production_scope() == ProductionScope::NotProduction;
+        // One run's executions of a model (partitions) form one version.
+        let mut merged: BTreeMap<String, usize> = BTreeMap::new();
         for exec in &run.models_executed {
             if !input.window.contains(exec.started_at) {
                 continue;
             }
             if production {
+                let model = exec.rocky_model_name().to_string();
                 if is_unmeasured_failure(exec) {
-                    out.not_measured.failed_executions += 1;
+                    // Entries like `<verify_after>` are not models.
+                    if !is_synthetic_name(&model) {
+                        out.not_measured.failed_executions += 1;
+                    }
                     continue;
                 }
+                let is_version = exec.output_target.is_some() && exec.status != "failed";
+                let measured = exec.stored_bytes.map(|s| (s.bytes, s.basis));
+                let reads = exec.upstream_reads.as_ref().map(|r| r.reads.clone());
+                if is_version && let Some(&held) = merged.get(&model) {
+                    let node = &mut nodes[held];
+                    node.started_at = node.started_at.min(exec.started_at);
+                    if exec.finished_at >= node.finished_at {
+                        node.finished_at = exec.finished_at;
+                        if measured.is_some() {
+                            node.measured = measured;
+                        }
+                    } else if node.measured.is_none() {
+                        node.measured = measured;
+                    }
+                    node.compute_ms += execution_compute_ms(exec);
+                    // A partition with no recorded reads makes the whole
+                    // version unmeasured.
+                    node.reads = match (node.reads.take(), reads) {
+                        (Some(mut all), Some(more)) => {
+                            all.extend(more);
+                            Some(all)
+                        }
+                        _ => None,
+                    };
+                    continue;
+                }
+                if is_version {
+                    merged.insert(model.clone(), nodes.len());
+                }
                 nodes.push(Node {
-                    model: exec.rocky_model_name().to_string(),
+                    model,
+                    is_version,
                     started_at: exec.started_at,
                     finished_at: exec.finished_at,
                     in_month: true,
                     compute_ms: execution_compute_ms(exec),
-                    measured: exec.stored_bytes.map(|s| (s.bytes, s.basis)),
-                    reads: exec.upstream_reads.as_ref().map(|r| r.reads.as_slice()),
+                    measured,
+                    reads,
                 });
             } else if not_production {
                 add(
@@ -586,6 +651,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
         };
         nodes.push(Node {
             model: exec.rocky_model_name().to_string(),
+            is_version: true,
             started_at: exec.started_at,
             finished_at: exec.finished_at,
             in_month: false,
@@ -614,22 +680,26 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
         rank
     };
     let mut versions: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut measured_chains: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for &index in &order {
-        versions
-            .entry(nodes[index].model.as_str())
-            .or_default()
-            .push(index);
+        if nodes[index].is_version {
+            versions
+                .entry(nodes[index].model.as_str())
+                .or_default()
+                .push(index);
+        }
+        if nodes[index].measured.is_some() {
+            measured_chains
+                .entry(nodes[index].model.as_str())
+                .or_default()
+                .push(index);
+        }
     }
 
     // ---- 2. Storage byte-hours per version. ---------------------------
     let horizon = input.window.end.min(input.as_of);
     let mut storage: Vec<Option<(Unit, u128)>> = vec![None; nodes.len()];
-    for chain in versions.values() {
-        let measured: Vec<usize> = chain
-            .iter()
-            .copied()
-            .filter(|&i| nodes[i].measured.is_some())
-            .collect();
+    for measured in measured_chains.values() {
         if let Some(&first) = measured.first()
             && nodes[first].in_month
             && !input.history_complete
@@ -664,46 +734,57 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
     }
 
     // ---- 4. Edges: which version each read hit. -----------------------
-    let mut target_of: BTreeMap<&str, (String, String, String)> = BTreeMap::new();
-    for exec in input
+    // Targets come from production executions and the carry-in only. A
+    // shadow run writes somewhere else, and a model can change target during
+    // the month, so every production target of a model stays.
+    let mut target_of: BTreeMap<&str, Vec<(String, String, String)>> = BTreeMap::new();
+    let production_execs = input
         .runs
         .iter()
+        .filter(|run| run.counts_as_production(UnrecordedScope::Count))
         .flat_map(|run| run.models_executed.iter())
-        .chain(input.carry_in.iter())
-    {
+        .chain(input.carry_in.iter());
+    for exec in production_execs {
         if let Some(target) = &exec.output_target {
-            target_of.insert(
-                target.model.as_str(),
-                (
-                    target.catalog.clone(),
-                    target.schema.clone(),
-                    target.table.clone(),
-                ),
+            let entry = target_of.entry(target.model.as_str()).or_default();
+            let triple = (
+                target.catalog.clone(),
+                target.schema.clone(),
+                target.table.clone(),
             );
+            if !entry.contains(&triple) {
+                entry.push(triple);
+            }
         }
     }
     let mut by_table: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    for (model, (_, _, table)) in &target_of {
-        by_table
-            .entry(table.to_ascii_lowercase())
-            .or_default()
-            .push(model);
+    for (model, targets) in &target_of {
+        for (_, _, table) in targets {
+            let models = by_table.entry(table.to_ascii_lowercase()).or_default();
+            if !models.contains(model) {
+                models.push(model);
+            }
+        }
     }
+    let mut unattributed_tables: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
 
     let mut edges: Vec<Vec<Edge>> = (0..nodes.len()).map(|_| Vec::new()).collect();
     for (reader, node) in nodes.iter().enumerate() {
         if !node.in_month {
             continue;
         }
-        for read in node.reads.unwrap_or_default() {
+        for read in node.reads.as_deref().unwrap_or_default() {
             let Some(upstream) = resolve_read(read, &by_table, &target_of, input.default_catalog)
             else {
+                unattributed_tables.insert(read.table.to_ascii_lowercase());
                 continue;
             };
             if upstream == node.model {
                 continue;
             }
             let Some(chain) = versions.get(upstream) else {
+                unattributed_tables.insert(read.table.to_ascii_lowercase());
                 continue;
             };
             // The newest version that had finished when this execution began.
@@ -723,6 +804,8 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
     for list in &mut edges {
         list.sort_by_key(|edge| rank[edge.reader]);
     }
+
+    out.not_measured.unattributed_read_tables = unattributed_tables.len() as u64;
 
     // ---- 5. The basis of each version's split. ------------------------
     let month_open = input.as_of < input.window.end;
@@ -866,20 +949,23 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
     out
 }
 
-/// The model a read names, when exactly one known model target matches it.
-/// Two models sharing a name in different catalogs make a read ambiguous, and
-/// an ambiguous read is not attributed.
+/// The model a read names, when exactly one known model matches it. Two
+/// models sharing a name in different catalogs make a read ambiguous, and an
+/// ambiguous read is not attributed. A model matches when any target it wrote
+/// in production matches.
 fn resolve_read<'a>(
     read: &UpstreamRead,
     by_table: &BTreeMap<String, Vec<&'a str>>,
-    target_of: &BTreeMap<&str, (String, String, String)>,
+    target_of: &BTreeMap<&str, Vec<(String, String, String)>>,
     default_catalog: Option<&str>,
 ) -> Option<&'a str> {
     let table = read.table.rsplit('.').next()?.to_ascii_lowercase();
     let mut found: Option<&'a str> = None;
     for &model in by_table.get(&table)? {
-        let (catalog, schema, tbl) = target_of.get(model)?;
-        if read_matches_target(&read.table, catalog, schema, tbl, default_catalog) {
+        let matches = target_of.get(model)?.iter().any(|(catalog, schema, tbl)| {
+            read_matches_target(&read.table, catalog, schema, tbl, default_catalog)
+        });
+        if matches {
             if found.is_some() {
                 return None;
             }
@@ -887,6 +973,10 @@ fn resolve_read<'a>(
         }
     }
     found
+}
+
+fn is_synthetic_name(name: &str) -> bool {
+    name.starts_with('<') && name.ends_with('>')
 }
 
 fn record_allocation(row: &mut ProductSplit, entry: AllocatedUpstream) {
@@ -907,7 +997,7 @@ fn record_allocation(row: &mut ProductSplit, entry: AllocatedUpstream) {
 
 fn plan_for(
     index: usize,
-    nodes: &[Node<'_>],
+    nodes: &[Node],
     edges: &[Edge],
     versions: &BTreeMap<&str, Vec<usize>>,
     rank: &[usize],

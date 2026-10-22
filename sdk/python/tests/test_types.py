@@ -581,7 +581,11 @@ def _month_cost_payload() -> dict:
         "unallocated": [],
         "shadow_branch": [],
         "measured_total": [{"unit": "compute_ms", "amount": 1400}],
-        "not_measured": {"failed_executions": 0, "storage_unknown_tables": 0},
+        "not_measured": {
+            "failed_executions": 0,
+            "storage_unknown_tables": 0,
+            "unattributed_read_tables": 0,
+        },
     }
 
 
