@@ -683,6 +683,25 @@ fn valkey_adopt_cas(
     Ok(swapped == 1)
 }
 
+/// Classify the raw value found at a Valkey claim key. A value that does not
+/// parse as an entry is treated as stale, as on `s3` and `gcs`; the caller
+/// takes it with the raw-bytes compare-and-set, so a bad value cannot block
+/// every run until its TTL.
+fn classify_valkey_raw(raw: &[u8], key: &str, new_entry: &IdempotencyEntry) -> IdempotencyCheck {
+    match serde_json::from_slice::<IdempotencyEntry>(raw) {
+        Ok(prior) => classify_live(prior, new_entry),
+        Err(_) => {
+            warn!(
+                key = %key,
+                "idempotency entry is not deserializable; treating it as stale"
+            );
+            IdempotencyCheck::AdoptStale {
+                prior_run_id: "<corrupt>".to_string(),
+            }
+        }
+    }
+}
+
 async fn valkey_check_and_claim(
     url: &str,
     prefix: &str,
@@ -741,10 +760,10 @@ async fn valkey_check_and_claim(
                     // Expired between the failed SET NX and the GET.
                     continue;
                 };
-                let prior: IdempotencyEntry = serde_json::from_slice(&raw)?;
                 // The server TTL decides expiry: a key that still exists is
-                // live, whatever this pod's clock says.
-                let verdict = classify_live(prior, &entry_for_task);
+                // live, whatever this pod's clock says. A value that is not an
+                // entry is stale, and the same compare-and-set takes it.
+                let verdict = classify_valkey_raw(&raw, &key_for_task, &entry_for_task);
                 match &verdict {
                     IdempotencyCheck::Proceed | IdempotencyCheck::AdoptStale { .. } => {
                         // Take the key only if it still holds what we read.
@@ -1220,10 +1239,10 @@ pub mod testing {
 
 /// Given a prior entry, decide the [`IdempotencyCheck`] outcome.
 ///
-/// Used by both Local (inside the redb write txn — if Proceed / AdoptStale
-/// the store then inserts the new entry) and Valkey (after a failed
-/// SET NX). Centralising the branching keeps the two backends' semantics
-/// bit-for-bit identical.
+/// Used by Local (inside the redb write txn — if Proceed / AdoptStale the
+/// store then inserts the new entry) and the object-store backends. These
+/// judge expiry by the clock. Valkey does not: the server TTL decides, so it
+/// calls [`classify_live`] (through `classify_valkey_raw`) instead.
 pub(crate) fn classify_existing(
     prior: IdempotencyEntry,
     now: DateTime<Utc>,
@@ -1842,6 +1861,33 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_valkey_value_is_stale_not_an_error() {
+        let now = Utc::now();
+        let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
+        for junk in [
+            &b"not json {"[..],
+            b"[1,2]",
+            b"\"str\"",
+            b"{\"no_run_id\":1}",
+            b"",
+        ] {
+            assert!(
+                matches!(
+                    classify_valkey_raw(junk, "k", &new),
+                    IdempotencyCheck::AdoptStale { .. }
+                ),
+                "{junk:?}"
+            );
+        }
+        let ok =
+            serde_json::to_vec(&mk_entry("run-a", IdempotencyState::InFlight, now, 24)).unwrap();
+        assert!(matches!(
+            classify_valkey_raw(&ok, "k", &new),
+            IdempotencyCheck::SkipInFlight { .. }
+        ));
+    }
+
+    #[test]
     fn a_key_that_still_exists_is_live_whatever_the_clock_says() {
         let now = Utc::now();
         let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
@@ -1987,6 +2033,37 @@ mod tests {
             "{verdict:?}"
         );
         assert_eq!(get_raw(&mut conn, &full), Some(old));
+        del_raw(&mut conn, &full);
+    }
+
+    /// A stored value that is not an entry does not block runs: the next run
+    /// takes it with the compare-and-set and its own finalize then lands.
+    #[tokio::test]
+    async fn live_valkey_an_unreadable_claim_is_taken_over() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("junk-claim");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        put_raw(&mut conn, &full, b"not json {");
+        let cfg = live_cfg(DedupPolicy::Success);
+        let backend = live_backend(&url, &prefix);
+
+        let verdict = backend
+            .check_and_claim(None, "k", "run-new", &cfg)
+            .await
+            .unwrap();
+        assert!(
+            matches!(verdict, IdempotencyCheck::AdoptStale { .. }),
+            "{verdict:?}"
+        );
+        backend
+            .finalize(None, "k", "run-new", FinalOutcome::Succeeded, &cfg)
+            .await
+            .unwrap();
+        let held: IdempotencyEntry =
+            serde_json::from_slice(&get_raw(&mut conn, &full).unwrap()).unwrap();
+        assert_eq!(held.run_id, "run-new");
+        assert_eq!(held.state, IdempotencyState::Succeeded);
         del_raw(&mut conn, &full);
     }
 
