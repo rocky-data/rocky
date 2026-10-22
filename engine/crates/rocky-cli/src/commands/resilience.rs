@@ -57,6 +57,36 @@ pub(crate) struct ResiliencePlan<'a> {
     /// Run-level consecutive-transient-failure breaker; `None` disables it
     /// (`circuit_breaker_threshold = 0`).
     pub breaker: Option<&'a CircuitBreaker>,
+    /// Attempt data for models whose retry loop ended in an error, keyed by
+    /// model name. The error itself carries no timing, so the loop leaves
+    /// what it measured here; the caller moves it onto the run output with
+    /// [`ResiliencePlan::take_failed`] so the failed model's run record keeps
+    /// its compute (#2470).
+    pub failed: std::sync::Mutex<std::collections::BTreeMap<String, FailedModelAttempts>>,
+}
+
+/// What the retry loop measured for a model that ended in an error.
+#[derive(Debug, Clone)]
+pub(crate) struct FailedModelAttempts {
+    /// The last attempt's own duration: the same meaning `duration_ms` has
+    /// on a success.
+    pub duration_ms: u64,
+    /// The full trail with the terminal failed attempt last, only when a
+    /// retry happened. Empty for a first-try failure, as for a first-try
+    /// success. Total compute is `sum(attempts[].duration_ms)` when
+    /// non-empty, else `duration_ms`.
+    pub attempts: Vec<AttemptRecord>,
+}
+
+impl ResiliencePlan<'_> {
+    /// Remove and return the attempt data left for `model_name` by a failed
+    /// [`run_model_with_retry`].
+    pub(crate) fn take_failed(&self, model_name: &str) -> Option<FailedModelAttempts> {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(model_name)
+    }
 }
 
 /// Decide whether the agent-policy plane permits run-loop retry.
@@ -228,8 +258,32 @@ where
                 }
 
                 // Terminal: permanent / unknown, budget exhausted, breaker
-                // tripped, or policy-gated. The trail is not surfaced (no
-                // materialization is produced); the error propagates as before.
+                // tripped, or policy-gated. No materialization is produced, so
+                // the last attempt's time and the trail (terminal attempt last,
+                // only after a retry) are left on the plan for the caller to record; the error
+                // propagates unchanged (#2470).
+                // Same rule as a success: a trail only when a retry happened.
+                if !trail.is_empty() {
+                    trail.push(AttemptRecord {
+                        attempt: attempt_no,
+                        outcome: "failed".to_string(),
+                        failure_class: Some(class.label().to_string()),
+                        transient_kind: class.transient_kind_label().map(str::to_string),
+                        error: Some(truncate_error(&err)),
+                        backoff_ms: None,
+                        duration_ms,
+                    });
+                }
+                plan.failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        model_name.to_string(),
+                        FailedModelAttempts {
+                            duration_ms,
+                            attempts: trail,
+                        },
+                    );
                 return Err(err);
             }
         }
@@ -389,6 +443,7 @@ mod tests {
             policy_allows_retry: true,
             budget,
             breaker,
+            failed: Default::default(),
         }
     }
 
@@ -484,6 +539,75 @@ mod tests {
         assert!(result.is_err());
         // 1 initial + 2 retries = 3 invocations, then it gives up.
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// #2470: a model that fails after its retries leaves every attempt (the
+    /// terminal one last) and the last attempt's time for the run record.
+    #[tokio::test]
+    async fn failed_model_keeps_every_attempt_and_last_duration() {
+        let adapter = FlakyAdapter::new(5);
+        let cfg = ResilienceConfig {
+            transient_max_retries: 2,
+            initial_backoff_ms: 0,
+            jitter: false,
+            ..Default::default()
+        };
+        let budget = RetryBudget::unbounded();
+        let plan = plan_for(&cfg, &budget, None);
+
+        let result = run_model_with_retry(&plan, &adapter, "orders", true, || {
+            let adapter = &adapter;
+            async move {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                adapter
+                    .execute_statement("x")
+                    .await
+                    .map(|()| sample_mat())
+                    .map_err(anyhow::Error::from)
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        let failed = plan.take_failed("orders").expect("failure recorded");
+        assert_eq!(failed.attempts.len(), 3);
+        assert_eq!(
+            failed
+                .attempts
+                .iter()
+                .map(|a| a.attempt)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(failed.attempts.iter().all(|a| a.outcome == "failed"));
+        assert!(failed.attempts.iter().all(|a| a.duration_ms >= 10));
+        // `duration_ms` is the last attempt's own time, as on a success.
+        assert_eq!(failed.duration_ms, failed.attempts[2].duration_ms);
+        assert_eq!(failed.attempts[2].backoff_ms, None, "terminal: no backoff");
+        assert!(plan.take_failed("orders").is_none(), "taken once");
+    }
+
+    /// #2470: a first-try failure records its time and an empty trail, as a
+    /// first-try success does; a success leaves nothing behind.
+    #[tokio::test]
+    async fn first_try_failure_records_time_with_empty_trail_and_success_records_none() {
+        let adapter = FlakyAdapter::new(0);
+        let cfg = ResilienceConfig::default();
+        let budget = RetryBudget::unbounded();
+        let plan = plan_for(&cfg, &budget, None);
+        let result = run_model_with_retry(&plan, &adapter, "bad", true, || async {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            Err::<MaterializationOutput, _>(anyhow::anyhow!("syntax error near FROM"))
+        })
+        .await;
+        assert!(result.is_err());
+        let failed = plan.take_failed("bad").expect("failure recorded");
+        assert!(failed.attempts.is_empty());
+        assert!(failed.duration_ms >= 10);
+
+        run_model_with_retry(&plan, &adapter, "good", true, || async { Ok(sample_mat()) })
+            .await
+            .unwrap();
+        assert!(plan.take_failed("good").is_none());
     }
 
     /// FIX: a transient failure on a NON-idempotent strategy (incremental /
@@ -647,6 +771,7 @@ mod tests {
             policy_allows_retry: false,
             budget: &budget,
             breaker: None,
+            failed: Default::default(),
         };
         let result = run_model_with_retry(&plan, &adapter, "orders", true, || {
             let adapter = &adapter;

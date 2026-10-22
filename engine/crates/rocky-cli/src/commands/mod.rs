@@ -70,7 +70,7 @@ mod profile;
 mod profile_storage;
 mod publish_ir;
 mod replay;
-mod resilience;
+pub(crate) mod resilience;
 mod restore;
 mod retention_status;
 mod reuse_decision;

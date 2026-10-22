@@ -420,8 +420,7 @@ pub(crate) fn run_backfill_in(
 ///
 /// A failure is only a usable seed when it was recorded against a real model
 /// name. Failures the run loop could only attribute to a sentinel
-/// (`<runtime>`, `<cycle>`, a pipeline name) — which the fail-fast local path
-/// emits when it cannot name the model — are dropped, and a clear error asks
+/// (`<cycle>`, or a failure outside the model phase) are dropped, and a clear error asks
 /// for an explicit `--model`. Enabling failure containment (`[resilience]
 /// contain_failures`) records the model by name, which makes this trigger
 /// resolve the contained window directly.

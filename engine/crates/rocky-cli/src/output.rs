@@ -367,6 +367,25 @@ pub struct RunOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) owned_shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject>,
+    /// Measured duration and attempt trail of models that failed in the
+    /// classified-retry loop, keyed by model name. Read by `to_run_record`
+    /// to fill the failed model's execution (#2470). Not part of the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) failed_attempts:
+        std::collections::BTreeMap<String, crate::commands::resilience::FailedModelAttempts>,
+    /// The model whose failure stopped a fail-fast run, staged here until the
+    /// entry point records the run's one error entry for it
+    /// ([`RunOutput::push_fail_fast_error`]).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) fail_fast_model: Option<String>,
+    /// `errors` index -> the model whose measurement in `failed_attempts`
+    /// belongs to that entry. Matching by entry, never by name, so a
+    /// replication table that shares a model's bare name gets nothing.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) error_models: std::collections::BTreeMap<usize, String>,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
     /// transformation runs so orchestrators can explain *why* each model
@@ -6388,6 +6407,9 @@ impl RunOutput {
             shadow: false,
             shadow_comparison: None,
             owned_shadow_objects: vec![],
+            failed_attempts: Default::default(),
+            fail_fast_model: None,
+            error_models: Default::default(),
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -6733,21 +6755,33 @@ impl RunOutput {
             .map(|volume| volume.model.as_str())
             .collect();
 
-        for err in &self.errors {
-            let model_name = err
-                .asset_key
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "<unknown>".to_string());
+        for (idx, err) in self.errors.iter().enumerate() {
+            // A run that stopped at its first failure reports one entry under
+            // an entry-point placeholder (`<runtime>`, `<selection>`, a
+            // pipeline name, `backfill`); the execution is recorded under the
+            // failed model's own name, as contained mode does. The JSON
+            // `asset_key` is not touched.
+            let model_name = self.error_models.get(&idx).cloned().unwrap_or_else(|| {
+                err.asset_key
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            });
             if volume_failed.contains(model_name.as_str()) {
                 continue;
             }
+            // The retry loop's measurement for this model, when it ran
+            // through one: real compute time and every attempt (#2470).
+            let failed = self
+                .error_models
+                .get(&idx)
+                .and_then(|m| self.failed_attempts.get(m));
             models.push(rocky_core::state::ModelExecution {
                 row_count: None,
                 model_name,
                 started_at,
                 finished_at,
-                duration_ms: 0,
+                duration_ms: failed.map_or(0, |f| f.duration_ms),
                 rows_affected: None,
                 status: "failed".to_string(),
                 sql_hash: String::new(),
@@ -6768,11 +6802,10 @@ impl RunOutput {
                 hash_scheme: None,
                 // A failed execution recorded no output columns.
                 output_column_hashes: None,
-                // A run-level error entry (no per-model materialization)
-                // carries no attempt trail; the failing model's own attempts,
-                // when the retry layer produced them, ride on its
-                // `MaterializationOutput` instead.
-                attempts: Vec::new(),
+                // The attempt trail the retry layer measured for this model,
+                // terminal failed attempt last. Empty for an error that did
+                // not come through the retry loop (replication, run-level).
+                attempts: failed.map(|f| f.attempts.clone()).unwrap_or_default(),
                 // A failed execution recorded no output version ("not
                 // recorded"); it may have written nothing at all.
                 output_version: None,
@@ -6838,6 +6871,25 @@ impl RunOutput {
             // open (#1732).
             verify_after_failed: self.verify_after_failed,
             queued_ms: None,
+        }
+    }
+
+    /// Record an error entry that belongs to `model`, so its run record can
+    /// take the model's measured attempts (#2470).
+    pub(crate) fn push_model_error(&mut self, err: TableErrorOutput, model: &str) {
+        self.error_models
+            .insert(self.errors.len(), model.to_string());
+        self.errors.push(err);
+    }
+
+    /// Record the one error entry of a run that stopped at its first failure.
+    /// The entry's key is entry-point specific (`<selection>`, `<runtime>`, a
+    /// pipeline name, `backfill`); the staged `fail_fast_model` says which
+    /// model it stands for.
+    pub(crate) fn push_fail_fast_error(&mut self, err: TableErrorOutput) {
+        match self.fail_fast_model.take() {
+            Some(model) => self.push_model_error(err, &model),
+            None => self.errors.push(err),
         }
     }
 
@@ -9153,6 +9205,82 @@ mod run_record_tests {
         assert_eq!(failed.model_name, "broken");
         assert_eq!(failed.duration_ms, 0);
         assert!(matches!(record.status, RunStatus::PartialFailure));
+    }
+
+    /// #2470: a failed model's execution keeps the retry loop's measured
+    /// duration and attempts; an error with no measurement stays at zero.
+    #[test]
+    fn to_run_record_keeps_failed_models_duration_and_attempts() {
+        let mut out = RunOutput::new(String::new(), 2_000, 1);
+        out.tables_failed = 2;
+        // "unmeasured" has no model attribution, and shares a bare name with
+        // nothing; "table" is a replication-style entry that must not take
+        // the measurement even though a model named "table" failed too.
+        for (name, model) in [
+            ("broken", Some("broken")),
+            ("unmeasured", None),
+            ("table", None),
+        ] {
+            let entry = TableErrorOutput {
+                asset_key: vec![name.to_string()],
+                error: "boom".to_string(),
+                failure_kind: FailureKind::Unknown,
+                cooldown_seconds: None,
+            };
+            match model {
+                Some(m) => out.push_model_error(entry, m),
+                None => out.errors.push(entry),
+            }
+        }
+        let attempt = |n: u32, ms: u64| rocky_core::state::AttemptRecord {
+            attempt: n,
+            outcome: "failed".to_string(),
+            failure_class: Some("transient".to_string()),
+            transient_kind: None,
+            error: Some("boom".to_string()),
+            backoff_ms: None,
+            duration_ms: ms,
+        };
+        out.failed_attempts.insert(
+            "table".to_string(),
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms: 99,
+                attempts: Vec::new(),
+            },
+        );
+        out.failed_attempts.insert(
+            "broken".to_string(),
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms: 40,
+                attempts: vec![attempt(1, 30), attempt(2, 40)],
+            },
+        );
+
+        let started = fixed_start();
+        let record = out.to_run_record(
+            "run-test-2470",
+            started,
+            started + chrono::Duration::seconds(2),
+            String::new(),
+            RunTrigger::Manual,
+            out.derive_run_status(),
+            RunRecordAudit::test_sentinels(),
+        );
+        let find = |n: &str| {
+            record
+                .models_executed
+                .iter()
+                .find(|m| m.model_name == n)
+                .unwrap()
+        };
+        let broken = find("broken");
+        assert_eq!(broken.status, "failed");
+        assert_eq!(broken.duration_ms, 40);
+        assert_eq!(broken.attempts.len(), 2);
+        let unmeasured = find("unmeasured");
+        assert_eq!(unmeasured.duration_ms, 0);
+        assert!(unmeasured.attempts.is_empty());
+        assert_eq!(find("table").duration_ms, 0, "matched by entry, not name");
     }
 
     #[test]

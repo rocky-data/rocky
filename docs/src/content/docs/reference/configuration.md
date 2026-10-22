@@ -776,7 +776,7 @@ Tune how `rocky plan --idempotency-key <KEY>` deduplicates a retried run (the `r
 |-------|------|---------|-------------|
 | `retention_days` | integer | `30` | Lifetime of a terminal idempotency stamp before garbage collection. `rocky run` sweeps the local `state.redb` copy after each run. It does not sweep expired entries in an `s3` or `gcs` bucket; use a bucket lifecycle rule for those. |
 | `dedup_on` | string | `"success"` | Which terminal statuses count as "already processed". `"success"` only stamps successful runs (failures stay claimable for retries); `"any"` stamps every terminal status. |
-| `in_flight_ttl_hours` | integer | `24` | Hours after which an `InFlight` claim is treated as a crashed-pod corpse and adopted by a fresh caller. Read when a run takes the claim and stamped on it: lowering the value later does not shorten a claim already made. Informational on Valkey/tiered backends, which set the TTL server-side via `SET NX EX`. |
+| `in_flight_ttl_hours` | integer | `24` | Hours after which an `InFlight` claim is treated as a crashed-pod corpse and adopted by a fresh caller. Read when a run takes the claim and stamped on it: lowering the value later does not shorten a claim already made. On `valkey` and `tiered` it sets the key's expiry on the server (`EX`), and the server decides when the claim is gone. |
 
 Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backends so sibling pods see the same entry. See [`rocky plan --idempotency-key`](/reference/cli/#rocky-run) for the three possible outcomes (`fresh_run`, `skipped_idempotent`, `skipped_in_flight`).
 
