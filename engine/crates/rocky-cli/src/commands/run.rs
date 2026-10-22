@@ -13119,6 +13119,7 @@ async fn execute_models_phase(
         policy_allows_retry: retry_policy_allows,
         budget: &retry_budget,
         breaker: retry_breaker.as_ref(),
+        failed: Default::default(),
     };
 
     // Source schemas for the typecheck that resolves `typed_columns`. A governed
@@ -14515,6 +14516,11 @@ async fn execute_models_phase(
                         }
                     }
                     Err(e) => {
+                        // Keep the failed model's measured attempts for its
+                        // run record (#2470).
+                        if let Some(failed) = resilience_plan.take_failed(name) {
+                            output.failed_attempts.insert(name.to_string(), failed);
+                        }
                         // Containment: record + poison EVERY failure in the
                         // layer (two models in one layer can have disjoint
                         // downstream closures — poisoning only the first would
@@ -14543,6 +14549,7 @@ async fn execute_models_phase(
                                     ))
                                     .await;
                             }
+                            output.fail_fast_model = Some(name.to_string());
                             first_error = Some(e);
                         }
                     }
@@ -15226,6 +15233,13 @@ async fn execute_models_phase(
                     }
                 }
                 Err(e) => {
+                    // Keep the failed model's measured attempts for its run
+                    // record (#2470).
+                    if let Some(failed) = resilience_plan.take_failed(model_name) {
+                        output
+                            .failed_attempts
+                            .insert(model_name.to_string(), failed);
+                    }
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                         let _ = reg
                             .fire(&HookContext::model_error(
@@ -15241,6 +15255,7 @@ async fn execute_models_phase(
                     if resilience.contain_failures {
                         record_contained_cause(output, &mut containment, model_name, &e);
                     } else {
+                        output.fail_fast_model = Some(model_name.to_string());
                         return Err(e);
                     }
                 }
@@ -26670,6 +26685,8 @@ auto_create_schemas = true
             shadow: false,
             shadow_comparison: None,
             owned_shadow_objects: vec![],
+            failed_attempts: Default::default(),
+            fail_fast_model: None,
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -38283,6 +38300,102 @@ backend = "local"
         (output, result)
     }
 
+    /// Drive `execute_models` fail-fast (the default, `contain_failures =
+    /// false`) at the given `--parallel` width.
+    async fn run_models_fail_fast(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        parallel: u32,
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path)
+            .expect("open duckdb")
+            .with_concurrent_for_test(parallel > 1);
+        let opts = PartitionRunOptions {
+            parallel,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
+        let result = super::execute_models(
+            models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await;
+        (output, result)
+    }
+
+    /// #2470: a fail-fast failure reaches the run record with its
+    /// measurement. `run` reports the stopping error under `<selection>`; the
+    /// record still finds the failed model's data through `fail_fast_model`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn fail_fast_failed_model_keeps_its_measurement_in_the_run_record() {
+        for parallel in [1u32, 2] {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_plain_model(&models_dir, "bad", "SELECT * FROM main.does_not_exist_xyz");
+
+            let db = tmp.path().join("ff.duckdb");
+            let (mut out, result) = run_models_fail_fast(&models_dir, &db, parallel).await;
+            assert!(result.is_err(), "fail-fast surfaces the error");
+            assert_eq!(out.fail_fast_model.as_deref(), Some("bad"));
+            // Plant a distinctive duration so the record check is not
+            // satisfied by a real sub-millisecond zero.
+            out.failed_attempts
+                .get_mut("bad")
+                .unwrap_or_else(|| panic!("measurement kept, parallel={parallel}"))
+                .duration_ms = 1234;
+
+            // What `run` does with the `Err`: one `<selection>` error entry.
+            out.tables_failed += 1;
+            out.errors.push(crate::output::TableErrorOutput {
+                asset_key: vec!["<selection>".to_string()],
+                error: "boom".to_string(),
+                failure_kind: crate::output::FailureKind::Unknown,
+                cooldown_seconds: None,
+            });
+            let started = chrono::Utc::now();
+            let record = out.to_run_record(
+                "run-fail-fast",
+                started,
+                started,
+                String::new(),
+                rocky_core::state::RunTrigger::Manual,
+                out.derive_run_status(),
+                crate::output::RunRecordAudit::test_sentinels(),
+            );
+            assert_eq!(record.models_executed.len(), 1);
+            assert_eq!(record.models_executed[0].status, "failed");
+            assert_eq!(record.models_executed[0].duration_ms, 1234);
+        }
+    }
+
     /// Write the diamond/disjoint DAG the containment tests share:
     ///
     /// - `good_a` (layer 0) builds; `dep_of_good` (layer 1) reads it → builds.
@@ -38372,6 +38485,14 @@ backend = "local"
             "errors[] must name the failed model: {:?}",
             out.errors
         );
+        // #2470: the retry loop's measurement reaches the output, so the
+        // failed model's run record keeps its attempt.
+        let measured = out
+            .failed_attempts
+            .get("bad")
+            .expect("the failed model's attempts are kept on the output");
+        // A first-try failure keeps an empty trail, as a first-try success.
+        assert!(measured.attempts.is_empty());
 
         // (c) The downstream closure of the failure is contained — and the
         // blocker is the SQL-`ref()`-only edge to `bad` (dep_of_bad declared no
@@ -41200,6 +41321,8 @@ auto_create_schemas = true
             contained.contains(&"rollup"),
             "rollup must be contained (augmented re-layering ordered it after the producer): {contained:?}"
         );
+        // #2470: the concurrent path keeps the failed model's measurement too.
+        assert!(out.failed_attempts.contains_key("stage_orders"));
         assert!(matches!(
             out.derive_run_status(),
             rocky_core::state::RunStatus::PartialFailure
@@ -47341,6 +47464,7 @@ auto_create_schemas = true
             policy_allows_retry: true,
             budget: &budget,
             breaker: None,
+            failed: Default::default(),
         };
 
         async fn dump(adapter: &DuckDbWarehouseAdapter) -> Vec<Vec<serde_json::Value>> {
