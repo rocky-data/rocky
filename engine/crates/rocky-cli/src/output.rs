@@ -6002,12 +6002,6 @@ pub struct ConnectorLoadInfo {
     pub status: ConnectorLoadStatus,
     /// Attempts that ran, counting the successful one. 0 when skipped.
     pub attempts: u32,
-    /// Files in the verified batch.
-    pub files: usize,
-    /// Rows in the verified batch.
-    pub rows: u64,
-    /// Bytes in the verified batch.
-    pub bytes: u64,
     /// Batches committed before this run.
     pub commit_seq_before: u64,
     /// Batches committed after this run. Equal to `commit_seq_before` unless
@@ -6016,7 +6010,7 @@ pub struct ConnectorLoadInfo {
     /// True when this run took over an expired in-flight claim. A prior run
     /// may then have promoted its batch before it crashed, and this run may
     /// load a duplicate batch.
-    pub adopted_prior_claim: bool,
+    pub adopted_expired_claim: bool,
     /// The hosts the manifest declares. Declared, not enforced.
     pub egress_hosts: Vec<String>,
     /// Why the run failed. Present only when `status` is `failed`.

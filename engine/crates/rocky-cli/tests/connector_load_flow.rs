@@ -27,8 +27,10 @@ use rocky_core::connector::StateEnvelope;
 use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck};
 use rocky_core::state::StateStore;
 
+// Far in the future, so the real clock the promote gate reads is always
+// before every claim expiry.
 fn t0() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 10, 22, 8, 0, 0).unwrap()
+    Utc.with_ymd_and_hms(2099, 10, 22, 8, 0, 0).unwrap()
 }
 
 fn ids(values: &[i64]) -> ArrayRef {
@@ -290,12 +292,14 @@ async fn three_runs_append_two_rows_each_and_advance_the_cursor() {
         outcome.result.as_ref().expect("the run succeeds");
         let connector = info(&outcome);
         assert_eq!(connector.status, ConnectorLoadStatus::Loaded);
-        assert_eq!(connector.files, 2);
-        assert_eq!(connector.rows, 2);
+        let output = outcome.output.as_ref().unwrap();
+        assert_eq!(output.files_loaded, 2);
+        assert_eq!(output.files_failed, 0);
+        assert_eq!(output.total_rows, 2);
         assert_eq!(connector.attempts, 1);
         assert_eq!(connector.commit_seq_before, run - 1);
         assert_eq!(connector.commit_seq_after, run);
-        assert!(!connector.adopted_prior_claim);
+        assert!(!connector.adopted_expired_claim);
         assert_eq!(project.row_count(), Some(expected_rows));
         assert_eq!(project.staging_tables(), 0, "staging is dropped");
     }
@@ -360,6 +364,14 @@ async fn a_second_file_with_other_columns_breaks_staging_and_changes_nothing() {
     let outcome = project.run().await;
     let error = format!("{:#}", outcome.result.as_ref().unwrap_err());
     assert!(error.contains("b.parquet"), "{error}");
+    // A staging failure reports every file as failed, like the directory loader.
+    let output = outcome.output.as_ref().unwrap();
+    assert_eq!(output.files.len(), 2);
+    assert!(output.files.iter().all(|f| f.error.is_some()));
+    assert_eq!(output.files_loaded, 0);
+    assert_eq!(output.files_failed, 2);
+    assert_eq!(output.total_rows, 0);
+    assert_eq!(output.total_bytes, 0);
     assert_eq!(project.row_count(), Some(2), "the target is untouched");
     assert_eq!(project.staging_tables(), 0, "staging is dropped");
     let saved = project.state().unwrap();
@@ -506,7 +518,7 @@ async fn an_expired_claim_is_adopted_with_a_warning_flag() {
     let after_expiry = project.run_at(Some(t0() + ChronoDuration::hours(4))).await;
     after_expiry.result.as_ref().unwrap();
     assert_eq!(info(&after_expiry).status, ConnectorLoadStatus::Loaded);
-    assert!(info(&after_expiry).adopted_prior_claim);
+    assert!(info(&after_expiry).adopted_expired_claim);
     assert_eq!(project.row_count(), Some(2));
 }
 
@@ -563,7 +575,7 @@ async fn a_failed_commit_after_the_promote_leaves_the_claim_in_flight() {
     // After it expires, the run adopts the claim and loads the batch again.
     let after = project.run_at(Some(t0() + ChronoDuration::hours(4))).await;
     after.result.as_ref().unwrap();
-    assert!(info(&after).adopted_prior_claim);
+    assert!(info(&after).adopted_expired_claim);
     assert_eq!(
         project.row_count(),
         Some(4),
@@ -687,7 +699,7 @@ async fn an_empty_batch_still_advances_the_state() {
     let outcome = project.run().await;
     outcome.result.as_ref().unwrap();
     assert_eq!(info(&outcome).status, ConnectorLoadStatus::Loaded);
-    assert_eq!(info(&outcome).files, 0);
+    assert_eq!(outcome.output.as_ref().unwrap().files_loaded, 0);
     assert_eq!(project.row_count(), None, "no rows, so no table");
     assert_eq!(project.state().unwrap().envelope.value["cursor"], 5);
 }
@@ -778,6 +790,10 @@ async fn a_failed_promote_keeps_the_claim_and_does_not_roll_back_drift() {
     let error = format!("{:#}", failed.result.as_ref().unwrap_err());
     assert!(error.contains("promote failed"), "{error}");
     assert!(error.contains("left in flight"), "{error}");
+    let output = failed.output.as_ref().unwrap();
+    assert_eq!(output.files_loaded, 0);
+    assert_eq!(output.files_failed, output.files.len());
+    assert!(output.files_failed > 0);
     assert_eq!(project.row_count(), Some(0), "no rows landed");
     assert!(
         has_column(&project, "extra"),

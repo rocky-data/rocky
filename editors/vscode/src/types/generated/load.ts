@@ -37,15 +37,11 @@ export interface ConnectorLoadInfo {
   /**
    * True when this run took over an expired in-flight claim. A prior run may then have promoted its batch before it crashed, and this run may load a duplicate batch.
    */
-  adopted_prior_claim: boolean;
+  adopted_expired_claim: boolean;
   /**
    * Attempts that ran, counting the successful one. 0 when skipped.
    */
   attempts: number;
-  /**
-   * Bytes in the verified batch.
-   */
-  bytes: number;
   /**
    * Batches committed after this run. Equal to `commit_seq_before` unless `status` is `loaded`.
    */
@@ -63,17 +59,9 @@ export interface ConnectorLoadInfo {
    */
   error?: string | null;
   /**
-   * Files in the verified batch.
-   */
-  files: number;
-  /**
    * The `[connector.<name>]` key.
    */
   name: string;
-  /**
-   * Rows in the verified batch.
-   */
-  rows: number;
   status: ConnectorLoadStatus;
   [k: string]: unknown;
 }

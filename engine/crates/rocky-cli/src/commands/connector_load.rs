@@ -249,9 +249,9 @@ fn print_text(output: &LoadOutput) {
         ConnectorLoadStatus::Loaded => println!(
             "Connector `{}` loaded {} file(s), {} rows, {} bytes ({} attempt(s), commit {} -> {}, {} ms)",
             info.name,
-            info.files,
-            info.rows,
-            info.bytes,
+            output.files_loaded,
+            output.total_rows,
+            output.total_bytes,
             info.attempts,
             info.commit_seq_before,
             info.commit_seq_after,
@@ -291,12 +291,9 @@ pub async fn execute_connector_load(params: &ConnectorLoadParams<'_>) -> Connect
             name: name.to_string(),
             status: ConnectorLoadStatus::Failed,
             attempts: 0,
-            files: 0,
-            rows: 0,
-            bytes: 0,
             commit_seq_before,
             commit_seq_after: commit_seq_before,
-            adopted_prior_claim: false,
+            adopted_expired_claim: false,
             egress_hosts: prepared.manifest.egress_hosts.clone(),
             error: None,
         },
@@ -308,15 +305,27 @@ pub async fn execute_connector_load(params: &ConnectorLoadParams<'_>) -> Connect
     if let Err(e) = &result {
         progress.info.error = Some(format!("{e:#}"));
     }
+    // Count like the directory loader: a file with an error is failed and adds
+    // no rows or bytes. A staging failure marks every file, so the batch
+    // reports `files_loaded = 0` and `files_failed = n`.
+    let files_failed = progress.files.iter().filter(|f| f.error.is_some()).count();
+    let files_loaded = progress.files.len() - files_failed;
+    let (total_rows, total_bytes) = progress
+        .files
+        .iter()
+        .filter(|f| f.error.is_none())
+        .fold((0u64, 0u64), |(r, b), f| {
+            (r + f.rows_loaded, b + f.bytes_read)
+        });
     let output = LoadOutput {
         version: VERSION.into(),
         command: "load".into(),
         source_dir: progress.source_dir,
         format: "parquet".into(),
-        files_loaded: progress.files.len(),
-        files_failed: 0,
-        total_rows: progress.info.rows,
-        total_bytes: progress.info.bytes,
+        files_loaded,
+        files_failed,
+        total_rows,
+        total_bytes,
         files: progress.files,
         duration_ms: start.elapsed().as_millis() as u64,
         connector: Some(progress.info),
@@ -469,7 +478,7 @@ async fn drive(
             // already-expired `Failed` entry, which is adopted without
             // doubt.
             if *prior_state == rocky_core::idempotency::IdempotencyState::InFlight {
-                progress.info.adopted_prior_claim = true;
+                progress.info.adopted_expired_claim = true;
                 warn!(
                     connector = name,
                     prior_run_id = %prior_run_id,
@@ -562,9 +571,6 @@ async fn drive(
     }
     let batch = ran.batch;
     progress.info.attempts = ran.attempts;
-    progress.info.files = batch.files.len();
-    progress.info.rows = batch.total_rows();
-    progress.info.bytes = batch.total_bytes();
     progress.source_dir = batch.scratch.display().to_string();
     let target = &prepared.config.target;
     let target_display = format!("{}.{}.{}", target.catalog, target.schema, target.table);
@@ -606,8 +612,6 @@ async fn drive(
                         f.rows_loaded = 0;
                         f.bytes_read = 0;
                     });
-                    progress.info.rows = 0;
-                    progress.info.bytes = 0;
                     finalize_claim(&claim, params, &run_id, FinalOutcome::Failed).await;
                     return Err(failure.error);
                 }

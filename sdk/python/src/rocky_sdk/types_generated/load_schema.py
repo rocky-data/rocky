@@ -33,17 +33,13 @@ class ConnectorLoadInfo(BaseModel):
     The child connector part of a `rocky load --connector` result.
     """
 
-    adopted_prior_claim: bool
+    adopted_expired_claim: bool
     """
     True when this run took over an expired in-flight claim. A prior run may then have promoted its batch before it crashed, and this run may load a duplicate batch.
     """
     attempts: conint(ge=0)
     """
     Attempts that ran, counting the successful one. 0 when skipped.
-    """
-    bytes: conint(ge=0)
-    """
-    Bytes in the verified batch.
     """
     commit_seq_after: conint(ge=0)
     """
@@ -61,17 +57,9 @@ class ConnectorLoadInfo(BaseModel):
     """
     Why the run failed. Present only when `status` is `failed`.
     """
-    files: conint(ge=0)
-    """
-    Files in the verified batch.
-    """
     name: str
     """
     The `[connector.<name>]` key.
-    """
-    rows: conint(ge=0)
-    """
-    Rows in the verified batch.
     """
     status: ConnectorLoadStatus
 
