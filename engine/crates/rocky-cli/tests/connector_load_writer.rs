@@ -14,13 +14,27 @@ use parquet::arrow::ArrowWriter;
 use rocky_cli::commands::{ConnectorLoadParams, execute_connector_load};
 use rocky_core::config::{ConcurrencyControl, load_rocky_config_fingerprinted};
 use rocky_core::connector::StateEnvelope;
+use rocky_core::fault_store::{FaultMode, FaultOp};
 use rocky_core::state_sync::{LedgerSeamSession, remote_testing};
 use rocky_core::test_harness::CrossPodHarness;
 
 #[tokio::test]
 async fn an_off_writer_is_refused_before_the_claim_when_others_use_cas() {
+    refused_before_the_claim(true, false).await;
+}
+
+/// The marker check cannot finish (the HEAD fails). The connector path
+/// fails closed: nothing has run yet, so a false refusal costs nothing, while
+/// a missed one would load the batch before the commit is refused.
+/// Mutation: make `preflight_writer` non-strict and the run goes on.
+#[tokio::test]
+async fn an_inconclusive_marker_check_refuses_before_the_claim() {
+    refused_before_the_claim(false, true).await;
+}
+
+async fn refused_before_the_claim(seed_marker: bool, fail_head: bool) {
     let _serial = remote_testing::serial_guard();
-    let _harness = CrossPodHarness::new_s3_like();
+    let harness = CrossPodHarness::new_s3_like();
 
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
@@ -92,22 +106,27 @@ target = {{ catalog = "", schema = "main", table = "events" }}
     // Another writer commits by compare-and-swap, which creates the marker.
     let mut cas = loaded.config.state.clone();
     cas.concurrency_control = Some(ConcurrencyControl::Cas);
-    LedgerSeamSession::new(&cas, &state_path, false)
-        .execute(|store, _generation| {
-            let result = store
-                .connector_commit(
-                    "other",
-                    0,
-                    &StateEnvelope {
-                        schema_version: 1,
-                        value: serde_json::Value::Null,
-                    },
-                )
-                .map_err(rocky_core::state_sync::StateSyncError::from);
-            Box::pin(async move { result })
-        })
-        .await
-        .unwrap();
+    if seed_marker {
+        LedgerSeamSession::new(&cas, &state_path, false)
+            .execute(|store, _generation| {
+                let result = store
+                    .connector_commit(
+                        "other",
+                        0,
+                        &StateEnvelope {
+                            schema_version: 1,
+                            value: serde_json::Value::Null,
+                        },
+                    )
+                    .map_err(rocky_core::state_sync::StateSyncError::from);
+                Box::pin(async move { result })
+            })
+            .await
+            .unwrap();
+    }
+    if fail_head {
+        harness.faults.arm(FaultOp::Head, FaultMode::FailAll);
+    }
 
     let params = ConnectorLoadParams::new(&config_path, &loaded, &state_path, "demo");
     let outcome = execute_connector_load(&params).await;

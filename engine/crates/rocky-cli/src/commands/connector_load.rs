@@ -65,6 +65,9 @@ pub struct ConnectorLoadParams<'a> {
     /// The time the promote deadline is checked against. `None` is the real
     /// time. A test moves it past the claim's expiry.
     pub promote_now: Option<DateTime<Utc>>,
+    /// Test seam: act as if a signal arrived just before the promote.
+    #[doc(hidden)]
+    pub interrupt_before_promote: bool,
 }
 
 impl<'a> ConnectorLoadParams<'a> {
@@ -83,6 +86,7 @@ impl<'a> ConnectorLoadParams<'a> {
             now: None,
             output_poll: DEFAULT_OUTPUT_POLL,
             promote_now: None,
+            interrupt_before_promote: false,
         }
     }
 }
@@ -177,7 +181,6 @@ fn resolve_secrets(names: &[String]) -> Result<Vec<(String, String)>> {
 pub fn claim_ttl_hours(wall_time_secs: u64, retries: u32) -> u32 {
     let attempts = u64::from(retries) + 1;
     let secs = wall_time_secs
-        .min(rocky_core::connector::MAX_WALL_TIME_SECS)
         .saturating_mul(attempts)
         .saturating_add(CLAIM_HEADROOM_SECS);
     // At most a year, so a clock addition cannot overflow.
@@ -341,9 +344,6 @@ type Preflight<'a> = (
 async fn preflight<'a>(params: &ConnectorLoadParams<'a>) -> Result<Preflight<'a>> {
     let prepared = prepare(params.config_path, params.loaded, params.name)?;
     let secrets = resolve_secrets(&prepared.config.secrets)?;
-    // The saved state is read BEFORE the claim: the claim key names the
-    // commit sequence this run will extend.
-    let saved = read_saved_state(params.loaded, params.state_path, params.name).await?;
     // Refuse a writer mode the commit would refuse, now. The commit comes
     // after the promote; a refusal there would leave the batch loaded and the
     // claim in flight, and every later run would load it again.
@@ -358,6 +358,9 @@ async fn preflight<'a>(params: &ConnectorLoadParams<'a>) -> Result<Preflight<'a>
         "the state backend refuses this writer before anything runs; fix [state] \
          concurrency_control, or use the setting the other writers use",
     )?;
+    // The saved state is read BEFORE the claim: the claim key names the
+    // commit sequence this run will extend.
+    let saved = read_saved_state(params.loaded, params.state_path, params.name).await?;
     if let Some(saved) = &saved
         && saved.envelope.schema_version > prepared.manifest.state_schema_version
     {
@@ -578,6 +581,7 @@ async fn drive(
             &PromoteGate {
                 deadline,
                 now: params.promote_now,
+                interrupted: params.interrupt_before_promote,
             },
         )
         .await;
@@ -732,6 +736,8 @@ struct PromoteGate {
     deadline: DateTime<Utc>,
     /// The time to compare with `deadline`. `None` is the real time.
     now: Option<DateTime<Utc>>,
+    /// Test seam: act as if a signal arrived before the promote.
+    interrupted: bool,
 }
 
 /// Where a staging, drift or promote failure happened.
@@ -749,6 +755,9 @@ struct StageFailure {
     error: anyhow::Error,
 }
 
+/// Every `?` on an `anyhow` error becomes `BeforePromote`. So no `?` may
+/// follow the point where the promote is sent: an error after that point must
+/// be built as `PromoteIssued` by hand.
 impl From<anyhow::Error> for StageFailure {
     fn from(error: anyhow::Error) -> Self {
         Self {
@@ -853,7 +862,7 @@ async fn stage_and_promote_inner(
     .await?;
 
     // Last checks before the one statement that changes the target.
-    if was_interrupted() {
+    if was_interrupted() || gate.interrupted {
         return Err(
             anyhow!("interrupted by a signal before the promote; the target is unchanged").into(),
         );

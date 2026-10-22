@@ -833,3 +833,35 @@ fn a_huge_wall_time_does_not_overflow_the_claim() {
     assert_eq!(claim_ttl_hours(u64::MAX, u32::MAX), 24 * 366);
     assert_eq!(claim_ttl_hours(0, 0), 1);
 }
+
+/// A signal before the promote is a failure before the promote: staging is
+/// dropped, the claim is freed and the target is untouched.
+#[tokio::test]
+async fn a_signal_before_the_promote_frees_the_claim_and_leaves_the_target_alone() {
+    let project = Project::new("");
+    standard_batches(&project);
+    project.run().await.result.as_ref().unwrap();
+    let loaded = project.loaded();
+    let config_path = project.config_path();
+    let state_path = project.state_path();
+    let mut params = ConnectorLoadParams::new(&config_path, &loaded, &state_path, "demo");
+    params.output_poll = Duration::from_millis(100);
+    params.interrupt_before_promote = true;
+    let outcome = execute_connector_load(&params).await;
+
+    let error = format!("{:#}", outcome.result.as_ref().unwrap_err());
+    assert!(
+        error.contains("interrupted by a signal before the promote"),
+        "{error}"
+    );
+    assert_eq!(info(&outcome).status, ConnectorLoadStatus::Failed);
+    assert_eq!(project.row_count(), Some(2), "the target is untouched");
+    assert_eq!(project.staging_tables(), 0);
+    assert_eq!(project.state().unwrap().commit_seq, 1);
+
+    // The claim was freed, so the next run loads the batch.
+    let again = project.run().await;
+    again.result.as_ref().unwrap();
+    assert_eq!(info(&again).status, ConnectorLoadStatus::Loaded);
+    assert_eq!(project.row_count(), Some(4));
+}

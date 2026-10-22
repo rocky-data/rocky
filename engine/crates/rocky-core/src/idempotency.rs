@@ -1117,12 +1117,18 @@ pub(crate) fn classify_existing(
     // `dedup_on = "success"`) would dedup a later `dedup_on = "any"` run as
     // completed work that never succeeded.
     if prior.expires_at <= now {
-        if prior.state == IdempotencyState::InFlight {
-            info!(
+        match prior.state {
+            IdempotencyState::InFlight => info!(
                 key = %prior.key,
                 prior_run_id = %prior.run_id,
                 "adopting stale InFlight idempotency entry past TTL"
-            );
+            ),
+            IdempotencyState::Succeeded => warn!(
+                key = %prior.key,
+                prior_run_id = %prior.run_id,
+                "adopting an expired Succeeded idempotency entry; the work it recorded will run again"
+            ),
+            IdempotencyState::Failed => {}
         }
         return IdempotencyCheck::AdoptStale {
             prior_run_id: prior.run_id,

@@ -1457,6 +1457,17 @@ async fn refuse_off_writer_at_start(
     cfg: &StateConfig,
     state_path: &Path,
 ) -> Result<(), StateSyncError> {
+    refuse_off_writer(cfg, state_path, false).await
+}
+
+/// [`refuse_off_writer_at_start`], optionally strict. A strict check fails
+/// closed: a marker check that cannot complete is an error, not a warning.
+/// A caller whose upload comes after an effect it cannot undo uses it.
+async fn refuse_off_writer(
+    cfg: &StateConfig,
+    state_path: &Path,
+    strict: bool,
+) -> Result<(), StateSyncError> {
     if matches!(cfg.backend, StateBackend::Local) || cas_effective(cfg) {
         return Ok(());
     }
@@ -1468,6 +1479,7 @@ async fn refuse_off_writer_at_start(
     {
         Ok(()) => Ok(()),
         Err(e @ StateSyncError::CasRequired { .. }) => Err(e),
+        Err(e) if strict => Err(e),
         Err(e) => {
             warn!(
                 error = %e,
@@ -1738,7 +1750,9 @@ impl LedgerSeamSession {
             return Ok(());
         }
         let cfg = resolved_state_config(&self.cfg).await?;
-        refuse_off_writer_at_start(&cfg, &self.state_path).await
+        // Strict: the caller has done nothing yet, so a false refusal costs
+        // nothing, while a missed one costs a duplicate batch.
+        refuse_off_writer(&cfg, &self.state_path, true).await
     }
 
     /// Run a read against the shared state, writing nothing. Local reads the
