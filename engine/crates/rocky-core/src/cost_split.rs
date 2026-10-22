@@ -412,9 +412,11 @@ pub struct NotMeasured {
     /// Tables whose storage before their first measurement this month is
     /// unknown, because history does not reach back far enough.
     pub storage_unknown_tables: u64,
-    /// Distinct tables that in-month executions read but that name no model
-    /// with a recorded version: a source Rocky does not build, or a table
-    /// built before the history Rocky keeps. Their cost is not split.
+    /// Distinct table names (lowercased, as the read named them, so `c.s.t`
+    /// and `s.t` count twice) that in-month executions read but that link to
+    /// no recorded version: a source Rocky does not build, a table that
+    /// matches two models, or a table built before the history Rocky keeps
+    /// or before the reader began. Their cost is not split.
     pub unattributed_read_tables: u64,
 }
 
@@ -527,10 +529,11 @@ impl MonthSplit {
 /// the carry-in measurement before it.
 struct Node {
     model: String,
-    /// Whether readers can link to this node: a successful execution that
-    /// recorded the table it wrote. A failed execution keeps its time but is
-    /// never a version, so it cannot take readers from the last good build or
-    /// close a window.
+    /// Whether readers can link to this node: an execution that recorded the
+    /// table it wrote, whatever its status (a volume breach fails the run but
+    /// still replaces the table). An execution with no recorded target keeps
+    /// its time but is never a version, so it cannot take readers from the
+    /// last good build or close a window.
     is_version: bool,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
@@ -597,7 +600,10 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                     }
                     continue;
                 }
-                let is_version = exec.output_target.is_some() && exec.status != "failed";
+                // A version is an execution that replaced the table, so it needs
+                // a recorded target. A volume breach fails the run but writes
+                // the table, so a failed execution with a target is a version.
+                let is_version = exec.output_target.is_some();
                 let measured = exec.stored_bytes.map(|s| (s.bytes, s.basis));
                 let reads = exec.upstream_reads.as_ref().map(|r| r.reads.clone());
                 if is_version && let Some(&held) = merged.get(&model) {
@@ -792,6 +798,9 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                 chain.partition_point(|&i| nodes[i].finished_at <= node.started_at + CLOCK_SLACK);
             let Some(&version) = chain[..cut].iter().rev().find(|&&i| rank[i] < rank[reader])
             else {
+                // The model has versions, but none had finished before this
+                // read: the table it hit was built before recorded history.
+                unattributed_tables.insert(read.table.to_ascii_lowercase());
                 continue;
             };
             edges[version].push(Edge {

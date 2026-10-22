@@ -12520,9 +12520,11 @@ pub struct CostNotMeasured {
     /// Tables whose storage before their first measurement this month is
     /// unknown, because run history does not reach back far enough.
     pub storage_unknown_tables: u64,
-    /// Distinct tables read this month that name no model with a recorded
-    /// build: a source Rocky does not build, or a table built before the
-    /// history Rocky keeps. Their cost is not split.
+    /// Distinct table names (lowercased, as the read named them, so `c.s.t`
+    /// and `s.t` count twice) read this month that link to no recorded
+    /// build: a source Rocky does not build, a table that matches two
+    /// models, or a table built before the history Rocky keeps or before
+    /// the reader began. Their cost is not split.
     pub unattributed_read_tables: u64,
 }
 

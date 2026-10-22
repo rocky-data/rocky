@@ -1279,50 +1279,79 @@ fn a_model_that_changes_target_mid_month_resolves_both_names() {
 }
 
 #[test]
-fn a_failed_execution_keeps_its_time_but_is_never_a_version() {
-    let failed_with_time = |target: bool| {
-        let mut e = exec("raw", oct(5, 2, 20), 30);
-        e.status = "failed".to_string();
-        if !target {
-            e.output_target = None;
-        }
-        e
-    };
-    for with_target in [true, false] {
-        let runs = vec![
-            run(
-                "good",
-                oct(5, 2, 0),
-                production(),
-                vec![
-                    exec("raw", oct(5, 2, 0), 100),
-                    reads(exec("fct_ltv", oct(5, 2, 10), 0), &[("raw", Some(10), 1)]),
-                ],
-            ),
-            run(
-                "bad",
-                oct(5, 2, 20),
-                production(),
-                vec![
-                    failed_with_time(with_target),
-                    reads(
-                        exec("fct_refunds", oct(5, 2, 30), 0),
-                        &[("raw", Some(10), 1)],
-                    ),
-                ],
-            ),
-        ];
-        let (o, c) = (owners(), BTreeMap::new());
-        let split = split_month(&input(&runs, &[], &o, &c, oct(20, 0, 0)));
-        // The good build's 100 ms is read by both. The failed build's 30 ms
-        // had no reader and stays unallocated (raw has no owner).
-        assert_eq!(upstream_of(&split, "B"), [("raw".to_string(), 50)]);
-        assert_eq!(upstream_of(&split, "C"), [("raw".to_string(), 50)]);
-        assert_eq!(ms(&split.unallocated), 30);
-        // The failed build did not close the good version's window.
-        assert!(split.products["B"].allocated_upstream[0].provisional);
-        assert!(split.invariant_violations().is_empty());
-    }
+fn a_failed_execution_with_no_target_keeps_its_time_but_is_never_a_version() {
+    let mut failed = exec("raw", oct(5, 2, 20), 30);
+    failed.status = "failed".to_string();
+    failed.output_target = None;
+    let runs = vec![
+        run(
+            "good",
+            oct(5, 2, 0),
+            production(),
+            vec![
+                exec("raw", oct(5, 2, 0), 100),
+                reads(exec("fct_ltv", oct(5, 2, 10), 0), &[("raw", Some(10), 1)]),
+            ],
+        ),
+        run(
+            "bad",
+            oct(5, 2, 20),
+            production(),
+            vec![
+                failed,
+                reads(
+                    exec("fct_refunds", oct(5, 2, 30), 0),
+                    &[("raw", Some(10), 1)],
+                ),
+            ],
+        ),
+    ];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, oct(20, 0, 0)));
+    // The good build's 100 ms is read by both. The failed build's 30 ms
+    // had no reader and stays unallocated (raw has no owner).
+    assert_eq!(upstream_of(&split, "B"), [("raw".to_string(), 50)]);
+    assert_eq!(upstream_of(&split, "C"), [("raw".to_string(), 50)]);
+    assert_eq!(ms(&split.unallocated), 30);
+    // The failed build did not close the good version's window.
+    assert!(split.products["B"].allocated_upstream[0].provisional);
+    assert!(split.invariant_violations().is_empty());
+}
+
+#[test]
+fn a_volume_failed_build_replaced_the_table_so_later_readers_pay_for_it() {
+    // A volume breach fails the run but writes the table: the failed build
+    // has a target, so it is a version and the later reader links to it,
+    // not to the overwritten good build.
+    let mut failed = exec("raw", oct(5, 2, 20), 30);
+    failed.status = "failed".to_string();
+    assert!(failed.output_target.is_some());
+    let runs = vec![
+        run(
+            "good",
+            oct(5, 2, 0),
+            production(),
+            vec![exec("raw", oct(5, 2, 0), 100)],
+        ),
+        run(
+            "volume",
+            oct(5, 2, 20),
+            production(),
+            vec![
+                failed,
+                reads(
+                    exec("fct_refunds", oct(5, 2, 30), 0),
+                    &[("raw", Some(10), 1)],
+                ),
+            ],
+        ),
+    ];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, oct(20, 0, 0)));
+    assert_eq!(upstream_of(&split, "C"), [("raw".to_string(), 30)]);
+    // The overwritten good build had no reader.
+    assert_eq!(ms(&split.unallocated), 100);
+    assert!(split.invariant_violations().is_empty());
 }
 
 #[test]

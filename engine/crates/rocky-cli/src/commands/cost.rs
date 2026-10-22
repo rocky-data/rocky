@@ -1937,4 +1937,14 @@ mod tests {
         assert!(msg(go(None, Some("product"), Some("2026-13"))).contains("YYYY-MM"));
         assert!(msg(go(None, Some("product"), Some("26-10"))).contains("YYYY-MM"));
     }
+
+    #[test]
+    fn a_figure_wider_than_u64_is_refused() {
+        let unit = cost_split::Unit::ALL[0];
+        let mut split = cost_split::MonthSplit::default();
+        split.measured_total.insert(unit, u128::from(u64::MAX));
+        assert!(check_fits_u64(&split).is_ok());
+        split.unallocated.insert(unit, u128::from(u64::MAX) + 1);
+        assert!(check_fits_u64(&split).is_err());
+    }
 }
