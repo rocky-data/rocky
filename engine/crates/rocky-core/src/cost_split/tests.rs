@@ -1215,6 +1215,38 @@ fn a_shadow_run_with_another_target_does_not_move_the_table() {
 }
 
 #[test]
+fn a_shadow_target_is_not_a_production_table() {
+    // A production execution reads a table whose name is only a shadow run's
+    // target. It is not a production table, so the read is not attributed.
+    let runs = vec![
+        run(
+            "shadow",
+            oct(1, 0, 0),
+            Some(RunScope::Shadow { schema: None }),
+            vec![in_schema(exec("raw", oct(1, 0, 0), 10), "main_shadow")],
+        ),
+        run(
+            "prod",
+            oct(5, 2, 0),
+            production(),
+            vec![
+                exec("raw", oct(5, 2, 0), 1_000),
+                reads_table(
+                    exec("fct_ltv", oct(5, 3, 0), 0),
+                    "memory.main_shadow.raw",
+                    10,
+                ),
+            ],
+        ),
+    ];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(split.not_measured.unattributed_read_tables, 1);
+    assert!(split.products["B"].allocated_upstream.is_empty());
+    assert_eq!(ms(&split.unallocated), 1_000);
+}
+
+#[test]
 fn a_model_that_changes_target_mid_month_resolves_both_names() {
     let runs = vec![
         run(
