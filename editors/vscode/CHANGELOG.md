@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.0] — 2026-10-23
+
+### Changed
+
+- Generated types updated for the new `rocky cost --month --by product` output and the `rocky load --connector` field in `LoadOutput`.
+
 ## [1.50.0] — 2026-10-16
 
 ### Added

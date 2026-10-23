@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-10-23
+
 ### Added
 
+- `RockyClient.cost_by_product(month)` runs `rocky cost --month YYYY-MM --by product` and returns the generated `ProductMonthCostOutput` (production cost per data product, in physical units). `ProductMonthCostOutput` and its related models are exported from `rocky_sdk.types_generated`.
+- The generated `LoadOutput` gains an optional `connector` (`ConnectorLoadInfo`), the result of `rocky load --connector`.
 - `MaterializationInfo` and the generated run and cost models gain an optional `upstream_reads` (`UpstreamReads`: per upstream table the rows scanned, the projected columns and an estimated byte count). `UpstreamReads` is exported from `rocky_sdk.types`.
 - `RunResult` gains `source_syncs`: one loose `dict` row per source connector the run waited for or started a sync on (`id`, `schema`, `outcome`, `waited_secs`, `last_sync_at`, `triggered`, `detail`). The generated `RunOutput` carries the typed `SourceSyncOutput`.
 - `DiscoverResult` gains `sync_trigger` (default `False`): `True` when the pipeline starts its own source syncs. An orchestrator that reacts to `last_sync_at` should stand down for such a pipeline.
