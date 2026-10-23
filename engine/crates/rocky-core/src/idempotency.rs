@@ -2186,7 +2186,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(verdict, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-old"),
+            matches!(verdict, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-old"),
             "{verdict:?}"
         );
         let held: IdempotencyEntry =
