@@ -157,6 +157,7 @@ pub async fn run_load(
                 total_bytes: 0,
                 files: vec![],
                 duration_ms: start.elapsed().as_millis() as u64,
+                connector: None,
             };
             print_json(&output)?;
         } else {
@@ -477,6 +478,7 @@ pub async fn run_load(
             total_bytes,
             files: file_results,
             duration_ms,
+            connector: None,
         };
         print_json(&output)?;
     } else {
@@ -550,7 +552,7 @@ fn parse_format(format: &str) -> Result<FileFormat> {
 /// Each warehouse adapter has a dedicated `LoaderAdapter` impl with its own
 /// bulk-load semantics (DuckDB COPY, Databricks COPY INTO, Snowflake stages,
 /// BigQuery INSERT fallback).
-fn build_loader(
+pub(crate) fn build_loader(
     adapter_name: &str,
     adapter_cfg: &rocky_core::config::AdapterConfig,
     registry: &AdapterRegistry,
@@ -611,7 +613,7 @@ fn discover_files(
 /// Error carrying the [`ContractResult`] of a failed contract gate so the
 /// caller can surface the specific violations in JSON output.
 #[derive(Debug)]
-struct ContractGateError(ContractResult);
+pub(crate) struct ContractGateError(pub(crate) ContractResult);
 
 impl std::fmt::Display for ContractGateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -635,7 +637,7 @@ impl std::error::Error for ContractGateError {}
 /// Validate the landed staging columns under the rules of the warehouse that
 /// described them. That warehouse decides one reading: a bare BigQuery
 /// `NUMERIC` is `NUMERIC(38, 9)` (#1856).
-fn validate_landed_contract(
+pub(crate) fn validate_landed_contract(
     contract: &ContractConfig,
     landed: &[rocky_ir::ColumnInfo],
     dialect: &dyn rocky_core::traits::SqlDialect,
@@ -807,7 +809,7 @@ async fn load_with_contract_gate(
 
 /// Convert an adapter-SDK [`TableRef`] into the rocky-ir `TableRef` that the
 /// `WarehouseAdapter` trait consumes.
-fn to_ir_table_ref(t: &TableRef) -> rocky_ir::TableRef {
+pub(crate) fn to_ir_table_ref(t: &TableRef) -> rocky_ir::TableRef {
     rocky_ir::TableRef {
         catalog: t.catalog.clone(),
         schema: t.schema.clone(),

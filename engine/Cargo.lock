@@ -4203,6 +4203,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "criterion",
+ "duckdb",
  "flate2",
  "fs4",
  "futures",

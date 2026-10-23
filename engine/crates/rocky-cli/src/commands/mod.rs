@@ -20,6 +20,7 @@ mod compare;
 mod compile;
 mod completions;
 mod compliance;
+mod connector_load;
 mod containment;
 mod cost;
 mod dag;
@@ -149,6 +150,10 @@ pub use compile::{
 };
 pub use completions::run_completions;
 pub use compliance::{compute_compliance, run_compliance};
+pub use connector_load::{
+    ConnectorLoadOutcome, ConnectorLoadParams, claim_key, claim_ttl_hours, execute_connector_load,
+    run_connector_load,
+};
 pub use cost::{CostGroupBy, compute_cost, compute_month_cost, run_cost};
 pub use dag::{dag_output, run_dag};
 pub use discover::discover;

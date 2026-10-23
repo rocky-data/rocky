@@ -264,6 +264,7 @@ rocky load [flags]
 | `--target <NAME>` | from the file name | Target table name. Every file in the directory goes to this one table. |
 | `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
 | `--truncate` | off | Empty the target table before each file loads. Read the warning below first. |
+| `--connector <NAME>` | | Run the [child connector](/guides/child-connectors/) `[connector.NAME]` once and load the Parquet files it writes. Cannot be combined with `--source-dir`, `--format`, `--target`, `--pipeline` or `--truncate`. |
 
 ```bash
 rocky load --source-dir data/dropbox/ --format parquet

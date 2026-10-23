@@ -1401,6 +1401,15 @@ enum Command {
         /// Truncate target table(s) before loading
         #[arg(long)]
         truncate: bool,
+        /// Run the child connector `[connector.<name>]` once and load the
+        /// Parquet files it writes into its target table. Cannot be combined
+        /// with the per-file options above.
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["source_dir", "format", "target", "pipeline", "truncate"]
+        )]
+        connector: Option<String>,
     },
 
     /// Load CSV seed files into the warehouse
@@ -4972,6 +4981,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             target,
             pipeline,
             truncate,
+            connector,
         } => {
             // WP-01 PR-B (2b): load the fingerprinted snapshot ONCE and thread
             // it (#1120 — `run_load` no longer self-loads), plus the SAME
@@ -4982,20 +4992,31 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // configured `[state] on_upload_failure` (`ConfigDefault`).
             let loaded = rocky_core::config::load_rocky_config_fingerprinted(&cli.config)
                 .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
-            rocky_cli::commands::run_load(
-                &cli.config,
-                &loaded,
-                &state_path,
-                source_dir.as_deref(),
-                format.as_deref(),
-                target.as_deref(),
-                pipeline.as_deref(),
-                truncate,
-                rocky_core::state_sync::FinalizeDurability::ConfigDefault,
-                json,
-                None, // `rocky load` owns no signal listener
-            )
-            .await
+            if let Some(connector) = connector {
+                rocky_cli::commands::run_connector_load(
+                    &cli.config,
+                    &loaded,
+                    &state_path,
+                    &connector,
+                    json,
+                )
+                .await
+            } else {
+                rocky_cli::commands::run_load(
+                    &cli.config,
+                    &loaded,
+                    &state_path,
+                    source_dir.as_deref(),
+                    format.as_deref(),
+                    target.as_deref(),
+                    pipeline.as_deref(),
+                    truncate,
+                    rocky_core::state_sync::FinalizeDurability::ConfigDefault,
+                    json,
+                    None, // `rocky load` owns no signal listener
+                )
+                .await
+            }
         }
         Command::Seed {
             seeds,

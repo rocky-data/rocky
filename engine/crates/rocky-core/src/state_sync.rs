@@ -1457,6 +1457,17 @@ async fn refuse_off_writer_at_start(
     cfg: &StateConfig,
     state_path: &Path,
 ) -> Result<(), StateSyncError> {
+    refuse_off_writer(cfg, state_path, false).await
+}
+
+/// [`refuse_off_writer_at_start`], optionally strict. A strict check fails
+/// closed: a marker check that cannot complete is an error, not a warning.
+/// A caller whose upload comes after an effect it cannot undo uses it.
+async fn refuse_off_writer(
+    cfg: &StateConfig,
+    state_path: &Path,
+    strict: bool,
+) -> Result<(), StateSyncError> {
     if matches!(cfg.backend, StateBackend::Local) || cas_effective(cfg) {
         return Ok(());
     }
@@ -1468,6 +1479,7 @@ async fn refuse_off_writer_at_start(
     {
         Ok(()) => Ok(()),
         Err(e @ StateSyncError::CasRequired { .. }) => Err(e),
+        Err(e) if strict => Err(e),
         Err(e) => {
             warn!(
                 error = %e,
@@ -1719,6 +1731,56 @@ impl LedgerSeamSession {
         }
 
         unreachable!("ledger-seam attempt loop always returns within the for body")
+    }
+
+    /// The refusals [`execute`][Self::execute] makes before it does any work,
+    /// run on their own: the mode resolution (an explicit `cas` on a store
+    /// that ignores conditional writes is refused) and the `cas-required`
+    /// marker check (an `off` writer is refused when other writers use CAS).
+    ///
+    /// A caller whose transition comes after an effect it cannot undo, such
+    /// as a warehouse write, calls this first. Otherwise the refusal would
+    /// arrive after the effect. Local state needs no check.
+    ///
+    /// # Errors
+    ///
+    /// [`StateSyncError::CasUnsupported`] and [`StateSyncError::CasRequired`].
+    /// This check is strict: a marker check that cannot finish also fails,
+    /// with the transfer or timeout error (for example
+    /// [`StateSyncError::Timeout`] or an object-store error). The caller
+    /// should retry later.
+    pub async fn preflight_writer(&self) -> Result<(), StateSyncError> {
+        if matches!(self.cfg.backend, StateBackend::Local) {
+            return Ok(());
+        }
+        let cfg = resolved_state_config(&self.cfg).await?;
+        // Strict: the caller has done nothing yet, so a false refusal costs
+        // nothing, while a missed one costs a duplicate batch.
+        refuse_off_writer(&cfg, &self.state_path, true).await
+    }
+
+    /// Run a read against the shared state, writing nothing. Local reads the
+    /// ledger file, or an empty store when the file does not exist yet. A
+    /// remote backend downloads the shared blob first, then reads it. Nothing
+    /// is uploaded.
+    ///
+    /// Like [`read_environment`][Self::read_environment], it skips config
+    /// resolution and the writer check, so it is for reads only.
+    ///
+    /// # Errors
+    ///
+    /// Download and store errors. A failed download is an error and not an
+    /// empty answer: the caller must not act on state it could not read.
+    pub async fn read_state<T>(
+        &self,
+        read: impl FnOnce(&StateStore) -> Result<T, crate::state::StateError>,
+    ) -> Result<T, StateSyncError> {
+        if !matches!(self.cfg.backend, StateBackend::Local) {
+            let _authority =
+                download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await?;
+        }
+        let store = StateStore::open_read_only_or_empty(&self.state_path)?;
+        Ok(read(&store)?)
     }
 
     /// Read one environment's head from the shared state, writing nothing.
@@ -10782,5 +10844,116 @@ mod private_mode_tests {
         write_state_bytes(&fresh, b"bytes").await.unwrap();
         assert_eq!(mode_of(&fresh).unwrap(), 0o600);
         assert_eq!(std::fs::read(&fresh).unwrap(), b"bytes");
+    }
+}
+
+#[cfg(test)]
+mod connector_commit_tests {
+    use super::*;
+    use crate::connector::{ConnectorStateRecord, StateEnvelope};
+    use crate::test_harness::CrossPodHarness;
+
+    fn envelope(cursor: u64) -> StateEnvelope {
+        StateEnvelope {
+            schema_version: 1,
+            value: serde_json::json!({ "cursor": cursor }),
+        }
+    }
+
+    /// Commit through the ledger seam, the way `rocky load --connector` does.
+    async fn commit(
+        cfg: &StateConfig,
+        path: &Path,
+        expected_seq: u64,
+        cursor: u64,
+    ) -> Result<u64, StateSyncError> {
+        let session = LedgerSeamSession::new(cfg, path, false);
+        let env = envelope(cursor);
+        session
+            .execute(|store, _generation| {
+                let result = store
+                    .connector_commit("demo", expected_seq, &env)
+                    .map_err(StateSyncError::from);
+                Box::pin(async move { result })
+            })
+            .await
+    }
+
+    async fn saved(cfg: &StateConfig, path: &Path) -> Option<ConnectorStateRecord> {
+        LedgerSeamSession::new(cfg, path, false)
+            .read_state(|store| store.connector_state_get("demo"))
+            .await
+            .unwrap()
+    }
+
+    /// An `off` writer is refused by the preflight when the `cas-required`
+    /// marker exists, before any caller effect. Mutation: make
+    /// `preflight_writer` return `Ok(())` and this passes through.
+    #[tokio::test]
+    async fn the_preflight_refuses_an_off_writer_when_the_marker_exists() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut h = CrossPodHarness::new_s3_like();
+        h.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        // A CAS commit creates the marker.
+        commit(&h.pod_a.cfg, &h.pod_a.state_path, 0, 1)
+            .await
+            .unwrap();
+
+        let mut off = h.pod_b.cfg.clone();
+        off.concurrency_control = Some(ConcurrencyControl::Off);
+        let session = LedgerSeamSession::new(&off, &h.pod_b.state_path, false);
+        let err = session.preflight_writer().await.unwrap_err();
+        assert!(matches!(err, StateSyncError::CasRequired { .. }), "{err:?}");
+
+        let session = LedgerSeamSession::new(&h.pod_a.cfg, &h.pod_a.state_path, false);
+        session
+            .preflight_writer()
+            .await
+            .expect("a CAS writer passes");
+    }
+
+    /// Two pods read commit sequence 0 and both try to commit batch 1. The
+    /// second is refused with the typed conflict, and the remote keeps the
+    /// first one's state. Mutation: drop the sequence check in
+    /// `connector_commit_with_files` and the second commit lands.
+    #[tokio::test]
+    async fn a_commit_is_refused_when_another_pod_moved_the_sequence() {
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut h = CrossPodHarness::new_s3_like();
+        h.pod_a.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+        h.pod_b.cfg.concurrency_control = Some(ConcurrencyControl::Cas);
+
+        // Both pods read the sequence before either commits.
+        assert!(saved(&h.pod_a.cfg, &h.pod_a.state_path).await.is_none());
+        assert!(saved(&h.pod_b.cfg, &h.pod_b.state_path).await.is_none());
+
+        assert_eq!(
+            commit(&h.pod_b.cfg, &h.pod_b.state_path, 0, 10)
+                .await
+                .unwrap(),
+            1
+        );
+        match commit(&h.pod_a.cfg, &h.pod_a.state_path, 0, 99).await {
+            Err(StateSyncError::State(crate::state::StateError::ConnectorCommitConflict {
+                expected,
+                found,
+                ..
+            })) => assert_eq!((expected, found), (0, 1)),
+            other => panic!("expected the typed conflict, got {other:?}"),
+        }
+
+        let remote = saved(&h.pod_a.cfg, &h.pod_a.state_path).await.unwrap();
+        assert_eq!(remote.commit_seq, 1);
+        assert_eq!(remote.envelope.value["cursor"], 10, "the winner's state");
+
+        // The loser can commit its batch on top, once it has read sequence 1.
+        assert_eq!(
+            commit(&h.pod_a.cfg, &h.pod_a.state_path, 1, 20)
+                .await
+                .unwrap(),
+            2
+        );
     }
 }

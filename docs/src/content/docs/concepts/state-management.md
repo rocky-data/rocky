@@ -51,6 +51,8 @@ Schema v32 adds two tables, `environments` and `publish_history`. A v31 store op
 
 Schema v33 marks a `rocky review --approve` row in the policy-decision ledger as an approval. An engine at v32 would read that row as a policy `allow` and count it in the scorecard and the brief, so v33 is a bump. A v32 store opened for writing gets the v33 stamp and keeps every record; no table changes. During a rolling upgrade, a v32 process keeps reading and writing the `v32/` remote key. After the first v33 upload, a row that a v32 process records there, such as a freeze, is not seen by the v33 processes until that process upgrades.
 
+Schema v34 adds one table, `connector_state`. It holds the saved state and the committed batch count of each [child connector](/guides/child-connectors/). A v33 store opened for writing gets the empty table and the v34 stamp, and keeps every record. A read-only command on a store stamped below v34 reads the table as empty. A store stamped v34 that lacks it is refused. The table replicates with the rest of the shared state. An engine at v33 refuses a v34 store when it opens it, as above. During a rolling upgrade, a v33 process keeps reading and writing the `v33/` remote key.
+
 ### Environments (state only, preview)
 
 From v32, the engine API can record **environments**: named sets of pointers, such as `staging` or `prod`. Each pointer names a model and the output version that one run recorded for it. A publish moves pointers and appends one row to the publish history. There is no CLI verb yet.
@@ -324,16 +326,16 @@ If the download fails, Rocky logs a warning and starts fresh from target-table m
 
 ### What a Schema Upgrade Does to Remote State
 
-This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v33/state.redb` on S3 or GCS and `<valkey_prefix>v33:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
+This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v34/state.redb` on S3 or GCS and `<valkey_prefix>v34:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
 
 When the current key is absent, Rocky looks for an older key. It probes older versions newest first, down to `v22`, and restores the first one it finds. The run then opens that state, migrates it in place, and uploads it under the current key. The policy ledger, the run history, and the watermarks all carry over.
 
 ```
-   download: v33 key? ── present ──▶ restore v33
+   download: v34 key? ── present ──▶ restore v34
                  │
                absent
                  ▼
-             v32 key? ── present ──▶ restore v32, upload writes v33
+             v33 key? ── present ──▶ restore v33, upload writes v34
                  │
                absent
                  ▼

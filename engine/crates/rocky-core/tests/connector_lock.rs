@@ -90,7 +90,7 @@ async fn a_crashed_claim_is_adopted_only_after_it_expires() {
         .await
         .unwrap();
     assert!(
-        matches!(late, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        matches!(late, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
         "{late:?}"
     );
 }
@@ -175,7 +175,7 @@ async fn a_succeeded_entry_past_its_expiry_is_adopted() {
         .await
         .unwrap();
     assert!(
-        matches!(past, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-a"),
+        matches!(past, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
         "{past:?}"
     );
 }

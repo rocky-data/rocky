@@ -2261,6 +2261,7 @@ mod tests {
         }
         RockyConfig {
             residency: None,
+            connectors: Default::default(),
             contracts: Default::default(),
             state: StateConfig::default(),
             adapters: IndexMap::new(),

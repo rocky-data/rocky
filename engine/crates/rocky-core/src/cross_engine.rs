@@ -613,6 +613,7 @@ mod tests {
         }
         RockyConfig {
             residency: None,
+            connectors: Default::default(),
             contracts: Default::default(),
             state: Default::default(),
             adapters: adapter_map,

@@ -248,6 +248,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ListPipelinesOutput": ("list_pipelines_schema", "ListPipelinesOutput"),
     "ListSourceEntry": ("list_sources_schema", "ListSourceEntry"),
     "ListSourcesOutput": ("list_sources_schema", "ListSourcesOutput"),
+    "ConnectorLoadInfo": ("load_schema", "ConnectorLoadInfo"),
+    "ConnectorLoadStatus": ("load_schema", "ConnectorLoadStatus"),
     "LoadFileOutput": ("load_schema", "LoadFileOutput"),
     "LoadOutput": ("load_schema", "LoadOutput"),
     "MaterializationMetadata": ("run_schema", "MaterializationMetadata"),
@@ -886,6 +888,8 @@ if TYPE_CHECKING:
         ScheduleHoldOutput,
     )
     from .load_schema import (
+        ConnectorLoadInfo,
+        ConnectorLoadStatus,
         ContractResult,
         ContractViolation,
         LoadFileOutput,
@@ -1249,6 +1253,8 @@ __all__ = [
     "SeedTableOutput",
     "LoadOutput",
     "LoadFileOutput",
+    "ConnectorLoadInfo",
+    "ConnectorLoadStatus",
     # `rocky list pipelines / adapters / models / sources` (#1760).
     "ListPipelinesOutput",
     "ListPipelineEntry",

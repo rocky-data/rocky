@@ -155,8 +155,15 @@ pub enum IdempotencyCheck {
     /// Prior entry was `InFlight` but past its TTL (crashed-pod corpse).
     /// The caller replaced it with a fresh `InFlight` stamp and should
     /// proceed. The prior `run_id` is surfaced so logs / `rocky history`
-    /// can cross-reference.
-    AdoptStale { prior_run_id: String },
+    /// can cross-reference. `prior_state` is the state the replaced entry
+    /// was in: only an `InFlight` one means a run may have died holding the
+    /// claim. A `Failed` entry that a failed run left (the object-store
+    /// finalize writes it already expired) is adopted too, and needs no
+    /// warning.
+    AdoptStale {
+        prior_run_id: String,
+        prior_state: IdempotencyState,
+    },
 }
 
 impl IdempotencyCheck {
@@ -709,6 +716,7 @@ fn classify_valkey_raw(raw: &[u8], key: &str, new_entry: &IdempotencyEntry) -> I
             );
             IdempotencyCheck::AdoptStale {
                 prior_run_id: "<corrupt>".to_string(),
+                prior_state: IdempotencyState::InFlight,
             }
         }
     }
@@ -1029,6 +1037,7 @@ async fn object_store_check_and_claim(
                 );
                 IdempotencyCheck::AdoptStale {
                     prior_run_id: "<corrupt>".to_string(),
+                    prior_state: IdempotencyState::InFlight,
                 }
             }
         };
@@ -1266,15 +1275,22 @@ pub(crate) fn classify_existing(
     // `dedup_on = "success"`) would dedup a later `dedup_on = "any"` run as
     // completed work that never succeeded.
     if prior.expires_at <= now {
-        if prior.state == IdempotencyState::InFlight {
-            info!(
+        match prior.state {
+            IdempotencyState::InFlight => info!(
                 key = %prior.key,
                 prior_run_id = %prior.run_id,
                 "adopting stale InFlight idempotency entry past TTL"
-            );
+            ),
+            IdempotencyState::Succeeded => warn!(
+                key = %prior.key,
+                prior_run_id = %prior.run_id,
+                "adopting an expired Succeeded idempotency entry; the work it recorded will run again"
+            ),
+            IdempotencyState::Failed => {}
         }
         return IdempotencyCheck::AdoptStale {
             prior_run_id: prior.run_id,
+            prior_state: prior.state,
         };
     }
     classify_live(prior, new_entry)
@@ -1300,6 +1316,7 @@ pub(crate) fn classify_live(
             // cross-reference.
             DedupPolicy::Success => IdempotencyCheck::AdoptStale {
                 prior_run_id: prior.run_id,
+                prior_state: IdempotencyState::Failed,
             },
         },
         IdempotencyState::InFlight => IdempotencyCheck::SkipInFlight {
@@ -1366,6 +1383,29 @@ mod tests {
         }
     }
 
+    /// An adopted entry reports the state it was in, so a caller can tell a
+    /// run that died holding the claim (`InFlight`) from a run that ended
+    /// cleanly (`Failed`, which the object-store finalize writes already
+    /// expired). Mutation: report `InFlight` for every adoption.
+    #[test]
+    fn adopting_reports_the_state_of_the_prior_entry() {
+        let now = Utc::now();
+        let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
+        for (state, ttl, age) in [
+            (IdempotencyState::InFlight, 1, 5),
+            (IdempotencyState::Failed, 1, 5),
+            (IdempotencyState::Failed, 24, 1),
+        ] {
+            let prior = mk_entry("run-prior", state, now - chrono::Duration::hours(age), ttl);
+            match classify_existing(prior, now, &new) {
+                IdempotencyCheck::AdoptStale { prior_state, .. } => {
+                    assert_eq!(prior_state, state);
+                }
+                other => panic!("expected AdoptStale, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn classify_succeeded_always_skips() {
         let now = Utc::now();
@@ -1394,7 +1434,9 @@ mod tests {
         let mut new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
         new.dedup_on = DedupPolicy::Success;
         match classify_existing(prior, now, &new) {
-            IdempotencyCheck::AdoptStale { prior_run_id } => assert_eq!(prior_run_id, "run-prior"),
+            IdempotencyCheck::AdoptStale { prior_run_id, .. } => {
+                assert_eq!(prior_run_id, "run-prior")
+            }
             other => panic!("expected AdoptStale, got {other:?}"),
         }
     }
@@ -1444,7 +1486,9 @@ mod tests {
         );
         let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
         match classify_existing(prior, now, &new) {
-            IdempotencyCheck::AdoptStale { prior_run_id } => assert_eq!(prior_run_id, "run-prior"),
+            IdempotencyCheck::AdoptStale { prior_run_id, .. } => {
+                assert_eq!(prior_run_id, "run-prior")
+            }
             other => panic!("expected AdoptStale, got {other:?}"),
         }
     }
@@ -1454,7 +1498,8 @@ mod tests {
         assert!(!IdempotencyCheck::Proceed.is_skip());
         assert!(
             !IdempotencyCheck::AdoptStale {
-                prior_run_id: "x".into()
+                prior_run_id: "x".into(),
+                prior_state: IdempotencyState::InFlight,
             }
             .is_skip()
         );
@@ -1778,7 +1823,9 @@ mod tests {
         );
         let new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
         match classify_existing(prior, now, &new) {
-            IdempotencyCheck::AdoptStale { prior_run_id } => assert_eq!(prior_run_id, "run-prior"),
+            IdempotencyCheck::AdoptStale { prior_run_id, .. } => {
+                assert_eq!(prior_run_id, "run-prior")
+            }
             other => panic!("expected AdoptStale, got {other:?}"),
         }
     }
@@ -1795,7 +1842,9 @@ mod tests {
         let mut new = mk_entry("run-new", IdempotencyState::InFlight, now, 24);
         new.dedup_on = DedupPolicy::Any;
         match classify_existing(prior, now, &new) {
-            IdempotencyCheck::AdoptStale { prior_run_id } => assert_eq!(prior_run_id, "run-prior"),
+            IdempotencyCheck::AdoptStale { prior_run_id, .. } => {
+                assert_eq!(prior_run_id, "run-prior")
+            }
             other => panic!("expected AdoptStale, got {other:?}"),
         }
     }
@@ -2137,7 +2186,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(verdict, IdempotencyCheck::AdoptStale { ref prior_run_id } if prior_run_id == "run-old"),
+            matches!(verdict, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-old"),
             "{verdict:?}"
         );
         let held: IdempotencyEntry =

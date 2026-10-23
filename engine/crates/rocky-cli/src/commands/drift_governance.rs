@@ -687,6 +687,7 @@ mod tests {
     fn cfg_opt_in_no_policy() -> RockyConfig {
         RockyConfig {
             residency: None,
+            connectors: Default::default(),
             contracts: Default::default(),
             state: Default::default(),
             adapters: Default::default(),

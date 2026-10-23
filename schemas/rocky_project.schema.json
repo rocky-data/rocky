@@ -769,6 +769,138 @@
       ],
       "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency."
     },
+    "ConnectorConfig": {
+      "additionalProperties": false,
+      "description": "`[connector.<name>]`: one child connector.\n\n```toml [connector.stripe_charges] manifest   = \"connectors/stripe/connector.toml\" output_uri = \"file://./.rocky/landing/stripe\" secrets    = [\"STRIPE_API_KEY\"] target     = { catalog = \"raw\", schema = \"stripe\", table = \"charges\" } ```",
+      "properties": {
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContractConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional data contract, checked on the staging table before the rows reach the target. The same type load pipelines use."
+        },
+        "limits": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectorLimitsConfig"
+            }
+          ],
+          "description": "Limits for one attempt. The smaller of this and the manifest's limits wins for each key."
+        },
+        "manifest": {
+          "description": "Path to the connector's `connector.toml`, relative to the directory that holds `rocky.toml`.",
+          "type": "string"
+        },
+        "output_uri": {
+          "description": "Where the connector writes. Only `file://` is supported. A relative path is relative to the directory that holds `rocky.toml`. Each attempt gets its own new directory inside it.",
+          "type": "string"
+        },
+        "retries": {
+          "description": "How many times to run the connector again after a failed attempt. Default 1. At most 10.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "secrets": {
+          "description": "Names of environment variables to hand to the connector. Rocky reads the values from its own environment. The child sees no other variable except `PATH`, `LANG`, `HOME`, `TMPDIR` and `ROCKY_RUN_ID`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "target": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectorTargetConfig"
+            }
+          ],
+          "description": "The table the rows land in."
+        }
+      },
+      "required": [
+        "manifest",
+        "output_uri",
+        "target"
+      ],
+      "type": "object"
+    },
+    "ConnectorLimitsConfig": {
+      "additionalProperties": false,
+      "description": "The four limits for one attempt. Every key is optional.",
+      "properties": {
+        "cpu_time_secs": {
+          "description": "CPU seconds one attempt may use. Default: no limit.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "memory_bytes": {
+          "description": "Address-space bytes. Default: no limit. Linux enforces it. macOS often refuses the limit, and Rocky then runs the child without it.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output_bytes": {
+          "description": "Bytes one attempt may write in total. Default 5 GiB.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "wall_time_secs": {
+          "description": "Wall-clock seconds one attempt may run. Default 3600.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ConnectorTargetConfig": {
+      "additionalProperties": false,
+      "description": "`target` of a connector: the table it fills.",
+      "properties": {
+        "adapter": {
+          "default": "default",
+          "description": "Name of the warehouse adapter (a key under `[adapter.*]`).",
+          "type": "string"
+        },
+        "catalog": {
+          "description": "Target catalog.",
+          "type": "string"
+        },
+        "schema": {
+          "description": "Target schema.",
+          "type": "string"
+        },
+        "table": {
+          "description": "Target table.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog",
+        "schema",
+        "table"
+      ],
+      "type": "object"
+    },
     "ContractConfig": {
       "description": "Data contract configuration — enforced at copy/load time.",
       "properties": {
@@ -5007,6 +5139,13 @@
         "allow_unmasked": []
       },
       "description": "Advisory settings for column classification — currently just the `allow_unmasked` list that suppresses W004 warnings."
+    },
+    "connector": {
+      "additionalProperties": {
+        "$ref": "#/definitions/ConnectorConfig"
+      },
+      "description": "`[connector.<name>]` — child connectors run by `rocky load --connector <name>`. Empty by default, and the key is not serialized when empty, so a project without connectors keeps its config snapshot byte-identical. See [`crate::connector::ConnectorConfig`].",
+      "type": "object"
     },
     "contracts": {
       "allOf": [

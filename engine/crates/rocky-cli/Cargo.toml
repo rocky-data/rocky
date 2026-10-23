@@ -93,6 +93,8 @@ fs4 = { workspace = true }
 reqwest = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
+# `connector_load_flow` reads the loaded table back from a DuckDB file.
+duckdb = { workspace = true }
 
 [[bench]]
 name = "compile"

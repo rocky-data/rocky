@@ -29,6 +29,7 @@ One row per top-level block:
 | [`[adapter.NAME]`](#adaptername) | One named connection to a warehouse or a source. |
 | [`[pipeline.NAME]`](#pipelinename) | One unit of work: source, target, checks, execution, schedule. |
 | [`[state]`](#state) | Where watermarks and run history live between runs. |
+| [`[connector.NAME]`](#connectorname) | One child connector: a program you supply, run by `rocky load --connector`. |
 | [`[run]`](#run) | Skip models that did not change. Off by default. |
 | [`[reuse]`](#reuse) | Reuse work for content-addressed models. |
 | [`[resilience]`](#resilience) | Retry a model that failed for a transient reason. On by default. |
@@ -1514,6 +1515,34 @@ The `regions...` component in a `schema_pattern` is a different thing: it names 
 ## `[fulfill]`
 
 Configure the agent driver for the experimental `rocky fulfill` loop. The deterministic commands never read this block. Rocky refuses an unknown field here. See [`rocky fulfill` configuration](/reference/commands/fulfill/#configuration) for the fields and the sandbox caveats.
+
+---
+
+## `[connector.NAME]`
+
+Declare a child connector: a program that Rocky runs once and whose Parquet output it loads into one table. Rocky refuses an unknown key here. The [child connectors guide](/guides/child-connectors/) explains the manifest, the limits and the guarantees.
+
+```toml
+[connector.stripe_charges]
+manifest   = "connectors/stripe/connector.toml"
+output_uri = "file://./.rocky/landing/stripe"
+secrets    = ["STRIPE_API_KEY"]
+target     = { catalog = "raw", schema = "stripe", table = "charges" }
+retries    = 1
+
+[connector.stripe_charges.limits]
+wall_time_secs = 3600
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `manifest` | none | Path to `connector.toml`, relative to the directory of `rocky.toml`. |
+| `output_uri` | none | `file://` only. `s3://` and `gs://` are refused as "not supported yet". |
+| `secrets` | `[]` | Names of environment variables to hand to the program. |
+| `target` | none | `catalog`, `schema` and `table`. `adapter` defaults to `default`. A BigQuery adapter is refused. |
+| `retries` | `1` | Extra attempts after a failed one. At most `10`. |
+| `contract` | none | A data contract, checked on the staging table. |
+| `limits` | see guide | `wall_time_secs` (3600), `cpu_time_secs`, `memory_bytes`, `output_bytes` (5 GiB). The smaller of this and the manifest wins. |
 
 ---
 
