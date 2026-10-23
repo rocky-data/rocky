@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.74.0] — 2026-10-23
+
+Pairs with engine 1.89.0. Needs `rocky-sdk>=0.29.0`, so the floor rises from `0.28.0`.
+
 ### Added
 
+- `RockyResource.cost_by_product(month)` delegates to `RockyClient.cost_by_product` (`rocky cost --month YYYY-MM --by product`).
 - `rocky_source_sensor` stands down when the Rocky pipeline starts its own Fivetran syncs (`rocky discover` reports `sync_trigger: true`). Rocky advances each connector's `last_sync_at` itself in that case, so reacting to it would start a second run for every sync. The sensor still advances its cursor, emits no `RunRequest` and skips the tick with a reason. Pass `include_rocky_triggered=True` to keep the old behaviour. A sync that Fivetran starts on its own schedule no longer fires the sensor for such a pipeline; the next Rocky run picks it up. `DiscoverResult.sync_trigger` needs `rocky-sdk` with the field; an older binary or SDK reads as `False` and the sensor is unchanged. The other direction of skew is not covered: a new engine with an older `dagster-rocky` has no stand-down, so its sensor keeps firing a second run for every sync Rocky starts. Upgrade `dagster-rocky` together with the engine, or set `trigger = false` on pipelines that a sensor watches.
 
 ## [1.73.0] — 2026-10-21
