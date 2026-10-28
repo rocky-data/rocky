@@ -12132,6 +12132,44 @@ fn record_contained_cause(
     containment.poison(model_name);
 }
 
+/// Handle a model failure that the retry loop did not run: fire the
+/// `model_error` hook, keep the model's measured time, then contain it or stop.
+///
+/// Returns `Ok(())` when the failure was contained (the caller moves on to the
+/// next model) and `Err` when the run must stop at this model, with
+/// `fail_fast_model` set so the run record stores the failure under its own
+/// name (#2470).
+#[allow(clippy::too_many_arguments)]
+async fn fail_unretried_model(
+    output: &mut RunOutput,
+    containment: &mut super::containment::ContainmentLedger,
+    hook_registry: Option<&HookRegistry>,
+    pipeline_name: Option<&str>,
+    run_id: &str,
+    model_name: &str,
+    duration_ms: u64,
+    contain_failures: bool,
+    err: anyhow::Error,
+) -> Result<()> {
+    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+        let _ = reg
+            .fire(&HookContext::model_error(
+                run_id,
+                pipe,
+                model_name,
+                &format!("{err:#}"),
+            ))
+            .await;
+    }
+    output.record_unretried_failure(model_name, duration_ms);
+    if contain_failures {
+        record_contained_cause(output, containment, model_name, &err);
+        return Ok(());
+    }
+    output.fail_fast_model = Some(model_name.to_string());
+    Err(err)
+}
+
 /// Resolve the `(reuse_enabled, column_level_enabled)` gates a supervised
 /// backfill hands to [`execute_models`].
 ///
@@ -14649,12 +14687,35 @@ async fn execute_models_phase(
                 // real CLI path (every evaluation fell through to build). The
                 // seeded typed IR (typed from the reviewed source-schema
                 // snapshot #2) is what the column-skip decision consumes (#3).
-                let model_ir = typed_model_ir(
+                // A failure here is this model's failure, handled as the
+                // content-addressed arm below handles the same failure: its
+                // name and time reach the run record (#2470). The gate is on
+                // by default, so this is the first site to build the IR.
+                let typed_ir_start = Instant::now();
+                let model_ir = match typed_model_ir(
                     model,
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                )?;
+                ) {
+                    Ok(ir) => ir,
+                    Err(e) => {
+                        gate.record(model_name, super::skip_gate::Verdict::Built);
+                        fail_unretried_model(
+                            output,
+                            &mut containment,
+                            hook_registry,
+                            pipeline_name,
+                            run_id,
+                            model_name,
+                            typed_ir_start.elapsed().as_millis() as u64,
+                            resilience.contain_failures,
+                            e.context(format!("model '{model_name}' failed")),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 if let ColumnSkipOutcome::Skip {
                     prior_output_column_hashes,
                     prior_blake3,
@@ -14757,26 +14818,19 @@ async fn execute_models_phase(
                 ) {
                     Ok(ir) => ir,
                     Err(e) => {
-                        if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
-                            let _ = reg
-                                .fire(&HookContext::model_error(
-                                    run_id,
-                                    pipe,
-                                    model_name,
-                                    &format!("{e:#}"),
-                                ))
-                                .await;
-                        }
-                        output.record_unretried_failure(
+                        fail_unretried_model(
+                            output,
+                            &mut containment,
+                            hook_registry,
+                            pipeline_name,
+                            run_id,
                             model_name,
                             model_start.elapsed().as_millis() as u64,
-                        );
-                        if resilience.contain_failures {
-                            record_contained_cause(output, &mut containment, model_name, &e);
-                            continue;
-                        }
-                        output.fail_fast_model = Some(model_name.to_string());
-                        return Err(e);
+                            resilience.contain_failures,
+                            e.context(format!("model '{model_name}' failed")),
+                        )
+                        .await?;
+                        continue;
                     }
                 };
                 let model_started_at = Utc::now();
@@ -38824,9 +38878,9 @@ backend = "local"
     /// #2470: a content-addressed model whose typed IR fails is stored under
     /// its own name with its time, fail-fast and contained. The dialect
     /// renders an unusable surrogate-key expression after a short delay, so
-    /// the step fails with measurable time. The skip gate and column-level
-    /// skip are off, so the content-addressed arm is the first to build the
-    /// typed IR.
+    /// the step fails with measurable time. Run with the column-level skip
+    /// on (the `rocky run` default, where it is the first site to build the
+    /// typed IR) and off (where the content-addressed arm is the first).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn content_addressed_typed_ir_failure_is_recorded_under_its_name() {
@@ -38964,7 +39018,10 @@ backend = "local"
             }
         }
 
-        for contain_failures in [false, true] {
+        for (column_level, contain_failures) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let ctx = format!("column_level={column_level} contain={contain_failures}");
             let tmp = tempfile::TempDir::new().unwrap();
             let models = tmp.path().join("models");
             std::fs::create_dir_all(&models).unwrap();
@@ -39003,7 +39060,7 @@ backend = "local"
                 &DeferOptions::default(),
                 super::SkipGateConfig::off(),
                 false,
-                false,
+                column_level,
                 &rocky_core::run_vars::RunVars::new(),
                 resilience,
                 false,
@@ -39014,29 +39071,30 @@ backend = "local"
                 false,
             )
             .await;
-            assert_eq!(
-                result.is_err(),
-                !contain_failures,
-                "contain={contain_failures}: {result:?}"
-            );
+            assert_eq!(result.is_err(), !contain_failures, "{ctx}: {result:?}");
             if let Err(e) = &result {
+                let msg = format!("{e:#}");
                 assert!(
-                    format!("{e:#}").contains("unusable SQL expression"),
-                    "the typed-IR step is what failed: {e:#}"
+                    msg.starts_with("model 'm' failed: "),
+                    "{ctx}: the error names the model: {msg}"
+                );
+                assert!(
+                    msg.contains("unusable SQL expression"),
+                    "{ctx}: the typed-IR step is what failed: {msg}"
                 );
             }
             let record = record_after(&mut out, !contain_failures);
             assert_eq!(
                 record.models_executed.len(),
                 1,
-                "contain={contain_failures}: {:?}",
+                "{ctx}: {:?}",
                 record.models_executed
             );
             let m = &record.models_executed[0];
-            assert_eq!(m.status, "failed", "contain={contain_failures}");
-            assert_eq!(m.model_name, "m", "contain={contain_failures}");
-            assert!(m.duration_ms > 0, "contain={contain_failures}: {m:?}");
-            assert!(m.attempts.is_empty());
+            assert_eq!(m.status, "failed", "{ctx}");
+            assert_eq!(m.model_name, "m", "{ctx}");
+            assert!(m.duration_ms > 0, "{ctx}: {m:?}");
+            assert!(m.attempts.is_empty(), "{ctx}");
         }
     }
 
