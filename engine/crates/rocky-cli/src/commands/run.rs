@@ -14746,12 +14746,39 @@ async fn execute_models_phase(
                 // `skip_hash()`, so the reuse spine / provenance ledger was
                 // never populated by a real `rocky run`. Seeded from the
                 // reviewed source-schema snapshot (#2) so CAS consumes it (#3).
-                let model_ir = typed_model_ir(
+                // A failure here is this model's failure, handled as the
+                // materialization error arm below handles one: its name and
+                // time reach the run record (#2470).
+                let model_ir = match typed_model_ir(
                     model,
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                )?;
+                ) {
+                    Ok(ir) => ir,
+                    Err(e) => {
+                        if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                            let _ = reg
+                                .fire(&HookContext::model_error(
+                                    run_id,
+                                    pipe,
+                                    model_name,
+                                    &format!("{e:#}"),
+                                ))
+                                .await;
+                        }
+                        output.record_unretried_failure(
+                            model_name,
+                            model_start.elapsed().as_millis() as u64,
+                        );
+                        if resilience.contain_failures {
+                            record_contained_cause(output, &mut containment, model_name, &e);
+                            continue;
+                        }
+                        output.fail_fast_model = Some(model_name.to_string());
+                        return Err(e);
+                    }
+                };
                 let model_started_at = Utc::now();
                 let target_table_full_name = format!(
                     "{}.{}.{}",
@@ -38788,6 +38815,225 @@ backend = "local"
             );
             let m = &record.models_executed[0];
             assert_eq!(m.status, "failed");
+            assert_eq!(m.model_name, "m", "contain={contain_failures}");
+            assert!(m.duration_ms > 0, "contain={contain_failures}: {m:?}");
+            assert!(m.attempts.is_empty());
+        }
+    }
+
+    /// #2470: a content-addressed model whose typed IR fails is stored under
+    /// its own name with its time, fail-fast and contained. The dialect
+    /// renders an unusable surrogate-key expression after a short delay, so
+    /// the step fails with measurable time. The skip gate and column-level
+    /// skip are off, so the content-addressed arm is the first to build the
+    /// typed IR.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn content_addressed_typed_ir_failure_is_recorded_under_its_name() {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use rocky_core::traits::{
+            AdapterResult, LiteralEscape, NullTimestamps, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::{ColumnSelection, MetadataColumn};
+
+        /// DuckDB, except that a surrogate key renders a statement
+        /// terminator, which `MetadataColumn::new` rejects.
+        struct BadKeyDialect;
+        impl SqlDialect for BadKeyDialect {
+            fn name(&self) -> &'static str {
+                DuckDbSqlDialect.name()
+            }
+            fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+                DuckDbSqlDialect.star_excluding(columns)
+            }
+            fn literal_escape(&self) -> LiteralEscape {
+                DuckDbSqlDialect.literal_escape()
+            }
+            fn format_table_ref(
+                &self,
+                catalog: &str,
+                schema: &str,
+                table: &str,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.format_table_ref(catalog, schema, table)
+            }
+            fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+                DuckDbSqlDialect.create_table_as(target, select_sql)
+            }
+            fn insert_into(&self, target: &str, select_sql: &str) -> String {
+                DuckDbSqlDialect.insert_into(target, select_sql)
+            }
+            fn merge_into(
+                &self,
+                target: &str,
+                source_sql: &str,
+                keys: &[Arc<str>],
+                update_cols: &ColumnSelection,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.merge_into(target, source_sql, keys, update_cols)
+            }
+            fn select_clause(
+                &self,
+                columns: &ColumnSelection,
+                metadata: &[MetadataColumn],
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.select_clause(columns, metadata)
+            }
+            fn watermark_where(
+                &self,
+                timestamp_col: &str,
+                last_watermark: Option<&DateTime<Utc>>,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.watermark_where(timestamp_col, last_watermark)
+            }
+            fn watermark_hold_back(
+                &self,
+                timestamp_col: &str,
+                held_max: &DateTime<Utc>,
+                nulls: NullTimestamps,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.watermark_hold_back(timestamp_col, held_max, nulls)
+            }
+            fn describe_table_sql(&self, table_ref: &str) -> String {
+                DuckDbSqlDialect.describe_table_sql(table_ref)
+            }
+            fn drop_table_sql(&self, table_ref: &str) -> String {
+                DuckDbSqlDialect.drop_table_sql(table_ref)
+            }
+            fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+                DuckDbSqlDialect.create_catalog_sql(name)
+            }
+            fn create_schema_sql(
+                &self,
+                catalog: &str,
+                schema: &str,
+            ) -> Option<AdapterResult<String>> {
+                DuckDbSqlDialect.create_schema_sql(catalog, schema)
+            }
+            fn tablesample_clause(&self, percent: u32) -> Option<String> {
+                DuckDbSqlDialect.tablesample_clause(percent)
+            }
+            fn insert_overwrite_partition(
+                &self,
+                target: &str,
+                partition_filter: &str,
+                select_sql: &str,
+            ) -> AdapterResult<Vec<String>> {
+                DuckDbSqlDialect.insert_overwrite_partition(target, partition_filter, select_sql)
+            }
+            fn list_tables_sql(&self, catalog: &str, schema: &str) -> AdapterResult<String> {
+                DuckDbSqlDialect.list_tables_sql(catalog, schema)
+            }
+            fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
+                DuckDbSqlDialect.regex_match_predicate(column, pattern)
+            }
+            fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
+                DuckDbSqlDialect.row_hash_expr(columns)
+            }
+            fn surrogate_key_expr(&self, _columns: &[&str]) -> String {
+                // Measurable time inside the failing step.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                "1; SELECT 2".to_string()
+            }
+        }
+
+        struct BadKeyDuckDb {
+            inner: DuckDbWarehouseAdapter,
+        }
+        #[async_trait]
+        impl WarehouseAdapter for BadKeyDuckDb {
+            fn dialect(&self) -> &dyn SqlDialect {
+                &BadKeyDialect
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models = tmp.path().join("models");
+            std::fs::create_dir_all(&models).unwrap();
+            std::fs::write(models.join("m.sql"), "SELECT 1 AS a\n").unwrap();
+            std::fs::write(
+                models.join("m.toml"),
+                "[strategy]\ntype = \"content_addressed\"\n\
+                 storage_prefix = \"s3://test-bucket/ca_2470_typed_ir\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"m\"\n\n\
+                 [[surrogate_key]]\nname = \"sk\"\ncolumns = [\"a\"]\n",
+            )
+            .unwrap();
+            let adapter = BadKeyDuckDb {
+                inner: DuckDbWarehouseAdapter::open(&tmp.path().join("w.duckdb")).unwrap(),
+            };
+            let mut out = RunOutput::new(String::new(), 0, 1);
+            let resilience = rocky_core::config::ResilienceConfig {
+                contain_failures,
+                ..Default::default()
+            };
+            let result = super::execute_models(
+                &models,
+                None,
+                &adapter as &dyn WarehouseAdapter,
+                None,
+                &PartitionRunOptions::default(),
+                "test-run",
+                None,
+                None,
+                &mut out,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                super::SkipGateConfig::off(),
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                resilience,
+                false,
+                true,
+                None,
+                None,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(
+                result.is_err(),
+                !contain_failures,
+                "contain={contain_failures}: {result:?}"
+            );
+            if let Err(e) = &result {
+                assert!(
+                    format!("{e:#}").contains("unusable SQL expression"),
+                    "the typed-IR step is what failed: {e:#}"
+                );
+            }
+            let record = record_after(&mut out, !contain_failures);
+            assert_eq!(
+                record.models_executed.len(),
+                1,
+                "contain={contain_failures}: {:?}",
+                record.models_executed
+            );
+            let m = &record.models_executed[0];
+            assert_eq!(m.status, "failed", "contain={contain_failures}");
             assert_eq!(m.model_name, "m", "contain={contain_failures}");
             assert!(m.duration_ms > 0, "contain={contain_failures}: {m:?}");
             assert!(m.attempts.is_empty());
