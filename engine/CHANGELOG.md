@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On DuckDB, `rocky load` with `[load] target.catalog` set now loads into that catalog. Before, it ignored the catalog and loaded into the current database with no warning (#2478). The catalog must name the current database. Letter case does not matter. Any other catalog now fails before anything is written. For a plain load, the error names the accepted value. For a contract-gated load, DuckDB's own "Catalog does not exist" error shows first. A set catalog with an empty `target.schema` is also an error.
+
 ## [1.89.0] — 2026-10-23
 
 ### Upgrade notes

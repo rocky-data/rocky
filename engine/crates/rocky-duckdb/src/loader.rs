@@ -79,15 +79,33 @@ fn resolve_format(source: &LoadSource, options: &LoadOptions) -> AdapterResult<F
     })
 }
 
-/// Build a two-part DuckDB table reference (`schema.table`), falling back to
-/// just the table name when schema is empty.
+/// Build the DuckDB table reference: `catalog.schema.table` when the catalog
+/// is set, `schema.table` when only the schema is set, or just the table name.
 ///
-/// Both identifiers are validated before interpolation. The target table is
+/// Every identifier is validated before interpolation. The target table is
 /// derived from `--table`, config, or a discovered filename stem, so a file
 /// named e.g. `evil; DROP TABLE x; --.csv` must not be able to drive arbitrary
 /// SQL. Matches the validation the Databricks and Snowflake loaders apply.
+///
+/// A set catalog with an empty schema is an error. DuckDB would read the
+/// two-part `catalog.table` as `schema.table`.
 fn format_target(target: &TableRef) -> AdapterResult<String> {
     validate_identifier(&target.table).map_err(AdapterError::new)?;
+    if !target.catalog.is_empty() {
+        validate_identifier(&target.catalog).map_err(AdapterError::new)?;
+        if target.schema.is_empty() {
+            return Err(AdapterError::msg(format!(
+                "target catalog '{}' is set but the target schema is empty; \
+                 set [load] target.schema too, or set target.catalog to \"\"",
+                target.catalog
+            )));
+        }
+        validate_identifier(&target.schema).map_err(AdapterError::new)?;
+        return Ok(format!(
+            "{}.{}.{}",
+            target.catalog, target.schema, target.table
+        ));
+    }
     if target.schema.is_empty() {
         Ok(target.table.clone())
     } else {
@@ -101,14 +119,50 @@ fn sql_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Check that a set target catalog names the current database (#2478).
+///
+/// Rocky has no hook to `ATTACH` another database, so the current database is
+/// the only one a load can reach. A matching catalog, compared
+/// case-insensitively as DuckDB compares catalog names, is accepted. Any other
+/// catalog is refused before anything is written. An empty catalog means the
+/// current database and is always accepted.
+fn check_target_catalog(conn: &DuckDbConnector, catalog: &str) -> AdapterResult<()> {
+    if catalog.is_empty() {
+        return Ok(());
+    }
+    let qr = conn
+        .execute_sql("SELECT current_database()")
+        .map_err(AdapterError::new)?;
+    let Some(current) = qr
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_str())
+    else {
+        return Err(AdapterError::msg("current_database() returned no name"));
+    };
+    if current.eq_ignore_ascii_case(catalog) {
+        return Ok(());
+    }
+    Err(AdapterError::msg(format!(
+        "DuckDB has no attached database named '{catalog}'; the current database is \
+         '{current}'. Set [load] target.catalog to \"\" or to '{current}'."
+    )))
+}
+
 /// Build the query that checks whether the target table exists.
 ///
-/// It matches the schema as well as the table name, so a same-named table in
-/// another schema does not count. An empty schema means DuckDB's current
-/// schema, which is where an unqualified `CREATE TABLE` puts the table. The
-/// catalog is always the current one, because `format_target` never emits a
-/// catalog. Names compare case-insensitively, as unquoted DuckDB identifiers do.
-fn table_exists_sql(schema: &str, table: &str) -> String {
+/// It matches the catalog and schema as well as the table name, so a
+/// same-named table in another schema does not count. An empty catalog means
+/// the current database, and an empty schema means DuckDB's current schema.
+/// That is where an unqualified name resolves. Names compare
+/// case-insensitively, as unquoted DuckDB identifiers do.
+fn table_exists_sql(catalog: &str, schema: &str, table: &str) -> String {
+    let catalog_expr = if catalog.is_empty() {
+        "current_database()".to_string()
+    } else {
+        sql_literal(catalog)
+    };
     let schema_expr = if schema.is_empty() {
         "current_schema()".to_string()
     } else {
@@ -116,7 +170,7 @@ fn table_exists_sql(schema: &str, table: &str) -> String {
     };
     format!(
         "SELECT 1 FROM information_schema.tables \
-         WHERE table_catalog = current_database() \
+         WHERE lower(table_catalog) = lower({catalog_expr}) \
          AND lower(table_schema) = lower({schema_expr}) \
          AND lower(table_name) = lower({})",
         sql_literal(table)
@@ -280,6 +334,7 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
     ) -> AdapterResult<LoadResult> {
         let format = resolve_format(source, options)?;
         let target_ref = format_target(target)?;
+        let catalog = target.catalog.clone();
         let schema = target.schema.clone();
         let table = target.table.clone();
         // Only local files have filesystem metadata; cloud sources report 0.
@@ -302,9 +357,13 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
                 .lock()
                 .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
 
+            // Refuse a catalog that is not the current database before
+            // anything is written.
+            check_target_catalog(&conn, &catalog)?;
+
             // Check whether the target table already exists.
             let table_exists = conn
-                .execute_sql(&table_exists_sql(&schema, &table))
+                .execute_sql(&table_exists_sql(&catalog, &schema, &table))
                 .map(|r| !r.rows.is_empty())
                 .unwrap_or(false);
 
@@ -658,8 +717,213 @@ mod tests {
 
     #[test]
     fn table_exists_sql_escapes_quotes() {
-        let sql = table_exists_sql("", "a'b");
+        let sql = table_exists_sql("", "", "a'b");
         assert!(sql.contains("'a''b'"));
+    }
+
+    // ------------------------------------------------------------------
+    // Target catalog (#2478)
+    // ------------------------------------------------------------------
+
+    fn target_at(catalog: &str, schema: &str, table: &str) -> TableRef {
+        TableRef {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    /// An in-memory DuckDB's current database is `memory`.
+    fn current_db(adapter: &DuckDbLoaderAdapter) -> String {
+        rows(adapter, "SELECT current_database()")[0][0].clone()
+    }
+
+    fn table_present(adapter: &DuckDbLoaderAdapter, schema: &str, table: &str) -> bool {
+        !rows(
+            adapter,
+            &format!(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = '{schema}' AND table_name = '{table}'"
+            ),
+        )
+        .is_empty()
+    }
+
+    #[tokio::test]
+    async fn catalog_equal_to_the_current_database_loads_into_it() {
+        let adapter = loader();
+        let cur = current_db(&adapter);
+        assert_eq!(cur, "memory");
+        let t = target_at(&cur, "main", "cat_t");
+        assert_eq!(format_target(&t).unwrap(), "memory.main.cat_t");
+        let f = csv_file("a,b\n1,x\n2,y\n");
+        let r = adapter
+            .load(&local(f.path()), &t, &LoadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r.rows_loaded, 2);
+        assert_eq!(
+            rows(&adapter, "SELECT count(*) FROM memory.main.cat_t")[0][0],
+            "2"
+        );
+    }
+
+    const UNKNOWN_CATALOG_ERR: &str = "DuckDB has no attached database named 'nope'; \
+         the current database is 'memory'. Set [load] target.catalog to \"\" or to 'memory'.";
+
+    #[tokio::test]
+    async fn unknown_catalog_is_refused_and_writes_nothing() {
+        let adapter = loader();
+        let f = csv_file("a,b\n1,x\n");
+        let err = adapter
+            .load(
+                &local(f.path()),
+                &target_at("nope", "main", "never"),
+                &LoadOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), UNKNOWN_CATALOG_ERR);
+        assert!(!table_present(&adapter, "main", "never"));
+    }
+
+    #[tokio::test]
+    async fn unknown_catalog_with_truncate_first_leaves_the_rows() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.keep2 (a INTEGER, b VARCHAR)");
+        exec(&adapter, "INSERT INTO main.keep2 VALUES (1, 'x'), (2, 'y')");
+        let f = csv_file("a,b\n9,z\n");
+        let opts = LoadOptions {
+            create_table: false,
+            truncate_first: true,
+            ..Default::default()
+        };
+        let err = adapter
+            .load(&local(f.path()), &target_at("nope", "main", "keep2"), &opts)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), UNKNOWN_CATALOG_ERR);
+        assert_eq!(
+            rows(&adapter, "SELECT a FROM main.keep2 ORDER BY a"),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_matches_the_current_database_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = DuckDbConnector::open(&dir.path().join("poc.duckdb")).unwrap();
+        let adapter = DuckDbLoaderAdapter::new(Arc::new(Mutex::new(conn)));
+        assert_eq!(current_db(&adapter), "poc");
+        let t = target_at("Poc", "main", "ci_t");
+        assert_eq!(format_target(&t).unwrap(), "Poc.main.ci_t");
+        let f = csv_file("a,b\n1,x\n");
+        let r = adapter
+            .load(&local(f.path()), &t, &LoadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r.rows_loaded, 1);
+        assert_eq!(
+            rows(&adapter, "SELECT count(*) FROM poc.main.ci_t")[0][0],
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_with_an_empty_schema_is_an_error() {
+        let adapter = loader();
+        let f = csv_file("a,b\n1,x\n");
+        let err = adapter
+            .load(
+                &local(f.path()),
+                &target_at("memory", "", "no_schema"),
+                &LoadOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("target schema is empty"),
+            "unexpected error: {err}"
+        );
+        assert!(!table_present(&adapter, "main", "no_schema"));
+    }
+
+    #[tokio::test]
+    async fn with_a_catalog_a_same_named_table_in_another_schema_does_not_hide_the_target() {
+        let adapter = loader();
+        exec(&adapter, "CREATE SCHEMA other");
+        exec(&adapter, "CREATE TABLE other.t5 (a INTEGER, b VARCHAR)");
+        let f = csv_file("a,b\n1,x\n2,y\n");
+        let t = target_at("memory", "main", "t5");
+        adapter
+            .load(&local(f.path()), &t, &LoadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM main.t5")[0][0], "2");
+        assert_eq!(rows(&adapter, "SELECT count(*) FROM other.t5")[0][0], "0");
+        let sql = table_exists_sql("memory", "main", "t5");
+        assert!(
+            sql.contains("lower(table_catalog) = lower('memory')"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn table_exists_sql_escapes_quotes_in_the_catalog() {
+        let sql = table_exists_sql("c'at", "s'ch", "a'b");
+        assert!(
+            sql.contains("lower(table_catalog) = lower('c''at')"),
+            "{sql}"
+        );
+        assert!(sql.contains("'s''ch'"), "{sql}");
+        assert!(sql.contains("'a''b'"), "{sql}");
+        assert!(!sql.contains("current_database()"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn truncate_first_with_a_catalog_deletes_from_the_qualified_table() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.tr (a INTEGER, b VARCHAR)");
+        exec(&adapter, "INSERT INTO main.tr VALUES (99, 'old')");
+        let f = csv_file("a,b\n1,new\n");
+        let opts = LoadOptions {
+            create_table: false,
+            truncate_first: true,
+            ..Default::default()
+        };
+        let r = adapter
+            .load(&local(f.path()), &target_at("memory", "main", "tr"), &opts)
+            .await
+            .unwrap();
+        assert_eq!(r.rows_loaded, 1);
+        assert_eq!(
+            rows(&adapter, "SELECT a, b FROM memory.main.tr"),
+            vec![vec!["1".to_string(), "new".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_table_false_appends_to_an_existing_table_with_a_catalog() {
+        let adapter = loader();
+        exec(&adapter, "CREATE TABLE main.nc (a INTEGER, b VARCHAR)");
+        exec(&adapter, "INSERT INTO main.nc VALUES (1, 'x')");
+        let f = csv_file("b,a\ny,2\n");
+        let r = adapter
+            .load(
+                &local(f.path()),
+                &target_at("memory", "main", "nc"),
+                &no_create(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.rows_loaded, 2);
+        assert_eq!(
+            rows(&adapter, "SELECT a, b FROM memory.main.nc ORDER BY a"),
+            vec![
+                vec!["1".to_string(), "x".to_string()],
+                vec!["2".to_string(), "y".to_string()]
+            ]
+        );
     }
 
     // ------------------------------------------------------------------
