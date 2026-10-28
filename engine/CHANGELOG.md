@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On `s3` and `gcs`, a run no longer skips its own idempotency claim (#2479). When a claim or take-over write landed but its reply was lost, the store client's retry saw a conflict, and the run read its own `InFlight` claim as another run's. The key then stayed blocked for `in_flight_ttl_hours`. Rocky now treats a claim that holds exactly what it wrote as its own. A `Failed` finalize whose reply is lost is no longer written twice either. Valkey gets the same check, though its client does not resend a command today.
+
 ## [1.89.0] — 2026-10-23
 
 ### Upgrade notes
