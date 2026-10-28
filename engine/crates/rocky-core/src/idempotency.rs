@@ -66,6 +66,14 @@
 //! `Failed` and unreadable entries are left for a take-over. A `Failed`
 //! finalize under `dedup_on = "success"` writes an already-expired `Failed`
 //! entry instead of deleting, so a retry adopts it with a conditional write.
+//!
+//! A conditional write can commit and still be reported as a conflict: the
+//! store client retries a request whose reply was lost, and the retry finds
+//! the object already changed (#2479). So when a re-read finds exactly the
+//! bytes this call wrote, the write landed and this call won. The check
+//! compares the whole entry, not only the `run_id`: a `run_id` has
+//! millisecond resolution and can be set by the caller, so two runs can share
+//! one, but the entry also carries this call's `stamped_at`.
 
 use std::path::PathBuf;
 
@@ -756,6 +764,8 @@ async fn valkey_check_and_claim(
             // before the run does any work.
             valkey_probe_eval(&mut conn, &key_for_task)?;
 
+            // The verdict of the last take-over this call attempted.
+            let mut attempted = IdempotencyCheck::Proceed;
             for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
                 // Try to claim atomically: SET key value NX EX ttl
                 let reply: Option<String> = redis::cmd("SET")
@@ -780,6 +790,13 @@ async fn valkey_check_and_claim(
                     // Expired between the failed SET NX and the GET.
                     continue;
                 };
+                if raw == value {
+                    // The key holds exactly this call's claim, so an earlier
+                    // write landed (#2479). This client does not resend a
+                    // command today, so a lost reply is an error instead;
+                    // this keeps a resend from skipping the run's own claim.
+                    return Ok(attempted);
+                }
                 // The server TTL decides expiry: a key that still exists is
                 // live, whatever this pod's clock says. A value that is not an
                 // entry is stale, and the same compare-and-set takes it.
@@ -789,6 +806,7 @@ async fn valkey_check_and_claim(
                         // Take the key only if it still holds what we read.
                         // When two runs adopt at once, exactly one script
                         // swaps; the other re-reads and re-classifies.
+                        attempted = verdict.clone();
                         if valkey_adopt_cas(&mut conn, &key_for_task, &raw, &value, ttl_secs)? {
                             return Ok(verdict);
                         }
@@ -1010,6 +1028,10 @@ async fn object_store_check_and_claim(
 ) -> Result<IdempotencyCheck, IdempotencyError> {
     let rel_path = object_store_relative_path(&entry.key);
     let encoded = Bytes::from(serde_json::to_vec(entry)?);
+    // The verdict of the last write this call attempted. A take-over that
+    // reported a conflict may still have landed; if it did, this is what the
+    // call won.
+    let mut attempted = IdempotencyCheck::Proceed;
 
     for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
         match provider
@@ -1028,6 +1050,13 @@ async fn object_store_check_and_claim(
             // Deleted between the failed create and the read: create again.
             continue;
         };
+        if observed.body == encoded {
+            // The object holds exactly the claim this call wrote: an earlier
+            // write landed but its reply was lost, and the store client's
+            // retry saw a conflict (#2479). This call owns the key.
+            debug!(path = %rel_path, "idempotency claim already holds this run's write");
+            return Ok(attempted);
+        }
         let verdict = match observed.entry.clone() {
             Some(prior) => classify_existing(prior, now, entry),
             None => {
@@ -1046,8 +1075,10 @@ async fn object_store_check_and_claim(
                 // Take over only if the object is still the one we read. When
                 // two runs adopt at once, exactly one write commits; the
                 // other sees a conflict, re-reads the winner's fresh claim and
-                // skips as in-flight.
+                // skips as in-flight. A conflict can also hide this call's
+                // own landed write; the re-read above catches that.
                 let generation = require_generation(&observed)?;
+                attempted = verdict.clone();
                 match provider
                     .put_if_match(&rel_path, encoded.clone(), Some(generation))
                     .await?
@@ -1102,6 +1133,9 @@ async fn object_store_finalize(
         Ok(Bytes::from(serde_json::to_vec(&updated)?))
     };
 
+    // The last entry this call tried to write. A write reported as a conflict
+    // may still have landed (#2479).
+    let mut attempted: Option<Bytes> = None;
     for _ in 0..MAX_CONDITIONAL_ATTEMPTS {
         let Some(observed) = observe_claim_at_path(provider, &rel_path).await? else {
             // The claim is gone (an operator or a bucket lifecycle rule
@@ -1110,14 +1144,19 @@ async fn object_store_finalize(
             if !should_keep {
                 return Ok(());
             }
-            match provider
-                .put_if_match(&rel_path, encode(retention_until)?, None)
-                .await?
-            {
+            let body = encode(retention_until)?;
+            attempted = Some(body.clone());
+            match provider.put_if_match(&rel_path, body, None).await? {
                 PutIfMatchOutcome::Committed(_) => return Ok(()),
                 PutIfMatchOutcome::Conflict => continue,
             }
         };
+        if attempted.as_ref() == Some(&observed.body) {
+            // This call's write landed; its reply was lost. Writing again
+            // would back-date a `Failed` entry to the time of that write
+            // instead of to the claim's own stamp.
+            return Ok(());
+        }
         let owned = observed
             .entry
             .as_ref()
@@ -1143,8 +1182,10 @@ async fn object_store_finalize(
                 .map_or(now, |prior| prior.stamped_at)
                 .min(now)
         };
+        let body = encode(expires_at)?;
+        attempted = Some(body.clone());
         match provider
-            .put_if_match(&rel_path, encode(expires_at)?, Some(generation))
+            .put_if_match(&rel_path, body, Some(generation))
             .await?
         {
             PutIfMatchOutcome::Committed(_) => return Ok(()),
@@ -2286,6 +2327,209 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.idempotency_get("k").unwrap(), Some(theirs));
+        del_raw(&mut conn, &full);
+    }
+
+    // -------------------------------------------------------------------
+    // #2479: a conditional write that lands but is reported as a conflict.
+    // The store client re-sends a request whose reply was lost, and the
+    // re-send finds the object already written. `land_then_conflict_nth_put`
+    // compresses that into what this code sees.
+    // -------------------------------------------------------------------
+
+    fn faulting_provider() -> (ObjectStoreProvider, crate::fault_store::FaultHandle) {
+        let (store, faults) = crate::fault_store::FaultingStore::wrap(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        (
+            ObjectStoreProvider::from_store(store, "s3", "bucket", ""),
+            faults,
+        )
+    }
+
+    fn lost_reply_cfg() -> IdempotencyConfig {
+        IdempotencyConfig {
+            in_flight_ttl_hours: 24,
+            dedup_on: DedupPolicy::Success,
+            ..IdempotencyConfig::default()
+        }
+    }
+
+    fn t0() -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 10, 21, 8, 0, 0).unwrap()
+    }
+
+    async fn claim_on(
+        provider: &ObjectStoreProvider,
+        run_id: &str,
+        now: DateTime<Utc>,
+    ) -> IdempotencyCheck {
+        let entry = mk_entry(run_id, IdempotencyState::InFlight, now, 24);
+        object_store_check_and_claim(provider, &entry, now)
+            .await
+            .unwrap()
+    }
+
+    async fn seed(provider: &ObjectStoreProvider, entry: &IdempotencyEntry) {
+        provider
+            .put(
+                &object_store_relative_path(&entry.key),
+                Bytes::from(serde_json::to_vec(entry).unwrap()),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn stored(provider: &ObjectStoreProvider) -> IdempotencyEntry {
+        let body = provider
+            .get(&object_store_relative_path("k"))
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// A first claim that lands but is reported as `AlreadyExists` is this
+    /// run's claim: the run proceeds, it does not skip itself.
+    #[tokio::test]
+    async fn a_first_claim_whose_reply_is_lost_still_proceeds() {
+        let (provider, faults) = faulting_provider();
+        faults.land_then_conflict_nth_put(1);
+
+        let verdict = claim_on(&provider, "run-a", t0()).await;
+        assert!(
+            matches!(verdict, IdempotencyCheck::Proceed),
+            "the run skipped its own claim: {verdict:?}"
+        );
+        assert_eq!(stored(&provider).await.run_id, "run-a");
+    }
+
+    /// A take-over of a stale claim that lands but is reported as a conflict
+    /// is a win, and still names the claim it replaced.
+    #[tokio::test]
+    async fn a_take_over_whose_reply_is_lost_still_adopts() {
+        let (provider, faults) = faulting_provider();
+        // Put #1 seeds an expired claim; #2 is the failed create; #3 is the
+        // take-over, which lands and reports a conflict.
+        seed(
+            &provider,
+            &mk_entry("run-old", IdempotencyState::InFlight, t0(), 1),
+        )
+        .await;
+        faults.land_then_conflict_nth_put(3);
+
+        let now = t0() + chrono::Duration::hours(2);
+        let verdict = claim_on(&provider, "run-new", now).await;
+        assert!(
+            matches!(
+                verdict,
+                IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-old"
+            ),
+            "the run skipped its own take-over: {verdict:?}"
+        );
+        assert_eq!(stored(&provider).await.run_id, "run-new");
+    }
+
+    /// Bound: another run's live claim still makes this run skip.
+    #[tokio::test]
+    async fn another_runs_live_claim_still_skips() {
+        let (provider, _faults) = faulting_provider();
+        seed(
+            &provider,
+            &mk_entry("run-b", IdempotencyState::InFlight, t0(), 24),
+        )
+        .await;
+
+        let verdict = claim_on(&provider, "run-a", t0()).await;
+        assert!(
+            matches!(verdict, IdempotencyCheck::SkipInFlight { ref run_id } if run_id == "run-b"),
+            "{verdict:?}"
+        );
+    }
+
+    /// Bound: a live claim with this run's `run_id` but another stamp is not
+    /// this call's write. A `run_id` can repeat (millisecond resolution, or a
+    /// caller-chosen id), so the run skips rather than share the key.
+    #[tokio::test]
+    async fn a_live_claim_with_the_same_run_id_but_another_stamp_still_skips() {
+        let (provider, _faults) = faulting_provider();
+        seed(
+            &provider,
+            &mk_entry("run-a", IdempotencyState::InFlight, t0(), 24),
+        )
+        .await;
+
+        let later = t0() + chrono::Duration::seconds(1);
+        let verdict = claim_on(&provider, "run-a", later).await;
+        assert!(
+            matches!(verdict, IdempotencyCheck::SkipInFlight { ref run_id } if run_id == "run-a"),
+            "{verdict:?}"
+        );
+    }
+
+    /// A `Failed` finalize under `dedup_on = "success"` whose reply is lost
+    /// keeps the back-date to the claim's own stamp. Writing it a second
+    /// time would back-date it only to the first finalize's time.
+    #[tokio::test]
+    async fn a_finalize_whose_reply_is_lost_is_not_written_twice() {
+        let (provider, faults) = faulting_provider();
+        let cfg = lost_reply_cfg();
+        assert!(matches!(
+            claim_on(&provider, "run-a", t0()).await,
+            IdempotencyCheck::Proceed
+        ));
+        // Put #1 was the claim; #2 is the finalize, which lands and reports a
+        // conflict.
+        faults.land_then_conflict_nth_put(2);
+
+        let now = t0() + chrono::Duration::hours(1);
+        object_store_finalize(
+            &provider,
+            "k",
+            "run-a",
+            FinalOutcome::Failed,
+            now + chrono::Duration::days(2),
+            &cfg,
+            now,
+        )
+        .await
+        .unwrap();
+        let entry = stored(&provider).await;
+        assert_eq!(entry.state, IdempotencyState::Failed);
+        assert_eq!(entry.expires_at, t0(), "back-dated to the wrong time");
+    }
+
+    /// Valkey: a key that already holds exactly this call's claim is this
+    /// run's. The client does not resend today, so this seeds the state a
+    /// resend would find.
+    #[tokio::test]
+    async fn live_valkey_a_key_holding_this_calls_claim_proceeds() {
+        let Some(url) = live_valkey_url() else { return };
+        let prefix = live_prefix("own-claim");
+        let full = valkey_key(&prefix, "k");
+        let mut conn = live_conn(&url);
+        let cfg = lost_reply_cfg();
+        let now = Utc::now();
+        let mine = mk_entry("run-a", IdempotencyState::InFlight, now, 24);
+        put_raw(&mut conn, &full, &serde_json::to_vec(&mine).unwrap());
+        let backend = live_backend(&url, &prefix);
+
+        let verdict = backend
+            .check_and_claim_at(None, "k", "run-a", &cfg, now)
+            .await
+            .unwrap();
+        assert!(matches!(verdict, IdempotencyCheck::Proceed), "{verdict:?}");
+
+        // Bound: the same run_id with another stamp is not this call's claim.
+        let later = now + chrono::Duration::seconds(1);
+        let verdict = backend
+            .check_and_claim_at(None, "k", "run-a", &cfg, later)
+            .await
+            .unwrap();
+        assert!(
+            matches!(verdict, IdempotencyCheck::SkipInFlight { .. }),
+            "{verdict:?}"
+        );
         del_raw(&mut conn, &full);
     }
 }
