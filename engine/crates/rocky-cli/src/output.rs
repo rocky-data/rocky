@@ -6921,6 +6921,19 @@ impl RunOutput {
         self.errors.push(err);
     }
 
+    /// Keep the measured time of a failed model that the retry loop did not
+    /// run (content-addressed, `time_interval`), so its run record keeps its
+    /// compute (#2470). There was no retry, so the trail is empty and
+    /// `duration_ms` is the total. An entry already left for the model wins.
+    pub(crate) fn record_unretried_failure(&mut self, model: &str, duration_ms: u64) {
+        self.failed_attempts.entry(model.to_string()).or_insert(
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms,
+                attempts: Vec::new(),
+            },
+        );
+    }
+
     /// Record the one error entry of a run that stopped at its first failure.
     /// The entry's key is entry-point specific (`<selection>`, `<runtime>`, a
     /// pipeline name, `backfill`); the staged `fail_fast_model` says which

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed `time_interval` or content-addressed model now keeps its time in run history. Before, it was stored with `duration_ms: 0`. The retry loop does not run these models, so `attempts` stays empty and `duration_ms` is the total. For a `time_interval` model, that is the failed partitions' own time; each healthy partition keeps its own record. A run that stops at its first failure now stores these models under their own names, not under a placeholder such as `<runtime>`. A volume breach in such a run no longer adds a second, zero-time record under the placeholder; the model's one failed record already carried its time. A failed replication table copy is still stored with `duration_ms: 0`, because the copy is not timed. (#2470)
+
 ## [1.89.0] — 2026-10-23
 
 ### Upgrade notes
