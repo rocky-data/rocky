@@ -920,6 +920,61 @@ mod tests {
             assert!(volume.fails_the_model(), "{volume:?}");
         }
 
+        /// #2470: a fail-fast error breach records the model once, as its
+        /// failed materialization with that materialization's time. The run's
+        /// one error entry (`<runtime>` here) stands for the same model, so
+        /// it adds no second, zero-time record under the placeholder. Serial
+        /// and concurrent paths.
+        #[tokio::test]
+        async fn a_fail_fast_breach_is_one_record_with_its_time() {
+            for parallel in [1, 4] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (mut output, result) = run_layers(
+                    tmp.path(),
+                    parallel,
+                    false,
+                    "max_rows = 2\nseverity = \"error\"",
+                    None,
+                )
+                .await;
+                assert!(result.is_err(), "parallel {parallel}");
+                // Plant a distinctive time so a real sub-millisecond zero
+                // cannot satisfy the check.
+                output
+                    .materializations
+                    .iter_mut()
+                    .find(|m| m.asset_key.last().map(String::as_str) == Some("vol"))
+                    .expect("vol built")
+                    .duration_ms = 1234;
+                // What the entry point does with the `Err`.
+                output.tables_failed += 1;
+                output.push_fail_fast_error(crate::output::TableErrorOutput {
+                    asset_key: vec!["<runtime>".to_string()],
+                    error: "breach".to_string(),
+                    failure_kind: crate::output::FailureKind::Unknown,
+                    cooldown_seconds: None,
+                });
+                let started = chrono::Utc::now();
+                let record = output.to_run_record(
+                    "run-2470",
+                    started,
+                    started,
+                    String::new(),
+                    rocky_core::state::RunTrigger::Manual,
+                    output.derive_run_status(),
+                    crate::output::RunRecordAudit::test_sentinels(),
+                );
+                let failed: Vec<_> = record
+                    .models_executed
+                    .iter()
+                    .filter(|m| m.status == "failed")
+                    .collect();
+                assert_eq!(failed.len(), 1, "parallel {parallel}: {failed:?}");
+                assert_eq!(failed[0].model_name, "vol", "parallel {parallel}");
+                assert_eq!(failed[0].duration_ms, 1234, "parallel {parallel}");
+            }
+        }
+
         #[tokio::test]
         async fn the_concurrent_path_contains_an_error_breach() {
             let (output, result, _tmp) = run_concurrent(true).await;
