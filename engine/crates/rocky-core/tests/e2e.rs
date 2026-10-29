@@ -285,7 +285,8 @@ fn test_incremental_pipeline_with_watermark() {
         lookback: None,
         filter_column: None,
     });
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect, Some(&stored.last_value)).unwrap();
+    let sql =
+        sql_gen::generate_insert_sql(&plan, &dialect, Some(&stored.last_value), None).unwrap();
 
     // Verify incremental SQL structure.
     assert!(
@@ -1013,7 +1014,8 @@ fn test_full_pipeline_flow_incremental_to_full_refresh() {
         lookback: None,
         filter_column: None,
     });
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect, Some(&prior_wm.last_value)).unwrap();
+    let sql =
+        sql_gen::generate_insert_sql(&plan, &dialect, Some(&prior_wm.last_value), None).unwrap();
     assert!(sql.contains("INSERT INTO"));
     assert!(sql.contains("WHERE _fivetran_synced > TIMESTAMP '"));
 
@@ -1183,7 +1185,7 @@ fn test_exact_insert_sql_output_first_run() {
         lookback: None,
         filter_column: None,
     });
-    let sql = sql_gen::generate_insert_sql(&plan, &dialect, None).unwrap();
+    let sql = sql_gen::generate_insert_sql(&plan, &dialect, None, None).unwrap();
 
     let expected = "\
 INSERT INTO acme_warehouse.staging__us_west__shopify.orders

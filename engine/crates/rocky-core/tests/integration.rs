@@ -183,7 +183,7 @@ async fn test_incremental_pipeline_two_runs() {
             filter_column: None,
         },
     );
-    let sql2 = sql_gen::generate_insert_sql(&plan2, &d, Some(&prior_wm.last_value)).unwrap();
+    let sql2 = sql_gen::generate_insert_sql(&plan2, &d, Some(&prior_wm.last_value), None).unwrap();
     p.execute(&sql2).await.unwrap();
 
     // Should now have 4 rows (2 original + 2 new).

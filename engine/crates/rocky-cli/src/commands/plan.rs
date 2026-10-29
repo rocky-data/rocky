@@ -1073,7 +1073,7 @@ fn replication_copy_sql(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<
             sql_gen::generate_create_table_as_sql(model_ir, dialect)?
         }
         MaterializationStrategy::Incremental { .. } => {
-            sql_gen::generate_insert_sql(model_ir, dialect, None)?
+            sql_gen::generate_insert_sql(model_ir, dialect, None, None)?
         }
         MaterializationStrategy::Merge { .. } => {
             match sql_gen::generate_merge_sql(model_ir, dialect) {

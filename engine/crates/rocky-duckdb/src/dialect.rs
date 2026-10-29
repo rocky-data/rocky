@@ -1125,4 +1125,106 @@ mod tests {
             assert_eq!((cell_i64(&r[0], "id"), cell_i64(&r[1], "id_1")), (1, 2));
         }
     }
+
+    /// #2468: drift appends a new source column after `_loaded_by`, but the
+    /// replication SELECT puts it before. A positional INSERT, as every other
+    /// dialect writes, swaps the two. The named column list keeps them apart.
+    #[test]
+    fn test_replication_insert_after_drift_add_column_live_duckdb() {
+        use crate::DuckDbConnector;
+        use rocky_core::{drift, sql_gen};
+        use rocky_ir::{
+            ColumnInfo, ColumnSelection, GovernanceConfig, MaterializationStrategy, MetadataColumn,
+            ModelIr, SourceRef, TableRef, TargetRef,
+        };
+
+        let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_sql(
+            "CREATE TABLE src (id INTEGER, ts TIMESTAMP);\n\
+             INSERT INTO src VALUES (1, TIMESTAMP '2026-01-01 00:00:00');",
+        )
+        .expect("seed source");
+        let ir = ModelIr::replication(
+            TargetRef {
+                catalog: "memory".into(),
+                schema: "main".into(),
+                table: "tgt".into(),
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "ts".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
+            },
+            SourceRef {
+                catalog: "memory".into(),
+                schema: "main".into(),
+                table: "src".into(),
+            },
+            ColumnSelection::All,
+            vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()],
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+        );
+        let d = dialect();
+        conn.execute_sql(&sql_gen::generate_create_table_as_sql(&ir, &d).unwrap())
+            .expect("first copy");
+
+        // The source gains `region`; drift appends it to the target.
+        conn.execute_sql(
+            "ALTER TABLE src ADD COLUMN region VARCHAR;\n\
+             INSERT INTO src VALUES (2, TIMESTAMP '2026-01-02 00:00:00', 'eu');",
+        )
+        .expect("source drift");
+        let target = TableRef {
+            catalog: "memory".into(),
+            schema: "main".into(),
+            table: "tgt".into(),
+        };
+        let added = vec![ColumnInfo {
+            name: "region".into(),
+            data_type: "VARCHAR".into(),
+            nullable: true,
+        }];
+        for stmt in drift::generate_add_column_sql(&target, &added, &d).unwrap() {
+            conn.execute_sql(&stmt).expect("add column");
+        }
+
+        let watermark = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let row_two = |conn: &DuckDbConnector| {
+            let r = conn
+                .execute_sql("SELECT region, _loaded_by FROM tgt WHERE id = 2")
+                .expect("query");
+            assert_eq!(r.rows.len(), 1);
+            (
+                r.rows[0][0].as_str().map(str::to_string),
+                r.rows[0][1].as_str().map(str::to_string),
+            )
+        };
+
+        // The positional form other dialects emit: `region` lands in `_loaded_by`.
+        let select = sql_gen::generate_select_sql(&ir, &d, Some(&watermark)).unwrap();
+        conn.execute_sql(&format!("INSERT INTO memory.main.tgt\n{select}"))
+            .expect("positional insert");
+        assert_eq!(row_two(&conn), (None, Some("eu".to_string())));
+        conn.execute_sql("DELETE FROM tgt WHERE id = 2")
+            .expect("reset");
+
+        // The named form keeps each value in its own column.
+        let columns = vec![
+            "id".to_string(),
+            "ts".to_string(),
+            "region".to_string(),
+            "_loaded_by".to_string(),
+        ];
+        let sql = sql_gen::generate_insert_sql(&ir, &d, Some(&watermark), Some(&columns)).unwrap();
+        assert!(sql.contains("(id, ts, region, _loaded_by)"), "{sql}");
+        conn.execute_sql(&sql).expect("named insert");
+        assert_eq!(row_two(&conn), (Some("eu".to_string()), None));
+    }
 }
