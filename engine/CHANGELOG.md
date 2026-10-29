@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On DuckDB, `rocky load` with `[load] target.catalog` set now loads into that catalog. Before, it ignored the catalog and loaded into the current database with no warning (#2478). The catalog must name the current database. Letter case does not matter. Any other catalog now fails before anything is written. For a plain load, the error names the accepted value. For a contract-gated load, DuckDB's own "Catalog does not exist" error shows first. A set catalog with an empty `target.schema` is also an error.
+- On `s3` and `gcs`, a run no longer skips its own idempotency claim (#2479). When a claim or take-over write landed but its reply was lost, the store client's retry saw a conflict, and the run read its own `InFlight` claim as another run's. The key then stayed blocked for `in_flight_ttl_hours`. Rocky now treats a claim that holds exactly what it wrote as its own. A `Failed` finalize whose reply is lost is no longer written twice either. Valkey gets the same check, though its client does not resend a command today.
+
 ## [1.89.0] — 2026-10-23
 
 ### Upgrade notes

@@ -1084,6 +1084,29 @@ create_table = true
 
     #[cfg(feature = "duckdb")]
     fn write_contract_config(dir: &Path, db_path: &Path) -> std::path::PathBuf {
+        write_load_config(dir, db_path, "", true)
+    }
+
+    /// A load config with `target.catalog = catalog`, with or without the
+    /// contract gate.
+    #[cfg(feature = "duckdb")]
+    fn write_load_config(
+        dir: &Path,
+        db_path: &Path,
+        catalog: &str,
+        contract: bool,
+    ) -> std::path::PathBuf {
+        let contract_section = if contract {
+            r#"
+[pipeline.ingest.contract]
+required_columns = [
+    { name = "id", type = "BIGINT" },
+    { name = "product", type = "VARCHAR" },
+]
+"#
+        } else {
+            ""
+        };
         let toml_content = format!(
             r#"
 [adapter.default]
@@ -1097,19 +1120,13 @@ format = "csv"
 
 [pipeline.ingest.target]
 adapter = "default"
-catalog = ""
+catalog = "{catalog}"
 schema = "main"
 table = "orders"
 
 [pipeline.ingest.options]
 create_table = true
-
-[pipeline.ingest.contract]
-required_columns = [
-    {{ name = "id", type = "BIGINT" }},
-    {{ name = "product", type = "VARCHAR" }},
-]
-"#,
+{contract_section}"#,
             db_path.display()
         );
         let config_path = dir.join("rocky.toml");
@@ -1521,6 +1538,58 @@ required_columns = [
             None,
             "staging table must be dropped after a successful promote"
         );
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn orders_data_dir(dir: &Path) {
+        let data_dir = dir.join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("orders.csv"),
+            "id,product,qty\n1,Widget,10\n2,Gadget,5\n3,Doohickey,3\n",
+        )
+        .unwrap();
+    }
+
+    /// #2478: with `target.catalog` set to the current database (the file
+    /// stem `wh`, in any case), a load lands rows in that catalog, with and
+    /// without the contract gate.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_load_with_the_current_database_as_catalog_lands_rows() {
+        for (catalog, contract) in [("wh", false), ("WH", false), ("wh", true), ("Wh", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            orders_data_dir(dir.path());
+            let db_path = dir.path().join("wh.duckdb");
+            let config_path = write_load_config(dir.path(), &db_path, catalog, contract);
+            drive_load(&config_path, false)
+                .await
+                .unwrap_or_else(|e| panic!("catalog {catalog}, contract {contract}: {e:#}"));
+            assert_eq!(table_row_count(&db_path, "orders"), Some(3));
+            assert_eq!(table_row_count(&db_path, "orders__rocky_stg"), None);
+        }
+    }
+
+    /// #2478: a catalog that is not the current database fails and creates
+    /// no target, with and without the contract gate. The per-file error
+    /// text is pinned by the loader's own tests; `run_load` returns only the
+    /// failed-file count.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_load_with_an_unknown_catalog_fails_and_creates_no_target() {
+        for contract in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            orders_data_dir(dir.path());
+            let db_path = dir.path().join("wh.duckdb");
+            let config_path = write_load_config(dir.path(), &db_path, "nope", contract);
+            let err = drive_load(&config_path, false)
+                .await
+                .expect_err("a load into an unknown catalog must fail");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("failed to load"), "unexpected error: {msg}");
+            assert_eq!(table_row_count(&db_path, "orders"), None);
+            assert_eq!(table_row_count(&db_path, "orders__rocky_stg"), None);
+        }
     }
 
     /// (b) A CSV violating the contract (missing required column AND a

@@ -48,6 +48,12 @@ struct Project {
 
 impl Project {
     fn new(connector_extra: &str) -> Self {
+        Self::with_catalog("", connector_extra)
+    }
+
+    /// A project whose connector target sets `catalog`. The warehouse file is
+    /// `warehouse.duckdb`, so the current database is `warehouse`.
+    fn with_catalog(catalog: &str, connector_extra: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let p = root.path();
         std::fs::create_dir_all(p.join("connector")).unwrap();
@@ -62,7 +68,7 @@ path = "{db}"
 [connector.demo]
 manifest = "connector/connector.toml"
 output_uri = "file://./landing"
-target = {{ catalog = "", schema = "main", table = "events" }}
+target = {{ catalog = "{catalog}", schema = "main", table = "events" }}
 {connector_extra}
 "#,
                 db = p.join("warehouse.duckdb").display()
@@ -397,6 +403,45 @@ async fn a_first_run_that_breaks_staging_creates_no_target() {
     );
     let outcome = project.run().await;
     assert!(outcome.result.is_err());
+    assert_eq!(project.row_count(), None, "no target table");
+    assert_eq!(project.staging_tables(), 0);
+    assert!(project.state().is_none());
+}
+
+/// #2478: a target catalog equal to the current database, in any case, loads
+/// into it.
+#[tokio::test]
+async fn a_target_catalog_naming_the_current_database_loads_into_it() {
+    for catalog in ["warehouse", "Warehouse"] {
+        let project = Project::with_catalog(catalog, "");
+        standard_batches(&project);
+        let outcome = project.run().await;
+        outcome
+            .result
+            .as_ref()
+            .unwrap_or_else(|e| panic!("catalog {catalog}: {e:#}"));
+        assert_eq!(info(&outcome).status, ConnectorLoadStatus::Loaded);
+        assert_eq!(project.row_count(), Some(2));
+        assert_eq!(project.staging_tables(), 0, "staging is dropped");
+    }
+}
+
+/// #2478: a target catalog that is not the current database fails before
+/// anything is written, and the error names the accepted value.
+#[tokio::test]
+async fn an_unknown_target_catalog_fails_and_creates_no_target() {
+    let project = Project::with_catalog("nope", "retries = 0");
+    standard_batches(&project);
+    let outcome = project.run().await;
+    let err = outcome.result.as_ref().expect_err("the run must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(
+            "DuckDB has no attached database named 'nope'; the current database is \
+             'warehouse'. Set [load] target.catalog to \"\" or to 'warehouse'."
+        ),
+        "unexpected error: {msg}"
+    );
     assert_eq!(project.row_count(), None, "no target table");
     assert_eq!(project.staging_tables(), 0);
     assert!(project.state().is_none());
