@@ -155,25 +155,39 @@ pub fn generate_insert_sql(
         &model_ir.target.table,
     )?;
     let select = generate_select_sql(model_ir, dialect, last_watermark)?;
-    replication_insert(dialect, &target, &select, insert_columns)
+    replication_insert(model_ir, dialect, &target, &select, insert_columns)
 }
 
 /// `INSERT INTO <target> SELECT ...`, positional or with a named column list.
+///
+/// A metadata column in the list is spelled as the dialect's SELECT names it
+/// ([`SqlDialect::metadata_column_ref`]). Every other column must be a plain
+/// identifier and stays bare, as `SELECT *` returns it.
 fn replication_insert(
+    model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
     target: &str,
     select: &str,
     insert_columns: Option<&[String]>,
 ) -> Result<String, SqlGenError> {
-    match insert_columns {
-        None => Ok(dialect.insert_into(target, select)),
-        Some(columns) => {
-            for column in columns {
+    let Some(columns) = insert_columns else {
+        return Ok(dialect.insert_into(target, select));
+    };
+    let mut rendered = Vec::with_capacity(columns.len());
+    for column in columns {
+        let metadata = model_ir
+            .metadata_columns
+            .iter()
+            .find(|m| m.name() == column.as_str());
+        match metadata {
+            Some(m) => rendered.push(dialect.metadata_column_ref(m.name())),
+            None => {
                 validation::validate_identifier(column)?;
+                rendered.push(column.clone());
             }
-            Ok(dialect.insert_into_columns(target, columns, select))
         }
     }
+    Ok(dialect.insert_into_columns(target, &rendered, select))
 }
 
 /// Generates CREATE TABLE AS SELECT using the given dialect (full refresh).
@@ -317,7 +331,13 @@ pub fn generate_held_back_insert_sql(
         "{}\nFROM {}\n{where_clause} AND {bound}",
         parts.select_clause, parts.source_ref
     );
-    replication_insert(dialect, &parts.target_ref, &select, insert_columns)
+    replication_insert(
+        model_ir,
+        dialect,
+        &parts.target_ref,
+        &select,
+        insert_columns,
+    )
 }
 
 /// The replacing full copy of an incremental replication table with the
