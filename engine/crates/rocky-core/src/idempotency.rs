@@ -49,10 +49,9 @@
 //! that run), so lowering `in_flight_ttl_hours` later never makes a sweep
 //! remove a live claim.
 //!
-//! Expired object-store entries are **not swept today**: `rocky run` never
-//! calls the object-store sweep, so nothing removes them except a take-over by
-//! a later run or a bucket lifecycle rule. [`IdempotencyBackend::sweep_expired`]
-//! can sweep them, and removes only `Succeeded` entries past retention.
+//! Rocky never sweeps object-store entries (#2463). A take-over by a later run
+//! replaces an expired entry, and a bucket lifecycle rule is the only cleanup.
+//! [`IdempotencyBackend::sweep_expired`] is a no-op on `s3` / `gcs`.
 //!
 //! # Object-store writes are conditional
 //!
@@ -60,10 +59,10 @@
 //! (generation) read together with the claim, so exactly one of two concurrent
 //! adopters wins and the loser re-reads and re-classifies. Finalize is
 //! `put_if_match` on the claim this run owns, and refuses a claim another run
-//! holds. The sweep re-reads a claim right before deleting it and skips it if
-//! it changed. The object-store API has no conditional delete, so the sweep
-//! deletes only `Succeeded` entries, which no run rewrites; `InFlight`,
-//! `Failed` and unreadable entries are left for a take-over. A `Failed`
+//! holds. Every expired entry, `Succeeded` past its retention included, is
+//! taken over with a conditional write. The object-store API has no
+//! conditional delete, so no code path may delete an entry: a plain delete
+//! could remove a claim another run just took over (#2463). A `Failed`
 //! finalize under `dedup_on = "success"` writes an already-expired `Failed`
 //! entry instead of deleting, so a retry adopts it with a conditional write.
 //!
@@ -548,8 +547,9 @@ impl IdempotencyBackend {
     ///   was claimed, so the current `in_flight_ttl_hours` plays no part.
     /// - Valkey: no-op (server-side `EX` handles TTL); Tiered sweeps the
     ///   local mirror.
-    /// - Object store: lists, re-reads, and deletes `Succeeded` entries past
-    ///   retention; see the module docs. `rocky run` does not call this today.
+    /// - Object store: no-op. A delete there cannot be conditional, and an
+    ///   expired entry may be one a run is taking over (#2463). A bucket
+    ///   lifecycle rule is the cleanup; see the module docs.
     ///
     /// Returns the number of entries swept.
     pub async fn sweep_expired(
@@ -578,13 +578,11 @@ impl IdempotencyBackend {
                     Ok(0)
                 }
             }
-            IdempotencyBackend::ObjectStore { uri, .. } => {
-                // The recommended GC path for S3/GCS is a bucket lifecycle
-                // rule. For operators who can't configure that, this is an
-                // active sweep: list, parse, re-check, delete-if-expired.
-                // Best-effort and non-authoritative.
-                let provider = provider_for_uri(uri)?;
-                object_store_sweep_expired(&provider, now).await
+            IdempotencyBackend::ObjectStore { .. } => {
+                debug!(
+                    "object-store idempotency entries are not swept; a bucket lifecycle rule removes them"
+                );
+                Ok(0)
             }
         }
     }
@@ -1195,104 +1193,6 @@ async fn object_store_finalize(
         }
     }
     Err(contended(&rel_path))
-}
-
-async fn object_store_sweep_expired(
-    provider: &ObjectStoreProvider,
-    now: DateTime<Utc>,
-) -> Result<usize, IdempotencyError> {
-    // Active sweep for object-store backends: list `idempotency/*`, read each
-    // claim, delete a `Succeeded` entry past its retention. Errors are
-    // warn-swallowed so a flaky bucket doesn't fail the run.
-    let paths = match provider.list("idempotency").await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "idempotency sweep list failed; bucket-lifecycle rules are the durable GC path");
-            return Ok(0);
-        }
-    };
-    let mut removed = 0;
-    for path in paths {
-        let rel_path = format!("idempotency/{}", path.trim_start_matches("idempotency/"));
-        let observed = match observe_claim_at_path(provider, &rel_path).await {
-            Ok(Some(observed)) => observed,
-            Ok(None) => continue,
-            Err(e) => {
-                warn!(error = %e, path = %rel_path, "idempotency sweep could not read an entry; skipping it");
-                continue;
-            }
-        };
-        if observed.entry.is_none() {
-            warn!(path = %rel_path, "idempotency sweep skipped an entry that is not deserializable");
-            continue;
-        }
-        if let Ok(true) = sweep_observed_claim(provider, &observed, now).await {
-            removed += 1;
-        }
-    }
-    Ok(removed)
-}
-
-/// Delete `observed` if it is a `Succeeded` entry past its retention and is
-/// still the object in the store.
-///
-/// Only `Succeeded` entries are swept. The object-store API has no
-/// conditional delete, so a read-then-delete can remove an object a run wrote
-/// in between. A `Succeeded` entry is never rewritten by a claim, finalize or
-/// take-over (a later run skips it as completed), so nothing can replace it
-/// in that window. `InFlight`, `Failed` and unreadable entries are all
-/// taken over with a conditional write, so the sweep leaves them: they stay
-/// until a run adopts them or a bucket lifecycle rule removes them.
-async fn sweep_observed_claim(
-    provider: &ObjectStoreProvider,
-    observed: &ObservedClaim,
-    now: DateTime<Utc>,
-) -> Result<bool, IdempotencyError> {
-    let expired_success = |claim: &ObservedClaim| {
-        claim.entry.as_ref().is_some_and(|entry| {
-            entry.state == IdempotencyState::Succeeded && entry.expires_at < now
-        })
-    };
-    if !expired_success(observed) {
-        return Ok(false);
-    }
-    let Some(current) = observe_claim_at_path(provider, &observed.path).await? else {
-        return Ok(false);
-    };
-    let unchanged = match (&observed.generation, &current.generation) {
-        (Some(before), Some(after)) => before == after,
-        _ => observed.body == current.body,
-    };
-    if !unchanged || !expired_success(&current) {
-        return Ok(false);
-    }
-    provider.delete(&observed.path).await?;
-    Ok(true)
-}
-
-/// Seams for tests that need to interleave a sweep with another writer.
-/// Compiled only for this crate's tests or under `test-support`.
-#[cfg(any(test, feature = "test-support"))]
-pub mod testing {
-    use super::*;
-
-    /// Read the claim for `key` the way the sweep does.
-    pub async fn observe_claim(
-        provider: &ObjectStoreProvider,
-        key: &str,
-    ) -> Result<Option<ObservedClaim>, IdempotencyError> {
-        observe_claim_at_path(provider, &object_store_relative_path(key)).await
-    }
-
-    /// Run the sweep's delete step on a claim read earlier. `Ok(true)` when
-    /// it deleted the object.
-    pub async fn sweep_observed(
-        provider: &ObjectStoreProvider,
-        observed: &ObservedClaim,
-        now: DateTime<Utc>,
-    ) -> Result<bool, IdempotencyError> {
-        sweep_observed_claim(provider, observed, now).await
-    }
 }
 
 // -----------------------------------------------------------------------

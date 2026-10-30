@@ -783,7 +783,7 @@ Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backend
 
 #### Bucket-native lifecycle for object-store backends
 
-Rocky's built-in sweep deletes idempotency stamps from the local `state.redb` after `retention_days`. Rocky does not sweep expired stamps in an `s3` / `gcs` bucket today, so they stay until a later run takes the key over. Configure a bucket-native lifecycle rule to remove them. It also keeps GC running when no Rocky process is active.
+Rocky's built-in sweep deletes idempotency stamps from the local `state.redb` after `retention_days`. Rocky never sweeps expired stamps in an `s3` / `gcs` bucket. A delete there cannot be conditional, so it could remove a claim that a run had just taken over. Expired stamps stay until a later run takes the key over. Configure a bucket-native lifecycle rule to remove them. It also keeps GC running when no Rocky process is active.
 
 Both rules below match the default `state.s3_prefix` / `state.gcs_prefix` of `rocky/state/`. Adjust the prefix if you've overridden it. The rule's age must be at least `[state.idempotency] retention_days` and larger than `in_flight_ttl_hours` (converted to days). A shorter rule can delete a live `InFlight` claim, and then two runs with the same key can proceed. It must also not remove a stamp that should still dedup. The examples below use 30 days, which fits the defaults (30 days and 24 hours); raise the age if you raise either setting.
 
