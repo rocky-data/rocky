@@ -322,7 +322,7 @@ pub(crate) fn classify_anyhow(
 /// The boundary walk is not cosmetic either: `String::truncate` panics when
 /// the index is not a char boundary, and `{err:#}` can carry any UTF-8 a
 /// warehouse chose to put in a message.
-fn truncate_error(err: &anyhow::Error) -> String {
+pub(crate) fn truncate_error(err: &anyhow::Error) -> String {
     let mut msg = crate::secret_filter::redact(&format!("{err:#}"));
     if msg.len() > MAX_ATTEMPT_ERROR_LEN {
         let mut cut = MAX_ATTEMPT_ERROR_LEN;

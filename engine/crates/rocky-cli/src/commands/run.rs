@@ -356,6 +356,48 @@ fn flush_interrupted_watermarks(
 }
 
 /// Error from parallel table processing (partial failure mode).
+/// The measured copy attempts of one failed replication table (#2470).
+#[derive(Debug, Clone)]
+struct CopyFailure {
+    /// The target table name: the name its run record would carry on success.
+    table: String,
+    /// Every copy attempt, terminal failed attempt last.
+    attempts: Vec<rocky_core::state::AttemptRecord>,
+}
+
+impl CopyFailure {
+    /// A failed copy attempt, numbered after the attempts already recorded.
+    fn attempt(
+        prior: &[rocky_core::state::AttemptRecord],
+        err: &anyhow::Error,
+        duration_ms: u64,
+    ) -> rocky_core::state::AttemptRecord {
+        rocky_core::state::AttemptRecord {
+            attempt: prior.len() as u32 + 1,
+            outcome: "failed".to_string(),
+            // The copy path does not classify a failure into a retry class.
+            failure_class: None,
+            transient_kind: None,
+            error: Some(super::resilience::truncate_error(err)),
+            backoff_ms: None,
+            duration_ms,
+        }
+    }
+
+    /// The run-record measurement: the last attempt's own time, and the full
+    /// trail only when a retry happened.
+    fn measured(&self) -> super::resilience::FailedModelAttempts {
+        super::resilience::FailedModelAttempts {
+            duration_ms: self.attempts.last().map_or(0, |a| a.duration_ms),
+            attempts: if self.attempts.len() > 1 {
+                self.attempts.clone()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
 struct TableError {
     asset_key: Vec<String>,
     error: String,
@@ -364,6 +406,10 @@ struct TableError {
     /// For the one entry a fail-fast model phase produced: the model it stands
     /// for, so its run record can take that model's measured attempts (#2470).
     model: Option<String>,
+    /// For a failed replication copy: the table and its measured copy
+    /// attempts, so its run record keeps its name and time (#2470). `None`
+    /// for an entry no copy produced (a freeze, a panicked task).
+    copy: Option<CopyFailure>,
     /// Coarse classification of the failure for the public JSON output.
     /// Set by walking the typed connector-error chain on `e` before the
     /// error is stringified; defaults to `Unknown` when no connector
@@ -927,9 +973,10 @@ fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_error
             failure_kind: e.failure_kind,
             cooldown_seconds: e.cooldown_seconds,
         };
-        match &e.model {
-            Some(model) => output.push_model_error(entry, model),
-            None => output.errors.push(entry),
+        match (&e.model, &e.copy) {
+            (Some(model), _) => output.push_model_error(entry, model),
+            (None, Some(copy)) => output.push_table_error(entry, &copy.table, copy.measured()),
+            (None, None) => output.errors.push(entry),
         }
     }
     output.status = output.derive_run_status();
@@ -6707,7 +6754,7 @@ pub async fn run_with_explicit_contracts(
     // (`prune_unchanged`) and the run didn't force a full pass (`--no-prune`).
     // Threaded into every `process_table` call in the concurrent loop below.
     let prune_enabled = shared_pipeline.prune_unchanged && !skip_opts.no_prune;
-    let mut join_set: JoinSet<(usize, Result<TableOutcome, anyhow::Error>)> = JoinSet::new();
+    let mut join_set: JoinSet<(usize, u64, Result<TableOutcome, anyhow::Error>)> = JoinSet::new();
 
     // Background state sync — flush watermarks to remote storage.
     //
@@ -6803,6 +6850,7 @@ pub async fn run_with_explicit_contracts(
             ),
             task_index: None,
             model: None,
+            copy: None,
             failure_kind: crate::output::FailureKind::Unknown,
             cooldown_seconds: None,
         });
@@ -6945,9 +6993,10 @@ pub async fn run_with_explicit_contracts(
             if cancel_at_copy {
                 stall_cancel.cancel();
             }
+            let copy_start = Instant::now();
             let result =
                 process_table_with_replacement_recovery(warehouse.as_ref(), &state, &pipeline_ref, &task, prune_enabled, required_replacement, needs_orphan_checks).await;
-            (idx, result)
+            (idx, copy_start.elapsed().as_millis() as u64, result)
         });
     }
 
@@ -6995,7 +7044,7 @@ pub async fn run_with_explicit_contracts(
         total_completed += 1;
 
         match result {
-            Ok((idx, Ok(TableOutcome::Pruned(pruned)))) => {
+            Ok((idx, _, Ok(TableOutcome::Pruned(pruned)))) => {
                 // A prune is a cheap successful metadata read, not real work —
                 // signal the throttle so it can widen concurrency, then record
                 // the skip. No materialization is emitted: the orchestrator's
@@ -7013,7 +7062,7 @@ pub async fn run_with_explicit_contracts(
                 )
                 .await;
             }
-            Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
+            Ok((_, _, Ok(TableOutcome::Materialized(tr)))) => {
                 collect_materialized_table(
                     *tr,
                     &mut MaterializedSinks {
@@ -7050,12 +7099,17 @@ pub async fn run_with_explicit_contracts(
                 )
                 .await;
             }
-            Ok((idx, Err(e))) => {
+            Ok((idx, copy_ms, Err(e))) => {
                 // Classify before stringification so the typed connector
                 // variant is preserved on `TableError.failure_kind` and
                 // the optional engine-supplied cooldown hint
                 // (warehouse-side breaker trip) is captured.
                 let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+                // The copy's own time and attempt, for its run record (#2470).
+                let copy = tables_to_process.get(idx).map(|task| CopyFailure {
+                    table: task.target_table_name.clone(),
+                    attempts: vec![CopyFailure::attempt(&[], &e, copy_ms)],
+                });
                 let raw = format!("{e:#}");
                 if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                     warn!(
@@ -7122,7 +7176,7 @@ pub async fn run_with_explicit_contracts(
                             asset_key: vec![],
                             status: rocky_core::state::TableStatus::Failed,
                             error: Some(msg.clone()),
-                            duration_ms: 0,
+                            duration_ms: copy_ms,
                             completed_at: Utc::now(),
                             held_max: None,
                         },
@@ -7135,6 +7189,7 @@ pub async fn run_with_explicit_contracts(
                     error: msg,
                     task_index: Some(idx),
                     model: None,
+                    copy,
                     failure_kind,
                     cooldown_seconds,
                 });
@@ -7169,6 +7224,7 @@ pub async fn run_with_explicit_contracts(
                     error: msg,
                     task_index: None,
                     model: None,
+                    copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
                 });
@@ -7424,6 +7480,7 @@ pub async fn run_with_explicit_contracts(
                     break;
                 }
                 let task = &tables_to_process[idx];
+                let retry_start = Instant::now();
                 match retry_table_after_recovery(
                     shared_warehouse.as_ref(),
                     &shared_state,
@@ -7507,11 +7564,24 @@ pub async fn run_with_explicit_contracts(
                             error = msg,
                             "retry also failed"
                         );
+                        // The first attempt's record, then this retry's (#2470).
+                        let mut attempts = table_errors
+                            .iter()
+                            .find(|prior| prior.task_index == Some(idx))
+                            .and_then(|prior| prior.copy.as_ref())
+                            .map(|prior| prior.attempts.clone())
+                            .unwrap_or_default();
+                        let retry_ms = retry_start.elapsed().as_millis() as u64;
+                        attempts.push(CopyFailure::attempt(&attempts, &e, retry_ms));
                         still_failed.push(TableError {
                             asset_key: vec![],
                             error: msg,
                             task_index: Some(idx),
                             model: None,
+                            copy: Some(CopyFailure {
+                                table: task.target_table_name.clone(),
+                                attempts,
+                            }),
                             failure_kind,
                             cooldown_seconds,
                         });
@@ -7900,6 +7970,7 @@ pub async fn run_with_explicit_contracts(
                         error: format!("{e:#}"),
                         task_index: None,
                         model: output.fail_fast_model.take(),
+                        copy: None,
                         failure_kind,
                         cooldown_seconds,
                     });
@@ -7925,6 +7996,7 @@ pub async fn run_with_explicit_contracts(
                     error: msg,
                     task_index: None,
                     model: None,
+                    copy: None,
                     failure_kind: crate::output::FailureKind::Unknown,
                     cooldown_seconds: None,
                 });
@@ -20320,7 +20392,7 @@ pub(crate) enum DrainDecision {
 /// failed one, because a success moves the denominator.
 #[allow(clippy::too_many_arguments)]
 async fn process_completed_result(
-    result: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
+    result: Result<(usize, u64, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
     tables_to_process: &[TableTask],
     throttle: &Option<AdaptiveThrottle>,
     semaphore: &Semaphore,
@@ -20338,7 +20410,7 @@ async fn process_completed_result(
     let mut failed = false;
 
     match result {
-        Ok((idx, Ok(TableOutcome::Pruned(pruned)))) => {
+        Ok((idx, _, Ok(TableOutcome::Pruned(pruned)))) => {
             if let Some(t) = &throttle {
                 t.on_success();
                 adjust_semaphore(t, semaphore, semaphore_capacity);
@@ -20352,7 +20424,7 @@ async fn process_completed_result(
             )
             .await;
         }
-        Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
+        Ok((_, _, Ok(TableOutcome::Materialized(tr)))) => {
             collect_materialized_table(
                 *tr,
                 sinks,
@@ -20370,11 +20442,16 @@ async fn process_completed_result(
             )
             .await;
         }
-        Ok((idx, Err(e))) => {
+        Ok((idx, copy_ms, Err(e))) => {
             // Classify before stringification so the typed connector
             // variant is preserved on `TableError.failure_kind` (plus
             // the optional warehouse-breaker cooldown hint).
             let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+            // The copy's own time and attempt, for its run record (#2470).
+            let copy = tables_to_process.get(idx).map(|task| CopyFailure {
+                table: task.target_table_name.clone(),
+                attempts: vec![CopyFailure::attempt(&[], &e, copy_ms)],
+            });
             let raw = format!("{e:#}");
             if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                 warn!(
@@ -20452,7 +20529,7 @@ async fn process_completed_result(
                         asset_key: vec![],
                         status: rocky_core::state::TableStatus::Failed,
                         error: Some(msg.clone()),
-                        duration_ms: 0,
+                        duration_ms: copy_ms,
                         completed_at: Utc::now(),
                         held_max: None,
                     },
@@ -20465,6 +20542,7 @@ async fn process_completed_result(
                 error: msg,
                 task_index: Some(idx),
                 model: None,
+                copy,
                 failure_kind,
                 cooldown_seconds,
             });
@@ -20496,6 +20574,7 @@ async fn process_completed_result(
                 error: msg,
                 task_index: None,
                 model: None,
+                copy: None,
                 failure_kind: FailureKind::Unknown,
                 cooldown_seconds: None,
             });
@@ -24429,9 +24508,10 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let hook_registry = HookRegistry::from_config(&Default::default());
 
         type CompletedResult =
-            Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>;
+            Result<(usize, u64, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>;
         let results: Vec<CompletedResult> = vec![
             Ok((
+                0,
                 0,
                 Ok(TableOutcome::Pruned(PrunedTable {
                     asset_key: vec!["test".into(), "orders".into()],
@@ -24442,6 +24522,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             )),
             Ok((
                 1,
+                0,
                 Err(anyhow::anyhow!(
                     "[TABLE_OR_VIEW_NOT_FOUND] the source table raw.items is gone"
                 )),
@@ -26902,6 +26983,7 @@ auto_create_schemas = true
             failed_attempts: Default::default(),
             fail_fast_model: None,
             error_models: Default::default(),
+            table_attempts: Default::default(),
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -33147,7 +33229,7 @@ timestamp_column = "ts"
             )
             .unwrap();
         process_completed_result(
-            Ok((0, Ok(TableOutcome::Materialized(result)))),
+            Ok((0, 0, Ok(TableOutcome::Materialized(result)))),
             &tasks,
             &throttle,
             &semaphore,
@@ -35128,6 +35210,7 @@ backend = "local"
             error: format!("copy of {asset} failed"),
             task_index: None,
             model: None,
+            copy: None,
             failure_kind: crate::output::FailureKind::QueryRejected,
             cooldown_seconds: None,
         }
@@ -36152,6 +36235,78 @@ backend = "local"
             out.status,
             rocky_core::state::RunStatus::PartialFailure
         ));
+    }
+
+    /// #2470: a failed replication copy reaches the run record under its
+    /// table's name with its measured time. A retried table keeps the last
+    /// attempt's time in `duration_ms` and the whole trail in `attempts`.
+    #[test]
+    fn merge_copy_failure_keeps_table_name_and_time_in_run_record() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        let attempt = |prior: &[rocky_core::state::AttemptRecord], ms: u64| {
+            CopyFailure::attempt(prior, &anyhow::anyhow!("the warehouse said no"), ms)
+        };
+        let first = attempt(&[], 30);
+        let retried = vec![first.clone(), attempt(std::slice::from_ref(&first), 45)];
+        let mut once = copy_table_error("once");
+        once.copy = Some(CopyFailure {
+            table: "orders".to_string(),
+            attempts: vec![attempt(&[], 25)],
+        });
+        let mut twice = copy_table_error("twice");
+        twice.copy = Some(CopyFailure {
+            table: "items".to_string(),
+            attempts: retried,
+        });
+        // A model of the same name failed too: each keeps its own time.
+        out.failed_attempts.insert(
+            "orders".to_string(),
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms: 999,
+                attempts: Vec::new(),
+            },
+        );
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &[once, twice]);
+
+        assert_eq!(out.errors.len(), 2);
+        assert_eq!(
+            out.errors[0].asset_key,
+            vec!["once".to_string()],
+            "JSON unchanged"
+        );
+        let started = Utc::now();
+        let record = out.to_run_record(
+            "run-2470",
+            started,
+            started + chrono::Duration::seconds(1),
+            String::new(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        let find = |n: &str| {
+            record
+                .models_executed
+                .iter()
+                .find(|m| m.model_name == n)
+                .unwrap_or_else(|| panic!("no record for {n}: {:?}", record.models_executed))
+        };
+        let orders = find("orders");
+        assert_eq!(orders.status, "failed");
+        assert_eq!(orders.duration_ms, 25);
+        assert!(
+            orders.attempts.is_empty(),
+            "a first-try failure has no trail"
+        );
+        let items = find("items");
+        assert_eq!(items.duration_ms, 45);
+        let trail: Vec<(u32, u64)> = items
+            .attempts
+            .iter()
+            .map(|a| (a.attempt, a.duration_ms))
+            .collect();
+        assert_eq!(trail, vec![(1, 30), (2, 45)]);
     }
 
     /// On the replication path with `[resilience] contain_failures = true`,
@@ -51621,7 +51776,10 @@ timestamp_column = "ts"
     #[tokio::test]
     async fn the_inline_drain_returns_the_abort_decision_for_both_settings() {
         async fn decide(
-            outcome: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
+            outcome: Result<
+                (usize, u64, Result<TableOutcome, anyhow::Error>),
+                tokio::task::JoinError,
+            >,
             policy: &AbortPolicy,
             prior_errors: usize,
             prior_completed: usize,
@@ -51656,6 +51814,7 @@ timestamp_column = "ts"
                     error: "earlier failure".to_string(),
                     task_index: None,
                     model: None,
+                    copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
                 })
@@ -51703,7 +51862,7 @@ timestamp_column = "ts"
             fail_fast: false,
             error_rate_abort_pct: 50,
         };
-        let failure = || Ok((0usize, Err(anyhow::anyhow!("the warehouse said no"))));
+        let failure = || Ok((0usize, 0, Err(anyhow::anyhow!("the warehouse said no"))));
 
         assert_eq!(
             decide(failure(), &fail_fast, 0, 0).await,
@@ -51715,6 +51874,7 @@ timestamp_column = "ts"
         assert_eq!(
             decide(
                 Ok((
+                    0,
                     0,
                     Ok(TableOutcome::Pruned(PrunedTable {
                         asset_key: vec!["t".into()],
@@ -51828,7 +51988,7 @@ timestamp_column = "ts"
         let mut total_completed = 0;
 
         process_completed_result(
-            Ok((0, Err(err))),
+            Ok((0, 42, Err(err))),
             &tasks,
             &throttle,
             &semaphore,
@@ -51872,6 +52032,13 @@ timestamp_column = "ts"
             reported, &expected_framed,
             "and it must be the SAME framing, not a second dialect of it"
         );
+        // #2470: the copy keeps its table name and its measured time.
+        let copy = table_errors[0].copy.as_ref().expect("a copy failure");
+        assert_eq!(copy.table, task.target_table_name);
+        assert_eq!(copy.attempts.len(), 1);
+        assert_eq!(copy.attempts[0].attempt, 1);
+        assert_eq!(copy.attempts[0].duration_ms, 42);
+        assert_eq!(copy.attempts[0].outcome, "failed");
 
         assert!(
             marker.exists(),
@@ -51957,7 +52124,7 @@ timestamp_column = "ts"
         let dropped = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             process_completed_result(
-                Ok((0, Ok(TableOutcome::Materialized(result)))),
+                Ok((0, 0, Ok(TableOutcome::Materialized(result)))),
                 &tasks,
                 &throttle,
                 &semaphore,
@@ -52046,7 +52213,7 @@ timestamp_column = "ts"
         let mut collected = CollectedRun::new();
 
         process_completed_result(
-            Ok((0, Ok(TableOutcome::Materialized(Box::new(tr))))),
+            Ok((0, 0, Ok(TableOutcome::Materialized(Box::new(tr))))),
             &tasks,
             &None,
             &semaphore,
