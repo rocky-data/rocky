@@ -384,6 +384,36 @@ impl CopyFailure {
         }
     }
 
+    /// A successful copy attempt, numbered after the failed ones before it.
+    fn success(
+        prior: &[rocky_core::state::AttemptRecord],
+        duration_ms: u64,
+    ) -> rocky_core::state::AttemptRecord {
+        rocky_core::state::AttemptRecord {
+            attempt: prior.len() as u32 + 1,
+            outcome: "success".to_string(),
+            failure_class: None,
+            transient_kind: None,
+            error: None,
+            backoff_ms: None,
+            duration_ms,
+        }
+    }
+
+    /// The copy attempts already recorded for task `idx`, for a retry to
+    /// extend. Empty when no copy failure is recorded for it.
+    fn prior_attempts(
+        table_errors: &[TableError],
+        idx: usize,
+    ) -> Vec<rocky_core::state::AttemptRecord> {
+        table_errors
+            .iter()
+            .find(|prior| prior.task_index == Some(idx))
+            .and_then(|prior| prior.copy.as_ref())
+            .map(|prior| prior.attempts.clone())
+            .unwrap_or_default()
+    }
+
     /// The run-record measurement: the last attempt's own time, and the full
     /// trail only when a retry happened.
     fn measured(&self) -> super::resilience::FailedModelAttempts {
@@ -7512,7 +7542,15 @@ pub async fn run_with_explicit_contracts(
                         )
                         .await;
                     }
-                    Ok(TableOutcome::Materialized(tr)) => {
+                    Ok(TableOutcome::Materialized(mut tr)) => {
+                        // The failed first attempt stays in the trail, as a
+                        // retried model's does (#2470).
+                        let mut attempts = CopyFailure::prior_attempts(&table_errors, idx);
+                        if !attempts.is_empty() {
+                            let success = CopyFailure::success(&attempts, tr.materialization.duration_ms);
+                            attempts.push(success);
+                            tr.materialization.attempts = attempts;
+                        }
                         // The same collector the two drain paths use (#1718).
                         // The first attempt recorded this table Failed; the
                         // retry's Success replaces it (same key, last write
@@ -7565,12 +7603,7 @@ pub async fn run_with_explicit_contracts(
                             "retry also failed"
                         );
                         // The first attempt's record, then this retry's (#2470).
-                        let mut attempts = table_errors
-                            .iter()
-                            .find(|prior| prior.task_index == Some(idx))
-                            .and_then(|prior| prior.copy.as_ref())
-                            .map(|prior| prior.attempts.clone())
-                            .unwrap_or_default();
+                        let mut attempts = CopyFailure::prior_attempts(&table_errors, idx);
                         let retry_ms = retry_start.elapsed().as_millis() as u64;
                         attempts.push(CopyFailure::attempt(&attempts, &e, retry_ms));
                         still_failed.push(TableError {
@@ -36235,6 +36268,42 @@ backend = "local"
             out.status,
             rocky_core::state::RunStatus::PartialFailure
         ));
+    }
+
+    /// #2470: a `table_retries` retry extends the attempts recorded for its
+    /// own task, numbered after them, whether it fails or succeeds.
+    #[test]
+    fn copy_retry_extends_its_own_tasks_attempts() {
+        let err = anyhow::anyhow!("the warehouse said no");
+        let mut first = copy_table_error("orders");
+        first.task_index = Some(3);
+        first.copy = Some(CopyFailure {
+            table: "orders".to_string(),
+            attempts: vec![CopyFailure::attempt(&[], &err, 30)],
+        });
+        let mut other = copy_table_error("items");
+        other.task_index = Some(4);
+        let errors = vec![other, first];
+
+        let mut failed = CopyFailure::prior_attempts(&errors, 3);
+        failed.push(CopyFailure::attempt(&failed, &err, 45));
+        let trail: Vec<(u32, &str, u64)> = failed
+            .iter()
+            .map(|a| (a.attempt, a.outcome.as_str(), a.duration_ms))
+            .collect();
+        assert_eq!(trail, vec![(1, "failed", 30), (2, "failed", 45)]);
+
+        let mut succeeded = CopyFailure::prior_attempts(&errors, 3);
+        succeeded.push(CopyFailure::success(&succeeded, 20));
+        assert_eq!(succeeded[1].attempt, 2);
+        assert_eq!(succeeded[1].outcome, "success");
+        assert!(succeeded[1].error.is_none());
+
+        assert!(
+            CopyFailure::prior_attempts(&errors, 4).is_empty(),
+            "an entry with no copy record adds nothing"
+        );
+        assert!(CopyFailure::prior_attempts(&errors, 9).is_empty());
     }
 
     /// #2470: a failed replication copy reaches the run record under its
