@@ -3830,8 +3830,9 @@ pub async fn run_with_explicit_contracts(
     // early error return *after the claim* still releases the idempotency
     // stamp. Without this wrapper, a run that errored before the existing
     // `finalize_idempotency` sites would leave the `InFlight` claim in
-    // redb/Valkey/object-store until the 24h `in_flight_ttl_hours` sweep
-    // reaped it — so a retry with the same key returned `skipped_in_flight`
+    // redb/Valkey/object-store until its 24h `in_flight_ttl_hours` expiry
+    // (a sweep on redb and Valkey; a later run's take-over on an object
+    // store) — so a retry with the same key returned `skipped_in_flight`
     // for up to 24h instead of proceeding. The happy / interrupted /
     // partial-failure paths each call `finalize_idempotency` which is
     // one-shot (takes the ctx out of the `Option`); if that already fired,
