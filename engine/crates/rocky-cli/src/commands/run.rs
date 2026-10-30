@@ -18120,6 +18120,50 @@ fn resolve_merge_update_columns(
     }
 }
 
+/// The column list for a replication INSERT, or `None` to keep it positional.
+///
+/// The SELECT is `*, <metadata columns>`: the source columns in source order,
+/// then the metadata columns. The target holds its existing columns, then any
+/// columns drift appended. When a source column is added, drift appends it
+/// after the metadata columns, so a positional INSERT writes it into
+/// `_loaded_by` and the other way round (#2468).
+///
+/// Returns the SELECT's column names when both sides hold the same columns
+/// (case-insensitive) in a different order. Any other case keeps the INSERT
+/// positional: matching order is already safe, and a mismatched column set
+/// fails at the warehouse as it did before. `None` also when the source
+/// description is empty.
+fn replication_insert_columns(
+    source_cols: &[ColumnInfo],
+    metadata_columns: &[MetadataColumn],
+    target_cols: &[ColumnInfo],
+    drift_added: &[String],
+) -> Option<Vec<String>> {
+    if source_cols.is_empty() {
+        return None;
+    }
+    let select: Vec<String> = source_cols
+        .iter()
+        .map(|c| c.name.clone())
+        .chain(metadata_columns.iter().map(|m| m.name().to_string()))
+        .collect();
+    let select_order: Vec<String> = select.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let target_order: Vec<String> = target_cols
+        .iter()
+        .map(|c| c.name.as_str())
+        .chain(drift_added.iter().map(String::as_str))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if select_order == target_order {
+        return None;
+    }
+    let mut select_set = select_order;
+    let mut target_set = target_order;
+    select_set.sort_unstable();
+    target_set.sort_unstable();
+    (select_set == target_set).then_some(select)
+}
+
 /// `MAX(<timestamp_column>) FROM <target>` — the post-execute watermark for the
 /// replication path. Reads the **target** table so the recorded value reflects
 /// exactly what was loaded (closing the source-side TOCTOU described on
@@ -18956,9 +19000,17 @@ async fn process_table(
 
     let mut use_full_refresh = !target_exists || (uses_watermark && prior_watermark.is_none());
     let mut drift_action: Option<DriftActionOutput> = None;
+    // Columns the drift step below appends to the target, in order. Unless the
+    // drift drops the table, they land after every existing column.
+    let mut drift_added_columns: Vec<String> = Vec::new();
 
     if target_exists {
         let drift_result = drift::detect_drift(&target_table, &source_cols, &target_cols, dialect);
+        drift_added_columns = drift_result
+            .added_columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
 
         // Governed additive-drift auto-apply (default-off). When the opt-in +
         // a `[policy]` grant are configured (`task.auto_apply_gate` is `Some`),
@@ -19150,6 +19202,18 @@ async fn process_table(
     // above for drift detection; `source_cols` is in scope and free. Reuse it.
     let resolved_strategy =
         resolve_merge_update_columns(&strategy, &source_cols, &task.metadata_columns);
+    // An incremental INSERT is positional on every dialect but DuckDB. Name the
+    // columns when the target's order differs from the SELECT's (#2468).
+    let insert_columns = if target_exists && !use_full_refresh {
+        replication_insert_columns(
+            &source_cols,
+            &task.metadata_columns,
+            &target_cols,
+            &drift_added_columns,
+        )
+    } else {
+        None
+    };
 
     let model_ir = replication_model_ir(
         task,
@@ -19191,10 +19255,14 @@ async fn process_table(
                         dialect,
                         prior_watermark.as_ref(),
                         held,
+                        insert_columns.as_deref(),
                     )?,
-                    None => {
-                        sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
-                    }
+                    None => sql_gen::generate_insert_sql(
+                        &model_ir,
+                        dialect,
+                        prior_watermark.as_ref(),
+                        insert_columns.as_deref(),
+                    )?,
                 }
             }
             MaterializationStrategy::Merge { .. } => {
@@ -19316,7 +19384,12 @@ async fn process_table(
             MaterializationStrategy::Microbatch { .. } => {
                 strategy_name = "microbatch";
                 // Microbatch on replication tables falls back to incremental insert.
-                sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
+                sql_gen::generate_insert_sql(
+                    &model_ir,
+                    dialect,
+                    prior_watermark.as_ref(),
+                    insert_columns.as_deref(),
+                )?
             }
             MaterializationStrategy::ContentAddressed { .. } => {
                 // content_addressed is a transformation strategy backed by
@@ -29339,6 +29412,88 @@ merge_keys_fallback = ["fallback_only"]
             }
             other => panic!("expected Merge with Explicit columns, got {other:?}"),
         }
+    }
+
+    fn cols(names: &[&str]) -> Vec<ColumnInfo> {
+        names
+            .iter()
+            .map(|n| ColumnInfo {
+                name: (*n).to_string(),
+                data_type: "STRING".to_string(),
+                nullable: true,
+            })
+            .collect()
+    }
+
+    fn loaded_by() -> Vec<MetadataColumn> {
+        vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()]
+    }
+
+    /// #2468: drift appends `region` after `_loaded_by`, but the SELECT puts it
+    /// before. The INSERT must name its columns.
+    #[test]
+    fn replication_insert_columns_names_drift_added_column() {
+        let got = replication_insert_columns(
+            &cols(&["id", "region"]),
+            &loaded_by(),
+            &cols(&["id", "_loaded_by"]),
+            &["region".to_string()],
+        );
+        assert_eq!(
+            got,
+            Some(vec![
+                "id".to_string(),
+                "region".to_string(),
+                "_loaded_by".to_string()
+            ])
+        );
+    }
+
+    /// The order already matches: the INSERT stays positional. Snowflake
+    /// reports the target's names in upper case.
+    #[test]
+    fn replication_insert_columns_keeps_matching_order_positional() {
+        let got = replication_insert_columns(
+            &cols(&["ID", "NAME"]),
+            &loaded_by(),
+            &cols(&["ID", "NAME", "_LOADED_BY"]),
+            &[],
+        );
+        assert_eq!(got, None);
+    }
+
+    /// A source reorder without drift is caught too.
+    #[test]
+    fn replication_insert_columns_names_reordered_source() {
+        let got = replication_insert_columns(
+            &cols(&["name", "id"]),
+            &loaded_by(),
+            &cols(&["id", "name", "_loaded_by"]),
+            &[],
+        );
+        assert_eq!(
+            got,
+            Some(vec![
+                "name".to_string(),
+                "id".to_string(),
+                "_loaded_by".to_string()
+            ])
+        );
+    }
+
+    /// A different column set keeps the INSERT positional, so the warehouse
+    /// still refuses it as before. So does an empty source description.
+    #[test]
+    fn replication_insert_columns_leaves_mismatched_sets_alone() {
+        let target = cols(&["id", "legacy", "_loaded_by"]);
+        assert_eq!(
+            replication_insert_columns(&cols(&["id"]), &loaded_by(), &target, &[]),
+            None
+        );
+        assert_eq!(
+            replication_insert_columns(&[], &loaded_by(), &target, &[]),
+            None
+        );
     }
 
     #[test]
