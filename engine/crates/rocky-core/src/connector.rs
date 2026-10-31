@@ -108,6 +108,13 @@ pub struct ConnectorConfig {
     /// limits wins for each key.
     #[serde(default, skip_serializing_if = "ConnectorLimitsConfig::is_unset")]
     pub limits: ConnectorLimitsConfig,
+
+    /// Keep the scratch directory of a successful run. By default Rocky
+    /// removes it after the state commit: it is the program's `HOME` and
+    /// `TMPDIR`, so caches and credential files the program wrote there
+    /// would otherwise outlive the run. A failed run always keeps it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_scratch: bool,
 }
 
 /// `target` of a connector: the table it fills.

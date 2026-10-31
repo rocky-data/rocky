@@ -143,6 +143,13 @@ echo "    id 20 loaded on load 2; id 25, at the source maximum, waits until a ne
 
 echo
 echo "=== password grep: JSON outputs, debug logs, kept scratch dirs, saved state ==="
+# keep_scratch = true, so the three runs' scratch directories must be there:
+# otherwise the grep below would pass on an empty tree.
+SCRATCH_DIRS="$(find .rocky/landing/pg_events -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+if [ "$SCRATCH_DIRS" -lt 3 ]; then
+    echo "FAIL: expected 3 kept scratch directories under .rocky/landing/pg_events, found $SCRATCH_DIRS"
+    exit 1
+fi
 if grep -r -a -F -l -- "$PGPASSWORD" expected .rocky; then
     echo "FAIL: the Postgres password appears in the files above"
     exit 1

@@ -659,7 +659,36 @@ async fn drive(
 
     // --- finalize ---------------------------------------------------------
     finalize_claim(&claim, params, &run_id, FinalOutcome::Succeeded).await;
+    if !prepared.config.keep_scratch {
+        remove_scratch(&prepared.landing_dir, &batch.scratch);
+    }
     Ok(())
+}
+
+/// Remove a committed run's own scratch directory. Only that directory: the
+/// landing directory may be shared, and another run may be using its own
+/// scratch directory beside this one. A failure is a warning, because the
+/// batch is already committed.
+fn remove_scratch(landing_dir: &Path, scratch: &Path) {
+    // Directly inside the landing directory, as `new_scratch_dir` makes it.
+    let inside_landing = match (landing_dir.canonicalize(), scratch.canonicalize()) {
+        (Ok(landing), Ok(dir)) => dir.parent() == Some(landing.as_path()),
+        (Err(_), _) | (_, Err(_)) => false,
+    };
+    if !inside_landing {
+        warn!(
+            scratch = %scratch.display(),
+            "kept the scratch directory: it is not inside the landing directory"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(scratch) {
+        warn!(
+            scratch = %scratch.display(),
+            error = %e,
+            "could not remove the scratch directory of a committed run"
+        );
+    }
 }
 
 /// Stamp the claim with its end state. A failure here is a warning: the

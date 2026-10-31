@@ -54,7 +54,7 @@ The state is `{"cursor": "<ISO-8601 UTC, microseconds>" | null}`, with `state_sc
 
 `rocky.toml` declares `secrets = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]`. Rocky hands only those variables to the program. The program runs `ATTACH '' AS pg (TYPE postgres, READ_ONLY)`, so libpq reads them from the environment. No connection string is in the SQL, in argv or in the output. The program prints counts only.
 
-Rocky replaces a secret value of 8 bytes or more with `${NAME}` in its logs. Shorter values are not replaced, so the POC password is longer than 8 bytes. The POC user is `rocky_reader`, not `postgres`. A user named `postgres` (8 bytes) would turn every "postgres" in the logs, such as the extension name, into `${PGUSER}`. `run.sh` greps the password over every output, every debug log, the kept scratch directories and the state file, and expects 0 hits.
+Rocky replaces a secret value of 8 bytes or more with `${NAME}` in its logs. Shorter values are not replaced, so the POC password is longer than 8 bytes. The POC user is `rocky_reader`, not `postgres`. A user named `postgres` (8 bytes) would turn every "postgres" in the logs, such as the extension name, into `${PGUSER}`. `run.sh` greps the password over every output, every debug log, the scratch directories and the state file, and expects 0 hits. The POC sets `keep_scratch = true` so the scratch directories are there to check; by default Rocky removes a successful run's scratch directory after the state commit.
 
 ## Layout
 

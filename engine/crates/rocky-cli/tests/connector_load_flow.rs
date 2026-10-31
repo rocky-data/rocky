@@ -234,6 +234,11 @@ target = {{ catalog = "{catalog}", schema = "main", table = "events" }}
     }
 }
 
+/// The run's scratch directory, as the load output names it.
+fn scratch_dir(outcome: &ConnectorLoadOutcome) -> PathBuf {
+    PathBuf::from(&outcome.output.as_ref().unwrap().source_dir)
+}
+
 fn info(outcome: &ConnectorLoadOutcome) -> &rocky_cli::output::ConnectorLoadInfo {
     outcome
         .output
@@ -379,6 +384,10 @@ async fn a_second_file_with_other_columns_breaks_staging_and_changes_nothing() {
     assert_eq!(output.total_bytes, 0);
     assert_eq!(project.row_count(), Some(2), "the target is untouched");
     assert_eq!(project.staging_tables(), 0, "staging is dropped");
+    assert!(
+        scratch_dir(&outcome).join("b.parquet").exists(),
+        "a failed run keeps its scratch directory"
+    );
     let saved = project.state().unwrap();
     assert_eq!(saved.commit_seq, 1, "the state did not move");
     assert_eq!(saved.envelope.value["cursor"], 2);
@@ -606,6 +615,10 @@ async fn a_failed_commit_after_the_promote_leaves_the_claim_in_flight() {
 
     let error = format!("{:#}", crashed.result.as_ref().unwrap_err());
     assert!(error.contains("not committed"), "{error}");
+    assert!(
+        scratch_dir(&crashed).is_dir(),
+        "a run whose commit failed keeps its scratch directory"
+    );
     assert_eq!(project.row_count(), Some(2), "the batch is in the table");
     assert!(project.state().is_none(), "the state did not move");
 
@@ -746,6 +759,45 @@ async fn an_empty_batch_still_advances_the_state() {
     assert_eq!(outcome.output.as_ref().unwrap().files_loaded, 0);
     assert_eq!(project.row_count(), None, "no rows, so no table");
     assert_eq!(project.state().unwrap().envelope.value["cursor"], 5);
+    assert!(
+        !scratch_dir(&outcome).exists(),
+        "a committed run removes its scratch"
+    );
+}
+
+/// A committed run removes its own scratch directory and nothing else in the
+/// landing directory, which another run or connector may share.
+#[tokio::test]
+async fn a_committed_run_removes_only_its_own_scratch_directory() {
+    let project = Project::new("");
+    standard_batches(&project);
+    let other = project.path().join("landing/other-1");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("keep.txt"), "x").unwrap();
+
+    let outcome = project.run().await;
+    outcome.result.as_ref().unwrap();
+    let scratch = scratch_dir(&outcome);
+    assert!(scratch.starts_with(project.path().canonicalize().unwrap()));
+    assert!(!scratch.exists(), "the committed run's scratch is removed");
+    assert!(project.path().join("landing").is_dir(), "landing stays");
+    assert!(
+        other.join("keep.txt").exists(),
+        "another directory is untouched"
+    );
+}
+
+/// `keep_scratch = true` keeps a committed run's scratch directory, owner-only.
+#[tokio::test]
+async fn keep_scratch_keeps_the_committed_scratch_directory() {
+    let project = Project::new("keep_scratch = true");
+    standard_batches(&project);
+    let outcome = project.run().await;
+    outcome.result.as_ref().unwrap();
+    let scratch = scratch_dir(&outcome);
+    assert!(scratch.join("a.parquet").exists(), "{}", scratch.display());
+    let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "the scratch directory is owner-only");
 }
 
 #[tokio::test]
