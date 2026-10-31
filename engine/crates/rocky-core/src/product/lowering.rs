@@ -740,6 +740,16 @@ fn field_rows(parsed: &ParsedSpec, phase: Phase) -> BTreeMap<String, FieldRow> {
              three-check posture verification ran before lowering",
         ),
     );
+    if !parsed.product().source.volume.is_empty() {
+        rows.insert(
+            "product.source.volume".to_string(),
+            FieldRow::new(Disposition::Verified).with_note(
+                "verified by the spec parser (each entry names a listed source table and \
+                 carries a valid range); no artifact: `rocky run` reads the ranges from the \
+                 spec itself and counts each source table when a production run starts",
+            ),
+        );
+    }
     if parsed.product().deliver_by.is_some() {
         rows.insert(
             "product.deliver_by".to_string(),
@@ -1691,6 +1701,58 @@ agent = "propose_only"
                 assert_eq!(row.disposition, Disposition::Verified, "{key}");
             }
         }
+    }
+
+    /// A source volume earns a verified manifest row in both phases and
+    /// emits no artifact; a spec without one earns no row.
+    #[test]
+    fn a_source_volume_lowers_to_a_verified_row_and_no_test() {
+        let tables = "tables = [\"poc.raw.stripe_charges\"]";
+        let text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replacen(
+                tables,
+                &format!(
+                    "{tables}\n\n[[product.source.volume]]\ntable = \"poc.raw.stripe_charges\"\n\
+                     min_rows = 1\nseverity = \"error\"\n"
+                ),
+                1,
+            );
+        let parsed = parse_spec_bytes(text.as_bytes(), SPEC_PATH).expect("valid");
+        assert_eq!(parsed.product().source.volume.len(), 1, "precondition");
+
+        let phase_a = lower_phase_a(&parsed, SPEC_PATH).expect("phase A");
+        let phase_b = lower_phase_b(
+            &parsed,
+            SPEC_PATH,
+            &drafted_sidecar_text(),
+            &verified_phase_a_manifest(&parsed),
+        )
+        .expect("phase B");
+        for manifest in [&phase_a.manifest, &phase_b.manifest] {
+            let row = manifest
+                .fields
+                .get("product.source.volume")
+                .expect("a source volume row");
+            assert_eq!(row.disposition, Disposition::Verified);
+        }
+        // Nothing is lowered: no emitted file but the manifest names the
+        // range, and no test is generated for it.
+        for artifact in &phase_b.artifacts {
+            if artifact.relpath.ends_with(MANIFEST_FILENAME) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&artifact.content);
+            assert!(
+                !text.contains("source.volume") && !text.contains("row_count_range"),
+                "{}: {text}",
+                artifact.relpath
+            );
+        }
+
+        let plain = parse_spec_bytes(SPEC_FIXTURE, SPEC_PATH).expect("valid");
+        let manifest = lower_phase_a(&plain, SPEC_PATH).expect("phase A").manifest;
+        assert!(!manifest.fields.contains_key("product.source.volume"));
     }
 
     #[test]
