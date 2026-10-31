@@ -79,8 +79,21 @@ pub(crate) struct FailedModelAttempts {
 }
 
 impl ResiliencePlan<'_> {
-    /// Remove and return the attempt data left for `model_name` by a failed
-    /// [`run_model_with_retry`].
+    /// Leave the measured time of a model that failed before the retry loop
+    /// ran (a refusal), so [`Self::take_failed`] hands it to the run record.
+    /// There was no attempt, so the trail is empty. An entry already left
+    /// for the model wins.
+    pub(crate) fn record_unretried_failure(&self, model_name: &str, duration_ms: u64) {
+        self.failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(model_name.to_string())
+            .or_insert(FailedModelAttempts {
+                duration_ms,
+                attempts: Vec::new(),
+            });
+    }
+
     pub(crate) fn take_failed(&self, model_name: &str) -> Option<FailedModelAttempts> {
         self.failed
             .lock()

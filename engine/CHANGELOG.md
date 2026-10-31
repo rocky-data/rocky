@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A product spec can declare row ranges on its source tables: `[[product.source.volume]]` with `table` (one of `source.tables`), `min_rows`, `max_rows` (at least one; `min_rows = 0` alone counts) and `severity` (`warning` by default, or `error`). The range is the source table's total rows when the run starts, before the run writes anything. It is not the number of rows the build reads.
+  - Reject codes: the output-range codes, with the path `product.source.volume[i]`, plus `volume-source-unknown` (the table is not in `source.tables`) and `volume-source-duplicate`. Any output strategy can carry a source range. The manifest gains a `product.source.volume` row; nothing is lowered.
+  - Every part of a table that a source range names must be a plain SQL identifier (letters, digits, `_`). The parser refuses any other part with `source-table-invalid`. A source table with no range is not checked, so existing specs keep parsing.
+  - A production `rocky run` counts each source table once (`SELECT COUNT(*)`), serially, before the model phase writes anything and before the skip gate runs. It counts only for products whose output model is in the run's selection. A table that two ranges name is counted once. On a view, an external or a federated table the count scans the whole table. A cancelled run stops waiting for it; on DuckDB the query still runs to completion in the background. A spec that cannot be read or parsed at run time is skipped with a warning, so its ranges are not checked; `rocky product verify` refuses such a spec. A replication pipeline that also builds models copies its tables first, so the count sees the copied rows. Shadow, branch and backfill runs count nothing.
+  - Out of range at `warning`: a line in `volume_warnings`, and the output builds. Out of range at `error`: the product's output model is refused before its write. A count that could not be taken (a missing table, a query error, an unreadable result) at `error` also refuses, so an unreadable source stops the output build before any write. A cancelled count refuses nothing. A refused model records one failed execution with the count's time, fires `on_model_error` (not the model-run hooks), withholds its downstream models, and makes the run partial with no `due_at`.
+  - Only the output model is protected. The upstream models of the chain still build in that run.
+  - `rocky run --output json` gains `source_volumes` (`SourceVolumeCheckOutput`: `product`, `model`, `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict`, `reason`), omitted when empty. A row stays when the skip gate later skips the output. An output refused at `error` is never skipped as unchanged. Each run record gains the same rows (`RunRecord.source_volumes`). The state schema stays at v34.
+  - `rocky product status` gains `source_volumes`: per declared range, the newest production count and its verdict against the range.
+
 ### Fixed
 
 - On DuckDB, `rocky load` with `[load] target.catalog` set now loads into that catalog. Before, it ignored the catalog and loaded into the current database with no warning (#2478). The catalog must name the current database. Letter case does not matter. Any other catalog now fails before anything is written. For a plain load, the error names the accepted value. For a contract-gated load, DuckDB's own "Catalog does not exist" error shows first. A set catalog with an empty `target.schema` is also an error.

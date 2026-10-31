@@ -174,6 +174,43 @@ pub(crate) fn product_volumes_in(root: &Path) -> Vec<ProductVolume> {
         .collect()
 }
 
+/// One product's declared range on one source table, keyed for `rocky run`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductSourceVolume {
+    /// The product that declares the range.
+    pub product: String,
+    /// The product's output model: the model an `error` breach refuses.
+    pub output_model: String,
+    /// The declared source table, range and severity.
+    pub range: rocky_core::product::spec::SourceVolumeSpec,
+}
+
+/// Every `[[product.source.volume]]` range the project's products declare,
+/// in spec file-name order, then declaration order.
+///
+/// Best effort, like [`product_volumes_in`]: a spec that does not parse
+/// contributes no range and logs a warning.
+pub(crate) fn product_source_volumes_in(root: &Path) -> Vec<ProductSourceVolume> {
+    loadable_specs_in(root, "source volume ranges")
+        .into_iter()
+        .flat_map(|parsed| {
+            let product = parsed.product().name.clone();
+            let output_model = parsed.output_model().to_string();
+            parsed
+                .product()
+                .source
+                .volume
+                .iter()
+                .map(|range| ProductSourceVolume {
+                    product: product.clone(),
+                    output_model: output_model.clone(),
+                    range: range.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Every `products/*.toml` under `root` that parses, in file-name order.
 /// `what` names the declaration a skipped spec loses, for the warning.
 fn loadable_specs_in(root: &Path, what: &str) -> Vec<ParsedSpec> {
@@ -959,6 +996,42 @@ pub struct ProductStatusOutput {
     /// declared range and the latest production count judged against it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<ProductVolumeStatus>,
+    /// Source range state, one row per `[[product.source.volume]]` the spec
+    /// declares: the range and the count the newest production run that
+    /// counted this product's sources took at its start. Empty (and
+    /// omitted) when the spec declares no source range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_volumes: Vec<ProductSourceVolumeStatus>,
+}
+
+/// One declared source range and the latest production count of its table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductSourceVolumeStatus {
+    /// The source table, as the spec lists it.
+    pub table: String,
+    /// The declared `min_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The declared severity: `warning` (the default) or `error`.
+    pub severity: rocky_core::product::spec::VolumeSeverity,
+    /// The table's total rows when the newest production run that counted
+    /// this product's sources started. Absent when that run took no count
+    /// of this table, or none has run yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    /// When that run started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The run that took the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// That count judged against the range the spec declares now:
+    /// `in_range`, `below_min`, `above_max`, or `not_evaluated` when no
+    /// count exists.
+    pub verdict: rocky_core::product::spec::VolumeVerdict,
 }
 
 /// The declared volume range and the latest production count.
@@ -2004,6 +2077,7 @@ pub(crate) fn product_status_at(
         journal_rows: 0,
         delivery: None,
         volume: None,
+        source_volumes: Vec::new(),
     };
 
     let parsed = match load_spec(root, product_name) {
@@ -2093,6 +2167,19 @@ pub(crate) fn product_status_at(
                 |count| volume.judge(count),
             ),
         });
+    }
+    if let Some(parsed) = &parsed
+        && !parsed.product().source.volume.is_empty()
+    {
+        let latest = match &store {
+            Some(store) => store.last_source_volumes(
+                &parsed.product().name,
+                rocky_core::state::UnrecordedScope::Exclude,
+            )?,
+            None => None,
+        };
+        output.source_volumes =
+            source_volume_statuses(&parsed.product().source.volume, latest.as_ref());
     }
     if let Some(store) = store {
         if let Some(record) = store.product_approval_get(product_name)? {
@@ -2386,8 +2473,79 @@ pub fn run_product_status(
         if let Some(volume) = &output.volume {
             print_volume(volume);
         }
+        for source in &output.source_volumes {
+            print_source_volume(source);
+        }
     }
     Ok(())
+}
+
+/// One status row per declared source range, judged against the counts of
+/// the newest production run that counted the product's sources.
+///
+/// The verdict is re-judged against the range the spec declares now, as
+/// the output volume status does. A table that run did not count reads
+/// `not_evaluated`.
+fn source_volume_statuses(
+    declared: &[rocky_core::product::spec::SourceVolumeSpec],
+    latest: Option<&rocky_core::state::LatestSourceVolumes>,
+) -> Vec<ProductSourceVolumeStatus> {
+    declared
+        .iter()
+        .map(|range| {
+            let row_count = latest.and_then(|latest| {
+                latest
+                    .rows
+                    .iter()
+                    .find(|row| row.table == range.table)
+                    .and_then(|row| row.row_count)
+            });
+            let counted = latest.filter(|_| row_count.is_some());
+            ProductSourceVolumeStatus {
+                table: range.table.clone(),
+                min_rows: range.min_rows,
+                max_rows: range.max_rows,
+                severity: range.severity(),
+                row_count,
+                counted_at: counted.map(|latest| latest.started_at),
+                run_id: counted.map(|latest| latest.run_id.clone()),
+                verdict: row_count.map_or(
+                    rocky_core::product::spec::VolumeVerdict::NotEvaluated,
+                    |count| range.judge(count),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The human-readable verdict word of a volume check.
+fn volume_verdict_text(verdict: rocky_core::product::spec::VolumeVerdict) -> &'static str {
+    match verdict {
+        rocky_core::product::spec::VolumeVerdict::InRange => "in range",
+        rocky_core::product::spec::VolumeVerdict::BelowMin => "BELOW min_rows",
+        rocky_core::product::spec::VolumeVerdict::AboveMax => "ABOVE max_rows",
+        rocky_core::product::spec::VolumeVerdict::NotEvaluated => "not evaluated",
+    }
+}
+
+/// The human-readable lines of one source range in `rocky product status`.
+fn print_source_volume(source: &ProductSourceVolumeStatus) {
+    let bound = |value: Option<u64>| value.map_or_else(|| "-".to_string(), |v| v.to_string());
+    println!(
+        "  source volume {}: min_rows {}, max_rows {} ({})",
+        source.table,
+        bound(source.min_rows),
+        bound(source.max_rows),
+        source.severity.as_str()
+    );
+    let verdict = volume_verdict_text(source.verdict);
+    match (source.row_count, source.counted_at) {
+        (Some(count), Some(at)) => println!(
+            "    count at run start: {count} row(s) at {} ({verdict})",
+            at.to_rfc3339()
+        ),
+        _ => println!("    count at run start: none yet ({verdict})"),
+    }
 }
 
 /// The human-readable volume lines of `rocky product status`.
@@ -2399,12 +2557,7 @@ fn print_volume(volume: &ProductVolumeStatus) {
         bound(volume.max_rows),
         volume.severity.as_str()
     );
-    let verdict = match volume.verdict {
-        rocky_core::product::spec::VolumeVerdict::InRange => "in range",
-        rocky_core::product::spec::VolumeVerdict::BelowMin => "BELOW min_rows",
-        rocky_core::product::spec::VolumeVerdict::AboveMax => "ABOVE max_rows",
-        rocky_core::product::spec::VolumeVerdict::NotEvaluated => "not evaluated",
-    };
+    let verdict = volume_verdict_text(volume.verdict);
     match (volume.row_count, volume.counted_at) {
         (Some(count), Some(at)) => println!(
             "    latest count: {count} row(s) at {} ({verdict})",

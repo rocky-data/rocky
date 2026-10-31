@@ -432,6 +432,10 @@ const COVERED_LEAF_FIELDS: &[(&str, &[&str])] = &[
         "product.output.volume",
         &["max_rows", "min_rows", "severity"],
     ),
+    (
+        "product.source.volume",
+        &["max_rows", "min_rows", "severity", "table"],
+    ),
 ];
 
 /// The declared leaf coverage, as a map.
@@ -662,6 +666,11 @@ pub fn spec_field_paths(spec: &SpecFile) -> BTreeSet<String> {
     paths.insert("product.name".to_string());
     paths.insert("product.intent".to_string());
     paths.insert("product.source.tables".to_string());
+    // Unlike `checks`, an absent source volume list earns no row: the key
+    // is new, and a manifest committed before it existed must stay total.
+    if !spec.product.source.volume.is_empty() {
+        paths.insert("product.source.volume".to_string());
+    }
     if spec.product.output.model.is_some() {
         paths.insert("product.output.model".to_string());
     }
@@ -889,6 +898,12 @@ timezone = "UTC"
 [product.source]
 tables = ["c.s.t"]
 
+[[product.source.volume]]
+table = "c.s.t"
+min_rows = 1
+max_rows = 10
+severity = "error"
+
 [product.output]
 model = "tiny"
 grain = ["id"]
@@ -933,6 +948,7 @@ agent = "propose_only"
         let paths = spec_field_paths(&parsed.spec);
         assert!(!paths.contains("product.output.freshness"));
         assert!(!paths.contains("product.output.volume"));
+        assert!(!paths.contains("product.source.volume"));
         assert!(!paths.contains("spec_version"));
         assert!(!paths.contains("product.output.model"));
         // An empty declaration is a disposition, not a silence.
@@ -945,6 +961,7 @@ agent = "propose_only"
         let paths = spec_field_paths(&parse(MAXIMAL).spec);
         assert!(paths.contains("product.output.freshness"));
         assert!(paths.contains("product.output.volume"));
+        assert!(paths.contains("product.source.volume"));
         assert!(paths.contains("spec_version"));
         assert!(paths.contains("product.output.model"));
     }

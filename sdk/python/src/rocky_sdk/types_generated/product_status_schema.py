@@ -105,7 +105,7 @@ class VolumeVerdict3(StrEnum):
 
 class VolumeVerdict4(StrEnum):
     """
-    No count was taken, or it could not be read. Never a failure.
+    No count was taken, or it could not be read. Never a failure for `[product.output.volume]`. For an `error` source range, a count that could not be taken refuses the output build; a cancelled run does not.
     """
 
     not_evaluated = "not_evaluated"
@@ -143,6 +143,45 @@ class DurationEstimateStatus(BaseModel):
     window: conint(ge=0)
     """
     The most runs it reads (the newest 20).
+    """
+
+
+class ProductSourceVolumeStatus(BaseModel):
+    """
+    One declared source range and the latest production count of its table.
+    """
+
+    counted_at: AwareDatetime | None = None
+    """
+    When that run started.
+    """
+    max_rows: conint(ge=0) | None = None
+    """
+    The declared `max_rows` (inclusive), when set.
+    """
+    min_rows: conint(ge=0) | None = None
+    """
+    The declared `min_rows` (inclusive), when set.
+    """
+    row_count: conint(ge=0) | None = None
+    """
+    The table's total rows when the newest production run that counted this product's sources started. Absent when that run took no count of this table, or none has run yet.
+    """
+    run_id: str | None = None
+    """
+    The run that took the count.
+    """
+    severity: VolumeSeverity1 | VolumeSeverity2
+    """
+    The declared severity: `warning` (the default) or `error`.
+    """
+    table: str
+    """
+    The source table, as the spec lists it.
+    """
+    verdict: VolumeVerdict1 | VolumeVerdict2 | VolumeVerdict3 | VolumeVerdict4
+    """
+    That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists.
     """
 
 
@@ -283,6 +322,10 @@ class ProductStatusOutput(BaseModel):
     snapshot_intact: bool | None = None
     """
     Whether the approval snapshot's bytes still digest to the recorded value. `null` without an approval; `false` is tamper.
+    """
+    source_volumes: list[ProductSourceVolumeStatus] | None = None
+    """
+    Source range state, one row per `[[product.source.volume]]` the spec declares: the range and the count the newest production run that counted this product's sources took at its start. Empty (and omitted) when the spec declares no source range.
     """
     spec_digest: str | None = None
     """

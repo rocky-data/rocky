@@ -229,10 +229,60 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "volume": {
+          "description": "Row-count ranges on source tables, counted when a production run starts (`[[product.source.volume]]`). Each names one of `tables`.",
+          "items": {
+            "$ref": "#/definitions/SourceVolumeSpec"
+          },
+          "type": "array"
         }
       },
       "required": [
         "tables"
+      ],
+      "type": "object"
+    },
+    "SourceVolumeSpec": {
+      "additionalProperties": false,
+      "description": "One `[[product.source.volume]]` entry: a row-count range on one source table.\n\nThe range is the table's total rows when a production run starts, before the run writes anything. It is not the number of rows the build reads. At least one bound is present. `min_rows = 0` alone counts as one.",
+      "properties": {
+        "max_rows": {
+          "description": "Most rows allowed (inclusive).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_rows": {
+          "description": "Fewest rows allowed (inclusive).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VolumeSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`warning` (the default when omitted) or `error`."
+        },
+        "table": {
+          "description": "The source table, exactly as `source.tables` lists it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table"
       ],
       "type": "object"
     },

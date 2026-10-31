@@ -184,6 +184,7 @@ fn record_run(store: &StateStore, models: &[&str]) {
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         })
         .expect("record run");
 }

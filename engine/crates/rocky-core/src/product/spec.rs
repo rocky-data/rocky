@@ -417,6 +417,55 @@ impl FreshnessSpec {
 pub struct SourceSpec {
     /// One or more exact table references.
     pub tables: Vec<String>,
+    /// Row-count ranges on source tables, counted when a production run
+    /// starts (`[[product.source.volume]]`). Each names one of `tables`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume: Vec<SourceVolumeSpec>,
+}
+
+/// One `[[product.source.volume]]` entry: a row-count range on one source
+/// table.
+///
+/// The range is the table's total rows when a production run starts, before
+/// the run writes anything. It is not the number of rows the build reads.
+/// At least one bound is present. `min_rows = 0` alone counts as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceVolumeSpec {
+    /// The source table, exactly as `source.tables` lists it.
+    pub table: String,
+    /// Fewest rows allowed (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// Most rows allowed (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// `warning` (the default when omitted) or `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<VolumeSeverity>,
+}
+
+impl SourceVolumeSpec {
+    /// The bounds and severity as a [`VolumeSpec`], so both ranges share
+    /// one judge.
+    pub fn range(&self) -> VolumeSpec {
+        VolumeSpec {
+            min_rows: self.min_rows,
+            max_rows: self.max_rows,
+            severity: self.severity,
+        }
+    }
+
+    /// The severity, `warning` when the spec omits it.
+    pub fn severity(&self) -> VolumeSeverity {
+        self.range().severity()
+    }
+
+    /// Where `row_count` sits against the declared range. Both bounds are
+    /// inclusive.
+    pub fn judge(&self, row_count: u64) -> VolumeVerdict {
+        self.range().judge(row_count)
+    }
 }
 
 /// The one output model and the guarantees around it.
@@ -518,7 +567,9 @@ pub enum VolumeVerdict {
     BelowMin,
     /// The count is above `max_rows`.
     AboveMax,
-    /// No count was taken, or it could not be read. Never a failure.
+    /// No count was taken, or it could not be read. Never a failure for
+    /// `[product.output.volume]`. For an `error` source range, a count that
+    /// could not be taken refuses the output build; a cancelled run does not.
     NotEvaluated,
 }
 
@@ -887,7 +938,7 @@ fn parse_freshness(value: &toml::Value, path: &str) -> SpecResult<FreshnessSpec>
 
 fn parse_source(value: &toml::Value, path: &str) -> SpecResult<SourceSpec> {
     let table = as_table(value, path)?;
-    reject_unknown_keys(table, &["tables"], path)?;
+    reject_unknown_keys(table, &["tables", "volume"], path)?;
     let tables = as_string_list(
         require(table, "tables", path)?,
         &path_join(path, "tables"),
@@ -917,7 +968,76 @@ fn parse_source(value: &toml::Value, path: &str) -> SpecResult<SourceSpec> {
             ));
         }
     }
-    Ok(SourceSpec { tables })
+
+    let volume = match table.get("volume") {
+        None => Vec::new(),
+        Some(raw) => {
+            let volume_path = path_join(path, "volume");
+            let entries = raw
+                .as_array()
+                .ok_or_else(|| invalid(&volume_path, "an array of tables", raw))?;
+            let mut volume: Vec<SourceVolumeSpec> = Vec::with_capacity(entries.len());
+            for (idx, entry) in entries.iter().enumerate() {
+                let entry_path = format!("{volume_path}[{idx}]");
+                let parsed = parse_source_volume(entry, &entry_path)?;
+                // Only a table the run will count must be a plain identifier.
+                // A source with no range is never addressed by Rocky, so an
+                // existing spec naming, say, a hyphenated BigQuery project
+                // still parses.
+                for part in parsed.table.split('.') {
+                    if let Err(err) = rocky_sql::validation::validate_identifier(part) {
+                        return Err(SpecRejected::new(
+                            "source-table-invalid",
+                            format!(
+                                "{entry_path}.table = \"{}\": part '{part}' is not a safe \
+                                 SQL identifier ({err}); a counted source must match \
+                                 [A-Za-z0-9_]+ in every part",
+                                parsed.table
+                            ),
+                        ));
+                    }
+                }
+                if !tables.contains(&parsed.table) {
+                    return Err(SpecRejected::new(
+                        "volume-source-unknown",
+                        format!(
+                            "{entry_path}.table = \"{}\" is not listed in {}: a source volume \
+                             names one of the product's source tables",
+                            parsed.table,
+                            path_join(path, "tables")
+                        ),
+                    ));
+                }
+                if volume.iter().any(|seen| seen.table == parsed.table) {
+                    return Err(SpecRejected::new(
+                        "volume-source-duplicate",
+                        format!(
+                            "{entry_path}.table = \"{}\" already has a range: declare one \
+                             range per source table",
+                            parsed.table
+                        ),
+                    ));
+                }
+                volume.push(parsed);
+            }
+            volume
+        }
+    };
+    Ok(SourceSpec { tables, volume })
+}
+
+/// Read one `[[product.source.volume]]` entry.
+fn parse_source_volume(value: &toml::Value, path: &str) -> SpecResult<SourceVolumeSpec> {
+    let table = as_table(value, path)?;
+    reject_unknown_keys(table, &["table", "min_rows", "max_rows", "severity"], path)?;
+    let source = as_string(require(table, "table", path)?, &path_join(path, "table"))?;
+    let range = parse_range(table, path)?;
+    Ok(SourceVolumeSpec {
+        table: source,
+        min_rows: range.min_rows,
+        max_rows: range.max_rows,
+        severity: range.severity,
+    })
 }
 
 fn parse_output(value: &toml::Value, path: &str) -> SpecResult<OutputSpec> {
@@ -1045,6 +1165,13 @@ fn parse_output(value: &toml::Value, path: &str) -> SpecResult<OutputSpec> {
 fn parse_volume(value: &toml::Value, path: &str) -> SpecResult<VolumeSpec> {
     let table = as_table(value, path)?;
     reject_unknown_keys(table, &["min_rows", "max_rows", "severity"], path)?;
+    parse_range(table, path)
+}
+
+/// Read and check the `min_rows`, `max_rows` and `severity` keys that the
+/// output range and each source range share. Unknown keys are the caller's
+/// check.
+fn parse_range(table: &toml::Table, path: &str) -> SpecResult<VolumeSpec> {
     let bound = |key: &str| -> SpecResult<Option<u64>> {
         let Some(raw) = table.get(key) else {
             return Ok(None);
@@ -1983,5 +2110,175 @@ include = ["stripe.*"]"#,
             )
         );
         assert_eq!(parsed.digest, spec_digest(VALID.as_bytes()));
+    }
+
+    // ----- source volume ranges -----
+
+    /// `VALID` with two source tables and `body` appended to `[product.source]`.
+    fn with_source_volume(body: &str) -> String {
+        VALID.replace(
+            "tables = [\"poc.raw.stripe_charges\"]\n",
+            &format!("tables = [\"poc.raw.stripe_charges\", \"poc.raw.customers\"]\n{body}\n"),
+        )
+    }
+
+    #[test]
+    fn source_volumes_are_read_with_a_warning_default() {
+        let parsed = parse(&with_source_volume(
+            "\n[[product.source.volume]]\ntable = \"poc.raw.stripe_charges\"\n\
+             min_rows = 1_000\nmax_rows = 50_000_000\n\n\
+             [[product.source.volume]]\ntable = \"poc.raw.customers\"\n\
+             min_rows = 0\nseverity = \"error\"",
+        ))
+        .expect("valid");
+        let volume = &parsed.product().source.volume;
+        assert_eq!(volume.len(), 2, "{volume:?}");
+        assert_eq!(volume[0].table, "poc.raw.stripe_charges");
+        assert_eq!(volume[0].min_rows, Some(1_000));
+        assert_eq!(volume[0].max_rows, Some(50_000_000));
+        assert_eq!(volume[0].severity, None, "the default is not written back");
+        assert_eq!(volume[0].severity(), VolumeSeverity::Warning);
+        assert_eq!(volume[1].min_rows, Some(0), "min_rows = 0 alone counts");
+        assert_eq!(volume[1].max_rows, None);
+        assert_eq!(volume[1].severity(), VolumeSeverity::Error);
+    }
+
+    #[test]
+    fn a_source_volume_judges_like_the_output_volume() {
+        let range = SourceVolumeSpec {
+            table: "c.s.t".into(),
+            min_rows: Some(10),
+            max_rows: Some(20),
+            severity: Some(VolumeSeverity::Error),
+        };
+        assert_eq!(range.judge(9), VolumeVerdict::BelowMin);
+        assert_eq!(range.judge(10), VolumeVerdict::InRange);
+        assert_eq!(range.judge(20), VolumeVerdict::InRange);
+        assert_eq!(range.judge(21), VolumeVerdict::AboveMax);
+        assert_eq!(range.severity(), VolumeSeverity::Error);
+    }
+
+    fn one_source_volume(body: &str) -> String {
+        with_source_volume(&format!(
+            "\n[[product.source.volume]]\ntable = \"poc.raw.stripe_charges\"\n{body}"
+        ))
+    }
+
+    #[test]
+    fn reject_source_volume_without_a_bound() {
+        let reject = expect_reject(&one_source_volume(""), "volume-missing-bound");
+        assert!(
+            reject.message.contains("product.source.volume[0]"),
+            "{reject}"
+        );
+        expect_reject(
+            &one_source_volume("severity = \"error\""),
+            "volume-missing-bound",
+        );
+    }
+
+    #[test]
+    fn reject_source_volume_min_above_max() {
+        expect_reject(
+            &one_source_volume("min_rows = 11\nmax_rows = 10"),
+            "volume-min-above-max",
+        );
+    }
+
+    #[test]
+    fn reject_source_volume_unknown_severity() {
+        expect_reject(
+            &one_source_volume("min_rows = 1\nseverity = \"fatal\""),
+            "volume-severity-unknown",
+        );
+    }
+
+    #[test]
+    fn reject_source_volume_unknown_key() {
+        expect_reject(&one_source_volume("min_rows = 1\nrows = 3"), "unknown-key");
+    }
+
+    #[test]
+    fn reject_source_volume_invalid_values() {
+        for body in [
+            "min_rows = -1",
+            "max_rows = 1.5",
+            "min_rows = \"10\"",
+            "min_rows = 1\nseverity = 3",
+        ] {
+            expect_reject(&one_source_volume(body), "invalid-value");
+        }
+        // `table` is required and must be a string.
+        expect_reject(
+            &with_source_volume("\n[[product.source.volume]]\nmin_rows = 1"),
+            "missing-key",
+        );
+        expect_reject(
+            &with_source_volume("\n[[product.source.volume]]\ntable = 3\nmin_rows = 1"),
+            "invalid-value",
+        );
+        // A single table instead of an array of tables.
+        expect_reject(
+            &with_source_volume(
+                "\n[product.source.volume]\ntable = \"poc.raw.customers\"\nmin_rows = 1",
+            ),
+            "invalid-value",
+        );
+    }
+
+    #[test]
+    fn reject_source_volume_on_an_unlisted_table() {
+        let reject = expect_reject(
+            &with_source_volume(
+                "\n[[product.source.volume]]\ntable = \"poc.raw.refunds\"\nmin_rows = 1",
+            ),
+            "volume-source-unknown",
+        );
+        assert!(reject.message.contains("poc.raw.refunds"), "{reject}");
+    }
+
+    #[test]
+    fn reject_two_ranges_on_one_source() {
+        expect_reject(
+            &with_source_volume(
+                "\n[[product.source.volume]]\ntable = \"poc.raw.customers\"\nmin_rows = 1\n\n\
+                 [[product.source.volume]]\ntable = \"poc.raw.customers\"\nmax_rows = 9",
+            ),
+            "volume-source-duplicate",
+        );
+    }
+
+    #[test]
+    fn reject_a_counted_source_table_part_that_is_not_an_identifier() {
+        for table in ["poc.raw.my-table", "poc.ra\\\"w.t", "my-project.raw.t"] {
+            // A source with no range keeps parsing: Rocky never addresses it.
+            let text = VALID.replace("poc.raw.stripe_charges", table);
+            parse(&text).expect("a source without a range is not checked");
+            let ranged =
+                format!("{text}\n[[product.source.volume]]\ntable = \"{table}\"\nmin_rows = 1\n");
+            expect_reject(&ranged, "source-table-invalid");
+        }
+        // Underscores and digits stay valid.
+        parse(&VALID.replace("poc.raw.stripe_charges", "c_1.s_2.t_3")).expect("valid");
+    }
+
+    /// A spec with source ranges serializes them back and parses to the same
+    /// value.
+    #[test]
+    fn source_volume_round_trips_through_serde() {
+        let parsed = parse(&one_source_volume(
+            "min_rows = 0\nmax_rows = 9\nseverity = \"error\"",
+        ))
+        .expect("valid");
+        let json = serde_json::to_string(&parsed.spec).expect("serializes");
+        let back: SpecFile = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, parsed.spec);
+        assert!(
+            json.contains(
+                "\"volume\":[{\"table\":\"poc.raw.stripe_charges\",\"min_rows\":0,\
+                 \"max_rows\":9,\"severity\":\"error\"}]"
+            ),
+            "{json}"
+        );
     }
 }

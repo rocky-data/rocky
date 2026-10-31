@@ -216,6 +216,79 @@
       ],
       "type": "object"
     },
+    "ProductSourceVolumeStatus": {
+      "description": "One declared source range and the latest production count of its table.",
+      "properties": {
+        "counted_at": {
+          "description": "When that run started.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_rows": {
+          "description": "The declared `max_rows` (inclusive), when set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_rows": {
+          "description": "The declared `min_rows` (inclusive), when set.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "row_count": {
+          "description": "The table's total rows when the newest production run that counted this product's sources started. Absent when that run took no count of this table, or none has run yet.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "The run that took the count.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/VolumeSeverity"
+            }
+          ],
+          "description": "The declared severity: `warning` (the default) or `error`."
+        },
+        "table": {
+          "description": "The source table, as the spec lists it.",
+          "type": "string"
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/VolumeVerdict"
+            }
+          ],
+          "description": "That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists."
+        }
+      },
+      "required": [
+        "severity",
+        "table",
+        "verdict"
+      ],
+      "type": "object"
+    },
     "ProductVolumeStatus": {
       "description": "The declared volume range and the latest production count.",
       "properties": {
@@ -328,7 +401,7 @@
           "type": "string"
         },
         {
-          "description": "No count was taken, or it could not be read. Never a failure.",
+          "description": "No count was taken, or it could not be read. Never a failure for `[product.output.volume]`. For an `error` source range, a count that could not be taken refuses the output build; a cancelled run does not.",
           "enum": [
             "not_evaluated"
           ],
@@ -423,6 +496,13 @@
         "boolean",
         "null"
       ]
+    },
+    "source_volumes": {
+      "description": "Source range state, one row per `[[product.source.volume]]` the spec declares: the range and the count the newest production run that counted this product's sources took at its start. Empty (and omitted) when the spec declares no source range.",
+      "items": {
+        "$ref": "#/definitions/ProductSourceVolumeStatus"
+      },
+      "type": "array"
     },
     "spec_digest": {
       "description": "The working spec's digest, when it parses.",

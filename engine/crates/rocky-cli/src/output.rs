@@ -464,6 +464,13 @@ pub struct RunOutput {
     /// omitted) when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volume_warnings: Vec<String>,
+    /// The source row counts this production run took when it started, one
+    /// entry per `[[product.source.volume]]` range whose product output is
+    /// in the run's selection. A run-level fact: a count is kept even when
+    /// the output model is later skipped or refused. Empty (and omitted)
+    /// when the run judged no source range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_volumes: Vec<SourceVolumeCheckOutput>,
     /// Soft warnings raised by the per-table override resolver — one
     /// entry per `[[table_overrides]]` rule that matched zero
     /// `(connector, table)` pairs this run, or whose connector half
@@ -1549,6 +1556,58 @@ pub struct VolumeCheckOutput {
     /// means for the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// One source row count `rocky run` took when a production run started,
+/// judged against a product's `[[product.source.volume]]` range.
+///
+/// The count is the source table's total rows before the run writes
+/// anything (`SELECT COUNT(*)`), not the rows the build reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SourceVolumeCheckOutput {
+    /// The product that declares the range.
+    pub product: String,
+    /// The product's output model: the model an `error` breach refuses.
+    pub model: String,
+    /// The source table, as the spec lists it.
+    pub table: String,
+    /// The table's total rows at run start. Absent when no count was taken
+    /// or it could not be read (`verdict = "not_evaluated"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    /// The declared `min_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows` (inclusive), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The declared severity: `warning` (the default) or `error`.
+    pub severity: rocky_core::product::spec::VolumeSeverity,
+    /// `in_range`, `below_min`, `above_max`, or `not_evaluated`. At
+    /// `error`, an out-of-range count and a count that could not be taken
+    /// both refuse the output model; a cancelled run refuses nothing.
+    pub verdict: rocky_core::product::spec::VolumeVerdict,
+    /// Why the verdict is `not_evaluated`, or what the breach did to the
+    /// output model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl SourceVolumeCheckOutput {
+    /// The persisted twin of this row, for the run record.
+    pub fn to_record(&self) -> rocky_core::state::SourceVolumeRecord {
+        rocky_core::state::SourceVolumeRecord {
+            product: self.product.clone(),
+            model: self.model.clone(),
+            table: self.table.clone(),
+            row_count: self.row_count,
+            min_rows: self.min_rows,
+            max_rows: self.max_rows,
+            severity: self.severity,
+            verdict: self.verdict,
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 impl VolumeCheckOutput {
@@ -6441,6 +6500,7 @@ impl RunOutput {
             pipeline_type: Some("replication".to_string()),
             scheduling_warnings: Vec::new(),
             volume_warnings: Vec::new(),
+            source_volumes: Vec::new(),
             filter,
             duration_ms,
             tables_copied: 0,
@@ -6921,6 +6981,11 @@ impl RunOutput {
             // open (#1732).
             verify_after_failed: self.verify_after_failed,
             queued_ms: None,
+            source_volumes: self
+                .source_volumes
+                .iter()
+                .map(SourceVolumeCheckOutput::to_record)
+                .collect(),
         }
     }
 

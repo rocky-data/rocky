@@ -72,6 +72,10 @@ export interface ProductStatusOutput {
    */
   snapshot_intact?: boolean | null;
   /**
+   * Source range state, one row per `[[product.source.volume]]` the spec declares: the range and the count the newest production run that counted this product's sources took at its start. Empty (and omitted) when the spec declares no source range.
+   */
+  source_volumes?: ProductSourceVolumeStatus[];
+  /**
    * The working spec's digest, when it parses.
    */
   spec_digest?: string | null;
@@ -204,6 +208,44 @@ export interface DurationEstimateStatus {
    * The most runs it reads (the newest 20).
    */
   window: number;
+  [k: string]: unknown;
+}
+/**
+ * One declared source range and the latest production count of its table.
+ */
+export interface ProductSourceVolumeStatus {
+  /**
+   * When that run started.
+   */
+  counted_at?: string | null;
+  /**
+   * The declared `max_rows` (inclusive), when set.
+   */
+  max_rows?: number | null;
+  /**
+   * The declared `min_rows` (inclusive), when set.
+   */
+  min_rows?: number | null;
+  /**
+   * The table's total rows when the newest production run that counted this product's sources started. Absent when that run took no count of this table, or none has run yet.
+   */
+  row_count?: number | null;
+  /**
+   * The run that took the count.
+   */
+  run_id?: string | null;
+  /**
+   * The declared severity: `warning` (the default) or `error`.
+   */
+  severity: VolumeSeverity;
+  /**
+   * The source table, as the spec lists it.
+   */
+  table: string;
+  /**
+   * That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists.
+   */
+  verdict: VolumeVerdict;
   [k: string]: unknown;
 }
 /**

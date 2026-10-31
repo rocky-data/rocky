@@ -3732,6 +3732,58 @@ pub struct RunRecord {
     /// `ledger_record_serialization_pinned` golden stays byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_ms: Option<u64>,
+
+    /// The source row counts a production run took when it started, one
+    /// row per `[[product.source.volume]]` range it judged. Empty for a run
+    /// that judged none, for a shadow, branch or backfill run, and for
+    /// records written before this field existed.
+    ///
+    /// Added without a schema bump, like [`Self::queued_ms`]. Omitted when
+    /// empty, so the `ledger_record_serialization_pinned` golden stays
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_volumes: Vec<SourceVolumeRecord>,
+}
+
+/// One source row count a production run took when it started, judged
+/// against a product's `[[product.source.volume]]` range.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceVolumeRecord {
+    /// The product that declares the range.
+    pub product: String,
+    /// The product's output model.
+    pub model: String,
+    /// The source table, as the spec lists it.
+    pub table: String,
+    /// The table's total rows at run start. `None` when no count was taken
+    /// or it could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    /// The declared `min_rows`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The declared severity.
+    pub severity: crate::product::spec::VolumeSeverity,
+    /// The verdict the run reached.
+    pub verdict: crate::product::spec::VolumeVerdict,
+    /// Why the verdict is `not_evaluated`, or what a breach did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The source counts one product got from its newest production run that
+/// took any. Returned by [`StateStore::last_source_volumes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestSourceVolumes {
+    /// The run that took the counts.
+    pub run_id: String,
+    /// When that run started: the counts are taken at run start.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// The run's rows for the product.
+    pub rows: Vec<SourceVolumeRecord>,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -5160,6 +5212,42 @@ impl StateStore {
                 .filter(|m| m.row_count.is_some() && m.rocky_model_name() == model_name)
                 .max_by_key(|m| m.finished_at)
                 .map(|m| (1, (run_id, m)))
+        })?;
+        Ok(found.into_iter().next())
+    }
+
+    /// The source counts of the newest production run that recorded any for
+    /// `product`: that run's id, its start time, and its rows for the
+    /// product.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when the run history cannot be read.
+    pub fn last_source_volumes(
+        &self,
+        product: &str,
+        unrecorded: UnrecordedScope,
+    ) -> Result<Option<LatestSourceVolumes>, StateError> {
+        let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
+            if !run.counts_as_production(unrecorded) {
+                return None;
+            }
+            let rows: Vec<SourceVolumeRecord> = run
+                .source_volumes
+                .into_iter()
+                .filter(|row| row.product == product)
+                .collect();
+            if rows.is_empty() {
+                return None;
+            }
+            Some((
+                1,
+                LatestSourceVolumes {
+                    run_id: run.run_id,
+                    started_at: run.started_at,
+                    rows,
+                },
+            ))
         })?;
         Ok(found.into_iter().next())
     }
@@ -10312,6 +10400,7 @@ pub fn run_with_output_versions(
         rocky_branch: None,
         run_scope: Some(RunScope::Production),
         queued_ms: None,
+        source_volumes: Vec::new(),
     }
 }
 
@@ -11492,6 +11581,7 @@ mod tests {
             rocky_branch: None,
             run_scope: Some(RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         }
     }
 

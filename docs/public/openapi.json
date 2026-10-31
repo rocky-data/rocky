@@ -18479,6 +18479,79 @@
         ],
         "type": "object"
       },
+      "ProductSourceVolumeStatus": {
+        "description": "One declared source range and the latest production count of its table.",
+        "properties": {
+          "counted_at": {
+            "description": "When that run started.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_rows": {
+            "description": "The declared `max_rows` (inclusive), when set.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "min_rows": {
+            "description": "The declared `min_rows` (inclusive), when set.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "row_count": {
+            "description": "The table's total rows when the newest production run that counted this product's sources started. Absent when that run took no count of this table, or none has run yet.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "run_id": {
+            "description": "The run that took the count.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "severity": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VolumeSeverity"
+              }
+            ],
+            "description": "The declared severity: `warning` (the default) or `error`."
+          },
+          "table": {
+            "description": "The source table, as the spec lists it.",
+            "type": "string"
+          },
+          "verdict": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VolumeVerdict"
+              }
+            ],
+            "description": "That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists."
+          }
+        },
+        "required": [
+          "severity",
+          "table",
+          "verdict"
+        ],
+        "type": "object"
+      },
       "ProductSpec": {
         "additionalProperties": false,
         "description": "The `[product]` table.",
@@ -18626,6 +18699,13 @@
               "boolean",
               "null"
             ]
+          },
+          "source_volumes": {
+            "description": "Source range state, one row per `[[product.source.volume]]` the spec declares: the range and the count the newest production run that counted this product's sources took at its start. Empty (and omitted) when the spec declares no source range.",
+            "items": {
+              "$ref": "#/components/schemas/ProductSourceVolumeStatus"
+            },
+            "type": "array"
           },
           "spec_digest": {
             "description": "The working spec's digest, when it parses.",
@@ -22808,6 +22888,13 @@
             },
             "type": "array"
           },
+          "source_volumes": {
+            "description": "The source row counts this production run took when it started, one entry per `[[product.source.volume]]` range whose product output is in the run's selection. A run-level fact: a count is kept even when the output model is later skipped or refused. Empty (and omitted) when the run judged no source range.",
+            "items": {
+              "$ref": "#/components/schemas/SourceVolumeCheckOutput"
+            },
+            "type": "array"
+          },
           "status": {
             "allOf": [
               {
@@ -24611,6 +24698,13 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "volume": {
+            "description": "Row-count ranges on source tables, counted when a production run starts (`[[product.source.volume]]`). Each names one of `tables`.",
+            "items": {
+              "$ref": "#/components/schemas/SourceVolumeSpec"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -24729,6 +24823,124 @@
           "outcome",
           "schema",
           "waited_secs"
+        ],
+        "type": "object"
+      },
+      "SourceVolumeCheckOutput": {
+        "description": "One source row count `rocky run` took when a production run started, judged against a product's `[[product.source.volume]]` range.\n\nThe count is the source table's total rows before the run writes anything (`SELECT COUNT(*)`), not the rows the build reads.",
+        "properties": {
+          "max_rows": {
+            "description": "The declared `max_rows` (inclusive), when set.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "min_rows": {
+            "description": "The declared `min_rows` (inclusive), when set.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "The product's output model: the model an `error` breach refuses.",
+            "type": "string"
+          },
+          "product": {
+            "description": "The product that declares the range.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the verdict is `not_evaluated`, or what the breach did to the output model.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "row_count": {
+            "description": "The table's total rows at run start. Absent when no count was taken or it could not be read (`verdict = \"not_evaluated\"`).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "severity": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VolumeSeverity"
+              }
+            ],
+            "description": "The declared severity: `warning` (the default) or `error`."
+          },
+          "table": {
+            "description": "The source table, as the spec lists it.",
+            "type": "string"
+          },
+          "verdict": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VolumeVerdict"
+              }
+            ],
+            "description": "`in_range`, `below_min`, `above_max`, or `not_evaluated`. At `error`, an out-of-range count and a count that could not be taken both refuse the output model; a cancelled run refuses nothing."
+          }
+        },
+        "required": [
+          "model",
+          "product",
+          "severity",
+          "table",
+          "verdict"
+        ],
+        "type": "object"
+      },
+      "SourceVolumeSpec": {
+        "additionalProperties": false,
+        "description": "One `[[product.source.volume]]` entry: a row-count range on one source table.\n\nThe range is the table's total rows when a production run starts, before the run writes anything. It is not the number of rows the build reads. At least one bound is present. `min_rows = 0` alone counts as one.",
+        "properties": {
+          "max_rows": {
+            "description": "Most rows allowed (inclusive).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "min_rows": {
+            "description": "Fewest rows allowed (inclusive).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VolumeSeverity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`warning` (the default when omitted) or `error`."
+          },
+          "table": {
+            "description": "The source table, exactly as `source.tables` lists it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "table"
         ],
         "type": "object"
       },
@@ -27271,7 +27483,7 @@
             "type": "string"
           },
           {
-            "description": "No count was taken, or it could not be read. Never a failure.",
+            "description": "No count was taken, or it could not be read. Never a failure for `[product.output.volume]`. For an `error` source range, a count that could not be taken refuses the output build; a cancelled run does not.",
             "enum": [
               "not_evaluated"
             ],

@@ -781,7 +781,7 @@ class UpstreamReads(BaseModel):
     """
 
 
-class VolumeSeverity6(StrEnum):
+class VolumeSeverity5(StrEnum):
     """
     The model is marked failed after its build, and the run is partial.
     """
@@ -789,7 +789,7 @@ class VolumeSeverity6(StrEnum):
     error = "error"
 
 
-class VolumeSeverity7(StrEnum):
+class VolumeSeverity6(StrEnum):
     """
     The run reports a warning, and delivery is recorded as usual.
     """
@@ -823,7 +823,7 @@ class VolumeVerdict7(StrEnum):
 
 class VolumeVerdict8(StrEnum):
     """
-    No count was taken, or it could not be read. Never a failure.
+    No count was taken, or it could not be read. Never a failure for `[product.output.volume]`. For an `error` source range, a count that could not be taken refuses the output build; a cancelled run does not.
     """
 
     not_evaluated = "not_evaluated"
@@ -1067,6 +1067,51 @@ class Diagnostic(BaseModel):
     """
 
 
+class SourceVolumeCheckOutput(BaseModel):
+    """
+    One source row count `rocky run` took when a production run started, judged against a product's `[[product.source.volume]]` range.
+
+    The count is the source table's total rows before the run writes anything (`SELECT COUNT(*)`), not the rows the build reads.
+    """
+
+    max_rows: conint(ge=0) | None = None
+    """
+    The declared `max_rows` (inclusive), when set.
+    """
+    min_rows: conint(ge=0) | None = None
+    """
+    The declared `min_rows` (inclusive), when set.
+    """
+    model: str
+    """
+    The product's output model: the model an `error` breach refuses.
+    """
+    product: str
+    """
+    The product that declares the range.
+    """
+    reason: str | None = None
+    """
+    Why the verdict is `not_evaluated`, or what the breach did to the output model.
+    """
+    row_count: conint(ge=0) | None = None
+    """
+    The table's total rows at run start. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
+    """
+    severity: VolumeSeverity5 | VolumeSeverity6
+    """
+    The declared severity: `warning` (the default) or `error`.
+    """
+    table: str
+    """
+    The source table, as the spec lists it.
+    """
+    verdict: VolumeVerdict5 | VolumeVerdict6 | VolumeVerdict7 | VolumeVerdict8
+    """
+    `in_range`, `below_min`, `above_max`, or `not_evaluated`. At `error`, an out-of-range count and a count that could not be taken both refuse the output model; a cancelled run refuses nothing.
+    """
+
+
 class TableCheckOutput(BaseModel):
     asset_key: list[str]
     checks: list[
@@ -1111,7 +1156,7 @@ class VolumeCheckOutput(BaseModel):
     """
     The table's total rows after the build. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
     """
-    severity: VolumeSeverity6 | VolumeSeverity7
+    severity: VolumeSeverity5 | VolumeSeverity6
     """
     The declared severity: `warning` (the default) or `error`.
     """
@@ -1286,6 +1331,10 @@ class RunOutput(BaseModel):
     source_syncs: list[SourceSyncOutput] | None = None
     """
     One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
+    """
+    source_volumes: list[SourceVolumeCheckOutput] | None = None
+    """
+    The source row counts this production run took when it started, one entry per `[[product.source.volume]]` range whose product output is in the run's selection. A run-level fact: a count is kept even when the output model is later skipped or refused. Empty (and omitted) when the run judged no source range.
     """
     status: RunStatus1 | RunStatus2 | RunStatus3
     """
