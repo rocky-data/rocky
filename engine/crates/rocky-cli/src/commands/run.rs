@@ -14474,6 +14474,14 @@ async fn execute_models_phase(
         )> = Vec::with_capacity(matched.len());
         if gate.config().is_active() {
             for &(idx, name, model) in &matched {
+                // A source volume refused this output: it must reach its
+                // refusal at dispatch, not be skipped as unchanged, or an
+                // `error` breach would pass silently (T-6 slice 2). The gate
+                // records no verdict for it.
+                if source_refusals.get(name).is_some() {
+                    to_build.push((idx, name, model, None));
+                    continue;
+                }
                 // Build the fully-typed IR (merge the typechecker's columns,
                 // mirroring `project_ir_from_compile`) so `skip_hash()` can
                 // canonicalise. An empty `typed_columns` ⇒ `skip_hash()` is

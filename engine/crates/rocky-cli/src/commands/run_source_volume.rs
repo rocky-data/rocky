@@ -73,6 +73,9 @@ pub(crate) struct SourceRefusal {
     lines: Vec<String>,
     /// The time the counts behind those breaches took, in milliseconds.
     pub(crate) duration_ms: u64,
+    /// The tables whose count time is already in `duration_ms`, so a table
+    /// two breaching ranges share is timed once.
+    timed: std::collections::BTreeSet<String>,
 }
 
 impl SourceRefusal {
@@ -189,9 +192,12 @@ pub(crate) async fn count_sources(
                         .or_insert(SourceRefusal {
                             lines: Vec::new(),
                             duration_ms: 0,
+                            timed: std::collections::BTreeSet::new(),
                         });
                 refusal.lines.push(line);
-                refusal.duration_ms = refusal.duration_ms.saturating_add(duration_ms);
+                if refusal.timed.insert(check.table.clone()) {
+                    refusal.duration_ms = refusal.duration_ms.saturating_add(duration_ms);
+                }
             }
         }
         output.source_volumes.push(check);
@@ -1174,6 +1180,79 @@ mod tests {
                 second.output.source_volumes[0].verdict,
                 VolumeVerdict::InRange
             );
+        }
+
+        /// An `error` breach must not hide behind the skip gate: the output is
+        /// unchanged since its last build, so the gate would skip it, but the
+        /// tightened range refuses it and the run fails.
+        #[tokio::test]
+        async fn an_error_breach_is_refused_even_when_the_gate_would_skip() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = StateStore::open(&tmp.path().join("state.redb")).unwrap();
+            let gate = SkipGateConfig {
+                feature_enabled: true,
+                force_rebuild: false,
+                rowcount_fallback: true,
+                lag_tolerance_seconds: 0,
+                shadow_or_branch: false,
+                full_refresh: false,
+            };
+            let models = [("vol", "SELECT id AS x FROM main.src\n", FULL_REFRESH)];
+            for parallel in [1, 4] {
+                let first = run_layers(
+                    tmp.path(),
+                    LayerRun {
+                        models: &models,
+                        range: "min_rows = 1",
+                        parallel,
+                        contain_failures: false,
+                        hooks: None,
+                        gate,
+                        state: Some(&state),
+                    },
+                )
+                .await;
+                first.result.as_ref().expect("the first run builds");
+                let started = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                    .expect("valid timestamp");
+                let record = first.output.to_run_record(
+                    "run-1",
+                    started,
+                    started,
+                    String::new(),
+                    rocky_core::state::RunTrigger::Manual,
+                    RunStatus::Success,
+                    crate::output::RunRecordAudit::test_sentinels(),
+                );
+                state.record_run(&record).expect("record run");
+
+                let second = run_layers(
+                    tmp.path(),
+                    LayerRun {
+                        models: &models,
+                        range: "min_rows = 1_000\nseverity = \"error\"",
+                        parallel,
+                        contain_failures: false,
+                        hooks: None,
+                        gate,
+                        state: Some(&state),
+                    },
+                )
+                .await;
+                assert!(
+                    second.result.is_err(),
+                    "parallel={parallel}: the refusal fails the run"
+                );
+                assert_eq!(
+                    second.output.tables_skipped, 0,
+                    "parallel={parallel}: a refused output is not skipped"
+                );
+                assert!(!built(&second.output, "vol"), "parallel={parallel}");
+                assert_eq!(
+                    second.output.source_volumes[0].verdict,
+                    VolumeVerdict::BelowMin
+                );
+            }
         }
     }
 }

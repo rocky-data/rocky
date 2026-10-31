@@ -104,7 +104,8 @@ Rocky counts before the model phase writes anything and before the skip gate run
 
 - A table that two ranges name, in one product or in two, is counted once.
 - Rocky counts the tables one after another, on the run's warehouse connection.
-- On a view, an external table or a federated table, the count scans the whole table. Only a cancelled run stops a count that has started.
+- On a view, an external table or a federated table, the count scans the whole table. A cancelled run stops waiting for a count that has started. On most warehouses the query stops too; on DuckDB it runs to completion in the background.
+- A spec Rocky cannot read or parse at run time is skipped with a warning, so its ranges are not checked, even at `error`. `rocky product verify` refuses such a spec; run it in CI to catch this.
 - Shadow, branch and backfill runs count nothing.
 - A replication pipeline that also builds models copies its tables first. The count then sees the copied rows.
 
@@ -112,7 +113,7 @@ At `error` severity, an out-of-range count refuses the output model. A count tha
 
 Only the output model is protected. The upstream models in the chain still build in that run, because they are not the delivered output.
 
-The result is `source_volumes` on the run output: one row per range, with `product`, `model` (the output model), `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records the same rows in its history. A row stays even when the skip gate later skips the output model.
+The result is `source_volumes` on the run output: one row per range, with `product`, `model` (the output model), `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records the same rows in its history. A row stays even when the skip gate later skips the output model. An output refused at `error` is never skipped as unchanged: the refusal always reaches it, and the run fails.
 
 ---
 
