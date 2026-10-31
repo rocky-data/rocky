@@ -1742,8 +1742,12 @@ include = ["stripe.*"]"#,
         std::fs::write(&path, VALID).expect("write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
+        // Root ignores the mode bits, so only assert when the read really fails.
+        if std::fs::read(&path).is_ok() {
+            eprintln!("skipping: this process can read a mode-000 file");
+            return;
+        }
         let reject = parse_spec_file(&path).expect_err("must reject");
-        // Root ignores the mode bits, so only assert when the read really failed.
         assert_eq!(reject.code, "spec-file-unreadable");
         assert!(
             reject.message.contains("could not be read"),

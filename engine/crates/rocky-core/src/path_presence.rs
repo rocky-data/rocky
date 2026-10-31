@@ -576,7 +576,12 @@ mod classify_tests {
         let leaf = locked.join("rocky.toml");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let reproduced = std::fs::symlink_metadata(&leaf).is_err();
+        // Root can search a mode-000 directory, and then the leaf is simply
+        // absent (`NotFound`). Only a permission failure reproduces the case.
+        let reproduced = matches!(
+            std::fs::symlink_metadata(&leaf),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+        );
         let verdict = is_present(&leaf);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
 
