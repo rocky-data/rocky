@@ -418,3 +418,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         continue-on-error: true
         run: bash examples/playground/scripts/run-all-parse-validate.sh
+
+      # The reference Postgres child connector. run-all-duckdb.sh skips it
+      # because it needs Docker; the runner has Docker, so run it here with
+      # REQUIRE_DOCKER=1 (a missing daemon fails instead of skipping). It
+      # pulls postgres:16-alpine from Docker Hub and the DuckDB postgres
+      # extension from extensions.duckdb.org. Either can rate-limit or go
+      # down, so this step is last and cannot turn the weekly job red.
+      - name: Postgres child connector POC (Docker)
+        working-directory: ${{ github.workspace }}
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          REQUIRE_DOCKER: "1"
+        run: bash examples/playground/pocs/07-adapters/08-postgres-child-connector/run.sh
