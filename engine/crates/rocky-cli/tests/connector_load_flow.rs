@@ -798,6 +798,14 @@ async fn keep_scratch_keeps_the_committed_scratch_directory() {
     assert!(scratch.join("a.parquet").exists(), "{}", scratch.display());
     let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "the scratch directory is owner-only");
+    // A directory made the default way shows the umask. When it is not 0700,
+    // the 0700 above can only come from the explicit mode.
+    let control = project.path().join("control");
+    std::fs::create_dir(&control).unwrap();
+    let default_mode = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+    if default_mode == 0o700 {
+        eprintln!("note: umask already yields 0700; the mode check is not discriminating here");
+    }
 }
 
 #[tokio::test]

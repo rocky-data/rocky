@@ -1085,6 +1085,10 @@ export interface ConnectorConfig {
    */
   contract?: ContractConfig | null;
   /**
+   * Keep the scratch directory of a successful run. By default Rocky removes it after the state commit: it is the program's `HOME` and `TMPDIR`, so caches and credential files the program wrote there would otherwise outlive the run. A failed run always keeps it.
+   */
+  keep_scratch?: boolean;
+  /**
    * Limits for one attempt. The smaller of this and the manifest's limits wins for each key.
    */
   limits?: ConnectorLimitsConfig;
