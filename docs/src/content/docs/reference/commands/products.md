@@ -86,7 +86,7 @@ The count is the source table's total rows when the run starts, before the run w
 
 The parser uses the same codes as the output range, with the path `product.source.volume[i]`: `volume-missing-bound`, `volume-min-above-max`, `volume-severity-unknown`, `unknown-key` and `invalid-value`. It also refuses a `table` that `source.tables` does not list (`volume-source-unknown`), and a second range on one table (`volume-source-duplicate`). Any output strategy can carry source ranges.
 
-Every part of every `source.tables` entry must be a plain SQL identifier: letters, digits and `_` only. The parser refuses any other part with `source-table-invalid`. This applies to every spec, with or without a source range.
+Every part of a table that a source range names must be a plain SQL identifier: letters, digits and `_` only. The parser refuses any other part with `source-table-invalid`. A source table with no range is not checked, because Rocky never addresses it.
 
 A production `rocky run` counts the sources once, at run start:
 

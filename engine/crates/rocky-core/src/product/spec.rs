@@ -967,17 +967,6 @@ fn parse_source(value: &toml::Value, path: &str) -> SpecResult<SourceSpec> {
                 ),
             ));
         }
-        for part in &parts {
-            if let Err(err) = rocky_sql::validation::validate_identifier(part) {
-                return Err(SpecRejected::new(
-                    "source-table-invalid",
-                    format!(
-                        "source table '{reference}': part '{part}' is not a safe SQL \
-                         identifier ({err}); each part must match [A-Za-z0-9_]+"
-                    ),
-                ));
-            }
-        }
     }
 
     let volume = match table.get("volume") {
@@ -991,6 +980,23 @@ fn parse_source(value: &toml::Value, path: &str) -> SpecResult<SourceSpec> {
             for (idx, entry) in entries.iter().enumerate() {
                 let entry_path = format!("{volume_path}[{idx}]");
                 let parsed = parse_source_volume(entry, &entry_path)?;
+                // Only a table the run will count must be a plain identifier.
+                // A source with no range is never addressed by Rocky, so an
+                // existing spec naming, say, a hyphenated BigQuery project
+                // still parses.
+                for part in parsed.table.split('.') {
+                    if let Err(err) = rocky_sql::validation::validate_identifier(part) {
+                        return Err(SpecRejected::new(
+                            "source-table-invalid",
+                            format!(
+                                "{entry_path}.table = \"{}\": part '{part}' is not a safe \
+                                 SQL identifier ({err}); a counted source must match \
+                                 [A-Za-z0-9_]+ in every part",
+                                parsed.table
+                            ),
+                        ));
+                    }
+                }
                 if !tables.contains(&parsed.table) {
                     return Err(SpecRejected::new(
                         "volume-source-unknown",
@@ -2243,10 +2249,14 @@ include = ["stripe.*"]"#,
     }
 
     #[test]
-    fn reject_a_source_table_part_that_is_not_an_identifier() {
+    fn reject_a_counted_source_table_part_that_is_not_an_identifier() {
         for table in ["poc.raw.my-table", "poc.ra\\\"w.t", "my-project.raw.t"] {
+            // A source with no range keeps parsing: Rocky never addresses it.
             let text = VALID.replace("poc.raw.stripe_charges", table);
-            expect_reject(&text, "source-table-invalid");
+            parse(&text).expect("a source without a range is not checked");
+            let ranged =
+                format!("{text}\n[[product.source.volume]]\ntable = \"{table}\"\nmin_rows = 1\n");
+            expect_reject(&ranged, "source-table-invalid");
         }
         // Underscores and digits stay valid.
         parse(&VALID.replace("poc.raw.stripe_charges", "c_1.s_2.t_3")).expect("valid");
