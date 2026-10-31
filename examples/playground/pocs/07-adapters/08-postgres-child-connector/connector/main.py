@@ -17,8 +17,9 @@ The cursor contract (state schema version 1):
 
 Each run reads the source maximum M of the cursor column first. It then
 extracts the rows with  cursor < value < M  (no lower bound on the first run;
-NULL values are skipped). Rows at M wait for the next run, so rows that tie
-at M are never split across two runs. The new cursor is the maximum of the
+NULL values are skipped). Rows at M wait until a newer row exists, so rows
+that tie at M are never split across two runs. On a quiet source the newest
+rows wait until newer data arrives. The new cursor is the maximum of the
 extracted rows. When no row is extracted, the cursor does not change and no
 file is written.
 """
@@ -195,7 +196,14 @@ def main():
         write_result(output_dir, [], lower_us)
         return
     upper_us = int(max_us)
-    if lower_us is not None and lower_us >= upper_us:
+    if lower_us is not None and lower_us > upper_us:
+        log(
+            "warning: the saved cursor is above the source maximum (rolled back or "
+            "truncated source?); extracted 0 rows and kept the cursor"
+        )
+        write_result(output_dir, [], lower_us)
+        return
+    if lower_us is not None and lower_us == upper_us:
         log("no row is newer than the cursor; extracted 0 rows")
         write_result(output_dir, [], lower_us)
         return
@@ -233,7 +241,7 @@ def main():
 
     new_cursor_us = int(row["max_us"])
     files = [{"path": BATCH_FILE, "bytes": os.path.getsize(batch_path), "rows": rows}]
-    log("extracted %d rows; rows at the source maximum wait for the next run" % rows)
+    log("extracted %d rows; rows at the source maximum wait until a newer row exists" % rows)
     write_result(output_dir, files, new_cursor_us)
 
 

@@ -226,7 +226,7 @@ Each run works like this:
 
 1. The program reads the maximum value M of the cursor column, in UTC.
 2. It extracts the rows whose value is above the saved cursor and below M. The first run has no lower bound. Rows with a NULL value are skipped.
-3. The new cursor is the largest value it extracted. Rows at M wait one run, so rows that tie at M always land together.
+3. The new cursor is the largest value it extracted. Rows at M wait until a newer row exists, so rows that tie at M always land together. On a quiet source the newest rows wait until newer data arrives.
 4. If no row qualifies, the program writes no file. Rocky loads nothing and still saves the state.
 
 The connection settings are the `PG*` variables, declared under `secrets` in `rocky.toml`. The program attaches with an empty connection string, so libpq reads them from its environment. They never appear in SQL or in the output.
@@ -239,7 +239,7 @@ The limits of this design:
 - Delivery is at least once, as for every child connector.
 - Each run scans the whole source table.
 
-The POC runs three loads against a Postgres container and checks the row counts, the cursor and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file.
+The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file.
 
 ## Related
 

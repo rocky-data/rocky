@@ -12,6 +12,8 @@
 | The target only appends. | Use it for insert-only tables, such as events or logs. |
 | An updated row is a new row to Rocky only if its cursor value moves forward. | Then the row lands again, as a duplicate. An update that keeps the cursor value is never seen. Deletes are never seen. |
 | A row that commits late, with a cursor value below the saved cursor, is lost for good. | Use a cursor that the database sets at commit order, or leave a safety lag. |
+| The newest rows wait until a newer row arrives. | Rows at the source maximum are held back so ties land together. A source that stops receiving rows keeps its last rows unloaded. |
+| Rows with a NULL cursor value are skipped for good. | Make the cursor column `NOT NULL`. |
 | Delivery is at least once. | A crash between the promote and the state commit loads a batch twice. Deduplicate downstream on a key. |
 | Each run scans the whole source table. | The bounds compare `epoch_us(...)` integers, so DuckDB does not push the filter to Postgres. Fine for a demo; add an index-friendly filter for large tables. |
 | Python 3.8 or newer, standard library only. | `main.py` imports nothing outside the standard library. That is why the settings file is `source.json`, not TOML (`tomllib` needs 3.11). |
@@ -44,7 +46,7 @@ The state is `{"cursor": "<ISO-8601 UTC, microseconds>" | null}`, with `state_sc
 1. The program sets `TimeZone = 'UTC'` and reads `MAX(cursor_column)` once. Call it M.
 2. It extracts the rows with `cursor < value < M`. The first run has no lower bound. NULL values are skipped.
 3. The new cursor is the maximum value it extracted. When it extracts no row, the cursor does not change.
-4. Rows at M wait one run. So rows that tie at M are never split across two runs.
+4. Rows at M wait until a newer row exists. So rows that tie at M are never split across two runs, and on a quiet source the newest rows wait until newer data arrives.
 5. An empty source table selects nothing and keeps the cursor.
 6. With no rows, the program writes no Parquet file and lists none. Rocky skips the load and still commits the state.
 
@@ -104,7 +106,7 @@ To point the connector at your own Postgres, export `PGHOST`, `PGPORT`, `PGUSER`
 === load 3: rocky load --connector pg_events (expect 0 rows) ===
     status=loaded total_rows=0 commit_seq 2 -> 3
 === target table poc.main.events ===
-    rows=24 distinct ids=24 (id 25, at the source maximum, waits for a later run)
+    rows=24 distinct ids=24 (id 25, at the source maximum, waits until a newer row exists)
 === password grep: JSON outputs, debug logs, kept scratch dirs, saved state ===
     0 hits
 

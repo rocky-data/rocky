@@ -29,6 +29,10 @@ export PGHOST="${PGHOST:-127.0.0.1}"
 export PGPORT="${PGPORT:-55432}"
 export PGUSER="${PGUSER:-rocky_reader}"
 export PGPASSWORD="${PGPASSWORD:-rocky-poc-reader-pw}"
+if [ -z "$PGPASSWORD" ]; then
+    echo "FAIL: PGPASSWORD is empty; unset it to use the POC default"
+    exit 1
+fi
 export PGDATABASE="${PGDATABASE:-rocky_src}"
 
 rm -rf .rocky expected poc.duckdb poc.duckdb.wal
@@ -65,6 +69,8 @@ trap cleanup EXIT
 
 echo
 echo "=== docker compose up -d --wait (postgres:16-alpine, 20 seeded rows) ==="
+# A container left by a killed run would hold the port.
+docker compose down -v >/dev/null 2>&1 || true
 docker compose up -d --wait
 
 # Runs SQL inside the container, over the local socket.
@@ -126,7 +132,14 @@ if [ "$COUNTS" != "24,24" ]; then
     echo "FAIL: expected 24 rows and 24 distinct ids, got '$COUNTS'"
     exit 1
 fi
-echo "    rows=24 distinct ids=24 (id 25, at the source maximum, waits for a later run)"
+echo "    rows=24 distinct ids=24"
+HELD="$(duckdb -readonly -csv -noheader poc.duckdb \
+    "SELECT bool_or(id = 20)::INT || ',' || bool_or(id = 25)::INT FROM poc.main.events")"
+if [ "$HELD" != "1,0" ]; then
+    echo "FAIL: expected id 20 loaded and id 25 held back, got '$HELD'"
+    exit 1
+fi
+echo "    id 20 loaded on load 2; id 25, at the source maximum, waits until a newer row exists"
 
 echo
 echo "=== password grep: JSON outputs, debug logs, kept scratch dirs, saved state ==="

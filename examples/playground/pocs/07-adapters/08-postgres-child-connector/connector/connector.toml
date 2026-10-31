@@ -9,4 +9,4 @@ state_schema_version = 1
 egress_hosts         = ["extensions.duckdb.org"]
 
 [limits]
-wall_time_secs = 600
+wall_time_secs = 120
