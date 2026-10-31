@@ -1,0 +1,5 @@
+{
+  "schema": "public",
+  "table": "events",
+  "cursor_column": "created_at"
+}

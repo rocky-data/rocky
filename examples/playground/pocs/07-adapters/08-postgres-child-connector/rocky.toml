@@ -1,0 +1,18 @@
+# Reference child connector: Postgres -> Parquet -> DuckDB.
+#
+# `rocky load --connector pg_events` runs connector/main.py once. The program
+# reads the new rows from Postgres and writes one Parquet file. Rocky checks
+# the file, appends the rows to poc.main.events, and saves the cursor.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.pg_events]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/pg_events"
+# Rocky hands only these variables (plus PATH, LANG, HOME, TMPDIR and
+# ROCKY_RUN_ID) to the program. libpq reads them inside DuckDB.
+secrets    = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]
+target     = { catalog = "poc", schema = "main", table = "events" }
+retries    = 0
