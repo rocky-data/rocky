@@ -165,7 +165,7 @@ jobs:
           # mid-day (2026-08-20) and turn Clippy red with no code change.
           # Bump this version deliberately, running clippy first.
           toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Save only from main. The cache is immutable per key, so a PR that
@@ -195,7 +195,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
       # nextest runs all test binaries in one global scheduler instead of
@@ -233,7 +233,7 @@ jobs:
         with:
           toolchain: 1.98.0
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Save only from main. The cache is immutable per key, so a PR that
@@ -317,7 +317,7 @@ jobs:
           # mid-day (2026-08-20) and turn Clippy red with no code change.
           # Bump this version deliberately, running clippy first.
           toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Save only from main. The cache is immutable per key, so a PR that
