@@ -50,7 +50,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`). Some `run.sh` scripts read JSON with `jq` or `python3`.
 
-**90 of 102 POCs run with no external credentials.** See each POC's README for prerequisites.
+**91 of 103 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -198,9 +198,9 @@ The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt impo
 | [21-emit-sql-exit-path](pocs/06-developer-experience/21-emit-sql-exit-path) | `rocky emit-sql --out-dir` renders the model DAG to plain `.sql`, then runs it through DuckDB with no Rocky — the tested no-lock-in exit path |
 | [22-edit-one-model-loop](pocs/06-developer-experience/22-edit-one-model-loop) | Edit one model, rebuild only it and its downstream: `[run] skip_unchanged`, `rocky run --watch --models`, `--defer` and `--defer-to-state`, steps 1-4 proved from the JSON `model_decisions`, steps 5-6 from `materializations` |
 
-### 07 — Adapters (7 POCs · mixed)
+### 07 — Adapters (8 POCs · mixed)
 
-One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, plus two starters for writing your own adapter. Rocky ships more adapters than this section covers. Check the Credentials column before you run one.
+One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, two starters for writing your own adapter, and a reference child connector for Postgres. Rocky ships more adapters than this section covers. Check the Credentials column before you run one.
 
 | POC | Feature | Credentials |
 |---|---|---|
@@ -211,6 +211,7 @@ One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, plus two 
 | [05-bigquery-native-queries](pocs/07-adapters/05-bigquery-native-queries) | BigQuery adapter — backtick quoting, time-interval partitions, DML transactions | GCP SA / ADC |
 | [06-rust-native-adapter-skeleton](pocs/07-adapters/06-rust-native-adapter-skeleton) | Out-of-tree warehouse adapter starter — `rocky-adapter-sdk` traits against an in-memory mock, ClickHouse-shaped (backtick quoting, no `MERGE`, partition replace) | none (Rust toolchain) |
 | [07-trino-docker](pocs/07-adapters/07-trino-docker) | `rocky-trino` v0 adapter against a single-node `trinodb/trino` container — full_refresh CTAS from `tpch.tiny.nation` into the `memory` catalog | none (Docker) |
+| [08-postgres-child-connector](pocs/07-adapters/08-postgres-child-connector) | Reference child connector: a stdlib Python program that `rocky load --connector` runs to pull new Postgres rows by timestamp cursor into Parquet — three loads, ties held back one run, no password in logs | none (Docker) |
 
 ## Benchmarks
 

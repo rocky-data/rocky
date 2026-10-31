@@ -212,6 +212,35 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 | `egress_hosts` | The hosts the manifest declares. |
 | `error` | Why the run failed. Present only on failure. |
 
+## Reference connector
+
+The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete child connector for Postgres. Copy it as a starting point. It is one Python 3.8 file with no packages. It runs its SQL through the `duckdb` CLI and the DuckDB `postgres` extension.
+
+The connector reads one table and keeps a timestamp cursor in its state.
+
+```json
+{ "schema_version": 1, "value": { "cursor": "2026-10-01T00:19:00.000000Z" } }
+```
+
+Each run works like this:
+
+1. The program reads the maximum value M of the cursor column, in UTC.
+2. It extracts the rows whose value is above the saved cursor and below M. The first run has no lower bound. Rows with a NULL value are skipped.
+3. The new cursor is the largest value it extracted. Rows at M wait until a newer row exists, so rows that tie at M always land together. On a quiet source the newest rows wait until newer data arrives.
+4. If no row qualifies, the program writes no file. Rocky loads nothing and still saves the state.
+
+The connection settings are the `PG*` variables, declared under `secrets` in `rocky.toml`. The program attaches with an empty connection string, so libpq reads them from its environment. They never appear in SQL or in the output.
+
+The limits of this design:
+
+- The target only appends. Use the connector for insert-only tables.
+- An updated row lands again as a duplicate if its cursor value moves forward. Otherwise the update is never seen. Deletes are never seen.
+- A row that commits late, with a cursor value below the saved cursor, is never loaded.
+- Delivery is at least once, as for every child connector.
+- Each run scans the whole source table.
+
+The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file.
+
 ## Related
 
 - [`rocky load`](/reference/cli/#rocky-load) for loading files from a directory

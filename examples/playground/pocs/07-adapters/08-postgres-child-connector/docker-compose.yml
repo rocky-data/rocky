@@ -1,0 +1,29 @@
+# Postgres 16 source for the reference child connector POC.
+#
+# The values come from the PG* variables that run.sh exports with defaults.
+# seed.sql runs once, when the data volume is new. `docker compose down -v`
+# removes the volume, so every run starts from the same 20 rows.
+#
+# For brevity the connector user owns the database here. In production, give
+# the connector a role with SELECT on the source table only.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rocky-postgres-connector-poc
+    environment:
+      POSTGRES_USER: ${PGUSER:-rocky_reader}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-rocky-poc-reader-pw}
+      POSTGRES_DB: ${PGDATABASE:-rocky_src}
+    ports:
+      - "${PGPORT:-55432}:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      # TCP, not the socket: the init server listens on the socket only, so
+      # this passes after seed.sql has run and the real server is up.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s

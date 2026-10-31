@@ -1,0 +1,12 @@
+# Manifest for the reference Postgres child connector.
+# The secrets (the PG* variables) are declared in rocky.toml, not here:
+# the manifest refuses unknown keys.
+protocol_version     = 0
+name                 = "postgres-events"
+command              = ["./main.py"]
+state_schema_version = 1
+# Declared, not enforced. The real egress also includes your Postgres host.
+egress_hosts         = ["extensions.duckdb.org"]
+
+[limits]
+wall_time_secs = 120
