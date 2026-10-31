@@ -22,7 +22,7 @@ use object_store::{
 use rocky_core::config::IdempotencyConfig;
 use rocky_core::idempotency::{
     FinalOutcome, IdempotencyBackend, IdempotencyCheck, IdempotencyEntry, IdempotencyState,
-    ObjectStoreScheme, object_store_idempotency_path, testing,
+    ObjectStoreScheme, object_store_idempotency_path,
 };
 use rocky_core::object_store::ObjectStoreProvider;
 use rocky_core::state_sync::remote_testing::{install_global, serial_guard};
@@ -209,8 +209,7 @@ async fn a_crashed_claim_is_adopted_only_after_it_expires() {
 
 /// A claim is judged by the expiry stamped on it, not by the
 /// `in_flight_ttl_hours` of the config a later run uses. The object-store
-/// sweep never deletes an in-flight claim, expired or not: the delete is not
-/// conditional, so a run could take the claim over between its read and delete.
+/// sweep deletes nothing (#2463), so the claim stays until a run takes it over.
 #[tokio::test]
 async fn a_claim_is_judged_by_its_own_expiry_and_the_sweep_leaves_it() {
     let bucket = bucket(2);
@@ -244,10 +243,12 @@ async fn a_claim_is_judged_by_its_own_expiry_and_the_sweep_leaves_it() {
     );
 }
 
-/// The sweep removes a `Succeeded` entry once its retention has passed, and
-/// only then.
+/// #2463: the object-store sweep deletes nothing, even a `Succeeded` entry
+/// past its retention. Such an entry is one a run may take over, and a plain
+/// delete would remove that run's live claim, so a third run could claim the
+/// key fresh and run the same work twice.
 #[tokio::test]
-async fn the_sweep_removes_a_succeeded_entry_only_after_its_retention() {
+async fn the_sweep_leaves_an_expired_succeeded_entry_and_its_take_over() {
     let bucket = bucket(2);
     let b = backend();
     b.check_and_claim_at(None, "k", "run-a", &cfg(24), t0())
@@ -257,20 +258,38 @@ async fn the_sweep_removes_a_succeeded_entry_only_after_its_retention() {
         .await
         .unwrap();
 
-    let within = t0() + Duration::days(29);
-    assert_eq!(b.sweep_expired_at(None, within).await.unwrap(), 0);
-    let swept = b
-        .sweep_expired_at(None, t0() + Duration::days(31))
-        .await
-        .unwrap();
-    assert_eq!(swept, 1);
+    let past_retention = t0() + Duration::days(31);
+    assert_eq!(b.sweep_expired_at(None, past_retention).await.unwrap(), 0);
     let path = object_store_idempotency_path("k");
     assert!(
-        !bucket
+        bucket
             .provider
             .exists(path.to_str().unwrap())
             .await
-            .unwrap()
+            .unwrap(),
+        "the expired entry stays for a take-over or a lifecycle rule"
+    );
+
+    // Run X takes the expired entry over.
+    let taken = b
+        .check_and_claim_at(None, "k", "run-x", &cfg(24), past_retention)
+        .await
+        .unwrap();
+    assert!(
+        matches!(taken, IdempotencyCheck::AdoptStale { ref prior_run_id, .. } if prior_run_id == "run-a"),
+        "{taken:?}"
+    );
+
+    // A sweep now must not remove X's live claim.
+    assert_eq!(b.sweep_expired_at(None, past_retention).await.unwrap(), 0);
+    assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-x");
+    let other = b
+        .check_and_claim_at(None, "k", "run-y", &cfg(24), past_retention)
+        .await
+        .unwrap();
+    assert!(
+        matches!(other, IdempotencyCheck::SkipInFlight { .. }),
+        "run Y must see X's claim: {other:?}"
     );
 }
 
@@ -366,39 +385,6 @@ async fn finalize_by_a_non_owner_is_refused() {
         matches!(later, IdempotencyCheck::SkipCompleted { ref run_id } if run_id == "run-b"),
         "{later:?}"
     );
-}
-
-/// The sweep read an expired claim. Before it deleted, another run took the
-/// claim over. The sweep must leave the new claim alone.
-#[tokio::test]
-async fn the_sweep_does_not_delete_a_claim_re_adopted_between_read_and_delete() {
-    let bucket = bucket(2);
-    let b = backend();
-    b.check_and_claim_at(None, "k", "run-a", &cfg(24), t0())
-        .await
-        .unwrap();
-    let after_expiry = t0() + Duration::hours(25);
-
-    let seen_by_sweep = testing::observe_claim(&bucket.provider, "k")
-        .await
-        .unwrap()
-        .expect("the claim exists");
-
-    // A run adopts the expired claim after the sweep read it.
-    let verdict = b
-        .check_and_claim_at(None, "k", "run-b", &cfg(24), after_expiry)
-        .await
-        .unwrap();
-    assert!(
-        matches!(verdict, IdempotencyCheck::AdoptStale { .. }),
-        "{verdict:?}"
-    );
-
-    let deleted = testing::sweep_observed(&bucket.provider, &seen_by_sweep, after_expiry)
-        .await
-        .unwrap();
-    assert!(!deleted, "the sweep must skip a claim that changed");
-    assert_eq!(read_entry(&bucket.provider, "k").await.run_id, "run-b");
 }
 
 /// Under `dedup_on = "success"`, a failed owner frees the key without a

@@ -129,14 +129,22 @@ pub fn generate_select_sql(
 /// `last_watermark` is forwarded to [`generate_select_sql`] for the
 /// incremental WHERE filter. See that function's docs for semantics.
 ///
+/// `insert_columns` names the target columns, in SELECT order, when the
+/// target's own order differs (#2468). Most dialects insert by position, and
+/// schema drift appends a new source column after the metadata columns. With
+/// `None` the INSERT stays positional.
+///
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
-/// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
+/// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]),
+/// and a validation error for an insert column that is not a plain
+/// identifier.
 pub fn generate_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
     last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+    insert_columns: Option<&[String]>,
 ) -> Result<String, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Replication {
         return Err(variant_mismatch(model_ir, "Replication"));
@@ -147,7 +155,39 @@ pub fn generate_insert_sql(
         &model_ir.target.table,
     )?;
     let select = generate_select_sql(model_ir, dialect, last_watermark)?;
-    Ok(dialect.insert_into(&target, &select))
+    replication_insert(model_ir, dialect, &target, &select, insert_columns)
+}
+
+/// `INSERT INTO <target> SELECT ...`, positional or with a named column list.
+///
+/// A metadata column in the list is spelled as the dialect's SELECT names it
+/// ([`SqlDialect::metadata_column_ref`]). Every other column must be a plain
+/// identifier and stays bare, as `SELECT *` returns it.
+fn replication_insert(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    target: &str,
+    select: &str,
+    insert_columns: Option<&[String]>,
+) -> Result<String, SqlGenError> {
+    let Some(columns) = insert_columns else {
+        return Ok(dialect.insert_into(target, select));
+    };
+    let mut rendered = Vec::with_capacity(columns.len());
+    for column in columns {
+        let metadata = model_ir
+            .metadata_columns
+            .iter()
+            .find(|m| m.name() == column.as_str());
+        match metadata {
+            Some(m) => rendered.push(dialect.metadata_column_ref(m.name())),
+            None => {
+                validation::validate_identifier(column)?;
+                rendered.push(column.clone());
+            }
+        }
+    }
+    Ok(dialect.insert_into_columns(target, &rendered, select))
 }
 
 /// Generates CREATE TABLE AS SELECT using the given dialect (full refresh).
@@ -266,15 +306,19 @@ fn held_back_parts<'a>(
 /// sits below it. [`generate_insert_sql`] stays the unbounded form that
 /// `rocky plan` previews and that an empty or all-NULL source still runs.
 ///
+/// `insert_columns` has the same meaning as in [`generate_insert_sql`].
+///
 /// # Errors
 ///
 /// Returns [`SqlGenError::InvalidRequest`] unless `model_ir` is a
-/// replication [`ModelIr`] with the `Incremental` strategy.
+/// replication [`ModelIr`] with the `Incremental` strategy, and a
+/// validation error for an insert column that is not a plain identifier.
 pub fn generate_held_back_insert_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
     last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
     held_max: &chrono::DateTime<chrono::Utc>,
+    insert_columns: Option<&[String]>,
 ) -> Result<String, SqlGenError> {
     let parts = held_back_parts(model_ir, dialect)?;
     let where_clause = dialect.watermark_where(parts.timestamp_column, last_watermark)?;
@@ -287,7 +331,13 @@ pub fn generate_held_back_insert_sql(
         "{}\nFROM {}\n{where_clause} AND {bound}",
         parts.select_clause, parts.source_ref
     );
-    Ok(dialect.insert_into(&parts.target_ref, &select))
+    replication_insert(
+        model_ir,
+        dialect,
+        &parts.target_ref,
+        &select,
+        insert_columns,
+    )
 }
 
 /// The replacing full copy of an incremental replication table with the
@@ -2011,12 +2061,50 @@ mod tests {
 
     #[test]
     fn test_insert_into_sql() {
-        let sql = generate_insert_sql(&sample_incremental_ir(), &dialect(), None).unwrap();
+        let sql = generate_insert_sql(&sample_incremental_ir(), &dialect(), None, None).unwrap();
 
         assert!(sql.starts_with("INSERT INTO acme_warehouse.staging__us_west__shopify.orders"));
         assert!(sql.contains("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
         // First run: no prior watermark → 1970-01-01 sentinel literal.
         assert!(sql.contains("WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"));
+    }
+
+    /// #2468: with a column list, both inserts name the target columns in
+    /// SELECT order instead of relying on position.
+    #[test]
+    fn test_insert_with_columns_names_target_columns() {
+        let columns = vec![
+            "id".to_string(),
+            "region".to_string(),
+            "_loaded_by".to_string(),
+        ];
+        let expected_head = "INSERT INTO acme_warehouse.staging__us_west__shopify.orders \
+                             (id, region, _loaded_by)\nSELECT id, region, _loaded_by FROM (\n\
+                             SELECT *, CAST(NULL AS STRING) AS _loaded_by";
+        let plain = generate_insert_sql(&sample_incremental_ir(), &dialect(), None, Some(&columns))
+            .unwrap();
+        assert!(plain.starts_with(expected_head), "{plain}");
+        assert!(plain.ends_with(") AS _rocky_incoming"), "{plain}");
+        let held = generate_held_back_insert_sql(
+            &sample_incremental_ir(),
+            &dialect(),
+            None,
+            &held_max(),
+            Some(&columns),
+        )
+        .unwrap();
+        assert!(held.starts_with(expected_head), "{held}");
+        assert!(held.contains("AND _fivetran_synced < TIMESTAMP '2026-04-17 10:00:00'"));
+        assert!(held.ends_with(") AS _rocky_incoming"), "{held}");
+    }
+
+    #[test]
+    fn test_insert_with_columns_rejects_bad_identifier() {
+        let columns = vec!["id; DROP TABLE x".to_string()];
+        assert!(
+            generate_insert_sql(&sample_incremental_ir(), &dialect(), None, Some(&columns))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2046,6 +2134,7 @@ mod tests {
             &dialect(),
             Some(&prior),
             &held_max(),
+            None,
         )
         .unwrap();
         assert!(sql.starts_with("INSERT INTO acme_warehouse.staging__us_west__shopify.orders"));
@@ -2120,9 +2209,14 @@ mod tests {
     /// #2376: the hold-back is for incremental replication only.
     #[test]
     fn test_held_back_sql_refuses_other_strategies() {
-        let err =
-            generate_held_back_insert_sql(&sample_full_refresh_ir(), &dialect(), None, &held_max())
-                .unwrap_err();
+        let err = generate_held_back_insert_sql(
+            &sample_full_refresh_ir(),
+            &dialect(),
+            None,
+            &held_max(),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{err}");
         assert!(
             generate_held_back_create_table_as_sql(

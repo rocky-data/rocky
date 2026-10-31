@@ -1662,13 +1662,25 @@ pub trait SqlDialect: Send + Sync {
     /// an append that names its columns, for an incremental model whose
     /// output column order differs from the target's.
     ///
-    /// `columns` are validated identifiers. SQL Server overrides to lift the
+    /// `columns` are validated identifiers, or metadata columns rendered by
+    /// [`Self::metadata_column_ref`]. SQL Server overrides to lift the
     /// model's CTEs out of the derived table.
     fn insert_into_columns(&self, target: &str, columns: &[String], select_sql: &str) -> String {
         let list = columns.join(", ");
         format!(
             "INSERT INTO {target} ({list})\nSELECT {list} FROM (\n{select_sql}\n) AS _rocky_incoming"
         )
+    }
+
+    /// How a replication metadata column is referenced, spelled exactly as
+    /// [`Self::select_clause`] names its alias. A replication INSERT that
+    /// names its columns (#2468) must reach the column the copy created.
+    ///
+    /// Default: the bare name. Snowflake overrides: it quotes the alias, so
+    /// the column keeps its lower case and a bare reference would fold to
+    /// upper case and miss it.
+    fn metadata_column_ref(&self, name: &str) -> String {
+        name.to_string()
     }
 
     /// `ALTER TABLE … ADD COLUMN <column> <type>` for schema drift and an

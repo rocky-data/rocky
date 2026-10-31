@@ -103,6 +103,10 @@ impl SqlDialect for SnowflakeSqlDialect {
         format!("INSERT INTO {target}\n{select_sql}")
     }
 
+    fn metadata_column_ref(&self, name: &str) -> String {
+        self.quote_identifier(name)
+    }
+
     fn merge_into(
         &self,
         target: &str,
@@ -222,7 +226,7 @@ impl SqlDialect for SnowflakeSqlDialect {
             // alias so the materialized metadata column is stored
             // lowercase-preserving, consistent with the quoted column path
             // (and so a later quoted reference to it resolves).
-            let alias_q = self.quote_identifier(mc.name());
+            let alias_q = self.metadata_column_ref(mc.name());
             write!(
                 sql,
                 ", CAST({} AS {}) AS {alias_q}",
@@ -1146,5 +1150,50 @@ mod tests {
         assert!(!d.is_safe_type_widening("NUMBER(38,0)", "NUMBER("));
         assert!(!d.is_safe_type_widening("NUMBER(38,0)", "NUMBER(abc,0)"));
         assert!(!d.is_safe_type_widening("VARCHAR(100)", "VARCHAR()"));
+    }
+
+    /// #2468: the named replication INSERT must reference `_loaded_by` the way
+    /// the copy created it: quoted, lower case. A bare `_loaded_by` folds to
+    /// `_LOADED_BY` and misses the column. Source columns stay bare.
+    #[test]
+    fn replication_insert_with_columns_quotes_metadata_like_select() {
+        use rocky_ir::{GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef};
+        let ir = ModelIr::replication(
+            TargetRef {
+                catalog: "wh".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "_FIVETRAN_SYNCED".into(),
+                unique_key: Vec::new(),
+                lookback: None,
+                filter_column: None,
+            },
+            SourceRef {
+                catalog: "src".into(),
+                schema: "shop".into(),
+                table: "orders".into(),
+            },
+            ColumnSelection::All,
+            vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()],
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+        );
+        let columns = vec![
+            "ID".to_string(),
+            "REGION".to_string(),
+            "_loaded_by".to_string(),
+        ];
+        let sql = rocky_core::sql_gen::generate_insert_sql(&ir, &dialect(), None, Some(&columns))
+            .unwrap();
+        assert!(
+            sql.contains("(ID, REGION, \"_loaded_by\")\nSELECT ID, REGION, \"_loaded_by\" FROM ("),
+            "{sql}"
+        );
+        assert!(sql.contains("AS \"_loaded_by\""), "{sql}");
     }
 }

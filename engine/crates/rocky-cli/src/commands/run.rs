@@ -356,6 +356,78 @@ fn flush_interrupted_watermarks(
 }
 
 /// Error from parallel table processing (partial failure mode).
+/// The measured copy attempts of one failed replication table (#2470).
+#[derive(Debug, Clone)]
+struct CopyFailure {
+    /// The target table name: the name its run record would carry on success.
+    table: String,
+    /// Every copy attempt, terminal failed attempt last.
+    attempts: Vec<rocky_core::state::AttemptRecord>,
+}
+
+impl CopyFailure {
+    /// A failed copy attempt, numbered after the attempts already recorded.
+    fn attempt(
+        prior: &[rocky_core::state::AttemptRecord],
+        err: &anyhow::Error,
+        duration_ms: u64,
+    ) -> rocky_core::state::AttemptRecord {
+        rocky_core::state::AttemptRecord {
+            attempt: prior.len() as u32 + 1,
+            outcome: "failed".to_string(),
+            // The copy path does not classify a failure into a retry class.
+            failure_class: None,
+            transient_kind: None,
+            error: Some(super::resilience::truncate_error(err)),
+            backoff_ms: None,
+            duration_ms,
+        }
+    }
+
+    /// A successful copy attempt, numbered after the failed ones before it.
+    fn success(
+        prior: &[rocky_core::state::AttemptRecord],
+        duration_ms: u64,
+    ) -> rocky_core::state::AttemptRecord {
+        rocky_core::state::AttemptRecord {
+            attempt: prior.len() as u32 + 1,
+            outcome: "success".to_string(),
+            failure_class: None,
+            transient_kind: None,
+            error: None,
+            backoff_ms: None,
+            duration_ms,
+        }
+    }
+
+    /// The copy attempts already recorded for task `idx`, for a retry to
+    /// extend. Empty when no copy failure is recorded for it.
+    fn prior_attempts(
+        table_errors: &[TableError],
+        idx: usize,
+    ) -> Vec<rocky_core::state::AttemptRecord> {
+        table_errors
+            .iter()
+            .find(|prior| prior.task_index == Some(idx))
+            .and_then(|prior| prior.copy.as_ref())
+            .map(|prior| prior.attempts.clone())
+            .unwrap_or_default()
+    }
+
+    /// The run-record measurement: the last attempt's own time, and the full
+    /// trail only when a retry happened.
+    fn measured(&self) -> super::resilience::FailedModelAttempts {
+        super::resilience::FailedModelAttempts {
+            duration_ms: self.attempts.last().map_or(0, |a| a.duration_ms),
+            attempts: if self.attempts.len() > 1 {
+                self.attempts.clone()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
 struct TableError {
     asset_key: Vec<String>,
     error: String,
@@ -364,6 +436,10 @@ struct TableError {
     /// For the one entry a fail-fast model phase produced: the model it stands
     /// for, so its run record can take that model's measured attempts (#2470).
     model: Option<String>,
+    /// For a failed replication copy: the table and its measured copy
+    /// attempts, so its run record keeps its name and time (#2470). `None`
+    /// for an entry no copy produced (a freeze, a panicked task).
+    copy: Option<CopyFailure>,
     /// Coarse classification of the failure for the public JSON output.
     /// Set by walking the typed connector-error chain on `e` before the
     /// error is stringified; defaults to `Unknown` when no connector
@@ -927,9 +1003,10 @@ fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_error
             failure_kind: e.failure_kind,
             cooldown_seconds: e.cooldown_seconds,
         };
-        match &e.model {
-            Some(model) => output.push_model_error(entry, model),
-            None => output.errors.push(entry),
+        match (&e.model, &e.copy) {
+            (Some(model), _) => output.push_model_error(entry, model),
+            (None, Some(copy)) => output.push_table_error(entry, &copy.table, copy.measured()),
+            (None, None) => output.errors.push(entry),
         }
     }
     output.status = output.derive_run_status();
@@ -3753,8 +3830,9 @@ pub async fn run_with_explicit_contracts(
     // early error return *after the claim* still releases the idempotency
     // stamp. Without this wrapper, a run that errored before the existing
     // `finalize_idempotency` sites would leave the `InFlight` claim in
-    // redb/Valkey/object-store until the 24h `in_flight_ttl_hours` sweep
-    // reaped it — so a retry with the same key returned `skipped_in_flight`
+    // redb/Valkey/object-store until its 24h `in_flight_ttl_hours` expiry
+    // (a sweep on redb and Valkey; a later run's take-over on an object
+    // store) — so a retry with the same key returned `skipped_in_flight`
     // for up to 24h instead of proceeding. The happy / interrupted /
     // partial-failure paths each call `finalize_idempotency` which is
     // one-shot (takes the ctx out of the `Option`); if that already fired,
@@ -6707,7 +6785,7 @@ pub async fn run_with_explicit_contracts(
     // (`prune_unchanged`) and the run didn't force a full pass (`--no-prune`).
     // Threaded into every `process_table` call in the concurrent loop below.
     let prune_enabled = shared_pipeline.prune_unchanged && !skip_opts.no_prune;
-    let mut join_set: JoinSet<(usize, Result<TableOutcome, anyhow::Error>)> = JoinSet::new();
+    let mut join_set: JoinSet<(usize, u64, Result<TableOutcome, anyhow::Error>)> = JoinSet::new();
 
     // Background state sync — flush watermarks to remote storage.
     //
@@ -6803,6 +6881,7 @@ pub async fn run_with_explicit_contracts(
             ),
             task_index: None,
             model: None,
+            copy: None,
             failure_kind: crate::output::FailureKind::Unknown,
             cooldown_seconds: None,
         });
@@ -6945,9 +7024,10 @@ pub async fn run_with_explicit_contracts(
             if cancel_at_copy {
                 stall_cancel.cancel();
             }
+            let copy_start = Instant::now();
             let result =
                 process_table_with_replacement_recovery(warehouse.as_ref(), &state, &pipeline_ref, &task, prune_enabled, required_replacement, needs_orphan_checks).await;
-            (idx, result)
+            (idx, copy_start.elapsed().as_millis() as u64, result)
         });
     }
 
@@ -6995,7 +7075,7 @@ pub async fn run_with_explicit_contracts(
         total_completed += 1;
 
         match result {
-            Ok((idx, Ok(TableOutcome::Pruned(pruned)))) => {
+            Ok((idx, _, Ok(TableOutcome::Pruned(pruned)))) => {
                 // A prune is a cheap successful metadata read, not real work —
                 // signal the throttle so it can widen concurrency, then record
                 // the skip. No materialization is emitted: the orchestrator's
@@ -7013,7 +7093,7 @@ pub async fn run_with_explicit_contracts(
                 )
                 .await;
             }
-            Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
+            Ok((_, _, Ok(TableOutcome::Materialized(tr)))) => {
                 collect_materialized_table(
                     *tr,
                     &mut MaterializedSinks {
@@ -7050,12 +7130,17 @@ pub async fn run_with_explicit_contracts(
                 )
                 .await;
             }
-            Ok((idx, Err(e))) => {
+            Ok((idx, copy_ms, Err(e))) => {
                 // Classify before stringification so the typed connector
                 // variant is preserved on `TableError.failure_kind` and
                 // the optional engine-supplied cooldown hint
                 // (warehouse-side breaker trip) is captured.
                 let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+                // The copy's own time and attempt, for its run record (#2470).
+                let copy = tables_to_process.get(idx).map(|task| CopyFailure {
+                    table: task.target_table_name.clone(),
+                    attempts: vec![CopyFailure::attempt(&[], &e, copy_ms)],
+                });
                 let raw = format!("{e:#}");
                 if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                     warn!(
@@ -7122,7 +7207,7 @@ pub async fn run_with_explicit_contracts(
                             asset_key: vec![],
                             status: rocky_core::state::TableStatus::Failed,
                             error: Some(msg.clone()),
-                            duration_ms: 0,
+                            duration_ms: copy_ms,
                             completed_at: Utc::now(),
                             held_max: None,
                         },
@@ -7135,6 +7220,7 @@ pub async fn run_with_explicit_contracts(
                     error: msg,
                     task_index: Some(idx),
                     model: None,
+                    copy,
                     failure_kind,
                     cooldown_seconds,
                 });
@@ -7169,6 +7255,7 @@ pub async fn run_with_explicit_contracts(
                     error: msg,
                     task_index: None,
                     model: None,
+                    copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
                 });
@@ -7424,6 +7511,7 @@ pub async fn run_with_explicit_contracts(
                     break;
                 }
                 let task = &tables_to_process[idx];
+                let retry_start = Instant::now();
                 match retry_table_after_recovery(
                     shared_warehouse.as_ref(),
                     &shared_state,
@@ -7455,7 +7543,15 @@ pub async fn run_with_explicit_contracts(
                         )
                         .await;
                     }
-                    Ok(TableOutcome::Materialized(tr)) => {
+                    Ok(TableOutcome::Materialized(mut tr)) => {
+                        // The failed first attempt stays in the trail, as a
+                        // retried model's does (#2470).
+                        let mut attempts = CopyFailure::prior_attempts(&table_errors, idx);
+                        if !attempts.is_empty() {
+                            let success = CopyFailure::success(&attempts, tr.materialization.duration_ms);
+                            attempts.push(success);
+                            tr.materialization.attempts = attempts;
+                        }
                         // The same collector the two drain paths use (#1718).
                         // The first attempt recorded this table Failed; the
                         // retry's Success replaces it (same key, last write
@@ -7507,11 +7603,19 @@ pub async fn run_with_explicit_contracts(
                             error = msg,
                             "retry also failed"
                         );
+                        // The first attempt's record, then this retry's (#2470).
+                        let mut attempts = CopyFailure::prior_attempts(&table_errors, idx);
+                        let retry_ms = retry_start.elapsed().as_millis() as u64;
+                        attempts.push(CopyFailure::attempt(&attempts, &e, retry_ms));
                         still_failed.push(TableError {
                             asset_key: vec![],
                             error: msg,
                             task_index: Some(idx),
                             model: None,
+                            copy: Some(CopyFailure {
+                                table: task.target_table_name.clone(),
+                                attempts,
+                            }),
                             failure_kind,
                             cooldown_seconds,
                         });
@@ -7900,6 +8004,7 @@ pub async fn run_with_explicit_contracts(
                         error: format!("{e:#}"),
                         task_index: None,
                         model: output.fail_fast_model.take(),
+                        copy: None,
                         failure_kind,
                         cooldown_seconds,
                     });
@@ -7925,6 +8030,7 @@ pub async fn run_with_explicit_contracts(
                     error: msg,
                     task_index: None,
                     model: None,
+                    copy: None,
                     failure_kind: crate::output::FailureKind::Unknown,
                     cooldown_seconds: None,
                 });
@@ -12132,6 +12238,44 @@ fn record_contained_cause(
     containment.poison(model_name);
 }
 
+/// Handle a model failure that the retry loop did not run: fire the
+/// `model_error` hook, keep the model's measured time, then contain it or stop.
+///
+/// Returns `Ok(())` when the failure was contained (the caller moves on to the
+/// next model) and `Err` when the run must stop at this model, with
+/// `fail_fast_model` set so the run record stores the failure under its own
+/// name (#2470).
+#[allow(clippy::too_many_arguments)]
+async fn fail_unretried_model(
+    output: &mut RunOutput,
+    containment: &mut super::containment::ContainmentLedger,
+    hook_registry: Option<&HookRegistry>,
+    pipeline_name: Option<&str>,
+    run_id: &str,
+    model_name: &str,
+    duration_ms: u64,
+    contain_failures: bool,
+    err: anyhow::Error,
+) -> Result<()> {
+    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+        let _ = reg
+            .fire(&HookContext::model_error(
+                run_id,
+                pipe,
+                model_name,
+                &format!("{err:#}"),
+            ))
+            .await;
+    }
+    output.record_unretried_failure(model_name, duration_ms);
+    if contain_failures {
+        record_contained_cause(output, containment, model_name, &err);
+        return Ok(());
+    }
+    output.fail_fast_model = Some(model_name.to_string());
+    Err(err)
+}
+
 /// Resolve the `(reuse_enabled, column_level_enabled)` gates a supervised
 /// backfill hands to [`execute_models`].
 ///
@@ -14527,6 +14671,11 @@ async fn execute_models_phase(
                             if resilience.contain_failures {
                                 record_contained_cause(output, &mut containment, name, &e);
                             } else {
+                                // The error entry stands for this model, whose
+                                // failed materialization already carries its
+                                // time: no second record under a placeholder
+                                // (#2470).
+                                output.fail_fast_model = Some(name.to_string());
                                 first_error = Some(e);
                             }
                         }
@@ -14644,12 +14793,35 @@ async fn execute_models_phase(
                 // real CLI path (every evaluation fell through to build). The
                 // seeded typed IR (typed from the reviewed source-schema
                 // snapshot #2) is what the column-skip decision consumes (#3).
-                let model_ir = typed_model_ir(
+                // A failure here is this model's failure, handled as the
+                // content-addressed arm below handles the same failure: its
+                // name and time reach the run record (#2470). The gate is on
+                // by default, so this is the first site to build the IR.
+                let typed_ir_start = Instant::now();
+                let model_ir = match typed_model_ir(
                     model,
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                )?;
+                ) {
+                    Ok(ir) => ir,
+                    Err(e) => {
+                        gate.record(model_name, super::skip_gate::Verdict::Built);
+                        fail_unretried_model(
+                            output,
+                            &mut containment,
+                            hook_registry,
+                            pipeline_name,
+                            run_id,
+                            model_name,
+                            typed_ir_start.elapsed().as_millis() as u64,
+                            resilience.contain_failures,
+                            e.context(format!("model '{model_name}' failed")),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 if let ColumnSkipOutcome::Skip {
                     prior_output_column_hashes,
                     prior_blake3,
@@ -14741,12 +14913,32 @@ async fn execute_models_phase(
                 // `skip_hash()`, so the reuse spine / provenance ledger was
                 // never populated by a real `rocky run`. Seeded from the
                 // reviewed source-schema snapshot (#2) so CAS consumes it (#3).
-                let model_ir = typed_model_ir(
+                // A failure here is this model's failure, handled as the
+                // materialization error arm below handles one: its name and
+                // time reach the run record (#2470).
+                let model_ir = match typed_model_ir(
                     model,
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                )?;
+                ) {
+                    Ok(ir) => ir,
+                    Err(e) => {
+                        fail_unretried_model(
+                            output,
+                            &mut containment,
+                            hook_registry,
+                            pipeline_name,
+                            run_id,
+                            model_name,
+                            model_start.elapsed().as_millis() as u64,
+                            resilience.contain_failures,
+                            e.context(format!("model '{model_name}' failed")),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 let model_started_at = Utc::now();
                 let target_table_full_name = format!(
                     "{}.{}.{}",
@@ -15065,12 +15257,20 @@ async fn execute_models_phase(
                                 ))
                                 .await;
                         }
+                        // The retry loop does not run a content-addressed
+                        // model: its one attempt's time is the record's
+                        // duration, with no trail (#2470).
+                        output.record_unretried_failure(
+                            model_name,
+                            model_start.elapsed().as_millis() as u64,
+                        );
                         // Containment: record + poison this content-addressed
                         // model and continue disjoint work; fail-fast otherwise.
                         if resilience.contain_failures {
                             record_contained_cause(output, &mut containment, model_name, &e);
                             continue;
                         }
+                        output.fail_fast_model = Some(model_name.to_string());
                         return Err(e);
                     }
                 }
@@ -15111,10 +15311,18 @@ async fn execute_models_phase(
                 // poison the model so downstream consumers of the incomplete
                 // table are withheld, then continue. Fail-fast otherwise.
                 if let Err(e) = time_interval_res {
+                    // A failed partition left its own time on the output. A
+                    // failure before any partition ran (planning, bootstrap)
+                    // did not, so the model's elapsed time stands in (#2470).
+                    output.record_unretried_failure(
+                        model_name,
+                        model_start.elapsed().as_millis() as u64,
+                    );
                     if resilience.contain_failures {
                         record_contained_cause(output, &mut containment, model_name, &e);
                         continue;
                     }
+                    output.fail_fast_model = Some(model_name.to_string());
                     return Err(e);
                 }
                 // Cancel (#1606): a model that skipped partitions was not
@@ -15244,6 +15452,10 @@ async fn execute_models_phase(
                         if resilience.contain_failures {
                             record_contained_cause(output, &mut containment, model_name, &e);
                         } else {
+                            // As in the concurrent arm: the failed
+                            // materialization is this model's one record
+                            // (#2470).
+                            output.fail_fast_model = Some(model_name.to_string());
                             return Err(e);
                         }
                     }
@@ -17505,6 +17717,10 @@ async fn execute_time_interval_model(
     // We collect ALL results before checking errors so other in-flight
     // partitions complete cleanly (rather than being cancelled mid-flight).
     let mut first_error: Option<(anyhow::Error, String)> = None;
+    // Failed partitions' own time. A successful partition records its time
+    // on its own materialization, so only the failed ones go to the model's
+    // failed record (#2470).
+    let mut failed_ms: u64 = 0;
     for r in results {
         match r.outcome {
             Ok(Some(materialization)) => {
@@ -17514,6 +17730,7 @@ async fn execute_time_interval_model(
             Ok(None) => summary.partitions_skipped += 1,
             Err(err) => {
                 summary.partitions_failed += 1;
+                failed_ms = failed_ms.saturating_add(r.duration_ms);
                 if first_error.is_none() {
                     first_error = Some((err, r.partition_key));
                 }
@@ -17546,6 +17763,9 @@ async fn execute_time_interval_model(
     output.partition_summaries.push(summary);
 
     if let Some((err, key)) = first_error {
+        // Partitions are not retries: the trail stays empty and
+        // `duration_ms` is the failed partitions' total.
+        output.record_unretried_failure(model_name, failed_ms);
         return Err(err.context(format!("partition '{key}' of model '{model_name}' failed")));
     }
     Ok(())
@@ -17557,6 +17777,9 @@ async fn execute_time_interval_model(
 struct PartitionExecutionResult {
     /// Canonical partition key, used for sorting and error messages.
     partition_key: String,
+    /// This partition's own time, so a failed partition's compute reaches
+    /// the model's run record (#2470). Zero for a partition a cancel skipped.
+    duration_ms: u64,
     /// The materialization to push into `RunOutput.materializations`, `None`
     /// when a cancel stopped the partition before it started (no state row,
     /// no warehouse work), or an error to surface after all partitions
@@ -17595,6 +17818,7 @@ async fn run_one_partition(
     if cancel.is_cancelled() {
         return PartitionExecutionResult {
             partition_key: key,
+            duration_ms: 0,
             outcome: Ok(None),
         };
     }
@@ -17640,6 +17864,7 @@ async fn run_one_partition(
     if let Err(e) = state_ref.record_partitions(&batch_records(&record)) {
         return PartitionExecutionResult {
             partition_key: key.clone(),
+            duration_ms: partition_start.elapsed().as_millis() as u64,
             outcome: Err(anyhow::Error::from(e).context(format!(
                 "failed to record InProgress for {model_name}|{key}"
             ))),
@@ -17661,6 +17886,7 @@ async fn run_one_partition(
         Err(e) => {
             return PartitionExecutionResult {
                 partition_key: key.clone(),
+                duration_ms: partition_start.elapsed().as_millis() as u64,
                 outcome: Err(anyhow::Error::from(e)
                     .context(format!("SQL gen failed for {model_name}|{key}"))),
             };
@@ -17722,6 +17948,7 @@ async fn run_one_partition(
 
         return PartitionExecutionResult {
             partition_key: key,
+            duration_ms: partition_start.elapsed().as_millis() as u64,
             outcome: Err(err),
         };
     }
@@ -17734,6 +17961,7 @@ async fn run_one_partition(
     if let Err(e) = state_ref.record_partitions(&records) {
         return PartitionExecutionResult {
             partition_key: key.clone(),
+            duration_ms: partition_start.elapsed().as_millis() as u64,
             outcome: Err(anyhow::Error::from(e).context(format!(
                 "failed to record Computed batch for {model_name}|{key}"
             ))),
@@ -17774,6 +18002,7 @@ async fn run_one_partition(
     }
     PartitionExecutionResult {
         partition_key: key.clone(),
+        duration_ms: record.duration_ms,
         outcome: Ok(Some(MaterializationOutput {
             volume: None,
             asset_key: asset_key.to_vec(),
@@ -17995,6 +18224,50 @@ fn resolve_merge_update_columns(
         unique_key: unique_key.clone(),
         update_columns: ColumnSelection::Explicit(cols),
     }
+}
+
+/// The column list for a replication INSERT, or `None` to keep it positional.
+///
+/// The SELECT is `*, <metadata columns>`: the source columns in source order,
+/// then the metadata columns. The target holds its existing columns, then any
+/// columns drift appended. When a source column is added, drift appends it
+/// after the metadata columns, so a positional INSERT writes it into
+/// `_loaded_by` and the other way round (#2468).
+///
+/// Returns the SELECT's column names when both sides hold the same columns
+/// (case-insensitive) in a different order. Any other case keeps the INSERT
+/// positional: matching order is already safe, and a mismatched column set
+/// fails at the warehouse as it did before. `None` also when the source
+/// description is empty.
+fn replication_insert_columns(
+    source_cols: &[ColumnInfo],
+    metadata_columns: &[MetadataColumn],
+    target_cols: &[ColumnInfo],
+    drift_added: &[String],
+) -> Option<Vec<String>> {
+    if source_cols.is_empty() {
+        return None;
+    }
+    let select: Vec<String> = source_cols
+        .iter()
+        .map(|c| c.name.clone())
+        .chain(metadata_columns.iter().map(|m| m.name().to_string()))
+        .collect();
+    let select_order: Vec<String> = select.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let target_order: Vec<String> = target_cols
+        .iter()
+        .map(|c| c.name.as_str())
+        .chain(drift_added.iter().map(String::as_str))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if select_order == target_order {
+        return None;
+    }
+    let mut select_set = select_order;
+    let mut target_set = target_order;
+    select_set.sort_unstable();
+    target_set.sort_unstable();
+    (select_set == target_set).then_some(select)
 }
 
 /// `MAX(<timestamp_column>) FROM <target>` — the post-execute watermark for the
@@ -18833,9 +19106,17 @@ async fn process_table(
 
     let mut use_full_refresh = !target_exists || (uses_watermark && prior_watermark.is_none());
     let mut drift_action: Option<DriftActionOutput> = None;
+    // Columns the drift step below appends to the target, in order. Unless the
+    // drift drops the table, they land after every existing column.
+    let mut drift_added_columns: Vec<String> = Vec::new();
 
     if target_exists {
         let drift_result = drift::detect_drift(&target_table, &source_cols, &target_cols, dialect);
+        drift_added_columns = drift_result
+            .added_columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
 
         // Governed additive-drift auto-apply (default-off). When the opt-in +
         // a `[policy]` grant are configured (`task.auto_apply_gate` is `Some`),
@@ -19027,6 +19308,18 @@ async fn process_table(
     // above for drift detection; `source_cols` is in scope and free. Reuse it.
     let resolved_strategy =
         resolve_merge_update_columns(&strategy, &source_cols, &task.metadata_columns);
+    // An incremental INSERT is positional on every dialect but DuckDB. Name the
+    // columns when the target's order differs from the SELECT's (#2468).
+    let insert_columns = if target_exists && !use_full_refresh {
+        replication_insert_columns(
+            &source_cols,
+            &task.metadata_columns,
+            &target_cols,
+            &drift_added_columns,
+        )
+    } else {
+        None
+    };
 
     let model_ir = replication_model_ir(
         task,
@@ -19068,10 +19361,14 @@ async fn process_table(
                         dialect,
                         prior_watermark.as_ref(),
                         held,
+                        insert_columns.as_deref(),
                     )?,
-                    None => {
-                        sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
-                    }
+                    None => sql_gen::generate_insert_sql(
+                        &model_ir,
+                        dialect,
+                        prior_watermark.as_ref(),
+                        insert_columns.as_deref(),
+                    )?,
                 }
             }
             MaterializationStrategy::Merge { .. } => {
@@ -19193,7 +19490,12 @@ async fn process_table(
             MaterializationStrategy::Microbatch { .. } => {
                 strategy_name = "microbatch";
                 // Microbatch on replication tables falls back to incremental insert.
-                sql_gen::generate_insert_sql(&model_ir, dialect, prior_watermark.as_ref())?
+                sql_gen::generate_insert_sql(
+                    &model_ir,
+                    dialect,
+                    prior_watermark.as_ref(),
+                    insert_columns.as_deref(),
+                )?
             }
             MaterializationStrategy::ContentAddressed { .. } => {
                 // content_addressed is a transformation strategy backed by
@@ -20124,7 +20426,7 @@ pub(crate) enum DrainDecision {
 /// failed one, because a success moves the denominator.
 #[allow(clippy::too_many_arguments)]
 async fn process_completed_result(
-    result: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
+    result: Result<(usize, u64, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
     tables_to_process: &[TableTask],
     throttle: &Option<AdaptiveThrottle>,
     semaphore: &Semaphore,
@@ -20142,7 +20444,7 @@ async fn process_completed_result(
     let mut failed = false;
 
     match result {
-        Ok((idx, Ok(TableOutcome::Pruned(pruned)))) => {
+        Ok((idx, _, Ok(TableOutcome::Pruned(pruned)))) => {
             if let Some(t) = &throttle {
                 t.on_success();
                 adjust_semaphore(t, semaphore, semaphore_capacity);
@@ -20156,7 +20458,7 @@ async fn process_completed_result(
             )
             .await;
         }
-        Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
+        Ok((_, _, Ok(TableOutcome::Materialized(tr)))) => {
             collect_materialized_table(
                 *tr,
                 sinks,
@@ -20174,11 +20476,16 @@ async fn process_completed_result(
             )
             .await;
         }
-        Ok((idx, Err(e))) => {
+        Ok((idx, copy_ms, Err(e))) => {
             // Classify before stringification so the typed connector
             // variant is preserved on `TableError.failure_kind` (plus
             // the optional warehouse-breaker cooldown hint).
             let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+            // The copy's own time and attempt, for its run record (#2470).
+            let copy = tables_to_process.get(idx).map(|task| CopyFailure {
+                table: task.target_table_name.clone(),
+                attempts: vec![CopyFailure::attempt(&[], &e, copy_ms)],
+            });
             let raw = format!("{e:#}");
             if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                 warn!(
@@ -20256,7 +20563,7 @@ async fn process_completed_result(
                         asset_key: vec![],
                         status: rocky_core::state::TableStatus::Failed,
                         error: Some(msg.clone()),
-                        duration_ms: 0,
+                        duration_ms: copy_ms,
                         completed_at: Utc::now(),
                         held_max: None,
                     },
@@ -20269,6 +20576,7 @@ async fn process_completed_result(
                 error: msg,
                 task_index: Some(idx),
                 model: None,
+                copy,
                 failure_kind,
                 cooldown_seconds,
             });
@@ -20300,6 +20608,7 @@ async fn process_completed_result(
                 error: msg,
                 task_index: None,
                 model: None,
+                copy: None,
                 failure_kind: FailureKind::Unknown,
                 cooldown_seconds: None,
             });
@@ -24233,9 +24542,10 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let hook_registry = HookRegistry::from_config(&Default::default());
 
         type CompletedResult =
-            Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>;
+            Result<(usize, u64, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>;
         let results: Vec<CompletedResult> = vec![
             Ok((
+                0,
                 0,
                 Ok(TableOutcome::Pruned(PrunedTable {
                     asset_key: vec!["test".into(), "orders".into()],
@@ -24246,6 +24556,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             )),
             Ok((
                 1,
+                0,
                 Err(anyhow::anyhow!(
                     "[TABLE_OR_VIEW_NOT_FOUND] the source table raw.items is gone"
                 )),
@@ -26706,6 +27017,7 @@ auto_create_schemas = true
             failed_attempts: Default::default(),
             fail_fast_model: None,
             error_models: Default::default(),
+            table_attempts: Default::default(),
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -29216,6 +29528,88 @@ merge_keys_fallback = ["fallback_only"]
             }
             other => panic!("expected Merge with Explicit columns, got {other:?}"),
         }
+    }
+
+    fn cols(names: &[&str]) -> Vec<ColumnInfo> {
+        names
+            .iter()
+            .map(|n| ColumnInfo {
+                name: (*n).to_string(),
+                data_type: "STRING".to_string(),
+                nullable: true,
+            })
+            .collect()
+    }
+
+    fn loaded_by() -> Vec<MetadataColumn> {
+        vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()]
+    }
+
+    /// #2468: drift appends `region` after `_loaded_by`, but the SELECT puts it
+    /// before. The INSERT must name its columns.
+    #[test]
+    fn replication_insert_columns_names_drift_added_column() {
+        let got = replication_insert_columns(
+            &cols(&["id", "region"]),
+            &loaded_by(),
+            &cols(&["id", "_loaded_by"]),
+            &["region".to_string()],
+        );
+        assert_eq!(
+            got,
+            Some(vec![
+                "id".to_string(),
+                "region".to_string(),
+                "_loaded_by".to_string()
+            ])
+        );
+    }
+
+    /// The order already matches: the INSERT stays positional. Snowflake
+    /// reports the target's names in upper case.
+    #[test]
+    fn replication_insert_columns_keeps_matching_order_positional() {
+        let got = replication_insert_columns(
+            &cols(&["ID", "NAME"]),
+            &loaded_by(),
+            &cols(&["ID", "NAME", "_LOADED_BY"]),
+            &[],
+        );
+        assert_eq!(got, None);
+    }
+
+    /// A source reorder without drift is caught too.
+    #[test]
+    fn replication_insert_columns_names_reordered_source() {
+        let got = replication_insert_columns(
+            &cols(&["name", "id"]),
+            &loaded_by(),
+            &cols(&["id", "name", "_loaded_by"]),
+            &[],
+        );
+        assert_eq!(
+            got,
+            Some(vec![
+                "name".to_string(),
+                "id".to_string(),
+                "_loaded_by".to_string()
+            ])
+        );
+    }
+
+    /// A different column set keeps the INSERT positional, so the warehouse
+    /// still refuses it as before. So does an empty source description.
+    #[test]
+    fn replication_insert_columns_leaves_mismatched_sets_alone() {
+        let target = cols(&["id", "legacy", "_loaded_by"]);
+        assert_eq!(
+            replication_insert_columns(&cols(&["id"]), &loaded_by(), &target, &[]),
+            None
+        );
+        assert_eq!(
+            replication_insert_columns(&[], &loaded_by(), &target, &[]),
+            None
+        );
     }
 
     #[test]
@@ -32869,7 +33263,7 @@ timestamp_column = "ts"
             )
             .unwrap();
         process_completed_result(
-            Ok((0, Ok(TableOutcome::Materialized(result)))),
+            Ok((0, 0, Ok(TableOutcome::Materialized(result)))),
             &tasks,
             &throttle,
             &semaphore,
@@ -34850,6 +35244,7 @@ backend = "local"
             error: format!("copy of {asset} failed"),
             task_index: None,
             model: None,
+            copy: None,
             failure_kind: crate::output::FailureKind::QueryRejected,
             cooldown_seconds: None,
         }
@@ -35874,6 +36269,114 @@ backend = "local"
             out.status,
             rocky_core::state::RunStatus::PartialFailure
         ));
+    }
+
+    /// #2470: a `table_retries` retry extends the attempts recorded for its
+    /// own task, numbered after them, whether it fails or succeeds.
+    #[test]
+    fn copy_retry_extends_its_own_tasks_attempts() {
+        let err = anyhow::anyhow!("the warehouse said no");
+        let mut first = copy_table_error("orders");
+        first.task_index = Some(3);
+        first.copy = Some(CopyFailure {
+            table: "orders".to_string(),
+            attempts: vec![CopyFailure::attempt(&[], &err, 30)],
+        });
+        let mut other = copy_table_error("items");
+        other.task_index = Some(4);
+        let errors = vec![other, first];
+
+        let mut failed = CopyFailure::prior_attempts(&errors, 3);
+        failed.push(CopyFailure::attempt(&failed, &err, 45));
+        let trail: Vec<(u32, &str, u64)> = failed
+            .iter()
+            .map(|a| (a.attempt, a.outcome.as_str(), a.duration_ms))
+            .collect();
+        assert_eq!(trail, vec![(1, "failed", 30), (2, "failed", 45)]);
+
+        let mut succeeded = CopyFailure::prior_attempts(&errors, 3);
+        succeeded.push(CopyFailure::success(&succeeded, 20));
+        assert_eq!(succeeded[1].attempt, 2);
+        assert_eq!(succeeded[1].outcome, "success");
+        assert!(succeeded[1].error.is_none());
+
+        assert!(
+            CopyFailure::prior_attempts(&errors, 4).is_empty(),
+            "an entry with no copy record adds nothing"
+        );
+        assert!(CopyFailure::prior_attempts(&errors, 9).is_empty());
+    }
+
+    /// #2470: a failed replication copy reaches the run record under its
+    /// table's name with its measured time. A retried table keeps the last
+    /// attempt's time in `duration_ms` and the whole trail in `attempts`.
+    #[test]
+    fn merge_copy_failure_keeps_table_name_and_time_in_run_record() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        let attempt = |prior: &[rocky_core::state::AttemptRecord], ms: u64| {
+            CopyFailure::attempt(prior, &anyhow::anyhow!("the warehouse said no"), ms)
+        };
+        let first = attempt(&[], 30);
+        let retried = vec![first.clone(), attempt(std::slice::from_ref(&first), 45)];
+        let mut once = copy_table_error("once");
+        once.copy = Some(CopyFailure {
+            table: "orders".to_string(),
+            attempts: vec![attempt(&[], 25)],
+        });
+        let mut twice = copy_table_error("twice");
+        twice.copy = Some(CopyFailure {
+            table: "items".to_string(),
+            attempts: retried,
+        });
+        // A model of the same name failed too: each keeps its own time.
+        out.failed_attempts.insert(
+            "orders".to_string(),
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms: 999,
+                attempts: Vec::new(),
+            },
+        );
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &[once, twice]);
+
+        assert_eq!(out.errors.len(), 2);
+        assert_eq!(
+            out.errors[0].asset_key,
+            vec!["once".to_string()],
+            "JSON unchanged"
+        );
+        let started = Utc::now();
+        let record = out.to_run_record(
+            "run-2470",
+            started,
+            started + chrono::Duration::seconds(1),
+            String::new(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        let find = |n: &str| {
+            record
+                .models_executed
+                .iter()
+                .find(|m| m.model_name == n)
+                .unwrap_or_else(|| panic!("no record for {n}: {:?}", record.models_executed))
+        };
+        let orders = find("orders");
+        assert_eq!(orders.status, "failed");
+        assert_eq!(orders.duration_ms, 25);
+        assert!(
+            orders.attempts.is_empty(),
+            "a first-try failure has no trail"
+        );
+        let items = find("items");
+        assert_eq!(items.duration_ms, 45);
+        let trail: Vec<(u32, u64)> = items
+            .attempts
+            .iter()
+            .map(|a| (a.attempt, a.duration_ms))
+            .collect();
+        assert_eq!(trail, vec![(1, 30), (2, 45)]);
     }
 
     /// On the replication path with `[resilience] contain_failures = true`,
@@ -38414,6 +38917,564 @@ backend = "local"
             assert_eq!(record.models_executed[0].status, "failed");
             assert_eq!(record.models_executed[0].duration_ms, 1234);
             assert_eq!(record.models_executed[0].model_name, "bad");
+        }
+    }
+
+    /// A `time_interval` model over `raw__orders.orders`: the 2026-04-04
+    /// window is healthy, the 2026-04-05 window scans ~3M rows and then fails
+    /// on the un-castable `'BAD'` amount, so the failed partition takes real
+    /// time (#2470).
+    #[cfg(feature = "duckdb")]
+    async fn seed_slow_failing_time_interval(
+        models_dir: &std::path::Path,
+        db: &std::path::Path,
+        target_schema: &str,
+    ) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let seed = DuckDbWarehouseAdapter::open(db).expect("seed open");
+        for ddl in [
+            "CREATE SCHEMA IF NOT EXISTS raw__orders",
+            "CREATE TABLE raw__orders.orders \
+             (order_at TIMESTAMP, customer_id INTEGER, amount VARCHAR)",
+            "INSERT INTO raw__orders.orders VALUES \
+             (TIMESTAMP '2026-04-04 09:00:00', 1, '10'), \
+             (TIMESTAMP '2026-04-05 09:00:00', 1, 'BAD')",
+        ] {
+            seed.execute_statement(ddl).await.unwrap();
+        }
+        drop(seed);
+        std::fs::write(
+            models_dir.join("events.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date, customer_id, \
+             MAX(CAST(CASE WHEN r = 2999999 THEN amount ELSE '1' END AS INTEGER)) AS amt \
+             FROM raw__orders.orders, range(3000000) t(r) \
+             WHERE order_at >= @start_date AND order_at < @end_date \
+             GROUP BY 1, 2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("events.toml"),
+            format!(
+                "depends_on = []\n\n\
+                 [[sources]]\ncatalog = \"\"\nschema = \"raw__orders\"\ntable = \"orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nfirst_partition = \"2026-04-04\"\nlookback = 0\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"{target_schema}\"\ntable = \"events\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Drive `execute_models` serially over both partition windows.
+    #[cfg(feature = "duckdb")]
+    async fn run_time_interval_models(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        contain_failures: bool,
+        auto_create_schemas: bool,
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
+        let opts = PartitionRunOptions {
+            from: Some("2026-04-04".into()),
+            to: Some("2026-04-05".into()),
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let resilience = rocky_core::config::ResilienceConfig {
+            contain_failures,
+            ..Default::default()
+        };
+        let result = super::execute_models(
+            models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            auto_create_schemas,
+            None,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            resilience,
+            false,
+            true,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await;
+        (output, result)
+    }
+
+    /// What an entry point does with a fail-fast `Err`, then the run record.
+    #[cfg(feature = "duckdb")]
+    fn record_after(out: &mut RunOutput, failed: bool) -> rocky_core::state::RunRecord {
+        if failed {
+            out.tables_failed += 1;
+            out.push_fail_fast_error(crate::output::TableErrorOutput {
+                asset_key: vec!["<runtime>".to_string()],
+                error: "boom".to_string(),
+                failure_kind: crate::output::FailureKind::Unknown,
+                cooldown_seconds: None,
+            });
+        }
+        let started = chrono::Utc::now();
+        out.to_run_record(
+            "run-2470",
+            started,
+            started,
+            String::new(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        )
+    }
+
+    /// #2470: the failed partition's own time reaches the output, not the
+    /// healthy partition's (which its own materialization records). Calls
+    /// the partition executor directly so the caller's fallback cannot
+    /// stand in for it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn time_interval_failed_partition_leaves_its_own_time() {
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("ti.duckdb");
+        seed_slow_failing_time_interval(&models_dir, &db, "main").await;
+        let model = rocky_core::models::load_model_pair(
+            &models_dir.join("events.sql"),
+            &models_dir.join("events.toml"),
+            None,
+        )
+        .expect("load time_interval model");
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).expect("open");
+        let state = StateStore::open(&tmp.path().join("state.redb")).unwrap();
+        let opts = PartitionRunOptions {
+            from: Some("2026-04-04".into()),
+            to: Some("2026-04-05".into()),
+            ..Default::default()
+        };
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let result = super::execute_time_interval_model(
+            &model,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            &DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+            Some(&state),
+            &opts,
+            "test-run",
+            &mut output,
+            &exec_ctx,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_err(), "the 04-05 partition fails");
+        assert_eq!(output.materializations.len(), 1, "04-04 materializes");
+        let failed = output
+            .failed_attempts
+            .get("events")
+            .expect("the failed partition's time is kept");
+        assert!(failed.duration_ms > 0, "{failed:?}");
+        assert!(failed.attempts.is_empty(), "partitions are not retries");
+    }
+
+    /// #2470: a `time_interval` model's failure is recorded under its own
+    /// name with its time, fail-fast and contained, and a failure before any
+    /// partition ran (the bootstrap into a missing schema) keeps the model's
+    /// time too.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn time_interval_failure_is_recorded_under_its_name_with_its_time() {
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            let db = tmp.path().join("ti.duckdb");
+            seed_slow_failing_time_interval(&models_dir, &db, "marts").await;
+            let (mut out, result) =
+                run_time_interval_models(&models_dir, &db, contain_failures, true).await;
+            assert_eq!(result.is_err(), !contain_failures, "{result:?}");
+            let record = record_after(&mut out, !contain_failures);
+            let failed: Vec<_> = record
+                .models_executed
+                .iter()
+                .filter(|m| m.status == "failed")
+                .collect();
+            assert_eq!(failed.len(), 1, "contain={contain_failures}: {failed:?}");
+            assert_eq!(failed[0].model_name, "events", "contain={contain_failures}");
+            assert!(failed[0].duration_ms > 0, "contain={contain_failures}");
+            assert!(failed[0].attempts.is_empty());
+            assert!(
+                record
+                    .models_executed
+                    .iter()
+                    .any(|m| m.model_name == "events" && m.status == "success"),
+                "the healthy partition keeps its own record"
+            );
+        }
+
+        // A bootstrap failure: no partition ran, so the caller keeps the
+        // model's own elapsed time.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("ti.duckdb");
+        seed_slow_failing_time_interval(&models_dir, &db, "no_such_schema").await;
+        let (mut out, result) = run_time_interval_models(&models_dir, &db, false, false).await;
+        assert!(result.is_err(), "the bootstrap fails");
+        assert!(out.partition_summaries.is_empty(), "no partition ran");
+        assert!(out.failed_attempts.contains_key("events"));
+        let record = record_after(&mut out, true);
+        assert_eq!(record.models_executed.len(), 1);
+        assert_eq!(record.models_executed[0].model_name, "events");
+    }
+
+    /// #2470: a failed content-addressed model is stored under its own name
+    /// with its time, fail-fast and contained, through the real `run()`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn content_addressed_failure_is_stored_with_its_time() {
+        use object_store::memory::InMemory;
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path();
+            let models = dir.join("models");
+            std::fs::create_dir_all(&models).unwrap();
+            std::fs::write(
+                models.join("m.sql"),
+                "SELECT CAST(s AS INTEGER) AS content_addressed_failure_probe FROM \
+                 (SELECT CASE WHEN range = 4999999 THEN 'x' ELSE '1' END AS s \
+                 FROM range(5000000))\n",
+            )
+            .unwrap();
+            let prefix = format!("ca_2470_{}", uuid::Uuid::new_v4().simple());
+            let storage_prefix = format!("s3://test-bucket/{prefix}");
+            std::fs::write(
+                models.join("m.toml"),
+                format!(
+                    "[strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"{storage_prefix}\"\n\n\
+                     [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"m\"\n"
+                ),
+            )
+            .unwrap();
+            let store = std::sync::Arc::new(InMemory::new());
+            seed_content_addressed_test_table(&store, &prefix).await;
+            super::super::run_content_addressed::register_test_object_store(
+                &storage_prefix,
+                store.clone(),
+            );
+            let config_path = dir.join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+                     [state]\nbackend = \"local\"\n\n\
+                     [resilience]\ncontain_failures = {contain_failures}\n\n\
+                     [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
+                     [pipeline.tx.target]\nadapter = \"default\"\n",
+                    dir.join("w.duckdb").display(),
+                    models.join("**").display(),
+                ),
+            )
+            .unwrap();
+            let state_path = dir.join("state.redb");
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            let result = super::run(
+                &config_path,
+                loaded,
+                None,
+                None,
+                &state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+                &rocky_core::config::PrincipalRef::unnamed(),
+            )
+            .await;
+            assert!(result.is_err(), "contain={contain_failures}");
+            let store = StateStore::open_read_only(&state_path).expect("state store");
+            let runs = store.list_runs(1).expect("list runs");
+            let record = runs.first().expect("the failed run is stored");
+            assert_eq!(
+                record.models_executed.len(),
+                1,
+                "contain={contain_failures}: {:?}",
+                record.models_executed
+            );
+            let m = &record.models_executed[0];
+            assert_eq!(m.status, "failed");
+            assert_eq!(m.model_name, "m", "contain={contain_failures}");
+            assert!(m.duration_ms > 0, "contain={contain_failures}: {m:?}");
+            assert!(m.attempts.is_empty());
+        }
+    }
+
+    /// #2470: a content-addressed model whose typed IR fails is stored under
+    /// its own name with its time, fail-fast and contained. The dialect
+    /// renders an unusable surrogate-key expression after a short delay, so
+    /// the step fails with measurable time. Run with the column-level skip
+    /// on (the `rocky run` default, where it is the first site to build the
+    /// typed IR) and off (where the content-addressed arm is the first).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn content_addressed_typed_ir_failure_is_recorded_under_its_name() {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use rocky_core::traits::{
+            AdapterResult, LiteralEscape, NullTimestamps, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::{ColumnSelection, MetadataColumn};
+
+        /// DuckDB, except that a surrogate key renders a statement
+        /// terminator, which `MetadataColumn::new` rejects.
+        struct BadKeyDialect;
+        impl SqlDialect for BadKeyDialect {
+            fn name(&self) -> &'static str {
+                DuckDbSqlDialect.name()
+            }
+            fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+                DuckDbSqlDialect.star_excluding(columns)
+            }
+            fn literal_escape(&self) -> LiteralEscape {
+                DuckDbSqlDialect.literal_escape()
+            }
+            fn format_table_ref(
+                &self,
+                catalog: &str,
+                schema: &str,
+                table: &str,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.format_table_ref(catalog, schema, table)
+            }
+            fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+                DuckDbSqlDialect.create_table_as(target, select_sql)
+            }
+            fn insert_into(&self, target: &str, select_sql: &str) -> String {
+                DuckDbSqlDialect.insert_into(target, select_sql)
+            }
+            fn merge_into(
+                &self,
+                target: &str,
+                source_sql: &str,
+                keys: &[Arc<str>],
+                update_cols: &ColumnSelection,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.merge_into(target, source_sql, keys, update_cols)
+            }
+            fn select_clause(
+                &self,
+                columns: &ColumnSelection,
+                metadata: &[MetadataColumn],
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.select_clause(columns, metadata)
+            }
+            fn watermark_where(
+                &self,
+                timestamp_col: &str,
+                last_watermark: Option<&DateTime<Utc>>,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.watermark_where(timestamp_col, last_watermark)
+            }
+            fn watermark_hold_back(
+                &self,
+                timestamp_col: &str,
+                held_max: &DateTime<Utc>,
+                nulls: NullTimestamps,
+            ) -> AdapterResult<String> {
+                DuckDbSqlDialect.watermark_hold_back(timestamp_col, held_max, nulls)
+            }
+            fn describe_table_sql(&self, table_ref: &str) -> String {
+                DuckDbSqlDialect.describe_table_sql(table_ref)
+            }
+            fn drop_table_sql(&self, table_ref: &str) -> String {
+                DuckDbSqlDialect.drop_table_sql(table_ref)
+            }
+            fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+                DuckDbSqlDialect.create_catalog_sql(name)
+            }
+            fn create_schema_sql(
+                &self,
+                catalog: &str,
+                schema: &str,
+            ) -> Option<AdapterResult<String>> {
+                DuckDbSqlDialect.create_schema_sql(catalog, schema)
+            }
+            fn tablesample_clause(&self, percent: u32) -> Option<String> {
+                DuckDbSqlDialect.tablesample_clause(percent)
+            }
+            fn insert_overwrite_partition(
+                &self,
+                target: &str,
+                partition_filter: &str,
+                select_sql: &str,
+            ) -> AdapterResult<Vec<String>> {
+                DuckDbSqlDialect.insert_overwrite_partition(target, partition_filter, select_sql)
+            }
+            fn list_tables_sql(&self, catalog: &str, schema: &str) -> AdapterResult<String> {
+                DuckDbSqlDialect.list_tables_sql(catalog, schema)
+            }
+            fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
+                DuckDbSqlDialect.regex_match_predicate(column, pattern)
+            }
+            fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
+                DuckDbSqlDialect.row_hash_expr(columns)
+            }
+            fn surrogate_key_expr(&self, _columns: &[&str]) -> String {
+                // Measurable time inside the failing step.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                "1; SELECT 2".to_string()
+            }
+        }
+
+        struct BadKeyDuckDb {
+            inner: DuckDbWarehouseAdapter,
+        }
+        #[async_trait]
+        impl WarehouseAdapter for BadKeyDuckDb {
+            fn dialect(&self) -> &dyn SqlDialect {
+                &BadKeyDialect
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        for (column_level, contain_failures) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let ctx = format!("column_level={column_level} contain={contain_failures}");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models = tmp.path().join("models");
+            std::fs::create_dir_all(&models).unwrap();
+            std::fs::write(models.join("m.sql"), "SELECT 1 AS a\n").unwrap();
+            std::fs::write(
+                models.join("m.toml"),
+                "[strategy]\ntype = \"content_addressed\"\n\
+                 storage_prefix = \"s3://test-bucket/ca_2470_typed_ir\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"m\"\n\n\
+                 [[surrogate_key]]\nname = \"sk\"\ncolumns = [\"a\"]\n",
+            )
+            .unwrap();
+            let adapter = BadKeyDuckDb {
+                inner: DuckDbWarehouseAdapter::open(&tmp.path().join("w.duckdb")).unwrap(),
+            };
+            let mut out = RunOutput::new(String::new(), 0, 1);
+            let resilience = rocky_core::config::ResilienceConfig {
+                contain_failures,
+                ..Default::default()
+            };
+            let result = super::execute_models(
+                &models,
+                None,
+                &adapter as &dyn WarehouseAdapter,
+                None,
+                &PartitionRunOptions::default(),
+                "test-run",
+                None,
+                None,
+                &mut out,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                super::SkipGateConfig::off(),
+                false,
+                column_level,
+                &rocky_core::run_vars::RunVars::new(),
+                resilience,
+                false,
+                true,
+                None,
+                None,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(result.is_err(), !contain_failures, "{ctx}: {result:?}");
+            if let Err(e) = &result {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.starts_with("model 'm' failed: "),
+                    "{ctx}: the error names the model: {msg}"
+                );
+                assert!(
+                    msg.contains("unusable SQL expression"),
+                    "{ctx}: the typed-IR step is what failed: {msg}"
+                );
+            }
+            let record = record_after(&mut out, !contain_failures);
+            assert_eq!(
+                record.models_executed.len(),
+                1,
+                "{ctx}: {:?}",
+                record.models_executed
+            );
+            let m = &record.models_executed[0];
+            assert_eq!(m.status, "failed", "{ctx}");
+            assert_eq!(m.model_name, "m", "{ctx}");
+            assert!(m.duration_ms > 0, "{ctx}: {m:?}");
+            assert!(m.attempts.is_empty(), "{ctx}");
         }
     }
 
@@ -50785,7 +51846,10 @@ timestamp_column = "ts"
     #[tokio::test]
     async fn the_inline_drain_returns_the_abort_decision_for_both_settings() {
         async fn decide(
-            outcome: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
+            outcome: Result<
+                (usize, u64, Result<TableOutcome, anyhow::Error>),
+                tokio::task::JoinError,
+            >,
             policy: &AbortPolicy,
             prior_errors: usize,
             prior_completed: usize,
@@ -50820,6 +51884,7 @@ timestamp_column = "ts"
                     error: "earlier failure".to_string(),
                     task_index: None,
                     model: None,
+                    copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
                 })
@@ -50867,7 +51932,7 @@ timestamp_column = "ts"
             fail_fast: false,
             error_rate_abort_pct: 50,
         };
-        let failure = || Ok((0usize, Err(anyhow::anyhow!("the warehouse said no"))));
+        let failure = || Ok((0usize, 0, Err(anyhow::anyhow!("the warehouse said no"))));
 
         assert_eq!(
             decide(failure(), &fail_fast, 0, 0).await,
@@ -50879,6 +51944,7 @@ timestamp_column = "ts"
         assert_eq!(
             decide(
                 Ok((
+                    0,
                     0,
                     Ok(TableOutcome::Pruned(PrunedTable {
                         asset_key: vec!["t".into()],
@@ -50992,7 +52058,7 @@ timestamp_column = "ts"
         let mut total_completed = 0;
 
         process_completed_result(
-            Ok((0, Err(err))),
+            Ok((0, 42, Err(err))),
             &tasks,
             &throttle,
             &semaphore,
@@ -51036,6 +52102,13 @@ timestamp_column = "ts"
             reported, &expected_framed,
             "and it must be the SAME framing, not a second dialect of it"
         );
+        // #2470: the copy keeps its table name and its measured time.
+        let copy = table_errors[0].copy.as_ref().expect("a copy failure");
+        assert_eq!(copy.table, task.target_table_name);
+        assert_eq!(copy.attempts.len(), 1);
+        assert_eq!(copy.attempts[0].attempt, 1);
+        assert_eq!(copy.attempts[0].duration_ms, 42);
+        assert_eq!(copy.attempts[0].outcome, "failed");
 
         assert!(
             marker.exists(),
@@ -51121,7 +52194,7 @@ timestamp_column = "ts"
         let dropped = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             process_completed_result(
-                Ok((0, Ok(TableOutcome::Materialized(result)))),
+                Ok((0, 0, Ok(TableOutcome::Materialized(result)))),
                 &tasks,
                 &throttle,
                 &semaphore,
@@ -51210,7 +52283,7 @@ timestamp_column = "ts"
         let mut collected = CollectedRun::new();
 
         process_completed_result(
-            Ok((0, Ok(TableOutcome::Materialized(Box::new(tr))))),
+            Ok((0, 0, Ok(TableOutcome::Materialized(Box::new(tr))))),
             &tasks,
             &None,
             &semaphore,

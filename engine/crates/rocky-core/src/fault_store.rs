@@ -89,6 +89,10 @@ struct FaultState {
     /// applied to the inner store and THEN reported as a failure: a write
     /// whose response was lost after it landed.
     land_then_fail_nth_put: Option<u64>,
+    /// The `n`-th put is applied to the inner store and THEN reported as the
+    /// conditional-write failure its retry would see: a write whose reply was
+    /// lost, re-sent by the store client, and refused because it had landed.
+    land_then_conflict_nth_put: Option<u64>,
 }
 
 fn lock(state: &Mutex<FaultState>) -> std::sync::MutexGuard<'_, FaultState> {
@@ -177,6 +181,15 @@ impl FaultHandle {
     /// does.
     pub fn land_then_fail_nth_put(&self, n: u64) {
         lock(&self.0).land_then_fail_nth_put = Some(n);
+    }
+
+    /// Make the `n`-th put (1-based, counted from the store's creation) land
+    /// and then report a conditional-write conflict (`AlreadyExists` for a
+    /// create, `Precondition` for an update). This is what a caller sees when
+    /// the reply is lost and the store client's retry finds the object
+    /// already written.
+    pub fn land_then_conflict_nth_put(&self, n: u64) {
+        lock(&self.0).land_then_conflict_nth_put = Some(n);
     }
 
     /// `put_opts` calls observed on paths that do NOT start with `prefix`,
@@ -275,9 +288,10 @@ impl ObjectStore for FaultingStore {
         self.check(FaultOp::Put)?;
         let call_number = self.count_of(FaultOp::Put);
         self.record_put(location, &opts.mode)?;
-        let (opts, land_then_fail) = {
+        let (opts, land_then_fail, land_then_conflict) = {
             let guard = lock(&self.state);
             let land_then_fail = guard.land_then_fail_nth_put == Some(call_number);
+            let land_then_conflict = guard.land_then_conflict_nth_put == Some(call_number);
             let opts = if guard.ignore_conditional_writes {
                 PutOptions {
                     mode: PutMode::Overwrite,
@@ -286,9 +300,19 @@ impl ObjectStore for FaultingStore {
             } else {
                 opts
             };
-            (opts, land_then_fail)
+            (opts, land_then_fail, land_then_conflict)
         };
+        let create = matches!(opts.mode, PutMode::Create);
         let result = self.inner.put_opts(location, payload, opts).await?;
+        if land_then_conflict {
+            let path = location.to_string();
+            let source = format!("injected lost reply: Put call #{call_number} landed").into();
+            return Err(if create {
+                object_store::Error::AlreadyExists { path, source }
+            } else {
+                object_store::Error::Precondition { path, source }
+            });
+        }
         if land_then_fail {
             return Err(object_store::Error::Generic {
                 store: "FaultingStore",

@@ -386,6 +386,13 @@ pub struct RunOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) error_models: std::collections::BTreeMap<usize, String>,
+    /// `errors` index -> the measured copy attempts of a failed replication
+    /// table (#2470). Keyed by entry, so a model that shares the table's name
+    /// keeps its own measurement.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) table_attempts:
+        std::collections::BTreeMap<usize, crate::commands::resilience::FailedModelAttempts>,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
     /// transformation runs so orchestrators can explain *why* each model
@@ -6449,6 +6456,7 @@ impl RunOutput {
             failed_attempts: Default::default(),
             fail_fast_model: None,
             error_models: Default::default(),
+            table_attempts: Default::default(),
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
@@ -6811,10 +6819,12 @@ impl RunOutput {
             }
             // The retry loop's measurement for this model, when it ran
             // through one: real compute time and every attempt (#2470).
-            let failed = self
-                .error_models
-                .get(&idx)
-                .and_then(|m| self.failed_attempts.get(m));
+            // A failed replication copy carries its own measurement.
+            let failed = self.table_attempts.get(&idx).or_else(|| {
+                self.error_models
+                    .get(&idx)
+                    .and_then(|m| self.failed_attempts.get(m))
+            });
             models.push(rocky_core::state::ModelExecution {
                 row_count: None,
                 model_name,
@@ -6842,8 +6852,9 @@ impl RunOutput {
                 // A failed execution recorded no output columns.
                 output_column_hashes: None,
                 // The attempt trail the retry layer measured for this model,
-                // terminal failed attempt last. Empty for an error that did
-                // not come through the retry loop (replication, run-level).
+                // or a replication table's copy attempts, terminal failed
+                // attempt last. Empty for a first-try failure and for a
+                // run-level error.
                 attempts: failed.map(|f| f.attempts.clone()).unwrap_or_default(),
                 // A failed execution recorded no output version ("not
                 // recorded"); it may have written nothing at all.
@@ -6919,6 +6930,33 @@ impl RunOutput {
         self.error_models
             .insert(self.errors.len(), model.to_string());
         self.errors.push(err);
+    }
+
+    /// Record the error entry of a failed replication copy, so its run record
+    /// carries the table's name and measured copy time (#2470).
+    pub(crate) fn push_table_error(
+        &mut self,
+        err: TableErrorOutput,
+        table: &str,
+        measured: crate::commands::resilience::FailedModelAttempts,
+    ) {
+        let idx = self.errors.len();
+        self.error_models.insert(idx, table.to_string());
+        self.table_attempts.insert(idx, measured);
+        self.errors.push(err);
+    }
+
+    /// Keep the measured time of a failed model that the retry loop did not
+    /// run (content-addressed, `time_interval`), so its run record keeps its
+    /// compute (#2470). There was no retry, so the trail is empty and
+    /// `duration_ms` is the total. An entry already left for the model wins.
+    pub(crate) fn record_unretried_failure(&mut self, model: &str, duration_ms: u64) {
+        self.failed_attempts.entry(model.to_string()).or_insert(
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms,
+                attempts: Vec::new(),
+            },
+        );
     }
 
     /// Record the one error entry of a run that stopped at its first failure.
