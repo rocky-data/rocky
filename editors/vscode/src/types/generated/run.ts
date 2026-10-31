@@ -242,6 +242,10 @@ export interface RunOutput {
    */
   source_syncs?: SourceSyncOutput[];
   /**
+   * The source row counts this production run took when it started, one entry per `[[product.source.volume]]` range whose product output is in the run's selection. A run-level fact: a count is kept even when the output model is later skipped or refused. Empty (and omitted) when the run judged no source range.
+   */
+  source_volumes?: SourceVolumeCheckOutput[];
+  /**
    * Terminal status of the run. `success` / `partial_failure` / `failure` match the lifecycle semantics callers already understand; the two `skipped_*` variants short-circuit via the idempotency key (see `idempotency_key` below). Always populated — non-skipped runs derive this field from `tables_failed` / materialization counts, so JSON consumers no longer need to re-derive status from counts themselves.
    */
   status: RunStatus;
@@ -954,5 +958,49 @@ export interface SourceSyncOutput {
    * Whole seconds from the start of the wait to this outcome.
    */
   waited_secs: number;
+  [k: string]: unknown;
+}
+/**
+ * One source row count `rocky run` took when a production run started, judged against a product's `[[product.source.volume]]` range.
+ *
+ * The count is the source table's total rows before the run writes anything (`SELECT COUNT(*)`), not the rows the build reads.
+ */
+export interface SourceVolumeCheckOutput {
+  /**
+   * The declared `max_rows` (inclusive), when set.
+   */
+  max_rows?: number | null;
+  /**
+   * The declared `min_rows` (inclusive), when set.
+   */
+  min_rows?: number | null;
+  /**
+   * The product's output model: the model an `error` breach refuses.
+   */
+  model: string;
+  /**
+   * The product that declares the range.
+   */
+  product: string;
+  /**
+   * Why the verdict is `not_evaluated`, or what the breach did to the output model.
+   */
+  reason?: string | null;
+  /**
+   * The table's total rows at run start. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
+   */
+  row_count?: number | null;
+  /**
+   * The declared severity: `warning` (the default) or `error`.
+   */
+  severity: VolumeSeverity;
+  /**
+   * The source table, as the spec lists it.
+   */
+  table: string;
+  /**
+   * `in_range`, `below_min`, `above_max`, or `not_evaluated`. At `error`, an out-of-range count and a count that could not be taken both refuse the output model; a cancelled run refuses nothing.
+   */
+  verdict: VolumeVerdict;
   [k: string]: unknown;
 }

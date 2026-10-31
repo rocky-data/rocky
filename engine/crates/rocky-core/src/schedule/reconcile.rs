@@ -1932,6 +1932,7 @@ cron = "also invalid"
             rocky_branch: None,
             run_scope: Some(crate::state::RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         }
     }
 

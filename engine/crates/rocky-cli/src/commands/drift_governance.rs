@@ -1023,6 +1023,7 @@ mod tests {
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         }
     }
 

@@ -555,6 +555,10 @@ class RunResult(BaseModel):
     #: ``[product.output.volume]`` range at ``warning`` severity. Empty when
     #: none.
     volume_warnings: list[str] = Field(default_factory=list)
+    #: The source row counts a production run took when it started, one
+    #: entry per ``[[product.source.volume]]`` range whose product output is
+    #: in the run's selection. Empty when the run judged no source range.
+    source_volumes: list[SourceVolumeCheckOutput] = Field(default_factory=list)
     #: Soft warnings from the per-table override resolver — one entry per
     #: ``[[table_overrides]]`` rule that matched nothing. Empty when no
     #: overrides are declared.
@@ -1615,6 +1619,7 @@ from .types_generated.run_schema import (  # noqa: E402, F401
     OverrideWarningOutput,
     QuarantineOutput,
     RunCostSummary,
+    SourceVolumeCheckOutput,
     UpstreamReads,
     VolumeCheckOutput,
 )

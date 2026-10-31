@@ -78,22 +78,6 @@ class FreshnessSpec(BaseModel):
     """
 
 
-class SourceSpec(BaseModel):
-    """
-    Grounding sources: exact `catalog.schema.table` triples only.
-
-    v0 has no globs and no `include` selectors, because no engine counterpart exists. An `include` key is refused as an unknown key; a glob smuggled inside `tables` is refused here.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    tables: list[str]
-    """
-    One or more exact table references.
-    """
-
-
 class TrustSpec(BaseModel):
     """
     The trust dial. `propose_only` is the only v0 value.
@@ -108,7 +92,7 @@ class TrustSpec(BaseModel):
     """
 
 
-class VolumeSeverity(StrEnum):
+class VolumeSeverity3(StrEnum):
     """
     The model is marked failed after its build, and the run is partial.
     """
@@ -116,7 +100,7 @@ class VolumeSeverity(StrEnum):
     error = "error"
 
 
-class VolumeSeverity5(StrEnum):
+class VolumeSeverity4(StrEnum):
     """
     The run reports a warning, and delivery is recorded as usual.
     """
@@ -142,7 +126,7 @@ class VolumeSpec(BaseModel):
     """
     Fewest rows allowed (inclusive).
     """
-    severity: VolumeSeverity | VolumeSeverity5 | None = None
+    severity: VolumeSeverity3 | VolumeSeverity4 | None = None
     """
     `warning` (the default when omitted) or `error`.
     """
@@ -185,6 +169,54 @@ class OutputSpec(BaseModel):
     volume: VolumeSpec | None = None
     """
     Optional row-count range the output must hold after a load.
+    """
+
+
+class SourceVolumeSpec(BaseModel):
+    """
+    One `[[product.source.volume]]` entry: a row-count range on one source table.
+
+    The range is the table's total rows when a production run starts, before the run writes anything. It is not the number of rows the build reads. At least one bound is present. `min_rows = 0` alone counts as one.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    max_rows: conint(ge=0) | None = None
+    """
+    Most rows allowed (inclusive).
+    """
+    min_rows: conint(ge=0) | None = None
+    """
+    Fewest rows allowed (inclusive).
+    """
+    severity: VolumeSeverity3 | VolumeSeverity4 | None = None
+    """
+    `warning` (the default when omitted) or `error`.
+    """
+    table: str
+    """
+    The source table, exactly as `source.tables` lists it.
+    """
+
+
+class SourceSpec(BaseModel):
+    """
+    Grounding sources: exact `catalog.schema.table` triples only.
+
+    v0 has no globs and no `include` selectors, because no engine counterpart exists. An `include` key is refused as an unknown key; a glob smuggled inside `tables` is refused here.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    tables: list[str]
+    """
+    One or more exact table references.
+    """
+    volume: list[SourceVolumeSpec] | None = None
+    """
+    Row-count ranges on source tables, counted when a production run starts (`[[product.source.volume]]`). Each names one of `tables`.
     """
 
 

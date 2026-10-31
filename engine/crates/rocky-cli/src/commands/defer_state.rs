@@ -346,6 +346,7 @@ pub(crate) mod tests {
             rocky_branch: None,
             run_scope: scope,
             queued_ms: None,
+            source_volumes: Vec::new(),
         }
     }
 

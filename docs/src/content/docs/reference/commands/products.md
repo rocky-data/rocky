@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed. Two fields are also read from the spec itself by `rocky run`. The delivery deadline (below) lowers to nothing. The volume range (below) lowers to a test and is also checked after each production build.
+A product spec is one TOML file at `products/<name>.toml`. It declares WHAT a data product must be: its grain, columns, checks, freshness, and classifications. The spec adds no new runtime machinery. Every field lowers onto something the engine already enforces — a contract, declarative tests, sidecar metadata, or the policy posture. A field that cannot lower is refused at parse time, never shimmed. Two fields are also read from the spec itself by `rocky run`. The delivery deadline (below) lowers to nothing. The volume range (below) lowers to a test and is also checked after each production build. The source volume ranges (below) lower to nothing and are checked when a production run starts.
 
 The verbs on this page are the deterministic half of spec fulfillment. They parse, verify, lower, and approve. The agent loop that drafts SQL is [`rocky fulfill`](/reference/commands/fulfill/), and it is gated by the same policy plane as every other agent action.
 
@@ -66,6 +66,53 @@ build ok ──▶ COUNT(*) ──▶ in range ───────────
 At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A non-full-refresh output reaching `rocky run` is `not_evaluated` with `volume-strategy-unsupported` in its reason. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
 
 The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records `row_count` in its history, and `rocky product status` reports it. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
+
+### Source volume ranges
+
+A product can say how many rows a source table should hold before the run builds the output. Add one `[[product.source.volume]]` table per source table to `[product.source]`:
+
+```toml
+[product.source]
+tables = ["raw.sales.orders", "raw.sales.customers"]
+
+[[product.source.volume]]
+table = "raw.sales.orders"   # one of source.tables
+min_rows = 1_000             # optional, inclusive
+max_rows = 50_000_000        # optional, inclusive; at least one bound is required
+severity = "warning"         # "warning" (the default) or "error"
+```
+
+The count is the source table's total rows when the run starts, before the run writes anything. It is not the number of rows the build reads.
+
+The parser uses the same codes as the output range, with the path `product.source.volume[i]`: `volume-missing-bound`, `volume-min-above-max`, `volume-severity-unknown`, `unknown-key` and `invalid-value`. It also refuses a `table` that `source.tables` does not list (`volume-source-unknown`), and a second range on one table (`volume-source-duplicate`). Any output strategy can carry source ranges.
+
+Every part of every `source.tables` entry must be a plain SQL identifier: letters, digits and `_` only. The parser refuses any other part with `source-table-invalid`. This applies to every spec, with or without a source range.
+
+A production `rocky run` counts the sources once, at run start:
+
+```
+run start ──▶ for each range whose product output is in the selection:
+                 SELECT COUNT(*) FROM <table>   (one per distinct table)
+                    ├─▶ in range ─────────────────────▶ in_range (recorded)
+                    ├─▶ out of range or count failed:
+                    │      warning ──▶ a `volume_warnings` line; the output builds
+                    │      error ────▶ the output model is refused, not built
+                    └─▶ run cancelled before the count ──▶ not_evaluated, nothing refused
+```
+
+Rocky counts before the model phase writes anything and before the skip gate runs. The details:
+
+- A table that two ranges name, in one product or in two, is counted once.
+- Rocky counts the tables one after another, on the run's warehouse connection.
+- On a view, an external table or a federated table, the count scans the whole table. Only a cancelled run stops a count that has started.
+- Shadow, branch and backfill runs count nothing.
+- A replication pipeline that also builds models copies its tables first. The count then sees the copied rows.
+
+At `error` severity, an out-of-range count refuses the output model. A count that Rocky could not take refuses it too: a missing table, a refused name, a query error, or a result Rocky cannot read. A source Rocky cannot read therefore stops the output build before any write. The output table keeps its rows. The model records one failed execution, with the count's time as its duration. The `on_model_error` hook fires; `on_before_model_run` and `on_after_model_run` do not. Downstream models are withheld as for any failed model. The run status is `partial_failure`, and the model gets no `due_at`.
+
+Only the output model is protected. The upstream models in the chain still build in that run, because they are not the delivered output.
+
+The result is `source_volumes` on the run output: one row per range, with `product`, `model` (the output model), `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records the same rows in its history. A row stays even when the skip gate later skips the output model.
 
 ---
 
@@ -187,6 +234,14 @@ When the spec declares `[product.output.volume]`, status also reports `volume`:
 | `min_rows`, `max_rows`, `severity` | The declared range and severity. |
 | `row_count`, `counted_at`, `run_id` | The newest production build that recorded a count, whatever its status. A build an `error` breach marked failed still shows its count. Absent until a build is counted. |
 | `verdict` | That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when there is no count. |
+
+When the spec declares `[[product.source.volume]]`, status also reports `source_volumes`, one row per declared range:
+
+| Field | Meaning |
+|---|---|
+| `table`, `min_rows`, `max_rows`, `severity` | The declared source table, range and severity. |
+| `row_count`, `counted_at`, `run_id` | The count from the newest production run that counted this product's sources, and when that run started. Absent when that run took no count of this table. |
+| `verdict` | That count judged against the range the spec declares now, or `not_evaluated` when there is no count. |
 
 ### JSON output
 

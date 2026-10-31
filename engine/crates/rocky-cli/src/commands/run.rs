@@ -13264,6 +13264,15 @@ async fn execute_models_phase(
             .map(|project| project.root.as_path()),
         shadow_config.is_none(),
     );
+    // The `[[product.source.volume]]` ranges this run counts at its start,
+    // read through the same gate: production, project root only.
+    let source_volumes = super::run_source_volume::SourceVolumes::load(
+        defer_opts
+            .project
+            .as_ref()
+            .map(|project| project.root.as_path()),
+        shadow_config.is_none(),
+    );
 
     // Build the run-scoped classified-retry plan once. The budget + breaker
     // carry interior atomics, so their caps are observed across the whole run
@@ -14034,6 +14043,25 @@ async fn execute_models_phase(
             .map(|m| (m.config.name.as_str(), &m.config.target)),
     );
 
+    // `[[product.source.volume]]`: count each source table once, before this
+    // phase writes anything (schemas, functions, models) and before any skip
+    // gate runs, for every product whose output model this run selects. An
+    // `error` breach refuses only that output model, at its dispatch point
+    // below; upstream models still build.
+    let source_refusals = super::run_source_volume::count_sources(
+        &source_volumes,
+        |model| {
+            model_name_filter.is_none_or(|selected| selected == model)
+                && model_set.is_none_or(|set| set.contains(model))
+                && !compile_excluded_models.contains(model)
+                && compile_result.project.model(model).is_some()
+        },
+        warehouse,
+        output,
+        cancel,
+    )
+    .await;
+
     // Pre-create target schemas when the caller requested auto-create.
     // Mirrors the replication path's per-source loop (see the
     // `governance.auto_create_schemas` block earlier in this file). Without
@@ -14534,8 +14562,13 @@ async fn execute_models_phase(
             // Fire before_model_run for every model up front, in index
             // order, so subscribers see the same announce ordering the
             // serial loop emits.
+            // A model a source range refuses never runs, so it is not
+            // announced; its refusal fires `model_error` in the failure arm.
             if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                 for (_, name, _) in &matched {
+                    if source_refusals.get(name).is_some() {
+                        continue;
+                    }
                     let _ = reg
                         .fire(&HookContext::before_model_run(run_id, pipe, name))
                         .await;
@@ -14561,8 +14594,18 @@ async fn execute_models_phase(
                 futures::stream::iter(0..matched.len())
                     .map(|idx| {
                         let plan = &resilience_plan;
+                        let source_refusals = &source_refusals;
                         async move {
                             let (_, name, model) = matched_ref[idx];
+                            // An `error` source range refuses this output
+                            // before any attempt: the model's `Err`, handled
+                            // by the layer's failure arm like a failed build.
+                            // Its time is the count's, left where that arm
+                            // takes a failed model's measurement from.
+                            if let Some(refusal) = source_refusals.get(name) {
+                                plan.record_unretried_failure(name, refusal.duration_ms);
+                                return (idx, name, Err(refusal.error()));
+                            }
                             // Classified retry wraps each attempt: a fresh
                             // timing clock per try, transient-only re-run,
                             // attempt trail stamped onto the output.
@@ -14871,6 +14914,26 @@ async fn execute_models_phase(
                     );
                     continue;
                 }
+            }
+
+            // An `error` source range refuses this output model here, after
+            // the skip gate and the column skip said it builds and before any
+            // hook or write. The gate records neither Built nor Skipped, no
+            // materialization is pushed and `models_executed` does not move.
+            if let Some(refusal) = source_refusals.get(model_name) {
+                fail_unretried_model(
+                    output,
+                    &mut containment,
+                    hook_registry,
+                    pipeline_name,
+                    run_id,
+                    model_name,
+                    refusal.duration_ms,
+                    resilience.contain_failures,
+                    refusal.error(),
+                )
+                .await?;
+                continue;
             }
 
             // Every model reached here is being built (the gate already
@@ -26995,6 +27058,7 @@ auto_create_schemas = true
 
         let output = RunOutput {
             volume_warnings: Vec::new(),
+            source_volumes: Vec::new(),
             version: "1.0.2".into(),
             command: "run".into(),
             scheduling_warnings: Vec::new(),
@@ -43992,6 +44056,7 @@ auto_create_schemas = true
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         };
         state.record_run(&failed).unwrap();
 
@@ -46416,6 +46481,7 @@ auto_create_schemas = true
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -46624,6 +46690,7 @@ auto_create_schemas = true
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         };
         store.record_run(&base_run).unwrap();
         store
@@ -46907,6 +46974,7 @@ auto_create_schemas = true
             rocky_branch: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
+            source_volumes: Vec::new(),
         };
         store.record_run(&run).unwrap();
 
@@ -47903,6 +47971,7 @@ auto_create_schemas = true
                 rocky_branch: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
+                source_volumes: Vec::new(),
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -48217,6 +48286,7 @@ auto_create_schemas = true
                     rocky_branch: None,
                     run_scope: Some(rocky_core::state::RunScope::Production),
                     queued_ms: None,
+                    source_volumes: Vec::new(),
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

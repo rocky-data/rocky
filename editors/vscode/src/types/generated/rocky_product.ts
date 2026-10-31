@@ -170,6 +170,33 @@ export interface SourceSpec {
    * One or more exact table references.
    */
   tables: string[];
+  /**
+   * Row-count ranges on source tables, counted when a production run starts (`[[product.source.volume]]`). Each names one of `tables`.
+   */
+  volume?: SourceVolumeSpec[];
+}
+/**
+ * One `[[product.source.volume]]` entry: a row-count range on one source table.
+ *
+ * The range is the table's total rows when a production run starts, before the run writes anything. It is not the number of rows the build reads. At least one bound is present. `min_rows = 0` alone counts as one.
+ */
+export interface SourceVolumeSpec {
+  /**
+   * Most rows allowed (inclusive).
+   */
+  max_rows?: number | null;
+  /**
+   * Fewest rows allowed (inclusive).
+   */
+  min_rows?: number | null;
+  /**
+   * `warning` (the default when omitted) or `error`.
+   */
+  severity?: VolumeSeverity | null;
+  /**
+   * The source table, exactly as `source.tables` lists it.
+   */
+  table: string;
 }
 /**
  * The trust dial. `propose_only` is the only v0 value.

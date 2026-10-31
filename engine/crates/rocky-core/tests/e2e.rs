@@ -547,6 +547,7 @@ fn test_run_history_flow() {
         rocky_branch: None,
         run_scope: Some(rocky_core::state::RunScope::Production),
         queued_ms: None,
+        source_volumes: Vec::new(),
     };
 
     store.record_run(&run).unwrap();
@@ -2214,6 +2215,7 @@ mod delivery_timing_e2e {
             rocky_branch: None,
             run_scope: Some(scope),
             queued_ms: None,
+            source_volumes: Vec::new(),
         }
     }
 

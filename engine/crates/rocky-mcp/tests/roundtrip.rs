@@ -5688,6 +5688,7 @@ fn seed_run_history(models_dir: &Path) {
         rocky_branch: None,
         run_scope: Some(rocky_core::state::RunScope::Production),
         queued_ms: None,
+        source_volumes: Vec::new(),
     };
     store.record_run(&run).expect("record run");
 
