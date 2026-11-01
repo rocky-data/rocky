@@ -10,6 +10,8 @@ path = "poc.duckdb"
 
 [connector.pg_events]
 manifest   = "connector/connector.toml"
+# Keep each run's scratch directory, so run.sh can grep it for the password.
+keep_scratch = true
 output_uri = "file://./.rocky/landing/pg_events"
 # Rocky hands only these variables (plus PATH, LANG, HOME, TMPDIR and
 # ROCKY_RUN_ID) to the program. libpq reads them inside DuckDB.

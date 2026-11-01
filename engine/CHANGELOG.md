@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `rocky run --output json` gains `source_volumes` (`SourceVolumeCheckOutput`: `product`, `model`, `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict`, `reason`), omitted when empty. A row stays when the skip gate later skips the output. An output refused at `error` is never skipped as unchanged. Each run record gains the same rows (`RunRecord.source_volumes`). The state schema stays at v34.
   - `rocky product status` gains `source_volumes`: per declared range, the newest production count and its verdict against the range.
 
+### Changed
+
+- `rocky load --connector` now removes the scratch directory of a successful run after the state commit. It was kept forever. The directory is the program's `HOME` and `TMPDIR`, so a program's caches and credential files no longer outlive the run. Rocky removes only that run's own directory, never anything else under `output_uri`. A run that fails after the child succeeded still keeps its directory for inspection. Set `keep_scratch = true` under `[connector.<name>]` to keep successful runs' directories too; a Rocky older than this release refuses that key. Scratch directories are now created readable by their owner only (mode `0700`). The JSON `source_dir` still names the directory, which may no longer exist. Staging tables left by a crashed run are still not cleaned up.
+
 ### Fixed
 
 - On DuckDB, `rocky load` with `[load] target.catalog` set now loads into that catalog. Before, it ignored the catalog and loaded into the current database with no warning (#2478). The catalog must name the current database. Letter case does not matter. Any other catalog now fails before anything is written. For a plain load, the error names the accepted value. For a contract-gated load, DuckDB's own "Catalog does not exist" error shows first. A set catalog with an empty `target.schema` is also an error.

@@ -63,6 +63,7 @@ output_bytes   = 5368709120
 | `retries` | Extra attempts after a failed one. Default 1. The most allowed is 10. |
 | `contract` | Optional data contract. Rocky checks it on the staging table, before the rows reach the target. |
 | `limits` | Limits for one attempt. See [Limits](#limits). |
+| `keep_scratch` | Keep the scratch directory of a successful run. Default `false`: Rocky removes it after the state commit. |
 
 A BigQuery target is refused when the config loads, because BigQuery does not accept local Parquet files. DuckDB is the tested path. Snowflake and Databricks accept `file://` through their loaders, but only DuckDB has a live test.
 
@@ -156,7 +157,7 @@ Each key is optional. Both the manifest and `[connector.<name>.limits]` can set 
 
 When Rocky stops a program, it sends `SIGTERM` to the whole process group, waits 5 seconds, and then sends `SIGKILL`.
 
-Each attempt gets a new scratch directory, named with the run id and the attempt number. Rocky removes the scratch directory of a failed attempt. It keeps the scratch directory of the successful attempt.
+Each attempt gets a new scratch directory, named with the run id and the attempt number, readable by its owner only. Rocky removes the scratch directory of a failed attempt. After the state commit of a successful run, Rocky removes that run's scratch directory too, unless `keep_scratch = true`. It removes only that one directory, never anything else under `output_uri`. A run that fails after the child succeeded keeps its scratch directory, so you can see what was or may have been loaded. That directory is the program's `HOME` and can hold its caches and credential files, so remove it when you are done.
 
 ## Schema drift
 
@@ -193,7 +194,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 ## Known gaps in this release
 
 - Secret values shorter than 8 bytes are not replaced by `${NAME}` in the log. Use long secrets.
-- Rocky keeps the scratch directory of a successful run and never cleans it up. Remove old ones from `output_uri` by hand.
+- A run that fails after the child succeeded keeps its scratch directory. Rocky never removes those. Remove them from `output_uri` by hand.
 - Staging tables from a crashed run stay in the warehouse. The name is `<table>__rocky_stg_<run id>`. Rocky does not clean up old staging tables yet. Drop them by hand.
 - Only `file://` output is supported.
 - A Ctrl-C or `SIGTERM` while the program runs stops the program group and fails the run. Rocky frees the claim. A signal that arrives while Rocky stages the batch makes Rocky stop before the promote. Rocky drops the staging table and frees the claim. Only a signal that arrives after Rocky sent the promote lets the state commit finish.

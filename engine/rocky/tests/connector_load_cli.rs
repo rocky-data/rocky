@@ -154,7 +154,9 @@ fn the_child_sees_only_the_variables_rocky_hands_it() {
         "python3 is required on PATH to run the environment probe"
     );
     let project = Project::new(
-        "secrets = [\"STRIPE_API_KEY\"]",
+        // Keep the scratch directory: the probe's `env.json` is read from it
+        // after the run, and a committed run removes it by default.
+        "secrets = [\"STRIPE_API_KEY\"]\nkeep_scratch = true",
         &manifest(GOOD_MANIFEST_EGRESS),
         // The connector is a Python script itself, so no shell sits between
         // Rocky and the probe (a shell adds PWD, SHLVL and `_` on its own).

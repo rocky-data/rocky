@@ -1543,6 +1543,7 @@ wall_time_secs = 3600
 | `retries` | `1` | Extra attempts after a failed one. At most `10`. |
 | `contract` | none | A data contract, checked on the staging table. |
 | `limits` | see guide | `wall_time_secs` (3600), `cpu_time_secs`, `memory_bytes`, `output_bytes` (5 GiB). The smaller of this and the manifest wins. |
+| `keep_scratch` | `false` | Keep the scratch directory of a successful run. By default Rocky removes it after the state commit. |
 
 ---
 

@@ -201,7 +201,13 @@ fn new_scratch_dir(landing: &Path, run_id: &str, attempt: u32) -> Result<PathBuf
         .map_err(|e| AttemptError::Setup(format!("{}: {e}", landing.display())))?;
     let scratch = landing.join(format!("{run_id}-{attempt}"));
     // `create_dir` fails when the path exists, so a directory is never reused.
-    std::fs::create_dir(&scratch)
+    // Owner-only: the directory is the program's `HOME` and `TMPDIR`, so it can
+    // hold caches and credential files, and a failed run keeps it.
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&scratch)
         .map_err(|e| AttemptError::Setup(format!("{}: {e}", scratch.display())))?;
     Ok(scratch)
 }
