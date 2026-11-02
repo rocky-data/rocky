@@ -75,7 +75,7 @@ jobs:
           # checks red with no code change. Bump deliberately.
           toolchain: 1.98.0
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Restore only, matching the other weekly jobs: a cache written here
@@ -98,7 +98,7 @@ jobs:
         with:
           # Pinned like windows-check. Bump deliberately.
           toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Restore only, matching the other weekly jobs.
@@ -179,7 +179,7 @@ jobs:
         with:
           # Pinned like windows-check. Bump deliberately.
           toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Restore only, matching the other weekly jobs.
@@ -220,7 +220,7 @@ jobs:
           # here keeps the dependency visible and resolved against the SAME
           # pinned toolchain.
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Restore only. A weekly job's cache would sit unread for seven days
@@ -350,7 +350,7 @@ jobs:
           # (2026-08-20) and turn required checks red with no code change,
           # while cache-busting every Rust job at once. Bump deliberately.
           toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: engine
           # Restore only. A weekly job's cache would sit unread for seven days
