@@ -104,7 +104,7 @@ dagster_rocky = "dagster_rocky"
 # to a build carrying twine 7.0.0. Still bounded, not open: 1.30.0 and 1.32.0
 # both shipped a metadata bump, so the ceiling is what turns the next one into
 # a caught failure instead of a broken publish.
-requires = ["hatchling>=1.30.1,<1.33"]
+requires = ["hatchling>=1.30.1,<1.34"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
