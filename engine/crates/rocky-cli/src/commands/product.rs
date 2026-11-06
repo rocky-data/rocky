@@ -152,13 +152,10 @@ pub(crate) struct ProductVolume {
     pub volume: rocky_core::product::spec::VolumeSpec,
 }
 
-/// Every volume range the project's products declare.
-///
-/// Best effort, like [`product_deadlines_in`]: a spec that does not parse
-/// contributes no range and logs a warning.
-pub(crate) fn product_volumes_in(root: &Path) -> Vec<ProductVolume> {
-    loadable_specs_in(root, "volume range")
-        .into_iter()
+/// Every volume range `specs` declare.
+fn product_volumes_of(specs: &[ParsedSpec]) -> Vec<ProductVolume> {
+    specs
+        .iter()
         .filter_map(|parsed| {
             parsed
                 .product()
@@ -185,14 +182,11 @@ pub(crate) struct ProductSourceVolume {
     pub range: rocky_core::product::spec::SourceVolumeSpec,
 }
 
-/// Every `[[product.source.volume]]` range the project's products declare,
-/// in spec file-name order, then declaration order.
-///
-/// Best effort, like [`product_volumes_in`]: a spec that does not parse
-/// contributes no range and logs a warning.
-pub(crate) fn product_source_volumes_in(root: &Path) -> Vec<ProductSourceVolume> {
-    loadable_specs_in(root, "source volume ranges")
-        .into_iter()
+/// Every `[[product.source.volume]]` range `specs` declare, in spec order,
+/// then declaration order.
+fn product_source_volumes_of(specs: &[ParsedSpec]) -> Vec<ProductSourceVolume> {
+    specs
+        .iter()
         .flat_map(|parsed| {
             let product = parsed.product().name.clone();
             let output_model = parsed.output_model().to_string();
@@ -211,6 +205,92 @@ pub(crate) fn product_source_volumes_in(root: &Path) -> Vec<ProductSourceVolume>
         .collect()
 }
 
+/// The output and source ranges a production run checks.
+#[derive(Debug, Default)]
+pub(crate) struct ProductRanges {
+    /// Every `[product.output.volume]` range.
+    pub output: Vec<ProductVolume>,
+    /// Every `[[product.source.volume]]` range.
+    pub source: Vec<ProductSourceVolume>,
+}
+
+/// Every range the products under `root` declare, read in one scan, or the
+/// refusal a production run reports.
+///
+/// Fails closed, unlike [`product_deadlines_in`]: a spec that cannot be
+/// read or parsed may declare an `error` range, and a run that skipped it
+/// would deliver an output nobody checked. A spec that does not load names
+/// no output model, so the refusal cannot be narrowed to one output. A
+/// missing `products/` directory declares nothing and is not refused.
+pub(crate) fn product_ranges_in(root: &Path) -> Result<ProductRanges, String> {
+    let (specs, problems) = scan_specs_in(root);
+    if !problems.is_empty() {
+        let lines: Vec<String> = problems.iter().map(SpecProblem::refusal).collect();
+        return Err(format!("[product-spec-unloadable] {}", lines.join("; ")));
+    }
+    Ok(ProductRanges {
+        output: product_volumes_of(&specs),
+        source: product_source_volumes_of(&specs),
+    })
+}
+
+/// The products under `root` that do not load, as warnings for a run that
+/// checks no range (a shadow or branch run). Empty when every spec loads.
+pub(crate) fn product_spec_problems_in(root: &Path) -> Vec<String> {
+    scan_specs_in(root)
+        .1
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// One thing that stopped a `products/` entry from loading.
+#[derive(Debug, Clone)]
+enum SpecProblem {
+    /// The `products/` directory exists but cannot be listed.
+    Dir { dir: String, error: String },
+    /// An entry of `products/` cannot be read, or its name is not UTF-8.
+    Entry { what: String, error: String },
+    /// `products/<stem>.toml` cannot be read, parsed or validated.
+    Spec { stem: String, reject: String },
+}
+
+impl SpecProblem {
+    /// The sentence a production run refuses with: what failed, why the
+    /// run stops, and the command that confirms the fix.
+    fn refusal(&self) -> String {
+        const WHY: &str = "a production run refuses to build with an unchecked product";
+        match self {
+            Self::Dir { dir, error } => format!(
+                "cannot read the products directory {dir}: {error}; {WHY}. \
+                 Fix its permissions and confirm with: rocky validate"
+            ),
+            Self::Entry { what, error } => format!(
+                "cannot read {what}: {error}; {WHY}. Fix or remove it and \
+                 confirm with: rocky validate"
+            ),
+            Self::Spec { stem, reject } => format!(
+                "product spec products/{stem}.toml does not load ({reject}); {WHY}. \
+                 Fix the spec and confirm with: rocky product verify {stem}"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for SpecProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dir { dir, error } => {
+                write!(f, "cannot read the products directory {dir}: {error}")
+            }
+            Self::Entry { what, error } => write!(f, "cannot read {what}: {error}"),
+            Self::Spec { stem, reject } => {
+                write!(f, "product spec {stem} does not load ({reject})")
+            }
+        }
+    }
+}
+
 /// Every `products/*.toml` under `root` that parses, in file-name order.
 /// `what` names the declaration a skipped spec loses, for the warning.
 fn loadable_specs_in(root: &Path, what: &str) -> Vec<ParsedSpec> {
@@ -222,8 +302,10 @@ fn loadable_specs_in(root: &Path, what: &str) -> Vec<ParsedSpec> {
 }
 
 /// Every `products/*.toml` under `root` that parses, in file-name order, and
-/// one sentence for each thing that stopped a spec from loading.
-fn scan_specs_in(root: &Path) -> (Vec<ParsedSpec>, Vec<String>) {
+/// one [`SpecProblem`] for each thing that stopped a spec from loading. An
+/// entry that cannot be listed, or a `.toml` name that is not UTF-8, is a
+/// problem too: it may be a spec.
+fn scan_specs_in(root: &Path) -> (Vec<ParsedSpec>, Vec<SpecProblem>) {
     let dir = root.join("products");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -233,30 +315,46 @@ fn scan_specs_in(root: &Path) -> (Vec<ParsedSpec>, Vec<String>) {
         Err(err) => {
             return (
                 Vec::new(),
-                vec![format!(
-                    "cannot read the products directory {}: {err}",
-                    dir.display()
-                )],
+                vec![SpecProblem::Dir {
+                    dir: dir.display().to_string(),
+                    error: err.to_string(),
+                }],
             );
         }
     };
-    let mut stems: Vec<String> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
-        .filter_map(|path| {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(str::to_string)
-        })
-        .collect();
+    let mut problems = Vec::new();
+    let mut stems: Vec<String> = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                problems.push(SpecProblem::Entry {
+                    what: format!("an entry of {}", dir.display()),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        match path.file_stem().and_then(|stem| stem.to_str()) {
+            Some(stem) => stems.push(stem.to_string()),
+            None => problems.push(SpecProblem::Entry {
+                what: path.display().to_string(),
+                error: "the file name is not UTF-8".to_string(),
+            }),
+        }
+    }
     stems.sort();
     let mut specs = Vec::new();
-    let mut problems = Vec::new();
     for stem in stems {
         match load_spec(root, &stem) {
             Ok(parsed) => specs.push(parsed),
-            Err(reject) => problems.push(format!("product spec {stem} does not load ({reject})")),
+            Err(reject) => problems.push(SpecProblem::Spec {
+                stem,
+                reject: reject.to_string(),
+            }),
         }
     }
     (specs, problems)
@@ -270,7 +368,8 @@ fn scan_specs_in(root: &Path) -> (Vec<ParsedSpec>, Vec<String>) {
 pub(crate) fn product_owners_in(
     root: &Path,
 ) -> (std::collections::BTreeMap<String, String>, Vec<String>) {
-    let (specs, mut problems) = scan_specs_in(root);
+    let (specs, problems) = scan_specs_in(root);
+    let mut problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
     let mut owners: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for parsed in &specs {
         let model = parsed.output_model().to_string();
