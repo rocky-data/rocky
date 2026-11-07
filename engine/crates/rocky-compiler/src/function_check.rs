@@ -446,6 +446,43 @@ impl Visitor for Calls<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every plain-named function the bundled DuckDB lists is in Rocky's
+    /// DuckDB list. DuckDB misses are `E057` errors, so a stale list refuses
+    /// valid SQL; the list was last regenerated for DuckDB 2.0, which added
+    /// functions such as `if`, `overlay` and `json_set`. Only the extensions
+    /// the bundled build links are listed here; the list also carries
+    /// autoloadable ones, which this cannot see offline.
+    #[test]
+    fn the_duckdb_list_covers_the_bundled_duckdb() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT lower(function_name) FROM duckdb_functions()")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            names.len() > 500,
+            "duckdb_functions() listed {}",
+            names.len()
+        );
+        let missing: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| {
+                n.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .filter(|n| !FunctionDialect::DuckDb.knows(n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "regenerate data/duckdb_functions.txt; missing: {missing:?}"
+        );
+    }
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
     use std::path::PathBuf;
 
