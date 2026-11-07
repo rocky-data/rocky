@@ -64,40 +64,32 @@ pub enum DuckDbError {
     #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
     KindSwitchCommitUncertain(duckdb::Error),
 
-    /// A result column holds an untyped `NULL` inside a list, struct, map
-    /// or union. DuckDB 2.0 types it as Arrow `Null`, which the `duckdb`
-    /// crate cannot read inside a nested value.
+    /// A result column has an Arrow type the `duckdb` crate cannot read,
+    /// such as `TIME_NS` or an untyped `NULL` inside a list or struct. The
+    /// crate would panic (`unreachable!`) on it.
     #[error(
-        "column `{column}` holds an untyped NULL inside a nested value ({data_type}), which \
-         Rocky cannot read from DuckDB. Cast it to a concrete type, for example \
-         `[NULL]::INTEGER[]` or `{{'a': NULL::VARCHAR}}`."
+        "column `{column}` has a type Rocky cannot read from DuckDB ({data_type}). Cast it to a \
+         supported type, for example `x::TIME`, `x::VARCHAR` or `[NULL]::INTEGER[]`."
     )]
-    UntypedNullInNestedColumn { column: String, data_type: String },
+    UnreadableColumnType { column: String, data_type: String },
 }
 
-/// Whether `data_type` holds an Arrow `Null` type below its top level. The
-/// `duckdb` crate panics (`unreachable!`) when it reads such a value.
-fn nests_a_null(data_type: &arrow::datatypes::DataType) -> bool {
-    use arrow::datatypes::DataType;
-    fn is_or_nests_a_null(data_type: &DataType) -> bool {
-        matches!(data_type, DataType::Null) || nests_a_null(data_type)
-    }
+/// Whether the `duckdb` crate's `row.get` can read a value of `data_type`.
+///
+/// This mirrors the match in `duckdb` 1.20000.1 `Row::value_ref_internal`
+/// (`src/row.rs`), which ends in `unreachable!` for every other type, and
+/// in `unimplemented!` / `panic!` for an interval unit or dictionary key it
+/// does not handle. Containers are read element by element through the same
+/// match, so an element must be readable too. A top-level Arrow `Null` (an
+/// untyped `SELECT NULL`) is handled by the caller, not here.
+fn crate_reads(data_type: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
     match data_type {
-        DataType::List(field)
-        | DataType::ListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::LargeList(field)
-        | DataType::LargeListView(field)
-        | DataType::Map(field, _) => is_or_nests_a_null(field.data_type()),
-        DataType::Struct(fields) => fields.iter().any(|f| is_or_nests_a_null(f.data_type())),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, f)| is_or_nests_a_null(f.data_type())),
-        DataType::Dictionary(key, value) => is_or_nests_a_null(key) || is_or_nests_a_null(value),
-        DataType::RunEndEncoded(run_ends, values) => {
-            is_or_nests_a_null(run_ends.data_type()) || is_or_nests_a_null(values.data_type())
-        }
-        DataType::Null
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_)
         | DataType::Boolean
         | DataType::Int8
         | DataType::Int16
@@ -110,24 +102,35 @@ fn nests_a_null(data_type: &arrow::datatypes::DataType) -> bool {
         | DataType::Float16
         | DataType::Float32
         | DataType::Float64
-        | DataType::Timestamp(..)
-        | DataType::Date32
-        | DataType::Date64
-        | DataType::Time32(_)
-        | DataType::Time64(_)
-        | DataType::Duration(_)
-        | DataType::Interval(_)
-        | DataType::Binary
-        | DataType::FixedSizeBinary(_)
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Utf8View
         | DataType::Decimal32(..)
         | DataType::Decimal64(..)
         | DataType::Decimal128(..)
-        | DataType::Decimal256(..) => false,
+        | DataType::Timestamp(..)
+        | DataType::Date32
+        | DataType::Time64(TimeUnit::Microsecond)
+        | DataType::Interval(IntervalUnit::MonthDayNano) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => crate_reads(field.data_type()),
+        DataType::Struct(fields) => fields.iter().all(|f| crate_reads(f.data_type())),
+        DataType::Union(fields, _) => fields.iter().all(|(_, f)| crate_reads(f.data_type())),
+        DataType::Dictionary(key, value) => {
+            matches!(**key, DataType::UInt8 | DataType::UInt16 | DataType::UInt32)
+                && crate_reads(value)
+        }
+        DataType::Null
+        | DataType::Time32(_)
+        | DataType::Time64(TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Nanosecond)
+        | DataType::Date64
+        | DataType::Duration(_)
+        | DataType::Interval(IntervalUnit::YearMonth | IntervalUnit::DayTime)
+        | DataType::BinaryView
+        | DataType::Utf8View
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Decimal256(..)
+        | DataType::RunEndEncoded(..) => false,
     }
 }
 
@@ -348,19 +351,20 @@ impl DuckDbConnector {
         // `Null` column; 1.x exported it as `int32`. The `duckdb` crate's
         // `row.get` panics (`unreachable!`) on that type, so such a column is
         // read as NULL without asking the crate.
-        // An untyped NULL nested inside a list or struct panics the same
-        // way, and there is no value to substitute, so it is an error that
-        // names the column.
+        // Any other type the crate cannot read (`TIME_NS`, an untyped NULL
+        // inside a list or struct) panics the same way, and there is no
+        // value to substitute, so it is an error that names the column.
         let mut null_typed = Vec::with_capacity(column_count);
         for (i, column) in columns.iter().enumerate() {
             let data_type = stmt_ref.column_type(i);
-            if nests_a_null(&data_type) {
-                return Err(DuckDbError::UntypedNullInNestedColumn {
+            let is_null_typed = data_type == arrow::datatypes::DataType::Null;
+            if !is_null_typed && !crate_reads(&data_type) {
+                return Err(DuckDbError::UnreadableColumnType {
                     column: column.clone(),
                     data_type: data_type.to_string(),
                 });
             }
-            null_typed.push(data_type == arrow::datatypes::DataType::Null);
+            null_typed.push(is_null_typed);
         }
 
         let mut rows = Vec::new();
@@ -841,25 +845,50 @@ mod tests {
         assert_eq!(setting.rows[0][0], serde_json::Value::Null);
     }
 
-    /// An untyped NULL inside a list or struct is an error that names the
-    /// column, not a panic. A typed one reads as before.
+    /// A type the `duckdb` crate cannot read is an error that names the
+    /// column, not a panic: an untyped NULL inside a list or struct, and
+    /// `TIME_NS` at the top level or inside a list. A cast reads as usual.
     #[test]
-    fn an_untyped_null_inside_a_nested_column_is_an_error_not_a_panic() {
+    fn an_unreadable_column_type_is_an_error_not_a_panic() {
         let db = DuckDbConnector::in_memory().unwrap();
         for sql in [
             "SELECT [NULL] AS xs",
             "SELECT {'a': NULL} AS xs",
             "SELECT MAP {1: NULL} AS xs",
+            "SELECT '12:00:00'::TIME_NS AS xs",
+            "SELECT [TIME_NS '12:00:00'] AS xs",
         ] {
             let err = db.execute_sql(sql).expect_err(sql);
             assert!(
-                matches!(&err, DuckDbError::UntypedNullInNestedColumn { column, .. } if column == "xs"),
+                matches!(&err, DuckDbError::UnreadableColumnType { column, .. } if column == "xs"),
                 "{sql}: {err}"
             );
             assert!(err.to_string().contains("Cast it"), "{err}");
         }
-        let typed = db.execute_sql("SELECT [NULL]::INTEGER[] AS xs").unwrap();
-        assert_eq!(typed.rows.len(), 1);
+        for sql in [
+            "SELECT [NULL]::INTEGER[] AS xs",
+            "SELECT '12:00:00'::TIME_NS::TIME AS xs",
+        ] {
+            assert_eq!(db.execute_sql(sql).unwrap().rows.len(), 1, "{sql}");
+        }
+    }
+
+    /// Every type a Rocky model commonly produces is readable, so the guard
+    /// refuses only what would have panicked.
+    #[test]
+    fn common_types_are_readable() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let sql = "SELECT true AS b, 1::TINYINT AS i1, 1::SMALLINT AS i2, 1 AS i4, \
+                   1::BIGINT AS i8, 1::HUGEINT AS i16, 1::UBIGINT AS u8, 1::UHUGEINT AS u16, \
+                   1.5::FLOAT AS f4, 1.5::DOUBLE AS f8, 1.5::DECIMAL(38,2) AS d, 'x' AS s, \
+                   'x'::BLOB AS bl, DATE '2024-01-01' AS dt, TIME '01:00' AS t, \
+                   TIMESTAMP '2024-01-01' AS ts, TIMESTAMPTZ '2024-01-01 00:00:00+00' AS tz, \
+                   '2024-01-01'::TIMESTAMP_NS AS tsn, INTERVAL 1 DAY AS iv, \
+                   gen_random_uuid() AS u, 'a'::ENUM('a') AS e, [1, NULL] AS l, \
+                   {'k': 1, 'n': NULL::INTEGER} AS st, MAP {1: 2} AS m, \
+                   [1]::INTEGER[1] AS fl, union_value(k := 1) AS un";
+        let result = db.execute_sql(sql).unwrap();
+        assert_eq!(result.rows.len(), 1);
     }
 
     #[test]
