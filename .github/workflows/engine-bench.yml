@@ -51,6 +51,13 @@ jobs:
           # entries; restoring from main still gives the warm dependency tree.
           save-if: false
           key: bench
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
 
       # DuckDB C++ compilation needs swap on CI. ubuntu-latest runners ship with
       # an active /swapfile, so disable and remove it before reallocating —
