@@ -43,7 +43,7 @@ dev = [
     # Capped: 0.90.0 changes the generated types (HealthCheck.details becomes a
     # length-2 constrained alias). The committed bindings and codegen-drift must
     # agree on the generator, so hold here until that change is adopted on purpose.
-    "datamodel-code-generator>=0.56.0,<0.84",
+    "datamodel-code-generator>=0.56.0,<0.90",
     "pytest>=8.0",
     "ruff>=0.4",
 ]
