@@ -263,11 +263,11 @@ impl SpecProblem {
         match self {
             Self::Dir { dir, error } => format!(
                 "cannot read the products directory {dir}: {error}; {WHY}. \
-                 Fix its permissions and confirm with: rocky validate"
+                 Make it a readable directory (or remove it) and run again"
             ),
             Self::Entry { what, error } => format!(
                 "cannot read {what}: {error}; {WHY}. Fix or remove it and \
-                 confirm with: rocky validate"
+                 run again"
             ),
             Self::Spec { stem, reject } => format!(
                 "product spec products/{stem}.toml does not load ({reject}); {WHY}. \
@@ -309,8 +309,20 @@ fn scan_specs_in(root: &Path) -> (Vec<ParsedSpec>, Vec<SpecProblem>) {
     let dir = root.join("products");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
+        // `NotFound` is not proof of absence: a dangling `products` symlink
+        // (an unmounted share) reads the same, and treating it as "no
+        // products" would check no range at all.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new());
+            return match rocky_core::path_presence::classify_not_found(&dir) {
+                rocky_core::path_presence::PathPresence::Absent => (Vec::new(), Vec::new()),
+                rocky_core::path_presence::PathPresence::Present { detail } => (
+                    Vec::new(),
+                    vec![SpecProblem::Dir {
+                        dir: dir.display().to_string(),
+                        error: detail,
+                    }],
+                ),
+            };
         }
         Err(err) => {
             return (

@@ -324,7 +324,32 @@ mod tests {
             .expect_err("an unlistable products dir must refuse a production run")
             .to_string();
         assert!(err.contains("cannot read the products directory"), "{err}");
-        assert!(err.contains("rocky validate"), "{err}");
+        assert!(err.contains("run again"), "{err}");
+    }
+
+    /// A dangling `products` symlink (an unmounted share) is not "no
+    /// products": its `NotFound` proves nothing, so the run refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_production_run_refuses_a_dangling_products_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("products")).unwrap();
+        let err = load_ranges(Some(dir.path()), true)
+            .expect_err("a dangling products link must refuse a production run")
+            .to_string();
+        assert!(err.contains("[product-spec-unloadable]"), "{err}");
+        assert!(err.contains("cannot read the products directory"), "{err}");
+    }
+
+    /// The refusal is a configuration error, never classified as transient:
+    /// an orchestrator must not retry it.
+    #[test]
+    fn the_refusal_is_not_classified_as_retryable() {
+        let dir = project_with(&[("q.toml", "[product\n")]);
+        let err = load_ranges(Some(dir.path()), true).expect_err("refuses");
+        let (kind, cooldown) = crate::output::classify_anyhow_error_with_cooldown(&err);
+        assert_eq!(kind, crate::output::FailureKind::Unknown);
+        assert_eq!(cooldown, None);
     }
 
     /// No `products/` declares nothing: a project without products runs.
