@@ -82,6 +82,11 @@ pub enum DuckDbError {
 /// does not handle. Containers are read element by element through the same
 /// match, so an element must be readable too. A top-level Arrow `Null` (an
 /// untyped `SELECT NULL`) is handled by the caller, not here.
+///
+/// The check is by type, so it also refuses a value the crate could read:
+/// an empty or all-NULL list of untyped NULLs (`SELECT []`, `MAP {}`,
+/// `array_agg(NULL)`, typed `"NULL"[]`). Only a list with an untyped NULL
+/// element panics, but the type alone cannot tell them apart.
 fn crate_reads(data_type: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
     match data_type {
@@ -99,7 +104,6 @@ fn crate_reads(data_type: &arrow::datatypes::DataType) -> bool {
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64
-        | DataType::Float16
         | DataType::Float32
         | DataType::Float64
         | DataType::Decimal32(..)
@@ -115,11 +119,15 @@ fn crate_reads(data_type: &arrow::datatypes::DataType) -> bool {
         | DataType::Map(field, _) => crate_reads(field.data_type()),
         DataType::Struct(fields) => fields.iter().all(|f| crate_reads(f.data_type())),
         DataType::Union(fields, _) => fields.iter().all(|(_, f)| crate_reads(f.data_type())),
+        // An ENUM: `Value::from` downcasts the values to `StringArray`.
         DataType::Dictionary(key, value) => {
             matches!(**key, DataType::UInt8 | DataType::UInt16 | DataType::UInt32)
-                && crate_reads(value)
+                && matches!(**value, DataType::Utf8)
         }
-        DataType::Null
+        // The crate downcasts a `Float16` column to `Float32Array` and
+        // unwraps, so it panics. DuckDB has no half float.
+        DataType::Float16
+        | DataType::Null
         | DataType::Time32(_)
         | DataType::Time64(TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Nanosecond)
         | DataType::Date64
