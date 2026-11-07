@@ -366,8 +366,10 @@ fn rocky_modulo_is_tighter_than_duckdb_and_sound() {
     );
 }
 
-/// Two places where DuckDB's own result type is **narrower than the exact
-/// result**, documented as measured fact.
+/// Where DuckDB's own result type is **narrower than the exact result**,
+/// documented as measured fact. DuckDB 1.x was narrower on multiply and on a
+/// mixed-scale add; DuckDB 2.0 fixed the add (it now agrees with Rocky), and
+/// multiply still diverges.
 ///
 /// This is the evidence for the design's governing position: matching the
 /// warehouse and being sound are different targets, and Rocky picks sound. If
@@ -389,30 +391,29 @@ fn duckdb_under_provisions_where_rocky_is_deliberately_wider() {
         "Rocky ({rocky}) should be wider than DuckDB ({duck}) on multiply"
     );
 
-    // Mixed-scale add: DuckDB's DECIMAL(10,0) + DECIMAL(10,10) result type
-    // cannot hold its own inputs, and DuckDB raises a range error at run time
-    // for values its own type claims to accept.
+    // Mixed-scale add: DuckDB 1.x typed DECIMAL(10,0) + DECIMAL(10,10) too
+    // narrow to hold its own inputs. DuckDB 2.0 gives DECIMAL(21,10), the
+    // same bound as Rocky: all 10 integer digits plus the carry.
     let duck = duckdb_result_type(&conn, &operand_sql(10, 0), "+", &operand_sql(10, 10));
-    let (duck_int, _) = duckdb_parts(&duck).expect("decimal");
-    assert!(
-        duck_int < 10,
-        "premise: DuckDB under-provisions integer digits here (got {duck})"
-    );
+    let rocky = arithmetic_result_type(DecimalOp::Add, &dec(10, 0), &dec(10, 10)).ty;
+    assert_eq!(rocky, dec(21, 10));
     assert_eq!(
-        arithmetic_result_type(DecimalOp::Add, &dec(10, 0), &dec(10, 10)).ty,
-        dec(21, 10),
-        "Rocky preserves all 10 integer digits plus the carry"
+        duck, "DECIMAL(21,10)",
+        "DuckDB 2.0 agrees on a mixed-scale add"
     );
 }
 
 /// ADR-TYPES §4 and Validation: a zero divisor over non-null operands.
 ///
-/// Measured on the bundled DuckDB: `%` returns NULL, so `%` must be
-/// nullable, and Rocky infers it so. `/` does not return NULL: it returns
-/// a `DOUBLE` (`inf`), for decimals and integers alike. That is a float, not
-/// a decimal, which is why Rocky types decimal and integer `/` as `Unknown`.
-/// Rocky still calls `/` nullable, which is sound (ANSI-off Databricks
-/// returns NULL), but on DuckDB the reason is not a NULL.
+/// Measured on the bundled DuckDB 2.0: `%` by zero raises
+/// `Division by zero` (DuckDB 1.x returned NULL), and `TRY(a % b)` returns
+/// NULL. Rocky still infers `%` nullable, which stays sound: `TRY`, DuckDB's
+/// `error_on_division_by_zero = false` and other warehouses all give NULL.
+/// `/` does not return NULL: it returns a `DOUBLE` (`inf`), for decimals and
+/// integers alike. That is a float, not a decimal, which is why Rocky types
+/// decimal and integer `/` as `Unknown`. Rocky still calls `/` nullable,
+/// which is sound (ANSI-off Databricks returns NULL), but on DuckDB the
+/// reason is not a NULL.
 #[test]
 fn duckdb_zero_divisor_results() {
     let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
@@ -427,8 +428,12 @@ fn duckdb_zero_divisor_results() {
         ("CAST(1 AS DECIMAL(10,2))", "CAST(0 AS DECIMAL(10,2))"),
         ("CAST(1 AS INTEGER)", "CAST(0 AS INTEGER)"),
     ] {
-        let remainder = value(&format!("{a} % {b}"));
-        assert!(remainder.is_null(), "{a} % {b} returned {remainder}");
+        let err = conn
+            .execute_sql(&format!("SELECT {a} % {b} AS v"))
+            .expect_err("DuckDB 2.0 refuses a remainder by zero");
+        assert!(err.to_string().contains("Division by zero"), "{err}");
+        let remainder = value(&format!("TRY({a} % {b})"));
+        assert!(remainder.is_null(), "TRY({a} % {b}) returned {remainder}");
         assert_eq!(duckdb_result_type(&conn, a, "/", b), "DOUBLE", "{a} / {b}");
         let quotient = value(&format!("{a} / {b}"));
         assert_eq!(

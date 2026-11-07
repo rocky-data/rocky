@@ -168,9 +168,11 @@ fn prepare_extensions(conn: &Connection, opts: &ExtensionOptions) -> Result<(), 
                 .unwrap_or_default(),
         };
         let (version, platform): (String, String) = conn
-            .query_row("SELECT version(), pragma_platform()", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT version(), platform FROM pragma_platform()",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap_or_default();
         return Err(DuckDbError::OfflineExtensionMissing {
             extension: "icu",
@@ -276,11 +278,22 @@ impl DuckDbConnector {
         let columns: Vec<String> = (0..column_count)
             .map(|i| stmt_ref.column_name(i).map_or("?", |v| v).to_string())
             .collect();
+        // DuckDB 2.0 exports an untyped NULL (`SELECT NULL AS x`) as an Arrow
+        // `Null` column; 1.x exported it as `int32`. The `duckdb` crate's
+        // `row.get` panics (`unreachable!`) on that type, so such a column is
+        // read as NULL without asking the crate.
+        let null_typed: Vec<bool> = (0..column_count)
+            .map(|i| stmt_ref.column_type(i) == arrow::datatypes::DataType::Null)
+            .collect();
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
+                if null_typed[i] {
+                    values.push(serde_json::Value::Null);
+                    continue;
+                }
                 let val: Value = row.get(i)?;
                 let json_val = match val {
                     Value::Null => serde_json::Value::Null,
@@ -424,7 +437,7 @@ impl DuckDbConnector {
     /// workspace `arrow::record_batch::RecordBatch`.
     ///
     /// Backs [`crate::adapter::DuckDbWarehouseAdapter::fetch_arrow_batch`].
-    /// Since `duckdb 1.10503` pins workspace `arrow 58`, the batches returned
+    /// Since `duckdb 1.20000` pins workspace `arrow 60`, the batches returned
     /// by `query_arrow` are type-compatible with the workspace and no IPC
     /// roundtrip is needed — multi-batch result sets are concatenated into
     /// one via `arrow::compute::concat_batches`.
@@ -574,6 +587,16 @@ mod tests {
             "must say how to fill it: {msg}"
         );
         assert!(msg.contains("never downloads"), "{msg}");
+        // The message names the build, so the user fills the right
+        // `<version>/<platform>` directory. DuckDB 2.0 made
+        // `pragma_platform` a table function; a scalar call failed and left
+        // the build empty.
+        let platform: String = Connection::open_in_memory()
+            .unwrap()
+            .query_row("SELECT platform FROM pragma_platform()", [], |r| r.get(0))
+            .unwrap();
+        assert!(!platform.is_empty());
+        assert!(msg.contains(&platform), "must name the platform: {msg}");
         assert!(
             std::fs::read_dir(dir.path()).unwrap().next().is_none(),
             "offline mode must not write into the directory"
@@ -722,6 +745,23 @@ mod tests {
             .execute_sql("SELECT CAST(340282366920938463463374607431768211455 AS UHUGEINT) AS n")
             .unwrap();
         assert_eq!(result.rows[0][0], "340282366920938463463374607431768211455");
+    }
+
+    /// An untyped NULL column is read as NULL. DuckDB 2.0 types it as an
+    /// Arrow `Null` column, on which the `duckdb` crate's `row.get` panics.
+    #[test]
+    fn an_untyped_null_column_is_null_not_a_panic() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db.execute_sql("SELECT 1 AS a, NULL AS b").unwrap();
+        assert_eq!(result.columns, ["a", "b"]);
+        assert_eq!(
+            result.rows,
+            [[serde_json::json!("1"), serde_json::Value::Null]]
+        );
+        let setting = db
+            .execute_sql("SELECT current_setting('enable_profiling') AS s")
+            .unwrap();
+        assert_eq!(setting.rows[0][0], serde_json::Value::Null);
     }
 
     #[test]

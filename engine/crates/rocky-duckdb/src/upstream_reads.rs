@@ -1,10 +1,12 @@
 //! What one DuckDB statement read from each upstream table.
 //!
-//! The statement runs with the JSON profiler on. Each `TABLE_SCAN` node of
-//! the profile names the table (`extra_info.Table`, as
-//! `catalog.schema.table`), the rows it scanned (`operator_rows_scanned`)
-//! and the columns it read (`extra_info.Projections`). Those become one
-//! [`UpstreamRead`] per table.
+//! The statement runs with the JSON profiler on. The profile root lists its
+//! operator nodes under `operator`; each node has a `type` and its own
+//! `children` (DuckDB 2.0's shape; 1.x used `operator_type`,
+//! `operator_rows_scanned` and a root `children`). Each `TABLE_SCAN` node
+//! names the table (`extra_info.Table`, as `catalog.schema.table`), the rows
+//! it scanned (`rows_scanned`) and the columns it read
+//! (`extra_info.Projections`). Those become one [`UpstreamRead`] per table.
 //!
 //! ```text
 //!   statement ──▶ profile JSON ──▶ TABLE_SCAN nodes
@@ -45,20 +47,22 @@ struct RawScans {
 
 /// Collect the `TABLE_SCAN` nodes of a profile tree.
 ///
-/// `None` when the profile has no `operator_type` anywhere, so it is not a
-/// profile of the shape this reads (the caller records "not measured").
+/// `None` when the profile has no operator node (`type`) anywhere, so it is
+/// not a profile of the shape this reads (the caller records "not
+/// measured").
 fn parse_profile(root: &Value) -> Option<RawScans> {
     fn walk(node: &Value, out: &mut RawScans, saw_operator: &mut bool) {
-        if node.get("operator_type").is_some() {
+        let kind = node.get("type").and_then(Value::as_str);
+        if kind.is_some() {
             *saw_operator = true;
         }
-        if node.get("operator_type").and_then(Value::as_str) == Some("TABLE_SCAN") {
+        if kind == Some("TABLE_SCAN") {
             let table = node
                 .get("extra_info")
                 .and_then(|e| e.get("Table"))
                 .and_then(Value::as_str)
                 .filter(|t| !t.is_empty());
-            let rows = node.get("operator_rows_scanned").and_then(Value::as_u64);
+            let rows = node.get("rows_scanned").and_then(Value::as_u64);
             match (table, rows) {
                 (Some(table), Some(rows_scanned)) => out.scans.push(RawScan {
                     table: table.to_string(),
@@ -72,9 +76,13 @@ fn parse_profile(root: &Value) -> Option<RawScans> {
                 (None, _) | (Some(_), None) => out.unattributed += 1,
             }
         }
-        if let Some(children) = node.get("children").and_then(Value::as_array) {
-            for child in children {
-                walk(child, out, saw_operator);
+        // The root holds its nodes under `operator`; every node below holds
+        // its own under `children`.
+        for key in ["operator", "children"] {
+            if let Some(children) = node.get(key).and_then(Value::as_array) {
+                for child in children {
+                    walk(child, out, saw_operator);
+                }
             }
         }
     }
@@ -244,7 +252,7 @@ impl DuckDbConnector {
             }
         };
         let enable = format!(
-            "PRAGMA enable_profiling = 'json'; PRAGMA profiling_output = '{}';",
+            "SET enable_profiling = 'json'; SET profiling_output = '{}';",
             sql_quote(&file.path().to_string_lossy())
         );
         if let Err(e) = self.conn.execute_batch(&enable) {
@@ -349,8 +357,8 @@ mod tests {
         }
         extra.insert("Projections".into(), projections);
         json!({
-            "operator_type": "TABLE_SCAN",
-            "operator_rows_scanned": rows,
+            "type": "TABLE_SCAN",
+            "rows_scanned": rows,
             "extra_info": extra,
             "children": [],
         })
@@ -374,11 +382,13 @@ mod tests {
     #[test]
     fn a_scan_without_a_table_is_unattributed() {
         let root = json!({
-            "operator_type": "EXPLAIN",
-            "children": [
-                scan_node(None, 10, json!("a")),
-                scan_node(Some("m.main.t"), 5, json!("a")),
-            ],
+            "operator": [{
+                "type": "RESULT_COLLECTOR",
+                "children": [
+                    scan_node(None, 10, json!("a")),
+                    scan_node(Some("m.main.t"), 5, json!("a")),
+                ],
+            }],
         });
         let raw = parse_profile(&root).unwrap();
         assert_eq!(raw.unattributed, 1);
@@ -388,6 +398,15 @@ mod tests {
     #[test]
     fn a_json_without_operators_is_not_a_profile() {
         assert_eq!(parse_profile(&json!({"x": 1})), None);
+        // The 1.x key names are not read: a profile in that shape is "not
+        // measured", never a profile with zero scans.
+        assert_eq!(
+            parse_profile(&json!({
+                "operator_type": "EXPLAIN",
+                "children": [{"operator_type": "TABLE_SCAN", "operator_rows_scanned": 1}],
+            })),
+            None
+        );
     }
 
     #[test]
@@ -444,8 +463,7 @@ mod tests {
             if let Some(filters) = filters {
                 node["extra_info"]["Filters"] = filters;
             }
-            let raw =
-                parse_profile(&json!({"operator_type": "EXPLAIN", "children": [node]})).unwrap();
+            let raw = parse_profile(&json!({"operator": [node]})).unwrap();
             summarize(raw, |_| types(&[("a", "BIGINT")])).reads[0].est_bytes
         };
         assert_eq!(with_filters(None), Some(800));

@@ -605,7 +605,7 @@ async fn test_pipeline_level_cost_attribution_matches_jobs_get() {
 ///
 /// Mirrors the rocky-duckdb conformance test (PR #631): runs
 /// `SELECT 1 AS n, 'foo' AS s`, asserts a 1-row / 2-column workspace
-/// `arrow 58` `RecordBatch` with column types `Int64` (BigQuery's
+/// `arrow 60` `RecordBatch` with column types `Int64` (BigQuery's
 /// canonical signed integer width) and `Utf8`. The two-hop flow under
 /// test:
 ///   1. `jobs.query` runs the SELECT.

@@ -724,7 +724,7 @@ impl BigQueryAdapter {
     }
 
     /// Execute `sql` and return its result as a single workspace
-    /// `arrow 58` `RecordBatch` via the BigQuery Storage Read API.
+    /// `arrow 60` `RecordBatch` via the BigQuery Storage Read API.
     ///
     /// Two-step:
     ///   1. `jobs.query` runs the SQL synchronously / async (existing

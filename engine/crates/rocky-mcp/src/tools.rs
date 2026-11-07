@@ -6990,11 +6990,19 @@ fn record_batch_to_query_result(
         .map(|col| ArrayFormatter::try_new(col.as_ref(), &options))
         .collect::<Result<_, _>>()?;
 
+    // `logical_nulls`, not `is_null`: an Arrow `Null` column (DuckDB 2.0's
+    // type for an untyped `NULL`) has no null buffer, so `is_null` says
+    // false for every row and the cell would render as "".
+    let nulls: Vec<Option<arrow::buffer::NullBuffer>> = batch
+        .columns()
+        .iter()
+        .map(|col| col.logical_nulls())
+        .collect();
     let mut rows: Vec<Vec<serde_json::Value>> = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         let mut cells: Vec<serde_json::Value> = Vec::with_capacity(batch.num_columns());
         for (col_idx, fmt) in formatters.iter().enumerate() {
-            let cell = if batch.column(col_idx).is_null(row) {
+            let cell = if nulls[col_idx].as_ref().is_some_and(|n| n.is_null(row)) {
                 serde_json::Value::Null
             } else {
                 serde_json::Value::String(fmt.value(row).to_string())
@@ -9714,6 +9722,23 @@ database = ":memory:"
         // Row 1: SQL NULL → JSON null, NOT the empty string.
         assert_eq!(qr.rows[1][0], serde_json::Value::Null);
         assert_eq!(qr.rows[1][1], serde_json::Value::Null);
+    }
+
+    /// An Arrow `Null` column has no null buffer, so `is_null` is false for
+    /// every row. DuckDB 2.0 returns one for `SELECT NULL AS x`. Each cell
+    /// must still be JSON null, not "".
+    #[test]
+    fn record_batch_to_query_result_renders_a_null_typed_column_as_null() {
+        use std::sync::Arc;
+
+        use arrow::array::NullArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(2))]).unwrap();
+        let qr = record_batch_to_query_result(&batch).unwrap();
+        assert_eq!(qr.rows, vec![vec![serde_json::Value::Null]; 2]);
     }
 
     #[test]

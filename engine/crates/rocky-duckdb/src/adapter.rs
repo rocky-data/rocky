@@ -427,7 +427,7 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
     }
 
     async fn fetch_arrow_batch(&self, sql: &str) -> AdapterResult<RecordBatch> {
-        // `duckdb 1.10503` pins workspace `arrow 58`, so `query_arrow`
+        // `duckdb 1.20000` pins workspace `arrow 60`, so `query_arrow`
         // returns batches directly type-compatible with the trait's
         // `arrow::record_batch::RecordBatch`. No IPC bridge required —
         // the connector concatenates multi-batch result sets in place.
@@ -1096,7 +1096,7 @@ mod tests {
     /// Marked `#[ignore]` because it links the bundled DuckDB C++ binary
     /// (already in the dev dependency graph, but the explicit gate keeps
     /// the default `cargo test` profile lean) and exercises the
-    /// `query_arrow` → workspace-arrow-58 path end-to-end. Run with:
+    /// `query_arrow` → workspace-arrow-60 path end-to-end. Run with:
     ///
     /// ```bash
     /// cargo test -p rocky-duckdb -- --ignored fetch_arrow_batch
