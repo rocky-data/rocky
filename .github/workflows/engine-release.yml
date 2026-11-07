@@ -103,6 +103,13 @@ jobs:
           # evicting the main-branch caches that every PR restores from.
           save-if: false
           key: release-${{ matrix.target }}
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
 
       # Windows: install NASM. `aws-lc-sys` (transitive dep of `jsonwebtoken`
       # via the `aws_lc_rs` feature flag enabled in the workspace toml)

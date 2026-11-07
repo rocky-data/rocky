@@ -85,6 +85,13 @@ jobs:
           # evicting the main-branch caches that every PR restores from.
           save-if: false
           key: wasm
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
 
       # Set up Node with the npm registry so `npm publish` picks up
       # NODE_AUTH_TOKEN automatically (no hand-rolled .npmrc).

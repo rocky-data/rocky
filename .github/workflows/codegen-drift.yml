@@ -157,6 +157,13 @@ jobs:
           # Save only from main — see the note in engine-ci.yml. PR runs restore
           # from main's entry and do not mint their own multi-GB duplicate.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
 
       - name: Install cmake (for DuckDB)
         # Present on the current ubuntu-24.04 image, but the `ubuntu-latest`
