@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.90.0] — 2026-11-07
+## [1.90.1] — 2026-11-07
+
+The first published release with the 1.90.0 changes below. It ships the same engine code as 1.90.0.
+
+### Fixed
+
+- Release: the macOS archives are built on the `macos-15` runner (#2529). GitHub retired `macos-14`, so the `engine-v1.90.0` run built no macOS archive and 1.90.0 was never published.
+
+## [1.90.0] — 2026-11-07 (not published)
 
 ### Upgrade notes
 
