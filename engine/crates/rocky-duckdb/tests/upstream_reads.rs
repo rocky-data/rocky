@@ -91,10 +91,29 @@ async fn a_parquet_scan_is_unattributed() {
 #[tokio::test]
 async fn a_count_star_has_no_projection_and_no_estimate() {
     let adapter = adapter().await;
-    let got = reads(&adapter, "CREATE TABLE c AS SELECT count(*) AS n FROM src").await;
+    // A filter DuckDB cannot prove from statistics makes it scan; the scan
+    // projects no column (the filter column is in `Filters`).
+    let got = reads(
+        &adapter,
+        "CREATE TABLE c AS SELECT count(*) AS n FROM src WHERE id % 2 = 0",
+    )
+    .await;
     assert_eq!(got.reads[0].rows_scanned, 5000);
     assert!(got.reads[0].projected_columns.is_empty());
     assert_eq!(got.reads[0].est_bytes, None);
+}
+
+/// DuckDB 2.0 answers an unfiltered `count(*)` over a table from its
+/// statistics, without a scan, and writes no profile at all. That is "not
+/// measured", never a read of zero rows.
+#[tokio::test]
+async fn an_unfiltered_count_star_is_not_measured() {
+    let adapter = adapter().await;
+    let (_, got) = adapter
+        .execute_statement_with_upstream_reads("CREATE TABLE c AS SELECT count(*) AS n FROM src")
+        .await
+        .unwrap();
+    assert_eq!(got, None);
 }
 
 #[tokio::test]

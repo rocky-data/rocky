@@ -24,7 +24,7 @@ jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 
 # Arrow path — `WarehouseAdapter::fetch_arrow_batch` returns workspace
-# `arrow 58` `RecordBatch`. The BigQuery Storage Read API hands back
+# `arrow 60` `RecordBatch`. The BigQuery Storage Read API hands back
 # Arrow IPC schema + record-batch messages over gRPC; we splice the
 # schema bytes onto each batch and feed them through
 # `arrow::ipc::reader::StreamReader` to land back on workspace types.

@@ -224,7 +224,7 @@ aliases. How Rocky treats a miss depends on how the list was made:
 
 | Warehouse | List | Checked against a live engine | Code |
 |---|---|---|---|
-| DuckDB | `duckdb_functions()` of DuckDB 1.5, plus functions its extensions load on first use | yes | `E057` (error) |
+| DuckDB | `duckdb_functions()` of DuckDB 2.0, plus functions its extensions load on first use | yes | `E057` (error) |
 | PostgreSQL | The PostgreSQL 17 built-in function catalog (`pg_proc`), plus the SQL-standard forms it lacks | yes, PostgreSQL 17.11 | `W057`: extensions add functions |
 | Snowflake | Vendor function reference | no, built from the docs | `W057` (warning) |
 | Databricks | Vendor function reference and the Spark list | no, built from the docs | `W057` |

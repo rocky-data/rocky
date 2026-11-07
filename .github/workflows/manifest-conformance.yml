@@ -90,11 +90,12 @@ jobs:
         working-directory: engine
         run: cargo build --release --bin rocky --bin rocky-verify
       # The recipe-provenance POC shells out to the standalone `duckdb` CLI to
-      # seed data. Pin 1.5.3 to match the engine's bundled DuckDB.
+      # seed data. Pin 2.0.0 to match the engine's bundled DuckDB.
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
-          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz -o /tmp/duckdb.tar.gz
+          echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  /tmp/duckdb.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/duckdb.tar.gz -C /usr/local/bin duckdb
           sudo chmod +x /usr/local/bin/duckdb
           duckdb --version
       - name: Run manifest conformance

@@ -39,7 +39,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-# `fetch_arrow_batch` returns a workspace `arrow 58` `RecordBatch`; the
+# `fetch_arrow_batch` returns a workspace `arrow 60` `RecordBatch`; the
 # data-grounding tools convert it to the JSON row shape via `arrow::util::display`.
 arrow = { workspace = true }
 # rmcp's `#[tool]` macro generates code that references `schemars` (1.x) by

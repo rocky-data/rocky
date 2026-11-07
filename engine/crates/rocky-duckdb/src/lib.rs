@@ -63,6 +63,83 @@ pub enum DuckDbError {
 
     #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
     KindSwitchCommitUncertain(duckdb::Error),
+
+    /// A result column has an Arrow type the `duckdb` crate cannot read,
+    /// such as `TIME_NS` or an untyped `NULL` inside a list or struct. The
+    /// crate would panic (`unreachable!`) on it.
+    #[error(
+        "column `{column}` has a type Rocky cannot read from DuckDB ({data_type}). Cast it to a \
+         supported type, for example `x::TIME`, `x::VARCHAR` or `[NULL]::INTEGER[]`."
+    )]
+    UnreadableColumnType { column: String, data_type: String },
+}
+
+/// Whether the `duckdb` crate's `row.get` can read a value of `data_type`.
+///
+/// This mirrors the match in `duckdb` 1.20000.1 `Row::value_ref_internal`
+/// (`src/row.rs`), which ends in `unreachable!` for every other type, and
+/// in `unimplemented!` / `panic!` for an interval unit or dictionary key it
+/// does not handle. Containers are read element by element through the same
+/// match, so an element must be readable too. A top-level Arrow `Null` (an
+/// untyped `SELECT NULL`) is handled by the caller, not here.
+///
+/// The check is by type, so it also refuses a value the crate could read:
+/// an empty or all-NULL list of untyped NULLs (`SELECT []`, `MAP {}`,
+/// `array_agg(NULL)`, typed `"NULL"[]`). Only a list with an untyped NULL
+/// element panics, but the type alone cannot tell them apart.
+fn crate_reads(data_type: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
+    match data_type {
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_)
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Timestamp(..)
+        | DataType::Date32
+        | DataType::Time64(TimeUnit::Microsecond)
+        | DataType::Interval(IntervalUnit::MonthDayNano) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => crate_reads(field.data_type()),
+        DataType::Struct(fields) => fields.iter().all(|f| crate_reads(f.data_type())),
+        DataType::Union(fields, _) => fields.iter().all(|(_, f)| crate_reads(f.data_type())),
+        // An ENUM: `Value::from` downcasts the values to `StringArray`.
+        DataType::Dictionary(key, value) => {
+            matches!(**key, DataType::UInt8 | DataType::UInt16 | DataType::UInt32)
+                && matches!(**value, DataType::Utf8)
+        }
+        // The crate downcasts a `Float16` column to `Float32Array` and
+        // unwraps, so it panics. DuckDB has no half float.
+        DataType::Float16
+        | DataType::Null
+        | DataType::Time32(_)
+        | DataType::Time64(TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Nanosecond)
+        | DataType::Date64
+        | DataType::Duration(_)
+        | DataType::Interval(IntervalUnit::YearMonth | IntervalUnit::DayTime)
+        | DataType::BinaryView
+        | DataType::Utf8View
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Decimal256(..)
+        | DataType::RunEndEncoded(..) => false,
+    }
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -168,9 +245,11 @@ fn prepare_extensions(conn: &Connection, opts: &ExtensionOptions) -> Result<(), 
                 .unwrap_or_default(),
         };
         let (version, platform): (String, String) = conn
-            .query_row("SELECT version(), pragma_platform()", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT version(), platform FROM pragma_platform()",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap_or_default();
         return Err(DuckDbError::OfflineExtensionMissing {
             extension: "icu",
@@ -276,11 +355,34 @@ impl DuckDbConnector {
         let columns: Vec<String> = (0..column_count)
             .map(|i| stmt_ref.column_name(i).map_or("?", |v| v).to_string())
             .collect();
+        // DuckDB 2.0 exports an untyped NULL (`SELECT NULL AS x`) as an Arrow
+        // `Null` column; 1.x exported it as `int32`. The `duckdb` crate's
+        // `row.get` panics (`unreachable!`) on that type, so such a column is
+        // read as NULL without asking the crate.
+        // Any other type the crate cannot read (`TIME_NS`, an untyped NULL
+        // inside a list or struct) panics the same way, and there is no
+        // value to substitute, so it is an error that names the column.
+        let mut null_typed = Vec::with_capacity(column_count);
+        for (i, column) in columns.iter().enumerate() {
+            let data_type = stmt_ref.column_type(i);
+            let is_null_typed = data_type == arrow::datatypes::DataType::Null;
+            if !is_null_typed && !crate_reads(&data_type) {
+                return Err(DuckDbError::UnreadableColumnType {
+                    column: column.clone(),
+                    data_type: data_type.to_string(),
+                });
+            }
+            null_typed.push(is_null_typed);
+        }
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
             let mut values = Vec::with_capacity(column_count);
-            for i in 0..column_count {
+            for (i, &is_null_typed) in null_typed.iter().enumerate() {
+                if is_null_typed {
+                    values.push(serde_json::Value::Null);
+                    continue;
+                }
                 let val: Value = row.get(i)?;
                 let json_val = match val {
                     Value::Null => serde_json::Value::Null,
@@ -424,7 +526,7 @@ impl DuckDbConnector {
     /// workspace `arrow::record_batch::RecordBatch`.
     ///
     /// Backs [`crate::adapter::DuckDbWarehouseAdapter::fetch_arrow_batch`].
-    /// Since `duckdb 1.10503` pins workspace `arrow 58`, the batches returned
+    /// Since `duckdb 1.20000` pins workspace `arrow 60`, the batches returned
     /// by `query_arrow` are type-compatible with the workspace and no IPC
     /// roundtrip is needed — multi-batch result sets are concatenated into
     /// one via `arrow::compute::concat_batches`.
@@ -574,6 +676,16 @@ mod tests {
             "must say how to fill it: {msg}"
         );
         assert!(msg.contains("never downloads"), "{msg}");
+        // The message names the build, so the user fills the right
+        // `<version>/<platform>` directory. DuckDB 2.0 made
+        // `pragma_platform` a table function; a scalar call failed and left
+        // the build empty.
+        let platform: String = Connection::open_in_memory()
+            .unwrap()
+            .query_row("SELECT platform FROM pragma_platform()", [], |r| r.get(0))
+            .unwrap();
+        assert!(!platform.is_empty());
+        assert!(msg.contains(&platform), "must name the platform: {msg}");
         assert!(
             std::fs::read_dir(dir.path()).unwrap().next().is_none(),
             "offline mode must not write into the directory"
@@ -722,6 +834,69 @@ mod tests {
             .execute_sql("SELECT CAST(340282366920938463463374607431768211455 AS UHUGEINT) AS n")
             .unwrap();
         assert_eq!(result.rows[0][0], "340282366920938463463374607431768211455");
+    }
+
+    /// An untyped NULL column is read as NULL. DuckDB 2.0 types it as an
+    /// Arrow `Null` column, on which the `duckdb` crate's `row.get` panics.
+    #[test]
+    fn an_untyped_null_column_is_null_not_a_panic() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db.execute_sql("SELECT 1 AS a, NULL AS b").unwrap();
+        assert_eq!(result.columns, ["a", "b"]);
+        assert_eq!(
+            result.rows,
+            [[serde_json::json!("1"), serde_json::Value::Null]]
+        );
+        let setting = db
+            .execute_sql("SELECT current_setting('enable_profiling') AS s")
+            .unwrap();
+        assert_eq!(setting.rows[0][0], serde_json::Value::Null);
+    }
+
+    /// A type the `duckdb` crate cannot read is an error that names the
+    /// column, not a panic: an untyped NULL inside a list or struct, and
+    /// `TIME_NS` at the top level or inside a list. A cast reads as usual.
+    #[test]
+    fn an_unreadable_column_type_is_an_error_not_a_panic() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        for sql in [
+            "SELECT [NULL] AS xs",
+            "SELECT {'a': NULL} AS xs",
+            "SELECT MAP {1: NULL} AS xs",
+            "SELECT '12:00:00'::TIME_NS AS xs",
+            "SELECT [TIME_NS '12:00:00'] AS xs",
+        ] {
+            let err = db.execute_sql(sql).expect_err(sql);
+            assert!(
+                matches!(&err, DuckDbError::UnreadableColumnType { column, .. } if column == "xs"),
+                "{sql}: {err}"
+            );
+            assert!(err.to_string().contains("Cast it"), "{err}");
+        }
+        for sql in [
+            "SELECT [NULL]::INTEGER[] AS xs",
+            "SELECT '12:00:00'::TIME_NS::TIME AS xs",
+        ] {
+            assert_eq!(db.execute_sql(sql).unwrap().rows.len(), 1, "{sql}");
+        }
+    }
+
+    /// Every type a Rocky model commonly produces is readable, so the guard
+    /// refuses only what would have panicked.
+    #[test]
+    fn common_types_are_readable() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let sql = "SELECT true AS b, 1::TINYINT AS i1, 1::SMALLINT AS i2, 1 AS i4, \
+                   1::BIGINT AS i8, 1::HUGEINT AS i16, 1::UBIGINT AS u8, 1::UHUGEINT AS u16, \
+                   1.5::FLOAT AS f4, 1.5::DOUBLE AS f8, 1.5::DECIMAL(38,2) AS d, 'x' AS s, \
+                   'x'::BLOB AS bl, DATE '2024-01-01' AS dt, TIME '01:00' AS t, \
+                   TIMESTAMP '2024-01-01' AS ts, TIMESTAMPTZ '2024-01-01 00:00:00+00' AS tz, \
+                   '2024-01-01'::TIMESTAMP_NS AS tsn, INTERVAL 1 DAY AS iv, \
+                   gen_random_uuid() AS u, 'a'::ENUM('a') AS e, [1, NULL] AS l, \
+                   {'k': 1, 'n': NULL::INTEGER} AS st, MAP {1: 2} AS m, \
+                   [1]::INTEGER[1] AS fl, union_value(k := 1) AS un";
+        let result = db.execute_sql(sql).unwrap();
+        assert_eq!(result.rows.len(), 1);
     }
 
     #[test]

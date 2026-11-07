@@ -27,7 +27,7 @@ done
 echo
 echo "==> 3. Estimated rows per scan from the join model's plan (revenue_by_tier):"
 jq -r '.estimates[] | select(.model_name == "revenue_by_tier") | .raw_explain' expected/estimate.json \
-  | grep -E "rows|Table:|HASH_JOIN|status=" | sed 's/[│└┌─┐┘├┤ ]\+/ /g' | sed 's/^ //' | grep -v '^$' | head -12
+  | grep -E "rows|Table:|Hash Join|Filters:" | sed -E 's/[│└┌─┐┘├┤╭╮╰╯┴ ]+/ /g' | sed 's/^ //' | grep -v '^$' | head -12
 
 echo
 echo "==> 4. Nothing was materialized — estimate is a dry-run"
@@ -40,9 +40,9 @@ echo
 if [[ "$(jq -r '.total_models' expected/estimate.json)" != "2" ]]; then
   echo "FAIL: expected 2 model estimates"; exit 1
 fi
-if ! jq -e '.estimates[] | select(.model_name == "revenue_by_tier") | .raw_explain | test("HASH_JOIN")' \
+if ! jq -e '.estimates[] | select(.model_name == "revenue_by_tier") | .raw_explain | test("Hash Join")' \
      expected/estimate.json > /dev/null; then
-  echo "FAIL: join model's EXPLAIN plan missing the expected HASH_JOIN node"; exit 1
+  echo "FAIL: join model's EXPLAIN plan missing the expected Hash Join node"; exit 1
 fi
 if [[ "$TABLES" != "0" ]]; then
   echo "FAIL: estimate materialized a table — it must be a dry-run"; exit 1

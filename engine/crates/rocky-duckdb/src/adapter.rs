@@ -298,6 +298,19 @@ impl DuckDbWarehouseAdapter {
     }
 }
 
+/// The schema DuckDB 2.0 names in `... does not exist because schema "<s>"
+/// does not exist.`
+///
+/// DuckDB 2.0 reports a missing CATALOG this way too: `nosuch.main.t` gives
+/// `schema "nosuch.main"`. Rocky's identifiers cannot contain a `.`
+/// (`rocky-sql` validation), so a dotted name here means the catalog is
+/// missing, which is a config mismatch, not an absent object.
+pub(crate) fn missing_schema_in(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once(" does not exist because schema \"")?;
+    let (schema, tail) = rest.split_once('"')?;
+    tail.starts_with(" does not exist.").then_some(schema)
+}
+
 #[async_trait]
 impl WarehouseAdapter for DuckDbWarehouseAdapter {
     fn dialect(&self) -> &dyn SqlDialect {
@@ -315,8 +328,7 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             || message.starts_with("Catalog Error: Schema with name "))
             && message.contains(" does not exist!"))
             || (message.starts_with("Catalog Error: Table with name ")
-                && message.contains(" does not exist because schema ")
-                && message.contains(" does not exist."))
+                && missing_schema_in(&message).is_some_and(|schema| !schema.contains('.')))
     }
 
     /// DuckDB folds identifier case, so this is a dialect constant and needs
@@ -427,7 +439,7 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
     }
 
     async fn fetch_arrow_batch(&self, sql: &str) -> AdapterResult<RecordBatch> {
-        // `duckdb 1.10503` pins workspace `arrow 58`, so `query_arrow`
+        // `duckdb 1.20000` pins workspace `arrow 60`, so `query_arrow`
         // returns batches directly type-compatible with the trait's
         // `arrow::record_batch::RecordBatch`. No IPC bridge required —
         // the connector concatenates multi-batch result sets in place.
@@ -828,6 +840,31 @@ mod tests {
         )));
     }
 
+    /// DuckDB 2.0 words a missing catalog as a missing `catalog.schema`
+    /// schema. That is a config mismatch, not an absent object: the shadow
+    /// lifecycle must stop, not go on to create in a database that is not
+    /// attached.
+    #[tokio::test]
+    async fn real_describe_missing_catalog_error_is_not_an_absent_object() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let missing = adapter
+            .describe_table(&TableRef {
+                catalog: "nosuch".into(),
+                schema: "main".into(),
+                table: "missing".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(!adapter.is_missing_object_error(&missing), "{missing}");
+        assert_eq!(
+            missing_schema_in(
+                "Catalog Error: Table with name \"nosuch.main.t\" does not exist because \
+                 schema \"nosuch.main\" does not exist."
+            ),
+            Some("nosuch.main")
+        );
+    }
+
     #[tokio::test]
     async fn real_describe_missing_schema_error_confirms_absence() {
         let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
@@ -1096,7 +1133,7 @@ mod tests {
     /// Marked `#[ignore]` because it links the bundled DuckDB C++ binary
     /// (already in the dev dependency graph, but the explicit gate keeps
     /// the default `cargo test` profile lean) and exercises the
-    /// `query_arrow` → workspace-arrow-58 path end-to-end. Run with:
+    /// `query_arrow` → workspace-arrow-60 path end-to-end. Run with:
     ///
     /// ```bash
     /// cargo test -p rocky-duckdb -- --ignored fetch_arrow_batch
