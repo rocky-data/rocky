@@ -82,6 +82,13 @@ jobs:
           # would sit unread for seven days while competing for the repo's
           # 10 GB budget against caches that every PR restores from.
           save-if: false
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
       - name: cargo check (x86_64-pc-windows-msvc)
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
 
@@ -103,6 +110,13 @@ jobs:
           workspaces: engine
           # Restore only, matching the other weekly jobs.
           save-if: false
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
       - name: Spool probe (denied directory listing)
         # Prints what the path-presence classifier and the spool readers return
         # when `icacls` denies listing a directory. The test asserts nothing
@@ -184,6 +198,13 @@ jobs:
           workspaces: engine
           # Restore only, matching the other weekly jobs.
           save-if: false
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
       - name: In-process cancel and settle tests
         # The run_cancel module tests, and the run tests that cancel a run
         # through its token. No console events; these check the settle itself.
@@ -227,6 +248,13 @@ jobs:
           # while competing for the repo's 10 GB budget against caches that
           # every PR restores from. Latency does not matter on a schedule.
           save-if: false
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
       # Headroom for the coverage build, which is the largest thing this
       # repository builds anywhere. Buys back roughly 25 GB.
       #
@@ -357,6 +385,13 @@ jobs:
           # while competing for the repo's 10 GB budget against caches that
           # every PR restores from. Latency does not matter on a schedule.
           save-if: false
+      # rust-cache's cleanup deletes every file outside a profile dir but keeps
+      # the folders, so a restored cache holds libduckdb-sys's duckdb-sources/
+      # tree without its `.complete` marker and the build script fails with
+      # DirectoryNotEmpty. Drop it so the build script unpacks a fresh copy.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
       - name: Free disk space and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
