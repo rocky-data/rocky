@@ -63,6 +63,72 @@ pub enum DuckDbError {
 
     #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
     KindSwitchCommitUncertain(duckdb::Error),
+
+    /// A result column holds an untyped `NULL` inside a list, struct, map
+    /// or union. DuckDB 2.0 types it as Arrow `Null`, which the `duckdb`
+    /// crate cannot read inside a nested value.
+    #[error(
+        "column `{column}` holds an untyped NULL inside a nested value ({data_type}), which \
+         Rocky cannot read from DuckDB. Cast it to a concrete type, for example \
+         `[NULL]::INTEGER[]` or `{{'a': NULL::VARCHAR}}`."
+    )]
+    UntypedNullInNestedColumn { column: String, data_type: String },
+}
+
+/// Whether `data_type` holds an Arrow `Null` type below its top level. The
+/// `duckdb` crate panics (`unreachable!`) when it reads such a value.
+fn nests_a_null(data_type: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    fn is_or_nests_a_null(data_type: &DataType) -> bool {
+        matches!(data_type, DataType::Null) || nests_a_null(data_type)
+    }
+    match data_type {
+        DataType::List(field)
+        | DataType::ListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::Map(field, _) => is_or_nests_a_null(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| is_or_nests_a_null(f.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, f)| is_or_nests_a_null(f.data_type())),
+        DataType::Dictionary(key, value) => is_or_nests_a_null(key) || is_or_nests_a_null(value),
+        DataType::RunEndEncoded(run_ends, values) => {
+            is_or_nests_a_null(run_ends.data_type()) || is_or_nests_a_null(values.data_type())
+        }
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Timestamp(..)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => false,
+    }
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -282,9 +348,20 @@ impl DuckDbConnector {
         // `Null` column; 1.x exported it as `int32`. The `duckdb` crate's
         // `row.get` panics (`unreachable!`) on that type, so such a column is
         // read as NULL without asking the crate.
-        let null_typed: Vec<bool> = (0..column_count)
-            .map(|i| stmt_ref.column_type(i) == arrow::datatypes::DataType::Null)
-            .collect();
+        // An untyped NULL nested inside a list or struct panics the same
+        // way, and there is no value to substitute, so it is an error that
+        // names the column.
+        let mut null_typed = Vec::with_capacity(column_count);
+        for (i, column) in columns.iter().enumerate() {
+            let data_type = stmt_ref.column_type(i);
+            if nests_a_null(&data_type) {
+                return Err(DuckDbError::UntypedNullInNestedColumn {
+                    column: column.clone(),
+                    data_type: data_type.to_string(),
+                });
+            }
+            null_typed.push(data_type == arrow::datatypes::DataType::Null);
+        }
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
@@ -762,6 +839,27 @@ mod tests {
             .execute_sql("SELECT current_setting('enable_profiling') AS s")
             .unwrap();
         assert_eq!(setting.rows[0][0], serde_json::Value::Null);
+    }
+
+    /// An untyped NULL inside a list or struct is an error that names the
+    /// column, not a panic. A typed one reads as before.
+    #[test]
+    fn an_untyped_null_inside_a_nested_column_is_an_error_not_a_panic() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        for sql in [
+            "SELECT [NULL] AS xs",
+            "SELECT {'a': NULL} AS xs",
+            "SELECT MAP {1: NULL} AS xs",
+        ] {
+            let err = db.execute_sql(sql).expect_err(sql);
+            assert!(
+                matches!(&err, DuckDbError::UntypedNullInNestedColumn { column, .. } if column == "xs"),
+                "{sql}: {err}"
+            );
+            assert!(err.to_string().contains("Cast it"), "{err}");
+        }
+        let typed = db.execute_sql("SELECT [NULL]::INTEGER[] AS xs").unwrap();
+        assert_eq!(typed.rows.len(), 1);
     }
 
     #[test]
