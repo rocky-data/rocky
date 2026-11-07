@@ -176,12 +176,12 @@ url = "2"
 percent-encoding = "2"
 
 # DuckDB
-# Bounded to the 1.x line (year/upstream-version-coded scheme, 1.10506 and
-# up) so it ships against workspace `arrow 58` directly — earlier 1.4.x
-# releases tracked `arrow 56` and required an IPC-stream bridge inside the
-# rocky-duckdb adapter. The upper bound keeps DuckDB 2.0 out until #2491
-# moves arrow, parquet and duckdb together.
-duckdb = { version = ">=1.10506, <1.20000", features = ["bundled"] }
+# Bounded to the DuckDB 2.x line (year/upstream-version-coded scheme:
+# 1.20000 = DuckDB 2.0). duckdb 1.20000 ships against workspace `arrow 60`;
+# duckdb's RecordBatch is that arrow's type, so arrow, parquet and duckdb move
+# together. The upper bound keeps the next DuckDB major out until it is
+# evaluated the same way (#2491 did 2.0).
+duckdb = { version = ">=1.20000.1, <1.30000", features = ["bundled"] }
 
 # CSV parsing
 csv = "1"
@@ -253,8 +253,8 @@ tower-lsp = "0.20"
 notify = "8"
 
 # Arrow and Parquet stay on duckdb's arrow major (see .github/dependabot.yml)
-arrow = "58"
-parquet = "58"
+arrow = "60"
+parquet = "60"
 
 # WASM
 wasm-bindgen = "0.2"
