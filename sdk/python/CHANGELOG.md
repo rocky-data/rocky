@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-11-07
+
+### Added
+
+- The generated `RunOutput` gains `source_volumes` (`SourceVolumeCheckOutput`: `product`, `model`, `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict`, `reason`), one row per declared source row range a production run checked. `RunResult.source_volumes` carries the same rows. `SourceVolumeCheckOutput` is exported from `rocky_sdk.types_generated`.
+- The generated `ProductStatusOutput` gains an optional `source_volumes` (`ProductSourceVolumeStatus`), and the generated product spec's `SourceSpec` an optional `volume` (`SourceVolumeSpec`).
+- The generated `ConnectorConfig` gains an optional `keep_scratch`.
+
+### Changed
+
+- The generated volume-severity enums are renumbered: `VolumeSeverity` and `VolumeSeverity5`–`VolumeSeverity7` are now `VolumeSeverity3`–`VolumeSeverity6`. Code that imports one of these numbered names must follow the rename; the values are unchanged.
+- Development dependencies are refreshed. `datamodel-code-generator` stays below 0.84, because 0.90 changes the generated `HealthCheck.details` type.
+
 ## [0.29.0] — 2026-10-23
 
 ### Added

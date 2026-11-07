@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.90.0] — 2026-11-07
+
+### Upgrade notes
+
+- Rocky now bundles DuckDB 2.0. A DuckDB database file that this Rocky creates cannot be opened by DuckDB 1.x tools (`Trying to read a database file with version number 69`). Upgrade the DuckDB CLI or library you use beside Rocky to 2.0. An existing 1.x file stays readable by 1.x.
+- On DuckDB, `a % 0` and `a // 0` now fail the statement with `Division by zero` instead of returning NULL, so a scheduled run that divided by zero now fails. Use `TRY(a % b)` where NULL is wanted.
+- On DuckDB, the regex operator `~` now matches anywhere in the string, as in PostgreSQL. A model that filters with `~` can return different rows with no error.
+- On DuckDB, the `E057` unknown-function check now refuses 15 names that DuckDB 2.0 dropped, such as `postgres_scan` and `pg_clear_cache`. The full list is under Changed.
+
 ### Added
 
 - A product spec can declare row ranges on its source tables: `[[product.source.volume]]` with `table` (one of `source.tables`), `min_rows`, `max_rows` (at least one; `min_rows = 0` alone counts) and `severity` (`warning` by default, or `error`). The range is the source table's total rows when the run starts, before the run writes anything. It is not the number of rows the build reads.
