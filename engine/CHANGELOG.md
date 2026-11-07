@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `rocky mcp` now runs on `rmcp` 3.9.0 (was 3.5.1). rmcp 3.6 caps one stdio message at 16 MiB: a larger request is dropped without a reply, so the client waits for an answer that never comes. Protocol-version negotiation is unchanged.
+
 - `rocky load --connector` now removes the scratch directory of a successful run after the state commit. It was kept forever. The directory is the program's `HOME` and `TMPDIR`, so a program's caches and credential files no longer outlive the run. Rocky removes only that run's own directory, never anything else under `output_uri`. A run that fails after the child succeeded still keeps its directory for inspection. Set `keep_scratch = true` under `[connector.<name>]` to keep successful runs' directories too; a Rocky older than this release refuses that key. Scratch directories are now created readable by their owner only (mode `0700`). The JSON `source_dir` still names the directory, which may no longer exist. Staging tables left by a crashed run are still not cleaned up.
 
 - Rocky now bundles DuckDB 2.0.0 (`duckdb` crate 1.20000.1, bounded `<1.30000`), with `arrow` and `parquet` 60 (#2491). Dependabot proposes no DuckDB 3.x. What changes on DuckDB:
