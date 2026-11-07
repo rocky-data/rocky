@@ -17,7 +17,7 @@ updates:
           - patch
     ignore:
       # arrow and parquet follow the duckdb crate's arrow major: engine/Cargo.toml
-      # pins duckdb 1.10506, which ships against arrow 58, and duckdb's
+      # bounds duckdb to the 1.x line from 1.10506, which ships against arrow 58, and duckdb's
       # RecordBatch is that arrow's type. A standalone arrow or parquet major
       # bump does not compile (#2097, #2098). Bump all three by hand, in
       # lockstep, when duckdb moves to the next arrow major.
@@ -29,6 +29,10 @@ updates:
       # link-local IPv6 address (e.g. fe80::1%en0). See #2124.
       - dependency-name: "object_store"
         versions: ["0.14.2"]
+      # DuckDB 2.0 waits on #2491. engine/Cargo.toml bounds duckdb below
+      # 1.20000; this keeps Dependabot from proposing past that bound.
+      - dependency-name: "duckdb"
+        versions: [">=1.20000.0"]
 
   # --- Docs site (Astro / npm) ---
   - package-ecosystem: npm

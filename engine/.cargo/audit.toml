@@ -11,4 +11,12 @@
 # attacker-supplied ciphertext, so the timing oracle the advisory describes is
 # not reachable in our usage. Re-evaluate (and drop this entry) once `rsa`
 # ships a patched release. See crates/rocky-snowflake/src/auth.rs.
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2026-0435 — unbounded allocation in the `thrift` crate's binary
+# protocol `read_bytes`. `thrift 0.17` reaches us only through `parquet 58`,
+# which uses it for types and the compact *output* protocol. parquet decodes
+# file metadata with its own `ThriftSliceInputProtocol`, so the vulnerable
+# reader is not on any path Rocky calls. The fix (`thrift >= 0.23`) needs a
+# parquet major, which moves in lockstep with arrow and duckdb (#2491). Drop
+# this entry when that lands.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0435"]
