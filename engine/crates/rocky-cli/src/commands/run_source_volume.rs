@@ -862,7 +862,11 @@ mod tests {
             )
             .await;
             ran.result.as_ref().expect("a shadow run checks no range");
-            assert!(ran.built("vol"), "the shadow run builds: {}", ran.output);
+            assert!(
+                ran.built("vol_rocky_shadow"),
+                "the shadow run builds: {}",
+                ran.output
+            );
             assert!(
                 !format!("{}", ran.output).contains("product-spec-unloadable"),
                 "{}",
