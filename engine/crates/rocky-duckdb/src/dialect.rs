@@ -352,14 +352,18 @@ impl SqlDialect for DuckDbSqlDialect {
 /// The catalog name DuckDB assigns when it attaches the database file at
 /// `path` as the primary database — mirrors
 /// `AttachedDatabase::ExtractDatabaseName` in DuckDB's own
-/// `src/main/attached_database.cpp` (checked against the bundled 1.10505.0
-/// source and confirmed live against the `duckdb` 1.5.5 CLI, #2005): an
-/// empty path or the literal `:memory:` names the catalog `"memory"` (the
-/// in-memory case — checked *before* the file-stem derivation below, exactly
-/// as DuckDB's own function does). Otherwise: the file's base name (any
-/// `?query` suffix stripped), split on every `.`, with empty pieces dropped
-/// — the FIRST remaining piece is the name. If that name collides with a
-/// catalog DuckDB reserves (`main`, `temp`, `system`), DuckDB appends `_db`.
+/// `src/main/attached_database.cpp` (checked against the bundled DuckDB 2.0
+/// source in `libduckdb-sys` 1.20000.1; first written against 1.10505.0 and
+/// the `duckdb` 1.5.5 CLI, #2005): an empty path or the literal `:memory:`
+/// names the catalog `"memory"` (the in-memory case — checked *before* the
+/// file-stem derivation below, exactly as DuckDB's own function does).
+/// Otherwise: the file's base name split on every `.`, with empty pieces
+/// dropped — the FIRST remaining piece, with any `?query` suffix stripped
+/// (`FileSystem::ExtractBaseName`, then `RemoveQueryParams`), is the name.
+/// If that name equals a catalog DuckDB reserves (`main`, `temp`, `system`),
+/// ignoring case, DuckDB appends `_db`. DuckDB 2.0 made that comparison
+/// case-insensitive (`Identifier` equality is `CIEquals`); 1.x compared
+/// exact strings.
 ///
 /// No such derivation existed anywhere in this crate before this function —
 /// `rocky-duckdb` just opens the file and lets the bundled DuckDB engine
@@ -370,6 +374,7 @@ impl SqlDialect for DuckDbSqlDialect {
 /// Examples (confirmed against the live CLI):
 /// - `"warehouse.duckdb"` -> `"warehouse"`
 /// - `"main.duckdb"` -> `"main_db"` (collides with the reserved `main` catalog)
+/// - `"MAIN.duckdb"` -> `"MAIN_db"` (the reserved check ignores case)
 /// - `"my.warehouse.duckdb"` -> `"my"` (DuckDB splits on the FIRST `.`, not the last —
 ///   this differs from [`std::path::Path::file_stem`], which would return `"my.warehouse"`)
 /// - `":memory:"` or `""` -> `"memory"`
@@ -381,13 +386,17 @@ pub fn catalog_name_for_path(path: &str) -> String {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(path);
-    // DuckDB strips a `?query` suffix before splitting on `.`
-    // (`RemoveQueryParams` in `attached_database.cpp`).
-    let base = base.split('?').next().unwrap_or(base);
+    // DuckDB takes the first `.` piece (`FileSystem::ExtractBaseName`), then
+    // strips a `?query` suffix from it (`RemoveQueryParams`).
     let first_segment = base.split('.').find(|s| !s.is_empty()).unwrap_or(base);
-    match first_segment {
-        "main" | "temp" | "system" => format!("{first_segment}_db"),
-        other => other.to_string(),
+    let name = first_segment.split('?').next().unwrap_or(first_segment);
+    if ["main", "temp", "system"]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        format!("{name}_db")
+    } else {
+        name.to_string()
     }
 }
 
@@ -410,11 +419,13 @@ mod catalog_name_for_path_tests {
     }
 
     #[test]
-    fn reserved_check_is_case_sensitive() {
-        // Matches DuckDB's own `name == DEFAULT_SCHEMA` exact-string check —
-        // "MAIN.duckdb" does NOT get the "_db" suffix (it instead fails to
-        // attach at all, a live-adapter concern, not this pure function's).
-        assert_eq!(catalog_name_for_path("MAIN.duckdb"), "MAIN");
+    fn reserved_check_ignores_case() {
+        // DuckDB 2.0's `NameIsReserved` compares `Identifier`s, whose
+        // equality is case-insensitive (`StringUtil::CIEquals`). The
+        // suffix keeps the file's own spelling.
+        assert_eq!(catalog_name_for_path("MAIN.duckdb"), "MAIN_db");
+        assert_eq!(catalog_name_for_path("Temp.duckdb"), "Temp_db");
+        assert_eq!(catalog_name_for_path("SYSTEM"), "SYSTEM_db");
     }
 
     #[test]
@@ -463,6 +474,31 @@ mod catalog_name_for_path_tests {
     #[test]
     fn empty_path_names_the_memory_catalog() {
         assert_eq!(catalog_name_for_path(""), "memory");
+    }
+
+    /// The mirror must give the name the bundled DuckDB actually assigns.
+    /// Each path is opened for real and `current_database()` is compared, so
+    /// a DuckDB upgrade that changes the rule fails here (DuckDB 2.0 made the
+    /// reserved-name check case-insensitive).
+    #[test]
+    fn the_mirror_matches_the_bundled_duckdb() {
+        for file in [
+            "warehouse.duckdb",
+            "main.duckdb",
+            "MAIN.duckdb",
+            "Temp.duckdb",
+            "my.warehouse.duckdb",
+            "warehouse",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(file);
+            let path = path.to_str().unwrap();
+            let conn = duckdb::Connection::open(path).unwrap();
+            let actual: String = conn
+                .query_row("SELECT current_database()", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(catalog_name_for_path(path), actual, "path {file:?}");
+        }
     }
 }
 
