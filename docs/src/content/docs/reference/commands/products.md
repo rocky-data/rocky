@@ -105,7 +105,7 @@ Rocky counts before the model phase writes anything and before the skip gate run
 - A table that two ranges name, in one product or in two, is counted once.
 - Rocky counts the tables one after another, on the run's warehouse connection.
 - On a view, an external table or a federated table, the count scans the whole table. A cancelled run stops waiting for a count that has started. On most warehouses the query stops too; on DuckDB it runs to completion in the background.
-- A spec Rocky cannot read or parse at run time is skipped with a warning, so its ranges are not checked, even at `error`. `rocky product verify` refuses such a spec; run it in CI to catch this.
+- A production run refuses its model phase when any spec in `products/` cannot be read, parsed or validated, or when `products/` cannot be listed. The error is `[product-spec-unloadable]`. It names the file and the command that confirms the fix (`rocky product verify <name>`). A spec that does not load names no output model, so the whole model phase stops, before any model write. A shadow or branch run checks no range, so it only warns. Keep drafts outside `products/`, and run `rocky product verify` in CI to catch a broken spec before a scheduled run does.
 - Shadow, branch and backfill runs count nothing.
 - A replication pipeline that also builds models copies its tables first. The count then sees the copied rows.
 
