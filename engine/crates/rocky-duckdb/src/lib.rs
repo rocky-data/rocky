@@ -289,8 +289,8 @@ impl DuckDbConnector {
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
             let mut values = Vec::with_capacity(column_count);
-            for i in 0..column_count {
-                if null_typed[i] {
+            for (i, &is_null_typed) in null_typed.iter().enumerate() {
+                if is_null_typed {
                     values.push(serde_json::Value::Null);
                     continue;
                 }
