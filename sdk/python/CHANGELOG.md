@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Monthly product budgets. The generated `ProductMonthCost` gains `budget` and `breach_events`, `RunOutput` gains `product_budgets`, and `ProductStatusOutput` gains `cost_month` and `cost_month_error`; each is `None` or empty when the engine leaves it out. New generated models: `ProductBudgetStatus`, `ProductBudgetCheck`, `ProductBudgetBreachEvent`, `ProductBudgetVerdict`, `ProductBudgetLimitType`, `RunProductBudget` and `ProductCostMonth`. The generated project config gains `ProductBudgetConfig` and `ProductBudgetBreachAction`.
+
 ## [0.31.0] — 2026-11-08
 
 ### Added

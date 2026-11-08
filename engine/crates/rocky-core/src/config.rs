@@ -391,6 +391,15 @@ pub enum ConfigError {
     },
     #[error("[cost] {key} = {value} is not a valid price: it must be a finite number, 0 or more")]
     CostPriceInvalid { key: &'static str, value: f64 },
+    #[error(
+        "[product_budget.{product}] {key} = {value} is not a valid limit: it must be a finite \
+         number, 0 or more"
+    )]
+    ProductBudgetLimitInvalid {
+        product: String,
+        key: &'static str,
+        value: f64,
+    },
     #[error("[pipeline.{pipeline}.source.discovery.sync] {reason}")]
     SourceSyncInvalid { pipeline: String, reason: String },
     #[error(
@@ -2739,6 +2748,63 @@ pub struct BudgetBreach {
     pub actual: f64,
 }
 
+/// What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn`
+/// exists: the breach is reported and the `on_budget_breach` hook fires, and
+/// the run's exit code does not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductBudgetBreachAction {
+    #[default]
+    Warn,
+}
+
+/// One `[product_budget.<name>]` table: a month-to-date budget for one data
+/// product, checked at the end of every production `rocky run`.
+///
+/// Each limit tests what the product is charged this month (`kept` plus
+/// `allocated_upstream` in `rocky cost --month --by product`), in the month
+/// of the project's `[schedule].timezone`. A limit left unset is not checked.
+///
+/// ```toml
+/// [product_budget.orders]
+/// max_compute_hours = 40
+/// max_storage_gb_month = 200
+/// max_usd = 120.0
+/// on_breach = "warn"
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductBudgetConfig {
+    /// Most model time the product may be charged this month, in hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_compute_hours: Option<f64>,
+
+    /// Most stored data the product may be charged this month, in GB-months
+    /// (1 GB = 2^30 bytes). Each storage basis is checked on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_storage_gb_month: Option<f64>,
+
+    /// Most USD the product may be charged this month. Needs the matching
+    /// `[cost]` prices (`compute_cost_per_machine_hour`,
+    /// `storage_cost_per_gb_month`); without them it is not evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+
+    /// What a breach does. Only `warn`.
+    #[serde(default)]
+    pub on_breach: ProductBudgetBreachAction,
+}
+
+impl ProductBudgetConfig {
+    /// True when no limit is set: nothing is checked.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.max_compute_hours.is_none()
+            && self.max_storage_gb_month.is_none()
+            && self.max_usd.is_none()
+    }
+}
+
 /// Per-model `[budget]` overrides declared in a model sidecar.
 ///
 /// Same field set as [`BudgetConfig`], but every field — including
@@ -3322,6 +3388,13 @@ pub struct RockyConfig {
     /// semantics of each limit and the breach action.
     #[serde(default)]
     pub budget: BudgetConfig,
+
+    /// Monthly budgets per data product, keyed by product name. See
+    /// [`ProductBudgetConfig`]. Absent means empty, and the key is not
+    /// serialized, so a project without it keeps its config snapshot
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub product_budget: std::collections::BTreeMap<String, ProductBudgetConfig>,
 
     /// The removed `[schema_evolution]` section.
     ///
@@ -4866,6 +4939,30 @@ pub fn validate_cost_prices(config: &RockyConfig) -> Vec<ConfigError> {
         .filter(|(_, value)| !value.is_finite() || *value < 0.0)
         .map(|(key, value)| ConfigError::CostPriceInvalid { key, value })
         .collect()
+}
+
+/// Validate that every `[product_budget.<name>]` limit is finite and not
+/// negative.
+pub fn validate_product_budget_limits(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (product, budget) in &config.product_budget {
+        for (key, value) in [
+            ("max_compute_hours", budget.max_compute_hours),
+            ("max_storage_gb_month", budget.max_storage_gb_month),
+            ("max_usd", budget.max_usd),
+        ] {
+            if let Some(value) = value
+                && (!value.is_finite() || value < 0.0)
+            {
+                errors.push(ConfigError::ProductBudgetLimitInvalid {
+                    product: product.clone(),
+                    key,
+                    value,
+                });
+            }
+        }
+    }
+    errors
 }
 
 /// Validate every `[pipeline.<name>.source.discovery.sync]` table.
@@ -9257,6 +9354,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_metadata_columns,
     validate_residency,
     validate_cost_prices,
+    validate_product_budget_limits,
     validate_source_sync,
     validate_connectors,
 ];
@@ -13076,6 +13174,73 @@ schema_template = "raw"
             format!("{err:#}").contains("storage_cost_per_gb_month"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn product_budget_parses_every_key() {
+        let config: RockyConfig = toml::from_str(
+            "[product_budget.orders]\nmax_compute_hours = 40\nmax_storage_gb_month = 200\n\
+             max_usd = 120.0\non_breach = \"warn\"\n",
+        )
+        .unwrap();
+        let budget = &config.product_budget["orders"];
+        assert_eq!(budget.max_compute_hours, Some(40.0));
+        assert_eq!(budget.max_storage_gb_month, Some(200.0));
+        assert_eq!(budget.max_usd, Some(120.0));
+        assert_eq!(budget.on_breach, ProductBudgetBreachAction::Warn);
+        assert!(!budget.is_unset());
+        assert!(validate_product_budget_limits(&config).is_empty());
+    }
+
+    /// Only `warn` exists; a typo or an `error` action does not load.
+    #[test]
+    fn product_budget_refuses_other_actions_and_unknown_keys() {
+        for body in ["on_breach = \"error\"\n", "max_hours = 1\n"] {
+            let parsed: Result<RockyConfig, _> =
+                toml::from_str(&format!("[product_budget.orders]\n{body}"));
+            assert!(parsed.is_err(), "{body} parsed");
+        }
+    }
+
+    #[test]
+    fn product_budget_limit_must_be_finite_and_not_negative() {
+        for key in ["max_compute_hours", "max_storage_gb_month", "max_usd"] {
+            for literal in ["-1.0", "nan", "inf"] {
+                let config: RockyConfig =
+                    toml::from_str(&format!("[product_budget.orders]\n{key} = {literal}\n"))
+                        .unwrap();
+                let errors = validate_product_budget_limits(&config);
+                assert!(
+                    matches!(
+                        errors.as_slice(),
+                        [ConfigError::ProductBudgetLimitInvalid { product, key: k, .. }]
+                            if product == "orders" && *k == key
+                    ),
+                    "{key} = {literal}: {errors:?}"
+                );
+            }
+        }
+        let zero: RockyConfig =
+            toml::from_str("[product_budget.orders]\nmax_usd = 0\n").unwrap();
+        assert!(validate_product_budget_limits(&zero).is_empty());
+    }
+
+    #[test]
+    fn load_rocky_config_rejects_a_negative_product_budget() {
+        let (_d, path) = write_cfg(
+            "[adapter]\ntype = \"duckdb\"\n\n[product_budget.orders]\nmax_usd = -1.0\n",
+        );
+        let err = load_rocky_config(&path).expect_err("a negative limit must not load");
+        assert!(format!("{err:#}").contains("max_usd"), "{err:#}");
+    }
+
+    /// A project with no `[product_budget]` serializes no such key, so its
+    /// config snapshot and section digests do not move.
+    #[test]
+    fn absent_product_budget_is_not_serialized() {
+        let config: RockyConfig = toml::from_str("[adapter.default]\ntype = \"duckdb\"\n").unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("product_budget"));
     }
 
     #[test]

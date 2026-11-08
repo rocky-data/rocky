@@ -479,6 +479,40 @@ impl HookContext {
         ctx
     }
 
+    /// Build a [`HookContext`] for a monthly product budget breach.
+    ///
+    /// The same event and keys as [`Self::budget_breach`], plus three
+    /// metadata keys that tell it apart from a run-level breach:
+    /// `scope = "product_month"`, `product` (the product name) and `month`
+    /// (`YYYY-MM`, in the project's `[schedule].timezone`). `limit_type` is
+    /// `max_compute_hours`, `max_storage_gb_month` or `max_usd`. `run_id` is
+    /// the production run at which the product's month-to-date charge first
+    /// went over the limit.
+    pub fn product_budget_breach(
+        run_id: &str,
+        pipeline: &str,
+        product: &str,
+        month: &str,
+        limit_type: &str,
+        limit: f64,
+        actual: f64,
+    ) -> Self {
+        let mut ctx = Self::budget_breach(run_id, pipeline, limit_type, limit, actual);
+        ctx.metadata.insert(
+            "scope".to_string(),
+            serde_json::Value::String("product_month".to_string()),
+        );
+        ctx.metadata.insert(
+            "product".to_string(),
+            serde_json::Value::String(product.to_string()),
+        );
+        ctx.metadata.insert(
+            "month".to_string(),
+            serde_json::Value::String(month.to_string()),
+        );
+        ctx
+    }
+
     /// Creates a synthetic test context for `rocky hooks test`.
     pub fn synthetic(event: HookEvent, pipeline: &str) -> Self {
         let mut ctx = Self::new(event, "test-run-id", pipeline);
@@ -1004,6 +1038,30 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn product_budget_breach_carries_scope_product_and_month() {
+        let ctx = HookContext::product_budget_breach(
+            "run-7",
+            "main",
+            "orders",
+            "2026-10",
+            "max_compute_hours",
+            40.0,
+            41.5,
+        );
+        assert_eq!(ctx.event, HookEvent::BudgetBreach);
+        assert_eq!(ctx.run_id, "run-7");
+        assert_eq!(ctx.metadata["scope"], "product_month");
+        assert_eq!(ctx.metadata["product"], "orders");
+        assert_eq!(ctx.metadata["month"], "2026-10");
+        assert_eq!(ctx.metadata["limit_type"], "max_compute_hours");
+        assert_eq!(ctx.metadata["limit"], 40.0);
+        assert_eq!(ctx.metadata["actual"], 41.5);
+        // A run-level breach has no scope key.
+        let run_level = HookContext::budget_breach("run-7", "main", "max_usd", 1.0, 2.0);
+        assert!(!run_level.metadata.contains_key("scope"));
+    }
 
     // -- Shell-command platform builder --
 

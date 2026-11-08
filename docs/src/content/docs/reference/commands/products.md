@@ -244,6 +244,15 @@ When the spec declares `[[product.source.volume]]`, status also reports `source_
 | `row_count`, `counted_at`, `run_id` | The count from the newest production run that counted this product's sources, and when that run started. Absent when that run took no count of this table. |
 | `verdict` | That count judged against the range the spec declares now, or `not_evaluated` when there is no count. |
 
+When the spec parses, status also reports `cost_month`: the product's cost for the current month, in the project's `[schedule].timezone`.
+
+| Field | Meaning |
+|---|---|
+| `month`, `timezone`, `as_of`, `history_complete` | The month reported, its time zone, when it was computed, and whether run history covers it. |
+| `cost` | The product's row from [`rocky cost --month <month> --by product`](/reference/commands/administration/#one-month-split-by-product): `built`, `kept`, `charged`, money, and, when it has a [`[product_budget.NAME]`](/reference/configuration/#product_budgetname), `budget` and `breach_events`. |
+
+When the month cannot be computed, `cost_month` is absent and `cost_month_error` says why. Only `rocky product status` reports `cost_month`; `rocky product list` does not.
+
 ### JSON output
 
 `ProductStatusOutput` — every field above, machine-readable.

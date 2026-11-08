@@ -30,6 +30,7 @@ Two mandatory sections (`[adapter]` + at least one `[pipeline.<name>]`) plus opt
 [state]                  # Embedded state store backend
 [cache.schemas]          # Schema (DESCRIBE) cache: enabled, ttl_seconds, replicate, trusted_max_age_seconds, strict_sources
 [cost]                   # Cost model for `rocky optimize`
+[product_budget.<name>]   # Monthly budget for one data product (warn only)
 [hook.<event>]           # Lifecycle hooks (one per event)
 # Governance (tags, grants, workspace bindings) is NOT a top-level table:
 # it lives under [pipeline.<name>.target.governance]. A top-level

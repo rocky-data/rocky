@@ -35,6 +35,7 @@ One row per top-level block:
 | [`[resilience]`](#resilience) | Retry a model that failed for a transient reason. On by default. |
 | [`[retry]`](#retry) | One shared connector retry budget for the run. |
 | [`[budget]`](#budget) | Limits on cost, time and bytes scanned per run. |
+| [`[product_budget.NAME]`](#product_budgetname) | A monthly budget for one data product. |
 | [`[cost]`](#cost) | Warehouse prices for `rocky optimize`. |
 | [`[cache]`](#cache) | The schema cache for typechecking. |
 | [`[freshness]`](#freshness) | Project-wide staleness budget. |
@@ -992,6 +993,43 @@ Put a ceiling on what one run may cost, how long it may take, and how much it ma
 The three limits are independent, and any one of them breaching trips the event. Rocky evaluates them once per run against the observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route a breach into a notification system.
 
 Each [`BudgetBreachOutput`](/reference/json-output/) carries a `limit_type` tag: `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`. A consumer can branch on the dimension that broke without matching strings in the human message.
+
+---
+
+## `[product_budget.NAME]`
+
+Put a monthly ceiling on what one data product is charged. `NAME` is the product name, the same as `products/NAME.toml`. `[budget]` checks one run; this checks one product's month to date, across runs.
+
+```toml
+[product_budget.orders]
+max_compute_hours = 40       # model time
+max_storage_gb_month = 200   # stored data, each storage basis on its own
+max_usd = 120.0              # needs prices in [cost]
+on_breach = "warn"           # the only value
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_compute_hours` | float | | Most model time the product may be charged this month, in hours. |
+| `max_storage_gb_month` | float | | Most stored data the product may be charged this month, in GB-months (1 GB = 2^30 bytes). Each storage basis (`data_files`, `allocated_blocks`) is checked on its own; they are never added together. |
+| `max_usd` | float | | Most USD the product may be charged this month. Rocky prices the charge from your [`[cost]`](#cost) prices only, the same money that `rocky cost --month --by product` shows. With no price, this limit is not evaluated. |
+| `on_breach` | string | `"warn"` | Only `"warn"`. A breach is reported and fires the hook. The run's exit code does not change. |
+
+Each limit must be a finite number, 0 or more. A limit left unset is not checked. Rocky rejects an unknown field here.
+
+**What is tested.** The figure the product is **charged** in `rocky cost --month <YYYY-MM> --by product`: `kept` plus `allocated_upstream`. When another product reads a table this product builds, that build is charged to the reader. Then this product's own budget does not see it. `built` shows the product's own spend beside it, but the budget does not test `built`. A product's month is cut in the project's `[schedule].timezone`, the same month `rocky cost --month` uses.
+
+**When.** At the end of every production `rocky run`, after the run record is written, Rocky checks **every** product that has a budget, not only the products whose models ran. A new reader of a shared table changes every reader's share, and stored data accrues with time. So a product can cross its limit, or come back under it, at a run of another pipeline. Shadow and branch runs check nothing.
+
+**Verdict.** `in_budget`, `breached` or `not_evaluated`. `breached` when any limit is over (more than the limit, not equal to it). Otherwise `not_evaluated` when any limit cannot be checked: `max_usd` has no price, or the month measured no model time or no stored size. When run history does not cover the whole month (state retention swept part of it), the verdict is always `not_evaluated`. Rocky never reports `in_budget` by default.
+
+**Breach events.** A breach event is recorded each time a product goes from not over to over. Rocky finds them by checking the budget again after each production run of the month, in order. A product that goes over, back under and over again has two events. Each event names the run (`run_id`) after which the product was over, with the limit and the figure. An event is never withdrawn, even when a later run moves the product back under. A run where the verdict is `not_evaluated` neither ends a breach nor starts one.
+
+**The hook.** `on_budget_breach` fires once for each exceeded limit, only at the run that made the change. Its metadata has `scope = "product_month"`, `product` and `month` beside the usual `limit_type`, `limit` and `actual`. See [Hooks](/concepts/hooks/).
+
+**Where to read it.** `rocky run --output json` has `product_budgets`; `rocky cost --month <YYYY-MM> --by product` has `budget` and `breach_events` on each product; `rocky product status` has `cost_month`.
+
+`rocky validate` warns with **V065** when `NAME` matches no file in `products/`, and with **V066** when `[product_budget]` is set and `[state.retention] max_age_days` is below 62.
 
 ---
 

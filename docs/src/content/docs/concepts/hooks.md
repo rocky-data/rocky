@@ -92,6 +92,16 @@ Rocky fires 18 events, grouped into six phases:
 |-------|------|----------|
 | `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) | Page oncall on overspend |
 
+`budget_breach` also fires when a data product goes over its monthly budget, declared in [`[product_budget.NAME]`](/reference/configuration/#product_budgetname). It fires once for each exceeded limit, at the end of the production run after which the product was first over. It does not fire again while the product stays over. Its `metadata` then has three more keys, so a hook can tell the two apart:
+
+| Key | Value |
+|-----|-------|
+| `scope` | `"product_month"`. A run-level breach has no `scope`. |
+| `product` | The product name. |
+| `month` | The month, `YYYY-MM`, in the project's `[schedule].timezone`. |
+
+`limit_type` is `max_compute_hours`, `max_storage_gb_month` or `max_usd`; `limit` and `actual` are in hours, GB-months or USD. A product breach never changes the run's exit code. Unlike the pipeline events, it also fires for a model-only run such as `rocky run --model X`.
+
 :::note[Event names carry an `on_` prefix in config]
 The bare names above (`pipeline_start`, `budget_breach`, …) are what Rocky writes into the `event` field of the JSON context. When you **reference** an event — as a `[hook.*]` config key or as the `rocky hooks test` argument — prefix it with `on_`: `on_pipeline_start`, `on_budget_breach`, and so on. An unknown/unprefixed key is ignored with a warning rather than firing.
 :::
