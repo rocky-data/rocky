@@ -115,6 +115,191 @@ pub struct ConnectorConfig {
     /// would otherwise outlive the run. A failed run always keeps it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_scratch: bool,
+
+    /// `[connector.<name>.options]`: settings for the program, as any TOML
+    /// table. Rocky writes it as JSON to `options.json` in the scratch
+    /// directory and passes the path as `options_path` in the request. Not
+    /// for secrets: the file is written to disk in clear. At most 64 KiB as
+    /// JSON.
+    #[serde(default, skip_serializing_if = "ConnectorOptions::is_empty")]
+    pub options: ConnectorOptions,
+}
+
+/// Name of the options file Rocky writes into each scratch directory.
+pub const OPTIONS_FILE_NAME: &str = "options.json";
+
+/// Largest `[connector.<name>.options]` table Rocky accepts, measured as the
+/// bytes of `options.json`: 64 KiB.
+pub const MAX_OPTIONS_BYTES: usize = 64 * 1024;
+
+/// `[connector.<name>.options]`, already in its JSON form.
+///
+/// The TOML table is converted once, when the config is read. Every TOML
+/// value has a JSON form except two:
+///
+/// - A datetime becomes a string. An offset datetime is RFC 3339
+///   (`1979-05-27T07:32:00Z`). A local datetime, date or time is written as
+///   TOML spells it (`1979-05-27T07:32:00`, `1979-05-27`, `07:32:00`).
+/// - A float that is `nan` or `inf` has no JSON form, so the config is
+///   refused.
+///
+/// Prints, serializes and hashes as the JSON object.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ConnectorOptions(serde_json::Map<String, serde_json::Value>);
+
+impl ConnectorOptions {
+    /// `true` when no option is set. An absent table and an empty one are
+    /// the same.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The options as a JSON object.
+    pub fn as_map(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.0
+    }
+
+    /// The exact bytes of `options.json`: compact JSON, `{}` when no option
+    /// is set. The size cap measures these bytes, so the cap and the file
+    /// can never disagree.
+    pub fn to_json_bytes(&self) -> Vec<u8> {
+        // A map of JSON values always serializes.
+        serde_json::to_vec(&self.0).unwrap_or_else(|_| b"{}".to_vec())
+    }
+
+    /// Every option key or value that holds a value Rocky substituted from
+    /// the environment, as `(path, rendered)`. Both are rendered with each
+    /// secret replaced by `${NAME}`, so both are safe to print: a key can
+    /// hold a secret too.
+    ///
+    /// This reads the process's substitution registry, so it sees only
+    /// values of at least [`crate::secret_registry::SECRET_LENGTH_FLOOR`]
+    /// bytes, and never the literal default of `${VAR:-default}`.
+    pub fn substituted_values(&self) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for (key, value) in &self.0 {
+            walk_substituted(key, Some(key), value, &mut found);
+        }
+        found
+    }
+}
+
+/// An option path as it may be printed: every substituted value in it,
+/// in any key, replaced by `${NAME}`.
+fn safe_path(path: &str) -> String {
+    crate::secret_registry::render_placeholders(path)
+}
+
+/// Collects into `found` each key or leaf under `path` that renders
+/// differently through the secret registry.
+fn walk_substituted(
+    path: &str,
+    key: Option<&str>,
+    value: &serde_json::Value,
+    found: &mut Vec<(String, String)>,
+) {
+    use serde_json::Value;
+    if let Some(key) = key {
+        let rendered = crate::secret_registry::render_placeholders(key);
+        if rendered != key {
+            found.push((safe_path(path), rendered));
+        }
+    }
+    match value {
+        Value::String(s) => {
+            let rendered = crate::secret_registry::render_placeholders(s);
+            if &rendered != s {
+                found.push((safe_path(path), rendered));
+            }
+        }
+        Value::Number(n) => {
+            let text = n.to_string();
+            let rendered = crate::secret_registry::render_placeholders(&text);
+            if rendered != text {
+                found.push((safe_path(path), rendered));
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                walk_substituted(&format!("{path}[{i}]"), None, item, found);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                walk_substituted(&format!("{path}.{k}"), Some(k), v, found);
+            }
+        }
+        Value::Bool(_) | Value::Null => {}
+    }
+}
+
+/// TOML value to JSON value. `path` names the value in an error.
+fn toml_to_json(path: &str, value: toml::Value) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    Ok(match value {
+        toml::Value::String(s) => Value::String(s),
+        toml::Value::Integer(i) => Value::from(i),
+        toml::Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .ok_or_else(|| {
+                format!(
+                    "options `{}` is {f}, which JSON cannot hold; use a string",
+                    safe_path(path)
+                )
+            })?,
+        toml::Value::Boolean(b) => Value::Bool(b),
+        toml::Value::Datetime(dt) => Value::String(dt.to_string()),
+        toml::Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(i, item)| toml_to_json(&format!("{path}[{i}]"), item))
+                .collect::<Result<_, _>>()?,
+        ),
+        toml::Value::Table(table) => Value::Object(table_to_json(Some(path), table)?),
+    })
+}
+
+fn table_to_json(
+    prefix: Option<&str>,
+    table: toml::Table,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut map = serde_json::Map::new();
+    for (key, value) in table {
+        let path = match prefix {
+            Some(p) => format!("{p}.{key}"),
+            None => key.clone(),
+        };
+        let json = toml_to_json(&path, value)?;
+        map.insert(key, json);
+    }
+    Ok(map)
+}
+
+impl<'de> Deserialize<'de> for ConnectorOptions {
+    /// Reads a TOML table, from TOML or from its JSON form, and converts it.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let table = toml::Table::deserialize(deserializer)?;
+        table_to_json(None, table)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// An object with any keys, so the exported schema accepts any table.
+impl JsonSchema for ConnectorOptions {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <std::collections::BTreeMap<String, serde_json::Value>>::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <std::collections::BTreeMap<String, serde_json::Value>>::json_schema(generator)
+    }
 }
 
 /// `target` of a connector: the table it fills.
@@ -427,6 +612,20 @@ pub fn check_connector_block(
             problems.push(format!("secrets entry `{secret}` is listed more than once"));
         }
     }
+    let options_bytes = connector.options.to_json_bytes().len();
+    if options_bytes > MAX_OPTIONS_BYTES {
+        problems.push(format!(
+            "options is {options_bytes} bytes as JSON, but the most allowed is \
+             {MAX_OPTIONS_BYTES} (64 KiB)"
+        ));
+    }
+    for (path, rendered) in connector.options.substituted_values() {
+        problems.push(format!(
+            "options `{path}` holds a value substituted from the environment \
+             (`{rendered}`). Options are written to disk in clear and must not hold \
+             secrets; list the variable under `secrets` instead"
+        ));
+    }
     for (field, value) in [
         ("schema", &connector.target.schema),
         ("table", &connector.target.table),
@@ -464,6 +663,92 @@ command = ["./run.sh"]
 state_schema_version = 1
 egress_hosts = []
 "#;
+
+    #[derive(Deserialize)]
+    struct OptionsOnly {
+        options: ConnectorOptions,
+    }
+
+    fn options(body: &str) -> ConnectorOptions {
+        toml::from_str::<OptionsOnly>(&format!("[options]\n{body}"))
+            .unwrap()
+            .options
+    }
+
+    #[test]
+    fn options_keep_every_toml_type_as_json() {
+        let opts = options(
+            r#"
+schema = "public"
+batch = 500
+ratio = 0.25
+enabled = true
+tables = ["a", "b"]
+offset_at = 1979-05-27T07:32:00Z
+local_at = 1979-05-27T07:32:00
+day = 1979-05-27
+clock = 07:32:00
+[options.nested]
+depth = { level = 2 }
+[[options.streams]]
+name = "s1"
+[[options.streams]]
+name = "s2"
+"#,
+        );
+        let expected = serde_json::json!({
+            "schema": "public",
+            "batch": 500,
+            "ratio": 0.25,
+            "enabled": true,
+            "tables": ["a", "b"],
+            "offset_at": "1979-05-27T07:32:00Z",
+            "local_at": "1979-05-27T07:32:00",
+            "day": "1979-05-27",
+            "clock": "07:32:00",
+            "nested": { "depth": { "level": 2 } },
+            "streams": [{ "name": "s1" }, { "name": "s2" }],
+        });
+        let written: serde_json::Value = serde_json::from_slice(&opts.to_json_bytes()).unwrap();
+        assert_eq!(written, expected);
+        assert!(written["batch"].is_i64(), "an integer stays an integer");
+    }
+
+    #[test]
+    fn no_options_write_an_empty_object() {
+        assert_eq!(ConnectorOptions::default().to_json_bytes(), b"{}");
+    }
+
+    #[test]
+    fn options_round_trip_through_their_json_form() {
+        let opts = options("a = 1\nwhen = 1979-05-27T07:32:00Z\n[options.t]\nb = [true]\n");
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: ConnectorOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, opts);
+    }
+
+    #[test]
+    fn an_infinite_option_is_refused_with_its_path() {
+        let err = toml::from_str::<OptionsOnly>("[options.inner]\nlist = [1.0, inf]\n")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("options `inner.list[1]`"), "{err}");
+    }
+
+    #[test]
+    fn a_nan_under_a_substituted_key_prints_the_key_as_a_placeholder() {
+        let secret = "rocky-option-key-secret-7d21e0";
+        crate::secret_registry::register_substitution("ROCKY_TEST_OPTION_KEY_NAN", secret);
+        let err = toml::from_str::<OptionsOnly>(&format!("[options.\"{secret}\"]\nratio = nan\n"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("options `${ROCKY_TEST_OPTION_KEY_NAN}.ratio`"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn a_good_manifest_loads() {

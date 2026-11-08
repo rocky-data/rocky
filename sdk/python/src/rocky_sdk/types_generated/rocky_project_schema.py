@@ -3411,6 +3411,10 @@ class ConnectorConfig(BaseModel):
     """
     Path to the connector's `connector.toml`, relative to the directory that holds `rocky.toml`.
     """
+    options: dict[str, Any] | None = None
+    """
+    `[connector.<name>.options]`: settings for the program, as any TOML table. Rocky writes it as JSON to `options.json` in the scratch directory and passes the path as `options_path` in the request. Not for secrets: the file is written to disk in clear. At most 64 KiB as JSON.
+    """
     output_uri: str
     """
     Where the connector writes. Only `file://` is supported. A relative path is relative to the directory that holds `rocky.toml`. Each attempt gets its own new directory inside it.

@@ -70,8 +70,13 @@ def us_to_cursor(micros):
     return (EPOCH + timedelta(microseconds=micros)).strftime(CURSOR_FORMAT)
 
 
-def load_source():
-    path = os.path.join(HERE, "source.json")
+def load_source(request):
+    # Rocky writes [connector.<name>.options] from rocky.toml to options.json
+    # and passes its path in the request. The file always exists; it holds {}
+    # when rocky.toml sets no option.
+    path = request.get("options_path")
+    if not isinstance(path, str) or not path:
+        fail("the request has no options_path; this Rocky is too old")
     try:
         with open(path, encoding="utf-8") as handle:
             source = json.load(handle)
@@ -79,7 +84,7 @@ def load_source():
         fail("cannot read %s: %s" % (path, error))
     for key in ("schema", "table", "cursor_column"):
         if not isinstance(source.get(key), str) or not source[key]:
-            fail("source.json needs a non-empty string %r" % key)
+            fail("[connector.<name>.options] needs a non-empty string %r" % key)
     ext_dir = source.get("extension_directory") or ".duckdb-extensions"
     # A relative directory is relative to this file, not to the scratch
     # directory, so the extension downloads once and stays out of the landing.
@@ -180,7 +185,7 @@ def main():
     if not isinstance(output_dir, str) or not os.path.isdir(output_dir):
         fail("the request has no usable output_dir")
 
-    source = load_source()
+    source = load_source(request)
     lower_us = read_cursor(request)
     table = "pg.%s.%s" % (ident(source["schema"]), ident(source["table"]))
     column = ident(source["cursor_column"])

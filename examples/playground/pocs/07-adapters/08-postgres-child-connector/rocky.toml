@@ -18,3 +18,12 @@ output_uri = "file://./.rocky/landing/pg_events"
 secrets    = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]
 target     = { catalog = "poc", schema = "main", table = "events" }
 retries    = 0
+
+# Settings for the program. Rocky writes this table as JSON to options.json
+# in the scratch directory and passes its path as `options_path` in the
+# request. Not for secrets: the file is on disk in clear.
+[connector.pg_events.options]
+schema        = "public"
+table         = "events"
+cursor_column = "created_at"
+# extension_directory = ".duckdb-extensions"   # relative to connector/main.py

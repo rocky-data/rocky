@@ -115,6 +115,7 @@ impl Case {
             landing_dir: &self.landing,
             retries: self.retries,
             output_poll: Duration::from_millis(100),
+            options_json: b"{}",
         })
         .await
     }
