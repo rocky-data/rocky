@@ -530,7 +530,12 @@ pub const W013: &str = "W013";
 /// The compile still succeeds, but `/api/v1/models` and `/api/v1/dag` show
 /// only `models/`, not the union of every pipeline's models. When `models/`
 /// itself holds no model, the compile fails with the load error instead
-/// (`engine_not_ready`). Emitted by `rocky serve` only.
+/// (`engine_not_ready`).
+///
+/// Also emitted, once per pipeline, when a transformation pipeline's models
+/// directory does not exist and the pipeline does not set
+/// `allow_empty_models = true`. The other pipelines' models are still served;
+/// that pipeline adds none. Emitted by `rocky serve` only.
 pub const W014: &str = "W014";
 
 /// Imported producer added a column. Surfaced (at info severity) only to

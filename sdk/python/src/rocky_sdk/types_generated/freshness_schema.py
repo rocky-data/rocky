@@ -97,3 +97,7 @@ class FreshnessOutput(BaseModel):
     """
     summary: FreshnessSummary
     version: str
+    warnings: list[str] | None = None
+    """
+    What the report could not check. One entry per transformation pipeline whose models directory does not exist, unless the pipeline sets `allow_empty_models = true`. Omitted when empty.
+    """

@@ -627,9 +627,21 @@ fn declared_children(
         let Some(tx) = pipeline.as_transformation() else {
             continue;
         };
-        let dir = match crate::models_loader::resolve_models_dir(&tx.models, config_path) {
-            Ok(Some(dir)) => dir,
-            Ok(None) => continue,
+        let dir = match crate::models_loader::locate_models_dir(&tx.models, config_path) {
+            Ok(crate::models_loader::ModelsDir::Present(dir)) => dir,
+            // `rocky run` fails on a missing models directory unless the
+            // pipeline sets `allow_empty_models = true`, so the report says
+            // why this pipeline adds no model.
+            Ok(crate::models_loader::ModelsDir::Absent(dir)) => {
+                if !tx.allow_empty_models {
+                    warnings.push(crate::models_loader::missing_models_dir_warning(
+                        &dir,
+                        name,
+                        "its declared dependencies are unknown",
+                    ));
+                }
+                continue;
+            }
             Err(error) => {
                 warnings.push(format!(
                     "pipeline {name}: its models directory cannot be resolved ({error:#}); \
@@ -1866,6 +1878,41 @@ pub(crate) mod tests {
 
     use chrono::{TimeZone, Utc};
     use tempfile::TempDir;
+
+    /// A pipeline whose models directory does not exist adds a warning to
+    /// the month report, unless it sets `allow_empty_models = true`.
+    #[test]
+    fn a_missing_models_dir_warns_unless_allowed() {
+        for allow in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let config_path = dir.path().join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n\n\
+                     [pipeline.silver]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                     allow_empty_models = {allow}\n\n\
+                     [pipeline.silver.target.governance]\nauto_create_schemas = true\n"
+                ),
+            )
+            .unwrap();
+            let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+            let mut warnings = Vec::new();
+            let children = declared_children(Some(&cfg), &config_path, &mut warnings);
+            assert!(children.is_empty());
+            if allow {
+                assert!(warnings.is_empty(), "{warnings:?}");
+            } else {
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert!(warnings[0].contains("does not exist"), "{warnings:?}");
+                assert!(warnings[0].contains("pipeline 'silver'"), "{warnings:?}");
+                assert!(
+                    warnings[0].contains("allow_empty_models = true"),
+                    "{warnings:?}"
+                );
+            }
+        }
+    }
 
     fn sample_exec(
         name: &str,

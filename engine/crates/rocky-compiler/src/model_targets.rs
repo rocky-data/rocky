@@ -184,6 +184,10 @@ fn pipeline_model_names(
     config_path: &Path,
 ) -> Option<Vec<String>> {
     match models_loader::locate_models_dir(&tx.models, config_path).ok()? {
+        // Not a "cannot be read" case: an absent directory loads no model, so
+        // the pipeline claims none. Its target still reaches every unclaimed
+        // model through `unclaimed`, and `rocky run` refuses the pipeline
+        // unless it sets `allow_empty_models = true` (the reports warn).
         models_loader::ModelsDir::Absent(_) => Some(Vec::new()),
         models_loader::ModelsDir::Present(dir) => {
             let glob = models_loader::resolved_models_glob(&tx.models, config_path);
@@ -686,6 +690,25 @@ mod tests {
         );
         let regions = resolve(tmp.path(), &pipelines);
         assert_eq!(regions.for_model("orders"), vec![label("eu"), label("us")]);
+    }
+
+    /// A pipeline whose models directory does not exist claims no model, but
+    /// its region still reaches every unclaimed model: a model run through
+    /// `rocky run --models` on that pipeline is judged against it.
+    #[test]
+    fn a_pipeline_with_a_missing_models_dir_still_covers_unclaimed_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_model(&tmp.path().join("models"), "orders");
+        let pipelines = format!(
+            "{}{}",
+            transformation("gone", "missing/**", Some("us")),
+            transformation("good", "models/**", Some("eu"))
+        );
+        let regions = resolve(tmp.path(), &pipelines);
+        assert_eq!(regions.for_model("orders"), vec![label("eu")]);
+        let mut adhoc = regions.for_model("adhoc");
+        adhoc.sort();
+        assert_eq!(adhoc, vec![label("eu"), label("us")]);
     }
 
     #[test]
