@@ -878,7 +878,8 @@ rocky run --watch
 
 - With `--models <dir>`, it watches that directory, when it exists.
 - Without `--models`, it watches the models directory of each transformation pipeline. With `--pipeline <name>`, it watches only that pipeline's directory. The directory is the part of the pipeline's `models` glob before the first wildcard, so `models/**` and `models/*.sql` both give `models/`.
-- A directory is watched once. A directory inside another watched directory is not watched again. When a pipeline's directory is the `rocky.toml` directory itself (for example `models = "./*.sql"`), that directory is watched once, recursively.
+- A directory is watched once. A directory inside another watched directory is not watched again. When a pipeline's directory is the `rocky.toml` directory itself (for example `models = "./*.sql"`), that directory is watched once, recursively. If that recursive watch fails (for example the Linux inotify watch limit), Rocky warns and watches `rocky.toml` only.
+- A file under a directory whose name starts with `.` (`.git`, `.venv`), or is `target` or `node_modules`, does not start a re-run.
 - A directory that does not exist at startup, or a pipeline added to `rocky.toml` later, is watched only after a restart.
 
 The directory watch is FSEvents-safe on macOS: atomic-rename saves (vim's `:w`, VSCode's default) trigger correctly where a file-level watch can miss the new inode. Banner / "detected change" lines go to `stderr` so `stdout` stays parseable; with `--output json`, each iteration emits one `RunOutput` JSON object on `stdout` (newline-delimited).
