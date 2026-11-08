@@ -28497,6 +28497,79 @@
         ]
       }
     },
+    "/api/v1/cost/month": {
+      "get": {
+        "description": "One month of production cost split across the data products, in physical units, with money in USD only where `[cost]` sets a price, and each `[product_budget.<name>]` checked with its breach events. The same bytes as `rocky cost --month <month> --by product --output json`, modulo the clock: `as_of` is the request instant, and storage in the current month accrues to it. Without `month`, the month that contains the request instant in the project's `[schedule].timezone`, the month `rocky product status` reports as `cost_month`. `money` is absent unless `money_status` is `priced`: a figure Rocky does not measure, or one with no price, is never `0`. Reads run history only.",
+        "operationId": "getCostMonth",
+        "parameters": [
+          {
+            "description": "The month, `YYYY-MM`, in the project's `[schedule].timezone`. Default: the current month.",
+            "in": "query",
+            "name": "month",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductMonthCostOutput"
+                }
+              }
+            },
+            "description": "The month's cost by product."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "`month` is not `YYYY-MM`."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound `rocky.toml` or the state store could not be read, or the month's split broke its own invariant."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One month of production cost by product",
+        "tags": [
+          "products"
+        ]
+      }
+    },
     "/api/v1/custody/{subject}": {
       "get": {
         "description": "Who proposed it, what the policy plane decided, what the plan changed, which runs materialized it, what verification found, and the downstream blast radius, for a model name, a run id, a plan id or a decision-only custody id such as `freeze:global`. The same bytes as `rocky audit --for <subject> --output json`. A subject nothing references is `200` with `resolved: false`, as the CLI. Compiles the project once per call for the blast radius, as the CLI does. Reads only.",

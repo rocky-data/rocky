@@ -1154,6 +1154,53 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/cost/month",
+            operation_id: "getCostMonth",
+            tag: "products",
+            summary: "One month of production cost by product",
+            description: "One month of production cost split across the data products, in \
+                 physical units, with money in USD only where `[cost]` sets a price, and each \
+                 `[product_budget.<name>]` checked with its breach events. The same bytes as \
+                 `rocky cost --month <month> --by product --output json`, modulo the clock: \
+                 `as_of` is the request instant, and storage in the current month accrues to \
+                 it. Without `month`, the month that contains the request instant in the \
+                 project's `[schedule].timezone`, the month `rocky product status` reports \
+                 as `cost_month`. `money` is absent unless `money_status` is `priced`: a \
+                 figure Rocky does not measure, or one with no price, is never `0`. Reads \
+                 run history only.",
+            path_params: &[],
+            query_params: &[QueryParam {
+                name: "month",
+                description: "The month, `YYYY-MM`, in the project's `[schedule].timezone`. \
+                     Default: the current month.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The month's cost by product.",
+                    body: Body::Component("ProductMonthCostOutput"),
+                },
+                Resp {
+                    status: "400",
+                    description: "`month` is not `YYYY-MM`.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` or the state store could not be \
+                         read, or the month's split broke its own invariant.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/products/{name}/journal",
             operation_id: "getProductJournal",
             tag: "products",
@@ -1991,6 +2038,7 @@ mod tests {
             "ProductListOutput",
             "ProductStatusOutput",
             "ProductJournalOutput",
+            "ProductMonthCostOutput",
             "ReviewQueueOutput",
             "ReviewStatusOutput",
             "BriefOutput",
@@ -2060,6 +2108,7 @@ mod tests {
             ("/api/v1/products", "ProductListOutput"),
             ("/api/v1/products/{name}", "ProductStatusOutput"),
             ("/api/v1/products/{name}/journal", "ProductJournalOutput"),
+            ("/api/v1/cost/month", "ProductMonthCostOutput"),
             ("/api/v1/review/queue", "ReviewQueueOutput"),
             ("/api/v1/review/{plan_id}/status", "ReviewStatusOutput"),
             ("/api/v1/review/{plan_id}", "ReviewOutput"),

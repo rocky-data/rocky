@@ -114,8 +114,8 @@ use crate::commands::{
 };
 use crate::output::{
     AuditForOutput, AuditOutput, AuditScorecardOutput, BranchListOutput, BriefOutput,
-    PolicyRulesOutput, ProjectOutput, ReviewOutput, ReviewQueueOutput, ReviewStatusOutput,
-    ScorecardDimension,
+    PolicyRulesOutput, ProductMonthCostOutput, ProjectOutput, ReviewOutput, ReviewQueueOutput,
+    ReviewStatusOutput, ScorecardDimension,
 };
 use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
@@ -218,6 +218,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
         .route("/api/v1/products/{name}/journal", get(product_journal))
+        .route("/api/v1/cost/month", get(cost_month))
         .route("/api/v1/review/queue", get(review_queue))
         .route("/api/v1/review/{plan_id}", get(review_diff))
         .route("/api/v1/review/{plan_id}/status", get(review_status))
@@ -995,6 +996,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
         "GET /api/v1/products/{name}/journal",
+        "GET /api/v1/cost/month",
         "GET /api/v1/review/queue",
         "GET /api/v1/review/{plan_id}",
         "GET /api/v1/review/{plan_id}/status",
@@ -1036,6 +1038,7 @@ fn capabilities() -> Vec<String> {
         "journal",
         "review_diff",
         "samples",
+        "cost",
     ]
     .into_iter()
     .map(String::from)
@@ -1725,6 +1728,48 @@ async fn product_journal(
         Some(journal) => Ok(PrettyJson(journal)),
         None => Err(ApiError::product_not_found(&name)),
     }
+}
+
+/// Query string of `GET /api/v1/cost/month`.
+#[derive(Debug, Deserialize)]
+struct CostMonthQuery {
+    /// The month, `YYYY-MM`, in the project's `[schedule].timezone`. Absent
+    /// means the month that contains the request instant.
+    month: Option<String>,
+}
+
+/// `GET /api/v1/cost/month` — canonical [`ProductMonthCostOutput`].
+///
+/// The same bytes as `rocky cost --month <month> --by product --output json`
+/// for the project the bound config names, modulo the clock: `as_of` is the
+/// request instant, and storage of the current month accrues to it. Without
+/// `month`, the month that contains the request instant in the project's
+/// `[schedule].timezone`, the month `rocky product status` reports as
+/// `cost_month`. A malformed `month` is `400 bad_request` before the store
+/// is opened. Reads run history only; never writes.
+async fn cost_month(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<CostMonthQuery>,
+) -> Result<PrettyJson<ProductMonthCostOutput>, ApiError> {
+    if let Some(month) = query.month.as_deref() {
+        crate::commands::cost::parse_month(month)
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    }
+    let Some(config_path) = state.config_path.clone() else {
+        return Err(ApiError::engine_not_ready());
+    };
+    let state_path = state_path_for(&state);
+    let output = store_read(&state, move || -> anyhow::Result<ProductMonthCostOutput> {
+        let now = chrono::Utc::now();
+        let month = match query.month {
+            Some(month) => month,
+            None => crate::commands::cost::current_month(&config_path, now)?,
+        };
+        crate::commands::compute_month_cost(&state_path, &config_path, &month, now)
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
 }
 
 /// `GET /api/v1/review/queue` — canonical [`ReviewQueueOutput`].
@@ -6224,6 +6269,83 @@ mod tests {
             let err: ErrorEnvelope = resp.json().await.unwrap();
             assert_eq!(err.code, "engine_not_ready", "{path}");
         }
+    }
+
+    // --- /cost/month ---
+
+    /// `GET /api/v1/cost/month` answers with the bytes of `rocky cost
+    /// --month <month> --by product --output json` for the same project,
+    /// modulo `as_of` (the request instant), budget verdict and breach events
+    /// included. Without `month` it reports the current month. A malformed
+    /// month is a 400 before the store is opened, and a models-only server
+    /// has no cost surface.
+    #[tokio::test]
+    async fn cost_month_matches_the_cli_bytes_modulo_the_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        // A budget the one run breaches, so the payload carries `budget` and
+        // `breach_events`, the fields the browser UI renders.
+        let (config, state_path) = crate::commands::cost::tests::budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_compute_hours = 0.0001\n",
+        );
+        crate::commands::cost::tests::one_charged_run(&state_path);
+        let root = config.parent().unwrap().to_path_buf();
+        let state = pinned_server(root.join("models"), Some(config.clone()), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/cost/month?month=2026-10"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let served: ProductMonthCostOutput = serde_json::from_str(&text).unwrap();
+        let mut expected = {
+            let _gate = store_gate(&state).await;
+            crate::commands::compute_month_cost(&state_path, &config, "2026-10", chrono::Utc::now())
+                .unwrap()
+        };
+        expected.as_of.clone_from(&served.as_of);
+        assert_eq!(text, reference_bytes(&expected));
+        assert_eq!(served.command, "cost_by_product");
+        let product = served
+            .products
+            .iter()
+            .find(|p| p.product == "revenue_daily")
+            .expect("the budgeted product has a row");
+        assert_eq!(
+            product.budget.as_ref().map(|b| b.verdict),
+            Some(crate::output::ProductBudgetVerdict::Breached)
+        );
+        assert_eq!(product.breach_events.len(), 1);
+        assert_eq!(product.breach_events[0].run_id, "run-1");
+
+        // No `month`: the month that holds the request instant.
+        let resp = reqwest::get(format!("{base}/api/v1/cost/month"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let current: ProductMonthCostOutput = resp.json().await.unwrap();
+        assert_eq!(
+            current.month,
+            crate::commands::cost::current_month(&config, chrono::Utc::now()).unwrap()
+        );
+
+        for bad in ["2026-13", "26-10", "2026-1", "october", "2026-10-01"] {
+            let resp = reqwest::get(format!("{base}/api/v1/cost/month?month={bad}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "bad_request", "{bad}");
+        }
+
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{base}/api/v1/cost/month"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
     }
 
     // --- /review ---

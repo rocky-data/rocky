@@ -573,7 +573,7 @@ pub fn run_cost(
 // ---------------------------------------------------------------------------
 
 /// Parse `--month` as `YYYY-MM`.
-fn parse_month(raw: &str) -> Result<(i32, u32)> {
+pub(crate) fn parse_month(raw: &str) -> Result<(i32, u32)> {
     let bad = || anyhow::anyhow!("--month '{raw}' is not a month — expected YYYY-MM, e.g. 2026-10");
     let (year, month) = raw.split_once('-').ok_or_else(bad)?;
     if year.len() != 4 || month.len() != 2 {
@@ -1564,6 +1564,20 @@ fn project_timezone(config_path: &Path) -> Result<String> {
     Ok(cfg.map_or_else(|| "UTC".to_string(), |c| c.schedule.timezone))
 }
 
+/// The month, `YYYY-MM`, that contains `now` in the project's
+/// `[schedule].timezone` (UTC with no config). The month `rocky product
+/// status` reports, and the default month of `GET /api/v1/cost/month`.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, or when no month
+/// contains `now` in its time zone.
+pub(crate) fn current_month(config_path: &Path, now: DateTime<Utc>) -> Result<String> {
+    let timezone = project_timezone(config_path)?;
+    month_containing(now, &timezone)
+        .with_context(|| format!("no month contains {now} in time zone '{timezone}'"))
+}
+
 /// The product's current month, for `rocky product status`.
 ///
 /// # Errors
@@ -1576,9 +1590,7 @@ pub fn product_cost_month(
     product: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<ProductCostMonth>> {
-    let timezone = project_timezone(config_path)?;
-    let month = month_containing(now, &timezone)
-        .with_context(|| format!("no month contains {now} in time zone '{timezone}'"))?;
+    let month = current_month(config_path, now)?;
     let output = compute_month_cost(state_path, config_path, &month, now)?;
     Ok(output
         .products
@@ -1849,7 +1861,7 @@ pub fn run_month_cost(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use chrono::{TimeZone, Utc};
@@ -3032,7 +3044,7 @@ mod tests {
     /// The fixture project (product `revenue_daily` owns model
     /// `revenue_daily`), plus product `ltv` and `extra` appended to the
     /// config. Returns `(config, state_path)`.
-    fn budget_project(dir: &Path, extra: &str) -> (PathBuf, PathBuf) {
+    pub(crate) fn budget_project(dir: &Path, extra: &str) -> (PathBuf, PathBuf) {
         let (root, config, state_path) = api_fixture_project(dir);
         std::fs::write(root.join("products/ltv.toml"), LTV_SPEC).unwrap();
         let mut text = std::fs::read_to_string(&config).unwrap();
@@ -3074,7 +3086,7 @@ mod tests {
 
     /// 400 ms of `revenue_daily` reading 1,000 ms of unowned `raw`: charged
     /// 1,400 ms, about 0.000389 hours.
-    fn one_charged_run(state_path: &Path) {
+    pub(crate) fn one_charged_run(state_path: &Path) {
         let start = at(2026, 10, 5, 2, 0);
         record(
             state_path,

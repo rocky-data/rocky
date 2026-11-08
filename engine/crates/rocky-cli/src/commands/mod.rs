@@ -22,7 +22,7 @@ mod completions;
 mod compliance;
 mod connector_load;
 mod containment;
-mod cost;
+pub(crate) mod cost;
 mod dag;
 pub mod defer_state;
 mod discover;

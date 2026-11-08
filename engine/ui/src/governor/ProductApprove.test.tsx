@@ -216,6 +216,9 @@ describe("The product page", () => {
     const reads = { status: 0 };
     const loaders: ProductLoaders = {
       list: vi.fn(),
+      // Never answer: this test is about the approval, not the panel.
+      costMonth: vi.fn(() => new Promise<never>(() => {})),
+      schedule: vi.fn(() => new Promise<never>(() => {})),
       journal: vi.fn(
         async (): Promise<ProductJournalOutput> => ({
           version: "1",

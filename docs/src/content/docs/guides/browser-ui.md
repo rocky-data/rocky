@@ -145,6 +145,16 @@ Products shows each [data product](/reference/commands/products/): its fulfillme
 
 In operator mode, a product whose spec has no approval, or whose working spec differs from the approved one, shows an **Approve the spec** section. See [Approve a product spec](#approve-a-product-spec).
 
+### Delivery and cost
+
+Each product's page has a **Delivery and cost** panel. It is read-only: you change a deadline or a budget in the files, not here.
+
+- **Delivery** shows the spec's `deliver_by` deadline, whether the latest delivery was on time or how late it was, and whether the next one is at risk. The engine keeps the latest delivery only, so this is not a list of every run. The declared row-count ranges of the output and the sources show with their latest verdict.
+- **Schedules** lists the scheduled pipelines that deliver this product, with their latest start. It is marked Experimental.
+- **Cost this month** is the product's row of `rocky cost --month <month> --by product`, read from `GET /api/v1/cost/month`: what it was charged, kept and built, what it paid for tables it reads, shares nobody paid, and its `[product_budget.<name>]` verdict with each breach event.
+
+Each cost figure says how sure it is: **measured**, **estimated** (split by estimated bytes, or storage by allocated blocks), **rows only** (split by rows scanned), **not measured** or **no price**. A figure Rocky did not measure, or one `[cost]` gives no price, never shows as `0` or `$0`. When run history does not cover the whole month, the panel says the month is partial and shows no money total. A share a later reader can still change is marked provisional.
+
 ## Governance
 
 Governance answers "what did the agents do, and was it allowed?" It is the one area with tabs of its own: Scorecard, Custody and Audit.
