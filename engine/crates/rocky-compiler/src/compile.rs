@@ -3209,8 +3209,13 @@ mod tests {
         let first = compile(&config).expect("first compile");
         assert_eq!(first.type_check.typed_models.len(), 13);
 
-        std::fs::write(&defs, "[positive]\ntype = \"not_null\"\ncolumn = \"id\"\n")
-            .expect("edit test definitions");
+        // A column `a` does not have, so a check that ever typechecks tests
+        // against the model's output fails this test.
+        std::fs::write(
+            &defs,
+            "[positive]\ntype = \"not_null\"\ncolumn = \"missing\"\n",
+        )
+        .expect("edit test definitions");
         let incremental =
             compile_incremental(&config, std::slice::from_ref(&defs), &first).expect("incremental");
         let scratch = compile(&config).expect("from-scratch compile");
@@ -3316,6 +3321,7 @@ mod tests {
             scratch.type_check.typed_models.get("r")
         );
         assert_matches_from_scratch(&incremental, &scratch);
+        assert_stays_incremental(&config, &decl, &first);
     }
 
     /// Removing the declaration removes the alias `r` reads.
@@ -3340,5 +3346,6 @@ mod tests {
 
         assert!(!scratch.type_check.typed_models.contains_key("orders"));
         assert_matches_from_scratch(&incremental, &scratch);
+        assert_stays_incremental(&config, &decl, &first);
     }
 }
