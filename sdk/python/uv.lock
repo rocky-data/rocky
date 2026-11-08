@@ -2,7 +2,10 @@ version = 1
 revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
-    "python_full_version >= '3.14'",
+    "python_full_version >= '3.15' and sys_platform != 'emscripten'",
+    "python_full_version >= '3.15' and sys_platform == 'emscripten'",
+    "python_full_version == '3.14.*' and sys_platform != 'emscripten'",
+    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14'",
     "python_full_version < '3.12'",
 ]
@@ -182,7 +185,7 @@ nvtx = [
 
 [[package]]
 name = "datamodel-code-generator"
-version = "0.83.0"
+version = "0.91.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argcomplete" },
@@ -195,9 +198,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/cf/ad/bd0c954c4c4671e586b340059139ead38570ba916a237086e245982ab14d/datamodel_code_generator-0.83.0.tar.gz", hash = "sha256:30d841e31b82095c4ef11f3dbfc99525f559a146250b9e685e2a2e4a196ca0a1", size = 3074761, upload-time = "2026-09-24T08:56:40.622Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/41/34d267bec58937ecb2b55756cefe34d0d9edf25bf61b7a4a85b6dc732179/datamodel_code_generator-0.91.0.tar.gz", hash = "sha256:3e178da790d1e58b3b6573377a3c9394b38719ecf132e295575236dcf3ac34b5", size = 9237024, upload-time = "2026-11-07T17:01:59.901Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3a/4e/4a0231a7d3d4043cd27a746a50be87bc7637463023d7db9991610cd5fe56/datamodel_code_generator-0.83.0-py3-none-any.whl", hash = "sha256:371d80be360b2a57bc48462169553af57fa30225c0264ad85ae5f0d59b9d143a", size = 751087, upload-time = "2026-09-24T08:56:38.791Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/5e/5cf23bfe490991004ea3e17d3fb21b98c89c600ae7d6e20e5e5577da7d3f/datamodel_code_generator-0.91.0-py3-none-any.whl", hash = "sha256:e14fb21cb180c1d8a44c3c5c964d4a3c10f9faaf953defb2a6103fb23b8e4273", size = 2363661, upload-time = "2026-11-07T17:01:57.494Z" },
 ]
 
 [[package]]
@@ -594,7 +597,10 @@ name = "networkx"
 version = "3.7"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14'",
+    "python_full_version >= '3.15' and sys_platform != 'emscripten'",
+    "python_full_version >= '3.15' and sys_platform == 'emscripten'",
+    "python_full_version == '3.14.*' and sys_platform != 'emscripten'",
+    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/dc/76/3af777226b63a5e64a6b36b1ec5855c14e2b94a37096d4760e595fc43511/networkx-3.7.tar.gz", hash = "sha256:fd77a511bd90f39f3d016351345b52cf5319b813bdca01de3f755d3cca62e96a", size = 1866482, upload-time = "2026-09-21T16:45:16.974Z" }
@@ -689,7 +695,10 @@ name = "numpy"
 version = "2.5.4"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14'",
+    "python_full_version >= '3.15' and sys_platform != 'emscripten'",
+    "python_full_version >= '3.15' and sys_platform == 'emscripten'",
+    "python_full_version == '3.14.*' and sys_platform != 'emscripten'",
+    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/95/b0/c7453d0b6e2073c3264468b106ee1563750cecc910965e67357e3698c83e/numpy-2.5.4.tar.gz", hash = "sha256:9a94cf751c9ad8ebaa835bcd3d40dacf8534ad086b88c38029b65123c7999d2a", size = 20866315, upload-time = "2026-10-10T20:05:31.422Z" }
@@ -1380,7 +1389,7 @@ provides-extras = ["classify"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "datamodel-code-generator", specifier = ">=0.56.0,<0.84" },
+    { name = "datamodel-code-generator", specifier = ">=0.91.0,<0.92" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.4" },
 ]
