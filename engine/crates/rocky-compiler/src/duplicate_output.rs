@@ -27,7 +27,8 @@
 //!   With no known target, or on SQL Server, two unquoted names match
 //!   ignoring case, two quoted names match only when spelled the same, and a
 //!   quoted name never matches an unquoted one. A model that runs on several
-//!   warehouses is checked under each rule.
+//!   warehouses is checked under each rule. "Ignoring case" folds ASCII
+//!   letters only; a non-ASCII letter compares exactly.
 
 use std::collections::HashMap;
 
@@ -128,17 +129,23 @@ impl NameFold {
 
     /// The identity of a name under this rule: (in the separate quoted
     /// namespace, folded name).
+    ///
+    /// Case folds only ASCII letters. A warehouse's fold of a non-ASCII
+    /// letter can differ from Unicode's (`ß` upper-cases to `SS`, the
+    /// Kelvin sign U+212A lower-cases to `k`), so a
+    /// full Unicode fold could invent a repeat. Comparing non-ASCII letters
+    /// exactly can miss a repeat but never reports a false one.
     fn key(self, ident: &Ident) -> (bool, String) {
         let quoted = ident.quote_style.is_some();
         let value = &ident.value;
         match self {
-            Self::AllIgnoreCase => (false, value.to_lowercase()),
+            Self::AllIgnoreCase => (false, value.to_ascii_lowercase()),
             Self::UnquotedUpper if quoted => (false, value.clone()),
-            Self::UnquotedUpper => (false, value.to_uppercase()),
+            Self::UnquotedUpper => (false, value.to_ascii_uppercase()),
             Self::UnquotedLower if quoted => (false, value.clone()),
-            Self::UnquotedLower => (false, value.to_lowercase()),
+            Self::UnquotedLower => (false, value.to_ascii_lowercase()),
             Self::Conservative if quoted => (true, value.clone()),
-            Self::Conservative => (false, value.to_lowercase()),
+            Self::Conservative => (false, value.to_ascii_lowercase()),
         }
     }
 }
@@ -207,7 +214,7 @@ fn repeated_output_names(sql: &str, folds: &[NameFold]) -> Vec<(String, usize)> 
         for (name, count) in repeated_under(&names, *fold) {
             match repeated
                 .iter_mut()
-                .find(|(seen, _)| seen.to_lowercase() == name.to_lowercase())
+                .find(|(seen, _)| seen.eq_ignore_ascii_case(&name))
             {
                 Some(entry) => entry.1 = entry.1.max(count),
                 None => repeated.push((name, count)),
@@ -379,6 +386,51 @@ mod tests {
             repeated_on(sql_server, "SELECT ID, id FROM t"),
             [("ID".to_string(), 2)]
         );
+    }
+
+    #[test]
+    fn case_folds_only_ascii_letters() {
+        // Unicode lower-cases the Kelvin sign (U+212A) to `k`; a warehouse
+        // need not. Comparing non-ASCII letters exactly keeps this from a
+        // false repeat.
+        for dialect in [
+            OperandDialect::DuckDb,
+            OperandDialect::Databricks,
+            OperandDialect::BigQuery,
+            OperandDialect::Trino,
+        ] {
+            assert!(
+                repeated_on(dialect, "SELECT k, \"\u{212A}\" FROM t").is_empty(),
+                "{dialect:?}"
+            );
+        }
+        // ASCII letters still fold.
+        assert_eq!(
+            repeated_on(OperandDialect::DuckDb, r#"SELECT id, "ID" FROM t"#),
+            [("id".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn unquoted_folds_touch_only_ascii_letters() {
+        // The SQL parser refuses a non-ASCII letter in an unquoted name
+        // today, so these folds see only ASCII. Checked on the key directly,
+        // so a wider parser cannot bring the Unicode fold back: Unicode
+        // upper-cases `ß` to `SS`, which would make Snowflake's unquoted
+        // `straße` match a quoted `"STRASSE"`.
+        let snowflake = NameFold::UnquotedUpper;
+        assert_ne!(
+            snowflake.key(&Ident::new("straße")),
+            snowflake.key(&Ident::with_quote('"', "STRASSE"))
+        );
+        for fold in [NameFold::UnquotedLower, NameFold::Conservative] {
+            assert_eq!(
+                fold.key(&Ident::new("\u{212A}")),
+                (false, "\u{212A}".to_string()),
+                "{fold:?}"
+            );
+        }
+        assert_eq!(snowflake.key(&Ident::new("id")), (false, "ID".to_string()));
     }
 
     #[test]
