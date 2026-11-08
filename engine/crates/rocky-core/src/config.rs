@@ -5825,9 +5825,10 @@ pub struct AdapterConfig {
     /// A persistent path is required when the same DuckDB adapter is also used
     /// as a discovery source — discovery and warehouse share the same database.
     pub path: Option<EnvString>,
-    /// Directory DuckDB keeps its extensions in (DuckDB's
-    /// `extension_directory` setting). When unset, DuckDB uses its own
-    /// default under the home directory. Every extension Rocky loads reads
+    /// Directory DuckDB keeps its extensions in. Rocky sets it as the only
+    /// entry of DuckDB's `extension_directories` setting. When unset or
+    /// empty, DuckDB uses its own default under the home directory. Every
+    /// extension Rocky loads reads
     /// from, and installs into, this one directory.
     // Skipped when unset, so the config digest a plan records stays the same
     // for a project that does not use it.
