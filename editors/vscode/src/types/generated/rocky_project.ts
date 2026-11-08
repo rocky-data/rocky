@@ -1101,6 +1101,12 @@ export interface ConnectorConfig {
    */
   manifest: string;
   /**
+   * `[connector.<name>.options]`: settings for the program, as any TOML table. Rocky writes it as JSON to `options.json` in the scratch directory and passes the path as `options_path` in the request. Not for secrets: the file is written to disk in clear. At most 64 KiB as JSON.
+   */
+  options?: {
+    [k: string]: unknown;
+  };
+  /**
    * Where the connector writes. Only `file://` is supported. A relative path is relative to the directory that holds `rocky.toml`. Each attempt gets its own new directory inside it.
    */
   output_uri: string;
