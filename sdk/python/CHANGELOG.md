@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-11-08
+
+### Added
+
+- The generated `ConnectorConfig` gains an optional `options`: the `[connector.<name>.options]` table, any TOML table, that engine 1.91.0 passes to the connector program as `options.json`.
+- The generated transformation pipeline config gains an optional `allow_empty_models`.
+
 ### Changed
 
 - The generated types now come from `datamodel-code-generator` 0.91 (was below 0.84). The only change: `HealthCheck.details` is now `list[Detail]`, where `Detail` is a `list[str]` of exactly two items. A `details` row with any other length now fails validation. The dev dependency is pinned to `>=0.91.0,<0.92`.
+- The generated `[state]` config's `on_schema_mismatch` no longer defaults to `"recreate"`; it defaults to `None`, which means the backend default (engine 1.91.0: `fail` on `local`, `recreate` on remote backends).
+- Generated docstrings for `extension_directory` and the schema-mismatch policies follow engine 1.91.0.
 
 ## [0.30.0] — 2026-11-07
 
