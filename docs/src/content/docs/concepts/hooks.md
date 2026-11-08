@@ -92,7 +92,7 @@ Rocky fires 18 events, grouped into six phases:
 |-------|------|----------|
 | `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) | Page oncall on overspend |
 
-`budget_breach` also fires when a data product goes over its monthly budget, declared in [`[product_budget.NAME]`](/reference/configuration/#product_budgetname). It fires once for each exceeded limit, at the end of the production run after which the product was first over. It does not fire again while the product stays over. Its `metadata` then has three more keys, so a hook can tell the two apart:
+`budget_breach` also fires when a data product goes over its monthly budget, declared in [`[product_budget.NAME]`](/reference/configuration/#product_budgetname). It fires once for each exceeded limit, at the end of the production run after which the product was first over. It does not fire again while the product stays over. An interrupted run and a backfill do not check budgets, so a breach they cause fires no hook; it still shows as an event in `rocky cost --month`. Its `metadata` then has three more keys, so a hook can tell the two apart:
 
 | Key | Value |
 |-----|-------|

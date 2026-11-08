@@ -1550,6 +1550,10 @@ pub fn product_budgets_after_run(
         return Ok(Vec::new());
     }
     let Some(record) = store.get_run(run_id)? else {
+        tracing::warn!(
+            run_id,
+            "monthly product budgets not checked: this run's record is not in the state store"
+        );
         return Ok(Vec::new());
     };
     if !record.counts_as_production(UnrecordedScope::Count) {

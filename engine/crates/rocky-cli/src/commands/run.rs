@@ -1911,27 +1911,6 @@ pub(crate) fn capture_run_output_for_test(run_id: &str, output: &RunOutput) {
 #[inline]
 pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 
-/// Persist the run's terminal record, best-effort: a failed write is logged
-/// and the run goes on, because history is advisory for most of its readers.
-///
-/// Returns whether the record landed (`false` when there is no store, or the
-/// write failed). A caller whose error TYPE tells the dispatcher "my record
-/// is persisted, upload it" should check this before returning that type:
-/// finalizing on a record that is not there publishes a ledger without the
-/// run, and a fresh pod then reads an authoritative history with the failure
-/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816),
-/// and every caller of [`run_status_exit_result`] now threads it onto the
-/// sentinel as a [`RecordCustody`] so [`session_disposition`] decides on the
-/// fact rather than on the error type (#1836).
-///
-/// A SUCCESSFUL run whose record write failed still finalizes: its session
-/// also carries the run's other state writes, and abandoning to punish a lost
-/// record would discard those too. Its exit code follows
-/// [`record_custody_exit_result`] (#1884): non-zero under `on_upload_failure =
-/// "fail"` or on a governed run, 0 under the default `skip`. On a replication
-/// run the `run_progress` header written before the first copy travels in the
-/// same upload, and `rocky history` lists a header with no record as an
-/// unrecorded run, so other pods do not read the history as complete.
 /// Check every `[product_budget.<name>]` after this run's record is written,
 /// and put the verdicts on `output.product_budgets`.
 ///
@@ -2000,6 +1979,50 @@ pub(crate) async fn fire_product_budget_breaches(
     }
 }
 
+/// [`record_product_budgets`] and [`fire_product_budget_breaches`] for an arm
+/// that holds no hook registry of its own: it builds one from `[hook]` only
+/// when this run moved a product over.
+pub(crate) async fn check_product_budgets_and_fire(
+    state_store: Option<&StateStore>,
+    config_path: Option<&Path>,
+    hooks: &rocky_core::hooks::HooksConfig,
+    run_id: &str,
+    pipeline: &str,
+    output: &mut RunOutput,
+) {
+    record_product_budgets(state_store, config_path, run_id, output);
+    if output
+        .product_budgets
+        .iter()
+        .any(|b| b.breach_event.is_some())
+    {
+        let registry = HookRegistry::from_config(hooks);
+        fire_product_budget_breaches(&registry, run_id, pipeline, &output.product_budgets).await;
+        let _ = registry.wait_async_webhooks().await;
+    }
+}
+
+/// Persist the run's terminal record, best-effort: a failed write is logged
+/// and the run goes on, because history is advisory for most of its readers.
+///
+/// Returns whether the record landed (`false` when there is no store, or the
+/// write failed). A caller whose error TYPE tells the dispatcher "my record
+/// is persisted, upload it" should check this before returning that type:
+/// finalizing on a record that is not there publishes a ledger without the
+/// run, and a fresh pod then reads an authoritative history with the failure
+/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816),
+/// and every caller of [`run_status_exit_result`] now threads it onto the
+/// sentinel as a [`RecordCustody`] so [`session_disposition`] decides on the
+/// fact rather than on the error type (#1836).
+///
+/// A SUCCESSFUL run whose record write failed still finalizes: its session
+/// also carries the run's other state writes, and abandoning to punish a lost
+/// record would discard those too. Its exit code follows
+/// [`record_custody_exit_result`] (#1884): non-zero under `on_upload_failure =
+/// "fail"` or on a governed run, 0 under the default `skip`. On a replication
+/// run the `run_progress` header written before the first copy travels in the
+/// same upload, and `rocky history` lists a header with no record as an
+/// unrecorded run, so other pods do not read the history as complete.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
@@ -8461,6 +8484,21 @@ pub async fn run_with_explicit_contracts(
             &run_id,
             &output,
             false,
+        )
+        .await;
+        // Monthly product budgets: the models this run built still count, so
+        // the check and its hook run here too. Only warns.
+        record_product_budgets(
+            state_store.as_ref(),
+            Some(config_path),
+            &run_id,
+            &mut output,
+        );
+        fire_product_budget_breaches(
+            &hook_registry,
+            &run_id,
+            pipeline_name,
+            &output.product_budgets,
         )
         .await;
         // WP-01 PR-C: drop the owned state store BEFORE finalize so its copy is

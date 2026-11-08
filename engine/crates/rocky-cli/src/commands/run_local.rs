@@ -1136,6 +1136,17 @@ pub async fn run_quality(
     if output.interrupted {
         return interrupted_result(recorded, run_id);
     }
+    // Monthly product budgets, now that this run's record is written. Only
+    // warns: the gate below decides the exit code. The JSON was printed above.
+    super::run::check_product_budgets_and_fire(
+        Some(&store),
+        Some(config_path),
+        &rocky_cfg.hooks,
+        run_id,
+        pipeline_name,
+        &mut output,
+    )
+    .await;
     // A quarantine that was refused or did not complete fails the run with the
     // check gate off too. Its `quarantine:compile` or `quarantine:execute`
     // check is among `error_failures`.
@@ -1919,6 +1930,18 @@ pub async fn run_snapshot(
         Some(pipeline_name),
         Some(config_path),
     );
+
+    // Monthly product budgets, now that this run's record is written. Only
+    // warns: it never changes the exit code.
+    super::run::check_product_budgets_and_fire(
+        Some(&store),
+        Some(config_path),
+        &rocky_cfg.hooks,
+        run_id,
+        pipeline_name,
+        &mut output,
+    )
+    .await;
 
     if tables_failed > 0 {
         anyhow::bail!("snapshot pipeline failed");
