@@ -237,8 +237,9 @@ fn tick_verdict(report: &TickReport, output: &TickOutput) -> TickVerdict {
 ///
 /// Only transformation pipelines have member models, and only `freshness = true`
 /// pipelines consult the budget — so nothing else is loaded. A pipeline whose
-/// models cannot be loaded (missing dir, read fault) is simply omitted, so it
-/// falls back to the project default rather than aborting the tick; the
+/// models cannot be loaded (missing dir, read fault) is omitted with a logged
+/// warning, so it falls back to the project default rather than aborting the
+/// tick; the
 /// `V043`-class validation warning is the pre-tick signal for that gap.
 pub(crate) fn build_member_budgets(
     config: &RockyConfig,
@@ -284,8 +285,8 @@ pub(crate) fn build_member_budgets(
 /// reconciler's fallback — so only own-declared budgets count as member lags.
 ///
 /// A models directory that does not exist gives no lags, and a warning unless
-/// the pipeline sets `allow_empty_models = true`: the child `rocky run` this
-/// tick launches fails on it, and the budget falls back to the project default.
+/// the pipeline sets `allow_empty_models = true`: a child `rocky run` of this
+/// pipeline would fail on it, and the budget falls back to the project default.
 fn member_max_lags(
     name: &str,
     tx: &TransformationPipelineConfig,
