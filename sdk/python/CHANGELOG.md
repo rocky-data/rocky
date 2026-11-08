@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The generated types now come from `datamodel-code-generator` 0.91 (was below 0.84). The only change: `HealthCheck.details` is now `list[Detail]`, where `Detail` is a `list[str]` of exactly two items. A `details` row with any other length now fails validation. The dev dependency is pinned to `>=0.91.0,<0.92`.
 - The generated project `CostSection` no longer defaults `storage_cost_per_gb_month` to `0.023` or `compute_cost_per_dbu` to `0.4`. Both are `None` when unset.
 
 ## [0.30.0] — 2026-11-07
