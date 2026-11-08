@@ -180,6 +180,10 @@ pub async fn run_watch(
                      so a model edit does not re-run"
                 );
                 config_dir_recursive = false;
+                // A failed recursive watch can leave the subdirectories it
+                // registered before the error; drop them so only rocky.toml
+                // is watched, as the warning says.
+                let _ = watcher.unwatch(&dir);
                 watcher
                     .watch(&dir, RecursiveMode::NonRecursive)
                     .with_context(|| format!("failed to watch config dir: {}", dir.display()))?;
