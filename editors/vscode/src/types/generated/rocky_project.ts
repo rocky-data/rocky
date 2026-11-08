@@ -632,7 +632,7 @@ export interface AdapterConfig {
   database?: string | null;
   destination_id?: string | null;
   /**
-   * Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
+   * Directory DuckDB keeps its extensions in. Rocky sets it as the only entry of DuckDB's `extension_directories` setting. When unset or empty, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
    */
   extension_directory?: string | null;
   /**

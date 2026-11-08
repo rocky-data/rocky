@@ -20864,7 +20864,9 @@ mod private_mode_tests {
     }
 
     /// Mutation: drop the `create_private_dir_all` call in `open_lock_file`
-    /// and the open fails with `LockIo`.
+    /// and the open fails: the lock file cannot be created in a directory
+    /// that does not exist (`LockIo`). A directory that cannot be created
+    /// is `StateDirCreate`, tested in `state::tests`.
     #[test]
     fn a_writer_open_creates_the_missing_state_directory_owner_only() {
         let dir = tempfile::tempdir().unwrap();
