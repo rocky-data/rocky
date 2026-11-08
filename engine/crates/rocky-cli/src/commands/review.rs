@@ -779,8 +779,14 @@ fn disclosed_units(scope: &ApprovalScope) -> Vec<&ScopeUnit> {
 /// Breaking-change findings for a `--dag` plan: each pipeline's directory
 /// and glob, concatenated (#2239). The result is never a partial clean list:
 /// any pipeline that cannot compile makes the whole result
-/// [`ReviewFindings::NotComputed`], and otherwise any skipped pipeline makes
-/// it [`ReviewFindings::Skipped`].
+/// [`ReviewFindings::NotComputed`]. Otherwise every compared pipeline's
+/// findings are kept, and the result is [`ReviewFindings::Skipped`] only when
+/// no pipeline was compared at all.
+///
+/// A skipped pipeline has nothing at the base, so it has no findings to add.
+/// Letting it mark the whole result skipped would throw away the findings of
+/// the pipelines that were compared: a deleted pipeline next to a new one
+/// would review as "skipped", with a breaking count of zero.
 fn dag_review_findings(
     config_path: &Path,
     scope: &ApprovalScope,
@@ -789,8 +795,11 @@ fn dag_review_findings(
     repo_dir: Option<&Path>,
 ) -> Result<ReviewFindings> {
     let mut findings = Vec::new();
-    let mut skipped = false;
-    for unit in scope.present_units() {
+    let mut compared = false;
+    // Every unit, including one whose directory is gone at HEAD: a pipeline
+    // whose models were all deleted still has removals to report against the
+    // base.
+    for unit in &scope.units {
         match compute_review_findings(
             config_path,
             &unit.models_dir,
@@ -800,12 +809,15 @@ fn dag_review_findings(
             base_ref,
             repo_dir,
         )? {
-            ReviewFindings::Computed(unit_findings) => findings.extend(unit_findings),
-            ReviewFindings::Skipped => skipped = true,
+            ReviewFindings::Computed(unit_findings) => {
+                compared = true;
+                findings.extend(unit_findings);
+            }
+            ReviewFindings::Skipped => {}
             not_computed @ ReviewFindings::NotComputed(_) => return Ok(not_computed),
         }
     }
-    if skipped {
+    if !compared {
         return Ok(ReviewFindings::Skipped);
     }
     Ok(ReviewFindings::Computed(findings))
@@ -1078,18 +1090,29 @@ fn review_state_path(models_dir: &Path) -> PathBuf {
     rocky_core::state::resolve_state_path(None, models_dir).path
 }
 
+/// Whether `cfg` declares at least one transformation pipeline, so has a
+/// models directory for the breaking-change gates to compare.
+pub(crate) fn declares_models_pipeline(cfg: &rocky_core::config::RockyConfig) -> bool {
+    cfg.pipelines
+        .values()
+        .any(|pipeline| pipeline.as_transformation().is_some())
+}
+
 /// The outcome of the breaking-change compare for a review.
 ///
 /// `--approve` refuses on [`Self::NotComputed`]. It still approves on
-/// [`Self::Skipped`], where there is nothing at HEAD or at the base to
-/// compare, or there is no git history.
+/// [`Self::Skipped`], where the base has no models or there is no git
+/// history. A project that declares no transformation pipeline and has no
+/// models directory also skips when its base cannot be read.
 #[derive(Debug)]
 enum ReviewFindings {
     /// Both sides compiled and the classifier ran.
     Computed(Vec<BreakingFinding>),
-    /// Nothing to compare: the models directory is missing or holds no
-    /// models, the base ref holds no models, or there is no git
-    /// history.
+    /// Nothing to compare: the base ref holds no models, or there is no git
+    /// history. A project that declares no transformation pipeline and has
+    /// no models directory also skips when its base cannot be read. A HEAD
+    /// with no models is NOT on its own a skip:
+    /// against a base with models it is a compare whose findings are removals.
     Skipped,
     /// The compare could not run: HEAD or the base ref does not compile, the
     /// base ref names no commit, or git cannot read it. The string names the
@@ -1116,9 +1139,11 @@ impl ReviewFindings {
 /// - `Ok(Computed(findings))` when both refs compiled and the typed-IR diff
 ///   ran. `findings` is the full classified list including `Info`-severity
 ///   entries; callers filter on [`BreakingFinding::is_breaking`].
-/// - `Ok(Skipped)` when there is nothing to compare: the models directory is
-///   missing or holds no models, the base ref holds no models, or there is no
-///   git history.
+/// - `Ok(Skipped)` when there is nothing to compare: the base ref holds no
+///   models, or there is no git history. A HEAD with no models (the models
+///   directory is missing or empty, or the glob matches nothing) does NOT
+///   skip on its own: when the base has models, each one is reported as
+///   removed.
 ///   Approval still requires a successful conditional DROP calculation.
 /// - `Ok(NotComputed(reason))` when HEAD or the base ref does not compile,
 ///   the base ref names no commit, or git cannot read the base ref.
@@ -1157,13 +1182,30 @@ fn compute_review_findings(
     let loaded_cfg = rocky_core::config::load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
 
-    if !models_dir.is_dir() {
-        tracing::warn!(
+    // A HEAD with no models is not "nothing to compare" on its own. A change
+    // that deletes every model leaves the directory missing or empty, and
+    // the base still holds the models it deleted. So HEAD's model set is
+    // `None` here and the base decides: no models there either skips, and
+    // models there diff against an empty HEAD as removals.
+    let head_has_dir = models_dir.is_dir();
+    // A config that declares no transformation pipeline (a replication-only
+    // project, say) and has no models directory used to skip before git was
+    // read. Its base is still read, because a replication `--all` run can
+    // execute models from that directory, so deleting them is still gated.
+    // But a base it cannot read (a `--base-ref` that does not exist locally,
+    // or a git read failure) skips, as it did before, instead of refusing.
+    // A project with no `rocky.toml` is not lenient: `models/` is its models
+    // directory by default.
+    let lenient_base = !head_has_dir
+        && loaded_cfg
+            .as_ref()
+            .is_some_and(|cfg| !declares_models_pipeline(cfg));
+    if !head_has_dir {
+        tracing::info!(
             target: "rocky::review",
             models_dir = %models_dir.display(),
-            "models directory missing — breaking-change gate skipped"
+            "models directory missing at HEAD — comparing against the base's models"
         );
-        return Ok(ReviewFindings::Skipped);
     }
 
     // Seed both compiles with the cached source schemas so the resulting IR
@@ -1178,7 +1220,11 @@ fn compute_review_findings(
         None => std::collections::HashMap::new(),
     };
 
-    let head_compile = {
+    // `None` when HEAD holds no models: a missing directory, an empty one,
+    // or a glob matching nothing.
+    let head_compile = if !head_has_dir {
+        None
+    } else {
         let config = CompilerConfig {
             models_dir: models_dir.to_path_buf(),
             contracts_dir: None,
@@ -1190,16 +1236,14 @@ fn compute_review_findings(
             None => rocky_compiler::compile::compile(&config),
         };
         match compiled {
-            Ok(r) => r,
-            // An empty directory, or a glob matching nothing, has nothing to
-            // compare, like a missing directory.
+            Ok(r) => Some(r),
             Err(e) if crate::commands::branch::is_no_models(&e) => {
-                tracing::warn!(
+                tracing::info!(
                     target: "rocky::review",
                     error = %e,
-                    "no models at HEAD — breaking-change gate skipped"
+                    "no models at HEAD — comparing against the base's models"
                 );
-                return Ok(ReviewFindings::Skipped);
+                None
             }
             Err(e) => {
                 tracing::warn!(
@@ -1224,8 +1268,8 @@ fn compute_review_findings(
     ) {
         Ok(r) => r,
         Err(error) => {
-            use crate::commands::branch::{BaseCompileGateAction, base_compile_gate_action};
-            return Ok(match base_compile_gate_action(&error) {
+            use crate::commands::branch::{BaseCompileGateAction, base_compile_gate_action_for};
+            return Ok(match base_compile_gate_action_for(&error, lenient_base) {
                 BaseCompileGateAction::Skip => {
                     tracing::warn!(
                         target: "rocky::review",
@@ -1249,7 +1293,12 @@ fn compute_review_findings(
     };
 
     let base_ir = super::ci_diff::project_ir_from_compile(&base_compile);
-    let head_ir = super::ci_diff::project_ir_from_compile(&head_compile);
+    // The base has models. A HEAD with none removes every one of them, and
+    // the diff reports each as `ModelRemoved`.
+    let head_ir = match &head_compile {
+        Some(compile) => super::ci_diff::project_ir_from_compile(compile),
+        None => crate::commands::branch::empty_project_ir(),
+    };
     let mut findings = breaking_change::diff_project_ir(&base_ir, &head_ir);
     if let Some(names) = executed_models {
         // Findings are keyed by target name. Map each executed model to its
@@ -2797,6 +2846,205 @@ mod tests {
             "the refusal names the compile failure: {msg}"
         );
         assert!(!review_marker_path(root, &plan_id).exists());
+        Ok(())
+    }
+
+    /// Review findings for `root`'s `models/` against `HEAD`, read in `root`.
+    fn findings_in_repo(root: &Path) -> anyhow::Result<ReviewFindings> {
+        let models_dir = root.join("models");
+        compute_review_findings(
+            &root.join("rocky.toml"),
+            &models_dir,
+            None,
+            None,
+            &review_state_path(&models_dir),
+            "HEAD",
+            Some(root),
+        )
+    }
+
+    /// A HEAD that deletes every model is a change to review. Before, the
+    /// gate skipped on a HEAD with no models, so deleting the whole project
+    /// reviewed as "nothing to compare". Both shapes a deletion leaves are
+    /// covered: the directory gone (what a git checkout of the commit
+    /// leaves) and the directory kept but empty.
+    #[test]
+    fn review_reports_every_base_model_removed_when_head_has_none() -> anyhow::Result<()> {
+        for remove_dir in [true, false] {
+            let dir = tempfile::tempdir()?;
+            let root = dir.path();
+            git_project(
+                root,
+                "",
+                &[
+                    ("models/m.sql", "SELECT 1 AS id\n"),
+                    ("models/m.toml", &sidecar("m")),
+                ],
+                &[],
+            )?;
+            std::fs::remove_file(root.join("rocky.toml"))?;
+            if remove_dir {
+                std::fs::remove_dir_all(root.join("models"))?;
+            } else {
+                std::fs::remove_file(root.join("models/m.sql"))?;
+                std::fs::remove_file(root.join("models/m.toml"))?;
+            }
+
+            let findings = match findings_in_repo(root)? {
+                ReviewFindings::Computed(findings) => findings,
+                ReviewFindings::Skipped => {
+                    panic!("a HEAD with no models must be compared (remove_dir={remove_dir})")
+                }
+                ReviewFindings::NotComputed(reason) => {
+                    panic!("the compare must run (remove_dir={remove_dir}): {reason}")
+                }
+            };
+            assert_eq!(
+                findings.len(),
+                1,
+                "one finding per base model: {findings:?}"
+            );
+            assert!(findings[0].is_breaking());
+            assert!(
+                matches!(
+                    &findings[0].change,
+                    breaking_change::BreakingChange::ModelRemoved { model }
+                        if model.ends_with("main.m")
+                ),
+                "the deleted model is reported removed: {findings:?}"
+            );
+        }
+        Ok(())
+    }
+
+    fn dag_scope(root: &Path, dirs: &[&str]) -> ApprovalScope {
+        ApprovalScope {
+            dag: true,
+            units: dirs
+                .iter()
+                .map(|d| crate::commands::approval_scope::ScopeUnit {
+                    pipeline: Some((*d).to_string()),
+                    models_dir: root.join(d),
+                    models_glob: None,
+                })
+                .collect(),
+            seeds_dir: None,
+        }
+    }
+
+    /// A `--dag` review keeps every compared pipeline's findings. Pipeline
+    /// `models` is deleted at HEAD (its model is removed); pipeline `newdir`
+    /// is new, with nothing at the base, so it skips. Before, that one skip
+    /// turned the whole review into `Skipped` with a breaking count of zero.
+    #[test]
+    fn dag_review_keeps_removals_next_to_a_new_pipeline() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        git_project(
+            root,
+            "",
+            &[
+                ("models/m.sql", "SELECT 1 AS id\n"),
+                ("models/m.toml", &sidecar("m")),
+            ],
+            &[],
+        )?;
+        std::fs::remove_file(root.join("rocky.toml"))?;
+        std::fs::remove_dir_all(root.join("models"))?;
+        std::fs::create_dir(root.join("newdir"))?;
+        std::fs::write(root.join("newdir/c.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(root.join("newdir/c.toml"), sidecar("c"))?;
+
+        let models_dir = root.join("models");
+        let findings = dag_review_findings(
+            &root.join("rocky.toml"),
+            &dag_scope(root, &["models", "newdir"]),
+            &review_state_path(&models_dir),
+            "HEAD",
+            Some(root),
+        )?;
+        let ReviewFindings::Computed(findings) = findings else {
+            panic!("the deleted pipeline was compared; the review must not skip: {findings:?}");
+        };
+        assert_eq!(
+            findings.iter().filter(|f| f.is_breaking()).count(),
+            1,
+            "the removal is counted: {findings:?}"
+        );
+        Ok(())
+    }
+
+    /// Every `--dag` pipeline missing, and no git history: nothing was
+    /// compared, so the review is `Skipped`, not "compared, zero breaking".
+    #[test]
+    fn dag_review_skips_when_every_pipeline_is_missing_and_there_is_no_git() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let findings = dag_review_findings(
+            &root.join("rocky.toml"),
+            &dag_scope(root, &["a", "b"]),
+            &root.join("state.redb"),
+            "HEAD",
+            Some(root),
+        )?;
+        assert!(matches!(findings, ReviewFindings::Skipped), "{findings:?}");
+        Ok(())
+    }
+
+    /// A config with no transformation pipeline and no models directory
+    /// skips when its base ref does not exist, as it did before. A config
+    /// WITH a transformation pipeline and a missing directory fails closed
+    /// on the same bad ref.
+    #[test]
+    fn review_skips_a_project_with_no_models_pipeline_before_reading_git() -> anyhow::Result<()> {
+        let adapter = "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        let with_tx = format!(
+            "{adapter}\n[pipeline.t]\ntype = \"transformation\"\n\n[pipeline.t.target]\nadapter = \"default\"\n"
+        );
+        for (config, skips) in [(adapter.to_string(), true), (with_tx, false)] {
+            let dir = tempfile::tempdir()?;
+            let root = dir.path();
+            git_project(root, &config, &[], &[])?;
+            std::fs::remove_dir_all(root.join("models"))?;
+            let models_dir = root.join("models");
+            let findings = compute_review_findings(
+                &root.join("rocky.toml"),
+                &models_dir,
+                None,
+                None,
+                &review_state_path(&models_dir),
+                "no-such-ref",
+                Some(root),
+            )?;
+            if skips {
+                assert!(matches!(findings, ReviewFindings::Skipped), "{findings:?}");
+            } else {
+                assert!(
+                    matches!(&findings, ReviewFindings::NotComputed(r) if r.contains("no-such-ref")),
+                    "a models project with a bad base ref fails closed: {findings:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Both sides empty still skips: there is nothing to compare at either
+    /// ref, whether HEAD's directory is missing or empty.
+    #[test]
+    fn review_skips_when_neither_head_nor_base_has_models() -> anyhow::Result<()> {
+        for remove_dir in [true, false] {
+            let dir = tempfile::tempdir()?;
+            let root = dir.path();
+            git_project(root, "", &[], &[])?;
+            std::fs::remove_file(root.join("rocky.toml"))?;
+            if remove_dir {
+                std::fs::remove_dir_all(root.join("models"))?;
+            }
+            assert!(
+                matches!(findings_in_repo(root)?, ReviewFindings::Skipped),
+                "no models at HEAD or the base skips (remove_dir={remove_dir})"
+            );
+        }
         Ok(())
     }
 

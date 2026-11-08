@@ -417,8 +417,10 @@ pub struct TransformationModels {
 /// The glob is not what limits either: `models/**` matches at every depth.
 /// Unifying the two traversals is #1262; this doc must not claim it is done.
 ///
-/// A missing directory is not an error here — that matches `run`, which treats
-/// an absent models directory as a no-op rather than a failure.
+/// A missing directory is not an error here: it is recorded in
+/// `missing_roots`, and each caller decides. `rocky run --dag` refuses it
+/// unless the pipeline sets `allow_empty_models = true`, as a single-pipeline
+/// `rocky run` does.
 ///
 /// Attribution is per pipeline, which is the half of #1261 that
 /// `build_unified_dag` needs: given one flat list it gave every transformation

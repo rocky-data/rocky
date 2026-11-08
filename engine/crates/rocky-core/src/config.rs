@@ -7681,6 +7681,15 @@ pub struct TransformationPipelineConfig {
     #[serde(default = "default_models_glob")]
     pub models: String,
 
+    /// Allow `rocky run` to succeed when the models directory does not exist.
+    /// Default `false`: a missing models directory fails the run and is a
+    /// `rocky validate` error, so a moved or mistyped directory is not a
+    /// silent no-op. Set `true` for a pipeline that has no models on
+    /// purpose, for example one that only loads seeds. An existing directory
+    /// with no models still fails either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_empty_models: bool,
+
     /// Target configuration (adapter + governance).
     pub target: TransformationTargetConfig,
 

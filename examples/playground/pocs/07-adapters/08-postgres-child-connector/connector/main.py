@@ -114,7 +114,9 @@ def run_duckdb(source, sql):
     preamble = "\n".join(
         [
             "SET TimeZone = 'UTC';",
-            "SET extension_directory = %s;" % literal(source["extension_directory"]),
+            # DuckDB 2.0 prints a deprecation warning on stdout for the old
+            # `extension_directory` setting, which breaks the JSON parse.
+            "SET extension_directories = [%s];" % literal(source["extension_directory"]),
             "INSTALL postgres;",
             "LOAD postgres;",
             # An empty connection string: libpq reads the PG* variables.
