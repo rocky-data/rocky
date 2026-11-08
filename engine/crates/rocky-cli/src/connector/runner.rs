@@ -22,7 +22,7 @@ use rocky_adapter_sdk::child::GroupKillGuard;
 use rocky_adapter_sdk::child::{RlimitPlan, apply_rlimits, read_bounded_line, stop_child};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rocky_adapter_sdk::child::{kill_group, leader_has_exited};
-use rocky_core::connector::{EffectiveLimits, PROTOCOL_VERSION, StateEnvelope};
+use rocky_core::connector::{EffectiveLimits, OPTIONS_FILE_NAME, PROTOCOL_VERSION, StateEnvelope};
 use serde::Serialize;
 use tokio::io::{AsyncRead, BufReader};
 use tokio::process::Child;
@@ -70,6 +70,9 @@ pub struct ChildSpec<'a> {
     pub retries: u32,
     /// Gap between two checks of the bytes the child has written.
     pub output_poll: Duration,
+    /// The bytes of `options.json`, written into each scratch directory
+    /// before the child starts. `{}` when the config sets no option.
+    pub options_json: &'a [u8],
 }
 
 /// Why one attempt failed. All of them can be retried.
@@ -119,6 +122,8 @@ struct Request<'a> {
     protocol_version: u32,
     run_id: &'a str,
     output_dir: &'a str,
+    /// Absolute path of `options.json`, which always exists.
+    options_path: &'a str,
     state: Option<&'a StateEnvelope>,
     limits: &'a EffectiveLimits,
 }
@@ -212,6 +217,22 @@ fn new_scratch_dir(landing: &Path, run_id: &str, attempt: u32) -> Result<PathBuf
     Ok(scratch)
 }
 
+/// Write `options.json` into the new scratch directory, owner-only, and
+/// return its path. The file is new: the scratch directory was just made.
+fn write_options_file(scratch: &Path, bytes: &[u8]) -> Result<PathBuf, AttemptError> {
+    let path = scratch.join(OPTIONS_FILE_NAME);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&path)
+        .map_err(|e| AttemptError::Setup(format!("{}: {e}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(|e| AttemptError::Setup(format!("{}: {e}", path.display())))?;
+    Ok(path)
+}
+
 /// The request as an anonymous file, rewound for reading.
 ///
 /// A pipe would need Rocky to write after the spawn, and a child that exits
@@ -233,10 +254,15 @@ async fn run_child(spec: &ChildSpec<'_>, scratch: &Path) -> Result<(), AttemptEr
     let output_dir = scratch
         .to_str()
         .ok_or_else(|| AttemptError::Setup("the scratch path is not valid UTF-8".to_string()))?;
+    let options_path = write_options_file(scratch, spec.options_json)?;
+    let options_path = options_path
+        .to_str()
+        .ok_or_else(|| AttemptError::Setup("the options path is not valid UTF-8".to_string()))?;
     let request = serde_json::to_string(&Request {
         protocol_version: PROTOCOL_VERSION,
         run_id: spec.run_id,
         output_dir,
+        options_path,
         state: spec.state,
         limits: &spec.limits,
     })

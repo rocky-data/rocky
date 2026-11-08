@@ -1532,6 +1532,10 @@ retries    = 1
 
 [connector.stripe_charges.limits]
 wall_time_secs = 3600
+
+[connector.stripe_charges.options]
+account = "acct_main"
+page_size = 100
 ```
 
 | Key | Default | Meaning |
@@ -1544,6 +1548,7 @@ wall_time_secs = 3600
 | `contract` | none | A data contract, checked on the staging table. |
 | `limits` | see guide | `wall_time_secs` (3600), `cpu_time_secs`, `memory_bytes`, `output_bytes` (5 GiB). The smaller of this and the manifest wins. |
 | `keep_scratch` | `false` | Keep the scratch directory of a successful run. By default Rocky removes it after the state commit. |
+| `options` | `{}` | Settings for the program, as any TOML table. Rocky writes it as JSON to `options.json` in the scratch directory. At most 64 KiB as JSON. Not for secrets: the file is on disk in clear. See [Options](/guides/child-connectors/#options). |
 
 ---
 

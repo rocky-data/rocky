@@ -64,6 +64,7 @@ output_bytes   = 5368709120
 | `contract` | Optional data contract. Rocky checks it on the staging table, before the rows reach the target. |
 | `limits` | Limits for one attempt. See [Limits](#limits). |
 | `keep_scratch` | Keep the scratch directory of a successful run. Default `false`: Rocky removes it after the state commit. |
+| `options` | Settings for the program, as any TOML table. See [Options](#options). |
 
 A BigQuery target is refused when the config loads, because BigQuery does not accept local Parquet files. DuckDB is the tested path. Snowflake and Databricks accept `file://` through their loaders, but only DuckDB has a live test.
 
@@ -98,10 +99,13 @@ Rocky writes one JSON document to the stdin of the program.
   "protocol_version": 0,
   "run_id": "9b2f0c1e4d5a4f6e8a7b3c2d1e0f9a8b",
   "output_dir": "/abs/path/.rocky/landing/stripe/9b2f...-1",
+  "options_path": "/abs/path/.rocky/landing/stripe/9b2f...-1/options.json",
   "state": { "schema_version": 1, "value": { "cursor": 120 } },
   "limits": { "wall_time_secs": 1800, "output_bytes": 5368709120 }
 }
 ```
+
+`options_path` is the absolute path of `options.json`. See [Options](#options).
 
 `state` is `null` on the first run. If the saved state has an older `schema_version` than the manifest, Rocky hands it over unchanged. The program must upgrade it. If the saved state has a newer version than the manifest, Rocky refuses to start the program.
 
@@ -128,6 +132,39 @@ Rocky checks the following. Any failure fails the attempt, and Rocky may start a
 - The files together are at most `output_bytes`.
 
 A result with no files is valid. Rocky then saves the new state and loads no rows.
+
+## Options
+
+Put the settings of the program under `[connector.<name>.options]`. Use any TOML table.
+
+```toml
+[connector.stripe_charges.options]
+account   = "acct_main"
+page_size = 100
+since     = 2026-01-01T00:00:00Z
+
+[connector.stripe_charges.options.filters]
+status = ["succeeded", "refunded"]
+```
+
+Before each attempt, Rocky writes the table as one line of JSON to `options.json` in the scratch directory. The request gives its absolute path in `options_path`. The file is in the working directory of the program too.
+
+```json
+{"account":"acct_main","page_size":100,"since":"2026-01-01T00:00:00Z","filters":{"status":["succeeded","refunded"]}}
+```
+
+- The file always exists. With no `options` table it holds `{}`. A program can read it with no check first.
+- Strings, integers, floats, booleans, arrays and tables keep their JSON types.
+- A datetime becomes a string. An offset datetime is RFC 3339, such as `2026-01-01T00:00:00Z`. A local datetime, date or time is written as TOML spells it, such as `2026-01-01T00:00:00`, `2026-01-01` or `07:30:00`.
+- A float that is `nan` or `inf` has no JSON form. The config is refused.
+- The JSON must be at most 64 KiB (65536 bytes). A larger table is refused when the config loads, and by `rocky validate`. The error names the connector and the size.
+- The file is readable by its owner only. It counts toward `output_bytes`, like every file in the scratch directory.
+
+:::caution[Options are not secrets]
+Rocky writes `options.json` to disk in clear, and a kept scratch directory keeps it. Put a credential under `secrets`, and read it from the environment of the program.
+
+Rocky refuses an option key or value that holds a value it substituted from the environment with `${VAR}`. The error names the option and shows `${VAR}`, never the value. This check has two gaps. A value shorter than 8 bytes is not detected. The literal default in `${VAR:-default}` is not detected either, because it is already in `rocky.toml` in clear.
+:::
 
 ## What the program sees
 
@@ -230,6 +267,8 @@ Each run works like this:
 2. It extracts the rows whose value is above the saved cursor and below M. The first run has no lower bound. Rows with a NULL value are skipped.
 3. The new cursor is the largest value it extracted. Rows at M wait until a newer row exists, so rows that tie at M always land together. On a quiet source the newest rows wait until newer data arrives.
 4. If no row qualifies, the program writes no file. Rocky loads nothing and still saves the state.
+
+The source table and the cursor column are in `[connector.pg_events.options]`. The program reads them from `options.json`.
 
 The connection settings are the `PG*` variables, declared under `secrets` in `rocky.toml`. The program attaches with an empty connection string, so libpq reads them from its environment. They never appear in SQL or in the output.
 
