@@ -342,8 +342,8 @@ fn withhold_unproven_non_null(
             "column '{}' had no NULLs in {} profiled row(s), but Rocky cannot prove it is \
              non-null from the model SQL and the source schemas it has, so the draft leaves \
              `nullable` unset. To make `nullable = false` checkable, COALESCE it in the model \
-             to a value of its own type that is never NULL (a NOT NULL column, or a literal \
-             such as `''` for text). A NOT NULL source column also works, but only once Rocky's \
+             with a NOT NULL column of the same type (the `E012` help lists when a literal \
+             default also works). A NOT NULL source column also works, but only once Rocky's \
              schema cache holds that table: a replication pipeline's `rocky run` or `rocky \
              discover --with-schemas` can fill it; a transformation-only pipeline does not",
             column.name, observed.rows

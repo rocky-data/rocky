@@ -119,7 +119,7 @@ What an unverified type *does* to the exit code at each gate is open. See Open q
 ### 4. Nullability follows 3VL, and over-approximation is the safe direction
 
 - Inference may say "nullable" for a column that never holds NULL. It must never say "non-nullable" for a column that can hold NULL. A wrong non-nullable result is a soundness bug in `typecheck.rs`, and a contract that passes on it is a false guarantee.
-- So `E012` stays fail-closed on unresolved expressions. The fix a user is told to apply is `COALESCE` to a value of the column's type that is never NULL, or a NOT NULL source column, never a `CAST` (a cast never removes nullability; it only changes the type). Not a `WHERE ... IS NOT NULL` filter either: inference does not read the WHERE clause, so the filter leaves the column nullable.
+- So `E012` stays fail-closed on unresolved expressions. The fix a user is told to apply is `COALESCE` to a value of the column's type that is never NULL, or a NOT NULL source column, never a bare `CAST` of the column (a cast never removes nullability; it only changes the type). Not a `WHERE ... IS NOT NULL` filter either: inference does not read the WHERE clause, so the filter leaves the column nullable.
 - `nullable = true` in a contract means "may be NULL". It checks nothing and promises nothing.
 - Struct field nullability is compared as part of §2.
 

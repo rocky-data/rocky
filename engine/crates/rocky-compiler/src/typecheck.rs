@@ -5353,7 +5353,8 @@ mod tests {
                 .find(|d| &*d.code == "E012")
         };
         for (sql, fails) in [
-            // Not remedies: the column stays nullable.
+            // Not remedies: the column stays nullable. The `CASE` row is
+            // conservative: inference does not read the guard.
             ("SELECT z AS c, x FROM t WHERE z IS NOT NULL", true),
             ("SELECT CAST(z AS BIGINT) AS c, x FROM t", true),
             (
@@ -5372,7 +5373,13 @@ mod tests {
         let help = e012("SELECT z AS c FROM t")
             .and_then(|d| d.suggestion)
             .expect("E012 carries a suggestion");
-        for remedy in ["COALESCE", "NOT NULL", "CAST(0 AS INT)", "nullable = true"] {
+        for remedy in [
+            "COALESCE(c, other_col)",
+            "NOT NULL",
+            "CAST(0 AS INT)",
+            "another column of the same SELECT",
+            "nullable = true",
+        ] {
             assert!(help.contains(remedy), "{remedy}: {help}");
         }
         assert!(
