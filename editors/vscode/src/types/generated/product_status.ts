@@ -72,7 +72,7 @@ export interface ProductStatusOutput {
    */
   committed_spec_digest?: string | null;
   /**
-   * The product's cost for the current month (in the project's `[schedule].timezone`), with its `[product_budget.<name>]` verdict and breach events when it has a budget: its row from `rocky cost --month <month> --by product`. Present only from `rocky product status`, and only when the spec parses and the product owns a model.
+   * The product's cost for the current month (in the project's `[schedule].timezone`), with its `[product_budget.<name>]` verdict and breach events when it has a budget: its row from `rocky cost --month <month> --by product`. Present only from `rocky product status` (and the same route of `rocky serve`), only for a product that has a `[product_budget.<name>]`, whose spec parses and that owns a model.
    */
   cost_month?: ProductCostMonth | null;
   /**

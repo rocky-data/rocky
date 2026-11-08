@@ -1225,6 +1225,33 @@ fn evaluate_budgets(
         .collect()
 }
 
+/// Every budgeted product's verdict as of the replay step at `index` of
+/// [`MonthInputs::runs`]: the month split over the runs whose records were
+/// written by the time that run's was, with storage accrued to then.
+fn step_verdicts(
+    inputs: &MonthInputs,
+    budgets: &std::collections::BTreeMap<String, ProductBudgetConfig>,
+    index: usize,
+) -> Result<std::collections::BTreeMap<String, ProductBudgetStatus>> {
+    let run = &inputs.runs[index];
+    let split = inputs.split(&inputs.runs[..=index], run.finished_at)?;
+    Ok(evaluate_budgets(inputs, budgets, &split, true))
+}
+
+/// The event a breached step records: the run, and the limits it exceeded.
+fn breach_event(run: &RunRecord, status: &ProductBudgetStatus) -> ProductBudgetBreachEvent {
+    ProductBudgetBreachEvent {
+        run_id: run.run_id.clone(),
+        at: run.finished_at.to_rfc3339(),
+        breached: status
+            .checks
+            .iter()
+            .filter(|c| c.verdict == ProductBudgetVerdict::Breached)
+            .cloned()
+            .collect(),
+    }
+}
+
 /// The breach events of every budgeted product this month.
 ///
 /// The prior verdict is not stored. Instead the month is split again after
@@ -1249,8 +1276,7 @@ fn replay_breach_events(
         if !inputs.is_step(run) {
             continue;
         }
-        let split = inputs.split(&inputs.runs[..=index], run.finished_at)?;
-        for (product, status) in evaluate_budgets(inputs, budgets, &split, true) {
+        for (product, status) in step_verdicts(inputs, budgets, index)? {
             match status.verdict {
                 ProductBudgetVerdict::NotEvaluated => {}
                 ProductBudgetVerdict::InBudget => {
@@ -1264,18 +1290,59 @@ fn replay_breach_events(
                     events
                         .entry(product)
                         .or_default()
-                        .push(ProductBudgetBreachEvent {
-                            run_id: run.run_id.clone(),
-                            at: run.finished_at.to_rfc3339(),
-                            breached: status
-                                .checks
-                                .into_iter()
-                                .filter(|c| c.verdict == ProductBudgetVerdict::Breached)
-                                .collect(),
-                        });
+                        .push(breach_event(run, &status));
                 }
             }
         }
+    }
+    Ok(events)
+}
+
+/// The events the replay step at `index` records, by product: the same rule
+/// as [`replay_breach_events`], without replaying the whole month.
+///
+/// Splits the month at `index`, then, for each product breached there, walks
+/// back over earlier steps only until it finds that product's last evaluated
+/// verdict. Usually that is the step before, so the end-of-run check costs
+/// two splits, not one per run of the month.
+fn events_at_step(
+    inputs: &MonthInputs,
+    budgets: &std::collections::BTreeMap<String, ProductBudgetConfig>,
+    index: usize,
+) -> Result<std::collections::BTreeMap<String, ProductBudgetBreachEvent>> {
+    let mut events = std::collections::BTreeMap::new();
+    let run = &inputs.runs[index];
+    if !inputs.history_complete || !inputs.is_step(run) {
+        return Ok(events);
+    }
+    let mut pending: std::collections::BTreeMap<String, ProductBudgetStatus> =
+        step_verdicts(inputs, budgets, index)?
+            .into_iter()
+            .filter(|(_, status)| status.verdict == ProductBudgetVerdict::Breached)
+            .collect();
+    for earlier in (0..index).rev() {
+        if pending.is_empty() {
+            break;
+        }
+        if !inputs.is_step(&inputs.runs[earlier]) {
+            continue;
+        }
+        let before = step_verdicts(inputs, budgets, earlier)?;
+        pending.retain(|product, status| {
+            match before.get(product).map(|s| s.verdict) {
+                // Already over: still out, no new event.
+                Some(ProductBudgetVerdict::Breached) => false,
+                Some(ProductBudgetVerdict::InBudget) => {
+                    events.insert(product.clone(), breach_event(run, status));
+                    false
+                }
+                Some(ProductBudgetVerdict::NotEvaluated) | None => true,
+            }
+        });
+    }
+    // No evaluated verdict before this step: this is the product's first.
+    for (product, status) in pending {
+        events.insert(product, breach_event(run, &status));
     }
     Ok(events)
 }
@@ -1497,20 +1564,23 @@ pub fn product_budgets_after_run(
 
     let mut out = Vec::new();
     for month in months {
-        let report = compute_month_cost_in(store, config_path, &month, now)?;
-        for product in report.products {
-            let Some(budget) = product.budget else {
-                continue;
-            };
-            let breach_event = product
-                .breach_events
-                .into_iter()
-                .find(|event| event.run_id == run_id);
+        let inputs = load_month_inputs(store, config_path, &month, now)?;
+        let Some(budgets) = inputs.budgets() else {
+            continue;
+        };
+        let split = inputs.split(&inputs.runs, now)?;
+        let production_ran = inputs.runs.iter().any(|run| inputs.is_step(run));
+        let verdicts = evaluate_budgets(&inputs, budgets, &split, production_ran);
+        let mut events = match inputs.runs.iter().position(|run| run.run_id == run_id) {
+            Some(index) => events_at_step(&inputs, budgets, index)?,
+            None => std::collections::BTreeMap::new(),
+        };
+        for (product, budget) in verdicts {
             out.push(RunProductBudget {
-                product: product.product,
-                month: report.month.clone(),
+                breach_event: events.remove(&product),
+                product,
+                month: inputs.label.clone(),
                 budget,
-                breach_event,
             });
         }
     }
@@ -3223,6 +3293,54 @@ mod tests {
         );
     }
 
+    /// The end-of-run check walks back only as far as it must, and agrees
+    /// with the full replay at every step, including a breach found at a run
+    /// of another pipeline.
+    #[test]
+    fn the_run_check_agrees_with_the_full_replay_at_every_step() {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_storage_gb_month = 0.5\nmax_usd = 1\n",
+        );
+        let first = at(2026, 10, 1, 0, 0);
+        let mut build = exec_at("revenue_daily", first, 10);
+        build.stored_bytes = Some(StoredBytes {
+            bytes: 1 << 30,
+            basis: StoredBytesBasis::DataFiles,
+        });
+        let mut runs = vec![sample_run_at("build", first, vec![build])];
+        for day in [5, 10, 15, 20, 25] {
+            let start = at(2026, 10, day, 0, 0);
+            runs.push(sample_run_at(
+                &format!("day-{day}"),
+                start,
+                vec![exec_at("raw", start, 5)],
+            ));
+        }
+        record(&state, &runs);
+        let replayed = event_runs(&month(&config, &state), "revenue_daily");
+        assert_eq!(
+            replayed,
+            ["day-20"],
+            "the unpriced max_usd does not hide it"
+        );
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let mut found = Vec::new();
+        for run in &runs {
+            let after =
+                product_budgets_after_run(&store, &config, &run.run_id, at(2026, 11, 2, 0, 0))
+                    .unwrap();
+            found.extend(
+                after
+                    .into_iter()
+                    .filter_map(|b| b.breach_event.map(|e| e.run_id)),
+            );
+        }
+        assert_eq!(found, replayed);
+    }
+
     /// A shadow run is not a production run: no check, no event.
     #[test]
     fn a_shadow_run_checks_no_budget() {
@@ -3245,6 +3363,37 @@ mod tests {
         }
         let out = month(&config, &state);
         assert!(event_runs(&out, "revenue_daily").is_empty());
+    }
+
+    /// `rocky product status` carries the current month only for a product
+    /// that has a budget, with its verdict.
+    #[test]
+    fn product_status_gains_cost_month_only_with_a_budget() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let root = config.parent().unwrap();
+        let now = at(2026, 10, 9, 0, 0);
+        let status = |product: &str| {
+            let mut out =
+                crate::commands::product::product_status_in(root, Some(&state), product).unwrap();
+            crate::commands::product::attach_cost_month(&mut out, &config, &state, now);
+            out
+        };
+        let budgeted = status("revenue_daily");
+        assert_eq!(budgeted.cost_month_error, None);
+        let cost_month = budgeted
+            .cost_month
+            .expect("a budgeted product has cost_month");
+        assert_eq!(cost_month.month, "2026-10");
+        assert_eq!(
+            cost_month.cost.budget.map(|b| b.verdict),
+            Some(ProductBudgetVerdict::Breached)
+        );
+        assert_eq!(cost_month.cost.breach_events.len(), 2);
+        let unbudgeted = status("ltv");
+        assert!(unbudgeted.cost_month.is_none());
+        assert!(unbudgeted.cost_month_error.is_none());
     }
 
     #[test]

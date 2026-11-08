@@ -1671,13 +1671,24 @@ async fn get_product(
     }
     let root = project_root_for(&state)?;
     let state_path = state_path_for(&state);
+    let config_path = state.config_path.clone();
     let lookup = name.clone();
     let output = store_read(&state, move || -> anyhow::Result<Option<_>> {
         let known = product_names_in(&root, Some(&state_path))?;
         if !known.iter().any(|known| known == &lookup) {
             return Ok(None);
         }
-        product_status_in(&root, Some(&state_path), &lookup).map(Some)
+        let mut status = product_status_in(&root, Some(&state_path), &lookup)?;
+        // The same `cost_month` as `rocky product status`.
+        if let Some(config_path) = config_path.as_deref() {
+            crate::commands::product::attach_cost_month(
+                &mut status,
+                config_path,
+                &state_path,
+                chrono::Utc::now(),
+            );
+        }
+        Ok(Some(status))
     })
     .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;

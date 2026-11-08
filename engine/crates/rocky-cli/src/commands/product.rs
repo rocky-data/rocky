@@ -1116,8 +1116,9 @@ pub struct ProductStatusOutput {
     /// The product's cost for the current month (in the project's
     /// `[schedule].timezone`), with its `[product_budget.<name>]` verdict and
     /// breach events when it has a budget: its row from `rocky cost --month
-    /// <month> --by product`. Present only from `rocky product status`, and
-    /// only when the spec parses and the product owns a model.
+    /// <month> --by product`. Present only from `rocky product status` (and
+    /// the same route of `rocky serve`), only for a product that has a
+    /// `[product_budget.<name>]`, whose spec parses and that owns a model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_month: Option<crate::output::ProductCostMonth>,
     /// Why `cost_month` could not be computed, when it could not.
@@ -2536,6 +2537,38 @@ pub fn run_product_journal(
     Ok(())
 }
 
+/// Fill `cost_month` (or `cost_month_error`) on a status report, as of `now`.
+///
+/// Only for a product whose spec parses and that has a
+/// `[product_budget.<name>]` in the config at `config_path`: the month is a
+/// scan of run history, and a status report without a budget does not pay
+/// for it. `rocky product status` and `GET /api/v1/products/:name` both call
+/// this, so the two answer with the same fields.
+pub(crate) fn attach_cost_month(
+    output: &mut ProductStatusOutput,
+    config_path: &Path,
+    state_path: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if !output.spec_present {
+        return;
+    }
+    let budgeted = match rocky_core::config::load_optional_project_config(Some(config_path)) {
+        Ok(cfg) => cfg.is_some_and(|cfg| cfg.product_budget.contains_key(&output.product)),
+        Err(error) => {
+            output.cost_month_error = Some(format!("{error:#}"));
+            return;
+        }
+    };
+    if !budgeted {
+        return;
+    }
+    match crate::commands::cost::product_cost_month(state_path, config_path, &output.product, now) {
+        Ok(cost_month) => output.cost_month = cost_month,
+        Err(error) => output.cost_month_error = Some(format!("{error:#}")),
+    }
+}
+
 /// Execute `rocky product status <name>`.
 pub fn run_product_status(
     config_path: &Path,
@@ -2545,17 +2578,7 @@ pub fn run_product_status(
 ) -> Result<()> {
     let root = product_command_root(config_path);
     let mut output = product_status_in(&root, Some(state_path), product_name)?;
-    if output.spec_present {
-        match crate::commands::cost::product_cost_month(
-            state_path,
-            config_path,
-            product_name,
-            chrono::Utc::now(),
-        ) {
-            Ok(cost_month) => output.cost_month = cost_month,
-            Err(error) => output.cost_month_error = Some(format!("{error:#}")),
-        }
-    }
+    attach_cost_month(&mut output, config_path, state_path, chrono::Utc::now());
     if output_json {
         print_json(&output)?;
     } else {
