@@ -204,6 +204,63 @@ describe("the five states of a cost figure", () => {
     const card = chargedCard();
     expect(within(card).getByText("no total: the month is partial")).toBeInTheDocument();
     expect(card.textContent).not.toMatch(/\$/);
+    // Every physical amount in the cards is marked partial too, never
+    // "measured". The split-by chip in the upstream table still names how a
+    // share was split, which stays true; its amount column says partial.
+    const cards = Array.from(document.querySelectorAll("[data-tone]"));
+    for (const one of cards) {
+      expect(one.querySelector('[data-figure-state="measured"]')).toBeNull();
+    }
+    expect(
+      document.querySelectorAll('[data-figure-state="partial"]').length,
+    ).toBeGreaterThanOrEqual(4);
+    expect(screen.getByText("charged (partial)")).toBeInTheDocument();
+  });
+
+  it("a partial month with a budget does not claim 'no breach'", () => {
+    renderPanel(
+      report(
+        row({
+          money: null,
+          money_status: "partial",
+          money_parts: [],
+          budget: { verdict: "not_evaluated", on_breach: "warn", checks: [], reasons: ["history"] },
+        }),
+        false,
+      ),
+    );
+    expect(screen.queryByText("No breach this month.")).toBeNull();
+    expect(screen.getByText(/Breach events are not known/)).toBeInTheDocument();
+  });
+
+  it("a value a newer engine adds is never read as measured or priced", () => {
+    const product = row({
+      money_status: "estimated_somehow" as unknown as ProductMonthCost["money_status"],
+      allocated_upstream: [
+        { ...row().allocated_upstream[0], basis: "magic" as unknown as "bytes" },
+      ],
+    });
+    expect(moneyState(product)).toBe("not_measured");
+    expect(basisState("magic" as unknown as "bytes")).toBe("not_measured");
+    renderPanel(report(product));
+    const card = chargedCard();
+    expect(card.textContent).not.toMatch(/\$/);
+    expect(within(card).getByText(/status estimated_somehow/)).toBeInTheDocument();
+  });
+
+  it("names owner_pays as itself, and shows the report's caveats", () => {
+    const empty = report(
+      row({ allocated_upstream: [{ ...row().allocated_upstream[0], basis: "owner_pays" }] }),
+    );
+    renderPanel({
+      ...empty,
+      warnings: ["[product_budget.ghost] names no product that owns a model; it is not checked"],
+      not_measured: { failed_executions: 2, storage_unknown_tables: 0, unattributed_read_tables: 3 },
+    });
+    expect(screen.getByText("owner pays")).toBeInTheDocument();
+    expect(screen.getByText(/names no product that owns a model/)).toBeInTheDocument();
+    expect(screen.getByText(/2 failed executions recorded no time/)).toBeInTheDocument();
+    expect(screen.getByText(/3 tables were read with no recorded build/)).toBeInTheDocument();
   });
 
   it("a priced zero is a real $0.00, and a tiny figure keeps its digits", () => {

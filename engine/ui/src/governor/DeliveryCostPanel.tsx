@@ -57,7 +57,18 @@ const FIGURE_STATE_TONE: Record<FigureState, string> = {
   no_price: "border-zinc-300 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300",
 };
 
-/** How a split's `basis` reads as a figure state. */
+/**
+ * What a chip can say. The five figure states, plus two that are not about
+ * how sure a number is: `partial` (run history does not cover the month) and
+ * `owner_pays` (no reader share was measured, so the table's owner kept the
+ * whole cost — the cost itself was measured).
+ */
+export type ChipState = FigureState | "partial" | "owner_pays";
+
+/**
+ * How a split's `basis` reads as a figure state. A basis a newer engine adds
+ * reads as `not_measured`: an unknown is never shown as measured.
+ */
 export function basisState(basis: CostSplitBasis): FigureState {
   switch (basis) {
     case "bytes":
@@ -67,12 +78,18 @@ export function basisState(basis: CostSplitBasis): FigureState {
     case "rows_scanned_unweighted":
       return "rows_only";
     case "owner_pays":
-      // Nothing usable was measured, so the owner kept the cost.
+      return "not_measured";
+    default:
       return "not_measured";
   }
 }
 
-/** How a physical unit reads as a figure state. */
+/** The chip for a split's `basis` in a table: `owner_pays` is named as itself. */
+export function basisChip(basis: CostSplitBasis): ChipState {
+  return basis === "owner_pays" ? "owner_pays" : basisState(basis);
+}
+
+/** How a physical unit reads as a figure state. An unknown unit is not measured. */
 export function unitState(unit: CostUnit): FigureState {
   switch (unit) {
     case "compute_ms":
@@ -80,6 +97,8 @@ export function unitState(unit: CostUnit): FigureState {
       return "measured";
     case "storage_byte_hours_allocated_blocks":
       return "estimated";
+    default:
+      return "not_measured";
   }
 }
 
@@ -112,6 +131,9 @@ export function moneyState(cost: ProductMonthCost): FigureState | "partial" {
       return "not_measured";
     case "priced":
       break;
+    default:
+      // A status a newer engine adds: never read as priced.
+      return "not_measured";
   }
   let state: FigureState = "measured";
   for (const amount of cost.charged) {
@@ -126,12 +148,19 @@ export function moneyState(cost: ProductMonthCost): FigureState | "partial" {
 }
 
 /** A state written as text in a bordered chip: the word carries it, not the colour. */
-export function FigureChip({ state }: { state: FigureState | "partial" }) {
-  const label = state === "partial" ? "partial" : FIGURE_STATE_LABEL[state];
-  const tone =
-    state === "partial"
-      ? "border-amber-300 text-amber-800 dark:border-amber-800 dark:text-amber-300"
-      : FIGURE_STATE_TONE[state];
+export function FigureChip({ state }: { state: ChipState }) {
+  let label: string;
+  let tone: string;
+  if (state === "partial") {
+    label = "partial";
+    tone = "border-amber-300 text-amber-800 dark:border-amber-800 dark:text-amber-300";
+  } else if (state === "owner_pays") {
+    label = "owner pays";
+    tone = FIGURE_STATE_TONE.no_price;
+  } else {
+    label = FIGURE_STATE_LABEL[state];
+    tone = FIGURE_STATE_TONE[state];
+  }
   return (
     <span
       data-figure-state={state}
@@ -159,6 +188,8 @@ export function formatAmount(unit: CostUnit, amount: number): string {
       return `${formatNumber(amount / BYTES_PER_GIB)} GiB-hours (data files)`;
     case "storage_byte_hours_allocated_blocks":
       return `${formatNumber(amount / BYTES_PER_GIB)} GiB-hours (allocated blocks)`;
+    default:
+      return `${amount} ${String(unit)}`;
   }
 }
 
@@ -183,6 +214,8 @@ function MoneyFigureText({ cost }: { cost: ProductMonthCost }) {
         return "no money figure: Rocky does not measure it";
       case "partial":
         return "no total: the month is partial";
+      default:
+        return `no money figure: status ${String(cost.money_status)}`;
     }
   })();
   return (
@@ -211,9 +244,12 @@ export function chargedUnitState(cost: ProductMonthCost, unit: CostUnit): Figure
 function AmountsText({
   amounts,
   stateOf = unitState,
+  partial = false,
 }: {
   amounts: CostAmount[];
   stateOf?: (unit: CostUnit) => FigureState;
+  /** Run history does not cover the month: every amount is partial. */
+  partial?: boolean;
 }) {
   if (amounts.length === 0) {
     // An empty list is "nothing recorded in this unit", not "zero".
@@ -224,7 +260,7 @@ function AmountsText({
       {amounts.map((amount) => (
         <li key={amount.unit} className="flex flex-wrap items-baseline gap-2">
           <span>{formatAmount(amount.unit, amount.amount)}</span>
-          <FigureChip state={stateOf(amount.unit)} />
+          <FigureChip state={partial ? "partial" : stateOf(amount.unit)} />
         </li>
       ))}
     </ul>
@@ -241,6 +277,8 @@ function moneyStatusLabel(status: MoneyStatus): string {
       return "not measured";
     case "partial":
       return "partial";
+    default:
+      return String(status);
   }
 }
 
@@ -251,6 +289,8 @@ function verdictTone(verdict: ProductBudgetVerdict): Tone {
     case "breached":
       return "risk";
     case "not_evaluated":
+      return "warn";
+    default:
       return "warn";
   }
 }
@@ -264,6 +304,8 @@ function verdictLabel(verdict: ProductBudgetVerdict): string {
     case "not_evaluated":
       // Never read as in budget.
       return "not evaluated";
+    default:
+      return String(verdict);
   }
 }
 
@@ -275,6 +317,8 @@ function formatLimit(type: ProductBudgetLimitType, value: number): string {
       return `${formatNumber(value)} GB-month`;
     case "max_usd":
       return formatUsd(value);
+    default:
+      return `${value} (${String(type)})`;
   }
 }
 
@@ -295,11 +339,11 @@ function checkCells(check: ProductBudgetCheck): ReactNode[] {
   ];
 }
 
-function UpstreamTable({ rows }: { rows: AllocatedUpstreamCost[] }) {
+function UpstreamTable({ rows, partial }: { rows: AllocatedUpstreamCost[]; partial: boolean }) {
   return (
     <Rows
       ariaLabel="What this product pays for tables it reads"
-      columns={["table", "charged", "share", "split by", "notes"]}
+      columns={["table", partial ? "charged (partial)" : "charged", "share", "split by", "notes"]}
       rows={rows.map((row) => [
         <span key="t" className="font-mono text-xs">
           {row.table}
@@ -310,7 +354,7 @@ function UpstreamTable({ rows }: { rows: AllocatedUpstreamCost[] }) {
             ? `${formatNumber((row.amount / row.of_total) * 100)}% of the table's cost`
             : NOT_RECORDED}
         </span>,
-        <FigureChip key="b" state={basisState(row.basis)} />,
+        <FigureChip key="b" state={basisChip(row.basis)} />,
         <UpstreamNotes key="n" row={row} />,
       ])}
     />
@@ -380,10 +424,34 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
       </div>
     );
   }
+  const partial = !report.history_complete;
+  const counts = report.not_measured;
+  const unmeasured = [
+    counts.failed_executions > 0
+      ? `${counts.failed_executions} failed executions recorded no time, so their compute is lost`
+      : null,
+    counts.storage_unknown_tables > 0
+      ? `${counts.storage_unknown_tables} tables have unknown storage before their first measurement this month`
+      : null,
+    counts.unattributed_read_tables > 0
+      ? `${counts.unattributed_read_tables} tables were read with no recorded build, so the cost of those reads is not split`
+      : null,
+  ].filter((line): line is string => line !== null);
+  const caveats = [...(report.warnings ?? []), ...unmeasured];
   return (
     <div className="space-y-3">
       {header}
-      {!report.history_complete && (
+      {caveats.length > 0 && (
+        <div className="text-xs text-amber-700 dark:text-amber-400">
+          <p>The whole month&apos;s report is less complete than it looks:</p>
+          <ul className="list-disc pl-5">
+            {caveats.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {partial && (
         <StatusCard
           label="partial month"
           value="run history does not cover the whole month"
@@ -404,18 +472,25 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
             <AmountsText
               amounts={cost.charged}
               stateOf={(unit) => chargedUnitState(cost, unit)}
+              partial={partial}
             />
           }
           sub="Kept plus what it paid for tables it reads."
         />
         <StatusCard
           label="kept"
-          value={<AmountsText amounts={cost.kept} />}
-          sub="What the product still pays for its own builds after other products pay for what they read."
+          value={<AmountsText amounts={cost.kept} partial={partial} />}
+          sub={
+            cost.owner_residual.length > 0
+              ? `What the product still pays for its own builds after other products pay for what they read. Of it, ${cost.owner_residual
+                  .map((amount) => formatAmount(amount.unit, amount.amount))
+                  .join(" and ")} came back from readers outside every product.`
+              : "What the product still pays for its own builds after other products pay for what they read."
+          }
         />
         <StatusCard
           label="built (memo, not summed)"
-          value={<AmountsText amounts={cost.built} />}
+          value={<AmountsText amounts={cost.built} partial={partial} />}
           sub="What its own builds cost before any split."
         />
       </div>
@@ -441,7 +516,7 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
             It was charged for no table it reads.
           </p>
         ) : (
-          <UpstreamTable rows={cost.allocated_upstream} />
+          <UpstreamTable rows={cost.allocated_upstream} partial={partial} />
         )}
       </div>
       {cost.shared_not_charged.length > 0 && (
@@ -460,17 +535,17 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
                 {row.reader}
               </span>,
               formatAmount(row.unit, row.amount),
-              <FigureChip key="b" state={basisState(row.basis)} />,
+              <FigureChip key="b" state={basisChip(row.basis)} />,
             ])}
           />
         </div>
       )}
-      <BudgetBlock cost={cost} />
+      <BudgetBlock cost={cost} partial={partial} />
     </div>
   );
 }
 
-function BudgetBlock({ cost }: { cost: ProductMonthCost }) {
+function BudgetBlock({ cost, partial }: { cost: ProductMonthCost; partial: boolean }) {
   const budget = cost.budget;
   if (budget === null || budget === undefined) {
     return (
@@ -497,13 +572,19 @@ function BudgetBlock({ cost }: { cost: ProductMonthCost }) {
       {budget.checks.length > 0 && (
         <Rows
           ariaLabel="Budget limits"
-          columns={["limit", "set to", "month to date", "verdict"]}
+          columns={["limit", "set to", partial ? "month to date (partial)" : "month to date", "verdict"]}
           rows={budget.checks.map(checkCells)}
         />
       )}
       {cost.breach_events_skipped ? (
         <p className="text-xs text-amber-700 dark:text-amber-400">
           {cost.breach_events_skipped}
+        </p>
+      ) : partial && events.length === 0 ? (
+        // With history incomplete the engine lists no events at all, so an
+        // empty list here says nothing about whether the product went over.
+        <p className="text-xs text-amber-700 dark:text-amber-400">
+          Breach events are not known: run history does not cover the month.
         </p>
       ) : events.length === 0 ? (
         <p className="text-xs text-zinc-600 dark:text-zinc-300">No breach this month.</p>
@@ -543,6 +624,8 @@ function volumeVerdictLabel(verdict: VolumeVerdict): string {
       return "above the maximum";
     case "not_evaluated":
       return "not evaluated: no count yet";
+    default:
+      return String(verdict);
   }
 }
 
@@ -596,7 +679,11 @@ function riskText(delivery: DeliveryStatus): { value: string; tone: Tone; sub: s
     return {
       value: "at risk",
       tone: "risk",
-      sub: `The p90 (${formatDuration(estimate.p90_ms ?? 0)}) is longer than the time left. From ${basis}.`,
+      sub: `The p90 (${
+        estimate.p90_ms === null || estimate.p90_ms === undefined
+          ? "unknown"
+          : formatDuration(estimate.p90_ms)
+      }) is longer than the time left. From ${basis}.`,
     };
   }
   if (delivery.at_risk === false) {

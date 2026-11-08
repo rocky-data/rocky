@@ -1752,8 +1752,11 @@ async fn cost_month(
     ApiQuery(query): ApiQuery<CostMonthQuery>,
 ) -> Result<PrettyJson<ProductMonthCostOutput>, ApiError> {
     if let Some(month) = query.month.as_deref() {
-        crate::commands::cost::parse_month(month)
-            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        crate::commands::cost::parse_month(month).map_err(|_| {
+            ApiError::bad_request(format!(
+                "query parameter `month` '{month}' is not a month: expected YYYY-MM, e.g. 2026-10"
+            ))
+        })?;
     }
     let Some(config_path) = state.config_path.clone() else {
         return Err(ApiError::engine_not_ready());
@@ -6337,6 +6340,7 @@ mod tests {
             assert_eq!(resp.status(), 400, "{bad}");
             let err: ErrorEnvelope = resp.json().await.unwrap();
             assert_eq!(err.code, "bad_request", "{bad}");
+            assert!(err.message.contains("`month`"), "{bad}: {}", err.message);
         }
 
         let base = spawn_router(test_state()).await;
