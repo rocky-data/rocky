@@ -245,7 +245,7 @@ pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Optio
 /// freshness was checked for it". The rest of the text matches the run error.
 pub fn missing_models_dir_warning(models_dir: &Path, pipeline: &str, consequence: &str) -> String {
     format!(
-        "models directory '{}' does not exist, so pipeline '{pipeline}' has no models and \
+        "models directory '{}' does not exist, so pipeline '{pipeline}' has no models: \
          {consequence}. `rocky run` fails on this pipeline. Fix the `models` glob, or set \
          `allow_empty_models = true` under `[pipeline.{pipeline}]` if this pipeline has no \
          models on purpose.",

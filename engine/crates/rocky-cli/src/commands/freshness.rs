@@ -642,8 +642,6 @@ mod tests {
         .expect("run record")
     }
 
-    /// #2201: a newer shadow or branch build does not make the production
-    /// model fresh; the newest production build does.
     /// A pipeline whose models directory does not exist makes the report
     /// say so, instead of reading as a project with no model freshness.
     /// `allow_empty_models = true` keeps it silent.
@@ -685,6 +683,8 @@ mod tests {
         }
     }
 
+    /// #2201: a newer shadow or branch build does not make the production
+    /// model fresh; the newest production build does.
     #[test]
     fn last_build_ignores_shadow_and_branch_runs() {
         let dir = tempfile::TempDir::new().unwrap();

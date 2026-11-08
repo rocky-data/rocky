@@ -261,7 +261,7 @@ pub(crate) fn build_member_budgets(
         let Some(tx) = pipeline.as_transformation() else {
             continue;
         };
-        match member_max_lags(tx, config_path) {
+        match member_max_lags(name, tx, config_path) {
             Ok(lags) if !lags.is_empty() => {
                 budgets.insert(name.clone(), lags);
             }
@@ -282,10 +282,30 @@ pub(crate) fn build_member_budgets(
 /// The `max_lag_seconds` of every member model that declares its own freshness
 /// block. Models without one inherit the project default, which is already the
 /// reconciler's fallback — so only own-declared budgets count as member lags.
-fn member_max_lags(tx: &TransformationPipelineConfig, config_path: &Path) -> Result<Vec<u64>> {
-    let Some(models_dir) = crate::models_loader::resolve_models_dir(&tx.models, config_path)?
-    else {
-        return Ok(Vec::new());
+///
+/// A models directory that does not exist gives no lags, and a warning unless
+/// the pipeline sets `allow_empty_models = true`: the child `rocky run` this
+/// tick launches fails on it, and the budget falls back to the project default.
+fn member_max_lags(
+    name: &str,
+    tx: &TransformationPipelineConfig,
+    config_path: &Path,
+) -> Result<Vec<u64>> {
+    let models_dir = match crate::models_loader::locate_models_dir(&tx.models, config_path)? {
+        crate::models_loader::ModelsDir::Present(dir) => dir,
+        crate::models_loader::ModelsDir::Absent(dir) => {
+            if !tx.allow_empty_models {
+                tracing::warn!(
+                    "{}",
+                    crate::models_loader::missing_models_dir_warning(
+                        &dir,
+                        name,
+                        "its freshness budget falls back to the project default",
+                    )
+                );
+            }
+            return Ok(Vec::new());
+        }
     };
     // Partial: a broken draft in one subdirectory must not drop every healthy
     // member budget and silently widen this pipeline to the project default.
