@@ -3483,6 +3483,7 @@ impl RockyMcpServer {
             message: None,
             unverified_types: drafted.unverified_types,
             unmatched_columns: drafted.unmatched_columns,
+            unproven_non_null: drafted.unproven_non_null,
         }))
     }
 

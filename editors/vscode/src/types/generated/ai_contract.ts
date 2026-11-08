@@ -39,6 +39,12 @@ export interface AiContractOutput {
    */
   unmatched_columns?: string[];
   /**
+   * `nullable = false` claims the draft withheld, one message per column.
+   *
+   * The column had no NULLs in the profiled table, but Rocky cannot prove it non-null from the model SQL and the source schemas it has, so `E012` would refuse the claim. The draft leaves `nullable` unset for it, which promises nothing, instead of writing `nullable = true`. Empty when every `nullable = false` in the draft was proven.
+   */
+  unproven_non_null?: string[];
+  /**
    * Declared column types the compiler could NOT check, one message each.
    *
    * The drafting loop only fails on error-severity diagnostics. A column whose type Rocky could not infer reports `I003` instead, and the declared type is then accepted without being compared to anything. With a cold schema cache that is every leaf column, so an empty `errors` list is not evidence the declared types are right. Empty when every declared type was actually checked.
