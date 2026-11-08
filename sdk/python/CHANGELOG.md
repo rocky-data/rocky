@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The generated `ProductMonthCost` and `ProductMonthCostOutput` gain money fields: `money`, `money_status` and `money_parts` per product, and `measured_total_money*` and `unallocated_money*` per month. New generated models: `MoneyStatus`, `MoneyFigure` and `MoneyPart`.
+
+### Changed
+
+- The generated project `CostSection` no longer defaults `storage_cost_per_gb_month` to `0.023` or `compute_cost_per_dbu` to `0.4`. Both are `None` when unset.
+
 ## [0.30.0] — 2026-11-07
 
 ### Added

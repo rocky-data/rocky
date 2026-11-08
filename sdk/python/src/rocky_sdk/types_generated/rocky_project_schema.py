@@ -385,13 +385,13 @@ class CostSection(BaseModel):
     """
     Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by default. Config only for now: no cost path reads it yet.
     """
-    compute_cost_per_dbu: float | None = 0.4
+    compute_cost_per_dbu: float | None = None
     """
-    Cost per DBU (default: $0.40).
+    Price of one DBU-hour, in USD. Unset by default. When unset, run cost estimates and `rocky optimize` use $0.40. The monthly product view does not read it.
     """
     compute_cost_per_machine_hour: float | None = None
     """
-    Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. Config only for now: no cost path reads it yet.
+    Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. The monthly product view (`rocky cost --month`) prices model time with it.
     """
     cross_region_transfer_cost_per_gb: float | None = None
     """
@@ -401,9 +401,9 @@ class CostSection(BaseModel):
     """
     Minimum runs before making cost recommendations.
     """
-    storage_cost_per_gb_month: float | None = 0.023
+    storage_cost_per_gb_month: float | None = None
     """
-    Cost per GB of storage per month (default: $0.023).
+    Price of one GB of storage for one month, in USD per GB-month. Unset by default. When unset, estimates such as `rocky optimize` use $0.023; the monthly product view (`rocky cost --month`) uses only a price set here.
     """
     warehouse_size: str | None = "Medium"
     """
@@ -4315,13 +4315,7 @@ class RockyConfig(BaseModel):
     Project-level contract settings (`[contracts]`). Today this is `strict`: refuse a contract column whose declared type Rocky cannot check. See [`ContractsConfig`].
     """
     cost: CostSection | None = Field(
-        {
-            "compute_cost_per_dbu": 0.4,
-            "min_history_runs": 5,
-            "storage_cost_per_gb_month": 0.023,
-            "warehouse_size": "Medium",
-        },
-        validate_default=True,
+        {"min_history_runs": 5, "warehouse_size": "Medium"}, validate_default=True
     )
     """
     Cost estimation configuration.

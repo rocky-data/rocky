@@ -761,7 +761,7 @@ fn resolve_warehouse(cfg: &rocky_core::config::RockyConfig) -> Option<(Warehouse
         .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))?;
     let wh = WarehouseType::from_adapter_type(&preferred)?;
     let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-    Some((wh, dbu_per_hour, cfg.cost.compute_cost_per_dbu))
+    Some((wh, dbu_per_hour, cfg.cost.compute_cost_per_dbu_or_default()))
 }
 
 /// Render the composed plan as a concise human-readable report.

@@ -2510,12 +2510,17 @@ impl<'de> Deserialize<'de> for RemovedSchemaEvolution {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CostSection {
-    /// Cost per GB of storage per month (default: $0.023).
-    #[serde(default = "default_storage_cost")]
-    pub storage_cost_per_gb_month: f64,
-    /// Cost per DBU (default: $0.40).
-    #[serde(default = "default_compute_cost_per_dbu")]
-    pub compute_cost_per_dbu: f64,
+    /// Price of one GB of storage for one month, in USD per GB-month. Unset
+    /// by default. When unset, estimates such as `rocky optimize` use
+    /// $0.023; the monthly product view (`rocky cost --month`) uses only a
+    /// price set here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_cost_per_gb_month: Option<f64>,
+    /// Price of one DBU-hour, in USD. Unset by default. When unset, run cost
+    /// estimates and `rocky optimize` use $0.40. The monthly product view
+    /// does not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_cost_per_dbu: Option<f64>,
     /// Warehouse size for cost estimation (e.g., "Small", "Medium", "Large").
     #[serde(default = "default_warehouse_size")]
     pub warehouse_size: String,
@@ -2523,8 +2528,8 @@ pub struct CostSection {
     #[serde(default = "default_min_history_runs")]
     pub min_history_runs: usize,
     /// Price of one machine-hour of compute, in USD per hour. For engines
-    /// that bill by machine time instead of DBUs. Unset by default. Config
-    /// only for now: no cost path reads it yet.
+    /// that bill by machine time instead of DBUs. Unset by default. The
+    /// monthly product view (`rocky cost --month`) prices model time with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_cost_per_machine_hour: Option<f64>,
     /// Price of moving one GB of data across regions, in USD per GB. Unset
@@ -2537,12 +2542,32 @@ pub struct CostSection {
     pub ai_cost_per_million_tokens: Option<f64>,
 }
 
-fn default_storage_cost() -> f64 {
-    0.023
+/// The storage price an estimate uses when `[cost]` sets none.
+pub const DEFAULT_STORAGE_COST_PER_GB_MONTH: f64 = 0.023;
+/// The DBU-hour price an estimate uses when `[cost]` sets none.
+pub const DEFAULT_COMPUTE_COST_PER_DBU: f64 = 0.40;
+
+impl CostSection {
+    /// The storage price for an estimate: the user's
+    /// `storage_cost_per_gb_month`, or [`DEFAULT_STORAGE_COST_PER_GB_MONTH`]
+    /// when it is unset. Never use it where a figure must come from a price
+    /// the user set.
+    #[must_use]
+    pub fn storage_cost_per_gb_month_or_default(&self) -> f64 {
+        self.storage_cost_per_gb_month
+            .unwrap_or(DEFAULT_STORAGE_COST_PER_GB_MONTH)
+    }
+
+    /// The DBU-hour price for an estimate: the user's `compute_cost_per_dbu`,
+    /// or [`DEFAULT_COMPUTE_COST_PER_DBU`] when it is unset. Never use it
+    /// where a figure must come from a price the user set.
+    #[must_use]
+    pub fn compute_cost_per_dbu_or_default(&self) -> f64 {
+        self.compute_cost_per_dbu
+            .unwrap_or(DEFAULT_COMPUTE_COST_PER_DBU)
+    }
 }
-fn default_compute_cost_per_dbu() -> f64 {
-    0.40
-}
+
 fn default_warehouse_size() -> String {
     "Medium".to_string()
 }
@@ -2553,8 +2578,8 @@ fn default_min_history_runs() -> usize {
 impl Default for CostSection {
     fn default() -> Self {
         CostSection {
-            storage_cost_per_gb_month: default_storage_cost(),
-            compute_cost_per_dbu: default_compute_cost_per_dbu(),
+            storage_cost_per_gb_month: None,
+            compute_cost_per_dbu: None,
             warehouse_size: default_warehouse_size(),
             min_history_runs: default_min_history_runs(),
             compute_cost_per_machine_hour: None,
@@ -4820,11 +4845,8 @@ fn cross_region_edges(config: &RockyConfig) -> Vec<(&String, &str, &str)> {
 pub fn validate_cost_prices(config: &RockyConfig) -> Vec<ConfigError> {
     let cost = &config.cost;
     let prices = [
-        (
-            "storage_cost_per_gb_month",
-            Some(cost.storage_cost_per_gb_month),
-        ),
-        ("compute_cost_per_dbu", Some(cost.compute_cost_per_dbu)),
+        ("storage_cost_per_gb_month", cost.storage_cost_per_gb_month),
+        ("compute_cost_per_dbu", cost.compute_cost_per_dbu),
         (
             "compute_cost_per_machine_hour",
             cost.compute_cost_per_machine_hour,
@@ -12928,9 +12950,12 @@ catalog_template = "{client}"
 schema_template = "raw"
 "#;
         let config: RockyConfig = toml::from_str(toml_str).unwrap();
-        // cost section should use defaults when omitted
-        assert!((config.cost.storage_cost_per_gb_month - 0.023).abs() < f64::EPSILON);
-        assert!((config.cost.compute_cost_per_dbu - 0.40).abs() < f64::EPSILON);
+        // An omitted price stays unset; the estimate accessors fall back
+        // to the shipped defaults.
+        assert_eq!(config.cost.storage_cost_per_gb_month, None);
+        assert_eq!(config.cost.compute_cost_per_dbu, None);
+        assert!((config.cost.storage_cost_per_gb_month_or_default() - 0.023).abs() < f64::EPSILON);
+        assert!((config.cost.compute_cost_per_dbu_or_default() - 0.40).abs() < f64::EPSILON);
         assert_eq!(config.cost.warehouse_size, "Medium");
         assert_eq!(config.cost.min_history_runs, 5);
     }
@@ -12966,8 +12991,10 @@ catalog_template = "{client}"
 schema_template = "raw"
 "#;
         let config: RockyConfig = toml::from_str(toml_str).unwrap();
-        assert!((config.cost.storage_cost_per_gb_month - 0.10).abs() < f64::EPSILON);
-        assert!((config.cost.compute_cost_per_dbu - 0.75).abs() < f64::EPSILON);
+        assert_eq!(config.cost.storage_cost_per_gb_month, Some(0.10));
+        assert_eq!(config.cost.compute_cost_per_dbu, Some(0.75));
+        assert!((config.cost.storage_cost_per_gb_month_or_default() - 0.10).abs() < f64::EPSILON);
+        assert!((config.cost.compute_cost_per_dbu_or_default() - 0.75).abs() < f64::EPSILON);
         assert_eq!(config.cost.warehouse_size, "Large");
         assert_eq!(config.cost.min_history_runs, 10);
     }
@@ -13058,6 +13085,34 @@ schema_template = "raw"
         assert!(!obj.contains_key("compute_cost_per_machine_hour"));
         assert!(!obj.contains_key("cross_region_transfer_cost_per_gb"));
         assert!(!obj.contains_key("ai_cost_per_million_tokens"));
+        assert!(!obj.contains_key("storage_cost_per_gb_month"));
+        assert!(!obj.contains_key("compute_cost_per_dbu"));
+    }
+
+    /// A user price equal to the shipped default is still a user price: it
+    /// stays `Some`, so a reader that needs a price the user set can tell it
+    /// from an omitted key.
+    #[test]
+    fn cost_section_user_price_equal_to_default_is_kept() {
+        let set: CostSection =
+            toml::from_str("storage_cost_per_gb_month = 0.023\ncompute_cost_per_dbu = 0.40\n")
+                .unwrap();
+        assert_eq!(set.storage_cost_per_gb_month, Some(0.023));
+        assert_eq!(set.compute_cost_per_dbu, Some(0.40));
+        let unset: CostSection = toml::from_str("").unwrap();
+        assert_eq!(unset.storage_cost_per_gb_month, None);
+        assert_eq!(unset.compute_cost_per_dbu, None);
+        assert!(
+            (unset.storage_cost_per_gb_month_or_default() - DEFAULT_STORAGE_COST_PER_GB_MONTH)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (unset.compute_cost_per_dbu_or_default() - DEFAULT_COMPUTE_COST_PER_DBU).abs()
+                < f64::EPSILON
+        );
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["storage_cost_per_gb_month"], 0.023);
     }
 
     // --- workspace binding config tests ---

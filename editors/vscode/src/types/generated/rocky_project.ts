@@ -1227,11 +1227,11 @@ export interface CostSection {
    */
   ai_cost_per_million_tokens?: number | null;
   /**
-   * Cost per DBU (default: $0.40).
+   * Price of one DBU-hour, in USD. Unset by default. When unset, run cost estimates and `rocky optimize` use $0.40. The monthly product view does not read it.
    */
-  compute_cost_per_dbu?: number;
+  compute_cost_per_dbu?: number | null;
   /**
-   * Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. Config only for now: no cost path reads it yet.
+   * Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. The monthly product view (`rocky cost --month`) prices model time with it.
    */
   compute_cost_per_machine_hour?: number | null;
   /**
@@ -1243,9 +1243,9 @@ export interface CostSection {
    */
   min_history_runs?: number;
   /**
-   * Cost per GB of storage per month (default: $0.023).
+   * Price of one GB of storage for one month, in USD per GB-month. Unset by default. When unset, estimates such as `rocky optimize` use $0.023; the monthly product view (`rocky cost --month`) uses only a price set here.
    */
-  storage_cost_per_gb_month?: number;
+  storage_cost_per_gb_month?: number | null;
   /**
    * Warehouse size for cost estimation (e.g., "Small", "Medium", "Large").
    */

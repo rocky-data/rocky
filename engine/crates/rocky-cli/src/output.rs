@@ -6576,7 +6576,7 @@ impl RunOutput {
 
         let dbu_per_hour =
             rocky_core::cost::warehouse_size_to_dbu_per_hour(&cost_cfg.warehouse_size);
-        let cost_per_dbu = cost_cfg.compute_cost_per_dbu;
+        let cost_per_dbu = cost_cfg.compute_cost_per_dbu_or_default();
 
         let mut per_model = Vec::with_capacity(self.materializations.len());
         let mut any_cost_computed = false;
@@ -8949,8 +8949,8 @@ mod cost_finalize_tests {
         out.materializations.push(mat(&["orders"], 1_800_000));
         out.materializations.push(mat(&["customers"], 1_800_000));
         let cost_cfg = CostSection {
-            storage_cost_per_gb_month: 0.023,
-            compute_cost_per_dbu: 0.40,
+            storage_cost_per_gb_month: Some(0.023),
+            compute_cost_per_dbu: Some(0.40),
             warehouse_size: "Medium".to_string(),
             min_history_runs: 5,
             ..Default::default()
@@ -8979,8 +8979,8 @@ mod cost_finalize_tests {
         out.populate_cost_summary(
             "databricks",
             &CostSection {
-                storage_cost_per_gb_month: 0.023,
-                compute_cost_per_dbu: 0.40,
+                storage_cost_per_gb_month: Some(0.023),
+                compute_cost_per_dbu: Some(0.40),
                 warehouse_size: "Medium".to_string(),
                 min_history_runs: 5,
                 ..Default::default()
@@ -12780,6 +12780,57 @@ pub struct ProductMonthCost {
     pub shared_not_charged: Vec<SharedNotChargedCost>,
     /// What the product is charged: `kept` plus `allocated_upstream`.
     pub charged: Vec<CostAmount>,
+    /// `charged` in USD, priced only from prices set in `[cost]`. Present
+    /// only when `money_status` is `priced`. It covers compute and storage;
+    /// egress and AI tokens are not measured and are not in it.
+    pub money: Option<f64>,
+    /// Why `money` is or is not present.
+    pub money_status: MoneyStatus,
+    /// `charged` priced one figure at a time.
+    pub money_parts: Vec<MoneyPart>,
+}
+
+/// Whether a money figure in the monthly report could be computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MoneyStatus {
+    // Every measured figure has a price set in `[cost]`. A figure whose
+    // amount is 0 costs $0 with or without a price.
+    Priced,
+    // A measured figure has no price in `[cost]`. Rocky's shipped default
+    // prices are never used here.
+    NoPrice,
+    // Rocky does not measure this figure. It is unknown, not $0.
+    NotMeasured,
+    // Run history does not cover the whole month, so the amounts are
+    // partial and no money is shown for them.
+    Partial,
+}
+
+/// What a [`MoneyPart`] prices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MoneyFigure {
+    // `compute_ms`, priced by `compute_cost_per_machine_hour`.
+    Compute,
+    // `storage_byte_hours_data_files`, priced by `storage_cost_per_gb_month`.
+    StorageDataFiles,
+    // `storage_byte_hours_allocated_blocks`, priced by
+    // `storage_cost_per_gb_month`.
+    StorageAllocatedBlocks,
+    // Data moved across regions. Not measured.
+    Egress,
+    // AI tokens. Not measured.
+    AiTokens,
+}
+
+/// One figure of a monthly money total.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MoneyPart {
+    pub figure: MoneyFigure,
+    pub status: MoneyStatus,
+    /// USD. Present only when `status` is `priced`.
+    pub usd: Option<f64>,
 }
 
 /// Executions the monthly report could not measure. Counts, never amounts.
@@ -12802,11 +12853,14 @@ pub struct CostNotMeasured {
 }
 
 /// `rocky cost --month YYYY-MM --by product`: one month of production cost,
-/// split across data products, in physical units. No money.
+/// split across data products, in physical units, with money in USD where
+/// `[cost]` sets a price.
 ///
 /// For every unit, `sum(charged) + unallocated` equals `measured_total`,
 /// exactly. Shadow and branch spend (`shadow_branch`) and `not_measured`
-/// sit outside that equation.
+/// sit outside that equation. Money is priced from each figure on its own,
+/// so the money figures are floating point and are not claimed to add up
+/// to the cent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProductMonthCostOutput {
     pub version: String,
@@ -12836,6 +12890,16 @@ pub struct ProductMonthCostOutput {
     pub shadow_branch: Vec<CostAmount>,
     /// Everything measured in production this month.
     pub measured_total: Vec<CostAmount>,
+    /// `measured_total` in USD. Present only when
+    /// `measured_total_money_status` is `priced`.
+    pub measured_total_money: Option<f64>,
+    pub measured_total_money_status: MoneyStatus,
+    pub measured_total_money_parts: Vec<MoneyPart>,
+    /// `unallocated` in USD. Present only when `unallocated_money_status`
+    /// is `priced`.
+    pub unallocated_money: Option<f64>,
+    pub unallocated_money_status: MoneyStatus,
+    pub unallocated_money_parts: Vec<MoneyPart>,
     pub not_measured: CostNotMeasured,
     /// Things that make the report less complete than it looks: a product
     /// spec that did not load, a model graph that could not be read.

@@ -576,11 +576,24 @@ def _month_cost_payload() -> dict:
                 ],
                 "shared_not_charged": [],
                 "charged": [{"unit": "compute_ms", "amount": 1400}],
+                "money": 0.0014,
+                "money_status": "priced",
+                "money_parts": [
+                    {"figure": "compute", "status": "priced", "usd": 0.0014},
+                    {"figure": "egress", "status": "not_measured", "usd": None},
+                    {"figure": "ai_tokens", "status": "not_measured", "usd": None},
+                ],
             }
         ],
         "unallocated": [],
         "shadow_branch": [],
         "measured_total": [{"unit": "compute_ms", "amount": 1400}],
+        "measured_total_money": 0.0014,
+        "measured_total_money_status": "priced",
+        "measured_total_money_parts": [{"figure": "compute", "status": "priced", "usd": 0.0014}],
+        "unallocated_money": 0.0,
+        "unallocated_money_status": "priced",
+        "unallocated_money_parts": [{"figure": "compute", "status": "priced", "usd": 0.0}],
         "not_measured": {
             "failed_executions": 0,
             "storage_unknown_tables": 0,
@@ -598,4 +611,8 @@ def test_parse_rocky_output_dispatches_cost_by_product():
     product = result.products[0]
     assert product.allocated_upstream[0].provisional is True
     assert product.charged[0].amount == 1400
+    assert product.money_status == "priced"
+    assert product.money == 0.0014
+    assert product.money_parts[1].status == "not_measured"
+    assert product.money_parts[1].usd is None
     assert result.warnings is None

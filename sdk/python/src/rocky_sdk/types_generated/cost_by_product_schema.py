@@ -48,6 +48,29 @@ class CostUnit(StrEnum):
     storage_byte_hours_allocated_blocks = "storage_byte_hours_allocated_blocks"
 
 
+class MoneyFigure(StrEnum):
+    """
+    What a [`MoneyPart`] prices.
+    """
+
+    compute = "compute"
+    storage_data_files = "storage_data_files"
+    storage_allocated_blocks = "storage_allocated_blocks"
+    egress = "egress"
+    ai_tokens = "ai_tokens"
+
+
+class MoneyStatus(StrEnum):
+    """
+    Whether a money figure in the monthly report could be computed.
+    """
+
+    priced = "priced"
+    no_price = "no_price"
+    not_measured = "not_measured"
+    partial = "partial"
+
+
 class SharedNotChargedCost(BaseModel):
     """
     A share of an owned table's cost that a reader did not pay.
@@ -110,6 +133,19 @@ class CostAmount(BaseModel):
     unit: CostUnit
 
 
+class MoneyPart(BaseModel):
+    """
+    One figure of a monthly money total.
+    """
+
+    figure: MoneyFigure
+    status: MoneyStatus
+    usd: float | None = None
+    """
+    USD. Present only when `status` is `priced`.
+    """
+
+
 class ProductMonthCost(BaseModel):
     """
     One product's month inside [`ProductMonthCostOutput`].
@@ -131,6 +167,18 @@ class ProductMonthCost(BaseModel):
     """
     The part of `built` the product still pays after other products pay for what they read.
     """
+    money: float | None = None
+    """
+    `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.
+    """
+    money_parts: list[MoneyPart]
+    """
+    `charged` priced one figure at a time.
+    """
+    money_status: MoneyStatus
+    """
+    Why `money` is or is not present.
+    """
     output_model: str
     """
     The model the product owns.
@@ -148,9 +196,9 @@ class ProductMonthCost(BaseModel):
 
 class ProductMonthCostOutput(BaseModel):
     """
-    `rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units. No money.
+    `rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.
 
-    For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation.
+    For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.
     """
 
     as_of: str
@@ -169,6 +217,12 @@ class ProductMonthCostOutput(BaseModel):
     """
     Everything measured in production this month.
     """
+    measured_total_money: float | None = None
+    """
+    `measured_total` in USD. Present only when `measured_total_money_status` is `priced`.
+    """
+    measured_total_money_parts: list[MoneyPart]
+    measured_total_money_status: MoneyStatus
     month: str
     """
     The month, `YYYY-MM`, in `timezone`.
@@ -198,6 +252,12 @@ class ProductMonthCostOutput(BaseModel):
     """
     Cost of tables no product owns that no measured reader took.
     """
+    unallocated_money: float | None = None
+    """
+    `unallocated` in USD. Present only when `unallocated_money_status` is `priced`.
+    """
+    unallocated_money_parts: list[MoneyPart]
+    unallocated_money_status: MoneyStatus
     version: str
     warnings: list[str] | None = None
     """

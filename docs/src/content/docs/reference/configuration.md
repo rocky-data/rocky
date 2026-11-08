@@ -964,13 +964,13 @@ A Valkey-backed runtime cache exists in the codebase but `rocky.toml` does not r
 
 ## `[cost]`
 
-Tell `rocky optimize` what your warehouse costs, so its materialization recommendations reflect your prices rather than generic ones.
+Tell Rocky what your warehouse costs. `rocky optimize` and run cost estimates use these prices, and fall back to Rocky's defaults for an unset storage or DBU price. The monthly product view, `rocky cost --month <YYYY-MM> --by product`, uses only the prices you set: a figure with no price shows no money.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `storage_cost_per_gb_month` | float | `0.023` | Storage price in USD per GB-month. Must be a finite number, 0 or more. |
-| `compute_cost_per_dbu` | float | `0.40` | Compute price in USD per DBU (Databricks). Must be a finite number, 0 or more. |
-| `compute_cost_per_machine_hour` | float | unset | Compute price in USD per machine-hour, for engines that bill by machine time. Must be a finite number, 0 or more. Read by no cost command yet. |
+| `storage_cost_per_gb_month` | float | unset | Storage price in USD per GB-month. Must be a finite number, 0 or more. When unset, `rocky optimize` estimates with `0.023`. The monthly product view (`rocky cost --month`) uses only a price you set. |
+| `compute_cost_per_dbu` | float | unset | Compute price in USD per DBU-hour (Databricks, Snowflake). Must be a finite number, 0 or more. When unset, run cost estimates (`rocky cost <run>`, `rocky optimize`, run summaries) use `0.40`. |
+| `compute_cost_per_machine_hour` | float | unset | Compute price in USD per machine-hour, for engines that bill by machine time. Must be a finite number, 0 or more. Prices model time in `rocky cost --month <YYYY-MM> --by product`. |
 | `cross_region_transfer_cost_per_gb` | float | unset | Price in USD to move 1 GB across regions. Must be a finite number, 0 or more. Read by no cost command yet. |
 | `ai_cost_per_million_tokens` | float | unset | AI price in USD per 1,000,000 tokens. Must be a finite number, 0 or more. Read by no cost command yet. |
 | `warehouse_size` | string | `"Medium"` | Warehouse size for cost estimation (e.g., `"Small"`, `"Medium"`, `"Large"`). |

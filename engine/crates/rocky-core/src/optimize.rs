@@ -79,8 +79,9 @@ impl From<crate::config::CostSection> for CostConfig {
         // `rocky optimize`, so the mismatch was never observed).
         let dbu_per_hour = crate::cost::warehouse_size_to_dbu_per_hour(&section.warehouse_size);
         CostConfig {
-            storage_cost_per_gb_month: section.storage_cost_per_gb_month,
-            compute_cost_per_second: section.compute_cost_per_dbu * dbu_per_hour / 3600.0,
+            storage_cost_per_gb_month: section.storage_cost_per_gb_month_or_default(),
+            compute_cost_per_second: section.compute_cost_per_dbu_or_default() * dbu_per_hour
+                / 3600.0,
             min_history_runs: section.min_history_runs,
         }
     }
