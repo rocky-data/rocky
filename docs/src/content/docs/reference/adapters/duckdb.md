@@ -48,9 +48,11 @@ offline = true
 Fill the directory once, on a machine with network access:
 
 ```sql
-SET extension_directory = '/opt/rocky/duckdb-extensions';
+SET extension_directories = ['/opt/rocky/duckdb-extensions'];
 INSTALL icu;
 ```
+
+Rocky sets that path as DuckDB's `extension_directories` (a list of one path). DuckDB 2.0 deprecates the older `extension_directory` setting. The Rocky config key stays `extension_directory`.
 
 Offline mode applies to every DuckDB connection Rocky opens for the project: the adapter itself, and the local in-memory databases of `rocky test`, `rocky ci`, `rocky compile` (the seed it runs for source schemas), `rocky publish-ir --with-seed` and `rocky replay --execute`. These read the settings of the `type = "duckdb"` adapters in `rocky.toml`. With several DuckDB adapters, the local database is offline when any of them sets `offline = true`, and uses the first `extension_directory` found. For `rocky compile`, a missing extension only logs a warning, and compile goes on without the seed schemas.
 

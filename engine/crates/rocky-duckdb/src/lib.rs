@@ -49,7 +49,7 @@ pub enum DuckDbError {
     #[error(
         "DuckDB offline mode needs the `{extension}` extension in '{directory}', but it could not \
          be loaded ({cause}). Offline mode never downloads extensions. Fill the directory once \
-         while online: run `SET extension_directory = '{directory}'; INSTALL {extension};` in \
+         while online: run `SET extension_directories = ['{directory}']; INSTALL {extension};` in \
          DuckDB, or copy `{extension}.duckdb_extension` for this DuckDB build ({build}) into \
          '{directory}/{build_dir}/'. Then connect again."
     )]
@@ -168,7 +168,8 @@ pub struct QueryResult {
 /// serves a whole offline deployment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionOptions {
-    /// DuckDB's `extension_directory`. `None` leaves DuckDB's default.
+    /// The one directory Rocky sets as DuckDB's `extension_directories`.
+    /// `None` leaves DuckDB's default.
     pub directory: Option<PathBuf>,
     /// Never fetch an extension from the network. A required extension that
     /// is missing from the directory is an error at connect.
@@ -219,14 +220,36 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// The statement that makes `dir` DuckDB's only extension directory.
+///
+/// DuckDB 2.0 deprecates the single-valued `extension_directory` in favour
+/// of the list-valued `extension_directories`. The path is one quoted
+/// element, so a quote or a comma in it stays inside that element.
+fn set_extension_directories_sql(dir: &Path) -> String {
+    format!(
+        "SET extension_directories = [{}]",
+        sql_literal(&dir.to_string_lossy())
+    )
+}
+
+/// The first of DuckDB's `extension_directories`, or an empty string when
+/// the list is empty (DuckDB's default directory is in use).
+fn first_extension_directory(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT current_setting('extension_directories')[1]",
+        [],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
 /// Applies the extension settings, then loads `icu`, before the connection
 /// runs any statement.
 fn prepare_extensions(conn: &Connection, opts: &ExtensionOptions) -> Result<(), DuckDbError> {
     if let Some(dir) = &opts.directory {
-        conn.execute_batch(&format!(
-            "SET extension_directory = {}",
-            sql_literal(&dir.to_string_lossy())
-        ))?;
+        conn.execute_batch(&set_extension_directories_sql(dir))?;
     }
     if !opts.offline {
         load_icu(conn);
@@ -238,11 +261,7 @@ fn prepare_extensions(conn: &Connection, opts: &ExtensionOptions) -> Result<(), 
     if let Err(err) = conn.execute_batch("LOAD icu") {
         let directory = match &opts.directory {
             Some(dir) => dir.to_string_lossy().into_owned(),
-            None => conn
-                .query_row("SELECT current_setting('extension_directory')", [], |r| {
-                    r.get::<_, String>(0)
-                })
-                .unwrap_or_default(),
+            None => first_extension_directory(conn),
         };
         let (version, platform): (String, String) = conn
             .query_row(
@@ -616,7 +635,8 @@ mod tests {
         assert!(!reversed.offline);
     }
 
-    /// The configured directory reaches DuckDB's `extension_directory`, and
+    /// The configured directory reaches DuckDB's `extension_directories` as
+    /// its only element, and
     /// offline mode turns auto-install off. The directory is empty, so the
     /// connect fails at `LOAD icu`; the settings are read from the raw
     /// connection afterwards. No network is used.
@@ -630,12 +650,22 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let err = prepare_extensions(&conn, &opts).unwrap_err();
         assert!(matches!(err, DuckDbError::OfflineExtensionMissing { .. }));
-        let dir_setting: String = conn
+        let (dir_setting, len): (String, i64) = conn
+            .query_row(
+                "SELECT current_setting('extension_directories')[1], \
+                 len(current_setting('extension_directories'))",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dir_setting, dir.path().to_string_lossy());
+        assert_eq!(len, 1, "the configured directory is the only one");
+        let deprecated: String = conn
             .query_row("SELECT current_setting('extension_directory')", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(dir_setting, dir.path().to_string_lossy());
+        assert_eq!(deprecated, "", "the deprecated setting is left alone");
         let auto: bool = conn
             .query_row(
                 "SELECT current_setting('autoinstall_known_extensions')",
@@ -644,6 +674,41 @@ mod tests {
             )
             .unwrap();
         assert!(!auto, "offline mode must switch auto-install off");
+    }
+
+    /// A directory whose name holds a quote and a comma is one list element,
+    /// unchanged: the quote is escaped and the comma stays inside the
+    /// string. No network is used.
+    #[test]
+    fn a_directory_with_a_quote_and_a_comma_is_one_list_element() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("it's, here");
+        let opts = ExtensionOptions {
+            directory: Some(dir.clone()),
+            offline: true,
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        let err = prepare_extensions(&conn, &opts).unwrap_err();
+        assert!(matches!(err, DuckDbError::OfflineExtensionMissing { .. }));
+        let (first, len): (String, i64) = conn
+            .query_row(
+                "SELECT current_setting('extension_directories')[1], \
+                 len(current_setting('extension_directories'))",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first, dir.to_string_lossy());
+        assert_eq!(len, 1);
+        assert_eq!(first_extension_directory(&conn), dir.to_string_lossy());
+    }
+
+    /// With no directory configured, the error falls back to DuckDB's own
+    /// list, which is empty by default.
+    #[test]
+    fn first_extension_directory_is_empty_by_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(first_extension_directory(&conn), "");
     }
 
     /// Without the new settings nothing changes: auto-install stays on.
@@ -704,8 +769,8 @@ mod tests {
             let online = Connection::open_in_memory().unwrap();
             online
                 .execute_batch(&format!(
-                    "SET extension_directory = {}; INSTALL icu",
-                    sql_literal(&dir.path().to_string_lossy())
+                    "{}; INSTALL icu",
+                    set_extension_directories_sql(dir.path())
                 ))
                 .expect("populating the directory needs the network");
         }
