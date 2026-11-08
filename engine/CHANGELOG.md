@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A production `rocky run` now refuses its model phase when a `products/*.toml` does not load. This covers a spec that cannot be read, does not parse or fails validation, and a `products/` directory that cannot be listed. Before, the run skipped such a spec with a warning, so an `error` volume range it declared was never checked and the output was delivered unchecked. The refusal comes before any model write, and it covers both `[product.output.volume]` and `[[product.source.volume]]` ranges, read in one scan. A spec that does not load names no output model, so the whole model phase is refused, even for a `--model` selection that does not include that product. Replication copies made earlier in the same run stand, so a replication run exits as partial; a model-only run fails. The error is `[product-spec-unloadable]`. It names the file and the fix: `rocky product verify <name>` for a spec. A dangling `products` symlink is refused too, not read as "no products". A shadow or branch run checks no range, so it warns and builds. A missing `products/` directory is not refused. A directory entry that cannot be read, or a `.toml` name that is not UTF-8, is now reported instead of silently skipped, and that applies to the delivery-deadline warnings too. Delivery deadlines stay best effort. Upgrade note: a half-written spec in `products/` now fails a scheduled production run. Write specs into place atomically, or keep drafts outside `products/`.
+
 ## [1.90.1] — 2026-11-07
 
 The first published release with the 1.90.0 changes below. It ships the same engine code as 1.90.0.
