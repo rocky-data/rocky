@@ -1303,6 +1303,42 @@ async fn local_forward_incompat_unset_policy_refuses_and_keeps_file() {
     assert!(!backup.exists(), "a refusal must not move the file");
 }
 
+/// #2450: two binaries taking turns on one local volume, with an explicit
+/// `recreate`. The older binary's first run moves the newer file to its
+/// `.bak`. The newer binary then upgrades the fresh file in place (simulated
+/// by stamping it). The older binary's second run refuses, names the backup,
+/// and leaves both files: recreate works once per schema version.
+#[tokio::test]
+async fn local_forward_incompat_recreate_refuses_on_the_second_cycle() {
+    let _serial = remote_testing::serial_guard();
+    let project = ModelProject::local("SELECT 1 AS id\n", "on_schema_mismatch = \"recreate\"");
+    let future_version = rocky_core::state::current_schema_version() + 1;
+
+    rocky_core::state::force_schema_version(&project.state_path, &future_version.to_string());
+    drive_run(&project, None, None)
+        .await
+        .expect("the first recreate proceeds");
+    let backup =
+        rocky_core::state::forward_incompat_backup_path(&project.state_path, future_version);
+    let backup_before = std::fs::read(&backup).expect("read .bak");
+
+    rocky_core::state::force_schema_version(&project.state_path, &future_version.to_string());
+    let state_before = std::fs::read(&project.state_path).expect("read state file");
+    let err = drive_run(&project, None, None)
+        .await
+        .expect_err("the second recreate for the same version must refuse");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(&backup.display().to_string()) && text.contains("Move or remove"),
+        "the refusal must name the existing backup and say to move or remove it; got: {text}"
+    );
+    assert_eq!(std::fs::read(&backup).expect("read .bak"), backup_before);
+    assert_eq!(
+        std::fs::read(&project.state_path).expect("read state file"),
+        state_before
+    );
+}
+
 /// #2450: an explicit `on_schema_mismatch = "recreate"` on the local backend
 /// still recreates, but moves the newer file to its `.bak` first.
 #[tokio::test]

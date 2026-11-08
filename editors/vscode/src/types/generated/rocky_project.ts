@@ -419,7 +419,7 @@ export type StateNamespacing = "none" | "pipeline";
 /**
  * Policy applied when the engine opens a state store whose schema version is **newer** than the binary supports (a *forward*-incompatibility).
  *
- * This is the deploy-safety knob for rolling upgrades that cross a redb schema version. During a rolling bump, pods on the *old* binary can read state written by *already-upgraded* pods through a shared tiered backend. [`Recreate`][Self::Recreate] degrades that window instead of breaking it: the old pod does one full-refresh run and succeeds, rather than stranding the orchestrated run in an hour-long retry spiral.
+ * This is the deploy-safety knob for a binary that meets a state file written by a newer one, for example after a rollback across a redb schema version. Remote state keys are qualified by schema version (see `state_sync::schema_version_segment`), so an old pod never downloads state that upgraded pods uploaded. On a remote backend the open meets a newer local file only when that file is left on disk: the start-of-run download failed and kept it, or an open ran before the download (the `--idempotency-key` claim opens the store before the session acquires). [`Recreate`][Self::Recreate] degrades that case instead of breaking it: the old pod does one full-refresh run and succeeds, rather than stranding the orchestrated run in a retry spiral.
  *
  * The policy has no fixed default. When `[state] on_schema_mismatch` is unset, [`StateConfig::schema_mismatch_policy`] picks one from the backend: [`Fail`][Self::Fail] on `local`, where the state file is the only copy, and [`Recreate`][Self::Recreate] on the remote and tiered backends.
  *

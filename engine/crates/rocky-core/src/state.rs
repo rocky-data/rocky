@@ -1142,6 +1142,24 @@ pub enum StateError {
         path: String,
     },
 
+    /// [`SchemaMismatchPolicy::Recreate`] found a store newer than this binary
+    /// but could not move it aside, because the backup name
+    /// `<file>.v{found}.bak` is already taken (by an earlier recreate, or by
+    /// anything else at that path). The open refuses so that backup is never
+    /// overwritten; both files are left as they were.
+    #[error(
+        "state schema version mismatch: database has v{found}, binary expects v{expected}. \
+         on_schema_mismatch = \"recreate\" would move the state file at {path} to {backup}, \
+         but that backup already exists, so nothing was moved. Move or remove {backup} \
+         (keep a copy if you may roll forward again), then re-run; or upgrade rocky."
+    )]
+    SchemaMismatchBackupExists {
+        found: u32,
+        expected: u32,
+        path: String,
+        backup: String,
+    },
+
     /// A read-only open found a store that holds something but lacks tables
     /// this binary reads.
     ///
@@ -1788,30 +1806,60 @@ impl StateStore {
                     path: path.display().to_string(),
                 };
                 // Never overwrite an earlier backup: a second bad open must not
-                // destroy the first one. `symlink_metadata` also sees a
-                // dangling symlink, which `rename` would replace. We hold the
-                // writer lock, so no other Rocky process races this check.
-                if std::fs::symlink_metadata(&backup).is_ok() {
-                    tracing::warn!(
-                        target: "rocky::state",
-                        found,
-                        expected = CURRENT_SCHEMA_VERSION,
-                        path = %path.display(),
-                        backup = %backup.display(),
-                        "state schema version mismatch: database has v{found}, binary expects \
-                         v{CURRENT_SCHEMA_VERSION}. on_schema_mismatch = recreate would move it \
-                         to {}, but that backup already exists. Refusing, so the existing \
-                         backup is not overwritten. Move or delete the backup, or upgrade rocky.",
-                        backup.display()
-                    );
-                    return Err(mismatch());
+                // destroy the first one. Reserve the backup name first with
+                // `create_new`, which fails if anything (a file, a directory or
+                // a dangling symlink) already holds it. Then rename the state
+                // file over our own empty reservation. A plain `rename` would
+                // replace an existing target on Unix and on Windows, so this
+                // closes the check-then-rename gap on both (the same pattern as
+                // `state_sync::quarantine_aside`).
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&backup)
+                {
+                    Ok(reservation) => drop(reservation),
+                    Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                        tracing::warn!(
+                            target: "rocky::state",
+                            found,
+                            expected = CURRENT_SCHEMA_VERSION,
+                            path = %path.display(),
+                            backup = %backup.display(),
+                            "state schema version mismatch: database has v{found}, binary \
+                             expects v{CURRENT_SCHEMA_VERSION}. on_schema_mismatch = recreate \
+                             would move it to {}, but that backup already exists. Refusing, so \
+                             the existing backup is not overwritten.",
+                            backup.display()
+                        );
+                        return Err(StateError::SchemaMismatchBackupExists {
+                            found,
+                            expected: CURRENT_SCHEMA_VERSION,
+                            path: path.display().to_string(),
+                            backup: backup.display().to_string(),
+                        });
+                    }
+                    Err(source) => {
+                        tracing::warn!(
+                            target: "rocky::state",
+                            error = %source,
+                            path = %path.display(),
+                            backup = %backup.display(),
+                            "could not reserve {} to move the forward-incompatible state file \
+                             aside; falling back to hard failure",
+                            backup.display()
+                        );
+                        return Err(mismatch());
+                    }
                 }
                 drop(db);
                 // If we cannot move the forward-incompatible file aside,
                 // reopening would just re-read the same newer version and loop.
-                // Degrade to the hard-fail error so the operator gets the
-                // actionable message rather than a silent spin.
+                // Remove our empty reservation and degrade to the hard-fail
+                // error so the operator gets the actionable message rather
+                // than a silent spin.
                 if let Err(source) = std::fs::rename(path, &backup) {
+                    let _ = std::fs::remove_file(&backup);
                     tracing::warn!(
                         target: "rocky::state",
                         error = %source,
@@ -19312,9 +19360,25 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            matches!(err, StateError::SchemaMismatch { found: f, expected, .. }
-                if f == found && expected == CURRENT_SCHEMA_VERSION),
+            matches!(&err, StateError::SchemaMismatchBackupExists { found: f, expected, backup: b, .. }
+                if *f == found && *expected == CURRENT_SCHEMA_VERSION
+                    && *b == backup.display().to_string()),
             "got {err:?}"
+        );
+        // The message must not send the operator round the loop ("set
+        // recreate"): it names the backup and says to move or remove it.
+        let text = err.to_string();
+        assert!(
+            text.contains(&backup.display().to_string()),
+            "the refusal must name the existing backup; got: {text}"
+        );
+        assert!(
+            text.contains("Move or remove"),
+            "the refusal must say to move or remove the backup; got: {text}"
+        );
+        assert!(
+            !text.contains("moves it to"),
+            "the refusal must not advise the recreate that just refused; got: {text}"
         );
         assert_eq!(
             std::fs::read(&backup).unwrap(),
@@ -19328,30 +19392,83 @@ mod tests {
         );
     }
 
-    /// #2450: a second recreate with a real earlier backup refuses too, so a
-    /// repeated bad open keeps both newer files.
+    /// #2450: two binaries taking turns on one local file. The newer binary
+    /// upgrades the file in place (simulated by stamping it at the newer
+    /// version), the older one recreates and keeps a `.bak`, the newer one
+    /// upgrades the fresh file again, and the older one's next open refuses:
+    /// recreate works once per schema version. Both files are kept.
     #[test]
     fn open_with_policy_recreate_twice_keeps_both_files() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.redb");
         let found = CURRENT_SCHEMA_VERSION + 1;
-        StateStore::open(&path).unwrap();
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .set_watermark("first.cycle", &sample_watermark())
+                .unwrap();
+        }
+        // Cycle 1: the newer binary upgrades in place, the older recreates.
         force_schema_version(&path, &found.to_string());
         drop(StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate).unwrap());
         let backup = forward_incompat_backup_path(&path, found);
         let backup_before = std::fs::read(&backup).unwrap();
 
-        // A newer binary writes the file again, then the old one opens it.
+        // Cycle 2: the newer binary upgrades the fresh file in place and
+        // writes to it, then the older binary opens it again.
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .set_watermark("second.cycle", &sample_watermark())
+                .unwrap();
+        }
         force_schema_version(&path, &found.to_string());
+        let state_before = std::fs::read(&path).unwrap();
         let err = match StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate) {
             Ok(_) => panic!("the second recreate must refuse"),
             Err(e) => e,
         };
         assert!(
-            matches!(err, StateError::SchemaMismatch { .. }),
+            matches!(err, StateError::SchemaMismatchBackupExists { .. }),
             "got {err:?}"
         );
         assert_eq!(std::fs::read(&backup).unwrap(), backup_before);
+        assert_eq!(std::fs::read(&path).unwrap(), state_before);
+        assert!(read_watermark_raw(&backup, "first.cycle").is_some());
+        assert!(read_watermark_raw(&path, "second.cycle").is_some());
+    }
+
+    /// #2450: the backup name is reserved with `create_new`, so a dangling
+    /// symlink at that name also refuses. A plain `rename` would replace the
+    /// link, and a `create` that follows it would write through it.
+    #[cfg(unix)]
+    #[test]
+    fn open_with_policy_recreate_refuses_a_dangling_symlink_backup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let found = CURRENT_SCHEMA_VERSION + 1;
+        StateStore::open(&path).unwrap();
+        force_schema_version(&path, &found.to_string());
+        let backup = forward_incompat_backup_path(&path, found);
+        let target = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, &backup).unwrap();
+
+        let err = match StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate) {
+            Ok(_) => panic!("recreate must refuse when the .bak name is a symlink"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StateError::SchemaMismatchBackupExists { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must be left as it was"
+        );
+        assert!(!target.exists(), "nothing may be written through the link");
         assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(found));
     }
 
