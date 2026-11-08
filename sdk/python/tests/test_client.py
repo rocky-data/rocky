@@ -1080,6 +1080,12 @@ def test_cost_by_product_argv_and_typed_parse():
         "unallocated": [{"unit": "compute_ms", "amount": 7}],
         "shadow_branch": [],
         "measured_total": [{"unit": "compute_ms", "amount": 7}],
+        "measured_total_money": None,
+        "measured_total_money_status": "partial",
+        "measured_total_money_parts": [{"figure": "compute", "status": "no_price", "usd": None}],
+        "unallocated_money": None,
+        "unallocated_money_status": "partial",
+        "unallocated_money_parts": [{"figure": "compute", "status": "no_price", "usd": None}],
         "not_measured": {
             "failed_executions": 1,
             "storage_unknown_tables": 0,
@@ -1094,6 +1100,8 @@ def test_cost_by_product_argv_and_typed_parse():
     assert report.history_complete is False
     assert report.unallocated[0].amount == 7
     assert report.not_measured.failed_executions == 1
+    assert report.measured_total_money is None
+    assert report.measured_total_money_status == "partial"
 
 
 def test_product_list_argv_and_typed_parse():

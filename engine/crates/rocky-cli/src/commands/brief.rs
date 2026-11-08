@@ -709,7 +709,7 @@ fn build_cost(cfg: Option<&RockyConfig>, runs: &[&RunRecord]) -> BriefCostSectio
     // reaches here — `compute_brief` already refused.
     let adapter_info: Option<(String, WarehouseType, f64, f64)> = cfg.and_then(|c| {
         let dbu_per_hour = warehouse_size_to_dbu_per_hour(&c.cost.warehouse_size);
-        let cost_per_dbu = c.cost.compute_cost_per_dbu;
+        let cost_per_dbu = c.cost.compute_cost_per_dbu_or_default();
         resolve_warehouse_type(c).map(|(name, wh)| (name, wh, dbu_per_hour, cost_per_dbu))
     });
 

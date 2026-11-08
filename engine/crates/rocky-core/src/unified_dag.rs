@@ -2269,8 +2269,8 @@ mod tests {
             pipelines: map,
             hooks: Default::default(),
             cost: CostSection {
-                storage_cost_per_gb_month: 0.023,
-                compute_cost_per_dbu: 0.40,
+                storage_cost_per_gb_month: Some(0.023),
+                compute_cost_per_dbu: Some(0.40),
                 warehouse_size: "Medium".to_string(),
                 min_history_runs: 5,
                 ..Default::default()

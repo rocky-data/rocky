@@ -1907,8 +1907,10 @@ class RockyClient:
 
         One calendar month of production cost (``YYYY-MM``, cut in the
         project's ``[schedule].timezone``), split across data products in
-        physical units: model time in milliseconds and stored byte-hours. No
-        money. For every unit, the sum of each product's ``charged`` plus
+        physical units: model time in milliseconds and stored byte-hours. Money
+        (``money``, ``money_status``) is in USD, only from prices set in
+        ``[cost]``; ``money`` is ``None`` unless ``money_status`` is
+        ``"priced"``. For every unit, the sum of each product's ``charged`` plus
         ``unallocated`` equals ``measured_total``. Check ``history_complete``
         before trusting a total: ``False`` means state retention may have
         swept runs the month needs.

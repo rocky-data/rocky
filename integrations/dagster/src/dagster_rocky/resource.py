@@ -1455,8 +1455,9 @@ class RockyResource(dg.ConfigurableResource):
         """Run ``rocky cost --month <month> --by product`` (``YYYY-MM``).
 
         One month of production cost split across data products, in physical
-        units (model time in ms, stored byte-hours). Check ``history_complete``
-        before trusting a total.
+        units (model time in ms, stored byte-hours), with money in USD where
+        ``[cost]`` sets a price. Check ``history_complete`` before trusting a
+        total.
         """
         with _translating():
             return self._get_client().cost_by_product(month)

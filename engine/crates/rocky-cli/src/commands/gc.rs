@@ -672,7 +672,7 @@ fn load_adapter_cost(config_path: &Path) -> Option<AdapterCost> {
     match load_rocky_config(config_path) {
         Ok(cfg) => {
             let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-            let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
+            let cost_per_dbu = cfg.cost.compute_cost_per_dbu_or_default();
             let preferred = cfg
                 .adapters
                 .iter()
