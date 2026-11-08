@@ -52,6 +52,11 @@ pub struct FreshnessOutput {
     /// One entry per model `[freshness]` block.
     pub models: Vec<FreshnessCheckResult>,
     pub summary: FreshnessSummary,
+    /// What the report could not check. One entry per transformation
+    /// pipeline whose models directory does not exist, unless the pipeline
+    /// sets `allow_empty_models = true`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Counts per status across `sources` and `models`.
@@ -171,6 +176,7 @@ pub async fn freshness_output(
     let mut models = Vec::new();
     // Two pipelines may load the same models directory; check each model once.
     let mut seen_models: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut warnings = Vec::new();
 
     for (name, tx) in pipelines {
         let declared: Vec<&PipelineSourceConfig> = tx
@@ -178,7 +184,7 @@ pub async fn freshness_output(
             .iter()
             .filter(|s| s.freshness.is_some())
             .collect();
-        let mut model_list = load_models_with_freshness(cfg, tx, config_path)?;
+        let mut model_list = load_models_with_freshness(cfg, name, tx, config_path, &mut warnings)?;
         model_list.retain(|m| seen_models.insert(m.config.name.clone()));
         if declared.is_empty() && model_list.is_empty() {
             continue;
@@ -263,16 +269,33 @@ pub async fn freshness_output(
         sources,
         models,
         summary,
+        warnings,
     })
 }
 
+/// The models of pipeline `name` that declare freshness. A models directory
+/// that does not exist gives none, and adds a warning unless the pipeline
+/// sets `allow_empty_models = true`: `rocky run` fails on it, so the report
+/// must not read as "no model declares freshness".
 fn load_models_with_freshness(
     cfg: &RockyConfig,
+    name: &str,
     tx: &TransformationPipelineConfig,
     config_path: &Path,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<rocky_core::models::Model>> {
-    let Some(dir) = crate::models_loader::resolve_models_dir(&tx.models, config_path)? else {
-        return Ok(Vec::new());
+    let dir = match crate::models_loader::locate_models_dir(&tx.models, config_path)? {
+        crate::models_loader::ModelsDir::Present(dir) => dir,
+        crate::models_loader::ModelsDir::Absent(dir) => {
+            if !tx.allow_empty_models {
+                warnings.push(crate::models_loader::missing_models_dir_warning(
+                    &dir,
+                    name,
+                    "no model freshness was checked for it",
+                ));
+            }
+            return Ok(Vec::new());
+        }
     };
     let glob = crate::models_loader::resolved_models_glob(&tx.models, config_path);
     let mut models =
@@ -548,7 +571,14 @@ fn status_label(s: FreshnessStatus) -> &'static str {
 }
 
 fn render_text(output: &FreshnessOutput) {
+    for warning in &output.warnings {
+        println!("warning: {warning}");
+    }
     if output.sources.is_empty() && output.models.is_empty() {
+        if !output.warnings.is_empty() {
+            println!("No freshness checked.");
+            return;
+        }
         println!(
             "No freshness declared. Add a `freshness` block to a `[[pipeline.<name>.sources]]` \
              entry or a model `[freshness]` block."
@@ -614,6 +644,47 @@ mod tests {
 
     /// #2201: a newer shadow or branch build does not make the production
     /// model fresh; the newest production build does.
+    /// A pipeline whose models directory does not exist makes the report
+    /// say so, instead of reading as a project with no model freshness.
+    /// `allow_empty_models = true` keeps it silent.
+    #[tokio::test]
+    async fn a_missing_models_dir_is_a_warning_unless_allowed() {
+        for allow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("rocky.toml");
+            let toml = format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.silver]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 allow_empty_models = {allow}\n\n\
+                 [pipeline.silver.target.governance]\nauto_create_schemas = true\n",
+                dir.path().join("w.duckdb").display()
+            );
+            std::fs::write(&config_path, toml).unwrap();
+            let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+            let output = freshness_output(
+                &cfg,
+                &config_path,
+                &dir.path().join("state.redb"),
+                None,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+            assert!(output.models.is_empty(), "allow={allow}");
+            if allow {
+                assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+            } else {
+                assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+                let warning = &output.warnings[0];
+                assert!(warning.contains("does not exist"), "{warning}");
+                assert!(warning.contains("pipeline 'silver'"), "{warning}");
+                assert!(warning.contains("allow_empty_models = true"), "{warning}");
+            }
+            let json = serde_json::to_value(&output).unwrap();
+            assert_eq!(json.get("warnings").is_some(), !allow, "{json}");
+        }
+    }
+
     #[test]
     fn last_build_ignores_shadow_and_branch_runs() {
         let dir = tempfile::TempDir::new().unwrap();

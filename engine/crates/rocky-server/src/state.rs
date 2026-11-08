@@ -654,8 +654,16 @@ impl ServerState {
                 Some(Ok(loaded)) => {
                     let models =
                         rocky_compiler::models_loader::union_by_model_name(&loaded.by_pipeline);
-                    rocky_compiler::compile::compile_preloaded_models(models, &config)
-                        .map_err(|e| e.to_string())?
+                    let mut result =
+                        rocky_compiler::compile::compile_preloaded_models(models, &config)
+                            .map_err(|e| e.to_string())?;
+                    if let Some(project) = &gate_config {
+                        result.diagnostics.extend(missing_models_dir_diagnostics(
+                            project,
+                            &loaded.missing_roots,
+                        ));
+                    }
+                    result
                 }
                 Some(Err(e)) => {
                     let reason = format!("{e:#}");
@@ -882,6 +890,37 @@ fn has_transformation_pipeline(project: &rocky_core::config::RockyConfig) -> boo
         .pipelines
         .values()
         .any(|pipeline| pipeline.as_transformation().is_some())
+}
+
+/// A `W014` warning for each transformation pipeline whose models directory
+/// does not exist and that does not set `allow_empty_models = true`.
+/// `rocky run` fails on such a pipeline, so the served project must not show
+/// it as one with no models without saying why.
+fn missing_models_dir_diagnostics(
+    project: &rocky_core::config::RockyConfig,
+    missing_roots: &[(String, PathBuf)],
+) -> Vec<rocky_compiler::diagnostic::Diagnostic> {
+    missing_roots
+        .iter()
+        .filter(|(pipeline, _)| {
+            project
+                .pipelines
+                .get(pipeline)
+                .and_then(|p| p.as_transformation())
+                .is_some_and(|tx| !tx.allow_empty_models)
+        })
+        .map(|(pipeline, dir)| {
+            rocky_compiler::diagnostic::Diagnostic::warning(
+                rocky_compiler::diagnostic::W014,
+                "rocky.toml",
+                rocky_compiler::models_loader::missing_models_dir_warning(
+                    dir,
+                    pipeline,
+                    "/models and /dag show none of its models",
+                ),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1453,6 +1492,47 @@ mod tests {
             ("bad.toml", "this is = = not toml"),
         ]);
         assert_models_dir_still_served(&tmp, "bad.toml").await;
+    }
+
+    /// A pipeline whose models directory does not exist gets a `W014`
+    /// warning naming it, and the other pipeline's models are still served.
+    /// `allow_empty_models = true` keeps it silent.
+    #[tokio::test]
+    async fn a_missing_models_dir_is_a_warning_unless_allowed() {
+        for allow in [false, true] {
+            let tmp = two_pipeline_project(&[]);
+            let root = tmp.path().canonicalize().unwrap();
+            std::fs::remove_dir_all(root.join("other")).unwrap();
+            if allow {
+                let toml = std::fs::read_to_string(root.join("rocky.toml"))
+                    .unwrap()
+                    .replace(
+                        "models = \"other/**\"\n",
+                        "models = \"other/**\"\nallow_empty_models = true\n",
+                    );
+                std::fs::write(root.join("rocky.toml"), toml).unwrap();
+            }
+            let state = ServerState::new(root.join("models"), None, Some(root.join("rocky.toml")));
+            let outcome = state.recompile().await;
+            assert!(outcome.compile_error.is_none(), "{outcome:?}");
+            let guard = state.compile_result.read().await;
+            let result = guard.as_ref().unwrap();
+            assert!(result.project.model("stg").is_some());
+            let w014: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|d| &*d.code == "W014")
+                .collect();
+            if allow {
+                assert!(w014.is_empty(), "{w014:?}");
+            } else {
+                assert_eq!(w014.len(), 1, "{:?}", result.diagnostics);
+                let message = &w014[0].message;
+                assert!(message.contains("does not exist"), "{message}");
+                assert!(message.contains("pipeline 'other'"), "{message}");
+                assert!(message.contains("allow_empty_models = true"), "{message}");
+            }
+        }
     }
 
     /// Fixing the error and recompiling drops the warning and serves the

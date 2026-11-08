@@ -31,6 +31,10 @@ export interface FreshnessOutput {
   sources: FreshnessCheckResult[];
   summary: FreshnessSummary;
   version: string;
+  /**
+   * What the report could not check. One entry per transformation pipeline whose models directory does not exist, unless the pipeline sets `allow_empty_models = true`. Omitted when empty.
+   */
+  warnings?: string[];
   [k: string]: unknown;
 }
 /**
