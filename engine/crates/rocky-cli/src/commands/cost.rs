@@ -1180,6 +1180,11 @@ fn print_month_table(output: &ProductMonthCostOutput) {
         money_cell(output.measured_total_money),
         money_status_label(output.measured_total_money_status)
     );
+    if output.measured_total_money_status == MoneyStatus::NoPrice {
+        println!(
+            "  to price this view, set [cost] compute_cost_per_machine_hour and storage_cost_per_gb_month; compute_cost_per_dbu does not price it"
+        );
+    }
     println!();
     println!(
         "not measured: {} failed executions with no recorded time, {} tables with unknown early storage",
