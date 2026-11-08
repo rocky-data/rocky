@@ -742,11 +742,19 @@ name = "s2"
         crate::secret_registry::register_substitution("ROCKY_TEST_OPTION_KEY_NAN", secret);
         let err = toml::from_str::<OptionsOnly>(&format!("[options.\"{secret}\"]\nratio = nan\n"))
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
+        // The message this module builds. The TOML crate's own snippet of the
+        // input is not checked here: in this test the secret is written into
+        // the text itself, and the config loader redacts that snippet (see
+        // the config tests for substituted option keys).
+        let message = err.message();
         assert!(
-            err.contains("options `${ROCKY_TEST_OPTION_KEY_NAN}.ratio`"),
-            "{err}"
+            message.contains("options `${ROCKY_TEST_OPTION_KEY_NAN}.ratio`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains(secret),
+            "the error must not print the key: {message}"
         );
     }
 

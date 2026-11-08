@@ -19327,6 +19327,43 @@ target = { catalog = "raw", schema = "stripe", table = "charges" }
     }
 
     #[test]
+    fn a_substituted_option_key_in_an_array_of_tables_is_refused_without_printing_it() {
+        let name = "ROCKY_TEST_OPTION_ARRAY_TABLE_KEY";
+        let secret = "rocky-option-array-table-key-secret-b7";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[adapter.default]\ntype = \"duckdb\"\n\n{GOOD}\n\
+                 [[connector.stripe_charges.options.streams]]\n\"${{{name}}}\" = 1\n"
+            ),
+        )
+        .unwrap();
+        // SAFETY: a unique variable name no other test reads or writes.
+        unsafe { std::env::set_var(name, secret) };
+        let result = load_rocky_config(&path);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(name) };
+        let err = result.expect_err("a substituted option key is refused");
+        // The whole chain, as `{:#}` on an `anyhow::Error` prints it.
+        let mut chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(cause) = source {
+            chain.push_str(&format!(": {cause}"));
+            source = cause.source();
+        }
+        assert!(
+            chain.contains(&format!("options `streams[0].${{{name}}}`")),
+            "{chain}"
+        );
+        assert!(
+            !chain.contains(secret),
+            "the error must not print the key: {chain}"
+        );
+    }
+
+    #[test]
     fn a_nan_under_a_substituted_option_key_does_not_print_the_key() {
         let name = "ROCKY_TEST_OPTION_KEY_ABOVE_NAN";
         let secret = "rocky-option-key-above-nan-secret-e4";
