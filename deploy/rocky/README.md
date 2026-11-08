@@ -86,7 +86,7 @@ docker compose pull
 docker compose up -d
 ```
 
-On its first read the new engine migrates the state store forward when the state schema changed; the engine changelog names every such change. Rolling back across such a change: `rocky serve` refuses a store written by a newer engine, and `rocky run` starts from a fresh local state by default (`[state] on_schema_mismatch`), so restore the copy first to keep the history.
+On its first read the new engine migrates the state store forward when the state schema changed; the engine changelog names every such change. Rolling back across such a change: `rocky serve` refuses a store written by a newer engine, and so does `rocky run` on the local backend by default. With `[state] on_schema_mismatch = "recreate"`, `rocky run` moves the newer file to `<file>.v<N>.bak` and starts from a fresh local state, once per schema version. Restore the copy first to keep the history.
 
 ## What it does not do
 

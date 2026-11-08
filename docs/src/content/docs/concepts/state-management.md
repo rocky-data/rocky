@@ -43,7 +43,7 @@ rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 
 ## Schema version
 
-The store carries a schema version. A newer engine migrates an older store forward on first open. An older engine refuses a newer store, or, for `rocky run` under the default `[state] on_schema_mismatch = "recreate"`, starts from a fresh local store and does one full refresh. See [Mixed versions during an upgrade](/advanced/deployment-contract/#mixed-versions-during-an-upgrade).
+The store carries a schema version. A newer engine migrates an older store forward on first open. An older engine refuses a newer store. On a remote backend, or with `[state] on_schema_mismatch = "recreate"`, `rocky run` instead moves the newer file to `<file>.v<N>.bak`, starts from a fresh local store and does one full refresh. This schema-mismatch path never deletes the newer file, and it refuses when that `.bak` already exists. The start-of-run download from a remote backend is unchanged: it can still replace the local file with the remote copy before the store is opened. See [Mixed versions during an upgrade](/advanced/deployment-contract/#mixed-versions-during-an-upgrade).
 
 The version moves when an older engine would misread a newer record. Schema v31 is one such move. A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and treats a recorded run as owing nothing, so it would skip those checks. From v31 on, an older engine never reaches that checkpoint.
 

@@ -1251,8 +1251,10 @@ fn classify_state_schema(on_disk: Option<u32>, supported: u32) -> (HealthStatus,
             HealthStatus::Critical,
             format!(
                 "on-disk state schema v{found} is newer than this binary supports \
-                 (v{supported}); this pod is forward-incompatible. Upgrade rocky, or \
-                 set [state] on_schema_mismatch = recreate to run a full refresh."
+                 (v{supported}); this pod is forward-incompatible. Upgrade rocky. On the \
+                 local backend the run refuses unless you set [state] on_schema_mismatch = \
+                 recreate, which moves the newer file to <file>.v{found}.bak and runs a \
+                 full refresh."
             ),
         ),
         Some(found) if found < supported => (

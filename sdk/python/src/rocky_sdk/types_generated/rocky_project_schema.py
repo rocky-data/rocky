@@ -1812,7 +1812,7 @@ class SchemaCacheConfig(BaseModel):
 
 class SchemaMismatchPolicy1(StrEnum):
     """
-    Treat a forward-incompatible store as cold: log a single `WARN`, bootstrap a fresh local state, and **never write the downgraded state back** to the shared tier (so the newer state upgraded pods depend on is left intact). The run proceeds as a full refresh. Default — it turns a hard, run-stranding failure into a graceful one-time full refresh during the mixed-version window of a schema-changing upgrade.
+    Treat a forward-incompatible store as cold: rename the newer file to `<file>.v{found}.bak`, log a single `WARN` that names the backup, bootstrap a fresh local state, and **never write the downgraded state back** to the shared tier (so the newer state upgraded pods depend on is left intact). The run proceeds as a full refresh. If the backup path already exists, the open refuses as [`Fail`][Self::Fail] does, so a second recreate never overwrites the first backup. The unset default on the remote and tiered backends.
     """
 
     recreate = "recreate"
@@ -1820,7 +1820,7 @@ class SchemaMismatchPolicy1(StrEnum):
 
 class SchemaMismatchPolicy2(StrEnum):
     """
-    Abort the open with a clear error (the historical behaviour). Appropriate when an operator would rather an incompatible pod fail loudly than do a full refresh against newer shared state.
+    Abort the open with a clear error and leave the file untouched. Appropriate when an operator would rather an incompatible pod fail loudly than do a full refresh against newer shared state. The unset default on the `local` backend.
     """
 
     fail = "fail"
@@ -3874,11 +3874,11 @@ class StateConfig(BaseModel):
     """
     Per-pipeline / per-client state-file namespacing. Defaults to [`StateNamespacing::None`] (one global state file — byte-identical to a project that omits this key). Set `namespacing = "pipeline"` to give each pipeline its own `<models>/.rocky-state/<pipeline>.redb` so independent fan-out runs don't serialize on one advisory lock. The per-invocation `--state-namespace <key>` flag overrides this; an explicit `--state-path` disables namespacing for that run.
     """
-    on_schema_mismatch: SchemaMismatchPolicy1 | SchemaMismatchPolicy2 | None = (
-        "recreate"
-    )
+    on_schema_mismatch: SchemaMismatchPolicy1 | SchemaMismatchPolicy2 | None = None
     """
-    What to do when the engine opens a state store whose schema version is **newer** than this binary supports (a forward-incompatibility, which happens during a rolling upgrade that crosses a redb schema version). Defaults to [`SchemaMismatchPolicy::Recreate`] — the old pod bootstraps fresh, does one full-refresh run, and never clobbers the newer shared state. Set to `fail` to keep the historical hard-abort behaviour. Only the run path honours this; inspection/branch commands still hard-fail on a forward-incompatible store. See [`SchemaMismatchPolicy`].
+    What to do when the engine opens a state store whose schema version is **newer** than this binary supports (a forward-incompatibility, which happens during a rolling upgrade that crosses a redb schema version).
+
+    Unset means the backend default, resolved by [`StateConfig::schema_mismatch_policy`]: `fail` on `local` (the state file is the only copy, so the open refuses and leaves it untouched), and `recreate` on `s3`, `gcs`, `valkey` and `tiered` (the old pod renames the newer file to `<file>.v{found}.bak`, bootstraps fresh, does one full-refresh run, and never uploads over the newer shared state). An explicit value applies on every backend, so `recreate` on `local` also renames to the `.bak`. Only the run and load paths honour this; inspection/branch commands still hard-fail on a forward-incompatible store. See [`SchemaMismatchPolicy`].
     """
     on_upload_failure: StateUploadFailureMode1 | StateUploadFailureMode2 | None = "skip"
     """
@@ -4478,7 +4478,7 @@ class RockyConfig(BaseModel):
                 "retention_days": 30,
             },
             "namespacing": "none",
-            "on_schema_mismatch": "recreate",
+            "on_schema_mismatch": None,
             "on_upload_failure": "skip",
             "retention": {
                 "applies_to": ["history", "lineage", "audit"],
