@@ -405,7 +405,7 @@ class AdapterConfig(BaseModel):
     destination_id: str | None = None
     extension_directory: str | None = None
     """
-    Directory DuckDB keeps its extensions in (DuckDB's `extension_directory` setting). When unset, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
+    Directory DuckDB keeps its extensions in. Rocky sets it as the only entry of DuckDB's `extension_directories` setting. When unset or empty, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
     """
     extra: dict[str, Any] | None = None
     """
