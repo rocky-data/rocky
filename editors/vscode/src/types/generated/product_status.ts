@@ -199,7 +199,7 @@ export interface ProductMonthCost {
    */
   breach_events?: ProductBudgetBreachEvent[];
   /**
-   * Why `breach_events` was not computed, when it was not: the month has more production runs than the report replays (the reason gives both counts). `budget` is still checked. Absent otherwise.
+   * Why `breach_events` was not computed, when it was not: replaying the month would split more executions than the report allows (the reason gives the runs, the executions and the cap). `budget` is still checked. Absent otherwise.
    */
   breach_events_skipped?: string | null;
   /**
