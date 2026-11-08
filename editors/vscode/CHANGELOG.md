@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.53.0] — 2026-11-08
+
+### Changed
+
+- The generated TypeScript config types follow engine 1.91.0. `ConnectorConfig` gains `options`, the `[connector.<name>.options]` table. A transformation pipeline gains `allow_empty_models`. `on_schema_mismatch` under `[state]` no longer defaults to `"recreate"`: unset now means the backend default. The `extension_directory` description now says Rocky sets DuckDB's `extension_directories`.
+
 ## [1.52.0] — 2026-11-07
 
 ### Added
