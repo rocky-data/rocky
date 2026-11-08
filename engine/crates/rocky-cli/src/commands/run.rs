@@ -13252,26 +13252,20 @@ async fn execute_models_phase(
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
-    // The `[product.output.volume]` ranges this run checks after each build.
-    // Read from the project's `products/` (the `rocky.toml` directory, the
-    // one `rocky product` reads). A shadow or branch run counts nothing,
+    // The `[product.output.volume]` ranges this run checks after each build
+    // and the `[[product.source.volume]]` ranges it counts at its start, read
+    // in one scan of the project's `products/` (the `rocky.toml` directory,
+    // the one `rocky product` reads). A shadow or branch run counts nothing,
     // and a caller with no project root (a backfill, tests) checks nothing.
-    let product_volumes = super::run_volume::ProductVolumes::load(
+    // A production run refuses here, before any write, when a spec does not
+    // load: it could declare an `error` range nobody would check.
+    let (product_volumes, source_volumes) = super::run_volume::load_ranges(
         defer_opts
             .project
             .as_ref()
             .map(|project| project.root.as_path()),
         shadow_config.is_none(),
-    );
-    // The `[[product.source.volume]]` ranges this run counts at its start,
-    // read through the same gate: production, project root only.
-    let source_volumes = super::run_source_volume::SourceVolumes::load(
-        defer_opts
-            .project
-            .as_ref()
-            .map(|project| project.root.as_path()),
-        shadow_config.is_none(),
-    );
+    )?;
 
     // Build the run-scoped classified-retry plan once. The budget + breaker
     // carry interior atomics, so their caps are observed across the whole run

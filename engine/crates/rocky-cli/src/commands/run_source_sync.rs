@@ -782,7 +782,9 @@ auto_create_schemas = true
         std::fs::write(
             &config_path,
             CONFIG
-                .replace("__KEY__", key)
+                // A TOML basic string reads `\` as an escape, and a Windows
+                // temp path (`C:\Users\...`) is a key here.
+                .replace("__KEY__", &key.replace('\\', "\\\\"))
                 .replace("__MODE__", mode)
                 .replace("__TRIGGER__", &trigger.to_string())
                 .replace("__TIMEOUT__", &timeout_secs.to_string()),

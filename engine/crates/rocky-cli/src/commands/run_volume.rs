@@ -42,20 +42,6 @@ pub(crate) struct ProductVolumes {
 }
 
 impl ProductVolumes {
-    /// The ranges the products under `root` declare, or none.
-    ///
-    /// Empty when `production` is false (a shadow or branch run counts
-    /// nothing, as it stamps no `due_at`) or when the run has no project
-    /// root to read `products/` from.
-    pub(crate) fn load(root: Option<&Path>, production: bool) -> Self {
-        let ranges = match root {
-            Some(root) if production => super::product::product_volumes_in(root),
-            Some(_) | None => Vec::new(),
-        };
-        Self { ranges }
-    }
-
-    #[cfg(test)]
     pub(crate) fn from_ranges(ranges: Vec<ProductVolume>) -> Self {
         Self { ranges }
     }
@@ -63,6 +49,40 @@ impl ProductVolumes {
     fn for_model(&self, model: &str) -> Option<&ProductVolume> {
         self.ranges.iter().find(|range| range.output_model == model)
     }
+}
+
+/// The output and source ranges this run checks, read in one scan of the
+/// project's `products/`.
+///
+/// ```text
+///   project root? ──no──▶ nothing checked (a backfill, tests)
+///        │ yes
+///   production? ──no──▶ nothing checked; a spec that does not load is a warning
+///        │ yes
+///   every spec loads? ──no──▶ Err: the model phase refuses before any write
+///        │ yes
+///   the declared ranges
+/// ```
+///
+/// A shadow or branch run counts nothing, as it stamps no `due_at`.
+pub(crate) fn load_ranges(
+    root: Option<&Path>,
+    production: bool,
+) -> anyhow::Result<(ProductVolumes, super::run_source_volume::SourceVolumes)> {
+    let Some(root) = root else {
+        return Ok(Default::default());
+    };
+    if !production {
+        for problem in super::product::product_spec_problems_in(root) {
+            warn!("{problem}; this run checks no product range, but a production run refuses it");
+        }
+        return Ok(Default::default());
+    }
+    let ranges = super::product::product_ranges_in(root).map_err(|e| anyhow::anyhow!(e))?;
+    Ok((
+        ProductVolumes::from_ranges(ranges.output),
+        super::run_source_volume::SourceVolumes::from_ranges(ranges.source),
+    ))
 }
 
 /// Whether a total-row count on one write of this strategy says something
@@ -246,11 +266,129 @@ mod tests {
         assert!(!counts_total_rows(&MaterializationStrategy::Ephemeral));
     }
 
+    const SPEC_WITH_RANGES: &str = "[product]\nname = \"p\"\nintent = \"x\"\n\n\
+         [product.source]\ntables = [\"c.s.t\"]\n\n\
+         [[product.source.volume]]\ntable = \"c.s.t\"\nmin_rows = 1\n\n\
+         [product.output]\ngrain = [\"x\"]\n\
+         columns = [{ name = \"x\", type = \"Int32\", nullable = false }]\n\n\
+         [product.trust]\nagent = \"propose_only\"\n";
+
+    fn project_with(specs: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("products")).unwrap();
+        for (name, body) in specs {
+            std::fs::write(dir.path().join("products").join(name), body).unwrap();
+        }
+        dir
+    }
+
+    /// N26: a production run refuses when a spec does not parse. The spec
+    /// could declare an `error` range, so skipping it would deliver an
+    /// output nobody checked. The error names the file and the fix.
+    #[test]
+    fn a_production_run_refuses_a_spec_that_does_not_parse() {
+        let dir = project_with(&[("p.toml", SPEC_WITH_RANGES), ("q.toml", "[product\n")]);
+        let err = load_ranges(Some(dir.path()), true)
+            .expect_err("a broken spec must refuse a production run")
+            .to_string();
+        assert!(err.starts_with("[product-spec-unloadable] "), "{err}");
+        assert!(err.contains("products/q.toml does not load"), "{err}");
+        assert!(err.contains("rocky product verify q"), "{err}");
+        assert!(
+            !err.contains("products/p.toml"),
+            "the good spec is not named: {err}"
+        );
+    }
+
+    /// A spec that cannot be read (here a directory named like one) refuses
+    /// a production run too. A file is used, not a mode-000 file, because
+    /// a test running as root reads through permissions.
+    #[test]
+    fn a_production_run_refuses_a_spec_that_cannot_be_read() {
+        let dir = project_with(&[]);
+        std::fs::create_dir_all(dir.path().join("products/r.toml")).unwrap();
+        let err = load_ranges(Some(dir.path()), true)
+            .expect_err("an unreadable spec must refuse a production run")
+            .to_string();
+        assert!(err.contains("products/r.toml does not load"), "{err}");
+        assert!(err.contains("rocky product verify r"), "{err}");
+    }
+
+    /// A `products` that cannot be listed refuses, and points at
+    /// `rocky validate`: there is no spec name to verify.
+    #[test]
+    fn a_production_run_refuses_a_products_dir_it_cannot_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("products"), "not a directory").unwrap();
+        let err = load_ranges(Some(dir.path()), true)
+            .expect_err("an unlistable products dir must refuse a production run")
+            .to_string();
+        assert!(err.contains("cannot read the products directory"), "{err}");
+        assert!(err.contains("run again"), "{err}");
+    }
+
+    /// A dangling `products` symlink (an unmounted share) is not "no
+    /// products": its `NotFound` proves nothing, so the run refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_production_run_refuses_a_dangling_products_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("products")).unwrap();
+        let err = load_ranges(Some(dir.path()), true)
+            .expect_err("a dangling products link must refuse a production run")
+            .to_string();
+        assert!(err.contains("[product-spec-unloadable]"), "{err}");
+        assert!(err.contains("cannot read the products directory"), "{err}");
+    }
+
+    /// The refusal is a configuration error, never classified as transient:
+    /// an orchestrator must not retry it.
+    #[test]
+    fn the_refusal_is_not_classified_as_retryable() {
+        let dir = project_with(&[("q.toml", "[product\n")]);
+        let err = load_ranges(Some(dir.path()), true).expect_err("refuses");
+        let (kind, cooldown) = crate::output::classify_anyhow_error_with_cooldown(&err);
+        assert_eq!(kind, crate::output::FailureKind::Unknown);
+        assert_eq!(cooldown, None);
+    }
+
+    /// No `products/` declares nothing: a project without products runs.
+    #[test]
+    fn a_production_run_without_products_checks_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (output, source) = load_ranges(Some(dir.path()), true).expect("no products dir");
+        assert!(output.ranges.is_empty());
+        assert!(format!("{source:?}").contains("ranges: []"));
+    }
+
+    /// A shadow or branch run with a broken spec still runs: it checks no
+    /// range at all, so there is nothing to refuse. It warns instead.
+    #[test]
+    fn a_non_production_run_does_not_refuse_a_broken_spec() {
+        let dir = project_with(&[("q.toml", "[product\n")]);
+        load_ranges(Some(dir.path()), false).expect("a shadow run checks nothing");
+        load_ranges(None, true).expect("no project root checks nothing");
+    }
+
+    /// Both range kinds come from the same scan.
+    #[test]
+    fn a_production_run_loads_both_range_kinds() {
+        let dir = project_with(&[("p.toml", SPEC_WITH_RANGES)]);
+        let (output, source) = load_ranges(Some(dir.path()), true).expect("loads");
+        assert!(output.ranges.is_empty(), "p declares no output range");
+        assert!(
+            format!("{source:?}").contains("output_model: \"p\""),
+            "{source:?}"
+        );
+    }
+
     #[test]
     fn a_non_production_run_loads_no_range() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(
-            ProductVolumes::load(Some(dir.path()), false)
+            load_ranges(Some(dir.path()), false)
+                .expect("no products")
+                .0
                 .ranges
                 .is_empty()
         );
