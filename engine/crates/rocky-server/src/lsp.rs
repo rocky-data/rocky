@@ -1873,8 +1873,10 @@ impl LanguageServer for RockyLsp {
     ///
     /// A path that two events name inside one debounce window joins one
     /// recompile ([`PendingRecompile::record`] keeps it once), so a client
-    /// that also watches these files itself costs no second compile. It schedules the same
-    /// debounced recompile as an edit, with every changed path, so the
+    /// that also watches these files itself costs no second compile.
+    ///
+    /// It schedules the same debounced recompile as an edit, with every
+    /// changed path, so the
     /// incremental compile marks the models a directory `_defaults.toml`
     /// governs. A changed `rocky.toml` still compiles in full
     /// (`CastTargets::kept`).
@@ -5928,9 +5930,8 @@ mod tests {
     /// A client that supports dynamic registration for watched files gets
     /// one `client/registerCapability` for the three globs the server's
     /// `didChangeWatchedFiles` handler compiles on. Without it, an editor
-    /// with no client-side watcher config (Neovim, Helix, Zed) sends no
-    /// watched-file events, and a `_defaults.toml` edit never reaches the
-    /// server.
+    /// with no client-side watcher config of its own sends no watched-file
+    /// events, and a `_defaults.toml` edit never reaches the server.
     #[tokio::test]
     async fn a_client_with_dynamic_registration_is_asked_to_watch_the_project_files() {
         let requests = requests_after_handshake(

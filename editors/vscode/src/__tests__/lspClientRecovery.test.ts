@@ -12,8 +12,14 @@ let stateCb: ((e: { oldState: number; newState: number }) => void) | undefined;
 
 const STATE = { Stopped: 1, Running: 2, Starting: 3 };
 
+// The client options the extension passed to the last LanguageClient.
+let lastClientOptions: { synchronize?: { fileEvents?: unknown } } | undefined;
+
 vi.mock("vscode-languageclient/node", () => {
   class LanguageClient {
+    constructor(_id: string, _name: string, _server: unknown, options: unknown) {
+      lastClientOptions = options as typeof lastClientOptions;
+    }
     onDidChangeState(cb: (e: { oldState: number; newState: number }) => void) {
       stateCb = cb;
       return { dispose: vi.fn() };
@@ -107,6 +113,20 @@ describe("LSP crash recovery", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  // The server registers the watched-file globs itself (dynamic
+  // registration). A client-side `synchronize.fileEvents` list as well would
+  // make vscode-languageclient send every file event twice.
+  it("leaves watched files to the server's registration", async () => {
+    lastClientOptions = undefined;
+    const lsp = await import("../lspClient");
+    const ctx = { subscriptions: [] } as unknown as import("vscode").ExtensionContext;
+
+    lsp.startLspClient(ctx);
+    await flush();
+    expect(lastClientOptions).toBeDefined();
+    expect(lastClientOptions?.synchronize?.fileEvents).toBeUndefined();
   });
 
   it("resets Failed → Ready when the server auto-restarts (→Running)", async () => {

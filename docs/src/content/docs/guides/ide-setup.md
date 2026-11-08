@@ -328,7 +328,7 @@ The language server asks the editor to watch these file patterns:
 
 When a watched file changes, the language server recompiles the project incrementally. The Problems panel updates as it goes.
 
-The server makes this request when it starts. It goes to any editor whose LSP client supports dynamic registration of watched files (`workspace.didChangeWatchedFiles.dynamicRegistration`). VS Code supports it, and so do most other LSP clients. Check your editor's LSP documentation if an edit to a `_defaults.toml` file does not update the diagnostics. An editor without that support never hears of these patterns. It still recompiles when you edit an open `.rocky` or `.sql` file. An edit to a file that is not open, such as a `_defaults.toml` or `groups/*.toml` file, then shows only at the next recompile.
+The server makes this request when it starts. It goes to any editor whose LSP client supports dynamic registration of watched files (`workspace.didChangeWatchedFiles.dynamicRegistration`). VS Code supports it. For another editor, check its LSP client's documentation, or check whether an edit to a `_defaults.toml` file updates the diagnostics. An editor without that support never hears of these patterns. It still recompiles when you edit an open `.rocky` or `.sql` file. An edit to a file that is not open, such as a `_defaults.toml` or `groups/*.toml` file, then shows only at the next recompile.
 
 ## 9. Troubleshooting
 
