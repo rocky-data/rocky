@@ -650,6 +650,24 @@ fn governing_dir_defaults(model_file: &Path) -> Option<PathBuf> {
     model_file.parent().map(|dir| dir.join("_defaults.toml"))
 }
 
+/// The models directory a changed config group file governs, or `None` when
+/// `path` is not a group file.
+///
+/// A group file is `<dir>/groups/<name>.toml`. Each directory's loader reads
+/// `dir.join("groups")` for the models in `dir` only
+/// (`rocky_core::models::load_groups_from_dir`, called by both the `.sql`
+/// and the `.rocky` loader), so it governs `dir` and no other directory.
+fn governed_dir_of_group_file(path: &Path) -> Option<&Path> {
+    if path.extension() != Some(std::ffi::OsStr::new("toml")) {
+        return None;
+    }
+    let groups = path.parent()?;
+    if groups.file_name() != Some(std::ffi::OsStr::new("groups")) {
+        return None;
+    }
+    groups.parent()
+}
+
 /// §P3.1 — Incremental compile, narrow scope.
 ///
 /// Given the previous `CompileResult` and the set of model files that
@@ -723,6 +741,26 @@ pub fn compile_incremental(
     // incremental output must equal from-scratch output for the same final
     // state. Both sides are now the bytes the filesystem gave us.
     let changed_paths: HashSet<&Path> = changed_files.iter().map(PathBuf::as_path).collect();
+    // A config group's `[strategy]` and `schema_template` are merged into the
+    // config of each member (sidecar > group > `_defaults.toml`), so E061 /
+    // W002, E046 and the reads that bind by target move with a group edit.
+    // Membership (`group = "<name>"` in the sidecar) is not kept on the loaded
+    // model, so every model in the governed directory is marked: a superset
+    // bounded by one directory. Built from the path alone, so an added or a
+    // removed group file matches as well as an edited one.
+    //
+    // `test_definitions.toml` and version declarations need no rule here.
+    // The first changes only a model's `tests`, which no cached typecheck
+    // result reads (the project above is reloaded in full and the checks that
+    // read tests run over all of it). A declaration's latest alias has the
+    // declaration as its `file_path`, so the first check below marks it, and
+    // an alias that appears or disappears moves its readers' upstream set.
+    // `@v` pins are rewritten in `depends_on` without reading a declaration.
+    // If either ever feeds the typecheck, add it here.
+    let group_dirs: HashSet<&Path> = changed_files
+        .iter()
+        .filter_map(|path| governed_dir_of_group_file(path))
+        .collect();
     for m in &project.models {
         // A sidecar edit (`[target]`, `[strategy]`) changes what a reader's
         // checks bind to (E039 binds a bare read by the target table), so it
@@ -737,6 +775,9 @@ pub fn compile_incremental(
             || changed_paths.contains(m.file_path.with_extension("toml").as_path())
             || governing_dir_defaults(&m.file_path)
                 .is_some_and(|defaults| changed_paths.contains(defaults.as_path()))
+            || m.file_path
+                .parent()
+                .is_some_and(|dir| group_dirs.contains(dir))
         {
             affected.insert(m.config.name.clone());
         }
@@ -2645,6 +2686,30 @@ mod tests {
                 "typed columns of {name}"
             );
         }
+        assert_eq!(
+            resolved_configs(incremental),
+            resolved_configs(scratch),
+            "resolved model configs"
+        );
+    }
+
+    /// Every loaded model's resolved config, keyed by name. JSON, not
+    /// `PartialEq`: `ModelConfig` does not derive it, and `serde_json` object
+    /// equality ignores key order.
+    fn resolved_configs(
+        result: &CompileResult,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        result
+            .project
+            .models
+            .iter()
+            .map(|m| {
+                (
+                    m.config.name.clone(),
+                    serde_json::to_value(&m.config).expect("config serializes"),
+                )
+            })
+            .collect()
     }
 
     /// `models/sub/` holds one model whose output repeats `id`. Its sidecar
@@ -2893,5 +2958,387 @@ mod tests {
         ] {
             assert_ne!(governing_dir_defaults(model), Some(PathBuf::from(other)));
         }
+    }
+
+    // ---- config group, named-test and version-declaration edits ----
+    //
+    // The three other directory-level config files a model's resolved config
+    // reads. Same invariant and layout rule as the `_defaults.toml` tests
+    // above: twelve flat models at the root keep the governed models a
+    // minority, so the compile stays on the incremental path.
+
+    /// Proves `compile_incremental` stayed incremental for `changed`: an
+    /// unreported edit of the root model `m05` must keep its previous typed
+    /// result. A full compile would pick the edit up, and an equality test
+    /// that passes on a full compile proves nothing about the invalidation.
+    fn assert_stays_incremental(config: &CompilerConfig, changed: &Path, previous: &CompileResult) {
+        let m05 = config.models_dir.join("m05.sql");
+        std::fs::write(&m05, "SELECT 1 AS id, 2 AS qty\n").expect("silent edit");
+        let result =
+            compile_incremental(config, &[changed.to_path_buf()], previous).expect("incremental");
+        std::fs::write(&m05, "SELECT 1 AS id\n").expect("restore m05");
+        assert_eq!(
+            result.type_check.typed_models["m05"], previous.type_check.typed_models["m05"],
+            "the compile fell through to a full compile"
+        );
+    }
+
+    /// Write `<dir>/groups/<name>.toml`.
+    fn write_group(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let groups = dir.join("groups");
+        std::fs::create_dir_all(&groups).expect("groups dir");
+        let path = groups.join(format!("{name}.toml"));
+        std::fs::write(&path, body).expect("write group");
+        path
+    }
+
+    /// `models/sub/dup` repeats `id` and takes its strategy from the group
+    /// `g` in `models/sub/groups/g.toml`.
+    fn write_group_strategy_project(models_dir: &std::path::Path, strategy: &str) -> PathBuf {
+        write_flat_models(models_dir, 12);
+        let sub = models_dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub dir");
+        std::fs::write(sub.join("dup.sql"), "SELECT 1 AS id, 2 AS id, 3 AS ts\n")
+            .expect("write dup");
+        std::fs::write(
+            sub.join("dup.toml"),
+            "name = \"dup\"\ngroup = \"g\"\n[target]\ncatalog = \"analytics\"\nschema = \"sub\"\n",
+        )
+        .expect("write dup sidecar");
+        write_group(&sub, "g", strategy)
+    }
+
+    /// A group's `[strategy]` is merged into every member's config (sidecar >
+    /// group > defaults), so moving it from `full_refresh` (W002 for the
+    /// repeated name) to `incremental` (E061) must recompute the member.
+    #[test]
+    fn a_group_strategy_edit_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let group = write_group_strategy_project(&models_dir, FULL_REFRESH);
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert_eq!(first.type_check.typed_models.len(), 13);
+        assert!(codes_for(&first, "dup").contains(&"W002".to_string()));
+        assert!(!codes_for(&first, "dup").contains(&"E061".to_string()));
+
+        std::fs::write(&group, INCREMENTAL).expect("edit group");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&group), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(
+            codes_for(&scratch, "dup").contains(&"E061".to_string()),
+            "the edit must change the from-scratch result, or this test proves nothing: {:?}",
+            codes_for(&scratch, "dup")
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+        assert_stays_incremental(&config, &group, &first);
+    }
+
+    /// A group's `schema_template` routes each member's target schema. Here
+    /// the edit moves `a` from `warehouse.mart_eu` to `warehouse.other_eu`, so
+    /// `r`'s qualified read of `warehouse.mart_eu.a` stops binding to `a`.
+    #[test]
+    fn a_group_schema_template_edit_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_flat_models(&models_dir, 12);
+        let sub = models_dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub dir");
+        let group = write_group(&sub, "g", "schema_template = \"mart_{region}\"\n");
+        std::fs::write(sub.join("a.sql"), "SELECT amount FROM staging.orders\n").expect("write a");
+        std::fs::write(
+            sub.join("a.toml"),
+            "name = \"a\"\ngroup = \"g\"\n[args]\nregion = \"eu\"\n[target]\ncatalog = \"warehouse\"\n",
+        )
+        .expect("write a sidecar");
+        std::fs::write(
+            models_dir.join("r.sql"),
+            "SELECT amount, missing FROM warehouse.mart_eu.a\n",
+        )
+        .expect("write r");
+        std::fs::write(
+            models_dir.join("r.toml"),
+            "name = \"r\"\ndepends_on = [\"a\"]\n",
+        )
+        .expect("write r sidecar");
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            source_schemas: HashMap::from([(
+                "staging.orders".to_string(),
+                vec![rocky_ir::types::TypedColumn {
+                    name: "amount".to_string(),
+                    data_type: rocky_ir::types::RockyType::Int64,
+                    nullable: false,
+                }],
+            )]),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert_eq!(first.type_check.typed_models.len(), 15);
+        assert_eq!(
+            first.project.model("a").expect("a").config.target.schema,
+            "mart_eu"
+        );
+
+        std::fs::write(&group, "schema_template = \"other_{region}\"\n").expect("edit group");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&group), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(
+            diagnostic_set(&first) != diagnostic_set(&scratch)
+                || first.type_check.typed_models["r"] != scratch.type_check.typed_models["r"],
+            "the template edit must change the from-scratch result, or this test proves nothing"
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+    }
+
+    /// Bounds the blast radius of a group edit from above. A group file
+    /// governs only the models of the directory that holds its `groups/`
+    /// folder, so an edit of `sub/groups/g.toml` must not mark a model in a
+    /// sibling directory, in a subdirectory of `sub/` (each has its own
+    /// `groups/g.toml` and a member of it), or at the root. Each of those is
+    /// changed on disk WITHOUT being reported, so a model that was wrongly
+    /// marked would pick up its new SQL.
+    #[test]
+    fn a_group_edit_marks_only_the_models_in_its_own_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let group = write_group_strategy_project(&models_dir, FULL_REFRESH);
+        for (dir, name) in [("other", "sibling"), ("sub/deeper", "nested")] {
+            let dir = models_dir.join(dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            write_group(&dir, "g", FULL_REFRESH);
+            std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS id\n").expect("model");
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\ngroup = \"g\"\n[target]\ncatalog = \"analytics\"\nschema = \"s\"\n"
+                ),
+            )
+            .expect("sidecar");
+        }
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+        let first = compile(&config).expect("first compile");
+        assert_eq!(first.type_check.typed_models.len(), 15);
+
+        for path in ["other/sibling.sql", "sub/deeper/nested.sql", "m05.sql"] {
+            std::fs::write(models_dir.join(path), "SELECT 1 AS id, 2 AS qty\n")
+                .expect("silent edit");
+        }
+        std::fs::write(&group, INCREMENTAL).expect("edit group");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&group), &first)
+            .expect("incremental");
+
+        assert!(
+            codes_for(&incremental, "dup").contains(&"E061".to_string()),
+            "the member is recomputed"
+        );
+        for name in ["sibling", "nested", "m05"] {
+            assert_eq!(
+                incremental.type_check.typed_models[name], first.type_check.typed_models[name],
+                "{name} is not governed by sub/groups/g.toml and must not be recomputed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_file_governs_the_directory_above_its_groups_folder_only() {
+        assert_eq!(
+            governed_dir_of_group_file(Path::new("models/sub/groups/g.toml")),
+            Some(Path::new("models/sub"))
+        );
+        for not_a_group_file in [
+            "models/sub/g.toml",
+            "models/sub/groups/g.sql",
+            "models/sub/groups/deeper/g.toml",
+            "models/sub/_defaults.toml",
+        ] {
+            assert_eq!(
+                governed_dir_of_group_file(Path::new(not_a_group_file)),
+                None,
+                "{not_a_group_file}"
+            );
+        }
+    }
+
+    /// A `[[use_test]]` reference resolves into the model's `tests` from the
+    /// directory's `test_definitions.toml`. No cached result reads a model's
+    /// tests (the incremental compile reloads every model's config and
+    /// re-runs the whole-project checks), so this pins that the incremental
+    /// result still equals the from-scratch one after the edit.
+    #[test]
+    fn a_test_definitions_edit_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_flat_models(&models_dir, 12);
+        let sub = models_dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub dir");
+        let defs = sub.join("test_definitions.toml");
+        std::fs::write(
+            &defs,
+            "[positive]\ntype = \"expression\"\nexpression = \"id > 0\"\ncolumn = \"id\"\n",
+        )
+        .expect("write test definitions");
+        std::fs::write(sub.join("a.sql"), "SELECT 1 AS id\n").expect("write a");
+        std::fs::write(
+            sub.join("a.toml"),
+            "name = \"a\"\n[target]\ncatalog = \"analytics\"\nschema = \"sub\"\n\
+             [[use_test]]\nname = \"positive\"\n",
+        )
+        .expect("write a sidecar");
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert_eq!(first.type_check.typed_models.len(), 13);
+
+        std::fs::write(&defs, "[positive]\ntype = \"not_null\"\ncolumn = \"id\"\n")
+            .expect("edit test definitions");
+        let incremental =
+            compile_incremental(&config, std::slice::from_ref(&defs), &first).expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert_ne!(
+            resolved_configs(&first)["a"],
+            resolved_configs(&scratch)["a"],
+            "the edit must change the resolved tests, or this test proves nothing"
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+        assert_stays_incremental(&config, &defs, &first);
+    }
+
+    const ORDERS_DECL_V1: &str = "latest_version = 1\n[[versions]]\nv = 1\n[[versions]]\nv = 2\n";
+    const ORDERS_DECL_V2: &str = "latest_version = 2\n[[versions]]\nv = 1\n[[versions]]\nv = 2\n";
+
+    /// `models/sub/` holds `orders_v1` and `orders_v2` (which adds `amount`)
+    /// and, when `decl` is set, the version declaration `orders.toml`. At the
+    /// root, `r` reads the unversioned `orders` (the latest alias the
+    /// declaration adds) and `p` pins `orders@v1`.
+    fn write_versioned_project(models_dir: &std::path::Path, decl: Option<&str>) -> PathBuf {
+        write_flat_models(models_dir, 12);
+        let sub = models_dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub dir");
+        for (name, sql) in [
+            ("orders_v1", "SELECT 1 AS id\n"),
+            ("orders_v2", "SELECT 1 AS id, 2 AS amount\n"),
+        ] {
+            std::fs::write(sub.join(format!("{name}.sql")), sql).expect("write version");
+            std::fs::write(
+                sub.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n[target]\ncatalog = \"analytics\"\nschema = \"sub\"\n"),
+            )
+            .expect("write version sidecar");
+        }
+        std::fs::write(models_dir.join("r.sql"), "SELECT * FROM orders\n").expect("write r");
+        std::fs::write(models_dir.join("r.toml"), "name = \"r\"\n").expect("write r sidecar");
+        std::fs::write(models_dir.join("p.sql"), "SELECT id FROM orders_v1\n").expect("write p");
+        std::fs::write(
+            models_dir.join("p.toml"),
+            "name = \"p\"\ndepends_on = [\"orders@v1\"]\n",
+        )
+        .expect("write p sidecar");
+        let path = sub.join("orders.toml");
+        if let Some(decl) = decl {
+            std::fs::write(&path, decl).expect("write declaration");
+        }
+        path
+    }
+
+    /// Moving `latest_version` from 1 to 2 repoints the `orders` alias, so its
+    /// columns and those of `r`, which reads it, gain `amount`.
+    #[test]
+    fn a_version_declaration_edit_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let decl = write_versioned_project(&models_dir, Some(ORDERS_DECL_V1));
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert!(first.type_check.typed_models.contains_key("orders"));
+
+        std::fs::write(&decl, ORDERS_DECL_V2).expect("edit declaration");
+        let incremental =
+            compile_incremental(&config, std::slice::from_ref(&decl), &first).expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert_ne!(
+            first.type_check.typed_models["r"], scratch.type_check.typed_models["r"],
+            "the edit must change the from-scratch result, or this test proves nothing"
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+        assert_stays_incremental(&config, &decl, &first);
+    }
+
+    /// Adding a declaration adds the `orders` alias that `r` reads.
+    #[test]
+    fn adding_a_version_declaration_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let decl = write_versioned_project(&models_dir, None);
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert!(!first.type_check.typed_models.contains_key("orders"));
+
+        std::fs::write(&decl, ORDERS_DECL_V2).expect("add declaration");
+        let incremental =
+            compile_incremental(&config, std::slice::from_ref(&decl), &first).expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(scratch.type_check.typed_models.contains_key("orders"));
+        assert_ne!(
+            first.type_check.typed_models.get("r"),
+            scratch.type_check.typed_models.get("r")
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+    }
+
+    /// Removing the declaration removes the alias `r` reads.
+    #[test]
+    fn removing_a_version_declaration_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let decl = write_versioned_project(&models_dir, Some(ORDERS_DECL_V2));
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert!(first.type_check.typed_models.contains_key("orders"));
+
+        std::fs::remove_file(&decl).expect("remove declaration");
+        let incremental =
+            compile_incremental(&config, std::slice::from_ref(&decl), &first).expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(!scratch.type_check.typed_models.contains_key("orders"));
+        assert_matches_from_scratch(&incremental, &scratch);
     }
 }

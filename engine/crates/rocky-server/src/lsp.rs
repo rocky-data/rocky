@@ -5796,6 +5796,93 @@ mod tests {
         assert!(!codes.contains(&"W002".to_string()), "{codes:?}");
     }
 
+    /// A config group edit (`models/sub/groups/g.toml`) reaches the server
+    /// only as a watched-file event, like a `_defaults.toml` edit. The
+    /// incremental compile must recompute the group's member, so its W002
+    /// under the group's `full_refresh` gives way to E061 under
+    /// `incremental`. Twelve models at the root keep the compile on the
+    /// incremental path.
+    #[tokio::test]
+    async fn a_watched_group_edit_recomputes_the_models_it_governs() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("project");
+        let models = root.join("models");
+        let groups = models.join("sub/groups");
+        std::fs::create_dir_all(&groups).unwrap();
+        for i in 0..12 {
+            std::fs::write(models.join(format!("m{i:02}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                models.join(format!("m{i:02}.toml")),
+                format!(
+                    "name = \"m{i:02}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let sub = models.join("sub");
+        std::fs::write(sub.join("dup.sql"), "SELECT 1 AS id, 2 AS id, 3 AS ts").unwrap();
+        std::fs::write(
+            sub.join("dup.toml"),
+            "name = \"dup\"\ngroup = \"g\"\n[target]\ncatalog = \"c\"\nschema = \"sub\"\n",
+        )
+        .unwrap();
+        let group = groups.join("g.toml");
+        std::fs::write(&group, "[strategy]\ntype = \"full_refresh\"\n").unwrap();
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        tokio::spawn(async move { while socket.next().await.is_some() {} });
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        let codes = stored_codes(service.inner(), "dup").await;
+        assert!(codes.contains(&"W002".to_string()), "startup: {codes:?}");
+        assert!(!codes.contains(&"E061".to_string()), "startup: {codes:?}");
+
+        std::fs::write(
+            &group,
+            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n",
+        )
+        .unwrap();
+        let event = Request::build("workspace/didChangeWatchedFiles")
+            .params(serde_json::json!({
+                "changes": [
+                    { "uri": Url::from_file_path(&group).unwrap(), "type": 2 },
+                ],
+            }))
+            .finish();
+        service.ready().await.unwrap().call(event).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !stored_codes(service.inner(), "dup")
+            .await
+            .contains(&"E061".to_string())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let codes = stored_codes(service.inner(), "dup").await;
+        assert!(
+            codes.contains(&"E061".to_string()),
+            "the group edit was never compiled: {codes:?}"
+        );
+        assert!(!codes.contains(&"W002".to_string()), "{codes:?}");
+    }
+
     /// Two debounce windows straddle one slow compile. Window A takes the
     /// `_defaults.toml` edit and is held before it publishes. Window B takes
     /// an edit of another model, starts from the same previous result, marks
