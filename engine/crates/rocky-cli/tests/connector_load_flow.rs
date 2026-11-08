@@ -535,6 +535,11 @@ async fn a_held_claim_skips_the_run_without_starting_the_child() {
 
 /// Claim `connector:demo:0` as another run, at `now`.
 async fn claim_as_other_run(project: &Project, now: DateTime<Utc>) {
+    claim_as_run(project, "other-run", now).await;
+}
+
+/// Claim `connector:demo:0` as the run `run_id`, at `now`.
+async fn claim_as_run(project: &Project, run_id: &str, now: DateTime<Utc>) {
     let loaded = project.loaded();
     let connector = &loaded.config.connectors["demo"];
     let config = IdempotencyConfig {
@@ -544,16 +549,131 @@ async fn claim_as_other_run(project: &Project, now: DateTime<Utc>) {
     };
     let store = StateStore::open(&project.state_path()).unwrap();
     let verdict = IdempotencyBackend::Local
-        .check_and_claim_at(
-            Some(&store),
-            &claim_key("demo", 0),
-            "other-run",
-            &config,
-            now,
-        )
+        .check_and_claim_at(Some(&store), &claim_key("demo", 0), run_id, &config, now)
         .await
         .unwrap();
     assert!(matches!(verdict, IdempotencyCheck::Proceed));
+}
+
+/// Whether a table or view called `name` exists in the warehouse.
+fn table_exists(project: &Project, name: &str) -> bool {
+    project.sql(|c| {
+        c.query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+}
+
+/// A run that crashed while it staged its batch: it left its claim in flight
+/// and its staging table in the warehouse. A second connector writes the same
+/// target and has a staging table of its own. The run that adopts the claim
+/// drops the crashed run's table, and only that one.
+#[tokio::test]
+async fn adopting_a_stale_claim_drops_only_the_prior_runs_staging_table() {
+    let project = Project::new("");
+    standard_batches(&project);
+    claim_as_run(&project, "a1b2c3", t0()).await;
+    project.sql(|c| {
+        c.execute_batch(
+            "CREATE TABLE main.events__rocky_stg_a1b2c3 (id BIGINT);
+             CREATE TABLE main.events__rocky_stg_d4e5f6 (id BIGINT);",
+        )
+        .unwrap();
+    });
+
+    let outcome = project.run_at(Some(t0() + ChronoDuration::hours(4))).await;
+    outcome.result.as_ref().unwrap();
+    assert_eq!(info(&outcome).status, ConnectorLoadStatus::Loaded);
+    assert!(info(&outcome).adopted_expired_claim);
+    assert_eq!(project.row_count(), Some(2));
+    assert!(
+        !table_exists(&project, "events__rocky_stg_a1b2c3"),
+        "the crashed run's staging table is dropped"
+    );
+    assert!(
+        table_exists(&project, "events__rocky_stg_d4e5f6"),
+        "another run's staging table is left alone"
+    );
+    assert_eq!(project.staging_tables(), 1);
+}
+
+/// A run that takes no stale claim drops no staging table, even one named
+/// like a prior run's.
+#[tokio::test]
+async fn a_fresh_claim_drops_no_staging_table() {
+    let project = Project::new("");
+    standard_batches(&project);
+    project.sql(|c| {
+        c.execute_batch("CREATE TABLE main.events__rocky_stg_a1b2c3 (id BIGINT);")
+            .unwrap();
+    });
+    let outcome = project.run().await;
+    outcome.result.as_ref().unwrap();
+    assert!(!info(&outcome).adopted_expired_claim);
+    assert!(table_exists(&project, "events__rocky_stg_a1b2c3"));
+}
+
+/// The drop fails (the name is a view, and `DROP TABLE` refuses a view). The
+/// run warns and loads its batch anyway.
+#[tokio::test]
+async fn a_failed_drop_of_a_stale_staging_table_warns_and_the_run_goes_on() {
+    use tracing::instrument::WithSubscriber;
+
+    let project = Project::new("");
+    standard_batches(&project);
+    claim_as_run(&project, "a1b2c3", t0()).await;
+    project.sql(|c| {
+        c.execute_batch(
+            "CREATE TABLE main.base (id BIGINT);
+             CREATE VIEW main.events__rocky_stg_a1b2c3 AS SELECT * FROM main.base;",
+        )
+        .unwrap();
+    });
+
+    let captured = Capture::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let outcome = project
+        .run_at(Some(t0() + ChronoDuration::hours(4)))
+        .with_subscriber(subscriber)
+        .await;
+    outcome.result.as_ref().unwrap();
+    assert_eq!(info(&outcome).status, ConnectorLoadStatus::Loaded);
+    assert_eq!(project.row_count(), Some(2));
+    assert!(table_exists(&project, "events__rocky_stg_a1b2c3"));
+    let logs = captured.text();
+    assert!(
+        logs.contains("failed to drop the staging table of the prior run"),
+        "{logs}"
+    );
+}
+
+/// Log lines written by a test subscriber.
+#[derive(Clone, Default)]
+struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
