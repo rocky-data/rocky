@@ -260,7 +260,7 @@ describe("the five states of a cost figure", () => {
     expect(screen.getByText("owner pays")).toBeInTheDocument();
     expect(screen.getByText(/names no product that owns a model/)).toBeInTheDocument();
     expect(screen.getByText(/2 failed executions recorded no time/)).toBeInTheDocument();
-    expect(screen.getByText(/3 tables were read with no recorded build/)).toBeInTheDocument();
+    expect(screen.getByText(/3 tables read with no recorded build/)).toBeInTheDocument();
   });
 
   it("a priced zero is a real $0.00, and a tiny figure keeps its digits", () => {

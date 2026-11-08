@@ -405,6 +405,11 @@ export function CostSection({
   );
 }
 
+/** `1 table`, `3 tables`. */
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
 function CostBody({ name, report }: { name: string; report: ProductMonthCostOutput }) {
   const cost = report.products.find((row) => row.product === name);
   const header = (
@@ -428,13 +433,13 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
   const counts = report.not_measured;
   const unmeasured = [
     counts.failed_executions > 0
-      ? `${counts.failed_executions} failed executions recorded no time, so their compute is lost`
+      ? `${plural(counts.failed_executions, "failed execution")} recorded no time, so their compute is lost`
       : null,
     counts.storage_unknown_tables > 0
-      ? `${counts.storage_unknown_tables} tables have unknown storage before their first measurement this month`
+      ? `${plural(counts.storage_unknown_tables, "table")} with unknown storage before the first measurement this month`
       : null,
     counts.unattributed_read_tables > 0
-      ? `${counts.unattributed_read_tables} tables were read with no recorded build, so the cost of those reads is not split`
+      ? `${plural(counts.unattributed_read_tables, "table")} read with no recorded build, so the cost of those reads is not split`
       : null,
   ].filter((line): line is string => line !== null);
   const caveats = [...(report.warnings ?? []), ...unmeasured];
@@ -445,8 +450,8 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
         <div className="text-xs text-amber-700 dark:text-amber-400">
           <p>The whole month&apos;s report is less complete than it looks:</p>
           <ul className="list-disc pl-5">
-            {caveats.map((line) => (
-              <li key={line}>{line}</li>
+            {caveats.map((line, index) => (
+              <li key={`${index}:${line}`}>{line}</li>
             ))}
           </ul>
         </div>
@@ -497,7 +502,7 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
       {cost.money_parts.length > 0 && (
         <Rows
           ariaLabel="Money by figure"
-          columns={["figure", "status", "USD"]}
+          columns={["figure", "status", partial ? "USD (partial)" : "USD"]}
           rows={cost.money_parts.map((part) => [
             part.figure,
             moneyStatusLabel(part.status),
@@ -526,7 +531,7 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
           </h5>
           <Rows
             ariaLabel="Shares of this product's tables that readers did not pay"
-            columns={["table", "reader", "share it keeps", "split by"]}
+            columns={["table", "reader", partial ? "share it keeps (partial)" : "share it keeps", "split by"]}
             rows={cost.shared_not_charged.map((row) => [
               <span key="t" className="font-mono text-xs">
                 {row.table}
