@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- **Breaking:** `rocky compile` now refuses with `E061` a model whose output repeats a column name (`SELECT a.id, b.id`) when its strategy writes into the existing table: `incremental`, `delete_insert`, `time_interval` (and its alias `microbatch`) or `merge`. On DuckDB, which inserts by name since #2465, such a model failed on every run after the first with `Duplicate column name`. Alias the column (`b.id AS b_id`). Other strategies now get the `W002` warning for the same projection. The check reads aliased names and bare or qualified columns of the outermost `SELECT`, on every warehouse; it does not see a repeat that a star (`*`, `b.*`) expands to. The language server shows both. (#2467)
+- **Breaking:** `rocky compile` now refuses with `E061` a model whose output repeats a column name (`SELECT a.id, b.id`) when its strategy writes into the existing table: `incremental`, `delete_insert`, `time_interval` (and its alias `microbatch`) or `merge`. On DuckDB, which inserts by name since #2465, such a model failed on every run after the first with `Duplicate column name`. Alias the column (`b.id AS b_id`). Other strategies now get the `W002` warning for the same projection. The check reads aliased names and bare or qualified columns of the outermost `SELECT`, on every warehouse; it does not see a repeat that a star (`*`, `b.*`) expands to. `rocky run` does not build such a model: it reports it as a `compile_error` and fails the run, as for any compile error. The language server shows both codes. (#2467)
 
 ### Changed
 
