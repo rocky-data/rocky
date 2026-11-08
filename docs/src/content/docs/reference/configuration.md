@@ -334,7 +334,7 @@ A `"transformation"` pipeline takes these fields instead:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `models` | string | No | `"models/**"` | Glob for the model files, relative to the config file. |
-| `allow_empty_models` | bool | No | `false` | Lets `rocky run` succeed when the models directory does not exist. By default a missing directory fails the run, and `rocky validate` reports it as error `V025`. Set `true` only for a pipeline that has no models on purpose, for example one that only loads seeds. A directory that exists but holds no models fails either way. |
+| `allow_empty_models` | bool | No | `false` | Lets `rocky run` and `rocky run --dag` go on when the models directory does not exist. By default a missing directory fails the run, and `rocky validate` reports it as error `V025`. Set `true` only for a pipeline that has no models on purpose, for example one that only loads seeds. The key covers a missing directory only. A directory that exists but holds no models (or a glob that matches nothing in it) fails a single-pipeline `rocky run` with `no models found`, whatever this key says; a `--dag` run plans that pipeline with no nodes. |
 
 ```toml
 [pipeline.seeds_only]
