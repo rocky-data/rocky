@@ -345,6 +345,211 @@ const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
 /// inside the requested viewport.
 type SemanticTokensCache = Arc<RwLock<HashMap<String, (u64, Vec<(u32, u32, u32, u32)>)>>>;
 
+/// The debounced recompile and the files changed since it was scheduled.
+///
+/// The flag and the paths share one lock, so a change either joins the
+/// recompile that is about to take the paths, or finds nothing scheduled and
+/// schedules the next one. A change is never dropped between the two.
+#[derive(Debug, Default)]
+struct PendingRecompile {
+    state: std::sync::Mutex<PendingChanges>,
+}
+
+#[derive(Debug, Default)]
+struct PendingChanges {
+    scheduled: bool,
+    files: Vec<std::path::PathBuf>,
+    /// A change had no file path: the next recompile runs in full.
+    unknown: bool,
+}
+
+impl PendingRecompile {
+    /// Record one changed file. `true` when no recompile was scheduled, so
+    /// the caller schedules one.
+    fn record(&self, file: Option<std::path::PathBuf>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match file {
+            Some(file) if !state.files.contains(&file) => state.files.push(file),
+            Some(_) => {}
+            None => state.unknown = true,
+        }
+        !std::mem::replace(&mut state.scheduled, true)
+    }
+
+    /// Take the files for the recompile about to run, and clear the
+    /// schedule. `None` when one change had no file path: compile in full.
+    fn take(&self) -> Option<Vec<std::path::PathBuf>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let PendingChanges { files, unknown, .. } = std::mem::take(&mut *state);
+        (!unknown).then_some(files)
+    }
+}
+
+impl RockyLsp {
+    /// Schedule the debounced recompile for `changes`, one entry per changed
+    /// file (`None` for a URI that is not a file path, which compiles in
+    /// full). Changes that arrive while a recompile is scheduled join it, so
+    /// the incremental compile sees every file changed in the window, not
+    /// only the first.
+    fn schedule_recompile(&self, changes: impl IntoIterator<Item = Option<std::path::PathBuf>>) {
+        let mut schedule = false;
+        for path in changes {
+            schedule |= self.recompile_pending.record(path);
+        }
+        if schedule {
+            let client = self.client.clone();
+            let compile_result = self.compile_result.clone();
+            let models_dir = self.models_dir.clone();
+            let pending = self.recompile_pending.clone();
+            // Share the throttle so the did_change debounced recompile
+            // doesn't re-emit the info log that `recompile()` already
+            // emitted for the same project.
+            let schema_cache_throttle = self.schema_cache_throttle.clone();
+            let config_diagnostic_published = self.config_diagnostic_published.clone();
+            let published_files = self.published_files.clone();
+            let salsa_db = self.salsa_db.clone();
+            let salsa_sources = self.salsa_sources.clone();
+            let cast_targets = self.cast_targets.clone();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // Every path recorded up to here; a change after this
+                // schedules the next recompile.
+                let changed_files = pending.take();
+
+                let dir = models_dir.read().await;
+                let Some(ref dir) = *dir else { return };
+
+                // Keep the per-keystroke typecheck grounded in real
+                // warehouse types when the cache is warm. Throttle
+                // guarantees the info log fires at most once per session
+                // per project.
+                let dir_path = std::path::PathBuf::from(dir);
+                let source_schemas =
+                    Self::load_cached_source_schemas(&dir_path, &schema_cache_throttle, dir).await;
+
+                // Same project inputs as the initial compile. Building
+                // this from `Default` left W004 off and dropped the project
+                // `[freshness]` block after the first edit, so a model's
+                // inherited freshness vanished from the IDE's view of the
+                // project the moment the user typed.
+                let (mask, allow_unmasked, project_freshness, config_unreadable) =
+                    Self::project_compiler_inputs(&dir_path);
+                Self::publish_project_config_diagnostic(
+                    &client,
+                    &config_diagnostic_published,
+                    &dir_path,
+                    config_unreadable.as_deref(),
+                )
+                .await;
+                let mut config = CompilerConfig {
+                    models_dir: dir_path,
+                    contracts_dir: None,
+                    required_explicit_contract_model: None,
+                    source_schemas,
+                    mask,
+                    allow_unmasked,
+                    project_freshness,
+                    run_vars: rocky_core::run_vars::RunVars::new(),
+                    source_provenance: Default::default(),
+                    strict_contracts: false,
+                    // Diagnostics and symbols map onto the authored text, so keep it
+                    // rather than the ephemeral-inlined form.
+                    preserve_authored_sql: true,
+                    external_dependencies: Default::default(),
+                    project: None,
+                    // Set below: kept for an incremental compile, resolved
+                    // afresh for a full one (see `CastTargets`).
+                    target_dialects: Default::default(),
+                };
+
+                // Try incremental compilation if we have a previous result.
+                //
+                // Full compile (§P3.3) is offloaded to the blocking pool via
+                // `spawn_blocking` so it can't starve hover / completion /
+                // semantic-token handlers on the async runtime's worker
+                // threads. The incremental path stays inline: it's already
+                // fast (<50 ms on 100-model projects), needs a live borrow
+                // of the previous result, and won't dominate the runtime.
+                let generation = published_files.begin_compile();
+                // An incremental compile keeps the previous types of every
+                // model the edit does not reach, so it needs the targets the
+                // previous compile used. A changed `rocky.toml` can change
+                // them: compile in full then.
+                let kept_targets = if changed_files
+                    .as_ref()
+                    .is_some_and(|files| !files.is_empty())
+                    && compile_result.read().await.is_some()
+                {
+                    cast_targets.kept(&config.models_dir)
+                } else {
+                    None
+                };
+                // A full compile also returns the targets it resolved, kept
+                // only once its result is the stored one.
+                let new_result = if let Some(targets) = kept_targets {
+                    config.target_dialects = targets;
+                    let prev = compile_result.read().await;
+                    let prev_ref = prev.as_ref().expect("checked use_incremental above");
+                    let files = changed_files
+                        .as_deref()
+                        .expect("checked use_incremental above");
+                    compile_incremental(files, prev_ref, &config)
+                        .ok()
+                        .map(|result| (result, None))
+                } else {
+                    let mut config_for_blocking = config.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let resolved = CastTargets::resolve(&config_for_blocking.models_dir);
+                        config_for_blocking.target_dialects = resolved.targets.clone();
+                        rocky_compiler::compile::compile(&config_for_blocking)
+                            .ok()
+                            .map(|result| (result, Some(resolved)))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                };
+
+                if let Some((mut result, resolved)) = new_result {
+                    apply_project_gates(&config.models_dir, &mut result);
+                    let stored = Self::publish_compile_diagnostics(
+                        &client,
+                        &published_files,
+                        &compile_result,
+                        generation,
+                        result,
+                    )
+                    .await;
+                    if stored && let Some(resolved) = resolved {
+                        cast_targets.keep(generation, resolved);
+                    }
+                } else {
+                    // A newer compile that failed still outranks an older
+                    // one that may yet succeed.
+                    published_files.compile_failed(generation).await;
+                    // Same as `recompile`: a failed compile builds no
+                    // diagnostic, so surface the `.rocky` parse errors.
+                    Self::publish_dsl_parse_diagnostics(
+                        &client,
+                        &published_files,
+                        &salsa_db,
+                        &salsa_sources,
+                        &config.models_dir,
+                    )
+                    .await;
+                }
+            });
+        }
+    }
+}
+
 /// Rocky LSP backend.
 pub struct RockyLsp {
     client: Client,
@@ -352,8 +557,9 @@ pub struct RockyLsp {
     models_dir: Arc<RwLock<Option<String>>>,
     /// Document contents cache for completion context analysis.
     documents: Arc<RwLock<HashMap<String, String>>>,
-    /// Flag set when a recompile is pending (for debounced did_change).
-    recompile_pending: Arc<AtomicBool>,
+    /// The debounced recompile `did_change` and `did_change_watched_files`
+    /// schedule, and every file changed since it was scheduled.
+    recompile_pending: Arc<PendingRecompile>,
     /// Set to `true` once the initial compile in `initialized()` has finished.
     init_done: Arc<AtomicBool>,
     /// Notifies request handlers blocked on the initial compile.
@@ -1511,146 +1717,25 @@ impl LanguageServer for RockyLsp {
             );
         }
 
-        if !self.recompile_pending.swap(true, Ordering::SeqCst) {
-            let client = self.client.clone();
-            let compile_result = self.compile_result.clone();
-            let models_dir = self.models_dir.clone();
-            let pending = self.recompile_pending.clone();
-            // Share the throttle so the did_change debounced recompile
-            // doesn't re-emit the info log that `recompile()` already
-            // emitted for the same project.
-            let schema_cache_throttle = self.schema_cache_throttle.clone();
-            let config_diagnostic_published = self.config_diagnostic_published.clone();
-            let published_files = self.published_files.clone();
-            let salsa_db = self.salsa_db.clone();
-            let salsa_sources = self.salsa_sources.clone();
-            let cast_targets = self.cast_targets.clone();
+        self.schedule_recompile([changed_file]);
+    }
 
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                pending.store(false, Ordering::SeqCst);
-
-                let dir = models_dir.read().await;
-                let Some(ref dir) = *dir else { return };
-
-                // Keep the per-keystroke typecheck grounded in real
-                // warehouse types when the cache is warm. Throttle
-                // guarantees the info log fires at most once per session
-                // per project.
-                let dir_path = std::path::PathBuf::from(dir);
-                let source_schemas =
-                    Self::load_cached_source_schemas(&dir_path, &schema_cache_throttle, dir).await;
-
-                // Same project inputs as the initial compile. Building
-                // this from `Default` left W004 off and dropped the project
-                // `[freshness]` block after the first edit, so a model's
-                // inherited freshness vanished from the IDE's view of the
-                // project the moment the user typed.
-                let (mask, allow_unmasked, project_freshness, config_unreadable) =
-                    Self::project_compiler_inputs(&dir_path);
-                Self::publish_project_config_diagnostic(
-                    &client,
-                    &config_diagnostic_published,
-                    &dir_path,
-                    config_unreadable.as_deref(),
-                )
-                .await;
-                let mut config = CompilerConfig {
-                    models_dir: dir_path,
-                    contracts_dir: None,
-                    required_explicit_contract_model: None,
-                    source_schemas,
-                    mask,
-                    allow_unmasked,
-                    project_freshness,
-                    run_vars: rocky_core::run_vars::RunVars::new(),
-                    source_provenance: Default::default(),
-                    strict_contracts: false,
-                    // Diagnostics and symbols map onto the authored text, so keep it
-                    // rather than the ephemeral-inlined form.
-                    preserve_authored_sql: true,
-                    external_dependencies: Default::default(),
-                    project: None,
-                    // Set below: kept for an incremental compile, resolved
-                    // afresh for a full one (see `CastTargets`).
-                    target_dialects: Default::default(),
-                };
-
-                // Try incremental compilation if we have a previous result.
-                //
-                // Full compile (§P3.3) is offloaded to the blocking pool via
-                // `spawn_blocking` so it can't starve hover / completion /
-                // semantic-token handlers on the async runtime's worker
-                // threads. The incremental path stays inline: it's already
-                // fast (<50 ms on 100-model projects), needs a live borrow
-                // of the previous result, and won't dominate the runtime.
-                let generation = published_files.begin_compile();
-                // An incremental compile keeps the previous types of every
-                // model the edit does not reach, so it needs the targets the
-                // previous compile used. A changed `rocky.toml` can change
-                // them: compile in full then.
-                let kept_targets =
-                    if changed_file.is_some() && compile_result.read().await.is_some() {
-                        cast_targets.kept(&config.models_dir)
-                    } else {
-                        None
-                    };
-                // A full compile also returns the targets it resolved, kept
-                // only once its result is the stored one.
-                let new_result = if let Some(targets) = kept_targets {
-                    config.target_dialects = targets;
-                    let prev = compile_result.read().await;
-                    let prev_ref = prev.as_ref().expect("checked use_incremental above");
-                    let cf = changed_file
-                        .as_ref()
-                        .expect("checked use_incremental above");
-                    compile_incremental(std::slice::from_ref(cf), prev_ref, &config)
-                        .ok()
-                        .map(|result| (result, None))
-                } else {
-                    let mut config_for_blocking = config.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let resolved = CastTargets::resolve(&config_for_blocking.models_dir);
-                        config_for_blocking.target_dialects = resolved.targets.clone();
-                        rocky_compiler::compile::compile(&config_for_blocking)
-                            .ok()
-                            .map(|result| (result, Some(resolved)))
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                };
-
-                if let Some((mut result, resolved)) = new_result {
-                    apply_project_gates(&config.models_dir, &mut result);
-                    let stored = Self::publish_compile_diagnostics(
-                        &client,
-                        &published_files,
-                        &compile_result,
-                        generation,
-                        result,
-                    )
-                    .await;
-                    if stored && let Some(resolved) = resolved {
-                        cast_targets.keep(generation, resolved);
-                    }
-                } else {
-                    // A newer compile that failed still outranks an older
-                    // one that may yet succeed.
-                    published_files.compile_failed(generation).await;
-                    // Same as `recompile`: a failed compile builds no
-                    // diagnostic, so surface the `.rocky` parse errors.
-                    Self::publish_dsl_parse_diagnostics(
-                        &client,
-                        &published_files,
-                        &salsa_db,
-                        &salsa_sources,
-                        &config.models_dir,
-                    )
-                    .await;
-                }
-            });
-        }
+    /// A file the editor watches changed on disk: created, edited or
+    /// deleted. The VS Code client sends these for `**/*.rocky`, `**/*.toml`
+    /// and `**/models/**/*.sql`, but `didChange` only for the open `.rocky`
+    /// and `.sql` documents it selects, so a `_defaults.toml` or sidecar edit
+    /// reaches the server through here alone. It schedules the same
+    /// debounced recompile as an edit, with every changed path, so the
+    /// incremental compile marks the models a directory `_defaults.toml`
+    /// governs. A changed `rocky.toml` still compiles in full
+    /// (`CastTargets::kept`).
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        self.schedule_recompile(
+            params
+                .changes
+                .into_iter()
+                .map(|change| change.uri.to_file_path().ok()),
+        );
     }
 
     // ── Completion ──────────────────────────────────────────────────────────
@@ -5168,7 +5253,7 @@ pub async fn run_lsp() {
         compile_result: Arc::new(RwLock::new(None)),
         models_dir: Arc::new(RwLock::new(None)),
         documents: Arc::new(RwLock::new(HashMap::new())),
-        recompile_pending: Arc::new(AtomicBool::new(false)),
+        recompile_pending: Arc::new(PendingRecompile::default()),
         init_done: Arc::new(AtomicBool::new(false)),
         init_notify: Arc::new(Notify::new()),
         semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -5210,7 +5295,7 @@ mod tests {
             compile_result: Arc::new(RwLock::new(None)),
             models_dir: Arc::new(RwLock::new(None)),
             documents: Arc::new(RwLock::new(HashMap::new())),
-            recompile_pending: Arc::new(AtomicBool::new(false)),
+            recompile_pending: Arc::new(PendingRecompile::default()),
             init_done: Arc::new(AtomicBool::new(false)),
             init_notify: Arc::new(Notify::new()),
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -5325,7 +5410,7 @@ mod tests {
             compile_result: Arc::new(RwLock::new(None)),
             models_dir: Arc::new(RwLock::new(None)),
             documents: Arc::new(RwLock::new(HashMap::new())),
-            recompile_pending: Arc::new(AtomicBool::new(false)),
+            recompile_pending: Arc::new(PendingRecompile::default()),
             init_done: Arc::new(AtomicBool::new(false)),
             init_notify: Arc::new(Notify::new()),
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -5519,6 +5604,145 @@ mod tests {
                 "after an edit, contract {contract_type}: {codes:?}"
             );
         }
+    }
+
+    /// The codes the stored compile result holds for `model`, sorted.
+    async fn stored_codes(lsp: &RockyLsp, model: &str) -> Vec<String> {
+        let stored = lsp.compile_result.read().await;
+        let mut codes: Vec<String> = stored
+            .as_ref()
+            .map(|result| {
+                result
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.model == model)
+                    .map(|d| d.code.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        codes.sort();
+        codes
+    }
+
+    /// A `_defaults.toml` edit reaches the server only as a watched-file
+    /// event: the VS Code client sends `didChange` for the open `.rocky` and
+    /// `.sql` documents alone. The event must run the incremental compile
+    /// with the defaults path, so the model it governs is recomputed. Before
+    /// this the server dropped the event, and the next edit of any model ran
+    /// an incremental compile that kept the governed model's cached W002.
+    ///
+    /// Twelve models at the root and one under `models/sub/`, so the compile
+    /// stays on the incremental path (a full compile would pass this test
+    /// without the invalidation).
+    #[tokio::test]
+    async fn a_watched_defaults_edit_recomputes_the_models_it_governs() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("project");
+        let models = root.join("models");
+        let sub = models.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..12 {
+            std::fs::write(models.join(format!("m{i:02}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                models.join(format!("m{i:02}.toml")),
+                format!(
+                    "name = \"m{i:02}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(sub.join("dup.sql"), "SELECT 1 AS id, 2 AS id, 3 AS ts").unwrap();
+        std::fs::write(
+            sub.join("dup.toml"),
+            "name = \"dup\"\n[target]\ncatalog = \"c\"\nschema = \"sub\"\n",
+        )
+        .unwrap();
+        let defaults = sub.join("_defaults.toml");
+        std::fs::write(&defaults, "[strategy]\ntype = \"full_refresh\"\n").unwrap();
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        tokio::spawn(async move { while socket.next().await.is_some() {} });
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        let codes = stored_codes(service.inner(), "dup").await;
+        assert!(codes.contains(&"W002".to_string()), "startup: {codes:?}");
+        assert!(!codes.contains(&"E061".to_string()), "startup: {codes:?}");
+
+        std::fs::write(
+            &defaults,
+            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n",
+        )
+        .unwrap();
+        // Another file first: every path in the batch must reach the
+        // incremental compile, not only the first one.
+        let event = Request::build("workspace/didChangeWatchedFiles")
+            .params(serde_json::json!({
+                "changes": [
+                    { "uri": Url::from_file_path(models.join("m00.toml")).unwrap(), "type": 2 },
+                    { "uri": Url::from_file_path(&defaults).unwrap(), "type": 2 },
+                ],
+            }))
+            .finish();
+        service.ready().await.unwrap().call(event).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !stored_codes(service.inner(), "dup")
+            .await
+            .contains(&"E061".to_string())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let codes = stored_codes(service.inner(), "dup").await;
+        assert!(
+            codes.contains(&"E061".to_string()),
+            "the defaults edit was never compiled: {codes:?}"
+        );
+        assert!(!codes.contains(&"W002".to_string()), "{codes:?}");
+    }
+
+    /// Changes that arrive while a recompile is scheduled join it. The old
+    /// flag kept only the first edit's path, so a second file changed in the
+    /// same window was never marked affected.
+    #[test]
+    fn a_scheduled_recompile_collects_every_changed_file() {
+        let pending = PendingRecompile::default();
+        let a = std::path::PathBuf::from("models/a.sql");
+        let b = std::path::PathBuf::from("models/sub/_defaults.toml");
+        assert!(
+            pending.record(Some(a.clone())),
+            "the first change schedules"
+        );
+        assert!(!pending.record(Some(b.clone())), "the second joins it");
+        assert!(!pending.record(Some(a.clone())));
+        assert_eq!(pending.take(), Some(vec![a.clone(), b]));
+        assert!(
+            pending.record(Some(a.clone())),
+            "after the take, a change schedules the next recompile"
+        );
+        assert!(!pending.record(None));
+        assert_eq!(
+            pending.take(),
+            None,
+            "a change with no path compiles in full"
+        );
+        assert!(pending.record(Some(a)));
     }
 
     /// An edit after `rocky.toml` changed warehouse retypes every cast, not
@@ -5862,7 +6086,7 @@ mod tests {
             compile_result: Arc::new(RwLock::new(None)),
             models_dir: Arc::new(RwLock::new(None)),
             documents: Arc::new(RwLock::new(HashMap::new())),
-            recompile_pending: Arc::new(AtomicBool::new(false)),
+            recompile_pending: Arc::new(PendingRecompile::default()),
             init_done: Arc::new(AtomicBool::new(false)),
             init_notify: Arc::new(Notify::new()),
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -5994,7 +6218,7 @@ mod tests {
             compile_result: Arc::new(RwLock::new(None)),
             models_dir: Arc::new(RwLock::new(None)),
             documents: Arc::new(RwLock::new(HashMap::new())),
-            recompile_pending: Arc::new(AtomicBool::new(false)),
+            recompile_pending: Arc::new(PendingRecompile::default()),
             init_done: Arc::new(AtomicBool::new(false)),
             init_notify: Arc::new(Notify::new()),
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -6089,7 +6313,7 @@ mod tests {
             compile_result: Arc::new(RwLock::new(None)),
             models_dir: Arc::new(RwLock::new(None)),
             documents: Arc::new(RwLock::new(HashMap::new())),
-            recompile_pending: Arc::new(AtomicBool::new(false)),
+            recompile_pending: Arc::new(PendingRecompile::default()),
             init_done: Arc::new(AtomicBool::new(false)),
             init_notify: Arc::new(Notify::new()),
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -7043,7 +7267,7 @@ mod tests {
             compile_result: Arc::new(RwLock::new(None)),
             models_dir: Arc::new(RwLock::new(None)),
             documents: Arc::new(RwLock::new(HashMap::new())),
-            recompile_pending: Arc::new(AtomicBool::new(false)),
+            recompile_pending: Arc::new(PendingRecompile::default()),
             init_done: Arc::new(AtomicBool::new(false)),
             init_notify: Arc::new(Notify::new()),
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),

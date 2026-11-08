@@ -636,6 +636,20 @@ pub fn compile_project(
     })
 }
 
+/// The `_defaults.toml` whose `[strategy]` and `[target]` a model's config
+/// inherits: the one in the model's own directory.
+///
+/// Nearest file only. Each directory's loader reads `dir.join("_defaults.toml")`
+/// for the models in that directory and nothing else (`rocky_core::models::
+/// load_models_from_dir_filtered` for `.sql`, `load_rocky_models_with_db_filtered`
+/// in `project.rs` for `.rocky`), so a defaults file never reaches a model in a
+/// subdirectory or a sibling directory. If defaults ever merge up the tree,
+/// this must return every ancestor's file, or `compile_incremental` keeps a
+/// stale result for the models below an edited one.
+fn governing_dir_defaults(model_file: &Path) -> Option<PathBuf> {
+    model_file.parent().map(|dir| dir.join("_defaults.toml"))
+}
+
 /// §P3.1 — Incremental compile, narrow scope.
 ///
 /// Given the previous `CompileResult` and the set of model files that
@@ -713,8 +727,16 @@ pub fn compile_incremental(
         // A sidecar edit (`[target]`, `[strategy]`) changes what a reader's
         // checks bind to (E039 binds a bare read by the target table), so it
         // counts as an edit of the model.
+        //
+        // A `_defaults.toml` edit counts too: its `[strategy]` and `[target]`
+        // are merged into the config of every model it governs, so E061 /
+        // W002, E046 and the reads that bind by target all move with it. The
+        // path is built from the model, not read from disk, so a removed or a
+        // newly added defaults file matches as well as an edited one.
         if changed_paths.contains(m.file_path.as_path())
             || changed_paths.contains(m.file_path.with_extension("toml").as_path())
+            || governing_dir_defaults(&m.file_path)
+                .is_some_and(|defaults| changed_paths.contains(defaults.as_path()))
         {
             affected.insert(m.config.name.clone());
         }
@@ -2563,5 +2585,313 @@ mod tests {
             unified_dag: None,
         };
         assert!(target_collision_diagnostics(&project).is_empty());
+    }
+
+    // ---- `_defaults.toml` edits on the incremental path ----
+    //
+    // A directory's `_defaults.toml` is merged into the config of every model
+    // in that directory, so an edit of it must mark those models affected.
+    // Each test asserts the invariant `AGENT_REVIEW.md` names (incremental
+    // output == from-scratch output for the same final state) over the whole
+    // diagnostic set and every typed model, not over one code.
+    //
+    // Every layout keeps the governed models a minority of the project: twelve
+    // flat models at the root, plus a small subdirectory. `compile_incremental`
+    // compiles in full below ten models or when over half the project is
+    // affected, and a full compile would pass these tests with or without the
+    // invalidation.
+
+    /// Every diagnostic, rendered whole and sorted, so two compiles compare as
+    /// sets.
+    fn diagnostic_set(result: &CompileResult) -> Vec<String> {
+        let mut rendered: Vec<String> = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+            .collect();
+        rendered.sort();
+        rendered
+    }
+
+    /// The codes one model carries, sorted.
+    fn codes_for(result: &CompileResult, model: &str) -> Vec<String> {
+        let mut codes: Vec<String> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.model == model)
+            .map(|diagnostic| diagnostic.code.to_string())
+            .collect();
+        codes.sort();
+        codes
+    }
+
+    /// Incremental output equals from-scratch output: the same diagnostics
+    /// and the same typed columns for every model.
+    fn assert_matches_from_scratch(incremental: &CompileResult, scratch: &CompileResult) {
+        assert_eq!(
+            diagnostic_set(incremental),
+            diagnostic_set(scratch),
+            "incremental diagnostics must equal from-scratch diagnostics"
+        );
+        let mut names: Vec<&String> = scratch.type_check.typed_models.keys().collect();
+        names.sort();
+        let mut incremental_names: Vec<&String> =
+            incremental.type_check.typed_models.keys().collect();
+        incremental_names.sort();
+        assert_eq!(incremental_names, names, "typed model set");
+        for name in names {
+            assert_eq!(
+                incremental.type_check.typed_models[name], scratch.type_check.typed_models[name],
+                "typed columns of {name}"
+            );
+        }
+    }
+
+    /// `models/sub/` holds one model whose output repeats `id`. Its sidecar
+    /// pins the target, so `sub/_defaults.toml` (when written) supplies only
+    /// the strategy, and removing the file still leaves a loadable project.
+    fn write_repeated_output_project(models_dir: &std::path::Path, strategy: Option<&str>) {
+        write_flat_models(models_dir, 12);
+        let sub = models_dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub dir");
+        std::fs::write(sub.join("dup.sql"), "SELECT 1 AS id, 2 AS id, 3 AS ts\n")
+            .expect("write dup");
+        std::fs::write(
+            sub.join("dup.toml"),
+            "name = \"dup\"\n[target]\ncatalog = \"analytics\"\nschema = \"sub\"\n",
+        )
+        .expect("write dup sidecar");
+        if let Some(strategy) = strategy {
+            std::fs::write(sub.join("_defaults.toml"), strategy).expect("write sub defaults");
+        }
+    }
+
+    const FULL_REFRESH: &str = "[strategy]\ntype = \"full_refresh\"\n";
+    const INCREMENTAL: &str = "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n";
+
+    /// The case that motivated the fix: the directory default moves from
+    /// `full_refresh` (W002 for the repeated name) to `incremental` (E061).
+    /// Before it, the LSP kept the cached W002 until another edit.
+    #[test]
+    fn a_defaults_strategy_edit_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_repeated_output_project(&models_dir, Some(FULL_REFRESH));
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert_eq!(first.type_check.typed_models.len(), 13);
+        assert!(codes_for(&first, "dup").contains(&"W002".to_string()));
+        assert!(!codes_for(&first, "dup").contains(&"E061".to_string()));
+
+        let defaults = models_dir.join("sub/_defaults.toml");
+        std::fs::write(&defaults, INCREMENTAL).expect("edit sub defaults");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&defaults), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(
+            codes_for(&scratch, "dup").contains(&"E061".to_string()),
+            "the edit must change the from-scratch result, or this test proves nothing: {:?}",
+            codes_for(&scratch, "dup")
+        );
+        assert!(!codes_for(&scratch, "dup").contains(&"W002".to_string()));
+        assert_matches_from_scratch(&incremental, &scratch);
+    }
+
+    /// Removing `_defaults.toml` drops the inherited strategy, so E061 must
+    /// give way to W002 again. The governing path is built from the model,
+    /// not read from disk, so a file that is gone still matches.
+    #[test]
+    fn removing_a_defaults_file_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_repeated_output_project(&models_dir, Some(INCREMENTAL));
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert!(codes_for(&first, "dup").contains(&"E061".to_string()));
+
+        let defaults = models_dir.join("sub/_defaults.toml");
+        std::fs::remove_file(&defaults).expect("remove sub defaults");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&defaults), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(
+            !codes_for(&scratch, "dup").contains(&"E061".to_string()),
+            "the removal must change the from-scratch result: {:?}",
+            codes_for(&scratch, "dup")
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+    }
+
+    /// Adding a `_defaults.toml` where there was none is the third shape of
+    /// the same edit.
+    #[test]
+    fn adding_a_defaults_file_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_repeated_output_project(&models_dir, None);
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert!(!codes_for(&first, "dup").contains(&"E061".to_string()));
+
+        let defaults = models_dir.join("sub/_defaults.toml");
+        std::fs::write(&defaults, INCREMENTAL).expect("add sub defaults");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&defaults), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(codes_for(&scratch, "dup").contains(&"E061".to_string()));
+        assert_matches_from_scratch(&incremental, &scratch);
+    }
+
+    /// A `[target]` default moves where a model writes, and a reader that
+    /// names that table by `catalog.schema.table` binds to the model only
+    /// while the two agree. Here `sub/_defaults.toml` moves `a` from
+    /// `warehouse.marts` to `warehouse.other`, so `r`'s qualified read stops
+    /// binding to `a`.
+    #[test]
+    fn a_defaults_target_edit_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_flat_models(&models_dir, 12);
+        let sub = models_dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub dir");
+        let defaults = sub.join("_defaults.toml");
+        std::fs::write(
+            &defaults,
+            "[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\n",
+        )
+        .expect("write sub defaults");
+        std::fs::write(sub.join("a.sql"), "SELECT amount FROM staging.orders\n").expect("write a");
+        std::fs::write(sub.join("a.toml"), "name = \"a\"\n").expect("write a sidecar");
+        std::fs::write(
+            models_dir.join("r.sql"),
+            "SELECT amount, missing FROM warehouse.marts.a\n",
+        )
+        .expect("write r");
+        std::fs::write(
+            models_dir.join("r.toml"),
+            "name = \"r\"\ndepends_on = [\"a\"]\n",
+        )
+        .expect("write r sidecar");
+        // A typed source, so `a.amount` has a known type that `r` inherits
+        // only while its qualified read binds to `a`.
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            source_schemas: HashMap::from([(
+                "staging.orders".to_string(),
+                vec![rocky_ir::types::TypedColumn {
+                    name: "amount".to_string(),
+                    data_type: rocky_ir::types::RockyType::Int64,
+                    nullable: false,
+                }],
+            )]),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        // Fourteen models and the source.
+        assert_eq!(first.type_check.typed_models.len(), 15);
+
+        std::fs::write(
+            &defaults,
+            "[target]\ncatalog = \"warehouse\"\nschema = \"other\"\n",
+        )
+        .expect("edit sub defaults");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&defaults), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert!(
+            diagnostic_set(&first) != diagnostic_set(&scratch)
+                || first.type_check.typed_models["r"] != scratch.type_check.typed_models["r"],
+            "the target edit must change the from-scratch result, or this test proves nothing"
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+    }
+
+    /// Bounds the blast radius from above. An edit of `sub/_defaults.toml`
+    /// must not mark a model in a sibling directory, in a subdirectory of
+    /// `sub/`, or at the root. Each of those models is changed on disk
+    /// WITHOUT being reported, so a model that was wrongly marked would pick
+    /// up its new SQL; one that was correctly left alone keeps its previous
+    /// typed result.
+    #[test]
+    fn a_defaults_edit_marks_only_the_models_in_its_own_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_repeated_output_project(&models_dir, Some(FULL_REFRESH));
+        for (dir, name) in [("other", "sibling"), ("sub/deeper", "nested")] {
+            let dir = models_dir.join(dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(dir.join("_defaults.toml"), FULL_REFRESH).expect("defaults");
+            std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS id\n").expect("model");
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n[target]\ncatalog = \"analytics\"\nschema = \"s\"\n"),
+            )
+            .expect("sidecar");
+        }
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+        let first = compile(&config).expect("first compile");
+        assert_eq!(first.type_check.typed_models.len(), 15);
+
+        // Unreported edits: each adds a column.
+        for path in ["other/sibling.sql", "sub/deeper/nested.sql", "m05.sql"] {
+            std::fs::write(models_dir.join(path), "SELECT 1 AS id, 2 AS qty\n")
+                .expect("silent edit");
+        }
+        let defaults = models_dir.join("sub/_defaults.toml");
+        std::fs::write(&defaults, INCREMENTAL).expect("edit sub defaults");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&defaults), &first)
+            .expect("incremental");
+
+        assert!(
+            codes_for(&incremental, "dup").contains(&"E061".to_string()),
+            "the governed model is recomputed"
+        );
+        for name in ["sibling", "nested", "m05"] {
+            assert_eq!(
+                incremental.type_check.typed_models[name], first.type_check.typed_models[name],
+                "{name} is not governed by sub/_defaults.toml and must not be recomputed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_is_governed_by_the_defaults_file_in_its_own_directory_only() {
+        let model = Path::new("models/sub/a.sql");
+        assert_eq!(
+            governing_dir_defaults(model),
+            Some(PathBuf::from("models/sub/_defaults.toml"))
+        );
+        for other in [
+            "models/_defaults.toml",
+            "models/other/_defaults.toml",
+            "models/sub/deeper/_defaults.toml",
+        ] {
+            assert_ne!(governing_dir_defaults(model), Some(PathBuf::from(other)));
+        }
     }
 }
