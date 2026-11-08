@@ -78,7 +78,7 @@ chrono-tz = "0.10"
 # Cron occurrence math for the schedule reconciler. croner declares no MSRV,
 # so the version is pinned exactly — a patch bump could raise the required
 # toolchain past the workspace's 1.88 floor without warning.
-croner = "=4.0.1"
+croner = "=4.0.3"
 
 # JSON Schema generation (Phase 2 — codegen source of truth for dagster + vscode types)
 schemars = { version = "1.2", features = ["chrono04", "indexmap2"] }
@@ -119,7 +119,7 @@ tokio = { version = "1", features = ["full"] }
 # and `result_type_reaches_a_2026_07_28_client_and_no_other` green — NOT by
 # narrowing `supported_protocol_versions`, which is the extreme that test was
 # written to distinguish from a real fix.
-rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.9.0", features = ["server", "macros", "transport-io"] }
 
 # HTTP
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query", "form", "gzip", "http2"] }
@@ -163,7 +163,7 @@ tiberius = { version = "0.13", default-features = false, features = ["tds80", "r
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Redis/Valkey
-redis = "1.7"
+redis = "1.8"
 
 # Cloud object store (unified S3/GCS/Azure backend for state sync + loaders)
 object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
@@ -176,12 +176,12 @@ url = "2"
 percent-encoding = "2"
 
 # DuckDB
-# Bounded to the 1.x line (year/upstream-version-coded scheme, 1.10506 and
-# up) so it ships against workspace `arrow 58` directly — earlier 1.4.x
-# releases tracked `arrow 56` and required an IPC-stream bridge inside the
-# rocky-duckdb adapter. The upper bound keeps DuckDB 2.0 out until #2491
-# moves arrow, parquet and duckdb together.
-duckdb = { version = ">=1.10506, <1.20000", features = ["bundled"] }
+# Bounded to the DuckDB 2.x line (year/upstream-version-coded scheme:
+# 1.20000 = DuckDB 2.0). duckdb 1.20000 ships against workspace `arrow 60`;
+# duckdb's RecordBatch is that arrow's type, so arrow, parquet and duckdb move
+# together. The upper bound keeps the next DuckDB major out until it is
+# evaluated the same way (#2491 did 2.0).
+duckdb = { version = ">=1.20000.1, <1.30000", features = ["bundled"] }
 
 # CSV parsing
 csv = "1"
@@ -221,7 +221,7 @@ base64 = "0.23"
 # always zlib-compresses before base64 — see `rocky-cli/src/pipes.rs::detect`). Version pinned
 # to what was already resolved transitively in Cargo.lock, so adding it as a direct dependency
 # causes no lockfile churn.
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 
 # String similarity
 strsim = "0.11"
@@ -253,8 +253,8 @@ tower-lsp = "0.20"
 notify = "8"
 
 # Arrow and Parquet stay on duckdb's arrow major (see .github/dependabot.yml)
-arrow = "58"
-parquet = "58"
+arrow = "60"
+parquet = "60"
 
 # WASM
 wasm-bindgen = "0.2"

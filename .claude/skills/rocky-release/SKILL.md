@@ -48,7 +48,7 @@ git push origin engine-v0.2.0
 That's it. The tag push triggers `engine-release.yml`, which:
 
 1. `ensure-release` — creates the `engine-v0.2.0` GitHub Release if missing, as a **draft** (`--generate-notes --draft`). An existing draft (the local fallback) is used as it is. An existing published release stops the run.
-2. `build` matrix — runs on macos-14, ubuntu-24.04, and windows-2022 across 5 targets. Each target produces **two** archives, one per binary: `rocky-<target>.tar.gz` and `rocky-lsp-<target>.tar.gz` (`.zip` on Windows). **10 archives in total**, not 5.
+2. `build` matrix — runs on macos-15, ubuntu-24.04, and windows-2022 across 5 targets. Each target produces **two** archives, one per binary: `rocky-<target>.tar.gz` and `rocky-lsp-<target>.tar.gz` (`.zip` on Windows). **10 archives in total**, not 5.
 3. `checksums` — generates **`checksums.txt`** (not `SHA256SUMS`) from every platform archive and uploads it alongside them.
 4. `publish` — flips the release out of draft, once and only once every artifact is attached.
 

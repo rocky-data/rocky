@@ -21,7 +21,7 @@ the target schema is still empty.
 ## Why it's distinctive
 
 - The estimate comes from the **warehouse's own planner**, not a Rocky guess:
-  row counts, the `HASH_JOIN` node, and the `status='completed'` filter pushdown
+  row counts, the `Hash Join` node, and the `status='completed'` filter pushdown
   in the plan are exactly what the engine will execute.
 - It is a true dry-run: no table is created, so you can estimate the cost of a
   change in CI on every PR without touching production compute.
@@ -61,14 +61,15 @@ the target schema is still empty.
     - stg_orders
 
 ==> 3. Estimated rows per scan from the join model's plan (revenue_by_tier):
-~2 rows
+~5 rows
+~5 rows
 ~414 rows
 ~414 rows
-HASH_JOIN
+Hash Join
 ~414 rows
-Table: Table:
-status='completed'
-~500 rows ~200 rows
+Table: poc.raw__sales.orders Table: poc.raw__sales.customers
+Filters: status = 'completed' ~200 rows
+~500 rows
 
 ==> 4. Nothing was materialized — estimate is a dry-run
     tables in target schema 'demo' : 0  (expected 0)

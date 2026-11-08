@@ -1,6 +1,6 @@
 [package]
 name = "rocky-mcp"
-version = "1.89.0"
+version = "1.90.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -39,7 +39,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-# `fetch_arrow_batch` returns a workspace `arrow 58` `RecordBatch`; the
+# `fetch_arrow_batch` returns a workspace `arrow 60` `RecordBatch`; the
 # data-grounding tools convert it to the JSON row shape via `arrow::util::display`.
 arrow = { workspace = true }
 # rmcp's `#[tool]` macro generates code that references `schemars` (1.x) by
@@ -72,4 +72,4 @@ regex = { workspace = true }
 # The scripted round-trip test drives the stdio server in-process with an rmcp
 # client over a duplex pipe, so it needs the client side of rmcp too.
 # Pinned exact to match the workspace pin — see the note in engine/Cargo.toml.
-rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io", "client"] }
+rmcp = { version = "=3.9.0", features = ["server", "macros", "transport-io", "client"] }

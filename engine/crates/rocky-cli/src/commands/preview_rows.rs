@@ -684,17 +684,25 @@ fn looks_like_missing_relation(msg: &str) -> bool {
 
 /// Heuristic: does an adapter error indicate a missing *catalog* (database)?
 ///
-/// DuckDB reports this as a Binder Error — `Catalog "<name>" does not exist!` —
-/// which is distinct from a missing *table*, which DuckDB prefixes with
-/// `Catalog Error: Table with name ...`. Anchoring on the quote right after the
-/// word `catalog` avoids matching that `Catalog Error:` prefix. A missing
+/// DuckDB 2.0 reports a missing catalog on a three-part name as a missing
+/// two-part schema: `Table with name "nosuch.main.t" does not exist because
+/// schema "nosuch.main" does not exist.` Rocky identifiers cannot contain a
+/// `.`, so a dotted schema there names a missing catalog; an undotted one is
+/// a missing schema, which `rocky run` can create. Other engines say
+/// `Catalog "<name>" does not exist`; anchoring on the quote right after the
+/// word `catalog` avoids matching DuckDB's `Catalog Error:` prefix. A missing
 /// catalog is a target-config mismatch, not a not-yet-materialized state: on
 /// DuckDB the catalog is the database file name and can't be created by
 /// `rocky run`, so the `upstream_not_materialized` guidance would be wrong.
 fn looks_like_missing_catalog(msg: &str) -> bool {
     let m = msg.to_lowercase();
-    (m.contains("does not exist") || m.contains("not found"))
-        && (m.contains("catalog \"") || m.contains("catalog '"))
+    let named_catalog = (m.contains("does not exist") || m.contains("not found"))
+        && (m.contains("catalog \"") || m.contains("catalog '"));
+    let dotted_schema = m
+        .split_once(" does not exist because schema \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .is_some_and(|(schema, tail)| schema.contains('.') && tail.starts_with(" does not exist."));
+    named_catalog || dotted_schema
 }
 
 /// Map a failed preview query's error string to a structured `error_kind`.
@@ -973,6 +981,41 @@ mod tests {
             "Catalog Error: Table with name stg_orders does not exist!"
         ));
         assert!(!looks_like_missing_catalog("syntax error near SELECT"));
+        // DuckDB 2.0's wording for a missing catalog on a three-part name.
+        assert!(looks_like_missing_catalog(
+            "DuckDB error: Catalog Error: Table with name \"nosuch.main.t\" does not exist \
+             because schema \"nosuch.main\" does not exist."
+        ));
+        // A missing schema in an attached catalog is not a missing catalog.
+        assert!(!looks_like_missing_catalog(
+            "DuckDB error: Catalog Error: Table with name \"nosch.t\" does not exist \
+             because schema \"nosch\" does not exist."
+        ));
+    }
+
+    /// The classifier reads the text real DuckDB 2.0 produces, not a
+    /// hand-written copy of it.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_live_duckdb_missing_catalog_classifies_as_missing_catalog() {
+        let db = rocky_duckdb::DuckDbConnector::in_memory().unwrap();
+        let catalog = db.execute_sql("SELECT * FROM nosuch.main.t").unwrap_err();
+        assert_eq!(
+            classify_query_error_kind(&catalog.to_string()),
+            "missing_catalog"
+        );
+        let schema = db.execute_sql("SELECT * FROM memory.nosch.t").unwrap_err();
+        assert_eq!(
+            classify_query_error_kind(&schema.to_string()),
+            "upstream_not_materialized"
+        );
+        let table = db
+            .execute_sql("SELECT * FROM memory.main.nope")
+            .unwrap_err();
+        assert_eq!(
+            classify_query_error_kind(&table.to_string()),
+            "upstream_not_materialized"
+        );
     }
 
     #[test]

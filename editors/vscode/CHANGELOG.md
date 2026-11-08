@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.52.0] — 2026-11-07
+
+### Added
+
+- The generated TypeScript types gain the engine's new output fields: `source_volumes` on the run and product-status outputs, `volume` on a product's source spec, and `keep_scratch` on `ConnectorConfig`.
+
+### Changed
+
+- `vscode-languageclient` moves from 10 to 11.
+- Development dependencies are refreshed, including `jsdom` 31. TypeScript stays on 6.0, because `typescript-eslint` does not support 7 yet. `@types/vscode` stays at 1.120.0, matching `engines.vscode`.
+
 ## [1.51.0] — 2026-10-23
 
 ### Changed

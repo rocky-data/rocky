@@ -1,6 +1,6 @@
 [package]
 name = "rocky-bigquery"
-version = "1.89.0"
+version = "1.90.1"
 description = "BigQuery warehouse adapter for Rocky"
 edition.workspace = true
 license.workspace = true
@@ -24,7 +24,7 @@ jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 
 # Arrow path — `WarehouseAdapter::fetch_arrow_batch` returns workspace
-# `arrow 58` `RecordBatch`. The BigQuery Storage Read API hands back
+# `arrow 60` `RecordBatch`. The BigQuery Storage Read API hands back
 # Arrow IPC schema + record-batch messages over gRPC; we splice the
 # schema bytes onto each batch and feed them through
 # `arrow::ipc::reader::StreamReader` to land back on workspace types.

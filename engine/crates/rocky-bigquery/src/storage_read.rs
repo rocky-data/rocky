@@ -11,7 +11,7 @@
 //! For the trait's single-`RecordBatch` PoC contract, this module
 //! requests `max_stream_count = 1` so the entire result lands on one
 //! stream, decodes every `ArrowRecordBatch` into the workspace
-//! `arrow 58` types, and concatenates into one batch via
+//! `arrow 60` types, and concatenates into one batch via
 //! `arrow::compute::concat_batches`.
 
 use std::io::Cursor;
@@ -73,7 +73,7 @@ impl std::fmt::Debug for StorageReadError {
 /// the region on the server side).
 const STORAGE_READ_ENDPOINT: &str = "https://bigquerystorage.googleapis.com";
 
-/// Fetch a single workspace `arrow 58` `RecordBatch` from `table_ref`
+/// Fetch a single workspace `arrow 60` `RecordBatch` from `table_ref`
 /// (project/dataset/table) by opening a one-stream Arrow Storage Read
 /// session and concatenating all `ReadRowsResponse` chunks.
 ///

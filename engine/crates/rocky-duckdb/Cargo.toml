@@ -1,6 +1,6 @@
 [package]
 name = "rocky-duckdb"
-version = "1.89.0"
+version = "1.90.1"
 description = "DuckDB local execution adapter for Rocky"
 edition.workspace = true
 license.workspace = true
@@ -12,8 +12,8 @@ rocky-ir = { path = "../rocky-ir" }
 rocky-sql = { path = "../rocky-sql" }
 rocky-adapter-sdk = { path = "../rocky-adapter-sdk" }
 duckdb = { workspace = true }
-# Workspace arrow (58) is the type returned by `WarehouseAdapter::fetch_arrow_batch`.
-# `duckdb 1.10503` pins arrow 58 internally, so `query_arrow` returns workspace-
+# Workspace arrow (60) is the type returned by `WarehouseAdapter::fetch_arrow_batch`.
+# `duckdb 1.20000` pins arrow 60 internally, so `query_arrow` returns workspace-
 # compatible `RecordBatch` directly — no IPC bridge needed.
 arrow = { workspace = true }
 chrono = { workspace = true }

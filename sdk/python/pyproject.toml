@@ -1,6 +1,6 @@
 [project]
 name = "rocky-sdk"
-version = "0.29.0"
+version = "0.30.0"
 description = "Typed Python client for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -40,7 +40,10 @@ Documentation = "https://rocky-data.dev/"
 
 [dependency-groups]
 dev = [
-    "datamodel-code-generator>=0.56.0",
+    # Capped: 0.90.0 changes the generated types (HealthCheck.details becomes a
+    # length-2 constrained alias). The committed bindings and codegen-drift must
+    # agree on the generator, so hold here until that change is adopted on purpose.
+    "datamodel-code-generator>=0.56.0,<0.84",
     "pytest>=8.0",
     "ruff>=0.4",
 ]
