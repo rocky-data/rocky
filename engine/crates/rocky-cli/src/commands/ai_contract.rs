@@ -581,6 +581,7 @@ pub async fn run_ai_contract(
             profile: profile_out,
             unverified_types: drafted.unverified_types.clone(),
             unmatched_columns: drafted.unmatched_columns.clone(),
+            unproven_non_null: drafted.unproven_non_null.clone(),
         };
         print_json(&output)?;
     } else {
@@ -608,6 +609,17 @@ pub async fn run_ai_contract(
                 drafted.unverified_types.len()
             );
             for message in &drafted.unverified_types {
+                println!("  - {message}");
+            }
+        }
+        if !drafted.unproven_non_null.is_empty() {
+            println!();
+            println!(
+                "{} column(s) had no NULLs, but Rocky cannot prove them non-null, so \
+                 the draft leaves `nullable` unset:",
+                drafted.unproven_non_null.len()
+            );
+            for message in &drafted.unproven_non_null {
                 println!("  - {message}");
             }
         }

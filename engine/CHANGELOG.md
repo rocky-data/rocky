@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `[cost] storage_cost_per_gb_month` and `compute_cost_per_dbu` are now unset by default, so a price you set to `0.023` or `0.40` is no longer mistaken for the default. Estimates that used the defaults keep them: `rocky optimize`, run cost summaries, `rocky cost <run>`, `rocky brief`, `rocky gc`, `rocky preview` and `rocky backfill` still fall back to $0.023 per GB-month and $0.40 per DBU-hour. An unset price is left out of serialized config, and the generated project schema no longer gives these keys a default.
 
+### Fixed
+
+- `rocky ai-contract` (and the MCP `ai_contract` tool) no longer rewrites a column to `nullable = true` when the profile shows it holds no NULL. A drafted `nullable = false` that Rocky cannot prove (a source column with no `NOT NULL`, or a source schema Rocky does not have) failed with `E012`, and the retry only had one way out: `nullable = true`. Now the drafter leaves `nullable` unset for such a column, which promises nothing, and accepts the draft without a retry. Each withheld column is listed in the new `unproven_non_null` field (JSON) or under its own heading (table output), with how to make the claim checkable. `E012` itself is unchanged: it still refuses every `nullable = false` Rocky cannot prove. A `nullable = false` on a column whose profile counted NULLs still goes back to the LLM as before.
+
 ## [1.91.0] — 2026-11-08
 
 ### Upgrade notes

@@ -62,6 +62,12 @@ class AiContractOutput(BaseModel):
 
     `W010`, dropped by the same error-only filter as `unverified_types`. A required column that is missing fails the draft outright (`E010`); an optional one only warns, so a drafted column name the model never emits went unreported. Empty when every declared column exists.
     """
+    unproven_non_null: list[str] | None = None
+    """
+    `nullable = false` claims the draft withheld, one message per column.
+
+    The column had no NULLs in the profiled table, but Rocky cannot prove it non-null from the model SQL and the source schemas it has, so `E012` would refuse the claim. The draft leaves `nullable` unset for it, which promises nothing, instead of writing `nullable = true`. Empty when every `nullable = false` in the draft was proven.
+    """
     unverified_types: list[str] | None = None
     """
     Declared column types the compiler could NOT check, one message each.
