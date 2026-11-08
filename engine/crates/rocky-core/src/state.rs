@@ -1207,6 +1207,17 @@ pub enum StateError {
         source: std::io::Error,
     },
 
+    /// A writer open could not create the missing parent directory of the
+    /// state file. `dir` is the directory that was asked for; the OS error
+    /// names the reason (a file in the way, no permission, a read-only disk).
+    #[error("could not create the state directory {dir} for the state file {path}: {source}")]
+    StateDirCreate {
+        dir: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error(
         "state snapshot: table {0:?} exists on disk but is not registered in \
          SNAPSHOT_TABLE_REGISTRY — refusing to produce a snapshot that would silently \
@@ -1310,9 +1321,12 @@ fn open_lock_file(path: &Path) -> Result<(std::fs::File, std::path::PathBuf), St
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        crate::private_fs::create_private_dir_all(parent).map_err(|e| StateError::LockIo {
-            path: lock_path.display().to_string(),
-            source: e,
+        crate::private_fs::create_private_dir_all(parent).map_err(|e| {
+            StateError::StateDirCreate {
+                dir: parent.display().to_string(),
+                path: path.display().to_string(),
+                source: e,
+            }
         })?;
     }
     // Owner-only when this open creates the sidecar; an existing one keeps its
@@ -10912,6 +10926,41 @@ mod environment_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A state directory that cannot be created is its own error: it names
+    /// the directory and the OS error, not the lock file. A regular file
+    /// stands where a parent directory of the state path should be.
+    ///
+    /// Mutation: map the `create_private_dir_all` failure in `open_lock_file`
+    /// back to `LockIo` and this test fails.
+    #[test]
+    fn a_state_directory_that_cannot_be_created_names_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let state_dir = blocker.join("nested");
+        let path = state_dir.join("state.redb");
+
+        let err = match StateStore::open(&path) {
+            Ok(_) => panic!("a file in the way of the state directory must fail the open"),
+            Err(err) => err,
+        };
+        let StateError::StateDirCreate { dir: named, .. } = &err else {
+            panic!("expected StateError::StateDirCreate, got: {err}");
+        };
+        assert_eq!(named, &state_dir.display().to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not create the state directory"),
+            "{msg}"
+        );
+        assert!(msg.contains(&*state_dir.display().to_string()), "{msg}");
+        assert!(!msg.contains("lock file"), "{msg}");
+        // The OS reason is carried, not swallowed.
+        let os = std::error::Error::source(&err).expect("the io error is the source");
+        assert!(msg.contains(&os.to_string()), "{msg}");
+        assert!(!blocker.join("nested").exists());
+    }
 
     // ---- a read-only open takes no write transaction (#1545) ----
 
