@@ -81,7 +81,7 @@ Rocky runs once when it starts. Then it runs again about 200 ms after each save.
 
 Two limits apply:
 
-- Pass `--models models` (the models directory). Without it, `--watch` watches `rocky.toml` only, and a model edit does not start a run. Checked with Rocky 1.86.0.
+- `--watch` always watches `rocky.toml`. With `--models`, it also watches that directory. Without `--models`, it watches the models directory of each transformation pipeline, or only of the pipeline named by `--pipeline`. That directory is the part of the pipeline's `models` glob before the first wildcard. A directory that does not exist when `--watch` starts is watched only after a restart.
 - `--watch` cannot be combined with `--model`, `--select`, `--exclude`, `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, `--contracts`, `--keep-shadow`, `--refuse-hooks` or `--assume-fresh-state`. The skip gate does the narrowing instead.
 
 With `-o json`, each run prints one JSON object to stdout. Banner lines go to stderr.

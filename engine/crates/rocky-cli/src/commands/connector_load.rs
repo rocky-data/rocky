@@ -563,6 +563,7 @@ async fn drive(
         "running the child connector (egress hosts are declared, not enforced)"
     );
     let state = saved.as_ref().map(|s| &s.envelope);
+    let options_json = prepared.config.options.to_json_bytes();
     let spec = ChildSpec {
         name,
         argv: &prepared.argv,
@@ -574,6 +575,7 @@ async fn drive(
         landing_dir: &prepared.landing_dir,
         retries: prepared.config.retries,
         output_poll: params.output_poll,
+        options_json: &options_json,
     };
     let ran = match run_with_retries(&spec).await {
         Ok(ran) => ran,

@@ -1111,3 +1111,71 @@ async fn a_signal_before_the_promote_frees_the_claim_and_leaves_the_target_alone
     assert_eq!(info(&again).status, ConnectorLoadStatus::Loaded);
     assert_eq!(project.row_count(), Some(4));
 }
+
+/// `[connector.demo.options]` reaches the program as `options.json` in its
+/// scratch directory, equal to the TOML table as JSON, and the request names
+/// the file in `options_path`.
+#[tokio::test]
+async fn the_options_table_reaches_the_program_as_options_json() {
+    let project = Project::new(
+        r#"keep_scratch = true
+
+[connector.demo.options]
+schema = "public"
+batch = 500
+ratio = 0.5
+enabled = false
+tables = ["a", "b"]
+since = 2026-10-01T00:00:00Z
+
+[connector.demo.options.nested]
+inner = { depth = 2 }
+"#,
+    );
+    standard_batches(&project);
+    let outcome = project.run().await;
+    outcome.result.as_ref().unwrap();
+    let scratch = scratch_dir(&outcome);
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(scratch.join("options.json")).unwrap()).unwrap();
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "schema": "public",
+            "batch": 500,
+            "ratio": 0.5,
+            "enabled": false,
+            "tables": ["a", "b"],
+            "since": "2026-10-01T00:00:00Z",
+            "nested": { "inner": { "depth": 2 } },
+        })
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(scratch.join("request.json")).unwrap()).unwrap();
+    assert_eq!(
+        request["options_path"],
+        scratch.join("options.json").to_str().unwrap()
+    );
+    let mode = std::fs::metadata(scratch.join("options.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "options.json is owner-only");
+}
+
+/// With no options table the program still gets `options.json`, holding `{}`.
+#[tokio::test]
+async fn no_options_table_writes_an_empty_options_json() {
+    let project = Project::new("keep_scratch = true");
+    standard_batches(&project);
+    let outcome = project.run().await;
+    outcome.result.as_ref().unwrap();
+    let scratch = scratch_dir(&outcome);
+    assert_eq!(std::fs::read(scratch.join("options.json")).unwrap(), b"{}");
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(scratch.join("request.json")).unwrap()).unwrap();
+    assert_eq!(
+        request["options_path"],
+        scratch.join("options.json").to_str().unwrap()
+    );
+}
