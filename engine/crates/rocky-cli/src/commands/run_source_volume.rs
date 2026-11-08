@@ -22,7 +22,6 @@
 //! still build: the check protects the delivered output, not the chain.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Instant;
 
 use rocky_core::product::spec::{VolumeSeverity, VolumeVerdict};
@@ -39,20 +38,6 @@ pub(crate) struct SourceVolumes {
 }
 
 impl SourceVolumes {
-    /// The ranges the products under `root` declare, or none.
-    ///
-    /// The same gate as [`super::run_volume::ProductVolumes::load`]: empty
-    /// when `production` is false (a shadow or branch run) or when the run
-    /// has no project root to read `products/` from (a backfill).
-    pub(crate) fn load(root: Option<&Path>, production: bool) -> Self {
-        let ranges = match root {
-            Some(root) if production => super::product::product_source_volumes_in(root),
-            Some(_) | None => Vec::new(),
-        };
-        Self { ranges }
-    }
-
-    #[cfg(test)]
     pub(crate) fn from_ranges(ranges: Vec<ProductSourceVolume>) -> Self {
         Self { ranges }
     }
@@ -459,13 +444,10 @@ mod tests {
              [product.trust]\nagent = \"propose_only\"\n",
         )
         .unwrap();
-        assert!(
-            SourceVolumes::load(Some(dir.path()), false)
-                .ranges
-                .is_empty()
-        );
-        assert!(SourceVolumes::load(None, true).ranges.is_empty());
-        let loaded = SourceVolumes::load(Some(dir.path()), true);
+        let load = super::super::run_volume::load_ranges;
+        assert!(load(Some(dir.path()), false).unwrap().1.ranges.is_empty());
+        assert!(load(None, true).unwrap().1.ranges.is_empty());
+        let loaded = load(Some(dir.path()), true).unwrap().1;
         assert_eq!(loaded.ranges.len(), 1);
         assert_eq!(loaded.ranges[0].output_model, "p");
     }
@@ -665,6 +647,35 @@ mod tests {
             }
         }
 
+        /// N26: a production run whose `products/` holds a spec that does
+        /// not parse builds no model. The spec could declare an `error`
+        /// range, so the run stops before any write and records why.
+        #[tokio::test]
+        async fn a_spec_that_does_not_load_refuses_the_model_phase() {
+            let ran = run_with(
+                "[product\nname = \"vol_product\"\n",
+                &[("vol", VOL_SQL, FULL_REFRESH)],
+                &[SEED_SRC],
+                None,
+            )
+            .await;
+            assert!(!ran.built("vol"), "no model may build: {}", ran.output);
+            assert_ne!(ran.record.status, RunStatus::Success);
+            let text = format!("{:?} {}", ran.result, ran.output);
+            assert!(text.contains("[product-spec-unloadable]"), "{text}");
+            assert!(text.contains("products/vol_product.toml"), "{text}");
+            assert!(text.contains("rocky product verify vol_product"), "{text}");
+            assert!(ran.executions("vol").is_empty(), "nothing executed");
+            assert_eq!(
+                ran.query_i64(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_name = 'vol'"
+                )
+                .await,
+                [0],
+                "the output table was never written"
+            );
+        }
+
         #[tokio::test]
         async fn an_in_range_source_is_recorded_and_the_output_delivers() {
             let ran = run_with(
@@ -835,6 +846,31 @@ mod tests {
                     .as_str()
                     .is_some_and(|w| w.contains("could not be counted")),
                 "{warnings:?}"
+            );
+        }
+
+        /// A shadow run with the same broken spec checks no range, so it
+        /// has nothing to refuse: it builds.
+        #[tokio::test]
+        async fn a_shadow_run_builds_past_a_spec_that_does_not_load() {
+            let shadow = rocky_core::shadow::ShadowConfig::default();
+            let ran = run_with(
+                "[product\nname = \"vol_product\"\n",
+                &[("vol", VOL_SQL, FULL_REFRESH)],
+                &[SEED_SRC],
+                Some(&shadow),
+            )
+            .await;
+            ran.result.as_ref().expect("a shadow run checks no range");
+            assert!(
+                ran.built("vol_rocky_shadow"),
+                "the shadow run builds: {}",
+                ran.output
+            );
+            assert!(
+                !format!("{}", ran.output).contains("product-spec-unloadable"),
+                "{}",
+                ran.output
             );
         }
 
