@@ -897,7 +897,8 @@ fn product_out(
 /// The typed payload behind `rocky cost --month YYYY-MM --by product`.
 ///
 /// Splits one month of production cost across the products in `products/`,
-/// in physical units (see [`rocky_core::cost_split`]). It reads run history
+/// in physical units (see [`rocky_core::cost_split`]), priced in USD from the
+/// prices set in `[cost]` (see `MonthPricing`). It reads run history
 /// only; the month is cut in the project's `[schedule].timezone`, and each
 /// execution belongs to the month of its own start. `now` is passed in so a
 /// caller can pin it: storage accrues to the earlier of `now` and the end of
@@ -1052,7 +1053,7 @@ fn amount_cell(amounts: &[CostAmount], unit: CostUnit) -> String {
 }
 
 fn money_cell(usd: Option<f64>) -> String {
-    usd.map_or_else(|| "-".to_string(), |usd| format!("{usd:.2}"))
+    usd.map_or_else(|| "-".to_string(), |usd| format!("{usd:.6}"))
 }
 
 fn money_status_label(status: MoneyStatus) -> &'static str {
@@ -2241,6 +2242,72 @@ mod tests {
         }
         assert_eq!(out.measured_total_money_status, MoneyStatus::NoPrice);
         assert_eq!(out.measured_total_money, None);
+    }
+
+    /// `MonthPricing` on its own: both storage bases are priced and added,
+    /// the GB-month spreads over the hours of the month being reported
+    /// (November has 720), a zero amount is $0 without a price, and a
+    /// missing compute price holds back the total even when storage is
+    /// priced.
+    #[test]
+    fn month_pricing_prices_each_basis_over_the_hours_of_the_month() {
+        let window = cost_split::month_bounds_in_zone(2026, 11, "UTC").unwrap();
+        let gib_month = 1_073_741_824_u64 * 720;
+        let measured = [
+            CostAmount {
+                unit: CostUnit::ComputeMs,
+                amount: 3_600_000,
+            },
+            CostAmount {
+                unit: CostUnit::StorageByteHoursDataFiles,
+                amount: gib_month,
+            },
+            CostAmount {
+                unit: CostUnit::StorageByteHoursAllocatedBlocks,
+                amount: 2 * gib_month,
+            },
+        ];
+        let cost = |toml_text: &str| -> rocky_core::config::CostSection {
+            toml::from_str(toml_text).unwrap()
+        };
+
+        let both = cost("compute_cost_per_machine_hour = 2.0\nstorage_cost_per_gb_month = 0.5\n");
+        let pricing = MonthPricing::new(Some(&both), &window, true, &measured);
+        let (usd, status, parts) = pricing.price(&measured);
+        assert_eq!(status, MoneyStatus::Priced);
+        let usd_of = |figure| part(&parts, figure).usd.unwrap();
+        assert!((usd_of(MoneyFigure::Compute) - 2.0).abs() < 1e-12);
+        assert!((usd_of(MoneyFigure::StorageDataFiles) - 0.5).abs() < 1e-12);
+        assert!((usd_of(MoneyFigure::StorageAllocatedBlocks) - 1.0).abs() < 1e-12);
+        assert!((usd.unwrap() - 3.5).abs() < 1e-12, "{usd:?}");
+
+        // Storage priced, compute not: no total.
+        let storage_only = cost("storage_cost_per_gb_month = 0.5\n");
+        let pricing = MonthPricing::new(Some(&storage_only), &window, true, &measured);
+        let (usd, status, parts) = pricing.price(&measured);
+        assert_eq!(status, MoneyStatus::NoPrice);
+        assert_eq!(usd, None);
+        assert_eq!(
+            part(&parts, MoneyFigure::Compute).status,
+            MoneyStatus::NoPrice
+        );
+        assert_eq!(
+            part(&parts, MoneyFigure::StorageDataFiles).status,
+            MoneyStatus::Priced
+        );
+
+        // No prices at all, and nothing charged: $0, priced. With no config
+        // the same holds.
+        for section in [Some(cost("")), None] {
+            let pricing = MonthPricing::new(section.as_ref(), &window, true, &measured);
+            let (usd, status, parts) = pricing.price(&[]);
+            assert_eq!(status, MoneyStatus::Priced);
+            assert_eq!(usd, Some(0.0));
+            assert_eq!(parts.len(), 5, "{parts:?}");
+            // The same config with a non-zero amount is no_price.
+            let (usd, status, _) = pricing.price(&measured);
+            assert_eq!((usd, status), (None, MoneyStatus::NoPrice));
+        }
     }
 
     #[test]

@@ -2424,7 +2424,8 @@ enum Command {
         /// Report one calendar month (`YYYY-MM`, cut in the project's
         /// `[schedule].timezone`) instead of one run, split across data
         /// products in physical units: model time in milliseconds and
-        /// stored byte-hours. Needs `--by product`. No money.
+        /// stored byte-hours, plus money in USD where `[cost]` sets a price.
+        /// Needs `--by product`.
         #[arg(long, value_name = "YYYY-MM", requires = "by")]
         month: Option<String>,
     },

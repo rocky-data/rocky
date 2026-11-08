@@ -170,4 +170,7 @@ fn month_cost_json_without_prices_is_no_price() {
     assert!(product["money"].is_null());
     assert_eq!(json["measured_total_money_status"], "no_price");
     assert!(json["measured_total_money"].is_null());
+    // Nothing is unallocated: a zero amount is $0 with or without a price.
+    assert_eq!(json["unallocated_money_status"], "priced");
+    assert_eq!(json["unallocated_money"], 0.0);
 }

@@ -1083,6 +1083,8 @@ Each product, `measured_total` and `unallocated` get money fields: `money` (USD,
 - `not_measured`: used only on the `egress` and `ai_tokens` parts. Rocky does not measure them, so their `usd` is `null`, never `0`. They are not in `money`.
 - `partial`: `history_complete` is `false`. The amounts are partial, so no money total is shown, and no part that has a price shows money.
 
+For the current month, money is month-to-date: storage counts up to now, at the price of a whole GB-month spread over every hour of the month. The table view prints USD to six decimal places; the JSON carries the full value.
+
 Rocky prices each figure on its own, in floating point. The money of the products plus `unallocated` is close to `measured_total_money`, but the command does not claim it is exact to the cent.
 
 **Limits.**
