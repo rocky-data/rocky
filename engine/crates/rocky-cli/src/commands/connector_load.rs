@@ -458,7 +458,7 @@ async fn drive(
                 mirror_to_redb: true,
                 ..
             } => Some(
-                StateStore::open_with_policy(params.state_path, state_cfg.on_schema_mismatch)
+                StateStore::open_with_policy(params.state_path, state_cfg.schema_mismatch_policy())
                     .with_context(|| {
                         format!(
                             "failed to open the state store at {} for the idempotency claim",
@@ -795,7 +795,10 @@ async fn finalize_claim(
         | IdempotencyBackend::Valkey {
             mirror_to_redb: true,
             ..
-        } => match StateStore::open_with_policy(params.state_path, state_cfg.on_schema_mismatch) {
+        } => match StateStore::open_with_policy(
+            params.state_path,
+            state_cfg.schema_mismatch_policy(),
+        ) {
             Ok(store) => Some(store),
             Err(e) => {
                 warn!(error = %e, key = %claim.key, "could not open the state store to finalize the claim; it expires on its own");

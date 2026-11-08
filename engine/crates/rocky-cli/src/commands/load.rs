@@ -219,7 +219,7 @@ pub async fn run_load(
     // path + `on_schema_mismatch` policy as `rocky run` (load previously
     // hard-`open`ed a legacy `<config_dir>/.rocky_state`).
     let state_store =
-        match StateStore::open_with_policy(state_path, rocky_cfg.state.on_schema_mismatch) {
+        match StateStore::open_with_policy(state_path, rocky_cfg.state.schema_mismatch_policy()) {
             Ok(store) => store,
             Err(e) => {
                 session.abandon("load state store open failed").await;
