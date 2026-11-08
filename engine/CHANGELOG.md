@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky load --connector` now drops the staging table a crashed run left behind. When a run takes over an expired claim from a prior run, it drops `<table>__rocky_stg_<prior run id>` in the target schema with `DROP TABLE IF EXISTS`, before the program starts. It drops only that exact name, never a pattern, because two connectors can write one target. A claim that cannot be read names no run, so nothing is dropped. A failed drop does not fail the run: Rocky logs a warning, leaves the table, and loads the batch. The claim and the state are not changed.
+
 ### Changed
 
 - A production `rocky run` now refuses its model phase when a `products/*.toml` does not load. This covers a spec that cannot be read, does not parse or fails validation, and a `products/` directory that cannot be listed. Before, the run skipped such a spec with a warning, so an `error` volume range it declared was never checked and the output was delivered unchecked. The refusal comes before any model write, and it covers both `[product.output.volume]` and `[[product.source.volume]]` ranges, read in one scan. A spec that does not load names no output model, so the whole model phase is refused, even for a `--model` selection that does not include that product. Replication copies made earlier in the same run stand, so a replication run exits as partial; a model-only run fails. The error is `[product-spec-unloadable]`. It names the file and the fix: `rocky product verify <name>` for a spec. A dangling `products` symlink is refused too, not read as "no products". A shadow or branch run checks no range, so it warns and builds. A missing `products/` directory is not refused. A directory entry that cannot be read, or a `.toml` name that is not UTF-8, is now reported instead of silently skipped, and that applies to the delivery-deadline warnings too. Delivery deadlines stay best effort. Upgrade note: a half-written spec in `products/` now fails a scheduled production run. Write specs into place atomically, or keep drafts outside `products/`.

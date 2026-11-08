@@ -195,7 +195,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 
 - Secret values shorter than 8 bytes are not replaced by `${NAME}` in the log. Use long secrets.
 - A run that fails after the child succeeded keeps its scratch directory. Rocky never removes those. Remove them from `output_uri` by hand.
-- Staging tables from a crashed run stay in the warehouse. The name is `<table>__rocky_stg_<run id>`. Rocky does not clean up old staging tables yet. Drop them by hand.
+- A run that crashes leaves its staging table, `<table>__rocky_stg_<run id>`, in the warehouse. The next run of that connector takes over the crashed run's claim once it expires. That run drops the one staging table whose name the claim gives. It drops no other table, because another connector can write the same target. If the claim cannot be read, or the drop fails, the table stays and the run goes on with a warning. A staging table whose drop failed at the end of a run also stays. Drop those by hand.
 - Only `file://` output is supported.
 - A Ctrl-C or `SIGTERM` while the program runs stops the program group and fails the run. Rocky frees the claim. A signal that arrives while Rocky stages the batch makes Rocky stop before the promote. Rocky drops the staging table and frees the claim. Only a signal that arrives after Rocky sent the promote lets the state commit finish.
 

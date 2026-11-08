@@ -149,6 +149,10 @@ pub enum FinalOutcome {
     Failed,
 }
 
+/// The `prior_run_id` of an [`IdempotencyCheck::AdoptStale`] whose prior
+/// entry could not be read. It names no run.
+pub const CORRUPT_PRIOR_RUN_ID: &str = "<corrupt>";
+
 /// Result of [`IdempotencyBackend::check_and_claim`].
 #[derive(Debug, Clone)]
 pub enum IdempotencyCheck {
@@ -721,7 +725,7 @@ fn classify_valkey_raw(raw: &[u8], key: &str, new_entry: &IdempotencyEntry) -> I
                 "idempotency entry is not deserializable; treating it as stale"
             );
             IdempotencyCheck::AdoptStale {
-                prior_run_id: "<corrupt>".to_string(),
+                prior_run_id: CORRUPT_PRIOR_RUN_ID.to_string(),
                 prior_state: IdempotencyState::InFlight,
             }
         }
@@ -1063,7 +1067,7 @@ async fn object_store_check_and_claim(
                     "idempotency entry is not deserializable; treating it as stale"
                 );
                 IdempotencyCheck::AdoptStale {
-                    prior_run_id: "<corrupt>".to_string(),
+                    prior_run_id: CORRUPT_PRIOR_RUN_ID.to_string(),
                     prior_state: IdempotencyState::InFlight,
                 }
             }
