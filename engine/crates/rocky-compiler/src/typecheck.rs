@@ -584,6 +584,9 @@ fn compute_model_typecheck(
     let mentions_set_operation = model_by_name
         .get(model_name)
         .is_some_and(|m| sql_mentions_set_operation(&m.sql));
+    // A function over one column that Step 1 could not type from its name
+    // (`COALESCE(b, 0)`) needs it too: only inference reads its other
+    // arguments (#2553).
     let needs_inference = udf_scope.is_active()
         || mentions_set_operation
         || typed_cols
@@ -592,6 +595,10 @@ fn compute_model_typecheck(
                 Some(edge) => {
                     edge.transform.is_cast()
                         || edge.transform == rocky_sql::lineage::TransformKind::Expression
+                        || (matches!(
+                            edge.transform,
+                            rocky_sql::lineage::TransformKind::Aggregation(_)
+                        ) && col.data_type == RockyType::Unknown)
                         || !col.nullable
                 }
                 None => true,
@@ -635,14 +642,22 @@ fn compute_model_typecheck(
                 inferred.exact_type_outputs.contains(&index),
                 inferred.count_outputs.contains(&index),
                 inferred.cast_outputs.contains(&index),
+                inferred.coalesce_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count, cast)) =
+            let Some(&(inferred_col, exact_type, count, cast, coalesce)) =
                 inferred_by_name.get(col.name.as_str())
             else {
                 continue;
             };
+            // A `COALESCE` is NULL only when every argument is. Inference
+            // reads each argument in the SQL relation scope (outer-join side
+            // included), so its non-null answer holds whatever the result
+            // type is: `COALESCE(int_col, 0)` is non-null though `0` widens
+            // the type. Nullability only: the type keeps the rules below
+            // (#2553).
+            let coalesce_non_null = coalesce && !inferred_col.nullable;
             // A cast's output type is its target type, whatever the input
             // is (or whether it has a traceable column at all). Only the
             // type is taken here: nullability keeps following the input
@@ -656,10 +671,15 @@ fn compute_model_typecheck(
                 // No traceable source column. Only `COUNT(...)` is typed here:
                 // it is a non-null BIGINT whatever its argument (#2295). Other
                 // source-less projections (literals, multi-column arithmetic)
-                // stay Unknown.
+                // stay Unknown. A `COALESCE` whose column lineage cannot
+                // trace (an unqualified name in a join) still takes its
+                // non-null answer, type untouched (#2553).
                 if count {
                     col.data_type = inferred_col.data_type.clone();
                     col.nullable = inferred_col.nullable;
+                }
+                if coalesce_non_null {
+                    col.nullable = false;
                 }
                 continue;
             };
@@ -695,6 +715,9 @@ fn compute_model_typecheck(
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
                     }
+                    if coalesce_non_null {
+                        col.nullable = false;
+                    }
                 }
                 // An aggregate over a bare column: Step 1 already typed it
                 // from the column's type.
@@ -714,6 +737,10 @@ fn compute_model_typecheck(
                         // inference's exact answer, as for `Expression`.
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
+                    }
+                    // `coalesce` is never set for a set operation's output.
+                    if coalesce_non_null {
+                        col.nullable = false;
                     }
                 }
             }
@@ -2945,6 +2972,9 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
             }
             ast::Value::Boolean(_) => (RockyType::Boolean, false),
             ast::Value::Null => (RockyType::Unknown, true),
+            // A placeholder (`?`, `$1`, a Snowflake `$var`) is bound at run
+            // time and may be bound to NULL.
+            ast::Value::Placeholder(_) => (RockyType::Unknown, true),
             _ => (RockyType::Unknown, false),
         },
 
@@ -3899,6 +3929,10 @@ pub(crate) struct SelectInference {
     /// `SAFE_CAST`, `::`), looking through parentheses. Such an output has
     /// the cast's target type whatever its input.
     cast_outputs: HashSet<usize>,
+    /// Outputs whose projection is itself a `COALESCE(...)` call, looking
+    /// through parentheses. Such an output's nullable bit is exact: it is
+    /// NULL only when every argument is (#2553).
+    coalesce_outputs: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -3932,6 +3966,9 @@ impl SelectInference {
         }
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
+        }
+        if function.as_deref() == Some("COALESCE") {
+            self.coalesce_outputs.insert(self.columns.len());
         }
         // The cast's type was read for the model's warehouses
         // ([`cast_target_type`]): a name whose meaning differs between them
@@ -4324,6 +4361,9 @@ fn combine_set_operation(
         // A combined column's type is a supertype across branches, not a
         // single cast target.
         cast_outputs: HashSet::new(),
+        // A combined column may be NULL from any branch; the merge does not
+        // narrow a set operation's nullability.
+        coalesce_outputs: HashSet::new(),
         set_operation: true,
         set_branches,
     })
@@ -4500,6 +4540,9 @@ fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> Jo
                 | JoinOperator::LeftOuter(_)
                 | JoinOperator::FullOuter(_)
                 | JoinOperator::OuterApply
+                // Snowflake pads an unmatched left row with NULLs, as a left
+                // outer join does (#2553 red team).
+                | JoinOperator::AsOf { .. }
         ) {
             null_extend_scope(&mut right);
         }
@@ -5313,13 +5356,8 @@ mod tests {
     /// infers. Over `x INT NOT NULL`, `z INT NULL`, `b BIGINT NULL` and `s
     /// STRING NULL` on DuckDB: a `WHERE z IS NOT NULL` filter, a `CAST` and
     /// an `IS NULL` guard in a `CASE` leave the column nullable, so the help
-    /// must not offer them. `COALESCE` to a NOT NULL column, or to a literal
-    /// of the column's own type, makes it non-null.
-    ///
-    /// The literal rows project `x` beside the column on purpose. Rocky runs
-    /// expression inference only when some column needs it, so a `COALESCE`
-    /// over a literal in a model whose every other column is nullable stays
-    /// unknown. These rows test the literal rule, not that gate.
+    /// must not offer them. `COALESCE` to a NOT NULL column or to a literal
+    /// makes it non-null, also when it is the model's only column (#2553).
     #[test]
     fn e012_help_names_only_remedies_that_change_inference() {
         let t: &[(&str, RockyType, bool)] = &[
@@ -5363,9 +5401,10 @@ mod tests {
             ),
             // Remedies the help names.
             ("SELECT COALESCE(z, x) AS c FROM t", false),
-            ("SELECT COALESCE(s, '') AS c, x FROM t", false),
-            ("SELECT COALESCE(b, 0) AS c, x FROM t", false),
-            ("SELECT COALESCE(z, CAST(0 AS INT)) AS c, x FROM t", false),
+            ("SELECT COALESCE(s, '') AS c FROM t", false),
+            ("SELECT COALESCE(b, 0) AS c FROM t", false),
+            ("SELECT COALESCE(z, 0) AS c FROM t", false),
+            ("SELECT COALESCE(z, CAST(0 AS INT)) AS c FROM t", false),
             ("SELECT x AS c FROM t", false),
         ] {
             assert_eq!(e012(sql).is_some(), fails, "{sql}");
@@ -5375,9 +5414,10 @@ mod tests {
             .expect("E012 carries a suggestion");
         for remedy in [
             "COALESCE(c, other_col)",
+            "COALESCE(c, 0)",
+            "COALESCE(c, '')",
             "NOT NULL",
             "CAST(0 AS INT)",
-            "another column of the same SELECT",
             "nullable = true",
         ] {
             assert!(help.contains(remedy), "{remedy}: {help}");
@@ -5387,6 +5427,158 @@ mod tests {
             "{help}"
         );
         assert!(!help.contains("filter out NULLs"), "{help}");
+        assert!(!help.contains("another column"), "{help}");
+    }
+
+    /// Typecheck `sql` as model `m` over source `t` on `target` and return
+    /// the `(type, nullable)` of its column `c`, and whether a `nullable =
+    /// false` contract on `c` raises `E012`.
+    fn coalesce_column(sql: &str, target: OperandTarget) -> (RockyType, bool, bool) {
+        let t: &[(&str, RockyType, bool)] = &[
+            ("x", RockyType::Int32, false),
+            ("z", RockyType::Int32, true),
+            ("b", RockyType::Int64, true),
+            ("s", RockyType::String, true),
+            ("q", RockyType::Unknown, true),
+        ];
+        let sources = HashMap::from([
+            ("t".to_string(), source_schema(t)),
+            ("u".to_string(), source_schema(t)),
+        ]);
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(target),
+        );
+        let col = result.typed_models["m"]
+            .iter()
+            .find(|c| c.name == "c")
+            .unwrap_or_else(|| panic!("no column c: {sql}"));
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: None,
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let e012 = validate_contract("m", &result.typed_models["m"], &contract)
+            .iter()
+            .any(|d| &*d.code == "E012");
+        (col.data_type.clone(), col.nullable, e012)
+    }
+
+    /// A `COALESCE` is non-null when one argument is never NULL: a literal,
+    /// a NOT NULL column, a non-null expression. It holds for the model's
+    /// only column, on a known and an unknown warehouse, and when the
+    /// arguments' types differ (`COALESCE(z, 0)` widens `INT` to `BIGINT`):
+    /// nullability does not wait for the type (#2553).
+    #[test]
+    fn coalesce_with_a_non_null_argument_is_non_null() {
+        let unknown = OperandTarget::Unconfigured;
+        let mut wrong = Vec::new();
+        for target in [duckdb(), unknown] {
+            for (sql, ty) in [
+                ("SELECT COALESCE(b, 0) AS c FROM t", RockyType::Int64),
+                ("SELECT COALESCE(s, '') AS c FROM t", RockyType::String),
+                // `0` may widen `z`'s INT, so the type is not claimed.
+                ("SELECT COALESCE(z, 0) AS c FROM t", RockyType::Unknown),
+                ("SELECT COALESCE(b, z, 0) AS c FROM t", RockyType::Unknown),
+                ("SELECT (COALESCE(b, 0)) AS c FROM t", RockyType::Int64),
+                // An input whose type is unknown: the literal still makes it
+                // non-null.
+                ("SELECT COALESCE(q, 0) AS c FROM t", RockyType::Unknown),
+                ("SELECT COALESCE(z, x) AS c FROM t", RockyType::Int32),
+                ("SELECT COALESCE(b, x) AS c FROM t", RockyType::Unknown),
+                ("SELECT COALESCE(z, x + 1) AS c FROM t", RockyType::Unknown),
+                ("SELECT COALESCE(b, 0) AS c, z FROM t", RockyType::Int64),
+                // The preserved side of an outer join keeps NOT NULL.
+                (
+                    "SELECT COALESCE(t.x, u.z) AS c FROM t LEFT JOIN u ON t.z = u.z",
+                    RockyType::Int32,
+                ),
+                (
+                    "SELECT COALESCE(u.z, 0) AS c FROM t LEFT JOIN u ON t.z = u.z",
+                    RockyType::Unknown,
+                ),
+                // Lineage cannot trace an unqualified name in a join.
+                (
+                    "SELECT COALESCE(b, 0) AS c FROM t JOIN u ON t.z = u.z",
+                    RockyType::Unknown,
+                ),
+            ] {
+                let (got_ty, nullable, e012) = coalesce_column(sql, target.clone());
+                if nullable || e012 || got_ty != ty {
+                    wrong.push(format!("{sql} on {target:?}: {got_ty:?} {nullable} {e012}"));
+                }
+            }
+        }
+        // A cast whose width differs between warehouses has a type only once
+        // the warehouse is known. It is non-null either way.
+        for (sql, duck_ty) in [
+            (
+                "SELECT COALESCE(b, CAST(0 AS BIGINT)) AS c FROM t",
+                RockyType::Int64,
+            ),
+            (
+                "SELECT COALESCE(z, CAST(0 AS INT)) AS c FROM t",
+                RockyType::Int32,
+            ),
+        ] {
+            for (target, ty) in [
+                (duckdb(), duck_ty),
+                (OperandTarget::Unconfigured, RockyType::Unknown),
+            ] {
+                let (got_ty, nullable, e012) = coalesce_column(sql, target.clone());
+                if nullable || e012 || got_ty != ty {
+                    wrong.push(format!("{sql} on {target:?}: {got_ty:?} {nullable} {e012}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A `COALESCE` whose every argument may be NULL stays nullable and
+    /// keeps `E012`: all-nullable columns, a `NULL` literal, a cast of
+    /// `NULL`, `NULLIF`, a scalar subquery, a run-time placeholder, the
+    /// null-extended side of an outer join, a set operation with a nullable
+    /// branch, and a double-quoted `"x"`, which Rocky parses as a column
+    /// (#2553).
+    #[test]
+    fn coalesce_of_nullable_arguments_stays_nullable() {
+        let unknown = OperandTarget::Unconfigured;
+        let mut wrong = Vec::new();
+        for target in [duckdb(), unknown] {
+            for sql in [
+                "SELECT COALESCE(b) AS c FROM t",
+                "SELECT COALESCE(b, z) AS c FROM t",
+                "SELECT COALESCE(b, z, s) AS c FROM t",
+                "SELECT COALESCE(b, NULL) AS c FROM t",
+                "SELECT COALESCE(b, CAST(NULL AS BIGINT)) AS c FROM t",
+                "SELECT COALESCE(b, NULLIF(x, 0)) AS c FROM t",
+                "SELECT COALESCE(b, (SELECT 1)) AS c FROM t",
+                "SELECT COALESCE(b, x / 2) AS c FROM t",
+                "SELECT COALESCE(b, ?) AS c FROM t",
+                "SELECT COALESCE(u.x, t.z) AS c FROM t LEFT JOIN u ON t.z = u.z",
+                "SELECT COALESCE(t.x, u.z) AS c FROM t RIGHT JOIN u ON t.z = u.z",
+                // An ASOF join null-pads an unmatched left row.
+                "SELECT COALESCE(u.x, LAG(u.x) OVER (ORDER BY t.x)) AS c \
+                 FROM t ASOF JOIN u MATCH_CONDITION (t.x >= u.x) ON t.z = u.z",
+                "SELECT COALESCE(b, 0) AS c FROM t UNION ALL SELECT b AS c FROM t",
+                "SELECT COALESCE(b, \"n/a\") AS c FROM t",
+            ] {
+                let (_, nullable, e012) = coalesce_column(sql, target.clone());
+                if !nullable || !e012 {
+                    wrong.push(format!("{sql} on {target:?}: {nullable} {e012}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Typecheck one model over sources `t` and `u`, both `(x INT NOT NULL, n
@@ -6956,6 +7148,46 @@ mod tests {
         for name in ["joined", "downstream"] {
             assert_eq!(full.typed_models[name][0].data_type, RockyType::Int64);
             assert!(full.typed_models[name][0].nullable, "{name}");
+        }
+    }
+
+    /// Editing `b AS c` into `COALESCE(b, 0) AS c` makes `c` non-null in an
+    /// incremental typecheck as in a full one, and in the model that reads
+    /// it (#2553).
+    #[test]
+    fn coalesce_incremental_nullability_matches_full_typecheck() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[("b", RockyType::Int64, true)]),
+        )]);
+        let models = |projection: &str| {
+            vec![
+                make_model("m", &format!("SELECT {projection} AS c FROM t")),
+                make_model("downstream", "SELECT c FROM m"),
+            ]
+        };
+        let initial = Project::from_models(models("b")).unwrap();
+        let graph = build_semantic_graph(&initial, &HashMap::new()).unwrap();
+        let previous = typecheck_project_with_models(&graph, &sources, None, &initial.models, None);
+        assert!(previous.typed_models["downstream"][0].nullable);
+
+        let updated = Project::from_models(models("COALESCE(b, 0)")).unwrap();
+        let graph = build_semantic_graph(&updated, &HashMap::new()).unwrap();
+        let affected = HashSet::from(["m".to_string(), "downstream".to_string()]);
+        let incremental = typecheck_project_incremental(
+            &graph,
+            &sources,
+            &updated.models,
+            &affected,
+            &previous,
+            None,
+            &TargetDialects::default(),
+        );
+        let full = typecheck_project_with_models(&graph, &sources, None, &updated.models, None);
+        assert_eq!(incremental.typed_models, full.typed_models);
+        for name in ["m", "downstream"] {
+            assert_eq!(full.typed_models[name][0].data_type, RockyType::Int64);
+            assert!(!full.typed_models[name][0].nullable, "{name}");
         }
     }
 
