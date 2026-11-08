@@ -605,14 +605,39 @@ mod publish_gate {
         pub(super) release: tokio::sync::Notify,
     }
 
-    pub(super) static GATE: std::sync::Mutex<Option<Arc<Gate>>> = std::sync::Mutex::new(None);
+    /// One gate per test, each for its own models directory, so tests that
+    /// run at the same time on threads do not replace each other's gate.
+    static GATES: std::sync::Mutex<Vec<Arc<Gate>>> = std::sync::Mutex::new(Vec::new());
 
-    pub(super) async fn wait(models_dir: &Path) {
-        let gate = GATE
+    /// Install a gate for `models_dir`.
+    pub(super) fn install(models_dir: PathBuf) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            models_dir,
+            arrived: AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        GATES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .filter(|gate| gate.models_dir == models_dir);
+            .push(gate.clone());
+        gate
+    }
+
+    /// Remove the gate for `models_dir`.
+    pub(super) fn remove(models_dir: &Path) {
+        GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|gate| gate.models_dir != models_dir);
+    }
+
+    pub(super) async fn wait(models_dir: &Path) {
+        let gate = GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|gate| gate.models_dir == models_dir)
+            .cloned();
         let Some(gate) = gate else { return };
         if !gate.arrived.swap(true, Ordering::SeqCst) {
             gate.release.notified().await;
@@ -898,9 +923,24 @@ impl RockyLsp {
         let generation = self.published_files.begin_compile();
         match rocky_compiler::compile::compile(&config) {
             Ok(mut result) => {
+                #[cfg(test)]
+                publish_gate::wait(&dir_path).await;
                 apply_project_gates(&dir_path, &mut result);
                 if self.publish_diagnostics(generation, result).await {
                     self.cast_targets.keep(generation, cast_targets);
+                } else {
+                    // A newer compile was stored first. When it is a
+                    // debounced incremental pass, it started from the result
+                    // stored before this compile and marked only its own
+                    // files, so whatever this compile read from disk and
+                    // nothing else recorded (the file `did_save` saved, with
+                    // a client that sends no watched-file events) is not in
+                    // it, and would be lost for the session. Schedule a full
+                    // compile: this one read every file, so only another
+                    // full compile is sure to see them all. Keeping this
+                    // result instead would drop the newer pass's own edit,
+                    // which this compile may have read before it was made.
+                    self.schedule_recompile([None]);
                 }
             }
             Err(e) => {
@@ -6162,12 +6202,7 @@ mod tests {
                 .contains(&"W002".to_string())
         );
 
-        let gate = Arc::new(publish_gate::Gate {
-            models_dir: models.clone(),
-            arrived: AtomicBool::new(false),
-            release: Notify::new(),
-        });
-        *publish_gate::GATE.lock().unwrap() = Some(gate.clone());
+        let gate = publish_gate::install(models.clone());
         let watched = |path: &std::path::Path| {
             Request::build("workspace/didChangeWatchedFiles")
                 .params(serde_json::json!({
@@ -6243,7 +6278,7 @@ mod tests {
         {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        *publish_gate::GATE.lock().unwrap() = None;
+        publish_gate::remove(&models);
 
         // The final stored result equals a from-scratch compile.
         let scratch = rocky_compiler::compile::compile(&CompilerConfig {
@@ -6263,6 +6298,132 @@ mod tests {
             v
         };
         assert_eq!(set(stored), set(&scratch), "diagnostics");
+        for (name, cols) in &scratch.type_check.typed_models {
+            assert_eq!(
+                stored.type_check.typed_models.get(name),
+                Some(cols),
+                "typed columns of {name}"
+            );
+        }
+    }
+
+    /// The full compile `did_save` runs reads the saved file from disk, but
+    /// records no path. A debounced incremental pass that starts after it,
+    /// for another file's watched-file event, starts from the result stored
+    /// before the save and marks only its own file. When that pass is
+    /// stored first, the save's result is outranked. Before, nothing marked
+    /// the saved file again, so with a client that sends no watched-file
+    /// event for a save, its new columns were lost for the session.
+    #[tokio::test]
+    async fn an_outranked_save_compile_compiles_again() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("project");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for i in 0..12 {
+            std::fs::write(models.join(format!("m{i:02}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                models.join(format!("m{i:02}.toml")),
+                format!(
+                    "name = \"m{i:02}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        tokio::spawn(async move { while socket.next().await.is_some() {} });
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        let lsp = service.inner();
+        let has_column = |model: &'static str, column: &'static str| async move {
+            lsp.compile_result
+                .read()
+                .await
+                .as_ref()
+                .and_then(|r| r.type_check.typed_models.get(model).cloned())
+                .is_some_and(|cols| cols.iter().any(|c| c.name == column))
+        };
+        let wait_until = |model: &'static str, column: &'static str| async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !has_column(model, column).await && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            has_column(model, column).await
+        };
+
+        let gate = publish_gate::install(models.clone());
+        let saved = models.join("m02.sql");
+        std::fs::write(&saved, "SELECT 1 AS id, 2 AS saved").unwrap();
+        let save = lsp.did_save(DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::from_file_path(&saved).unwrap(),
+            },
+            text: None,
+        });
+        let other = models.join("m01.sql");
+        let drive = async {
+            // Window A: the save's full compile, held before it publishes.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.arrived.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                gate.arrived.load(Ordering::SeqCst),
+                "the save's compile never reached the gate"
+            );
+
+            // Window B: another model's watched-file edit, from the result
+            // stored before the save.
+            std::fs::write(&other, "SELECT 1 AS id, 2 AS marker").unwrap();
+            lsp.did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&other).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+            assert!(
+                wait_until("m01", "marker").await,
+                "window B was never stored"
+            );
+            assert!(
+                !has_column("m02", "saved").await,
+                "window B marked only its own model"
+            );
+            gate.release.notify_one();
+        };
+        tokio::join!(save, drive);
+
+        // The save's result was outranked. Its file must be compiled again.
+        let compiled_again = wait_until("m02", "saved").await;
+        publish_gate::remove(&models);
+        assert!(compiled_again, "the saved file was never compiled again");
+
+        // The final stored result equals a from-scratch compile.
+        let scratch = rocky_compiler::compile::compile(&CompilerConfig {
+            models_dir: models.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let stored = lsp.compile_result.read().await;
+        let stored = stored.as_ref().expect("a compile result is stored");
         for (name, cols) in &scratch.type_check.typed_models {
             assert_eq!(
                 stored.type_check.typed_models.get(name),
