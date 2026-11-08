@@ -264,7 +264,7 @@ Wire the ones you need into your pipeline.
 |---|---|---|
 | A model that no longer type-checks | `rocky compile` | Exits non-zero on any `E` code |
 | A broken contract or missing column | `rocky compile` | `E010`-`E014` |
-| A breaking change reaching production | `rocky branch promote <name>` | Refuses unless you pass `--allow-breaking`. The gate skips itself, and records that it did, when the models directory is missing or when either the base ref or the working tree fails to compile |
+| A breaking change reaching production | `rocky branch promote <name>` | Refuses unless you pass `--allow-breaking`. It also refuses when the base ref or the working tree fails to compile. Deleting every model is a breaking change: each base model is reported removed. The gate skips itself, and records that it did, only when the base has no models or there is no git history. A project whose config declares no transformation pipeline and that has no models directory also skips when its base ref cannot be read |
 | SQL that will not run on your target warehouse | `rocky compile --target-dialect <dbx\|sf\|bq\|duckdb>` | `P001` at error severity |
 | Classified data left unmasked | `rocky compliance --fail-on exception` | Exits 1 on any exception |
 | A run that costs more than budgeted | `rocky run` with `[budget] on_breach = "error"` | Fails the run. The default, `warn`, only fires the `budget_breach` event |
