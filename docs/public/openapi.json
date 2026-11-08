@@ -18081,6 +18081,191 @@
         ],
         "type": "object"
       },
+      "ProductBudgetBreachAction": {
+        "description": "What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.",
+        "enum": [
+          "warn"
+        ],
+        "type": "string"
+      },
+      "ProductBudgetBreachEvent": {
+        "description": "One time a product went over its monthly budget.",
+        "properties": {
+          "at": {
+            "description": "When that run finished (RFC 3339). The budget was checked as of then.",
+            "type": "string"
+          },
+          "breached": {
+            "description": "The limits that were exceeded at that run.",
+            "items": {
+              "$ref": "#/components/schemas/ProductBudgetCheck"
+            },
+            "type": "array"
+          },
+          "run_id": {
+            "description": "The production run after which the product was first over.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "breached",
+          "run_id"
+        ],
+        "type": "object"
+      },
+      "ProductBudgetCheck": {
+        "description": "One limit of a product budget, checked against the product's charge.",
+        "properties": {
+          "actual": {
+            "description": "The month-to-date figure the limit tests. Absent when it is not known.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "The configured limit.",
+            "format": "double",
+            "type": "number"
+          },
+          "limit_type": {
+            "$ref": "#/components/schemas/ProductBudgetLimitType"
+          },
+          "reason": {
+            "description": "Why the limit is `not_evaluated`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CostUnit"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For `max_storage_gb_month`, the storage basis checked. Absent for the other limits."
+          },
+          "verdict": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductBudgetVerdict"
+              }
+            ],
+            "description": "`breached` when `actual` is greater than `limit`. Equal is in budget."
+          }
+        },
+        "required": [
+          "limit",
+          "limit_type",
+          "verdict"
+        ],
+        "type": "object"
+      },
+      "ProductBudgetConfig": {
+        "additionalProperties": false,
+        "description": "One `[product_budget.<name>]` table: a month-to-date budget for one data product, checked at the end of every production `rocky run`.\n\nEach limit tests what the product is charged this month (`kept` plus `allocated_upstream` in `rocky cost --month --by product`), in the month of the project's `[schedule].timezone`. A limit left unset is not checked.\n\n```toml [product_budget.orders] max_compute_hours = 40 max_storage_gb_month = 200 max_usd = 120.0 on_breach = \"warn\" ```",
+        "properties": {
+          "max_compute_hours": {
+            "description": "Most model time the product may be charged this month, in hours.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_storage_gb_month": {
+            "description": "Most stored data the product may be charged this month, in GB-months (1 GB = 2^30 bytes). Each storage basis is checked on its own.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_usd": {
+            "description": "Most USD the product may be charged this month. Needs the matching `[cost]` prices (`compute_cost_per_machine_hour`, `storage_cost_per_gb_month`); without them it is not evaluated.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "on_breach": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductBudgetBreachAction"
+              }
+            ],
+            "default": "warn",
+            "description": "What a breach does. Only `warn`."
+          }
+        },
+        "type": "object"
+      },
+      "ProductBudgetLimitType": {
+        "description": "Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.",
+        "enum": [
+          "max_compute_hours",
+          "max_storage_gb_month",
+          "max_usd"
+        ],
+        "type": "string"
+      },
+      "ProductBudgetStatus": {
+        "description": "A product's monthly budget, checked once.",
+        "properties": {
+          "checks": {
+            "description": "One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).",
+            "items": {
+              "$ref": "#/components/schemas/ProductBudgetCheck"
+            },
+            "type": "array"
+          },
+          "on_breach": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductBudgetBreachAction"
+              }
+            ],
+            "description": "What a breach does. Only `warn`: the run's exit code does not change."
+          },
+          "reasons": {
+            "description": "Why the budget as a whole is `not_evaluated`, when it is.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verdict": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductBudgetVerdict"
+              }
+            ],
+            "description": "`breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`."
+          }
+        },
+        "required": [
+          "checks",
+          "on_breach",
+          "verdict"
+        ],
+        "type": "object"
+      },
+      "ProductBudgetVerdict": {
+        "description": "The verdict of a monthly product budget, or of one of its limits.",
+        "enum": [
+          "in_budget",
+          "breached",
+          "not_evaluated"
+        ],
+        "type": "string"
+      },
       "ProductCompileOutput": {
         "description": "JSON output of `rocky product compile`.",
         "properties": {
@@ -18150,6 +18335,43 @@
           "spec_digest",
           "spec_path",
           "version"
+        ],
+        "type": "object"
+      },
+      "ProductCostMonth": {
+        "description": "One product's current month, on `rocky product status`.",
+        "properties": {
+          "as_of": {
+            "description": "The instant the month was computed (RFC 3339).",
+            "type": "string"
+          },
+          "cost": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductMonthCost"
+              }
+            ],
+            "description": "The product's row from `rocky cost --month <month> --by product`."
+          },
+          "history_complete": {
+            "description": "Whether run history reaches back far enough to cover the month.",
+            "type": "boolean"
+          },
+          "month": {
+            "description": "The month, `YYYY-MM`, in `timezone`.",
+            "type": "string"
+          },
+          "timezone": {
+            "description": "The project's `[schedule].timezone`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "as_of",
+          "cost",
+          "history_complete",
+          "month",
+          "timezone"
         ],
         "type": "object"
       },
@@ -18391,6 +18613,24 @@
               "$ref": "#/components/schemas/AllocatedUpstreamCost"
             },
             "type": "array"
+          },
+          "breach_events": {
+            "description": "Each time this month the product went over its budget, in run order. Found by checking the budget again after each production run of the month. A product that goes over, back under and over again has two events. An event is never withdrawn, even when a later run moves the product back under. Empty (and omitted) when there was none.",
+            "items": {
+              "$ref": "#/components/schemas/ProductBudgetBreachEvent"
+            },
+            "type": "array"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductBudgetStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget."
           },
           "built": {
             "description": "What the product's own executions cost, before any split. A memo for reading `kept` beside it: it is never summed and is not part of the invariant.",
@@ -18767,6 +19007,24 @@
           },
           "committed_spec_digest": {
             "description": "The committed manifest's spec digest, when one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cost_month": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductCostMonth"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The product's cost for the current month (in the project's `[schedule].timezone`), with its `[product_budget.<name>]` verdict and breach events when it has a budget: its row from `rocky cost --month <month> --by product`. Present only from `rocky product status`, and only when the spec parses and the product owns a model."
+          },
+          "cost_month_error": {
+            "description": "Why `cost_month` could not be computed, when it could not.",
             "type": [
               "string",
               "null"
@@ -22112,6 +22370,13 @@
             },
             "description": "Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`]."
           },
+          "product_budget": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ProductBudgetConfig"
+            },
+            "description": "Monthly budgets per data product, keyed by product name. See [`ProductBudgetConfig`]. Absent means empty, and the key is not serialized, so a project without it keeps its config snapshot byte-identical.",
+            "type": "object"
+          },
           "residency": {
             "anyOf": [
               {
@@ -22958,6 +23223,13 @@
               "null"
             ]
           },
+          "product_budgets": {
+            "description": "Monthly product budgets checked at the end of this run: one entry per `[product_budget.<name>]` that names a product, for each month the run touched. Empty (and omitted) when no product budget is set, or the run is not a production run. A breach never changes the exit code.",
+            "items": {
+              "$ref": "#/components/schemas/RunProductBudget"
+            },
+            "type": "array"
+          },
           "quarantine": {
             "description": "Row-quarantine outcomes — one entry per table the quality pipeline quarantined. Empty for runs that did not use `[pipeline.x.checks.quarantine]`.",
             "items": {
@@ -23067,6 +23339,43 @@
           "tables_copied",
           "tables_failed",
           "version"
+        ],
+        "type": "object"
+      },
+      "RunProductBudget": {
+        "description": "One product budget checked at the end of a `rocky run`, on [`RunOutput::product_budgets`].",
+        "properties": {
+          "breach_event": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductBudgetBreachEvent"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present when this run is the one that moved the product over its budget. The `on_budget_breach` hook fired once for each limit in it."
+          },
+          "budget": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductBudgetStatus"
+              }
+            ],
+            "description": "The budget as of the end of this run."
+          },
+          "month": {
+            "description": "The month checked, `YYYY-MM`, in the project's `[schedule].timezone`.",
+            "type": "string"
+          },
+          "product": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "budget",
+          "month",
+          "product"
         ],
         "type": "object"
       },

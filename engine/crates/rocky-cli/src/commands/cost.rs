@@ -1219,12 +1219,7 @@ fn evaluate_budgets(
             let row = split.products.get(product)?;
             Some((
                 product.clone(),
-                evaluate_budget(
-                    budget,
-                    &charged_amounts(row),
-                    &pricing,
-                    production_ran,
-                ),
+                evaluate_budget(budget, &charged_amounts(row), &pricing, production_ran),
             ))
         })
         .collect()
@@ -2944,8 +2939,10 @@ mod tests {
 
     fn one_run_month(budget: &str) -> ProductMonthCostOutput {
         let dir = TempDir::new().unwrap();
-        let (config, state) =
-            budget_project(dir.path(), &format!("[product_budget.revenue_daily]\n{budget}"));
+        let (config, state) = budget_project(
+            dir.path(),
+            &format!("[product_budget.revenue_daily]\n{budget}"),
+        );
         one_charged_run(&state);
         month(&config, &state)
     }
@@ -2973,7 +2970,10 @@ mod tests {
     fn a_budget_below_the_charged_figure_is_breached() {
         let between = (400.0 + 1_000.0) / 2.0 / 3_600_000.0;
         let out = one_run_month(&format!("max_compute_hours = {between}\n"));
-        assert_eq!(verdict(&out, "revenue_daily"), ProductBudgetVerdict::Breached);
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
         assert_eq!(event_runs(&out, "revenue_daily"), ["run-1"]);
         let event = &budget_of(&out, "revenue_daily").breach_events[0];
         assert_eq!(event.breached.len(), 1);
@@ -2987,7 +2987,10 @@ mod tests {
     #[test]
     fn a_charge_equal_to_the_limit_is_in_budget() {
         let out = one_run_month(&format!("max_compute_hours = {HOURS_1400_MS}\n"));
-        assert_eq!(verdict(&out, "revenue_daily"), ProductBudgetVerdict::InBudget);
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::InBudget
+        );
     }
 
     #[test]
@@ -3023,7 +3026,10 @@ mod tests {
     #[test]
     fn a_known_breach_is_not_hidden_by_an_unpriced_limit() {
         let out = one_run_month("max_compute_hours = 0\nmax_usd = 100\n");
-        assert_eq!(verdict(&out, "revenue_daily"), ProductBudgetVerdict::Breached);
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
     }
 
     #[test]
@@ -3066,10 +3072,15 @@ mod tests {
     #[test]
     fn a_month_with_no_production_run_is_not_evaluated() {
         let dir = TempDir::new().unwrap();
-        let (config, state) =
-            budget_project(dir.path(), "[product_budget.revenue_daily]\nmax_compute_hours = 1\n");
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_compute_hours = 1\n",
+        );
         let out = month(&config, &state);
-        assert_eq!(verdict(&out, "revenue_daily"), ProductBudgetVerdict::NotEvaluated);
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::NotEvaluated
+        );
     }
 
     #[test]
@@ -3116,7 +3127,10 @@ mod tests {
         out_in_out(&state);
         let out = month(&config, &state);
         assert_eq!(event_runs(&out, "revenue_daily"), ["run-1", "run-3"]);
-        assert_eq!(verdict(&out, "revenue_daily"), ProductBudgetVerdict::Breached);
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
     }
 
     /// Still over at the next run is not a new event.
@@ -3145,8 +3159,10 @@ mod tests {
     fn a_product_that_did_not_run_can_still_cross() {
         use rocky_core::state::{StoredBytes, StoredBytesBasis};
         let dir = TempDir::new().unwrap();
-        let (config, state) =
-            budget_project(dir.path(), "[product_budget.revenue_daily]\nmax_storage_gb_month = 0.5\n");
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_storage_gb_month = 0.5\n",
+        );
         let first = at(2026, 10, 1, 0, 0);
         let mut build = exec_at("revenue_daily", first, 10);
         build.stored_bytes = Some(StoredBytes {
@@ -3181,7 +3197,11 @@ mod tests {
         let fourth = at(2026, 10, 8, 2, 0);
         record(
             &state,
-            &[sample_run_at("run-4", fourth, vec![exec_at("raw", fourth, 5)])],
+            &[sample_run_at(
+                "run-4",
+                fourth,
+                vec![exec_at("raw", fourth, 5)],
+            )],
         );
         let store = StateStore::open_read_only_or_empty(&state).unwrap();
         let now = at(2026, 10, 9, 0, 0);
@@ -3209,7 +3229,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
         let start = at(2026, 10, 5, 2, 0);
-        let mut shadow = sample_run_at("shadow-1", start, vec![exec_at("revenue_daily", start, 400)]);
+        let mut shadow = sample_run_at(
+            "shadow-1",
+            start,
+            vec![exec_at("revenue_daily", start, 400)],
+        );
         shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
         record(&state, &[shadow]);
         {
@@ -3229,7 +3253,10 @@ mod tests {
         // 1 November in Tokyo (UTC+9).
         let late = at(2026, 10, 31, 23, 30);
         assert_eq!(month_containing(late, "UTC").as_deref(), Some("2026-10"));
-        assert_eq!(month_containing(late, "Asia/Tokyo").as_deref(), Some("2026-11"));
+        assert_eq!(
+            month_containing(late, "Asia/Tokyo").as_deref(),
+            Some("2026-11")
+        );
         let early = at(2026, 11, 1, 2, 0);
         assert_eq!(
             month_containing(early, "America/New_York").as_deref(),

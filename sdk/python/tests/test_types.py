@@ -278,6 +278,51 @@ def test_run_result_containment_defaults_empty_when_omitted():
     assert result.contained == []
 
 
+def test_run_result_keeps_product_budgets():
+    # The end-of-run product budget verdict must survive the hand-written
+    # dispatch target, and default to an empty list when omitted.
+    base = {
+        "version": "1.0.0",
+        "command": "run",
+        "filter": "all",
+        "duration_ms": 1,
+        "tables_copied": 0,
+        "materializations": [],
+        "check_results": [],
+        "permissions": {
+            "grants_added": 0,
+            "grants_revoked": 0,
+            "catalogs_created": 0,
+            "schemas_created": 0,
+        },
+        "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+    }
+    check = {
+        "limit_type": "max_compute_hours",
+        "limit": 1.0,
+        "actual": 2.0,
+        "verdict": "breached",
+    }
+    with_budget = dict(base)
+    with_budget["product_budgets"] = [
+        {
+            "product": "orders",
+            "month": "2026-10",
+            "budget": {"verdict": "breached", "on_breach": "warn", "checks": [check]},
+            "breach_event": {
+                "run_id": "run-1",
+                "at": "2026-10-05T02:00:00+00:00",
+                "breached": [check],
+            },
+        }
+    ]
+    result = parse_rocky_output(json.dumps(with_budget))
+    assert isinstance(result, RunResult)
+    assert result.product_budgets[0].product == "orders"
+    assert result.product_budgets[0].breach_event.run_id == "run-1"
+    assert parse_rocky_output(json.dumps(base)).product_budgets == []
+
+
 def test_parse_rocky_output_rejects_non_object():
     with pytest.raises(ValueError, match="not a JSON object"):
         parse_rocky_output("[1, 2, 3]")

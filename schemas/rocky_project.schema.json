@@ -3042,6 +3042,53 @@
       },
       "type": "object"
     },
+    "ProductBudgetBreachAction": {
+      "description": "What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.",
+      "enum": [
+        "warn"
+      ],
+      "type": "string"
+    },
+    "ProductBudgetConfig": {
+      "additionalProperties": false,
+      "description": "One `[product_budget.<name>]` table: a month-to-date budget for one data product, checked at the end of every production `rocky run`.\n\nEach limit tests what the product is charged this month (`kept` plus `allocated_upstream` in `rocky cost --month --by product`), in the month of the project's `[schedule].timezone`. A limit left unset is not checked.\n\n```toml [product_budget.orders] max_compute_hours = 40 max_storage_gb_month = 200 max_usd = 120.0 on_breach = \"warn\" ```",
+      "properties": {
+        "max_compute_hours": {
+          "description": "Most model time the product may be charged this month, in hours.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_storage_gb_month": {
+          "description": "Most stored data the product may be charged this month, in GB-months (1 GB = 2^30 bytes). Each storage basis is checked on its own.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_usd": {
+          "description": "Most USD the product may be charged this month. Needs the matching `[cost]` prices (`compute_cost_per_machine_hour`, `storage_cost_per_gb_month`); without them it is not evaluated.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "on_breach": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetBreachAction"
+            }
+          ],
+          "default": "warn",
+          "description": "What a breach does. Only `warn`."
+        }
+      },
+      "type": "object"
+    },
     "ProjectFreshnessConfig": {
       "additionalProperties": false,
       "description": "Project-level freshness defaults.\n\nTop-level `[freshness]` block on `rocky.toml`. A model that declares no [`crate::models::ModelFreshnessConfig`] of its own, and sits under no `_defaults.toml` that declares one, inherits this block **whole** (see [`crate::models::ModelFreshnessConfig::from_project_default`]). Inheritance is not field-by-field: a model that declares its own block keeps exactly what it wrote. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).\n\nAll fields are optional. A project-level `[freshness]` with neither `warn_after` nor `error_after` (nor the deprecated `expected_lag_seconds`) supplies nothing at all: it is \"no project default\" for the W005 soft-warn, and it is not inherited, because a model freshness block needs a concrete threshold.\n\n`expected_lag_seconds` and `severity` are the deprecated spelling. They still parse and behave as before (`rocky validate` reports W058): the one value is the error level under `severity = \"error\"`, else the warn level. A block that mixes them with `warn_after` / `error_after` is refused.",
@@ -5289,6 +5336,13 @@
         "target_dialect": null
       },
       "description": "Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`]."
+    },
+    "product_budget": {
+      "additionalProperties": {
+        "$ref": "#/definitions/ProductBudgetConfig"
+      },
+      "description": "Monthly budgets per data product, keyed by product name. See [`ProductBudgetConfig`]. Absent means empty, and the key is not serialized, so a project without it keeps its config snapshot byte-identical.",
+      "type": "object"
     },
     "residency": {
       "anyOf": [

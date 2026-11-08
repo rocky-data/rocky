@@ -122,6 +122,22 @@ export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evalua
  */
 export type ModelDecision = "build" | "skip" | "reused";
 /**
+ * Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
+ */
+export type ProductBudgetLimitType = "max_compute_hours" | "max_storage_gb_month" | "max_usd";
+/**
+ * A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.
+ */
+export type CostUnit = "compute_ms" | "storage_byte_hours_data_files" | "storage_byte_hours_allocated_blocks";
+/**
+ * The verdict of a monthly product budget, or of one of its limits.
+ */
+export type ProductBudgetVerdict = "in_budget" | "breached" | "not_evaluated";
+/**
+ * What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.
+ */
+export type ProductBudgetBreachAction = "warn";
+/**
  * How the wait for one connector ended.
  */
 export type SourceSyncOutcome =
@@ -216,6 +232,10 @@ export interface RunOutput {
    * Pipeline type that was executed (e.g., "replication").
    */
   pipeline_type?: string | null;
+  /**
+   * Monthly product budgets checked at the end of this run: one entry per `[product_budget.<name>]` that names a product, for each month the run touched. Empty (and omitted) when no product budget is set, or the run is not a production run. A breach never changes the exit code.
+   */
+  product_budgets?: RunProductBudget[];
   /**
    * Row-quarantine outcomes — one entry per table the quality pipeline quarantined. Empty for runs that did not use `[pipeline.x.checks.quarantine]`.
    */
@@ -840,6 +860,92 @@ export interface PermissionSummary {
   grants_added: number;
   grants_revoked: number;
   schemas_created: number;
+  [k: string]: unknown;
+}
+/**
+ * One product budget checked at the end of a `rocky run`, on [`RunOutput::product_budgets`].
+ */
+export interface RunProductBudget {
+  /**
+   * Present when this run is the one that moved the product over its budget. The `on_budget_breach` hook fired once for each limit in it.
+   */
+  breach_event?: ProductBudgetBreachEvent | null;
+  /**
+   * The budget as of the end of this run.
+   */
+  budget: ProductBudgetStatus;
+  /**
+   * The month checked, `YYYY-MM`, in the project's `[schedule].timezone`.
+   */
+  month: string;
+  product: string;
+  [k: string]: unknown;
+}
+/**
+ * One time a product went over its monthly budget.
+ */
+export interface ProductBudgetBreachEvent {
+  /**
+   * When that run finished (RFC 3339). The budget was checked as of then.
+   */
+  at: string;
+  /**
+   * The limits that were exceeded at that run.
+   */
+  breached: ProductBudgetCheck[];
+  /**
+   * The production run after which the product was first over.
+   */
+  run_id: string;
+  [k: string]: unknown;
+}
+/**
+ * One limit of a product budget, checked against the product's charge.
+ */
+export interface ProductBudgetCheck {
+  /**
+   * The month-to-date figure the limit tests. Absent when it is not known.
+   */
+  actual?: number | null;
+  /**
+   * The configured limit.
+   */
+  limit: number;
+  limit_type: ProductBudgetLimitType;
+  /**
+   * Why the limit is `not_evaluated`.
+   */
+  reason?: string | null;
+  /**
+   * For `max_storage_gb_month`, the storage basis checked. Absent for the other limits.
+   */
+  unit?: CostUnit | null;
+  /**
+   * `breached` when `actual` is greater than `limit`. Equal is in budget.
+   */
+  verdict: ProductBudgetVerdict;
+  [k: string]: unknown;
+}
+/**
+ * A product's monthly budget, checked once.
+ */
+export interface ProductBudgetStatus {
+  /**
+   * One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).
+   */
+  checks: ProductBudgetCheck[];
+  /**
+   * What a breach does. Only `warn`: the run's exit code does not change.
+   */
+  on_breach: ProductBudgetBreachAction;
+  /**
+   * Why the budget as a whole is `not_evaluated`, when it is.
+   */
+  reasons?: string[];
+  /**
+   * `breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`.
+   */
+  verdict: ProductBudgetVerdict;
   [k: string]: unknown;
 }
 /**

@@ -5738,13 +5738,11 @@ auto_create_catalogs = false
     #[test]
     fn short_history_retention_with_a_product_budget_is_a_v066_warning() {
         let budget = "[product_budget.revenue_daily]\nmax_usd = 1\n";
-        let short = validate_with_product(&format!(
-            "{budget}\n[state.retention]\nmax_age_days = 61\n"
-        ));
+        let short =
+            validate_with_product(&format!("{budget}\n[state.retention]\nmax_age_days = 61\n"));
         assert_eq!(codes(&short, "V066"), 1, "{:?}", short.messages);
-        let enough = validate_with_product(&format!(
-            "{budget}\n[state.retention]\nmax_age_days = 62\n"
-        ));
+        let enough =
+            validate_with_product(&format!("{budget}\n[state.retention]\nmax_age_days = 62\n"));
         assert_eq!(codes(&enough, "V066"), 0, "{:?}", enough.messages);
         // Without a budget, short retention is not this warning's business.
         let no_budget = validate_with_product("[state.retention]\nmax_age_days = 10\n");

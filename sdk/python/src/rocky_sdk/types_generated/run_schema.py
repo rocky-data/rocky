@@ -126,6 +126,16 @@ class ContainedModelOutput(BaseModel):
     """
 
 
+class CostUnit(StrEnum):
+    """
+    A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.
+    """
+
+    compute_ms = "compute_ms"
+    storage_byte_hours_data_files = "storage_byte_hours_data_files"
+    storage_byte_hours_allocated_blocks = "storage_byte_hours_allocated_blocks"
+
+
 class DriftActionOutput(BaseModel):
     action: str
     asset_key: list[str]
@@ -443,6 +453,34 @@ class PermissionSummary(BaseModel):
     grants_added: conint(ge=0)
     grants_revoked: conint(ge=0)
     schemas_created: conint(ge=0)
+
+
+class ProductBudgetBreachAction(StrEnum):
+    """
+    What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.
+    """
+
+    warn = "warn"
+
+
+class ProductBudgetLimitType(StrEnum):
+    """
+    Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
+    """
+
+    max_compute_hours = "max_compute_hours"
+    max_storage_gb_month = "max_storage_gb_month"
+    max_usd = "max_usd"
+
+
+class ProductBudgetVerdict(StrEnum):
+    """
+    The verdict of a monthly product budget, or of one of its limits.
+    """
+
+    in_budget = "in_budget"
+    breached = "breached"
+    not_evaluated = "not_evaluated"
 
 
 class QuarantineOutput(BaseModel):
@@ -1067,6 +1105,57 @@ class Diagnostic(BaseModel):
     """
 
 
+class ProductBudgetCheck(BaseModel):
+    """
+    One limit of a product budget, checked against the product's charge.
+    """
+
+    actual: float | None = None
+    """
+    The month-to-date figure the limit tests. Absent when it is not known.
+    """
+    limit: float
+    """
+    The configured limit.
+    """
+    limit_type: ProductBudgetLimitType
+    reason: str | None = None
+    """
+    Why the limit is `not_evaluated`.
+    """
+    unit: CostUnit | None = None
+    """
+    For `max_storage_gb_month`, the storage basis checked. Absent for the other limits.
+    """
+    verdict: ProductBudgetVerdict
+    """
+    `breached` when `actual` is greater than `limit`. Equal is in budget.
+    """
+
+
+class ProductBudgetStatus(BaseModel):
+    """
+    A product's monthly budget, checked once.
+    """
+
+    checks: list[ProductBudgetCheck]
+    """
+    One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).
+    """
+    on_breach: ProductBudgetBreachAction
+    """
+    What a breach does. Only `warn`: the run's exit code does not change.
+    """
+    reasons: list[str] | None = None
+    """
+    Why the budget as a whole is `not_evaluated`, when it is.
+    """
+    verdict: ProductBudgetVerdict
+    """
+    `breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`.
+    """
+
+
 class SourceVolumeCheckOutput(BaseModel):
     """
     One source row count `rocky run` took when a production run started, judged against a product's `[[product.source.volume]]` range.
@@ -1223,6 +1312,45 @@ class MaterializationOutput(BaseModel):
     """
 
 
+class ProductBudgetBreachEvent(BaseModel):
+    """
+    One time a product went over its monthly budget.
+    """
+
+    at: str
+    """
+    When that run finished (RFC 3339). The budget was checked as of then.
+    """
+    breached: list[ProductBudgetCheck]
+    """
+    The limits that were exceeded at that run.
+    """
+    run_id: str
+    """
+    The production run after which the product was first over.
+    """
+
+
+class RunProductBudget(BaseModel):
+    """
+    One product budget checked at the end of a `rocky run`, on [`RunOutput::product_budgets`].
+    """
+
+    breach_event: ProductBudgetBreachEvent | None = None
+    """
+    Present when this run is the one that moved the product over its budget. The `on_budget_breach` hook fired once for each limit in it.
+    """
+    budget: ProductBudgetStatus
+    """
+    The budget as of the end of this run.
+    """
+    month: str
+    """
+    The month checked, `YYYY-MM`, in the project's `[schedule].timezone`.
+    """
+    product: str
+
+
 class RunOutput(BaseModel):
     """
     JSON output for `rocky run`.
@@ -1306,6 +1434,10 @@ class RunOutput(BaseModel):
     pipeline_type: str | None = None
     """
     Pipeline type that was executed (e.g., "replication").
+    """
+    product_budgets: list[RunProductBudget] | None = None
+    """
+    Monthly product budgets checked at the end of this run: one entry per `[product_budget.<name>]` that names a product, for each month the run touched. Empty (and omitted) when no product budget is set, or the run is not a production run. A breach never changes the exit code.
     """
     quarantine: list[QuarantineOutput] | None = None
     """

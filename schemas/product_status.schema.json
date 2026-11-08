@@ -1,6 +1,89 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "AllocatedUpstreamCost": {
+      "description": "What a product paid for one table it reads, in one unit.",
+      "properties": {
+        "amount": {
+          "description": "What this product was charged.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "basis": {
+          "$ref": "#/definitions/CostSplitBasis"
+        },
+        "low_confidence": {
+          "description": "The scan was so small that the proportions say little.",
+          "type": "boolean"
+        },
+        "of_total": {
+          "description": "The whole cost that was split, so `amount / of_total` is the share.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "provisional": {
+          "description": "The table has not been rebuilt since, in a month that is not over: a later reader can still change this share.",
+          "type": "boolean"
+        },
+        "table": {
+          "description": "The model whose table was read.",
+          "type": "string"
+        },
+        "unit": {
+          "$ref": "#/definitions/CostUnit"
+        }
+      },
+      "required": [
+        "amount",
+        "basis",
+        "low_confidence",
+        "of_total",
+        "provisional",
+        "table",
+        "unit"
+      ],
+      "type": "object"
+    },
+    "CostAmount": {
+      "description": "A whole-number amount in one [`CostUnit`].",
+      "properties": {
+        "amount": {
+          "description": "Whole units. Milliseconds, or byte-hours rounded down per interval.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unit": {
+          "$ref": "#/definitions/CostUnit"
+        }
+      },
+      "required": [
+        "amount",
+        "unit"
+      ],
+      "type": "object"
+    },
+    "CostSplitBasis": {
+      "description": "How a table version's cost was split across the models that read it.",
+      "enum": [
+        "bytes",
+        "estimated_bytes",
+        "rows_scanned_unweighted",
+        "owner_pays"
+      ],
+      "type": "string"
+    },
+    "CostUnit": {
+      "description": "A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.",
+      "enum": [
+        "compute_ms",
+        "storage_byte_hours_data_files",
+        "storage_byte_hours_allocated_blocks"
+      ],
+      "type": "string"
+    },
     "DeliveryStatus": {
       "description": "Delivery state of one product deadline: was the latest delivery on time, and is the next one at risk.\n\nReported by `rocky product status` and, per pipeline, by the scheduler status. `on_time` and `late_by_seconds` are facts about the latest delivery. `at_risk` rests on [`DurationEstimateStatus`], and is `null` whenever the estimate is `unknown`.",
       "properties": {
@@ -186,6 +269,51 @@
         }
       ]
     },
+    "MoneyFigure": {
+      "description": "What a [`MoneyPart`] prices.",
+      "enum": [
+        "compute",
+        "storage_data_files",
+        "storage_allocated_blocks",
+        "egress",
+        "ai_tokens"
+      ],
+      "type": "string"
+    },
+    "MoneyPart": {
+      "description": "One figure of a monthly money total.",
+      "properties": {
+        "figure": {
+          "$ref": "#/definitions/MoneyFigure"
+        },
+        "status": {
+          "$ref": "#/definitions/MoneyStatus"
+        },
+        "usd": {
+          "description": "USD. Present only when `status` is `priced`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "figure",
+        "status"
+      ],
+      "type": "object"
+    },
+    "MoneyStatus": {
+      "description": "Whether a money figure in the monthly report could be computed.",
+      "enum": [
+        "priced",
+        "no_price",
+        "not_measured",
+        "partial"
+      ],
+      "type": "string"
+    },
     "ProductApprovalOutput": {
       "description": "The approval record, as echoed by compile/status output.",
       "properties": {
@@ -213,6 +341,296 @@
         "approver",
         "snapshot_path",
         "spec_digest"
+      ],
+      "type": "object"
+    },
+    "ProductBudgetBreachAction": {
+      "description": "What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.",
+      "enum": [
+        "warn"
+      ],
+      "type": "string"
+    },
+    "ProductBudgetBreachEvent": {
+      "description": "One time a product went over its monthly budget.",
+      "properties": {
+        "at": {
+          "description": "When that run finished (RFC 3339). The budget was checked as of then.",
+          "type": "string"
+        },
+        "breached": {
+          "description": "The limits that were exceeded at that run.",
+          "items": {
+            "$ref": "#/definitions/ProductBudgetCheck"
+          },
+          "type": "array"
+        },
+        "run_id": {
+          "description": "The production run after which the product was first over.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "breached",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "ProductBudgetCheck": {
+      "description": "One limit of a product budget, checked against the product's charge.",
+      "properties": {
+        "actual": {
+          "description": "The month-to-date figure the limit tests. Absent when it is not known.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "The configured limit.",
+          "format": "double",
+          "type": "number"
+        },
+        "limit_type": {
+          "$ref": "#/definitions/ProductBudgetLimitType"
+        },
+        "reason": {
+          "description": "Why the limit is `not_evaluated`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CostUnit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For `max_storage_gb_month`, the storage basis checked. Absent for the other limits."
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetVerdict"
+            }
+          ],
+          "description": "`breached` when `actual` is greater than `limit`. Equal is in budget."
+        }
+      },
+      "required": [
+        "limit",
+        "limit_type",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "ProductBudgetLimitType": {
+      "description": "Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.",
+      "enum": [
+        "max_compute_hours",
+        "max_storage_gb_month",
+        "max_usd"
+      ],
+      "type": "string"
+    },
+    "ProductBudgetStatus": {
+      "description": "A product's monthly budget, checked once.",
+      "properties": {
+        "checks": {
+          "description": "One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).",
+          "items": {
+            "$ref": "#/definitions/ProductBudgetCheck"
+          },
+          "type": "array"
+        },
+        "on_breach": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetBreachAction"
+            }
+          ],
+          "description": "What a breach does. Only `warn`: the run's exit code does not change."
+        },
+        "reasons": {
+          "description": "Why the budget as a whole is `not_evaluated`, when it is.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetVerdict"
+            }
+          ],
+          "description": "`breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`."
+        }
+      },
+      "required": [
+        "checks",
+        "on_breach",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "ProductBudgetVerdict": {
+      "description": "The verdict of a monthly product budget, or of one of its limits.",
+      "enum": [
+        "in_budget",
+        "breached",
+        "not_evaluated"
+      ],
+      "type": "string"
+    },
+    "ProductCostMonth": {
+      "description": "One product's current month, on `rocky product status`.",
+      "properties": {
+        "as_of": {
+          "description": "The instant the month was computed (RFC 3339).",
+          "type": "string"
+        },
+        "cost": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductMonthCost"
+            }
+          ],
+          "description": "The product's row from `rocky cost --month <month> --by product`."
+        },
+        "history_complete": {
+          "description": "Whether run history reaches back far enough to cover the month.",
+          "type": "boolean"
+        },
+        "month": {
+          "description": "The month, `YYYY-MM`, in `timezone`.",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "The project's `[schedule].timezone`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "as_of",
+        "cost",
+        "history_complete",
+        "month",
+        "timezone"
+      ],
+      "type": "object"
+    },
+    "ProductMonthCost": {
+      "description": "One product's month inside [`ProductMonthCostOutput`].",
+      "properties": {
+        "allocated_upstream": {
+          "description": "What the product pays for tables it reads.",
+          "items": {
+            "$ref": "#/definitions/AllocatedUpstreamCost"
+          },
+          "type": "array"
+        },
+        "breach_events": {
+          "description": "Each time this month the product went over its budget, in run order. Found by checking the budget again after each production run of the month. A product that goes over, back under and over again has two events. An event is never withdrawn, even when a later run moves the product back under. Empty (and omitted) when there was none.",
+          "items": {
+            "$ref": "#/definitions/ProductBudgetBreachEvent"
+          },
+          "type": "array"
+        },
+        "budget": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget."
+        },
+        "built": {
+          "description": "What the product's own executions cost, before any split. A memo for reading `kept` beside it: it is never summed and is not part of the invariant.",
+          "items": {
+            "$ref": "#/definitions/CostAmount"
+          },
+          "type": "array"
+        },
+        "charged": {
+          "description": "What the product is charged: `kept` plus `allocated_upstream`.",
+          "items": {
+            "$ref": "#/definitions/CostAmount"
+          },
+          "type": "array"
+        },
+        "kept": {
+          "description": "The part of `built` the product still pays after other products pay for what they read.",
+          "items": {
+            "$ref": "#/definitions/CostAmount"
+          },
+          "type": "array"
+        },
+        "money": {
+          "description": "`charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "money_parts": {
+          "description": "`charged` priced one figure at a time.",
+          "items": {
+            "$ref": "#/definitions/MoneyPart"
+          },
+          "type": "array"
+        },
+        "money_status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MoneyStatus"
+            }
+          ],
+          "description": "Why `money` is or is not present."
+        },
+        "output_model": {
+          "description": "The model the product owns.",
+          "type": "string"
+        },
+        "owner_residual": {
+          "description": "The part of `kept` that came back from readers outside every product.",
+          "items": {
+            "$ref": "#/definitions/CostAmount"
+          },
+          "type": "array"
+        },
+        "product": {
+          "type": "string"
+        },
+        "shared_not_charged": {
+          "description": "Shares of the product's tables that readers did not pay.",
+          "items": {
+            "$ref": "#/definitions/SharedNotChargedCost"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "allocated_upstream",
+        "built",
+        "charged",
+        "kept",
+        "money_parts",
+        "money_status",
+        "output_model",
+        "owner_residual",
+        "product",
+        "shared_not_charged"
       ],
       "type": "object"
     },
@@ -357,6 +775,39 @@
       ],
       "type": "object"
     },
+    "SharedNotChargedCost": {
+      "description": "A share of an owned table's cost that a reader did not pay.",
+      "properties": {
+        "amount": {
+          "description": "The reader's share. It stays with the table's owner.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "basis": {
+          "$ref": "#/definitions/CostSplitBasis"
+        },
+        "reader": {
+          "description": "The model that read it.",
+          "type": "string"
+        },
+        "table": {
+          "description": "The owned model whose table was read.",
+          "type": "string"
+        },
+        "unit": {
+          "$ref": "#/definitions/CostUnit"
+        }
+      },
+      "required": [
+        "amount",
+        "basis",
+        "reader",
+        "table",
+        "unit"
+      ],
+      "type": "object"
+    },
     "VolumeSeverity": {
       "description": "What an out-of-range row count does to the run.",
       "oneOf": [
@@ -443,6 +894,24 @@
     },
     "committed_spec_digest": {
       "description": "The committed manifest's spec digest, when one exists.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cost_month": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProductCostMonth"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The product's cost for the current month (in the project's `[schedule].timezone`), with its `[product_budget.<name>]` verdict and breach events when it has a budget: its row from `rocky cost --month <month> --by product`. Present only from `rocky product status`, and only when the spec parses and the product owns a model."
+    },
+    "cost_month_error": {
+      "description": "Why `cost_month` could not be computed, when it could not.",
       "type": [
         "string",
         "null"

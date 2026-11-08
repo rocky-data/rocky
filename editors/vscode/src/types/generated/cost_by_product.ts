@@ -21,6 +21,18 @@ export type MoneyStatus = "priced" | "no_price" | "not_measured" | "partial";
  * How a table version's cost was split across the models that read it.
  */
 export type CostSplitBasis = "bytes" | "estimated_bytes" | "rows_scanned_unweighted" | "owner_pays";
+/**
+ * Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
+ */
+export type ProductBudgetLimitType = "max_compute_hours" | "max_storage_gb_month" | "max_usd";
+/**
+ * The verdict of a monthly product budget, or of one of its limits.
+ */
+export type ProductBudgetVerdict = "in_budget" | "breached" | "not_evaluated";
+/**
+ * What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.
+ */
+export type ProductBudgetBreachAction = "warn";
 
 /**
  * `rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.
@@ -142,6 +154,14 @@ export interface ProductMonthCost {
    */
   allocated_upstream: AllocatedUpstreamCost[];
   /**
+   * Each time this month the product went over its budget, in run order. Found by checking the budget again after each production run of the month. A product that goes over, back under and over again has two events. An event is never withdrawn, even when a later run moves the product back under. Empty (and omitted) when there was none.
+   */
+  breach_events?: ProductBudgetBreachEvent[];
+  /**
+   * The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget.
+   */
+  budget?: ProductBudgetStatus | null;
+  /**
    * What the product's own executions cost, before any split. A memo for reading `kept` beside it: it is never summed and is not part of the invariant.
    */
   built: CostAmount[];
@@ -206,6 +226,73 @@ export interface AllocatedUpstreamCost {
    */
   table: string;
   unit: CostUnit;
+  [k: string]: unknown;
+}
+/**
+ * One time a product went over its monthly budget.
+ */
+export interface ProductBudgetBreachEvent {
+  /**
+   * When that run finished (RFC 3339). The budget was checked as of then.
+   */
+  at: string;
+  /**
+   * The limits that were exceeded at that run.
+   */
+  breached: ProductBudgetCheck[];
+  /**
+   * The production run after which the product was first over.
+   */
+  run_id: string;
+  [k: string]: unknown;
+}
+/**
+ * One limit of a product budget, checked against the product's charge.
+ */
+export interface ProductBudgetCheck {
+  /**
+   * The month-to-date figure the limit tests. Absent when it is not known.
+   */
+  actual?: number | null;
+  /**
+   * The configured limit.
+   */
+  limit: number;
+  limit_type: ProductBudgetLimitType;
+  /**
+   * Why the limit is `not_evaluated`.
+   */
+  reason?: string | null;
+  /**
+   * For `max_storage_gb_month`, the storage basis checked. Absent for the other limits.
+   */
+  unit?: CostUnit | null;
+  /**
+   * `breached` when `actual` is greater than `limit`. Equal is in budget.
+   */
+  verdict: ProductBudgetVerdict;
+  [k: string]: unknown;
+}
+/**
+ * A product's monthly budget, checked once.
+ */
+export interface ProductBudgetStatus {
+  /**
+   * One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).
+   */
+  checks: ProductBudgetCheck[];
+  /**
+   * What a breach does. Only `warn`: the run's exit code does not change.
+   */
+  on_breach: ProductBudgetBreachAction;
+  /**
+   * Why the budget as a whole is `not_evaluated`, when it is.
+   */
+  reasons?: string[];
+  /**
+   * `breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`.
+   */
+  verdict: ProductBudgetVerdict;
   [k: string]: unknown;
 }
 /**

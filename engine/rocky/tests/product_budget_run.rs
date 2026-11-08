@@ -130,10 +130,7 @@ fn a_production_run_checks_the_product_budget_and_fires_the_hook_once() {
 
     // The monthly report shows the one event, as of the first run.
     let month = budget["month"].as_str().unwrap().to_string();
-    let cost = json_ok(
-        dir.path(),
-        &["cost", "--month", &month, "--by", "product"],
-    );
+    let cost = json_ok(dir.path(), &["cost", "--month", &month, "--by", "product"]);
     let product = &cost["products"][0];
     assert_eq!(product["product"], "revenue_daily");
     assert_eq!(product["budget"]["verdict"], "breached", "{product:#}");
@@ -147,7 +144,10 @@ fn a_production_run_checks_the_product_budget_and_fires_the_hook_once() {
 #[test]
 fn a_project_without_product_budgets_has_no_product_budgets_key() {
     let dir = project();
-    let text = CONFIG.split("[product_budget.revenue_daily]").next().unwrap();
+    let text = CONFIG
+        .split("[product_budget.revenue_daily]")
+        .next()
+        .unwrap();
     fs::write(dir.path().join("rocky.toml"), text).expect("write config");
     let run = json_ok(dir.path(), &["run", "--pipeline", "transform"]);
     assert!(run.get("product_budgets").is_none(), "{run:#}");
@@ -157,7 +157,10 @@ fn a_project_without_product_budgets_has_no_product_budgets_key() {
         &["cost", "--month", &cost_month, "--by", "product"],
     );
     assert!(cost["products"][0].get("budget").is_none(), "{cost:#}");
-    assert!(cost["products"][0].get("breach_events").is_none(), "{cost:#}");
+    assert!(
+        cost["products"][0].get("breach_events").is_none(),
+        "{cost:#}"
+    );
 }
 
 fn chrono_month_now() -> String {

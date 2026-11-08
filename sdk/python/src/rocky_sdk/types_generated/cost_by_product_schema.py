@@ -71,6 +71,34 @@ class MoneyStatus(StrEnum):
     partial = "partial"
 
 
+class ProductBudgetBreachAction(StrEnum):
+    """
+    What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.
+    """
+
+    warn = "warn"
+
+
+class ProductBudgetLimitType(StrEnum):
+    """
+    Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
+    """
+
+    max_compute_hours = "max_compute_hours"
+    max_storage_gb_month = "max_storage_gb_month"
+    max_usd = "max_usd"
+
+
+class ProductBudgetVerdict(StrEnum):
+    """
+    The verdict of a monthly product budget, or of one of its limits.
+    """
+
+    in_budget = "in_budget"
+    breached = "breached"
+    not_evaluated = "not_evaluated"
+
+
 class SharedNotChargedCost(BaseModel):
     """
     A share of an owned table's cost that a reader did not pay.
@@ -146,6 +174,76 @@ class MoneyPart(BaseModel):
     """
 
 
+class ProductBudgetCheck(BaseModel):
+    """
+    One limit of a product budget, checked against the product's charge.
+    """
+
+    actual: float | None = None
+    """
+    The month-to-date figure the limit tests. Absent when it is not known.
+    """
+    limit: float
+    """
+    The configured limit.
+    """
+    limit_type: ProductBudgetLimitType
+    reason: str | None = None
+    """
+    Why the limit is `not_evaluated`.
+    """
+    unit: CostUnit | None = None
+    """
+    For `max_storage_gb_month`, the storage basis checked. Absent for the other limits.
+    """
+    verdict: ProductBudgetVerdict
+    """
+    `breached` when `actual` is greater than `limit`. Equal is in budget.
+    """
+
+
+class ProductBudgetStatus(BaseModel):
+    """
+    A product's monthly budget, checked once.
+    """
+
+    checks: list[ProductBudgetCheck]
+    """
+    One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).
+    """
+    on_breach: ProductBudgetBreachAction
+    """
+    What a breach does. Only `warn`: the run's exit code does not change.
+    """
+    reasons: list[str] | None = None
+    """
+    Why the budget as a whole is `not_evaluated`, when it is.
+    """
+    verdict: ProductBudgetVerdict
+    """
+    `breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`.
+    """
+
+
+class ProductBudgetBreachEvent(BaseModel):
+    """
+    One time a product went over its monthly budget.
+    """
+
+    at: str
+    """
+    When that run finished (RFC 3339). The budget was checked as of then.
+    """
+    breached: list[ProductBudgetCheck]
+    """
+    The limits that were exceeded at that run.
+    """
+    run_id: str
+    """
+    The production run after which the product was first over.
+    """
+
+
 class ProductMonthCost(BaseModel):
     """
     One product's month inside [`ProductMonthCostOutput`].
@@ -154,6 +252,14 @@ class ProductMonthCost(BaseModel):
     allocated_upstream: list[AllocatedUpstreamCost]
     """
     What the product pays for tables it reads.
+    """
+    breach_events: list[ProductBudgetBreachEvent] | None = None
+    """
+    Each time this month the product went over its budget, in run order. Found by checking the budget again after each production run of the month. A product that goes over, back under and over again has two events. An event is never withdrawn, even when a later run moves the product back under. Empty (and omitted) when there was none.
+    """
+    budget: ProductBudgetStatus | None = None
+    """
+    The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget.
     """
     built: list[CostAmount]
     """

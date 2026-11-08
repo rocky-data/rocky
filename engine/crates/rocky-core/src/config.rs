@@ -13220,16 +13220,14 @@ schema_template = "raw"
                 );
             }
         }
-        let zero: RockyConfig =
-            toml::from_str("[product_budget.orders]\nmax_usd = 0\n").unwrap();
+        let zero: RockyConfig = toml::from_str("[product_budget.orders]\nmax_usd = 0\n").unwrap();
         assert!(validate_product_budget_limits(&zero).is_empty());
     }
 
     #[test]
     fn load_rocky_config_rejects_a_negative_product_budget() {
-        let (_d, path) = write_cfg(
-            "[adapter]\ntype = \"duckdb\"\n\n[product_budget.orders]\nmax_usd = -1.0\n",
-        );
+        let (_d, path) =
+            write_cfg("[adapter]\ntype = \"duckdb\"\n\n[product_budget.orders]\nmax_usd = -1.0\n");
         let err = load_rocky_config(&path).expect_err("a negative limit must not load");
         assert!(format!("{err:#}").contains("max_usd"), "{err:#}");
     }

@@ -8,6 +8,27 @@ from enum import StrEnum
 from pydantic import AwareDatetime, BaseModel, conint
 
 
+class CostSplitBasis(StrEnum):
+    """
+    How a table version's cost was split across the models that read it.
+    """
+
+    bytes = "bytes"
+    estimated_bytes = "estimated_bytes"
+    rows_scanned_unweighted = "rows_scanned_unweighted"
+    owner_pays = "owner_pays"
+
+
+class CostUnit(StrEnum):
+    """
+    A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.
+    """
+
+    compute_ms = "compute_ms"
+    storage_byte_hours_data_files = "storage_byte_hours_data_files"
+    storage_byte_hours_allocated_blocks = "storage_byte_hours_allocated_blocks"
+
+
 class EstimateBasis1(StrEnum):
     """
     From run start to the product's output model finishing.
@@ -40,6 +61,29 @@ class EstimateState2(StrEnum):
     unknown = "unknown"
 
 
+class MoneyFigure(StrEnum):
+    """
+    What a [`MoneyPart`] prices.
+    """
+
+    compute = "compute"
+    storage_data_files = "storage_data_files"
+    storage_allocated_blocks = "storage_allocated_blocks"
+    egress = "egress"
+    ai_tokens = "ai_tokens"
+
+
+class MoneyStatus(StrEnum):
+    """
+    Whether a money figure in the monthly report could be computed.
+    """
+
+    priced = "priced"
+    no_price = "no_price"
+    not_measured = "not_measured"
+    partial = "partial"
+
+
 class ProductApprovalOutput(BaseModel):
     """
     The approval record, as echoed by compile/status output.
@@ -61,6 +105,55 @@ class ProductApprovalOutput(BaseModel):
     """
     The approved `sha256:<hex>` spec digest.
     """
+
+
+class ProductBudgetBreachAction(StrEnum):
+    """
+    What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.
+    """
+
+    warn = "warn"
+
+
+class ProductBudgetLimitType(StrEnum):
+    """
+    Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
+    """
+
+    max_compute_hours = "max_compute_hours"
+    max_storage_gb_month = "max_storage_gb_month"
+    max_usd = "max_usd"
+
+
+class ProductBudgetVerdict(StrEnum):
+    """
+    The verdict of a monthly product budget, or of one of its limits.
+    """
+
+    in_budget = "in_budget"
+    breached = "breached"
+    not_evaluated = "not_evaluated"
+
+
+class SharedNotChargedCost(BaseModel):
+    """
+    A share of an owned table's cost that a reader did not pay.
+    """
+
+    amount: conint(ge=0)
+    """
+    The reader's share. It stays with the table's owner.
+    """
+    basis: CostSplitBasis
+    reader: str
+    """
+    The model that read it.
+    """
+    table: str
+    """
+    The owned model whose table was read.
+    """
+    unit: CostUnit
 
 
 class VolumeSeverity1(StrEnum):
@@ -111,6 +204,47 @@ class VolumeVerdict4(StrEnum):
     not_evaluated = "not_evaluated"
 
 
+class AllocatedUpstreamCost(BaseModel):
+    """
+    What a product paid for one table it reads, in one unit.
+    """
+
+    amount: conint(ge=0)
+    """
+    What this product was charged.
+    """
+    basis: CostSplitBasis
+    low_confidence: bool
+    """
+    The scan was so small that the proportions say little.
+    """
+    of_total: conint(ge=0)
+    """
+    The whole cost that was split, so `amount / of_total` is the share.
+    """
+    provisional: bool
+    """
+    The table has not been rebuilt since, in a month that is not over: a later reader can still change this share.
+    """
+    table: str
+    """
+    The model whose table was read.
+    """
+    unit: CostUnit
+
+
+class CostAmount(BaseModel):
+    """
+    A whole-number amount in one [`CostUnit`].
+    """
+
+    amount: conint(ge=0)
+    """
+    Whole units. Milliseconds, or byte-hours rounded down per interval.
+    """
+    unit: CostUnit
+
+
 class DurationEstimateStatus(BaseModel):
     """
     A p50/p90 duration estimate and the sample behind it.
@@ -143,6 +277,70 @@ class DurationEstimateStatus(BaseModel):
     window: conint(ge=0)
     """
     The most runs it reads (the newest 20).
+    """
+
+
+class MoneyPart(BaseModel):
+    """
+    One figure of a monthly money total.
+    """
+
+    figure: MoneyFigure
+    status: MoneyStatus
+    usd: float | None = None
+    """
+    USD. Present only when `status` is `priced`.
+    """
+
+
+class ProductBudgetCheck(BaseModel):
+    """
+    One limit of a product budget, checked against the product's charge.
+    """
+
+    actual: float | None = None
+    """
+    The month-to-date figure the limit tests. Absent when it is not known.
+    """
+    limit: float
+    """
+    The configured limit.
+    """
+    limit_type: ProductBudgetLimitType
+    reason: str | None = None
+    """
+    Why the limit is `not_evaluated`.
+    """
+    unit: CostUnit | None = None
+    """
+    For `max_storage_gb_month`, the storage basis checked. Absent for the other limits.
+    """
+    verdict: ProductBudgetVerdict
+    """
+    `breached` when `actual` is greater than `limit`. Equal is in budget.
+    """
+
+
+class ProductBudgetStatus(BaseModel):
+    """
+    A product's monthly budget, checked once.
+    """
+
+    checks: list[ProductBudgetCheck]
+    """
+    One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).
+    """
+    on_breach: ProductBudgetBreachAction
+    """
+    What a breach does. Only `warn`: the run's exit code does not change.
+    """
+    reasons: list[str] | None = None
+    """
+    Why the budget as a whole is `not_evaluated`, when it is.
+    """
+    verdict: ProductBudgetVerdict
+    """
+    `breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`.
     """
 
 
@@ -273,6 +471,108 @@ class DeliveryStatus(BaseModel):
     """
 
 
+class ProductBudgetBreachEvent(BaseModel):
+    """
+    One time a product went over its monthly budget.
+    """
+
+    at: str
+    """
+    When that run finished (RFC 3339). The budget was checked as of then.
+    """
+    breached: list[ProductBudgetCheck]
+    """
+    The limits that were exceeded at that run.
+    """
+    run_id: str
+    """
+    The production run after which the product was first over.
+    """
+
+
+class ProductMonthCost(BaseModel):
+    """
+    One product's month inside [`ProductMonthCostOutput`].
+    """
+
+    allocated_upstream: list[AllocatedUpstreamCost]
+    """
+    What the product pays for tables it reads.
+    """
+    breach_events: list[ProductBudgetBreachEvent] | None = None
+    """
+    Each time this month the product went over its budget, in run order. Found by checking the budget again after each production run of the month. A product that goes over, back under and over again has two events. An event is never withdrawn, even when a later run moves the product back under. Empty (and omitted) when there was none.
+    """
+    budget: ProductBudgetStatus | None = None
+    """
+    The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget.
+    """
+    built: list[CostAmount]
+    """
+    What the product's own executions cost, before any split. A memo for reading `kept` beside it: it is never summed and is not part of the invariant.
+    """
+    charged: list[CostAmount]
+    """
+    What the product is charged: `kept` plus `allocated_upstream`.
+    """
+    kept: list[CostAmount]
+    """
+    The part of `built` the product still pays after other products pay for what they read.
+    """
+    money: float | None = None
+    """
+    `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.
+    """
+    money_parts: list[MoneyPart]
+    """
+    `charged` priced one figure at a time.
+    """
+    money_status: MoneyStatus
+    """
+    Why `money` is or is not present.
+    """
+    output_model: str
+    """
+    The model the product owns.
+    """
+    owner_residual: list[CostAmount]
+    """
+    The part of `kept` that came back from readers outside every product.
+    """
+    product: str
+    shared_not_charged: list[SharedNotChargedCost]
+    """
+    Shares of the product's tables that readers did not pay.
+    """
+
+
+class ProductCostMonth(BaseModel):
+    """
+    One product's current month, on `rocky product status`.
+    """
+
+    as_of: str
+    """
+    The instant the month was computed (RFC 3339).
+    """
+    cost: ProductMonthCost
+    """
+    The product's row from `rocky cost --month <month> --by product`.
+    """
+    history_complete: bool
+    """
+    Whether run history reaches back far enough to cover the month.
+    """
+    month: str
+    """
+    The month, `YYYY-MM`, in `timezone`.
+    """
+    timezone: str
+    """
+    The project's `[schedule].timezone`.
+    """
+
+
 class ProductStatusOutput(BaseModel):
     """
     JSON output of `rocky product status`.
@@ -294,6 +594,14 @@ class ProductStatusOutput(BaseModel):
     committed_spec_digest: str | None = None
     """
     The committed manifest's spec digest, when one exists.
+    """
+    cost_month: ProductCostMonth | None = None
+    """
+    The product's cost for the current month (in the project's `[schedule].timezone`), with its `[product_budget.<name>]` verdict and breach events when it has a budget: its row from `rocky cost --month <month> --by product`. Present only from `rocky product status`, and only when the spec parses and the product owns a model.
+    """
+    cost_month_error: str | None = None
+    """
+    Why `cost_month` could not be computed, when it could not.
     """
     delivery: DeliveryStatus | None = None
     """
