@@ -3926,6 +3926,15 @@ pub struct AiContractOutput {
     /// emits went unreported. Empty when every declared column exists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_columns: Vec<String>,
+    /// `nullable = false` claims the draft withheld, one message per column.
+    ///
+    /// The column had no NULLs in the profiled table, but Rocky cannot prove
+    /// it non-null from the model SQL and the source schemas it has, so
+    /// `E012` would refuse the claim. The draft leaves `nullable` unset for
+    /// it, which promises nothing, instead of writing `nullable = true`.
+    /// Empty when every `nullable = false` in the draft was proven.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproven_non_null: Vec<String>,
 }
 
 /// Observed profile of one column, as reported by `rocky ai-contract`.

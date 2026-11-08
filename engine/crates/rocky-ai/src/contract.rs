@@ -79,6 +79,16 @@ pub struct DraftedContract {
     /// is missing fails the draft as `E010`; an optional one only warns, so
     /// an LLM that invented a column name was never contradicted.
     pub unmatched_columns: Vec<String>,
+    /// `nullable = false` claims the draft made and the loop withheld.
+    ///
+    /// Each column had no NULLs in the profiled table, but Rocky cannot
+    /// prove it non-null from the model SQL and the source schemas it has.
+    /// `E012` refuses an unproven `nullable = false`, so the loop drops the
+    /// `nullable` key for that column (which promises nothing) instead of
+    /// sending the `E012` to the LLM, whose retry rewrote it to
+    /// `nullable = true`. One message per column. Empty when every
+    /// `nullable = false` in the draft was proven.
+    pub unproven_non_null: Vec<String>,
 }
 
 /// Map a Rocky `Display` type rendering (e.g. `INT64`, `DECIMAL(10,2)`) to the
@@ -177,6 +187,8 @@ pub fn build_system_prompt() -> String {
          ```\n\n",
     );
     p.push_str("# Rules\n\n");
+    // The `nullable = false` rule below follows the data alone. A claim Rocky
+    // cannot prove is withheld by `withhold_unproven_non_null`, not retried.
     p.push_str(
         "- Use ONLY the `type` names listed above; they must match the observed type for each column.\n\
          - Set `nullable = false` for any column with an observed null_rate of exactly 0; otherwise leave it nullable.\n\
@@ -218,20 +230,25 @@ struct VerifiedContract {
     /// `W010` messages: optional columns the draft declares that the model
     /// does not produce.
     unmatched_columns: Vec<String>,
+    /// `nullable = false` claims withheld because Rocky could not prove them.
+    /// See [`withhold_unproven_non_null`].
+    unproven_non_null: Vec<String>,
 }
 
 fn verify_contract_toml(
     toml_body: &str,
-    model_name: &str,
+    profile: &TableProfile,
     inferred_schema: &[TypedColumn],
 ) -> Result<VerifiedContract, String> {
     if toml_body.trim().is_empty() {
         return Err("generated contract is empty".to_string());
     }
-    let contract: CompilerContract =
+    let mut contract: CompilerContract =
         toml::from_str(toml_body).map_err(|e| format!("contract TOML parse error: {e}"))?;
 
-    let diagnostics = validate_contract(model_name, inferred_schema, &contract);
+    let unproven_non_null = withhold_unproven_non_null(&mut contract, profile, inferred_schema);
+
+    let diagnostics = validate_contract(&profile.model, inferred_schema, &contract);
     let errors: Vec<String> = diagnostics
         .iter()
         .filter(|d| d.is_error())
@@ -266,7 +283,72 @@ fn verify_contract_toml(
         contract,
         unverified_types: collect_code(rocky_compiler::diagnostic::I003),
         unmatched_columns: collect_code(rocky_compiler::diagnostic::W010),
+        unproven_non_null,
     })
+}
+
+/// Drop each `nullable = false` the data supports but Rocky cannot prove.
+///
+/// A contract's `nullable = false` is a promise Rocky must prove from the
+/// model SQL and the source schemas (ADR-CONTRACTS §4). A source column with
+/// no `NOT NULL` constraint, or one whose schema Rocky does not have, is not
+/// proven non-null, so `E012` refuses the claim. That refusal is right. But
+/// the drafter used to hand it to the LLM as retry context, and the only
+/// change the LLM can make to a contract is to write `nullable = true`. The
+/// retry then recorded "may be NULL" for a column the profile showed holds
+/// no NULL at all.
+///
+/// The drafter can tell the cases apart, because it has the profile:
+///
+/// | Rocky's inference       | profiled NULLs  | the draft's `nullable = false` |
+/// |-------------------------|-----------------|--------------------------------|
+/// | proven non-null         | any             | kept; `E012` cannot fire       |
+/// | not proven (or unknown) | 0, in rows > 0  | withheld here and reported     |
+/// | not proven (or unknown) | > 0, or no rows | kept; `E012` goes to the retry |
+///
+/// "Not proven" covers both a column Rocky knows may be NULL and one whose
+/// nullability it does not know: `TypedColumn::nullable` is `true` for both.
+/// Zero profiled NULLs is evidence about today's table, not proof about
+/// future runs, which is why the claim is dropped rather than kept.
+/// The withheld column keeps every other key, so its type and its place in
+/// `required` / `protected` still go through validation. Withholding only
+/// weakens the draft; it never makes it claim non-null. Returns one message
+/// per withheld column.
+fn withhold_unproven_non_null(
+    contract: &mut CompilerContract,
+    profile: &TableProfile,
+    inferred_schema: &[TypedColumn],
+) -> Vec<String> {
+    let mut withheld = Vec::new();
+    for column in &mut contract.columns {
+        if column.nullable != Some(false) {
+            continue;
+        }
+        // A column the model does not produce is left to E010 / W010.
+        let Some(inferred) = inferred_schema.iter().find(|c| c.name == column.name) else {
+            continue;
+        };
+        if !inferred.nullable {
+            continue;
+        }
+        let Some(observed) = profile.columns.iter().find(|c| c.name == column.name) else {
+            continue;
+        };
+        if observed.rows == 0 || observed.nulls != 0 {
+            continue;
+        }
+        column.nullable = None;
+        withheld.push(format!(
+            "column '{}' had no NULLs in {} profiled row(s), but Rocky cannot prove it is \
+             non-null from the model SQL and the source schemas it has, so the draft leaves \
+             `nullable` unset. To make `nullable = false` checkable, COALESCE it to a non-NULL \
+             default in the model. A NOT NULL source column also works, but only once Rocky's \
+             schema cache holds that table: a replication pipeline's `rocky run` or `rocky \
+             discover --with-schemas` can fill it; a transformation-only pipeline does not",
+            column.name, observed.rows
+        ));
+    }
+    withheld
 }
 
 /// Draft a data contract for a model from its observed profile.
@@ -298,7 +380,7 @@ pub async fn draft_contract(
             consumed_output_tokens.saturating_add(response.output_tokens.unwrap_or(0));
 
         let toml_body = extract_toml(&response.content);
-        match verify_contract_toml(&toml_body, &profile.model, inferred_schema) {
+        match verify_contract_toml(&toml_body, profile, inferred_schema) {
             Ok(verified) => {
                 // Re-serialize from the parsed struct so the on-disk file is
                 // canonical TOML regardless of the LLM's formatting.
@@ -312,6 +394,7 @@ pub async fn draft_contract(
                     attempts: attempt,
                     unverified_types: verified.unverified_types,
                     unmatched_columns: verified.unmatched_columns,
+                    unproven_non_null: verified.unproven_non_null,
                 });
             }
             Err(errors) => {
@@ -474,7 +557,8 @@ nullable = false
 required = ["id"]
 protected = ["id"]
 "#;
-        let verified = verify_contract_toml(toml_body, "orders", &schema).expect("should verify");
+        let verified =
+            verify_contract_toml(toml_body, &sample_profile(), &schema).expect("should verify");
         assert_eq!(verified.contract.columns.len(), 2);
         assert_eq!(verified.contract.rules.required, vec!["id".to_string()]);
         assert!(
@@ -505,7 +589,8 @@ type = "Int64"
 name = "invented"
 type = "String"
 "#;
-        let verified = verify_contract_toml(toml_body, "orders", &schema).expect("should verify");
+        let verified =
+            verify_contract_toml(toml_body, &sample_profile(), &schema).expect("should verify");
         assert_eq!(
             verified.unmatched_columns.len(),
             1,
@@ -538,7 +623,8 @@ type = "Int64"
 name = "amount"
 type = "Decimal"
 "#;
-        let verified = verify_contract_toml(toml_body, "orders", &schema).expect("should verify");
+        let verified =
+            verify_contract_toml(toml_body, &sample_profile(), &schema).expect("should verify");
         assert_eq!(
             verified.unverified_types.len(),
             1,
@@ -561,7 +647,7 @@ type = "Decimal"
 [rules]
 required = ["email"]
 "#;
-        let err = verify_contract_toml(toml_body, "orders", &schema).unwrap_err();
+        let err = verify_contract_toml(toml_body, &sample_profile(), &schema).unwrap_err();
         assert!(err.contains("E010"), "expected E010 in: {err}");
     }
 
@@ -573,21 +659,175 @@ required = ["email"]
 name = "id"
 type = "String"
 "#;
-        let err = verify_contract_toml(toml_body, "orders", &schema).unwrap_err();
+        let err = verify_contract_toml(toml_body, &sample_profile(), &schema).unwrap_err();
         assert!(err.contains("E011"), "expected E011 in: {err}");
     }
 
     #[test]
     fn verify_rejects_unparseable_toml() {
         let schema = vec![tc("id", RockyType::Int64, false)];
-        let err = verify_contract_toml("this is = = not toml", "orders", &schema).unwrap_err();
+        let err =
+            verify_contract_toml("this is = = not toml", &sample_profile(), &schema).unwrap_err();
         assert!(err.contains("parse error"), "got: {err}");
     }
 
     #[test]
     fn verify_rejects_empty_body() {
         let schema = vec![tc("id", RockyType::Int64, false)];
-        let err = verify_contract_toml("   ", "orders", &schema).unwrap_err();
+        let err = verify_contract_toml("   ", &sample_profile(), &schema).unwrap_err();
         assert!(err.contains("empty"), "got: {err}");
+    }
+
+    /// A one-table profile: `rows` rows, `nulls` of them NULL in each column.
+    fn profile_of(model: &str, columns: &[&str], rows: u64, nulls: u64) -> TableProfile {
+        TableProfile {
+            model: model.to_string(),
+            columns: columns
+                .iter()
+                .map(|name| ColumnProfile {
+                    name: (*name).to_string(),
+                    type_name: "Unknown".to_string(),
+                    rows,
+                    nulls,
+                    null_rate: if rows == 0 {
+                        0.0
+                    } else {
+                        nulls as f64 / rows as f64
+                    },
+                    distinct: rows,
+                    observed_values: vec![],
+                    min: None,
+                    max: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn non_null_draft(columns: &[&str]) -> String {
+        columns
+            .iter()
+            .map(|c| format!("[[columns]]\nname = \"{c}\"\nnullable = false\n\n"))
+            .collect::<String>()
+            + &format!(
+                "[rules]\nrequired = [{}]\n",
+                columns
+                    .iter()
+                    .map(|c| format!("\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+    }
+
+    /// The reproduction. A passthrough model over a source whose schema Rocky
+    /// does not have (a cold schema cache) infers every column as
+    /// `(Unknown, nullable)`. The profile shows no NULL in any of 500 rows,
+    /// so the LLM drafts `nullable = false` for each. That used to fail as
+    /// six `E012`s, and the retry rewrote all six to `nullable = true`. The
+    /// draft must now pass on the first attempt, with `nullable` unset (not
+    /// `true`) and each withheld claim reported.
+    #[test]
+    fn unproven_non_null_on_a_passthrough_is_withheld_not_flipped() {
+        let cols = [
+            "order_id",
+            "customer_id",
+            "product_id",
+            "amount",
+            "status",
+            "order_date",
+        ];
+        let schema: Vec<TypedColumn> = cols
+            .iter()
+            .map(|c| tc(c, RockyType::Unknown, true))
+            .collect();
+        let profile = profile_of("raw_orders", &cols, 500, 0);
+
+        let verified = verify_contract_toml(&non_null_draft(&cols), &profile, &schema)
+            .expect("an unproven but observed non-null column must not fail the draft");
+
+        for column in &verified.contract.columns {
+            assert_eq!(
+                column.nullable, None,
+                "'{}' must be left unset, never `nullable = true` or an unproven `false`",
+                column.name
+            );
+        }
+        assert_eq!(verified.unproven_non_null.len(), cols.len());
+        for (message, col) in verified.unproven_non_null.iter().zip(cols) {
+            assert!(
+                message.contains(&format!("'{col}'")) && message.contains("500"),
+                "the message names the column and the evidence: {message}"
+            );
+        }
+        // The rest of the draft still went through validation.
+        assert_eq!(verified.contract.rules.required.len(), cols.len());
+    }
+
+    /// Proven non-null: Rocky's inference says the column cannot hold NULL
+    /// (for example a `NOT NULL` source column passed through), so the draft's
+    /// `nullable = false` is kept and nothing is reported.
+    #[test]
+    fn proven_non_null_keeps_the_claim() {
+        let schema = vec![tc("id", RockyType::Int64, false)];
+        let profile = profile_of("orders", &["id"], 10, 0);
+        let verified = verify_contract_toml(&non_null_draft(&["id"]), &profile, &schema)
+            .expect("a proven non-null column verifies");
+        assert_eq!(verified.contract.columns[0].nullable, Some(false));
+        assert!(verified.unproven_non_null.is_empty());
+    }
+
+    /// A column Rocky KNOWS may be NULL (a typed source column with no
+    /// `NOT NULL`, or a LEFT JOIN's null-extended side) that held no NULL in
+    /// the profile is withheld too, while a proven column in the same draft
+    /// keeps its `nullable = false`.
+    #[test]
+    fn a_known_nullable_column_is_withheld_beside_a_proven_one() {
+        let schema = vec![
+            tc("id", RockyType::Int64, false),
+            tc("customer_id", RockyType::Int64, true),
+        ];
+        let profile = profile_of("orders", &["id", "customer_id"], 10, 0);
+        let verified =
+            verify_contract_toml(&non_null_draft(&["id", "customer_id"]), &profile, &schema)
+                .expect("the draft verifies");
+        assert_eq!(verified.contract.columns[0].nullable, Some(false));
+        assert_eq!(verified.contract.columns[1].nullable, None);
+        assert_eq!(verified.unproven_non_null.len(), 1);
+        assert!(verified.unproven_non_null[0].contains("'customer_id'"));
+    }
+
+    /// Proven nullable, and the data agrees: the profile counted NULLs, so the
+    /// draft's `nullable = false` contradicts its own evidence. `E012` still
+    /// fails the attempt and goes back to the LLM.
+    #[test]
+    fn a_column_with_observed_nulls_still_fails_e012() {
+        for ty in [RockyType::Int64, RockyType::Unknown] {
+            let schema = vec![tc("id", ty.clone(), true)];
+            let profile = profile_of("orders", &["id"], 10, 3);
+            let err = verify_contract_toml(&non_null_draft(&["id"]), &profile, &schema)
+                .expect_err("observed NULLs must not be withheld");
+            assert!(err.contains("E012"), "{ty:?}: expected E012 in: {err}");
+        }
+    }
+
+    /// Unknown with no evidence: an empty table proves nothing either way, so
+    /// the unproven claim is not withheld and `E012` still fires.
+    #[test]
+    fn an_empty_profile_is_not_evidence_of_non_null() {
+        let schema = vec![tc("id", RockyType::Unknown, true)];
+        let profile = profile_of("orders", &["id"], 0, 0);
+        let err = verify_contract_toml(&non_null_draft(&["id"]), &profile, &schema)
+            .expect_err("zero rows is not evidence");
+        assert!(err.contains("E012"), "expected E012 in: {err}");
+    }
+
+    /// A column the profile does not cover is not withheld: there is no
+    /// evidence for it, so `E012` still fires.
+    #[test]
+    fn a_column_missing_from_the_profile_is_not_withheld() {
+        let schema = vec![tc("id", RockyType::Unknown, true)];
+        let profile = profile_of("orders", &["other"], 10, 0);
+        let err = verify_contract_toml(&non_null_draft(&["id"]), &profile, &schema)
+            .expect_err("no profile, no evidence");
+        assert!(err.contains("E012"), "expected E012 in: {err}");
     }
 }
