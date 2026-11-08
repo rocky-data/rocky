@@ -2227,9 +2227,10 @@ fn breaking_block_output(
 /// - `Some(findings)` when both refs compiled cleanly and the typed-IR diff
 ///   ran. `findings` is the full classified list, including `Info`-severity
 ///   entries — the caller filters on [`BreakingFinding::is_breaking`].
-/// - `None` when the gate was skipped: the models directory is missing or
-///   empty, the base ref has no models, or there is no git history (no
-///   repository, or no commits yet). A `BreakingChangesGateSkipped` audit event is appended to
+/// - `None` when the gate was skipped: the base ref has no models, or there
+///   is no git history (no repository, or no commits yet). A HEAD with no
+///   models (the models directory is missing or empty) does not skip on its
+///   own: when the base has models, each one is a breaking `ModelRemoved`. A `BreakingChangesGateSkipped` audit event is appended to
 ///   `audit` carrying the human-readable reason.
 /// - `Err` when the gate cannot run and must refuse: the config is present
 ///   and unreadable (#1702), HEAD does not compile, the base ref names no
@@ -2258,16 +2259,12 @@ fn evaluate_breaking_change_gate(
         });
     };
 
-    if !models_dir.is_dir() {
-        push_skip(
-            audit,
-            format!(
-                "models directory '{}' is missing — gate skipped",
-                models_dir.display()
-            ),
-        );
-        return Ok(None);
-    }
+    // A HEAD with no models does not skip on its own. A branch that deletes
+    // every model leaves the directory missing or empty, and the base still
+    // holds the models it deleted: that is a change to gate. HEAD's model
+    // set is `None` below and the base decides. No models there either
+    // skips; models there diff against an empty HEAD as removals.
+    let head_has_dir = models_dir.is_dir();
 
     // Seed both compiles with the cached source schemas so the resulting
     // IR uses real types rather than `Unknown`.
@@ -2315,15 +2312,13 @@ fn evaluate_breaking_change_gate(
         // through (the caller reads `None` as "proceed"). Same rule as the
         // unreadable config above: a gate that examined nothing has not
         // passed.
-        match compile::compile(&config) {
-            Ok(r) => r,
-            // An empty models directory is the missing-directory case: there
-            // is nothing at HEAD to compare, so it skips.
-            Err(e) if is_no_models(&e) => {
-                push_skip(audit, format!("{e} — gate skipped"));
-                return Ok(None);
-            }
-            Err(e) => {
+        match head_has_dir.then(|| compile::compile(&config)) {
+            // A missing models directory holds no models at HEAD.
+            None => None,
+            Some(Ok(r)) => Some(r),
+            // An empty models directory is the missing-directory case.
+            Some(Err(e)) if is_no_models(&e) => None,
+            Some(Err(e)) => {
                 return Err(anyhow::anyhow!(
                     "cannot evaluate the breaking-change gate: the models in {} do not \
                      compile: {e}. A promote past a gate that could not compile HEAD would \
@@ -2364,8 +2359,23 @@ fn evaluate_breaking_change_gate(
     };
 
     let base_ir = compile_result_to_project_ir(&base_compile);
-    let head_ir = compile_result_to_project_ir(&head_compile);
+    // The base has models. A HEAD with none removes every one of them, and
+    // the diff reports each as a breaking `ModelRemoved`.
+    let head_ir = match &head_compile {
+        Some(compile) => compile_result_to_project_ir(compile),
+        None => empty_project_ir(),
+    };
     Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
+}
+
+/// The project IR of a HEAD that holds no models. Diffed against a base that
+/// has models, it reports every base model as removed.
+pub(crate) fn empty_project_ir() -> ProjectIr {
+    ProjectIr {
+        models: Vec::new(),
+        dag: Vec::new(),
+        lineage_edges: Vec::new(),
+    }
 }
 
 /// What a breaking-change gate (branch promote and `rocky review`) does when
@@ -2396,7 +2406,8 @@ pub(crate) fn base_compile_gate_action(
 }
 
 /// Whether a HEAD compile failed only because the models directory (or its
-/// glob) holds no models. That is "nothing to compare", not a compile error.
+/// glob) holds no models. That is not a compile error: the gates compare the
+/// base against an empty HEAD.
 pub(crate) fn is_no_models(error: &rocky_compiler::compile::CompileError) -> bool {
     matches!(
         error,
@@ -4156,6 +4167,92 @@ mod tests {
         );
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
+    }
+
+    /// A branch that deletes every model is a change to gate. Before, a HEAD
+    /// with no models skipped the gate and the promote went through. Both
+    /// shapes a deletion leaves are covered: the directory gone (what a git
+    /// checkout of the commit leaves) and the directory kept but empty. Each
+    /// base model comes back as a breaking `ModelRemoved`, so the promote
+    /// refuses without `--allow-breaking`.
+    #[test]
+    fn gate_reports_removals_when_head_deletes_every_model() {
+        let _cwd_guard = cwd_lock();
+        for remove_dir in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+            let models_dir = init_git_repo_with_models(dir, rocky_toml, &[]);
+            write_two_model_chain(&models_dir, "id, name");
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?} failed");
+            };
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "models"]);
+            if remove_dir {
+                std::fs::remove_dir_all(&models_dir).unwrap();
+            } else {
+                for entry in std::fs::read_dir(&models_dir).unwrap() {
+                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                }
+            }
+
+            let mut audit: Vec<AuditEvent> = Vec::new();
+            let findings = run_gate_in(dir, &models_dir, &mut audit)
+                .expect("the gate must not refuse: the base compiles")
+                .unwrap_or_else(|| {
+                    panic!("a HEAD with no models is gated (remove_dir={remove_dir})")
+                });
+            let removed: Vec<&str> = findings
+                .iter()
+                .filter(|f| f.is_breaking())
+                .filter_map(|f| match &f.change {
+                    rocky_core::breaking_change::BreakingChange::ModelRemoved { model } => {
+                        Some(model.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                removed.len(),
+                2,
+                "both base models are breaking removals (remove_dir={remove_dir}): {findings:?}"
+            );
+            assert!(
+                audit.is_empty(),
+                "a gate that ran records no skip: {audit:?}"
+            );
+        }
+    }
+
+    /// Both sides empty still skips, in a repository whose base holds no
+    /// models and whose HEAD directory is missing or empty.
+    #[test]
+    fn gate_skips_when_neither_head_nor_base_has_models() {
+        let _cwd_guard = cwd_lock();
+        for remove_dir in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            let rocky_toml = "[adapters.duckdb]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+            let models_dir = init_git_repo_with_models(dir, rocky_toml, &[]);
+            if remove_dir {
+                std::fs::remove_dir_all(&models_dir).unwrap();
+            }
+            let mut audit: Vec<AuditEvent> = Vec::new();
+            let findings = run_gate_in(dir, &models_dir, &mut audit)
+                .expect("an empty project does not refuse");
+            assert!(
+                findings.is_none(),
+                "nothing to compare skips (remove_dir={remove_dir})"
+            );
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
+        }
     }
 
     /// Run the gate from inside `dir`, holding the caller's cwd lock.
