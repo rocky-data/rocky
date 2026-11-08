@@ -707,6 +707,29 @@ struct PlannedDag {
     ephemeral_nodes: HashSet<NodeId>,
 }
 
+/// Refuse a `--dag` run when a transformation pipeline's models directory
+/// does not exist and the pipeline does not set `allow_empty_models = true`.
+/// The same rule, and the same error, as a single-pipeline `rocky run`. A
+/// `--dag` run executes every pipeline, so every missing one is checked; the
+/// first in config order is named. Called while planning, before any node
+/// runs or any state is written.
+fn refuse_missing_models_dirs(
+    cfg: &rocky_core::config::RockyConfig,
+    missing_roots: &[(String, std::path::PathBuf)],
+) -> Result<()> {
+    use rocky_core::config::PipelineConfig;
+    for (pipeline, dir) in missing_roots {
+        let allowed = matches!(
+            cfg.pipelines.get(pipeline),
+            Some(PipelineConfig::Transformation(t)) if t.allow_empty_models
+        );
+        if !allowed {
+            return Err(super::run_local::missing_models_dir_error(dir, pipeline));
+        }
+    }
+    Ok(())
+}
+
 /// Load the project's models and seeds and build the graph `--dag` executes.
 ///
 /// Everything [`run_with_dag`] does before it dispatches a node, split out so
@@ -726,7 +749,9 @@ fn plan_runtime_dag(
     // validate a `models/` directory that only transformation pipelines
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
-    let mut models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
+    let loaded_models = load_transformation_models(config_path, cfg)?;
+    refuse_missing_models_dirs(cfg, &loaded_models.missing_roots)?;
+    let mut models_by_pipeline = loaded_models.by_pipeline;
     // Each node's sub-run compiles its model with `@var()` replaced by the
     // `--var` value, or its inline default when none was supplied. The graph
     // reads the same SQL with the same map, so a model whose `@var()` would
@@ -3154,7 +3179,8 @@ mod tests {
                  type = \"duckdb\"\n\
                  path = \"{}\"\n\n\
                  [pipeline.silver]\n\
-                 type = \"transformation\"\n\n\
+                 type = \"transformation\"\n\
+                 allow_empty_models = true\n\n\
                  [pipeline.silver.target]\n\
                  adapter = \"local\"\n\n\
                  [pipeline.silver.target.governance]\n\
@@ -3816,6 +3842,87 @@ mod tests {
     ///
     /// Mutation that must turn this red: pass `RunVars::new()` to
     /// `substitute_run_vars` in `plan_runtime_dag`.
+    /// A `--dag` run follows the single-pipeline rule: a transformation
+    /// pipeline whose models directory is missing refuses the plan, before
+    /// any node runs, unless it sets `allow_empty_models = true`. Before, the
+    /// absence was recorded and ignored, so a mistyped glob built zero nodes
+    /// for that pipeline and the run exited 0.
+    #[test]
+    fn run_dag_refuses_a_missing_models_dir_unless_allowed() {
+        for allow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = if allow {
+                "allow_empty_models = true\n"
+            } else {
+                ""
+            };
+            let pipelines = format!(
+                "{}[pipeline.gone]\ntype = \"transformation\"\nmodels = \"missing/**\"\n{key}\n\
+                 [pipeline.gone.target]\nadapter = \"local\"\n\n",
+                transformation_block("t")
+            );
+            write_fixture_project(
+                dir.path(),
+                &pipelines,
+                &[("a", "db", "main", "a", "SELECT 1 AS id")],
+            );
+            let result = plan_fixture(dir.path());
+            if allow {
+                let planned = result.expect("allow_empty_models keeps the skip");
+                assert!(
+                    planned
+                        .runtime
+                        .dag
+                        .nodes
+                        .iter()
+                        .any(|n| n.id.0 == "transformation:a"),
+                    "the present pipeline still plans its model"
+                );
+            } else {
+                let Err(err) = result else {
+                    panic!("a missing dir must refuse");
+                };
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("missing")
+                        && msg.contains("does not exist")
+                        && msg.contains("allow_empty_models = true")
+                        && msg.contains("[pipeline.gone]"),
+                    "the refusal names the path and the key: {msg}"
+                );
+            }
+        }
+    }
+
+    /// An EXISTING empty models directory is not refused by `--dag`: that
+    /// pipeline contributes no nodes and the plan succeeds. Only a missing
+    /// directory is refused. (A single-pipeline `rocky run` fails on an empty
+    /// directory instead; see `run_local`.)
+    #[test]
+    fn run_dag_plans_an_existing_empty_models_dir_as_no_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipelines = format!(
+            "{}[pipeline.hollow]\ntype = \"transformation\"\nmodels = \"empty/**\"\n\n\
+             [pipeline.hollow.target]\nadapter = \"local\"\n\n",
+            transformation_block("t")
+        );
+        write_fixture_project(
+            dir.path(),
+            &pipelines,
+            &[("a", "db", "main", "a", "SELECT 1 AS id")],
+        );
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        let planned = plan_fixture(dir.path()).expect("an empty existing dir plans");
+        assert!(
+            planned
+                .runtime
+                .dag
+                .nodes
+                .iter()
+                .any(|n| n.id.0 == "transformation:a")
+        );
+    }
+
     #[test]
     fn run_dag_graph_builder_substitutes_the_supplied_var() {
         let dir = tempfile::tempdir().unwrap();

@@ -588,6 +588,7 @@ mod tests {
     fn transformation_pipeline(target_adapter: &str, depends_on: Vec<String>) -> PipelineConfig {
         PipelineConfig::Transformation(Box::new(TransformationPipelineConfig {
             models: "models/**".into(),
+            allow_empty_models: false,
             target: TransformationTargetConfig {
                 region: None,
                 adapter: target_adapter.into(),

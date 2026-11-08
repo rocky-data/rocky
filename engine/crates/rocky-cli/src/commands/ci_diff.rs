@@ -960,14 +960,58 @@ pub(crate) fn extract_base_compile_typed_in(
 /// `None` when the models directory cannot be resolved; the caller then
 /// reports that failure itself.
 fn models_repository_dir(models_dir: &Path) -> Option<PathBuf> {
-    let abs_models = std::fs::canonicalize(models_dir).ok()?;
-    let root = git_in(Some(&abs_models))
+    let (_, anchor) = resolve_models_path(models_dir).ok()?;
+    let root = git_in(Some(&anchor))
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    Some(root.unwrap_or(abs_models))
+    Some(root.unwrap_or(anchor))
+}
+
+/// Resolve `models_dir` to an absolute, canonical path, and name the
+/// directory git can run in to read its history.
+///
+/// A models directory that does not exist is still a path git can read at a
+/// base ref: a commit that deletes every model leaves no directory in the
+/// working tree, yet the base still holds the models it deleted. So a
+/// missing directory resolves through its nearest existing ancestor, and
+/// that ancestor is the directory git runs in. Only plain path components
+/// may follow the ancestor; a `..` or `.` there keeps the canonicalize error.
+///
+/// Returns `(absolute models path, existing directory to run git in)`.
+fn resolve_models_path(models_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    let error = match std::fs::canonicalize(models_dir) {
+        Ok(abs) => return Ok((abs.clone(), abs)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => e,
+        Err(e) => return Err(e),
+    };
+    let absolute = std::path::absolute(models_dir)?;
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut ancestor = absolute.as_path();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(anchor) => {
+                let mut abs = anchor.clone();
+                abs.extend(missing.iter().rev());
+                return Ok((abs, anchor));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+            return Err(error);
+        };
+        if !matches!(
+            ancestor.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        ) {
+            return Err(error);
+        }
+        missing.push(name);
+        ancestor = parent;
+    }
 }
 
 /// Why the models at a base ref could not be compiled.
@@ -1179,7 +1223,7 @@ fn find_models_relative_path(
             "could not determine models directory relative to repo root: {detail}"
         ))
     };
-    let abs_models = std::fs::canonicalize(models_dir)
+    let (abs_models, anchor) = resolve_models_path(models_dir)
         .map_err(|e| unreadable(format!("{}: {e}", models_dir.display())))?;
 
     // `LC_ALL=C` keeps git's "not a git repository" text in English, so the
@@ -1220,7 +1264,7 @@ fn find_models_relative_path(
     // The models sit outside the repository git was asked about. When no
     // repository holds them at all, they have no history: skip. When another
     // repository holds them, the base would be read from the wrong history.
-    let models_repo = git_in(Some(&abs_models))
+    let models_repo = git_in(Some(&anchor))
         .env("LC_ALL", "C")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -3443,6 +3487,56 @@ mod tests {
         );
         assert_eq!(changes.len(), 1);
         assert_eq!(changes["c.s.orders_sql"].status(), ModelDiffStatus::Added);
+    }
+
+    /// `resolve_models_path` edge cases. A present directory resolves to
+    /// itself. A missing one resolves under its nearest existing ancestor,
+    /// which git then runs in.
+    #[test]
+    fn resolve_models_path_present_and_missing() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("models")).unwrap();
+        let (abs, anchor) = resolve_models_path(&root.join("models")).unwrap();
+        assert_eq!(
+            (abs.as_path(), anchor.as_path()),
+            (root.join("models").as_path(), root.join("models").as_path())
+        );
+
+        let (abs, anchor) = resolve_models_path(&root.join("gone/deeper")).unwrap();
+        assert_eq!(abs, root.join("gone/deeper"));
+        assert_eq!(anchor, root, "git runs in the nearest existing ancestor");
+    }
+
+    /// A `..` after the missing part, or a FILE where a directory belongs,
+    /// keeps the error rather than resolving somewhere else.
+    #[test]
+    fn resolve_models_path_refuses_dot_dot_and_a_file_ancestor() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            resolve_models_path(&root.join("gone/../models")).is_err(),
+            "a `..` under a missing component must not resolve"
+        );
+        std::fs::write(root.join("file"), "x").unwrap();
+        assert!(
+            resolve_models_path(&root.join("file/models")).is_err(),
+            "a file ancestor is not a missing directory"
+        );
+    }
+
+    /// A dangling symlink is treated as missing: the path resolves under the
+    /// symlink's parent by its own name, which is the name git tracks. It
+    /// never follows the link to another directory's models.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_models_path_treats_a_dangling_symlink_as_missing() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("models")).unwrap();
+        let (abs, anchor) = resolve_models_path(&root.join("models")).unwrap();
+        assert_eq!(abs, root.join("models"));
+        assert_eq!(anchor, root);
     }
 
     #[test]

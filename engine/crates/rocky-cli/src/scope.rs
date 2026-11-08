@@ -400,6 +400,7 @@ table = "customers"
 
         let tx = rocky_core::config::TransformationPipelineConfig {
             models: "models/**".to_string(),
+            allow_empty_models: false,
             target: rocky_core::config::TransformationTargetConfig {
                 region: None,
                 adapter: "default".to_string(),
@@ -451,6 +452,7 @@ table = "secret"
         let tx = rocky_core::config::TransformationPipelineConfig {
             // Point at the sibling dir via `..`.
             models: "../escape_models".to_string(),
+            allow_empty_models: false,
             target: rocky_core::config::TransformationTargetConfig {
                 region: None,
                 adapter: "default".to_string(),
