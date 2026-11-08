@@ -2210,6 +2210,16 @@ def test_cost_by_product_forwards_the_month_and_parses_the_split():
                 "unallocated": [{"unit": "compute_ms", "amount": 5}],
                 "shadow_branch": [],
                 "measured_total": [{"unit": "compute_ms", "amount": 5}],
+                "measured_total_money": None,
+                "measured_total_money_status": "no_price",
+                "measured_total_money_parts": [
+                    {"figure": "compute", "status": "no_price", "usd": None}
+                ],
+                "unallocated_money": None,
+                "unallocated_money_status": "no_price",
+                "unallocated_money_parts": [
+                    {"figure": "compute", "status": "no_price", "usd": None}
+                ],
                 "not_measured": {
                     "failed_executions": 0,
                     "storage_unknown_tables": 0,
@@ -2224,6 +2234,7 @@ def test_cost_by_product_forwards_the_month_and_parses_the_split():
     assert captured[0] == ["cost", "--month", "2026-10", "--by", "product"]
     assert result.history_complete is True
     assert result.unallocated[0].amount == 5
+    assert result.unallocated_money_status == "no_price"
 
 
 # ---------------------------------------------------------------------------

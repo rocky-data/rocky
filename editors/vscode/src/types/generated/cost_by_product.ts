@@ -10,14 +10,22 @@
  */
 export type CostUnit = "compute_ms" | "storage_byte_hours_data_files" | "storage_byte_hours_allocated_blocks";
 /**
+ * What a [`MoneyPart`] prices.
+ */
+export type MoneyFigure = "compute" | "storage_data_files" | "storage_allocated_blocks" | "egress" | "ai_tokens";
+/**
+ * Whether a money figure in the monthly report could be computed.
+ */
+export type MoneyStatus = "priced" | "no_price" | "not_measured" | "partial";
+/**
  * How a table version's cost was split across the models that read it.
  */
 export type CostSplitBasis = "bytes" | "estimated_bytes" | "rows_scanned_unweighted" | "owner_pays";
 
 /**
- * `rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units. No money.
+ * `rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.
  *
- * For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation.
+ * For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.
  */
 export interface ProductMonthCostOutput {
   /**
@@ -36,6 +44,12 @@ export interface ProductMonthCostOutput {
    * Everything measured in production this month.
    */
   measured_total: CostAmount[];
+  /**
+   * `measured_total` in USD. Present only when `measured_total_money_status` is `priced`.
+   */
+  measured_total_money?: number | null;
+  measured_total_money_parts: MoneyPart[];
+  measured_total_money_status: MoneyStatus;
   /**
    * The month, `YYYY-MM`, in `timezone`.
    */
@@ -65,6 +79,12 @@ export interface ProductMonthCostOutput {
    * Cost of tables no product owns that no measured reader took.
    */
   unallocated: CostAmount[];
+  /**
+   * `unallocated` in USD. Present only when `unallocated_money_status` is `priced`.
+   */
+  unallocated_money?: number | null;
+  unallocated_money_parts: MoneyPart[];
+  unallocated_money_status: MoneyStatus;
   version: string;
   /**
    * Things that make the report less complete than it looks: a product spec that did not load, a model graph that could not be read.
@@ -81,6 +101,18 @@ export interface CostAmount {
    */
   amount: number;
   unit: CostUnit;
+  [k: string]: unknown;
+}
+/**
+ * One figure of a monthly money total.
+ */
+export interface MoneyPart {
+  figure: MoneyFigure;
+  status: MoneyStatus;
+  /**
+   * USD. Present only when `status` is `priced`.
+   */
+  usd?: number | null;
   [k: string]: unknown;
 }
 /**
@@ -121,6 +153,18 @@ export interface ProductMonthCost {
    * The part of `built` the product still pays after other products pay for what they read.
    */
   kept: CostAmount[];
+  /**
+   * `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.
+   */
+  money?: number | null;
+  /**
+   * `charged` priced one figure at a time.
+   */
+  money_parts: MoneyPart[];
+  /**
+   * Why `money` is or is not present.
+   */
+  money_status: MoneyStatus;
   /**
    * The model the product owns.
    */

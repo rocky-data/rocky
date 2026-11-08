@@ -113,6 +113,51 @@
       ],
       "type": "string"
     },
+    "MoneyFigure": {
+      "description": "What a [`MoneyPart`] prices.",
+      "enum": [
+        "compute",
+        "storage_data_files",
+        "storage_allocated_blocks",
+        "egress",
+        "ai_tokens"
+      ],
+      "type": "string"
+    },
+    "MoneyPart": {
+      "description": "One figure of a monthly money total.",
+      "properties": {
+        "figure": {
+          "$ref": "#/definitions/MoneyFigure"
+        },
+        "status": {
+          "$ref": "#/definitions/MoneyStatus"
+        },
+        "usd": {
+          "description": "USD. Present only when `status` is `priced`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "figure",
+        "status"
+      ],
+      "type": "object"
+    },
+    "MoneyStatus": {
+      "description": "Whether a money figure in the monthly report could be computed.",
+      "enum": [
+        "priced",
+        "no_price",
+        "not_measured",
+        "partial"
+      ],
+      "type": "string"
+    },
     "ProductMonthCost": {
       "description": "One product's month inside [`ProductMonthCostOutput`].",
       "properties": {
@@ -144,6 +189,29 @@
           },
           "type": "array"
         },
+        "money": {
+          "description": "`charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "money_parts": {
+          "description": "`charged` priced one figure at a time.",
+          "items": {
+            "$ref": "#/definitions/MoneyPart"
+          },
+          "type": "array"
+        },
+        "money_status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MoneyStatus"
+            }
+          ],
+          "description": "Why `money` is or is not present."
+        },
         "output_model": {
           "description": "The model the product owns.",
           "type": "string"
@@ -171,6 +239,8 @@
         "built",
         "charged",
         "kept",
+        "money_parts",
+        "money_status",
         "output_model",
         "owner_residual",
         "product",
@@ -212,7 +282,7 @@
       "type": "object"
     }
   },
-  "description": "`rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units. No money.\n\nFor every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation.",
+  "description": "`rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.\n\nFor every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.",
   "properties": {
     "as_of": {
       "description": "The instant the report was computed. Storage accrues to the earlier of this and `month_end`.",
@@ -232,6 +302,23 @@
         "$ref": "#/definitions/CostAmount"
       },
       "type": "array"
+    },
+    "measured_total_money": {
+      "description": "`measured_total` in USD. Present only when `measured_total_money_status` is `priced`.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "measured_total_money_parts": {
+      "items": {
+        "$ref": "#/definitions/MoneyPart"
+      },
+      "type": "array"
+    },
+    "measured_total_money_status": {
+      "$ref": "#/definitions/MoneyStatus"
     },
     "month": {
       "description": "The month, `YYYY-MM`, in `timezone`.",
@@ -273,6 +360,23 @@
       },
       "type": "array"
     },
+    "unallocated_money": {
+      "description": "`unallocated` in USD. Present only when `unallocated_money_status` is `priced`.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "unallocated_money_parts": {
+      "items": {
+        "$ref": "#/definitions/MoneyPart"
+      },
+      "type": "array"
+    },
+    "unallocated_money_status": {
+      "$ref": "#/definitions/MoneyStatus"
+    },
     "version": {
       "type": "string"
     },
@@ -289,6 +393,8 @@
     "command",
     "history_complete",
     "measured_total",
+    "measured_total_money_parts",
+    "measured_total_money_status",
     "month",
     "month_end",
     "month_start",
@@ -297,6 +403,8 @@
     "shadow_branch",
     "timezone",
     "unallocated",
+    "unallocated_money_parts",
+    "unallocated_money_status",
     "version"
   ],
   "title": "ProductMonthCostOutput",

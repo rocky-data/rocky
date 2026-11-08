@@ -6574,13 +6574,15 @@
             ]
           },
           "compute_cost_per_dbu": {
-            "default": 0.4,
-            "description": "Cost per DBU (default: $0.40).",
+            "description": "Price of one DBU-hour, in USD. Unset by default. When unset, run cost estimates and `rocky optimize` use $0.40. The monthly product view does not read it.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "compute_cost_per_machine_hour": {
-            "description": "Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. Config only for now: no cost path reads it yet.",
+            "description": "Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. The monthly product view (`rocky cost --month`) prices model time with it.",
             "format": "double",
             "type": [
               "number",
@@ -6603,10 +6605,12 @@
             "type": "integer"
           },
           "storage_cost_per_gb_month": {
-            "default": 0.023,
-            "description": "Cost per GB of storage per month (default: $0.023).",
+            "description": "Price of one GB of storage for one month, in USD per GB-month. Unset by default. When unset, estimates such as `rocky optimize` use $0.023; the monthly product view (`rocky cost --month`) uses only a price set here.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "warehouse_size": {
             "default": "Medium",
@@ -14259,6 +14263,51 @@
         ],
         "type": "object"
       },
+      "MoneyFigure": {
+        "description": "What a [`MoneyPart`] prices.",
+        "enum": [
+          "compute",
+          "storage_data_files",
+          "storage_allocated_blocks",
+          "egress",
+          "ai_tokens"
+        ],
+        "type": "string"
+      },
+      "MoneyPart": {
+        "description": "One figure of a monthly money total.",
+        "properties": {
+          "figure": {
+            "$ref": "#/components/schemas/MoneyFigure"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MoneyStatus"
+          },
+          "usd": {
+            "description": "USD. Present only when `status` is `priced`.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "figure",
+          "status"
+        ],
+        "type": "object"
+      },
+      "MoneyStatus": {
+        "description": "Whether a money figure in the monthly report could be computed.",
+        "enum": [
+          "priced",
+          "no_price",
+          "not_measured",
+          "partial"
+        ],
+        "type": "string"
+      },
       "NamedStatement": {
         "description": "Named SQL statement (purpose + sql), reused by compact and archive.\n\n`sql` is optional in preparation for the v2 persisted plan format (Cluster 3 C — \"SQL as `.o` files\"). Today's emission path always populates `Some(string)` for both stdout JSON and the persisted plan; the v2 format will write `None` and rely on the apply path to regenerate SQL from the plan's typed IR.",
         "properties": {
@@ -18364,6 +18413,29 @@
             },
             "type": "array"
           },
+          "money": {
+            "description": "`charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "money_parts": {
+            "description": "`charged` priced one figure at a time.",
+            "items": {
+              "$ref": "#/components/schemas/MoneyPart"
+            },
+            "type": "array"
+          },
+          "money_status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MoneyStatus"
+              }
+            ],
+            "description": "Why `money` is or is not present."
+          },
           "output_model": {
             "description": "The model the product owns.",
             "type": "string"
@@ -18391,6 +18463,8 @@
           "built",
           "charged",
           "kept",
+          "money_parts",
+          "money_status",
           "output_model",
           "owner_residual",
           "product",
@@ -18399,7 +18473,7 @@
         "type": "object"
       },
       "ProductMonthCostOutput": {
-        "description": "`rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units. No money.\n\nFor every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation.",
+        "description": "`rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.\n\nFor every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.",
         "properties": {
           "as_of": {
             "description": "The instant the report was computed. Storage accrues to the earlier of this and `month_end`.",
@@ -18419,6 +18493,23 @@
               "$ref": "#/components/schemas/CostAmount"
             },
             "type": "array"
+          },
+          "measured_total_money": {
+            "description": "`measured_total` in USD. Present only when `measured_total_money_status` is `priced`.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "measured_total_money_parts": {
+            "items": {
+              "$ref": "#/components/schemas/MoneyPart"
+            },
+            "type": "array"
+          },
+          "measured_total_money_status": {
+            "$ref": "#/components/schemas/MoneyStatus"
           },
           "month": {
             "description": "The month, `YYYY-MM`, in `timezone`.",
@@ -18460,6 +18551,23 @@
             },
             "type": "array"
           },
+          "unallocated_money": {
+            "description": "`unallocated` in USD. Present only when `unallocated_money_status` is `priced`.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "unallocated_money_parts": {
+            "items": {
+              "$ref": "#/components/schemas/MoneyPart"
+            },
+            "type": "array"
+          },
+          "unallocated_money_status": {
+            "$ref": "#/components/schemas/MoneyStatus"
+          },
           "version": {
             "type": "string"
           },
@@ -18476,6 +18584,8 @@
           "command",
           "history_complete",
           "measured_total",
+          "measured_total_money_parts",
+          "measured_total_money_status",
           "month",
           "month_end",
           "month_start",
@@ -18484,6 +18594,8 @@
           "shadow_branch",
           "timezone",
           "unallocated",
+          "unallocated_money_parts",
+          "unallocated_money_status",
           "version"
         ],
         "type": "object"
@@ -21895,9 +22007,7 @@
               }
             ],
             "default": {
-              "compute_cost_per_dbu": 0.4,
               "min_history_runs": 5,
-              "storage_cost_per_gb_month": 0.023,
               "warehouse_size": "Medium"
             },
             "description": "Cost estimation configuration."

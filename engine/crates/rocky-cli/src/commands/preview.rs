@@ -1270,7 +1270,7 @@ pub async fn run_preview_cost(
         loaded_config.as_ref().and_then(|cfg| {
             let dbu_per_hour =
                 rocky_core::cost::warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-            let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
+            let cost_per_dbu = cfg.cost.compute_cost_per_dbu_or_default();
             cfg.adapters
                 .get("default")
                 .or_else(|| cfg.adapters.values().next())

@@ -966,13 +966,15 @@
           ]
         },
         "compute_cost_per_dbu": {
-          "default": 0.4,
-          "description": "Cost per DBU (default: $0.40).",
+          "description": "Price of one DBU-hour, in USD. Unset by default. When unset, run cost estimates and `rocky optimize` use $0.40. The monthly product view does not read it.",
           "format": "double",
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "compute_cost_per_machine_hour": {
-          "description": "Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. Config only for now: no cost path reads it yet.",
+          "description": "Price of one machine-hour of compute, in USD per hour. For engines that bill by machine time instead of DBUs. Unset by default. The monthly product view (`rocky cost --month`) prices model time with it.",
           "format": "double",
           "type": [
             "number",
@@ -995,10 +997,12 @@
           "type": "integer"
         },
         "storage_cost_per_gb_month": {
-          "default": 0.023,
-          "description": "Cost per GB of storage per month (default: $0.023).",
+          "description": "Price of one GB of storage for one month, in USD per GB-month. Unset by default. When unset, estimates such as `rocky optimize` use $0.023; the monthly product view (`rocky cost --month`) uses only a price set here.",
           "format": "double",
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         },
         "warehouse_size": {
           "default": "Medium",
@@ -5182,9 +5186,7 @@
         }
       ],
       "default": {
-        "compute_cost_per_dbu": 0.4,
         "min_history_runs": 5,
-        "storage_cost_per_gb_month": 0.023,
         "warehouse_size": "Medium"
       },
       "description": "Cost estimation configuration."

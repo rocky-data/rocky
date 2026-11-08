@@ -1022,7 +1022,7 @@ status: success   adapter: databricks   total: $0.101
 
 ### One month, split by product
 
-`rocky cost --month 2026-10 --by product` answers one question: which data product paid for how much of last month. It reads run history only. It reports physical units, not money: model time in milliseconds, and stored data in byte-hours. Money needs a price you set, and this command does not read one.
+`rocky cost --month 2026-10 --by product` answers one question: which data product paid for how much of last month. It reads run history only. It reports physical units: model time in milliseconds, and stored data in byte-hours. It adds money in USD only where you set a price in `[cost]`. Rocky's shipped default prices are never used here. See [Money](#money).
 
 ```bash
 rocky cost --month 2026-10 --by product
@@ -1062,11 +1062,36 @@ Per product, the JSON carries:
 
 A product that builds a table for others can show a `kept` of `0` while `built` is large. Read `built` beside `charged`.
 
+#### Money
+
+Each product, `measured_total` and `unallocated` get money fields: `money` (USD, or `null`), `money_status`, and `money_parts`, one entry per figure. The totals are `measured_total_money` and `unallocated_money`, each with its own `_status` and `_parts`. Money uses only the prices you set in `[cost]`:
+
+| Figure | Unit priced | Price |
+|---|---|---|
+| `compute` | `compute_ms` | `compute_cost_per_machine_hour`: milliseconds / 3,600,000 x price |
+| `storage_data_files` | `storage_byte_hours_data_files` | `storage_cost_per_gb_month`: byte-hours / (2^30 x hours in the month) x price |
+| `storage_allocated_blocks` | `storage_byte_hours_allocated_blocks` | `storage_cost_per_gb_month`, the same way |
+| `egress` | not measured | none |
+| `ai_tokens` | not measured | none |
+
+`compute_cost_per_dbu` does not price this view. Model time is machine time, not DBUs, so set `compute_cost_per_machine_hour`. A storage figure appears only when the month measured that basis. Each table's storage is measured on one basis, so the money total adds both storage figures.
+
+`money_status` is one of:
+
+- `priced`: every measured figure has a price. `money` is their sum. A figure whose amount is `0` costs `$0`, with or without a price.
+- `no_price`: a measured figure has no price. `money` is `null`, because a total without that figure would read low. The parts still show the figures that have a price.
+- `not_measured`: used only on the `egress` and `ai_tokens` parts. Rocky does not measure them, so their `usd` is `null`, never `0`. They are not in `money`.
+- `partial`: `history_complete` is `false`. The amounts are partial, so no money total is shown, and no part that has a price shows money.
+
+For the current month, money is month-to-date: storage counts up to now, at the price of a whole GB-month spread over every hour of the month. The table view prints USD to six decimal places; the JSON carries the full value.
+
+Rocky prices each figure on its own, in floating point. The money of the products plus `unallocated` is close to `measured_total_money`, but the command does not claim it is exact to the cent.
+
 **Limits.**
 
 - `history_complete: false` means state retention may have swept runs the month needs. The few rows that remain look like a quiet month. Every figure is then partial. Raise `[state.retention] max_age_days` to cover the month.
 - The command scans runs that started up to one day before the month. A run that started earlier, with executions inside the month, is missed.
-- Egress and AI tokens are not measured, so they do not appear.
+- Egress and AI tokens are not measured. They have no units, and their money parts are `not_measured`.
 - A reader that ran on an adapter that records no reads (anything but DuckDB) is invisible. The cost of its tables goes to the owner, or to `unallocated`.
 - Storage is the size measured right after each build. A table that Rocky did not build this month still counts, from its last measured build before the month, but only when that build is still in the state store and the table is known: an owned model, a model the scan ran, or a model named in the model graph. A table that is read but links to no recorded build (a source, a name that matches two models, or a build older than the history or than the reader) is counted in `not_measured.unattributed_read_tables`, once per name as written (`c.s.t` and `s.t` count twice), and its cost is not split. A model built before the month and never read still adds its storage to `measured_total`, and to `unallocated` when no product owns it. Retention can remove an old build, and `history_complete` does not flag that case. Before the first build of a table, with enough history, its storage is zero.
 - The several executions of one model in one run (for example, partitions) count as one version. A model that changes its target during the month still resolves under both names. Shadow and branch runs never decide where a model's table is.
@@ -1074,7 +1099,7 @@ A product that builds a table for others can show a `kept` of `0` while `built` 
 
 ### Adapter coverage
 
-- **Databricks / Snowflake**: derived from recorded duration, the configured warehouse size, and `[cost].compute_cost_per_dbu`. The adapter does not report a billed amount. An omitted `[cost]` block uses Rocky's defaults.
+- **Databricks / Snowflake**: derived from recorded duration, the configured warehouse size, and `[cost].compute_cost_per_dbu`. The adapter does not report a billed amount. An unset `compute_cost_per_dbu`, or an omitted `[cost]` block, uses Rocky's default of $0.40 per DBU-hour.
 - **BigQuery**: the compiled bytes formula runs only when the saved run has `bytes_scanned`. Otherwise `cost_usd` is `null`.
 - **DuckDB / local**: the cost model reports `$0.00`. This excludes machine and infrastructure costs. DuckDB `EXPLAIN` supplies no numeric byte, row, or compute estimate.
 - **Discovery adapters (Fivetran, Airbyte, etc.)**: skipped; cost is `None`.

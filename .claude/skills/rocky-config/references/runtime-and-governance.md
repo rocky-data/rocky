@@ -118,20 +118,21 @@ replicate   = false    # default; true to ship the cache through state_sync
 
 `[cache.schemas]` is the only `[cache]` table (`CacheConfig` in `config.rs`): it stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile. There is no `[cache] valkey_url` key: `ValkeyCacheConfig` exists as a type but is not wired into `RockyConfig`, and a `[cache]` table with any other key is refused (`deny_unknown_fields`). The Valkey tier is a `[state]` backend, not a cache setting.
 
-## Cost model (for `rocky optimize`)
+## Cost model (`rocky optimize`, `rocky cost`)
 
 ```toml
 [cost]
-storage_cost_per_gb_month = 0.023
-compute_cost_per_dbu      = 0.40
-warehouse_size            = "Medium"
-min_history_runs          = 5
-# Optional prices, unset by default, read by no cost command yet (USD):
-# compute_cost_per_machine_hour     = 1.50  # per machine-hour
+# Every price is in USD and unset by default.
+storage_cost_per_gb_month     = 0.023  # unset: estimates use 0.023
+compute_cost_per_dbu          = 0.40   # per DBU-hour; unset: estimates use 0.40
+compute_cost_per_machine_hour = 1.50   # prices model time in `rocky cost --month`
+warehouse_size                = "Medium"
+min_history_runs              = 5
+# Read by no cost command yet:
 # cross_region_transfer_cost_per_gb = 0.02  # per GB moved across regions
 # ai_cost_per_million_tokens        = 3.00  # per 1,000,000 tokens
 ```
-A negative or non-finite price is refused at load.
+A negative or non-finite price is refused at load. `rocky cost --month <YYYY-MM> --by product` prices only from keys you set (compute from `compute_cost_per_machine_hour`, storage from `storage_cost_per_gb_month`); an unset price is `no_price`, never the default. Set a price only when it is your real price.
 
 ## Hooks
 

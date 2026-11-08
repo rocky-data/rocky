@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- A plan made before this release refuses to apply once with the "config has changed" re-plan message, unless its `[cost]` sets both `storage_cost_per_gb_month` and `compute_cost_per_dbu`. The plan's config snapshot no longer records the two unset prices. Re-run `rocky plan` and apply the new `plan_id`.
+
+### Added
+
+- `rocky cost --month <YYYY-MM> --by product` now shows money in USD, from the prices you set in `[cost]` only. Each product, `measured_total` and `unallocated` gain `money` (or `null`), `money_status` and `money_parts`, one part per figure. Model time is priced by `compute_cost_per_machine_hour`, and stored byte-hours by `storage_cost_per_gb_month` (GiB, over the hours in the month). `money_status` is `priced`, `no_price` (a measured figure has no price, so no total), `partial` (`history_complete` is false, so no money) or `not_measured` (egress and AI tokens, which are never shown as $0). Rocky's shipped default prices are never used here, and `compute_cost_per_dbu` does not price this view. The table view gains a money section. JSON: `cost_by_product` (`ProductMonthCostOutput`), new `MoneyStatus`, `MoneyFigure` and `MoneyPart`.
+
+### Changed
+
+- `[cost] storage_cost_per_gb_month` and `compute_cost_per_dbu` are now unset by default, so a price you set to `0.023` or `0.40` is no longer mistaken for the default. Estimates that used the defaults keep them: `rocky optimize`, run cost summaries, `rocky cost <run>`, `rocky brief`, `rocky gc`, `rocky preview` and `rocky backfill` still fall back to $0.023 per GB-month and $0.40 per DBU-hour. An unset price is left out of serialized config, and the generated project schema no longer gives these keys a default.
+
 ## [1.91.0] — 2026-11-08
 
 ### Upgrade notes

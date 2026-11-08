@@ -43,7 +43,8 @@ use rocky_core::state::{
 
 use crate::output::{
     AllocatedUpstreamCost, CostAmount, CostGroup, CostNotMeasured, CostOutput, CostUnit,
-    PerModelCostHistorical, ProductMonthCost, ProductMonthCostOutput, SharedNotChargedCost,
+    MoneyFigure, MoneyPart, MoneyStatus, PerModelCostHistorical, ProductMonthCost,
+    ProductMonthCostOutput, SharedNotChargedCost,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -470,7 +471,7 @@ pub(crate) fn adapter_pricing(
         return Ok(None);
     };
     let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-    let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
+    let cost_per_dbu = cfg.cost.compute_cost_per_dbu_or_default();
     Ok(resolve_warehouse_type(&cfg.adapters)
         .map(|(name, wh)| (name, wh, dbu_per_hour, cost_per_dbu)))
 }
@@ -717,15 +718,145 @@ fn amounts_out(amounts: &cost_split::Amounts) -> Vec<CostAmount> {
         .collect()
 }
 
+/// Bytes in one GB, for `storage_cost_per_gb_month`. The same GiB that
+/// `rocky optimize` divides stored bytes by.
+const BYTES_PER_GB: f64 = 1_073_741_824.0;
+
+/// Milliseconds in one machine-hour, for `compute_cost_per_machine_hour`.
+const MS_PER_MACHINE_HOUR: f64 = 3_600_000.0;
+
+/// The prices the monthly report may use: only those the user set in
+/// `[cost]`. It reads the raw fields, never the estimate accessors that fall
+/// back to Rocky's shipped defaults, and never the per-run cost formula.
+#[derive(Debug, Clone, Copy)]
+struct MonthPricing {
+    /// USD per machine-hour of compute.
+    compute_per_machine_hour: Option<f64>,
+    /// USD per GB-month of storage.
+    storage_per_gb_month: Option<f64>,
+    /// Hours in the month being reported: a GB-month is one GB stored for
+    /// all of them.
+    hours_in_month: f64,
+    /// When false, every amount is partial and gets no money.
+    history_complete: bool,
+    /// Whether the month measured each storage basis at all. A basis the
+    /// month never measured is left out of every money total.
+    data_files_measured: bool,
+    allocated_blocks_measured: bool,
+}
+
+impl MonthPricing {
+    fn new(
+        cost: Option<&rocky_core::config::CostSection>,
+        window: &cost_split::MonthWindow,
+        history_complete: bool,
+        measured_total: &[CostAmount],
+    ) -> Self {
+        let measured = |unit: CostUnit| measured_total.iter().any(|a| a.unit == unit);
+        Self {
+            compute_per_machine_hour: cost.and_then(|c| c.compute_cost_per_machine_hour),
+            storage_per_gb_month: cost.and_then(|c| c.storage_cost_per_gb_month),
+            hours_in_month: (window.end - window.start).num_seconds() as f64 / 3600.0,
+            history_complete,
+            data_files_measured: measured(CostUnit::StorageByteHoursDataFiles),
+            allocated_blocks_measured: measured(CostUnit::StorageByteHoursAllocatedBlocks),
+        }
+    }
+
+    /// Price one measured amount. A zero amount is $0 with or without a
+    /// price; a non-zero amount needs a price the user set. In a partial
+    /// month a part that could be priced is `partial` and has no money.
+    fn part(&self, figure: MoneyFigure, amount: u64, price: Option<f64>, per: f64) -> MoneyPart {
+        let (status, usd) = match price {
+            _ if amount == 0 => (MoneyStatus::Priced, Some(0.0)),
+            None => (MoneyStatus::NoPrice, None),
+            Some(price) => (MoneyStatus::Priced, Some(amount as f64 / per * price)),
+        };
+        let (status, usd) = if status == MoneyStatus::Priced && !self.history_complete {
+            (MoneyStatus::Partial, None)
+        } else {
+            (status, usd)
+        };
+        MoneyPart {
+            figure,
+            status,
+            usd,
+        }
+    }
+
+    /// Price a set of amounts. Returns the total, its status and the parts.
+    ///
+    /// The total exists only when every measured part is priced. A partial
+    /// month has no total. Egress and AI tokens are listed as not measured
+    /// and are not part of the total.
+    fn price(&self, amounts: &[CostAmount]) -> (Option<f64>, MoneyStatus, Vec<MoneyPart>) {
+        let amount_of = |unit: CostUnit| {
+            amounts
+                .iter()
+                .find(|a| a.unit == unit)
+                .map_or(0, |a| a.amount)
+        };
+        let mut parts = vec![self.part(
+            MoneyFigure::Compute,
+            amount_of(CostUnit::ComputeMs),
+            self.compute_per_machine_hour,
+            MS_PER_MACHINE_HOUR,
+        )];
+        let byte_hours_per_gb_month = BYTES_PER_GB * self.hours_in_month;
+        for (figure, unit, present) in [
+            (
+                MoneyFigure::StorageDataFiles,
+                CostUnit::StorageByteHoursDataFiles,
+                self.data_files_measured,
+            ),
+            (
+                MoneyFigure::StorageAllocatedBlocks,
+                CostUnit::StorageByteHoursAllocatedBlocks,
+                self.allocated_blocks_measured,
+            ),
+        ] {
+            if present {
+                parts.push(self.part(
+                    figure,
+                    amount_of(unit),
+                    self.storage_per_gb_month,
+                    byte_hours_per_gb_month,
+                ));
+            }
+        }
+        let (usd, status) = if !self.history_complete {
+            (None, MoneyStatus::Partial)
+        } else if parts.iter().all(|p| p.status == MoneyStatus::Priced) {
+            (
+                Some(parts.iter().filter_map(|p| p.usd).sum()),
+                MoneyStatus::Priced,
+            )
+        } else {
+            (None, MoneyStatus::NoPrice)
+        };
+        for figure in [MoneyFigure::Egress, MoneyFigure::AiTokens] {
+            parts.push(MoneyPart {
+                figure,
+                status: MoneyStatus::NotMeasured,
+                usd: None,
+            });
+        }
+        (usd, status, parts)
+    }
+}
+
 fn product_out(
     product: &str,
     output_model: &str,
     row: &cost_split::ProductSplit,
+    pricing: &MonthPricing,
 ) -> ProductMonthCost {
     let charged: cost_split::Amounts = cost_split::Unit::ALL
         .into_iter()
         .map(|unit| (unit, row.charged(unit)))
         .collect();
+    let charged = amounts_out(&charged);
+    let (money, money_status, money_parts) = pricing.price(&charged);
     ProductMonthCost {
         product: product.to_string(),
         output_model: output_model.to_string(),
@@ -756,14 +887,18 @@ fn product_out(
                 amount: to_u64(s.amount),
             })
             .collect(),
-        charged: amounts_out(&charged),
+        charged,
+        money,
+        money_status,
+        money_parts,
     }
 }
 
 /// The typed payload behind `rocky cost --month YYYY-MM --by product`.
 ///
 /// Splits one month of production cost across the products in `products/`,
-/// in physical units (see [`rocky_core::cost_split`]). It reads run history
+/// in physical units (see [`rocky_core::cost_split`]), priced in USD from the
+/// prices set in `[cost]` (see `MonthPricing`). It reads run history
 /// only; the month is cut in the project's `[schedule].timezone`, and each
 /// execution belongs to the month of its own start. `now` is passed in so a
 /// caller can pin it: storage accrues to the earlier of `now` and the end of
@@ -853,6 +988,18 @@ pub fn compute_month_cost(
     );
 
     check_fits_u64(&split)?;
+    let measured_total = amounts_out(&split.measured_total);
+    let unallocated = amounts_out(&split.unallocated);
+    let pricing = MonthPricing::new(
+        cfg.as_ref().map(|c| &c.cost),
+        &window,
+        history_complete,
+        &measured_total,
+    );
+    let (measured_total_money, measured_total_money_status, measured_total_money_parts) =
+        pricing.price(&measured_total);
+    let (unallocated_money, unallocated_money_status, unallocated_money_parts) =
+        pricing.price(&unallocated);
     let model_of: std::collections::BTreeMap<&str, &str> = owners
         .iter()
         .map(|(model, product)| (product.as_str(), model.as_str()))
@@ -865,6 +1012,7 @@ pub fn compute_month_cost(
                 product,
                 model_of.get(product.as_str()).copied().unwrap_or(""),
                 row,
+                &pricing,
             )
         })
         .collect();
@@ -879,9 +1027,15 @@ pub fn compute_month_cost(
         as_of: now.to_rfc3339(),
         history_complete,
         products,
-        unallocated: amounts_out(&split.unallocated),
+        unallocated,
         shadow_branch: amounts_out(&split.shadow_branch),
-        measured_total: amounts_out(&split.measured_total),
+        measured_total,
+        measured_total_money,
+        measured_total_money_status,
+        measured_total_money_parts,
+        unallocated_money,
+        unallocated_money_status,
+        unallocated_money_parts,
         not_measured: CostNotMeasured {
             failed_executions: split.not_measured.failed_executions,
             storage_unknown_tables: split.not_measured.storage_unknown_tables,
@@ -896,6 +1050,19 @@ fn amount_cell(amounts: &[CostAmount], unit: CostUnit) -> String {
         .iter()
         .find(|a| a.unit == unit)
         .map_or_else(|| "-".to_string(), |a| a.amount.to_string())
+}
+
+fn money_cell(usd: Option<f64>) -> String {
+    usd.map_or_else(|| "-".to_string(), |usd| format!("{usd:.6}"))
+}
+
+fn money_status_label(status: MoneyStatus) -> &'static str {
+    match status {
+        MoneyStatus::Priced => "priced",
+        MoneyStatus::NoPrice => "no price",
+        MoneyStatus::NotMeasured => "not measured",
+        MoneyStatus::Partial => "partial",
+    }
 }
 
 fn print_month_table(output: &ProductMonthCostOutput) {
@@ -988,6 +1155,34 @@ fn print_month_table(output: &ProductMonthCostOutput) {
             "measured total",
             "",
             amount_cell(&output.measured_total, unit)
+        );
+    }
+    println!();
+    println!("money, USD (only from prices set in [cost]; egress and AI tokens are not measured)");
+    println!("  {:<24}  {:>14}  {:<12}", "product", "charged", "status");
+    for p in &output.products {
+        println!(
+            "  {:<24}  {:>14}  {:<12}",
+            p.product,
+            money_cell(p.money),
+            money_status_label(p.money_status)
+        );
+    }
+    println!(
+        "  {:<24}  {:>14}  {:<12}",
+        "<unallocated>",
+        money_cell(output.unallocated_money),
+        money_status_label(output.unallocated_money_status)
+    );
+    println!(
+        "  {:<24}  {:>14}  {:<12}",
+        "measured total",
+        money_cell(output.measured_total_money),
+        money_status_label(output.measured_total_money_status)
+    );
+    if output.measured_total_money_status == MoneyStatus::NoPrice {
+        println!(
+            "  to price this view, set [cost] compute_cost_per_machine_hour and storage_cost_per_gb_month; compute_cost_per_dbu does not price it"
         );
     }
     println!();
@@ -1947,5 +2142,253 @@ mod tests {
         assert!(check_fits_u64(&split).is_ok());
         split.unallocated.insert(unit, u128::from(u64::MAX) + 1);
         assert!(check_fits_u64(&split).is_err());
+    }
+
+    // ----- money in the monthly report -----
+
+    use std::path::PathBuf;
+
+    /// October 2026: `raw` (no product) runs 1,000 ms and `revenue_daily`
+    /// reads it for 400 ms, then keeps 1 GiB of data files stored from
+    /// 2026-10-16 to the end of the month.
+    fn money_project(dir: &Path, cost: &str) -> (PathBuf, PathBuf) {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let (_root, config, state_path) = api_fixture_project(dir);
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(cost);
+        std::fs::write(&config, text).unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        let start = at(2026, 10, 16, 0, 0);
+        let mut product = reading(
+            exec_at("revenue_daily", start + chrono::Duration::minutes(1), 400),
+            "raw",
+            10,
+        );
+        product.stored_bytes = Some(StoredBytes {
+            bytes: 1 << 30,
+            basis: StoredBytesBasis::DataFiles,
+        });
+        store
+            .record_run(&sample_run_at(
+                "run-1",
+                start,
+                vec![exec_at("raw", start, 1_000), product],
+            ))
+            .unwrap();
+        (config, state_path)
+    }
+
+    fn month(config: &Path, state_path: &Path) -> ProductMonthCostOutput {
+        compute_month_cost(state_path, config, "2026-10", at(2026, 11, 2, 0, 0)).unwrap()
+    }
+
+    fn part(parts: &[MoneyPart], figure: MoneyFigure) -> &MoneyPart {
+        parts
+            .iter()
+            .find(|p| p.figure == figure)
+            .unwrap_or_else(|| panic!("no {figure:?} part in {parts:?}"))
+    }
+
+    #[test]
+    fn month_money_is_priced_from_the_user_prices() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(
+            dir.path(),
+            "\n[cost]\ncompute_cost_per_machine_hour = 3.6\nstorage_cost_per_gb_month = 7.44\n",
+        );
+        let out = month(&config, &state);
+        let p = &out.products[0];
+        assert_eq!(p.money_status, MoneyStatus::Priced);
+        // 1,400 ms at $3.60 per machine-hour.
+        let compute = part(&p.money_parts, MoneyFigure::Compute);
+        assert_eq!(compute.status, MoneyStatus::Priced);
+        assert!((compute.usd.unwrap() - 0.0014).abs() < 1e-12, "{compute:?}");
+        // Byte-hours over (1 GiB x 744 hours), at $7.44 per GB-month.
+        let byte_hours = amount(&p.charged, CostUnit::StorageByteHoursDataFiles);
+        assert!(byte_hours > 0, "the fixture must store data");
+        let storage = part(&p.money_parts, MoneyFigure::StorageDataFiles);
+        let expected = byte_hours as f64 / (1_073_741_824.0 * 744.0) * 7.44;
+        assert!(
+            (storage.usd.unwrap() - expected).abs() < 1e-12,
+            "{storage:?}"
+        );
+        assert!(
+            (p.money.unwrap() - (0.0014 + expected)).abs() < 1e-12,
+            "{:?}",
+            p.money
+        );
+        // The month never measured allocated blocks, so it has no part.
+        assert!(
+            !p.money_parts
+                .iter()
+                .any(|part| part.figure == MoneyFigure::StorageAllocatedBlocks)
+        );
+        assert_eq!(out.measured_total_money_status, MoneyStatus::Priced);
+        assert!((out.measured_total_money.unwrap() - p.money.unwrap()).abs() < 1e-12);
+        // Nothing is unallocated: $0, priced.
+        assert_eq!(out.unallocated_money_status, MoneyStatus::Priced);
+        assert_eq!(out.unallocated_money, Some(0.0));
+    }
+
+    #[test]
+    fn month_money_without_prices_is_no_price_not_the_shipped_default() {
+        let dir = TempDir::new().unwrap();
+        // `compute_cost_per_dbu` is a DBU price, not a machine-hour price,
+        // and no shipped default stands in for either.
+        let (config, state) = money_project(dir.path(), "\n[cost]\ncompute_cost_per_dbu = 0.40\n");
+        let out = month(&config, &state);
+        let p = &out.products[0];
+        assert_eq!(p.money_status, MoneyStatus::NoPrice);
+        assert_eq!(p.money, None);
+        for figure in [MoneyFigure::Compute, MoneyFigure::StorageDataFiles] {
+            let part = part(&p.money_parts, figure);
+            assert_eq!(part.status, MoneyStatus::NoPrice, "{part:?}");
+            assert_eq!(part.usd, None);
+        }
+        assert_eq!(out.measured_total_money_status, MoneyStatus::NoPrice);
+        assert_eq!(out.measured_total_money, None);
+    }
+
+    /// `MonthPricing` on its own: both storage bases are priced and added,
+    /// the GB-month spreads over the hours of the month being reported
+    /// (November has 720), a zero amount is $0 without a price, and a
+    /// missing compute price holds back the total even when storage is
+    /// priced.
+    #[test]
+    fn month_pricing_prices_each_basis_over_the_hours_of_the_month() {
+        let window = cost_split::month_bounds_in_zone(2026, 11, "UTC").unwrap();
+        let gib_month = 1_073_741_824_u64 * 720;
+        let measured = [
+            CostAmount {
+                unit: CostUnit::ComputeMs,
+                amount: 3_600_000,
+            },
+            CostAmount {
+                unit: CostUnit::StorageByteHoursDataFiles,
+                amount: gib_month,
+            },
+            CostAmount {
+                unit: CostUnit::StorageByteHoursAllocatedBlocks,
+                amount: 2 * gib_month,
+            },
+        ];
+        let cost = |toml_text: &str| -> rocky_core::config::CostSection {
+            toml::from_str(toml_text).unwrap()
+        };
+
+        let both = cost("compute_cost_per_machine_hour = 2.0\nstorage_cost_per_gb_month = 0.5\n");
+        let pricing = MonthPricing::new(Some(&both), &window, true, &measured);
+        let (usd, status, parts) = pricing.price(&measured);
+        assert_eq!(status, MoneyStatus::Priced);
+        let usd_of = |figure| part(&parts, figure).usd.unwrap();
+        assert!((usd_of(MoneyFigure::Compute) - 2.0).abs() < 1e-12);
+        assert!((usd_of(MoneyFigure::StorageDataFiles) - 0.5).abs() < 1e-12);
+        assert!((usd_of(MoneyFigure::StorageAllocatedBlocks) - 1.0).abs() < 1e-12);
+        assert!((usd.unwrap() - 3.5).abs() < 1e-12, "{usd:?}");
+
+        // Storage priced, compute not: no total.
+        let storage_only = cost("storage_cost_per_gb_month = 0.5\n");
+        let pricing = MonthPricing::new(Some(&storage_only), &window, true, &measured);
+        let (usd, status, parts) = pricing.price(&measured);
+        assert_eq!(status, MoneyStatus::NoPrice);
+        assert_eq!(usd, None);
+        assert_eq!(
+            part(&parts, MoneyFigure::Compute).status,
+            MoneyStatus::NoPrice
+        );
+        assert_eq!(
+            part(&parts, MoneyFigure::StorageDataFiles).status,
+            MoneyStatus::Priced
+        );
+
+        // No prices at all, and nothing charged: $0, priced. With no config
+        // the same holds.
+        for section in [Some(cost("")), None] {
+            let pricing = MonthPricing::new(section.as_ref(), &window, true, &measured);
+            let (usd, status, parts) = pricing.price(&[]);
+            assert_eq!(status, MoneyStatus::Priced);
+            assert_eq!(usd, Some(0.0));
+            assert_eq!(parts.len(), 5, "{parts:?}");
+            // The same config with a non-zero amount is no_price.
+            let (usd, status, _) = pricing.price(&measured);
+            assert_eq!((usd, status), (None, MoneyStatus::NoPrice));
+        }
+    }
+
+    #[test]
+    fn month_money_with_one_price_missing_has_no_total() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(
+            dir.path(),
+            "\n[cost]\ncompute_cost_per_machine_hour = 3.6\n",
+        );
+        let out = month(&config, &state);
+        let p = &out.products[0];
+        assert_eq!(p.money_status, MoneyStatus::NoPrice);
+        assert_eq!(p.money, None, "a total without storage would understate");
+        let compute = part(&p.money_parts, MoneyFigure::Compute);
+        assert_eq!(compute.status, MoneyStatus::Priced);
+        assert!(compute.usd.is_some());
+        let storage = part(&p.money_parts, MoneyFigure::StorageDataFiles);
+        assert_eq!(storage.status, MoneyStatus::NoPrice);
+    }
+
+    #[test]
+    fn month_money_lists_egress_and_ai_tokens_as_not_measured() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(
+            dir.path(),
+            "\n[cost]\ncompute_cost_per_machine_hour = 3.6\nstorage_cost_per_gb_month = 1.0\n\
+             cross_region_transfer_cost_per_gb = 0.02\nai_cost_per_million_tokens = 3.0\n",
+        );
+        let out = month(&config, &state);
+        for parts in [
+            &out.products[0].money_parts,
+            &out.measured_total_money_parts,
+            &out.unallocated_money_parts,
+        ] {
+            for figure in [MoneyFigure::Egress, MoneyFigure::AiTokens] {
+                let part = part(parts, figure);
+                assert_eq!(part.status, MoneyStatus::NotMeasured);
+                assert_eq!(part.usd, None, "not measured is never $0");
+            }
+        }
+        // Not measured figures do not hold back a priced total.
+        assert_eq!(out.products[0].money_status, MoneyStatus::Priced);
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["products"][0]["money_status"], "priced");
+        let egress = json["products"][0]["money_parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["figure"] == "egress")
+            .unwrap()
+            .clone();
+        assert_eq!(egress["status"], "not_measured");
+        assert!(egress["usd"].is_null());
+    }
+
+    #[test]
+    fn a_partial_month_has_no_money_total() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(
+            dir.path(),
+            "\n[cost]\ncompute_cost_per_machine_hour = 3.6\nstorage_cost_per_gb_month = 1.0\n\
+             \n[state.retention]\nmax_age_days = 10\nmin_runs_kept = 3\n",
+        );
+        let out = month(&config, &state);
+        assert!(!out.history_complete, "10 days cannot cover October");
+        let p = &out.products[0];
+        assert!(amount(&p.charged, CostUnit::ComputeMs) > 0);
+        assert_eq!(p.money_status, MoneyStatus::Partial);
+        assert_eq!(p.money, None);
+        assert_eq!(
+            part(&p.money_parts, MoneyFigure::Compute).status,
+            MoneyStatus::Partial
+        );
+        assert_eq!(part(&p.money_parts, MoneyFigure::Compute).usd, None);
+        assert_eq!(out.measured_total_money_status, MoneyStatus::Partial);
+        assert_eq!(out.measured_total_money, None);
+        assert_eq!(out.unallocated_money, None);
     }
 }
