@@ -36,8 +36,7 @@ fi
 export PGDATABASE="${PGDATABASE:-rocky_src}"
 
 rm -rf .rocky expected poc.duckdb poc.duckdb.wal
-# `rocky load --connector` does not create the state file's directory.
-mkdir -p expected .rocky
+mkdir -p expected
 
 echo "=== rocky validate (parse-only, no network) ==="
 rocky -c rocky.toml validate

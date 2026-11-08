@@ -19255,6 +19255,84 @@ target = { catalog = "raw", schema = "stripe", table = "charges" }
         );
     }
 
+    /// Parse `options` (the body of `[connector.stripe_charges.options]`)
+    /// with `name` set to `value`, then drop the variable.
+    fn parse_with_env(name: &str, value: &str, options: &str) -> Result<RockyConfig, String> {
+        // SAFETY: each caller passes a unique variable name no other test
+        // reads or writes.
+        unsafe { std::env::set_var(name, value) };
+        let parsed = parse_rocky_config_str(&format!(
+            "[adapter.default]\ntype = \"duckdb\"\n\n{GOOD}\n\
+             [connector.stripe_charges.options]\n{options}"
+        ))
+        .map_err(|e| format!("{e:#}"));
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(name) };
+        parsed
+    }
+
+    #[test]
+    fn a_substituted_top_level_option_key_is_refused_without_printing_it() {
+        let name = "ROCKY_TEST_OPTION_TOP_KEY";
+        let secret = "rocky-option-top-key-secret-91b3";
+        let config = parse_with_env(name, secret, &format!("\"${{{name}}}\" = 1\n")).unwrap();
+        let errs: Vec<String> = validate_connectors(&config)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains(&format!("options `${{{name}}}`")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs[0].contains(secret),
+            "the error must not print the key"
+        );
+    }
+
+    #[test]
+    fn a_substituted_nested_option_key_is_refused_without_printing_it() {
+        let name = "ROCKY_TEST_OPTION_NESTED_KEY";
+        let secret = "rocky-option-nested-key-secret-5c0a";
+        let config = parse_with_env(
+            name,
+            secret,
+            &format!("[connector.stripe_charges.options.auth]\n\"${{{name}}}\" = true\n"),
+        )
+        .unwrap();
+        let errs: Vec<String> = validate_connectors(&config)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains(&format!("options `auth.${{{name}}}`")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs[0].contains(secret),
+            "the error must not print the key"
+        );
+    }
+
+    #[test]
+    fn a_nan_under_a_substituted_option_key_does_not_print_the_key() {
+        let name = "ROCKY_TEST_OPTION_KEY_ABOVE_NAN";
+        let secret = "rocky-option-key-above-nan-secret-e4";
+        let err = parse_with_env(
+            name,
+            secret,
+            &format!("[connector.stripe_charges.options.\"${{{name}}}\"]\nratio = nan\n"),
+        )
+        .unwrap_err();
+        assert!(err.contains(&format!("${{{name}}}")), "{err}");
+        assert!(
+            !err.contains(secret),
+            "the error must not print the key: {err}"
+        );
+    }
+
     #[test]
     fn a_nan_option_is_a_parse_error() {
         let body = format!("{GOOD}\n[connector.stripe_charges.options]\nratio = nan\n");

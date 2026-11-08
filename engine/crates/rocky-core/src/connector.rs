@@ -169,8 +169,9 @@ impl ConnectorOptions {
     }
 
     /// Every option key or value that holds a value Rocky substituted from
-    /// the environment, as `(path, rendered)`. `rendered` shows the value
-    /// with each secret replaced by `${NAME}`, so it is safe to print.
+    /// the environment, as `(path, rendered)`. Both are rendered with each
+    /// secret replaced by `${NAME}`, so both are safe to print: a key can
+    /// hold a secret too.
     ///
     /// This reads the process's substitution registry, so it sees only
     /// values of at least [`crate::secret_registry::SECRET_LENGTH_FLOOR`]
@@ -182,6 +183,12 @@ impl ConnectorOptions {
         }
         found
     }
+}
+
+/// An option path as it may be printed: every substituted value in it,
+/// in any key, replaced by `${NAME}`.
+fn safe_path(path: &str) -> String {
+    crate::secret_registry::render_placeholders(path)
 }
 
 /// Collects into `found` each key or leaf under `path` that renders
@@ -196,21 +203,21 @@ fn walk_substituted(
     if let Some(key) = key {
         let rendered = crate::secret_registry::render_placeholders(key);
         if rendered != key {
-            found.push((path.to_string(), rendered));
+            found.push((safe_path(path), rendered));
         }
     }
     match value {
         Value::String(s) => {
             let rendered = crate::secret_registry::render_placeholders(s);
             if &rendered != s {
-                found.push((path.to_string(), rendered));
+                found.push((safe_path(path), rendered));
             }
         }
         Value::Number(n) => {
             let text = n.to_string();
             let rendered = crate::secret_registry::render_placeholders(&text);
             if rendered != text {
-                found.push((path.to_string(), rendered));
+                found.push((safe_path(path), rendered));
             }
         }
         Value::Array(items) => {
@@ -236,7 +243,10 @@ fn toml_to_json(path: &str, value: toml::Value) -> Result<serde_json::Value, Str
         toml::Value::Float(f) => serde_json::Number::from_f64(f)
             .map(Value::Number)
             .ok_or_else(|| {
-                format!("options `{path}` is {f}, which JSON cannot hold; use a string")
+                format!(
+                    "options `{}` is {f}, which JSON cannot hold; use a string",
+                    safe_path(path)
+                )
             })?,
         toml::Value::Boolean(b) => Value::Bool(b),
         toml::Value::Datetime(dt) => Value::String(dt.to_string()),
@@ -724,6 +734,20 @@ name = "s2"
             .unwrap()
             .to_string();
         assert!(err.contains("options `inner.list[1]`"), "{err}");
+    }
+
+    #[test]
+    fn a_nan_under_a_substituted_key_prints_the_key_as_a_placeholder() {
+        let secret = "rocky-option-key-secret-7d21e0";
+        crate::secret_registry::register_substitution("ROCKY_TEST_OPTION_KEY_NAN", secret);
+        let err = toml::from_str::<OptionsOnly>(&format!("[options.\"{secret}\"]\nratio = nan\n"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("options `${ROCKY_TEST_OPTION_KEY_NAN}.ratio`"),
+            "{err}"
+        );
     }
 
     #[test]

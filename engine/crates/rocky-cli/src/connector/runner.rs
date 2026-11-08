@@ -217,15 +217,14 @@ fn new_scratch_dir(landing: &Path, run_id: &str, attempt: u32) -> Result<PathBuf
     Ok(scratch)
 }
 
-/// Write `options.json` into the new scratch directory, owner-only, and
+/// Write `options.json` into the new scratch directory, owner-only on Unix,
+/// and
 /// return its path. The file is new: the scratch directory was just made.
 fn write_options_file(scratch: &Path, bytes: &[u8]) -> Result<PathBuf, AttemptError> {
     let path = scratch.join(OPTIONS_FILE_NAME);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
+    let mut file = rocky_core::private_fs::private_file_options()
+        .write(true)
+        .create_new(true)
         .open(&path)
         .map_err(|e| AttemptError::Setup(format!("{}: {e}", path.display())))?;
     file.write_all(bytes)

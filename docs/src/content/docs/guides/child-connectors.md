@@ -107,6 +107,8 @@ Rocky writes one JSON document to the stdin of the program.
 
 `options_path` is the absolute path of `options.json`. See [Options](#options).
 
+Ignore request fields you do not know. Rocky can add fields without a new `protocol_version`, as it did with `options_path`.
+
 `state` is `null` on the first run. If the saved state has an older `schema_version` than the manifest, Rocky hands it over unchanged. The program must upgrade it. If the saved state has a newer version than the manifest, Rocky refuses to start the program.
 
 The program writes its Parquet files into `output_dir`. When it is done, it writes `_rocky_result.json` in the same directory and exits with code 0.
@@ -150,18 +152,20 @@ status = ["succeeded", "refunded"]
 Before each attempt, Rocky writes the table as one line of JSON to `options.json` in the scratch directory. The request gives its absolute path in `options_path`. The file is in the working directory of the program too.
 
 ```json
-{"account":"acct_main","page_size":100,"since":"2026-01-01T00:00:00Z","filters":{"status":["succeeded","refunded"]}}
+{"account":"acct_main","filters":{"status":["succeeded","refunded"]},"page_size":100,"since":"2026-01-01T00:00:00Z"}
 ```
+
+Rocky does not keep the key order of the TOML. Keys are sorted. Read the file by key, not by position.
 
 - The file always exists. With no `options` table it holds `{}`. A program can read it with no check first.
 - Strings, integers, floats, booleans, arrays and tables keep their JSON types.
 - A datetime becomes a string. An offset datetime is RFC 3339, such as `2026-01-01T00:00:00Z`. A local datetime, date or time is written as TOML spells it, such as `2026-01-01T00:00:00`, `2026-01-01` or `07:30:00`.
 - A float that is `nan` or `inf` has no JSON form. The config is refused.
 - The JSON must be at most 64 KiB (65536 bytes). A larger table is refused when the config loads, and by `rocky validate`. The error names the connector and the size.
-- The file is readable by its owner only. It counts toward `output_bytes`, like every file in the scratch directory.
+- On Unix the file is readable by its owner only (mode `0600`), in a scratch directory that is `0700`. On Windows it gets the default permissions of its directory. It counts toward `output_bytes`, like every file in the scratch directory.
 
 :::caution[Options are not secrets]
-Rocky writes `options.json` to disk in clear, and a kept scratch directory keeps it. Put a credential under `secrets`, and read it from the environment of the program.
+Rocky writes `options.json` to disk in clear. A failed run keeps its scratch directory, and `keep_scratch = true` keeps a successful run's one, so the file stays there too. Put a credential under `secrets`, and read it from the environment of the program.
 
 Rocky refuses an option key or value that holds a value it substituted from the environment with `${VAR}`. The error names the option and shows `${VAR}`, never the value. This check has two gaps. A value shorter than 8 bytes is not detected. The literal default in `${VAR:-default}` is not detected either, because it is already in `rocky.toml` in clear.
 :::
