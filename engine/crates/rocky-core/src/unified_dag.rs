@@ -697,7 +697,8 @@ pub fn build_unified_dag(
                 // THIS pipeline's models, not the project's. A pipeline the
                 // caller resolved no models for contributes no nodes, which is
                 // how a transformation pipeline whose directory is absent or
-                // empty behaves — the same no-op `run` treats it as.
+                // empty behaves in the DAG. (A single-pipeline `rocky run`
+                // fails on an absent directory unless `allow_empty_models`.)
                 let own_models = models_by_pipeline
                     .get(pipeline_name)
                     .map(Vec::as_slice)
@@ -2338,6 +2339,7 @@ mod tests {
     fn transform_pipeline(depends_on: Vec<&str>) -> PipelineConfig {
         PipelineConfig::Transformation(Box::new(TransformationPipelineConfig {
             models: "models/**".into(),
+            allow_empty_models: false,
             target: TransformationTargetConfig {
                 region: None,
                 adapter: "default".into(),

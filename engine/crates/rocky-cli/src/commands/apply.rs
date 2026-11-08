@@ -7253,7 +7253,8 @@ mod tests {
                  type = \"duckdb\"\n\
                  path = \"{}\"\n\n\
                  [pipeline.silver]\n\
-                 type = \"transformation\"\n\n\
+                 type = \"transformation\"\n\
+                 allow_empty_models = true\n\n\
                  [pipeline.silver.target]\n\
                  adapter = \"local\"\n\n\
                  [pipeline.silver.target.governance]\n\

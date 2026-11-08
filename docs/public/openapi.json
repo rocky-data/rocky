@@ -26737,6 +26737,10 @@
       "TransformationPipelineConfig": {
         "description": "Transformation pipeline configuration.\n\nOrchestrates `.sql` / `.rocky` model compilation and execution as a first-class pipeline, with its own execution, checks, and governance settings. Model-level strategy (incremental, merge, time_interval, etc.) is defined in each model's sidecar TOML, not at the pipeline level.\n\n```toml [pipeline.silver] type = \"transformation\" models = \"models/**\"\n\n[pipeline.silver.target] adapter = \"databricks_prod\" [pipeline.silver.target.governance] auto_create_schemas = true\n\n[pipeline.silver.execution] concurrency = 8 ```",
         "properties": {
+          "allow_empty_models": {
+            "description": "Allow `rocky run` to succeed when the models directory does not exist. Default `false`: a missing models directory fails the run and is a `rocky validate` error, so a moved or mistyped directory is not a silent no-op. Set `true` for a pipeline that has no models on purpose, for example one that only loads seeds. An existing directory with no models still fails either way.",
+            "type": "boolean"
+          },
           "checks": {
             "allOf": [
               {

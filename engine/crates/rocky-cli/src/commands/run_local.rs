@@ -43,6 +43,18 @@ pub enum ModelsDirDecision {
     Absent(PathBuf),
 }
 
+/// The error for a transformation pipeline whose models directory does not
+/// exist and that does not set `allow_empty_models = true`. One text for the
+/// single-pipeline run and the `--dag` run, so both name the path and the key.
+pub(crate) fn missing_models_dir_error(models_dir: &Path, pipeline: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "models directory '{}' does not exist, so pipeline '{pipeline}' has no models to run. \
+         Fix the `models` glob, or set `allow_empty_models = true` under \
+         `[pipeline.{pipeline}]` if this pipeline has no models on purpose.",
+        models_dir.display(),
+    )
+}
+
 /// Execute `rocky run` for a transformation pipeline.
 ///
 /// Compiles and executes models from the caller-resolved
@@ -319,10 +331,21 @@ pub async fn run_transformation(
                 models_dir.display()
             );
         }
+        // A missing models directory fails by default: a moved or mistyped
+        // `models` glob must not pass as a clean run that built nothing. Only
+        // a pipeline that sets `allow_empty_models = true` (for example one
+        // that only loads seeds) keeps the no-op below. Fires before the
+        // state store is opened, so nothing is mutated.
+        ModelsDirDecision::Absent(models_dir) if !pipeline.allow_empty_models => {
+            return Err(missing_models_dir_error(
+                models_dir,
+                pipeline_name.unwrap_or("<name>"),
+            ));
+        }
         ModelsDirDecision::Absent(models_dir) => {
             warn!(
                 models_dir = %models_dir.display(),
-                "models directory not found — nothing to execute"
+                "models directory not found — nothing to execute (allow_empty_models = true)"
             );
         }
     }
@@ -4065,6 +4088,135 @@ auto_create_schemas = true
         );
     }
 
+    /// Run `run_transformation` on an `Absent` decision for pipeline `t`.
+    async fn run_absent(
+        dir: &Path,
+        allow_empty_models: bool,
+    ) -> (anyhow::Result<()>, std::path::PathBuf) {
+        let decision = super::ModelsDirDecision::Absent(dir.join("models"));
+        run_decision(dir, decision, "models/**", allow_empty_models).await
+    }
+
+    /// Run `run_transformation` for pipeline `t` on `decision`, with the
+    /// models glob `glob` (relative to `dir`).
+    async fn run_decision(
+        dir: &Path,
+        decision: super::ModelsDirDecision,
+        glob: &str,
+        allow_empty_models: bool,
+    ) -> (anyhow::Result<()>, std::path::PathBuf) {
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+        write_config(dir, &db, "");
+        let loaded =
+            rocky_core::config::load_rocky_config_fingerprinted(&dir.join("rocky.toml")).unwrap();
+        let rocky_cfg = &loaded.config;
+        let (_, pipeline_config) =
+            crate::registry::resolve_pipeline(rocky_cfg, None).expect("resolve pipeline");
+        let rocky_core::config::PipelineConfig::Transformation(t) = pipeline_config else {
+            panic!("test config must resolve to a transformation pipeline");
+        };
+        let mut t = t.as_ref().clone();
+        t.allow_empty_models = allow_empty_models;
+        let models_glob = dir.join(glob).to_string_lossy().into_owned();
+        let result = super::run_transformation(
+            decision,
+            &models_glob,
+            &t,
+            rocky_cfg,
+            false, // output_json
+            &PartitionRunOptions::default(),
+            &rocky_core::config::SchemaCacheConfig::default(),
+            None, // shadow_config
+            super::super::run::SkipGateConfig::off(),
+            false, // no_reuse
+            &state_path,
+            "run-missing-models-dir",
+            chrono::Utc::now(),
+            "cfg-hash-test",
+            Some("t"),
+            None, // idempotency_key
+            &rocky_core::run_vars::RunVars::new(),
+            None,  // exec_fp_gate
+            None,  // freeze_fence
+            false, // expects_models
+            None,  // hook_registry
+            None,  // contracts_dir
+            None,  // project
+            None,  // target_dialects
+            &tokio_util::sync::CancellationToken::new(),
+            None, // config_path
+        )
+        .await;
+        (result, state_path)
+    }
+
+    /// A missing models directory fails the run by default. Before, it was a
+    /// silent no-op that exited 0, so a moved or mistyped directory looked
+    /// like a clean run that built nothing. The error names the directory and
+    /// the opt-in key, and fires before any state store is opened.
+    #[tokio::test]
+    async fn missing_models_dir_fails_and_names_the_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (result, state_path) = run_absent(tmp.path(), false).await;
+        let err = result.expect_err("a missing models directory must fail the run");
+        let msg = format!("{err:#}");
+        let models_dir = tmp.path().join("models");
+        assert!(
+            msg.contains(&format!("'{}' does not exist", models_dir.display())),
+            "the error names the missing directory: {msg}"
+        );
+        assert!(
+            msg.contains("allow_empty_models = true") && msg.contains("[pipeline.t]"),
+            "the error names the opt-in key and where it goes: {msg}"
+        );
+        assert!(!state_path.exists(), "a refused run opens no state store");
+    }
+
+    /// An EXISTING models directory that holds no models fails the run,
+    /// with or without `allow_empty_models`: the compile finds no models and
+    /// the run records it as a failed `<compile>` entry. The key covers only
+    /// a missing directory. A glob that matches nothing under an existing
+    /// directory fails the same way.
+    #[tokio::test]
+    async fn existing_dir_with_no_models_fails_whatever_the_key() {
+        for allow_empty_models in [false, true] {
+            for glob in ["models/**", "models/nothing_*.sql"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let models_dir = tmp.path().join("models");
+                std::fs::create_dir(&models_dir).unwrap();
+                // A file the glob `models/nothing_*.sql` does not match.
+                std::fs::write(models_dir.join("README.md"), "not a model").unwrap();
+                let (result, _) = run_decision(
+                    tmp.path(),
+                    super::ModelsDirDecision::Present(models_dir.clone()),
+                    glob,
+                    allow_empty_models,
+                )
+                .await;
+                let err = result.expect_err(&format!(
+                    "an existing directory with no models must fail \
+                     (glob={glob}, allow_empty_models={allow_empty_models})"
+                ));
+                let msg = format!("{err:#}");
+                assert!(
+                    !msg.contains("allow_empty_models"),
+                    "this is not the missing-directory error: {msg}"
+                );
+            }
+        }
+    }
+
+    /// With `allow_empty_models = true` a missing models directory is the
+    /// no-op it was before: the run succeeds and opens no state store.
+    #[tokio::test]
+    async fn missing_models_dir_with_the_opt_in_is_a_no_op() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (result, state_path) = run_absent(tmp.path(), true).await;
+        result.expect("allow_empty_models = true keeps the no-op");
+        assert!(!state_path.exists(), "the no-op opens no state store");
+    }
+
     /// Single-decision lazy gate: the dispatch site's resolved
     /// [`super::ModelsDirDecision`] — not a fresh filesystem check — governs
     /// whether `run_transformation` executes. The models directory EXISTS on
@@ -4095,12 +4247,15 @@ auto_create_schemas = true
         let rocky_core::config::PipelineConfig::Transformation(t) = pipeline_config else {
             panic!("test config must resolve to a transformation pipeline");
         };
+        // The no-op needs the opt-in; without it a missing directory fails.
+        let mut t = t.as_ref().clone();
+        t.allow_empty_models = true;
         let models_glob = dir.join("models/**").to_string_lossy().into_owned();
 
         super::run_transformation(
             super::ModelsDirDecision::Absent(models_dir.clone()),
             &models_glob,
-            t,
+            &t,
             rocky_cfg,
             false, // output_json
             &PartitionRunOptions::default(),
