@@ -161,7 +161,7 @@ export type { DoctorOutput, HealthCheck, HealthStatus } from "./doctor";
 
 // Drift — surfaced on `RunOutput.drift`. There is no `rocky drift` command,
 // so these come from the run schema, which is where they are actually emitted.
-export type { DriftSummary, DriftActionOutput } from "./run";
+export type { DriftSummary, DriftActionOutput, RunProductBudget } from "./run";
 
 // History (all runs)
 export type { HistoryOutput, RunHistoryRecord, RunModelRecord } from "./history";
@@ -392,7 +392,7 @@ export type {
   ProductListEntry,
   ProductApprovalOutput,
 } from "./product_list";
-export type { ProductStatusOutput } from "./product_status";
+export type { ProductCostMonth, ProductStatusOutput } from "./product_status";
 // `rocky product journal <name>`, also served at `GET /api/v1/products/{name}/journal`.
 export type { ProductJournalOutput, ProductJournalEntry } from "./product_journal";
 
@@ -429,6 +429,12 @@ export type {
   MoneyFigure,
   MoneyPart,
   MoneyStatus,
+  ProductBudgetBreachAction,
+  ProductBudgetBreachEvent,
+  ProductBudgetCheck,
+  ProductBudgetLimitType,
+  ProductBudgetStatus,
+  ProductBudgetVerdict,
   ProductMonthCost,
   ProductMonthCostOutput,
   SharedNotChargedCost,

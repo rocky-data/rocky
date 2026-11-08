@@ -4977,6 +4977,21 @@ impl StateStore {
         limit: usize,
         window: usize,
         cutoff: Option<chrono::DateTime<chrono::Utc>>,
+        weigh: impl FnMut(RunRecord) -> Option<(usize, T)>,
+    ) -> Result<Vec<T>, StateError> {
+        self.scan_runs_newest_first_within(limit, window, cutoff, None, weigh)
+    }
+
+    /// [`Self::scan_runs_newest_first_since`] that also skips, without
+    /// decoding, every run whose `started_at` is at or after `before`. Pass 1
+    /// holds each run's `started_at`, so the skip is free; skipped runs do not
+    /// count toward `window`.
+    fn scan_runs_newest_first_within<T>(
+        &self,
+        limit: usize,
+        window: usize,
+        cutoff: Option<chrono::DateTime<chrono::Utc>>,
+        before: Option<chrono::DateTime<chrono::Utc>>,
         mut weigh: impl FnMut(RunRecord) -> Option<(usize, T)>,
     ) -> Result<Vec<T>, StateError> {
         if limit == 0 || window == 0 {
@@ -5014,6 +5029,9 @@ impl StateStore {
             // ends the walk.
             if cutoff.is_some_and(|cutoff| started_at < cutoff) {
                 break;
+            }
+            if before.is_some_and(|before| started_at >= before) {
+                continue;
             }
             if let Some(value) = table.get(run_id.as_str())? {
                 decoded += 1;
@@ -5116,7 +5134,8 @@ impl StateStore {
     /// One newest-first walk serves every model, and it stops once each model
     /// has been found. A model that was never measured makes the walk reach
     /// the oldest run. A run that started at or after `before` holds no
-    /// execution that started before it, so it is skipped (still decoded).
+    /// execution that started before it, so it is skipped without being
+    /// decoded.
     ///
     /// # Errors
     ///
@@ -5134,7 +5153,7 @@ impl StateStore {
         }
         // Each run weighs the number of models it newly resolved, so the walk
         // ends when every model has been found.
-        self.scan_runs_newest_first(models.len(), usize::MAX, |run| {
+        self.scan_runs_newest_first_within(models.len(), usize::MAX, None, Some(before), |run| {
             if run.started_at >= before || !keep(&run) {
                 return None;
             }

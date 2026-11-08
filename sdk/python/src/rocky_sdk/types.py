@@ -547,6 +547,10 @@ class RunResult(BaseModel):
     #: Budget breaches detected at end of run. Empty when no ``[budget]`` block
     #: is configured or all limits were respected.
     budget_breaches: list[BudgetBreachOutput] = Field(default_factory=list)
+    #: Monthly product budgets checked at the end of this run, one entry per
+    #: ``[product_budget.<name>]`` that names a product. Empty when none is set
+    #: or the run is not a production run. A breach never changes the exit code.
+    product_budgets: list[RunProductBudget] = Field(default_factory=list)
     #: Scheduling warnings from physical-read edge derivation: mutual
     #: physical reads serialized by a deterministic order, models whose SQL
     #: could not be parsed for table references, and colliding targets.
@@ -1619,6 +1623,7 @@ from .types_generated.run_schema import (  # noqa: E402, F401
     OverrideWarningOutput,
     QuarantineOutput,
     RunCostSummary,
+    RunProductBudget,
     SourceVolumeCheckOutput,
     UpstreamReads,
     VolumeCheckOutput,

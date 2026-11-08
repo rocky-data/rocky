@@ -1113,6 +1113,17 @@ pub struct ProductStatusOutput {
     /// omitted) when the spec declares no source range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_volumes: Vec<ProductSourceVolumeStatus>,
+    /// The product's cost for the current month (in the project's
+    /// `[schedule].timezone`), with its `[product_budget.<name>]` verdict and
+    /// breach events when it has a budget: its row from `rocky cost --month
+    /// <month> --by product`. Present only from `rocky product status` (and
+    /// the same route of `rocky serve`), only for a product that has a
+    /// `[product_budget.<name>]`, whose spec parses and that owns a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_month: Option<crate::output::ProductCostMonth>,
+    /// Why `cost_month` could not be computed, when it could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_month_error: Option<String>,
 }
 
 /// One declared source range and the latest production count of its table.
@@ -2189,6 +2200,8 @@ pub(crate) fn product_status_at(
         delivery: None,
         volume: None,
         source_volumes: Vec::new(),
+        cost_month: None,
+        cost_month_error: None,
     };
 
     let parsed = match load_spec(root, product_name) {
@@ -2524,6 +2537,38 @@ pub fn run_product_journal(
     Ok(())
 }
 
+/// Fill `cost_month` (or `cost_month_error`) on a status report, as of `now`.
+///
+/// Only for a product whose spec parses and that has a
+/// `[product_budget.<name>]` in the config at `config_path`: the month is a
+/// scan of run history, and a status report without a budget does not pay
+/// for it. `rocky product status` and `GET /api/v1/products/:name` both call
+/// this, so the two answer with the same fields.
+pub(crate) fn attach_cost_month(
+    output: &mut ProductStatusOutput,
+    config_path: &Path,
+    state_path: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if !output.spec_present {
+        return;
+    }
+    let budgeted = match rocky_core::config::load_optional_project_config(Some(config_path)) {
+        Ok(cfg) => cfg.is_some_and(|cfg| cfg.product_budget.contains_key(&output.product)),
+        Err(error) => {
+            output.cost_month_error = Some(format!("{error:#}"));
+            return;
+        }
+    };
+    if !budgeted {
+        return;
+    }
+    match crate::commands::cost::product_cost_month(state_path, config_path, &output.product, now) {
+        Ok(cost_month) => output.cost_month = cost_month,
+        Err(error) => output.cost_month_error = Some(format!("{error:#}")),
+    }
+}
+
 /// Execute `rocky product status <name>`.
 pub fn run_product_status(
     config_path: &Path,
@@ -2532,7 +2577,8 @@ pub fn run_product_status(
     output_json: bool,
 ) -> Result<()> {
     let root = product_command_root(config_path);
-    let output = product_status_in(&root, Some(state_path), product_name)?;
+    let mut output = product_status_in(&root, Some(state_path), product_name)?;
+    attach_cost_month(&mut output, config_path, state_path, chrono::Utc::now());
     if output_json {
         print_json(&output)?;
     } else {
@@ -2587,8 +2633,50 @@ pub fn run_product_status(
         for source in &output.source_volumes {
             print_source_volume(source);
         }
+        if let Some(cost_month) = &output.cost_month {
+            print_cost_month(cost_month);
+        }
+        if let Some(error) = &output.cost_month_error {
+            println!("  cost this month: unknown — {error}");
+        }
     }
     Ok(())
+}
+
+/// The current month's charge and budget, on `rocky product status`.
+fn print_cost_month(cost_month: &crate::output::ProductCostMonth) {
+    let charged_ms = cost_month
+        .cost
+        .charged
+        .iter()
+        .find(|a| a.unit == crate::output::CostUnit::ComputeMs)
+        .map_or(0, |a| a.amount);
+    let money = cost_month
+        .cost
+        .money
+        .map_or_else(|| "-".to_string(), |usd| format!("${usd:.2}"));
+    println!(
+        "  cost {} ({}): {} ms model time charged, {money}{}",
+        cost_month.month,
+        cost_month.timezone,
+        charged_ms,
+        if cost_month.history_complete {
+            ""
+        } else {
+            " (partial: run history does not cover the month)"
+        }
+    );
+    if let Some(budget) = &cost_month.cost.budget {
+        let verdict = match budget.verdict {
+            crate::output::ProductBudgetVerdict::InBudget => "in budget",
+            crate::output::ProductBudgetVerdict::Breached => "BREACHED",
+            crate::output::ProductBudgetVerdict::NotEvaluated => "not evaluated",
+        };
+        println!(
+            "  budget: {verdict} ({} breach event(s) this month)",
+            cost_month.cost.breach_events.len()
+        );
+    }
 }
 
 /// One status row per declared source range, judged against the counts of

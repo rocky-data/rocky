@@ -333,6 +333,9 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     // --- Product specs (V050–V053) ---
     validate_products(config_path, &mut out);
 
+    // V065 / V066: `[product_budget.<name>]` keys and the history they need.
+    validate_product_budgets(&cfg, config_path, &mut out);
+
     Ok(out)
 }
 
@@ -770,6 +773,9 @@ fn config_error_diagnostic(
             ("V061", Some(format!("pipeline.{pipeline}.target.region")))
         }
         ConfigError::CostPriceInvalid { key, .. } => ("V046", Some(format!("cost.{key}"))),
+        ConfigError::ProductBudgetLimitInvalid { product, key, .. } => {
+            ("V046", Some(format!("product_budget.{product}.{key}")))
+        }
         ConfigError::SourceSyncInvalid { pipeline, .. } => (
             "V046",
             Some(format!("pipeline.{pipeline}.source.discovery.sync")),
@@ -1380,6 +1386,76 @@ fn validate_schedule_dag(cfg: &rocky_core::config::RockyConfig, out: &mut Valida
             ),
             file: None,
             field: None,
+        });
+    }
+}
+
+/// The retention below which `rocky validate` warns about product budgets.
+/// The current month needs up to 32 days of history (31 days and the day
+/// before the month that the scan reaches back to); 62 also keeps most of
+/// the month before it.
+const PRODUCT_BUDGET_MIN_HISTORY_DAYS: u32 = 62;
+
+/// Warnings for `[product_budget.<name>]`:
+///
+/// - **V065** (warn) — the key names no product: there is no
+///   `products/<name>.toml`, so the budget is never checked. A spec that
+///   exists but does not parse is reported by V051 instead.
+/// - **V066** (warn) — state retention sweeps run history younger than
+///   [`PRODUCT_BUDGET_MIN_HISTORY_DAYS`] days, so part of the month can be
+///   gone and every budget reads `not_evaluated`.
+fn validate_product_budgets(
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    out: &mut ValidateOutput,
+) {
+    if cfg.product_budget.is_empty() {
+        return;
+    }
+    let products_dir = crate::commands::product::product_command_root(config_path).join("products");
+    let names: std::collections::BTreeSet<String> = std::fs::read_dir(&products_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+                .filter_map(|path| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for product in cfg.product_budget.keys() {
+        if names.contains(product) {
+            continue;
+        }
+        out.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V065".into(),
+            message: format!(
+                "[product_budget.{product}] names no product: there is no \
+                 products/{product}.toml, so this budget is never checked"
+            ),
+            file: Some(config_path.display().to_string()),
+            field: Some(format!("product_budget.{product}")),
+        });
+    }
+    let retention = &cfg.state.retention;
+    if retention.applies_to_domain(rocky_core::retention::StateRetentionDomain::History)
+        && retention.max_age_days < PRODUCT_BUDGET_MIN_HISTORY_DAYS
+    {
+        out.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V066".into(),
+            message: format!(
+                "[product_budget] is set, but [state.retention] max_age_days = {} sweeps run \
+                 history a monthly budget needs; budgets will read not_evaluated for part of \
+                 each month. Set max_age_days to {PRODUCT_BUDGET_MIN_HISTORY_DAYS} or more.",
+                retention.max_age_days
+            ),
+            file: Some(config_path.display().to_string()),
+            field: Some("state.retention.max_age_days".into()),
         });
     }
 }
@@ -5625,5 +5701,63 @@ auto_create_catalogs = false
         assert_ne!(severity_prefix("error"), severity_prefix("warn"));
         assert_eq!(severity_prefix("ok"), "  ok ");
         assert_eq!(severity_prefix("lint"), " note");
+    }
+
+    /// A project in a temp dir with `products/revenue_daily.toml` and the
+    /// given `rocky.toml` body after a DuckDB adapter.
+    fn validate_with_product(extra: &str) -> ValidateOutput {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("products")).unwrap();
+        std::fs::write(
+            dir.path().join("products/revenue_daily.toml"),
+            include_str!("../../../rocky-core/src/product/testdata/revenue_daily.spec.toml"),
+        )
+        .unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            format!("[adapter]\ntype = \"duckdb\"\npath = \"x.db\"\n\n{extra}"),
+        )
+        .unwrap();
+        validate_inner(&config).unwrap()
+    }
+
+    #[test]
+    fn a_product_budget_naming_no_product_is_a_v065_warning() {
+        let out = validate_with_product(
+            "[product_budget.revenue_daily]\nmax_usd = 1\n\n[product_budget.nope]\nmax_usd = 1\n",
+        );
+        let hits: Vec<_> = out.messages.iter().filter(|m| m.code == "V065").collect();
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert_eq!(hits[0].severity, "warn");
+        assert_eq!(hits[0].field.as_deref(), Some("product_budget.nope"));
+        // The default retention keeps a year: no V066.
+        assert_eq!(codes(&out, "V066"), 0, "{:?}", out.messages);
+    }
+
+    #[test]
+    fn short_history_retention_with_a_product_budget_is_a_v066_warning() {
+        let budget = "[product_budget.revenue_daily]\nmax_usd = 1\n";
+        let short =
+            validate_with_product(&format!("{budget}\n[state.retention]\nmax_age_days = 61\n"));
+        assert_eq!(codes(&short, "V066"), 1, "{:?}", short.messages);
+        let enough =
+            validate_with_product(&format!("{budget}\n[state.retention]\nmax_age_days = 62\n"));
+        assert_eq!(codes(&enough, "V066"), 0, "{:?}", enough.messages);
+        // Without a budget, short retention is not this warning's business.
+        let no_budget = validate_with_product("[state.retention]\nmax_age_days = 10\n");
+        assert_eq!(codes(&no_budget, "V066"), 0, "{:?}", no_budget.messages);
+    }
+
+    #[test]
+    fn an_invalid_product_budget_limit_is_a_v046_error_on_its_field() {
+        let out = validate_with_product("[product_budget.revenue_daily]\nmax_usd = -1\n");
+        assert!(!out.valid);
+        assert!(
+            out.messages.iter().any(|m| m.code == "V046"
+                && m.field.as_deref() == Some("product_budget.revenue_daily.max_usd")),
+            "{:?}",
+            out.messages
+        );
     }
 }

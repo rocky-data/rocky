@@ -134,6 +134,17 @@ min_history_runs              = 5
 ```
 A negative or non-finite price is refused at load. `rocky cost --month <YYYY-MM> --by product` prices only from keys you set (compute from `compute_cost_per_machine_hour`, storage from `storage_cost_per_gb_month`); an unset price is `no_price`, never the default. Set a price only when it is your real price.
 
+## Monthly product budget
+
+```toml
+[product_budget.orders]          # key = product name (products/orders.toml)
+max_compute_hours    = 40        # charged model time this month, hours
+max_storage_gb_month = 200       # charged stored data, GB-months (2^30 bytes), per basis
+max_usd              = 120.0     # needs [cost] compute_cost_per_machine_hour / storage_cost_per_gb_month
+on_breach            = "warn"    # the only value; exit code never changes
+```
+Checked at the end of every production `rocky run` for every budgeted product, against the product's charged figure (`kept + allocated_upstream`) in `rocky cost --month --by product`, in the month of `[schedule].timezone`. Verdict `in_budget` / `breached` / `not_evaluated`; `not_evaluated` when history does not cover the month, `max_usd` has no price, or a figure was not measured. A change to over fires `on_budget_breach` with `metadata.scope = "product_month"`, `product`, `month`. Limits must be finite and 0 or more; unknown keys are refused. `rocky validate` warns V065 (no `products/<name>.toml`) and V066 (`[state.retention] max_age_days < 62`). Do not put the budget in `products/<name>.toml`.
+
 ## Hooks
 
 ```toml

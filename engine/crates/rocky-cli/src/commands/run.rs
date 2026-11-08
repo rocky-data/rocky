@@ -1911,6 +1911,97 @@ pub(crate) fn capture_run_output_for_test(run_id: &str, output: &RunOutput) {
 #[inline]
 pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 
+/// Check every `[product_budget.<name>]` after this run's record is written,
+/// and put the verdicts on `output.product_budgets`.
+///
+/// Only warns: a failure to evaluate is logged, and no verdict changes the
+/// run's exit code. Does nothing without a store or a config path (the
+/// record was not written, or there is no `rocky.toml` to read budgets from).
+pub(crate) fn record_product_budgets(
+    state_store: Option<&StateStore>,
+    config_path: Option<&Path>,
+    run_id: &str,
+    output: &mut RunOutput,
+) {
+    let (Some(store), Some(config_path)) = (state_store, config_path) else {
+        return;
+    };
+    match super::cost::product_budgets_after_run(store, config_path, run_id, Utc::now()) {
+        Ok(budgets) => {
+            for budget in budgets.iter().filter(|b| b.breach_event.is_some()) {
+                warn!(
+                    product = %budget.product,
+                    month = %budget.month,
+                    run_id,
+                    "product is over its monthly budget"
+                );
+            }
+            output.product_budgets = budgets;
+        }
+        Err(error) => warn!(
+            error = %format!("{error:#}"),
+            run_id,
+            "monthly product budgets could not be checked"
+        ),
+    }
+}
+
+/// Fire `on_budget_breach` once for each limit of each product budget this
+/// run moved over (see [`record_product_budgets`]). A product that was
+/// already over before this run fires nothing.
+pub(crate) async fn fire_product_budget_breaches(
+    hook_registry: &HookRegistry,
+    run_id: &str,
+    pipeline: &str,
+    budgets: &[crate::output::RunProductBudget],
+) {
+    for budget in budgets {
+        let Some(event) = &budget.breach_event else {
+            continue;
+        };
+        for check in &event.breached {
+            // A breached limit always has a figure.
+            let Some(actual) = check.actual else {
+                continue;
+            };
+            let _ = hook_registry
+                .fire(&HookContext::product_budget_breach(
+                    run_id,
+                    pipeline,
+                    &budget.product,
+                    &budget.month,
+                    check.limit_type.as_str(),
+                    check.limit,
+                    actual,
+                ))
+                .await;
+        }
+    }
+}
+
+/// [`record_product_budgets`] and [`fire_product_budget_breaches`] for an arm
+/// that holds no hook registry of its own: it builds one from `[hook]` only
+/// when this run moved a product over.
+pub(crate) async fn check_product_budgets_and_fire(
+    state_store: Option<&StateStore>,
+    config_path: Option<&Path>,
+    hooks: &rocky_core::hooks::HooksConfig,
+    run_id: &str,
+    pipeline: &str,
+    output: &mut RunOutput,
+) {
+    record_product_budgets(state_store, config_path, run_id, output);
+    if output
+        .product_budgets
+        .iter()
+        .any(|b| b.breach_event.is_some())
+    {
+        let registry = HookRegistry::from_config(hooks);
+        fire_product_budget_breaches(&registry, run_id, pipeline, &output.product_budgets).await;
+        let _ = registry.wait_async_webhooks().await;
+    }
+}
+
 /// Persist the run's terminal record, best-effort: a failed write is logged
 /// and the run goes on, because history is advisory for most of its readers.
 ///
@@ -4287,6 +4378,14 @@ pub async fn run_with_explicit_contracts(
         )
         .await;
 
+        // Monthly product budgets, now that this run's record is written.
+        record_product_budgets(
+            state_store.as_ref(),
+            Some(config_path),
+            &run_id,
+            &mut output,
+        );
+
         // WP-01 PR-C: drop the owned state store BEFORE the finalize upload so
         // its copy runs against a quiescent, unlocked file (the redb `Database`
         // + advisory writer lock are released here). This is the model-only arm's
@@ -4303,6 +4402,18 @@ pub async fn run_with_explicit_contracts(
             "refusing to exit 0: the state ledger mutation could not be persisted to the \
              remote [state] backend",
         )?;
+
+        // This arm fires no other hook, so it builds the registry only when a
+        // product budget was moved over. A model-only run has no pipeline.
+        if output
+            .product_budgets
+            .iter()
+            .any(|b| b.breach_event.is_some())
+        {
+            let hooks = HookRegistry::from_config(&rocky_cfg.hooks);
+            fire_product_budget_breaches(&hooks, &run_id, "", &output.product_budgets).await;
+            let _ = hooks.wait_async_webhooks().await;
+        }
 
         // Stamp the terminal status so the JSON payload reports the run
         // outcome directly (a compile-failed target makes this `Failure`).
@@ -8375,6 +8486,21 @@ pub async fn run_with_explicit_contracts(
             false,
         )
         .await;
+        // Monthly product budgets: the models this run built still count, so
+        // the check and its hook run here too. Only warns.
+        record_product_budgets(
+            state_store.as_ref(),
+            Some(config_path),
+            &run_id,
+            &mut output,
+        );
+        fire_product_budget_breaches(
+            &hook_registry,
+            &run_id,
+            pipeline_name,
+            &output.product_budgets,
+        )
+        .await;
         // WP-01 PR-C: drop the owned state store BEFORE finalize so its copy is
         // structurally lock-free. Legal here because this failure branch returns
         // `verify_after_result` below and never touches `state_store` again.
@@ -8427,6 +8553,15 @@ pub async fn run_with_explicit_contracts(
     )
     .await;
 
+    // Monthly product budgets, now that this run's record is written. Read-only
+    // over the store, so it adds nothing the terminal upload must carry.
+    record_product_budgets(
+        state_store.as_ref(),
+        Some(config_path),
+        &run_id,
+        &mut output,
+    );
+
     // WP-01 PR-C: drop the owned state store BEFORE the terminal finalize so its
     // copy runs against a quiescent, unlocked file (redb `Database` + advisory
     // writer lock released here). This is the happy path's last use of
@@ -8471,6 +8606,10 @@ pub async fn run_with_explicit_contracts(
             ))
             .await;
     }
+    // The same hook for a monthly product budget this run moved over, with
+    // `scope = "product_month"` in its metadata.
+    fire_product_budget_breaches(&hook_registry, &run_id, pipeline_name, &output.product_budgets)
+        .await;
 
     // Dagster Pipes message emission. We emit at the END of the run
     // (not per-event during) so the streaming is batch-at-the-end
@@ -27120,6 +27259,7 @@ auto_create_schemas = true
             interrupted: false,
             cost_summary: None,
             budget_breaches: vec![],
+            product_budgets: vec![],
             override_warnings: vec![],
             override_match_counts: vec![],
             source_syncs: vec![],

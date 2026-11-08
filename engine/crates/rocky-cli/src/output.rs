@@ -452,6 +452,12 @@ pub struct RunOutput {
     /// `on_budget_breach` hook so subscribers see them live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_breaches: Vec<BudgetBreachOutput>,
+    /// Monthly product budgets checked at the end of this run: one entry per
+    /// `[product_budget.<name>]` that names a product, for each month the
+    /// run touched. Empty (and omitted) when no product budget is set, or the
+    /// run is not a production run. A breach never changes the exit code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub product_budgets: Vec<RunProductBudget>,
     /// Scheduling warnings from physical-read edge derivation (#1275):
     /// mutual physical reads serialized by a deterministic order, models
     /// whose SQL could not be parsed for table references, and colliding
@@ -6558,6 +6564,7 @@ impl RunOutput {
             interrupted: false,
             cost_summary: None,
             budget_breaches: vec![],
+            product_budgets: vec![],
             override_warnings: vec![],
             override_match_counts: vec![],
             source_syncs: vec![],
@@ -12797,6 +12804,139 @@ pub struct ProductMonthCost {
     pub money_status: MoneyStatus,
     /// `charged` priced one figure at a time.
     pub money_parts: Vec<MoneyPart>,
+    /// The product's `[product_budget.<name>]` checked against `charged`, as
+    /// of this report. Absent when the product has no budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<ProductBudgetStatus>,
+    /// Each time this month the product went over its budget, in run order.
+    /// Found by checking the budget again after each production run of the
+    /// month. A product that goes over, back under and over again has two
+    /// events. An event is never withdrawn, even when a later run moves the
+    /// product back under. Empty (and omitted) when there was none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breach_events: Vec<ProductBudgetBreachEvent>,
+    /// Why `breach_events` was not computed, when it was not: replaying the
+    /// month would split more executions than the report allows (the reason
+    /// gives the runs, the executions and the cap). `budget` is still
+    /// checked. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breach_events_skipped: Option<String>,
+}
+
+/// The verdict of a monthly product budget, or of one of its limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductBudgetVerdict {
+    // Every limit was checked and none is exceeded.
+    InBudget,
+    // At least one limit is exceeded.
+    Breached,
+    // A limit could not be checked: run history does not cover the month,
+    // `max_usd` has no price, or the figure a limit tests was not measured.
+    // Never read as in budget.
+    NotEvaluated,
+}
+
+/// Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductBudgetLimitType {
+    // Charged model time, in hours.
+    MaxComputeHours,
+    // Charged stored data, in GB-months (1 GB = 2^30 bytes), one storage
+    // basis at a time.
+    MaxStorageGbMonth,
+    // Charged USD, priced from `[cost]`.
+    MaxUsd,
+}
+
+impl ProductBudgetLimitType {
+    /// The config key, also the `limit_type` of the `on_budget_breach` hook.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxComputeHours => "max_compute_hours",
+            Self::MaxStorageGbMonth => "max_storage_gb_month",
+            Self::MaxUsd => "max_usd",
+        }
+    }
+}
+
+/// One limit of a product budget, checked against the product's charge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductBudgetCheck {
+    pub limit_type: ProductBudgetLimitType,
+    /// For `max_storage_gb_month`, the storage basis checked. Absent for the
+    /// other limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<CostUnit>,
+    /// The configured limit.
+    pub limit: f64,
+    /// The month-to-date figure the limit tests. Absent when it is not known.
+    pub actual: Option<f64>,
+    /// `breached` when `actual` is greater than `limit`. Equal is in budget.
+    pub verdict: ProductBudgetVerdict,
+    /// Why the limit is `not_evaluated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A product's monthly budget, checked once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductBudgetStatus {
+    /// `breached` when any limit is breached. Otherwise `not_evaluated`
+    /// when any limit could not be checked, or when run history does not
+    /// cover the month (then always). Otherwise `in_budget`.
+    pub verdict: ProductBudgetVerdict,
+    /// What a breach does. Only `warn`: the run's exit code does not change.
+    pub on_breach: rocky_core::config::ProductBudgetBreachAction,
+    /// One check per limit set (two for `max_storage_gb_month` when both
+    /// storage bases were measured).
+    pub checks: Vec<ProductBudgetCheck>,
+    /// Why the budget as a whole is `not_evaluated`, when it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+/// One time a product went over its monthly budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductBudgetBreachEvent {
+    /// The production run after which the product was first over.
+    pub run_id: String,
+    /// When that run finished (RFC 3339). The budget was checked as of then.
+    pub at: String,
+    /// The limits that were exceeded at that run.
+    pub breached: Vec<ProductBudgetCheck>,
+}
+
+/// One product budget checked at the end of a `rocky run`, on
+/// [`RunOutput::product_budgets`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RunProductBudget {
+    pub product: String,
+    /// The month checked, `YYYY-MM`, in the project's `[schedule].timezone`.
+    pub month: String,
+    /// The budget as of the end of this run.
+    pub budget: ProductBudgetStatus,
+    /// Present when this run is the one that moved the product over its
+    /// budget. The `on_budget_breach` hook fired once for each limit in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breach_event: Option<ProductBudgetBreachEvent>,
+}
+
+/// One product's current month, on `rocky product status`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProductCostMonth {
+    /// The month, `YYYY-MM`, in `timezone`.
+    pub month: String,
+    /// The project's `[schedule].timezone`.
+    pub timezone: String,
+    /// The instant the month was computed (RFC 3339).
+    pub as_of: String,
+    /// Whether run history reaches back far enough to cover the month.
+    pub history_complete: bool,
+    /// The product's row from `rocky cost --month <month> --by product`.
+    pub cost: ProductMonthCost,
 }
 
 /// Whether a money figure in the monthly report could be computed.

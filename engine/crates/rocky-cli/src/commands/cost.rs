@@ -43,9 +43,12 @@ use rocky_core::state::{
 
 use crate::output::{
     AllocatedUpstreamCost, CostAmount, CostGroup, CostNotMeasured, CostOutput, CostUnit,
-    MoneyFigure, MoneyPart, MoneyStatus, PerModelCostHistorical, ProductMonthCost,
-    ProductMonthCostOutput, SharedNotChargedCost,
+    MoneyFigure, MoneyPart, MoneyStatus, PerModelCostHistorical, ProductBudgetBreachEvent,
+    ProductBudgetCheck, ProductBudgetLimitType, ProductBudgetStatus, ProductBudgetVerdict,
+    ProductCostMonth, ProductMonthCost, ProductMonthCostOutput, RunProductBudget,
+    SharedNotChargedCost,
 };
+use rocky_core::config::ProductBudgetConfig;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -851,11 +854,7 @@ fn product_out(
     row: &cost_split::ProductSplit,
     pricing: &MonthPricing,
 ) -> ProductMonthCost {
-    let charged: cost_split::Amounts = cost_split::Unit::ALL
-        .into_iter()
-        .map(|unit| (unit, row.charged(unit)))
-        .collect();
-    let charged = amounts_out(&charged);
+    let charged = charged_amounts(row);
     let (money, money_status, money_parts) = pricing.price(&charged);
     ProductMonthCost {
         product: product.to_string(),
@@ -891,26 +890,38 @@ fn product_out(
         money,
         money_status,
         money_parts,
+        budget: None,
+        breach_events: Vec::new(),
+        breach_events_skipped: None,
     }
 }
 
-/// The typed payload behind `rocky cost --month YYYY-MM --by product`.
-///
-/// Splits one month of production cost across the products in `products/`,
-/// in physical units (see [`rocky_core::cost_split`]), priced in USD from the
-/// prices set in `[cost]` (see `MonthPricing`). It reads run history
-/// only; the month is cut in the project's `[schedule].timezone`, and each
-/// execution belongs to the month of its own start. `now` is passed in so a
-/// caller can pin it: storage accrues to the earlier of `now` and the end of
-/// the month.
-///
-/// A split that breaks its own invariant is an error, never printed.
-pub fn compute_month_cost(
-    state_path: &Path,
+/// Everything one month's report reads, loaded once: the config, the month
+/// window, the run scan and the carry-in. Every split of the month (the
+/// report itself and each replay step of the budgets) is computed from this,
+/// so the budgets add no scan of the state store.
+struct MonthInputs {
+    cfg: Option<rocky_core::config::RockyConfig>,
+    /// `YYYY-MM`.
+    label: String,
+    timezone: String,
+    window: cost_split::MonthWindow,
+    history_complete: bool,
+    owners: std::collections::BTreeMap<String, String>,
+    children: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The scanned runs, ordered by when their record was written
+    /// (`finished_at`, then `run_id`).
+    runs: Vec<RunRecord>,
+    carry_in: Vec<ModelExecution>,
+    warnings: Vec<String>,
+}
+
+fn load_month_inputs(
+    store: &StateStore,
     config_path: &Path,
     month: &str,
     now: DateTime<Utc>,
-) -> Result<ProductMonthCostOutput> {
+) -> Result<MonthInputs> {
     let (year, month_number) = parse_month(month)?;
     let cfg = load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
@@ -941,12 +952,15 @@ pub fn compute_month_cost(
     warnings.extend(problems);
     let children = declared_children(cfg.as_ref(), config_path, &mut warnings);
 
-    let store = StateStore::open_read_only_or_empty(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     // A run can start before the month and hold executions inside it, so the
     // scan reaches one day back. Anything older is the known limit.
-    let runs =
+    let mut runs =
         store.list_runs_matching_since(window.start - chrono::Duration::days(1), |_| true)?;
+    runs.sort_by(|a, b| {
+        a.finished_at
+            .cmp(&b.finished_at)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
 
     // Models whose last build before the month is needed: every owned model,
     // every model run in the scan, and every model the graph names, so a table
@@ -966,41 +980,505 @@ pub fn compute_month_cost(
     })?;
     let carry_in: Vec<ModelExecution> = carry_in.into_values().collect();
 
-    let split = cost_split::split_month(&cost_split::SplitInput {
+    Ok(MonthInputs {
+        cfg,
+        label: format!("{year:04}-{month_number:02}"),
+        timezone,
         window,
-        as_of: now,
-        runs: &runs,
-        carry_in: &carry_in,
         history_complete,
-        owners: &owners,
-        declared_children: &children,
-        default_catalog: None,
-    });
-    let broken = split.invariant_violations();
-    anyhow::ensure!(
-        broken.is_empty(),
-        "the monthly split does not add up for {} — this is a bug in Rocky, not in your data",
-        broken
-            .iter()
-            .map(|u| u.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+        owners,
+        children,
+        runs,
+        carry_in,
+        warnings,
+    })
+}
 
-    check_fits_u64(&split)?;
+impl MonthInputs {
+    /// Split the month over `runs` (a prefix of [`Self::runs`] for a replay
+    /// step, or all of them), with storage accrued to `as_of`. A split that
+    /// breaks its own invariant is an error, never printed.
+    fn split(&self, runs: &[RunRecord], as_of: DateTime<Utc>) -> Result<cost_split::MonthSplit> {
+        let split = cost_split::split_month(&cost_split::SplitInput {
+            window: self.window,
+            as_of,
+            runs,
+            carry_in: &self.carry_in,
+            history_complete: self.history_complete,
+            owners: &self.owners,
+            declared_children: &self.children,
+            default_catalog: None,
+        });
+        let broken = split.invariant_violations();
+        anyhow::ensure!(
+            broken.is_empty(),
+            "the monthly split does not add up for {} — this is a bug in Rocky, not in your data",
+            broken
+                .iter()
+                .map(|u| u.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        check_fits_u64(&split)?;
+        Ok(split)
+    }
+
+    fn pricing(&self, measured_total: &[CostAmount]) -> MonthPricing {
+        MonthPricing::new(
+            self.cfg.as_ref().map(|c| &c.cost),
+            &self.window,
+            self.history_complete,
+            measured_total,
+        )
+    }
+
+    fn budgets(&self) -> Option<&std::collections::BTreeMap<String, ProductBudgetConfig>> {
+        self.cfg
+            .as_ref()
+            .map(|c| &c.product_budget)
+            .filter(|b| !b.is_empty())
+    }
+
+    /// The executions the full replay splits: for each replay step, every
+    /// execution in the runs up to it. This, not the number of runs, is what
+    /// the replay costs.
+    fn replay_work(&self) -> usize {
+        let mut prefix = 0usize;
+        let mut work = 0usize;
+        for run in &self.runs {
+            prefix = prefix.saturating_add(run.models_executed.len());
+            if self.is_step(run) {
+                work = work.saturating_add(prefix);
+            }
+        }
+        work
+    }
+
+    /// Whether `run` is a replay step: a production run with an execution
+    /// that started inside the month.
+    fn is_step(&self, run: &RunRecord) -> bool {
+        run.counts_as_production(UnrecordedScope::Count)
+            && run
+                .models_executed
+                .iter()
+                .any(|exec| self.window.contains(exec.started_at))
+    }
+}
+
+/// Milliseconds in one hour, for `max_compute_hours`.
+const MS_PER_HOUR: f64 = 3_600_000.0;
+
+fn budget_check(
+    limit_type: ProductBudgetLimitType,
+    unit: Option<CostUnit>,
+    limit: f64,
+    actual: Option<f64>,
+    unknown: Option<&str>,
+) -> ProductBudgetCheck {
+    let (verdict, reason) = match (actual, unknown) {
+        (_, Some(reason)) => (ProductBudgetVerdict::NotEvaluated, Some(reason.to_string())),
+        (None, None) => (
+            ProductBudgetVerdict::NotEvaluated,
+            Some("the figure is not known".to_string()),
+        ),
+        (Some(actual), None) if actual > limit => (ProductBudgetVerdict::Breached, None),
+        (Some(_), None) => (ProductBudgetVerdict::InBudget, None),
+    };
+    ProductBudgetCheck {
+        limit_type,
+        unit,
+        limit,
+        actual,
+        verdict,
+        reason,
+    }
+}
+
+const HISTORY_INCOMPLETE: &str =
+    "run history does not cover the whole month: state retention may have swept runs it needs";
+
+/// Check one product's budget against what it is charged this month.
+///
+/// `charged` is the product's `kept + allocated_upstream` (see
+/// [`product_out`]); `pricing` also says which storage bases the month
+/// measured at all; `production_ran` is whether any production run had an
+/// execution in the month. The verdict is never `in_budget` unless every limit was
+/// checked.
+fn evaluate_budget(
+    budget: &ProductBudgetConfig,
+    charged: &[CostAmount],
+    pricing: &MonthPricing,
+    production_ran: bool,
+) -> ProductBudgetStatus {
+    let amount_of = |unit: CostUnit| {
+        charged
+            .iter()
+            .find(|a| a.unit == unit)
+            .map_or(0, |a| a.amount)
+    };
+    let history = (!pricing.history_complete).then_some(HISTORY_INCOMPLETE);
+    let mut checks = Vec::new();
+    if let Some(limit) = budget.max_compute_hours {
+        let unknown = history.or_else(|| {
+            (!production_ran).then_some("no production run recorded model time this month")
+        });
+        checks.push(budget_check(
+            ProductBudgetLimitType::MaxComputeHours,
+            None,
+            limit,
+            Some(amount_of(CostUnit::ComputeMs) as f64 / MS_PER_HOUR),
+            unknown,
+        ));
+    }
+    if let Some(limit) = budget.max_storage_gb_month {
+        let byte_hours_per_gb_month = BYTES_PER_GB * pricing.hours_in_month;
+        let mut any = false;
+        for (unit, measured) in [
+            (
+                CostUnit::StorageByteHoursDataFiles,
+                pricing.data_files_measured,
+            ),
+            (
+                CostUnit::StorageByteHoursAllocatedBlocks,
+                pricing.allocated_blocks_measured,
+            ),
+        ] {
+            if !measured {
+                continue;
+            }
+            any = true;
+            checks.push(budget_check(
+                ProductBudgetLimitType::MaxStorageGbMonth,
+                Some(unit),
+                limit,
+                Some(amount_of(unit) as f64 / byte_hours_per_gb_month),
+                history,
+            ));
+        }
+        if !any {
+            checks.push(budget_check(
+                ProductBudgetLimitType::MaxStorageGbMonth,
+                None,
+                limit,
+                None,
+                Some("no stored size was measured this month"),
+            ));
+        }
+    }
+    if let Some(limit) = budget.max_usd {
+        let (usd, status, _) = pricing.price(charged);
+        let unknown = match status {
+            MoneyStatus::Priced => None,
+            MoneyStatus::NoPrice => Some(
+                "a charged figure has no price in [cost] (compute_cost_per_machine_hour, \
+                 storage_cost_per_gb_month)",
+            ),
+            MoneyStatus::Partial | MoneyStatus::NotMeasured => Some(HISTORY_INCOMPLETE),
+        };
+        checks.push(budget_check(
+            ProductBudgetLimitType::MaxUsd,
+            None,
+            limit,
+            usd,
+            unknown,
+        ));
+    }
+    let mut reasons = Vec::new();
+    let verdict = if let Some(reason) = history {
+        reasons.push(reason.to_string());
+        ProductBudgetVerdict::NotEvaluated
+    } else if checks.is_empty() {
+        reasons.push("the budget sets no limit".to_string());
+        ProductBudgetVerdict::NotEvaluated
+    } else if checks
+        .iter()
+        .any(|c| c.verdict == ProductBudgetVerdict::Breached)
+    {
+        ProductBudgetVerdict::Breached
+    } else if checks
+        .iter()
+        .any(|c| c.verdict == ProductBudgetVerdict::NotEvaluated)
+    {
+        ProductBudgetVerdict::NotEvaluated
+    } else {
+        ProductBudgetVerdict::InBudget
+    };
+    ProductBudgetStatus {
+        verdict,
+        on_breach: budget.on_breach,
+        checks,
+        reasons,
+    }
+}
+
+/// The charged amounts of one product row, as the report prints them.
+fn charged_amounts(row: &cost_split::ProductSplit) -> Vec<CostAmount> {
+    let charged: cost_split::Amounts = cost_split::Unit::ALL
+        .into_iter()
+        .map(|unit| (unit, row.charged(unit)))
+        .collect();
+    amounts_out(&charged)
+}
+
+/// Every budgeted product's verdict for one split of the month.
+fn evaluate_budgets(
+    inputs: &MonthInputs,
+    budgets: &std::collections::BTreeMap<String, ProductBudgetConfig>,
+    split: &cost_split::MonthSplit,
+    production_ran: bool,
+) -> std::collections::BTreeMap<String, ProductBudgetStatus> {
+    let measured_total = amounts_out(&split.measured_total);
+    let pricing = inputs.pricing(&measured_total);
+    budgets
+        .iter()
+        .filter_map(|(product, budget)| {
+            let row = split.products.get(product)?;
+            Some((
+                product.clone(),
+                evaluate_budget(budget, &charged_amounts(row), &pricing, production_ran),
+            ))
+        })
+        .collect()
+}
+
+/// Every budgeted product's verdict as of the replay step at `index` of
+/// [`MonthInputs::runs`]: the month split over the runs whose records were
+/// written by the time that run's was, with storage accrued to then.
+fn step_verdicts(
+    inputs: &MonthInputs,
+    budgets: &std::collections::BTreeMap<String, ProductBudgetConfig>,
+    index: usize,
+) -> Result<std::collections::BTreeMap<String, ProductBudgetStatus>> {
+    let run = &inputs.runs[index];
+    let split = inputs.split(&inputs.runs[..=index], run.finished_at)?;
+    Ok(evaluate_budgets(inputs, budgets, &split, true))
+}
+
+/// The event a breached step records: the run, and the limits it exceeded.
+fn breach_event(run: &RunRecord, status: &ProductBudgetStatus) -> ProductBudgetBreachEvent {
+    ProductBudgetBreachEvent {
+        run_id: run.run_id.clone(),
+        at: run.finished_at.to_rfc3339(),
+        breached: status
+            .checks
+            .iter()
+            .filter(|c| c.verdict == ProductBudgetVerdict::Breached)
+            .cloned()
+            .collect(),
+    }
+}
+
+/// The breach events of every budgeted product this month.
+///
+/// The prior verdict is not stored. Instead the month is split again after
+/// each production run, as of the moment that run's record was written, over
+/// the runs whose records existed by then, and the budget is checked each
+/// time. An event is a step where the product is `breached` and its last
+/// evaluated verdict before it was not (or there was none). A step that is
+/// `not_evaluated` is skipped over: it neither ends a breach nor starts one.
+fn replay_breach_events(
+    inputs: &MonthInputs,
+    budgets: &std::collections::BTreeMap<String, ProductBudgetConfig>,
+) -> Result<std::collections::BTreeMap<String, Vec<ProductBudgetBreachEvent>>> {
+    let mut events: std::collections::BTreeMap<String, Vec<ProductBudgetBreachEvent>> =
+        std::collections::BTreeMap::new();
+    // With history incomplete every step is `not_evaluated`.
+    if !inputs.history_complete {
+        return Ok(events);
+    }
+    let mut last: std::collections::BTreeMap<String, ProductBudgetVerdict> =
+        std::collections::BTreeMap::new();
+    for (index, run) in inputs.runs.iter().enumerate() {
+        if !inputs.is_step(run) {
+            continue;
+        }
+        for (product, status) in step_verdicts(inputs, budgets, index)? {
+            match status.verdict {
+                ProductBudgetVerdict::NotEvaluated => {}
+                ProductBudgetVerdict::InBudget => {
+                    last.insert(product, ProductBudgetVerdict::InBudget);
+                }
+                ProductBudgetVerdict::Breached => {
+                    let previous = last.insert(product.clone(), ProductBudgetVerdict::Breached);
+                    if previous == Some(ProductBudgetVerdict::Breached) {
+                        continue;
+                    }
+                    events
+                        .entry(product)
+                        .or_default()
+                        .push(breach_event(run, &status));
+                }
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// The events the replay step at `index` records, by product: the same rule
+/// as [`replay_breach_events`], without replaying the whole month.
+///
+/// Splits the month at `index`, then, for each product breached there, walks
+/// back over earlier steps only until it finds that product's last evaluated
+/// verdict. Usually that is the step before, so the end-of-run check costs
+/// two splits, not one per run of the month.
+fn events_at_step(
+    inputs: &MonthInputs,
+    budgets: &std::collections::BTreeMap<String, ProductBudgetConfig>,
+    index: usize,
+    walk_back_cap: usize,
+) -> Result<StepCheck> {
+    let mut events = std::collections::BTreeMap::new();
+    let run = &inputs.runs[index];
+    let verdicts = step_verdicts(inputs, budgets, index)?;
+    if !inputs.history_complete || !inputs.is_step(run) {
+        return Ok(StepCheck {
+            verdicts,
+            events,
+            earlier_splits: 0,
+        });
+    }
+    let mut pending: std::collections::BTreeMap<String, ProductBudgetStatus> = verdicts
+        .iter()
+        .filter(|(_, status)| status.verdict == ProductBudgetVerdict::Breached)
+        .map(|(product, status)| (product.clone(), status.clone()))
+        .collect();
+    let mut earlier_splits = 0;
+    for earlier in (0..index).rev() {
+        if pending.is_empty() || earlier_splits == walk_back_cap {
+            break;
+        }
+        if !inputs.is_step(&inputs.runs[earlier]) {
+            continue;
+        }
+        earlier_splits += 1;
+        let before = step_verdicts(inputs, budgets, earlier)?;
+        pending.retain(|product, status| {
+            match before.get(product).map(|s| s.verdict) {
+                // Already over: still out, no new event.
+                Some(ProductBudgetVerdict::Breached) => false,
+                Some(ProductBudgetVerdict::InBudget) => {
+                    events.insert(product.clone(), breach_event(run, status));
+                    false
+                }
+                Some(ProductBudgetVerdict::NotEvaluated) | None => true,
+            }
+        });
+    }
+    // No evaluated verdict before this step, within the cap: this is the
+    // product's first.
+    for (product, status) in pending {
+        events.insert(product, breach_event(run, &status));
+    }
+    Ok(StepCheck {
+        verdicts,
+        events,
+        earlier_splits,
+    })
+}
+
+/// What [`events_at_step`] found at one replay step.
+struct StepCheck {
+    /// Every budgeted product's verdict as of the step.
+    verdicts: std::collections::BTreeMap<String, ProductBudgetStatus>,
+    /// The events the step records, by product.
+    events: std::collections::BTreeMap<String, ProductBudgetBreachEvent>,
+    /// How many earlier steps it split to find the last verdicts.
+    earlier_splits: usize,
+}
+
+/// The most replay work for which the monthly report (`rocky cost --month`,
+/// and `cost_month` on `rocky product status`) lists breach events, counted
+/// as executions split (see `MonthInputs::replay_work`). Listing them splits
+/// the month once per production run, so the work grows with the square of
+/// the runs and with the executions in each. This cap is 750 runs of 21
+/// executions each (about 3 s in a release build); a month of hourly runs of
+/// about 20 models fits. Above it, the report skips the replay and says so.
+pub(crate) const MAX_REPLAY_WORK: usize = 750 * 751 / 2 * 21;
+
+/// The most earlier runs the end-of-run check splits to find a breached
+/// product's last verdict. Earlier runs are `not_evaluated` only while the
+/// month has measured nothing a limit needs, so the walk almost always stops
+/// at the run before. Past the cap, the breach counts as the product's first.
+const MAX_WALK_BACK_STEPS: usize = 8;
+
+/// The typed payload behind `rocky cost --month YYYY-MM --by product`.
+///
+/// Splits one month of production cost across the products in `products/`,
+/// in physical units (see [`rocky_core::cost_split`]), priced in USD from the
+/// prices set in `[cost]` (see `MonthPricing`). It reads run history
+/// only; the month is cut in the project's `[schedule].timezone`, and each
+/// execution belongs to the month of its own start. `now` is passed in so a
+/// caller can pin it: storage accrues to the earlier of `now` and the end of
+/// the month.
+///
+/// Each product with a `[product_budget.<name>]` also gets its budget,
+/// checked as of `now`, and the month's breach events (see
+/// `replay_breach_events`).
+///
+/// A split that breaks its own invariant is an error, never printed.
+pub fn compute_month_cost(
+    state_path: &Path,
+    config_path: &Path,
+    month: &str,
+    now: DateTime<Utc>,
+) -> Result<ProductMonthCostOutput> {
+    let store = StateStore::open_read_only_or_empty(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    compute_month_cost_in(&store, config_path, month, now, MAX_REPLAY_WORK)
+}
+
+/// [`compute_month_cost`] over a store the caller already holds open, listing
+/// breach events only when the month has at most `replay_cap` production runs.
+fn compute_month_cost_in(
+    store: &StateStore,
+    config_path: &Path,
+    month: &str,
+    now: DateTime<Utc>,
+    replay_cap: usize,
+) -> Result<ProductMonthCostOutput> {
+    let mut inputs = load_month_inputs(store, config_path, month, now)?;
+    let split = inputs.split(&inputs.runs, now)?;
     let measured_total = amounts_out(&split.measured_total);
     let unallocated = amounts_out(&split.unallocated);
-    let pricing = MonthPricing::new(
-        cfg.as_ref().map(|c| &c.cost),
-        &window,
-        history_complete,
-        &measured_total,
-    );
+    let pricing = inputs.pricing(&measured_total);
     let (measured_total_money, measured_total_money_status, measured_total_money_parts) =
         pricing.price(&measured_total);
     let (unallocated_money, unallocated_money_status, unallocated_money_parts) =
         pricing.price(&unallocated);
-    let model_of: std::collections::BTreeMap<&str, &str> = owners
+
+    let mut budget_status = std::collections::BTreeMap::new();
+    let mut breach_events = std::collections::BTreeMap::new();
+    let mut budget_warnings = Vec::new();
+    let mut events_skipped: Option<String> = None;
+    if let Some(budgets) = inputs.budgets() {
+        for product in budgets.keys() {
+            if !split.products.contains_key(product) {
+                budget_warnings.push(format!(
+                    "[product_budget.{product}] names no product that owns a model; \
+                     it is not checked"
+                ));
+            }
+        }
+        let steps = inputs.runs.iter().filter(|run| inputs.is_step(run)).count();
+        budget_status = evaluate_budgets(&inputs, budgets, &split, steps > 0);
+        let work = inputs.replay_work();
+        if work <= replay_cap {
+            breach_events = replay_breach_events(&inputs, budgets)?;
+        } else if inputs.history_complete {
+            // With history incomplete there are no events to list anyway.
+            let reason = format!(
+                "breach events are not listed: replaying this month's {steps} production \
+                 runs would split {work} executions, more than the {replay_cap} the report \
+                 replays"
+            );
+            budget_warnings.push(reason.clone());
+            events_skipped = Some(reason);
+        }
+    }
+    inputs.warnings.extend(budget_warnings);
+
+    let model_of: std::collections::BTreeMap<&str, &str> = inputs
+        .owners
         .iter()
         .map(|(model, product)| (product.as_str(), model.as_str()))
         .collect();
@@ -1008,24 +1486,30 @@ pub fn compute_month_cost(
         .products
         .iter()
         .map(|(product, row)| {
-            product_out(
+            let mut out = product_out(
                 product,
                 model_of.get(product.as_str()).copied().unwrap_or(""),
                 row,
                 &pricing,
-            )
+            );
+            out.budget = budget_status.remove(product);
+            out.breach_events = breach_events.remove(product).unwrap_or_default();
+            if out.budget.is_some() {
+                out.breach_events_skipped.clone_from(&events_skipped);
+            }
+            out
         })
         .collect();
 
     Ok(ProductMonthCostOutput {
         version: VERSION.to_string(),
         command: "cost_by_product".to_string(),
-        month: format!("{year:04}-{month_number:02}"),
-        timezone,
-        month_start: window.start.to_rfc3339(),
-        month_end: window.end.to_rfc3339(),
+        month: inputs.label,
+        timezone: inputs.timezone,
+        month_start: inputs.window.start.to_rfc3339(),
+        month_end: inputs.window.end.to_rfc3339(),
         as_of: now.to_rfc3339(),
-        history_complete,
+        history_complete: inputs.history_complete,
         products,
         unallocated,
         shadow_branch: amounts_out(&split.shadow_branch),
@@ -1041,8 +1525,152 @@ pub fn compute_month_cost(
             storage_unknown_tables: split.not_measured.storage_unknown_tables,
             unattributed_read_tables: split.not_measured.unattributed_read_tables,
         },
-        warnings,
+        warnings: inputs.warnings,
     })
+}
+
+/// The month, `YYYY-MM`, that contains `at` in `timezone`.
+fn month_containing(at: DateTime<Utc>, timezone: &str) -> Option<String> {
+    use chrono::Datelike;
+    // The local month is the UTC month or one next to it.
+    let utc = at.date_naive();
+    let (year, month) = (utc.year(), utc.month());
+    let candidates = [
+        if month == 1 {
+            (year - 1, 12)
+        } else {
+            (year, month - 1)
+        },
+        (year, month),
+        if month == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month + 1)
+        },
+    ];
+    candidates.into_iter().find_map(|(y, m)| {
+        cost_split::month_bounds_in_zone(y, m, timezone)
+            .ok()
+            .filter(|window| window.contains(at))
+            .map(|_| format!("{y:04}-{m:02}"))
+    })
+}
+
+/// The project's report time zone: `[schedule].timezone`, or UTC with no
+/// config.
+fn project_timezone(config_path: &Path) -> Result<String> {
+    let cfg = load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    Ok(cfg.map_or_else(|| "UTC".to_string(), |c| c.schedule.timezone))
+}
+
+/// The product's current month, for `rocky product status`.
+///
+/// # Errors
+///
+/// Returns an error when the config, the state store or the month split
+/// cannot be read.
+pub fn product_cost_month(
+    state_path: &Path,
+    config_path: &Path,
+    product: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<ProductCostMonth>> {
+    let timezone = project_timezone(config_path)?;
+    let month = month_containing(now, &timezone)
+        .with_context(|| format!("no month contains {now} in time zone '{timezone}'"))?;
+    let output = compute_month_cost(state_path, config_path, &month, now)?;
+    Ok(output
+        .products
+        .into_iter()
+        .find(|p| p.product == product)
+        .map(|cost| ProductCostMonth {
+            month: output.month,
+            timezone: output.timezone,
+            as_of: output.as_of,
+            history_complete: output.history_complete,
+            cost,
+        }))
+}
+
+/// Check every `[product_budget.<name>]` at the end of a production run.
+///
+/// Reads the run's record back from `store`, so it must run after the
+/// record is written. Checks each month the run's
+/// executions can fall in (the month of its start and of its finish, in the
+/// project's `[schedule].timezone`). Returns nothing when no product budget
+/// is set, the record is not there, or the run is not a production run.
+/// `breach_event` is set on an entry only when this run is the step that
+/// moved the product over.
+///
+/// # Errors
+///
+/// Returns an error when the config, the state store or a month split cannot
+/// be read. The caller only warns: a budget never fails a run.
+pub fn product_budgets_after_run(
+    store: &StateStore,
+    config_path: &Path,
+    run_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<RunProductBudget>> {
+    let Some(cfg) = load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?
+    else {
+        return Ok(Vec::new());
+    };
+    if cfg.product_budget.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(record) = store.get_run(run_id)? else {
+        tracing::warn!(
+            run_id,
+            "monthly product budgets not checked: this run's record is not in the state store"
+        );
+        return Ok(Vec::new());
+    };
+    if !record.counts_as_production(UnrecordedScope::Count) {
+        return Ok(Vec::new());
+    }
+    let timezone = cfg.schedule.timezone.clone();
+    let mut months: Vec<String> = [record.started_at, record.finished_at]
+        .into_iter()
+        .filter_map(|at| month_containing(at, &timezone))
+        .collect();
+    months.dedup();
+
+    let mut out = Vec::new();
+    for month in months {
+        let inputs = load_month_inputs(store, config_path, &month, now)?;
+        let Some(budgets) = inputs.budgets() else {
+            continue;
+        };
+        // The verdict is the one as of this run's finish, from the same split
+        // that decides its event. A run the scan does not hold (it started
+        // more than a day before the month) gets no entry for the month.
+        let Some(index) = inputs.runs.iter().position(|run| run.run_id == run_id) else {
+            continue;
+        };
+        let StepCheck {
+            verdicts,
+            mut events,
+            earlier_splits,
+        } = events_at_step(&inputs, budgets, index, MAX_WALK_BACK_STEPS)?;
+        tracing::debug!(
+            run_id,
+            month = %inputs.label,
+            earlier_splits,
+            "checked monthly product budgets"
+        );
+        for (product, budget) in verdicts {
+            out.push(RunProductBudget {
+                breach_event: events.remove(&product),
+                product,
+                month: inputs.label.clone(),
+                budget,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn amount_cell(amounts: &[CostAmount], unit: CostUnit) -> String {
@@ -2390,5 +3018,666 @@ mod tests {
         assert_eq!(out.measured_total_money_status, MoneyStatus::Partial);
         assert_eq!(out.measured_total_money, None);
         assert_eq!(out.unallocated_money, None);
+    }
+
+    // ----- monthly product budgets -----
+
+    /// A second product, `ltv`, owning the model `ltv`.
+    const LTV_SPEC: &str = "[product]\nname = \"ltv\"\nintent = \"lifetime value\"\n\n\
+                            [product.source]\ntables = [\"c.s.t\"]\n\n\
+                            [product.output]\nmodel = \"ltv\"\ngrain = [\"id\"]\n\
+                            columns = [ { name = \"id\", type = \"Int64\", nullable = false } ]\n\n\
+                            [product.trust]\nagent = \"propose_only\"\n";
+
+    /// The fixture project (product `revenue_daily` owns model
+    /// `revenue_daily`), plus product `ltv` and `extra` appended to the
+    /// config. Returns `(config, state_path)`.
+    fn budget_project(dir: &Path, extra: &str) -> (PathBuf, PathBuf) {
+        let (root, config, state_path) = api_fixture_project(dir);
+        std::fs::write(root.join("products/ltv.toml"), LTV_SPEC).unwrap();
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push('\n');
+        text.push_str(extra);
+        std::fs::write(&config, text).unwrap();
+        (config, state_path)
+    }
+
+    fn record(state_path: &Path, runs: &[RunRecord]) {
+        let store = StateStore::open(state_path).unwrap();
+        for run in runs {
+            store.record_run(run).unwrap();
+        }
+    }
+
+    fn budget_of<'a>(out: &'a ProductMonthCostOutput, product: &str) -> &'a ProductMonthCost {
+        out.products
+            .iter()
+            .find(|p| p.product == product)
+            .unwrap_or_else(|| panic!("no product {product}"))
+    }
+
+    fn verdict(out: &ProductMonthCostOutput, product: &str) -> ProductBudgetVerdict {
+        budget_of(out, product)
+            .budget
+            .as_ref()
+            .expect("the product has a budget")
+            .verdict
+    }
+
+    fn event_runs(out: &ProductMonthCostOutput, product: &str) -> Vec<String> {
+        budget_of(out, product)
+            .breach_events
+            .iter()
+            .map(|e| e.run_id.clone())
+            .collect()
+    }
+
+    /// 400 ms of `revenue_daily` reading 1,000 ms of unowned `raw`: charged
+    /// 1,400 ms, about 0.000389 hours.
+    fn one_charged_run(state_path: &Path) {
+        let start = at(2026, 10, 5, 2, 0);
+        record(
+            state_path,
+            &[sample_run_at(
+                "run-1",
+                start,
+                vec![
+                    exec_at("raw", start, 1_000),
+                    reading(
+                        exec_at("revenue_daily", start + chrono::Duration::minutes(1), 400),
+                        "raw",
+                        10,
+                    ),
+                ],
+            )],
+        );
+    }
+
+    fn one_run_month(budget: &str) -> ProductMonthCostOutput {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(
+            dir.path(),
+            &format!("[product_budget.revenue_daily]\n{budget}"),
+        );
+        one_charged_run(&state);
+        month(&config, &state)
+    }
+
+    const HOURS_1400_MS: f64 = 1_400.0 / 3_600_000.0;
+
+    #[test]
+    fn a_budget_above_the_charge_is_in_budget() {
+        let out = one_run_month("max_compute_hours = 1\n");
+        let product = budget_of(&out, "revenue_daily");
+        let budget = product.budget.as_ref().unwrap();
+        assert_eq!(budget.verdict, ProductBudgetVerdict::InBudget);
+        assert_eq!(budget.checks.len(), 1);
+        let check = &budget.checks[0];
+        assert_eq!(check.limit_type, ProductBudgetLimitType::MaxComputeHours);
+        assert!((check.actual.unwrap() - HOURS_1400_MS).abs() < 1e-12);
+        assert!(product.breach_events.is_empty());
+        // The product without a budget has none in the output.
+        assert!(budget_of(&out, "ltv").budget.is_none());
+    }
+
+    /// The budget tests the charged figure, `kept + allocated_upstream`
+    /// (1,400 ms), not `built` (400 ms).
+    #[test]
+    fn a_budget_below_the_charged_figure_is_breached() {
+        let between = (400.0 + 1_000.0) / 2.0 / 3_600_000.0;
+        let out = one_run_month(&format!("max_compute_hours = {between}\n"));
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
+        assert_eq!(event_runs(&out, "revenue_daily"), ["run-1"]);
+        let event = &budget_of(&out, "revenue_daily").breach_events[0];
+        assert_eq!(event.breached.len(), 1);
+        assert_eq!(
+            event.breached[0].limit_type,
+            ProductBudgetLimitType::MaxComputeHours
+        );
+    }
+
+    /// Equal to the limit is in budget: only more than the limit breaches.
+    #[test]
+    fn a_charge_equal_to_the_limit_is_in_budget() {
+        let out = one_run_month(&format!("max_compute_hours = {HOURS_1400_MS}\n"));
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::InBudget
+        );
+    }
+
+    #[test]
+    fn max_usd_without_a_price_is_not_evaluated() {
+        let out = one_run_month("max_compute_hours = 1\nmax_usd = 100\n");
+        let budget = budget_of(&out, "revenue_daily").budget.clone().unwrap();
+        assert_eq!(budget.verdict, ProductBudgetVerdict::NotEvaluated);
+        let usd = budget
+            .checks
+            .iter()
+            .find(|c| c.limit_type == ProductBudgetLimitType::MaxUsd)
+            .unwrap();
+        assert_eq!(usd.verdict, ProductBudgetVerdict::NotEvaluated);
+        assert_eq!(usd.actual, None);
+        assert!(usd.reason.as_deref().unwrap().contains("no price"));
+    }
+
+    /// `max_usd` uses the same money as the report: `charged` priced from
+    /// `[cost]`. 1,400 ms at $3.60 per machine-hour is $0.0014.
+    #[test]
+    fn max_usd_tests_the_priced_charge() {
+        let budget = "max_usd = 0.001\n\n[cost]\ncompute_cost_per_machine_hour = 3.6\n";
+        let out = one_run_month(budget);
+        let product = budget_of(&out, "revenue_daily");
+        let check = &product.budget.as_ref().unwrap().checks[0];
+        assert_eq!(check.actual, product.money);
+        assert!((check.actual.unwrap() - 0.0014).abs() < 1e-12);
+        assert_eq!(check.verdict, ProductBudgetVerdict::Breached);
+    }
+
+    /// A limit that is exceeded is a breach even when another limit cannot
+    /// be checked: a missing price never hides a known overrun.
+    #[test]
+    fn a_known_breach_is_not_hidden_by_an_unpriced_limit() {
+        let out = one_run_month("max_compute_hours = 0\nmax_usd = 100\n");
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
+    }
+
+    #[test]
+    fn a_storage_limit_with_no_storage_measured_is_not_evaluated() {
+        let out = one_run_month("max_storage_gb_month = 1\n");
+        let budget = budget_of(&out, "revenue_daily").budget.clone().unwrap();
+        assert_eq!(budget.verdict, ProductBudgetVerdict::NotEvaluated);
+        assert!(
+            budget.checks[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("no stored size")
+        );
+    }
+
+    #[test]
+    fn a_budget_with_no_limit_is_not_evaluated() {
+        let out = one_run_month("on_breach = \"warn\"\n");
+        let budget = budget_of(&out, "revenue_daily").budget.clone().unwrap();
+        assert_eq!(budget.verdict, ProductBudgetVerdict::NotEvaluated);
+        assert!(budget.checks.is_empty());
+    }
+
+    /// With history incomplete the verdict is `not_evaluated`, even for a
+    /// charge far over the limit, and no event is recorded.
+    #[test]
+    fn incomplete_history_is_not_evaluated_and_records_no_event() {
+        let out = one_run_month(
+            "max_compute_hours = 0\n\n[state.retention]\nmax_age_days = 10\nmin_runs_kept = 3\n",
+        );
+        assert!(!out.history_complete);
+        let product = budget_of(&out, "revenue_daily");
+        let budget = product.budget.as_ref().unwrap();
+        assert_eq!(budget.verdict, ProductBudgetVerdict::NotEvaluated);
+        assert!(!budget.reasons.is_empty());
+        assert!(product.breach_events.is_empty());
+    }
+
+    #[test]
+    fn a_month_with_no_production_run_is_not_evaluated() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_compute_hours = 1\n",
+        );
+        let out = month(&config, &state);
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::NotEvaluated
+        );
+    }
+
+    #[test]
+    fn a_budget_naming_no_product_is_a_warning() {
+        let out = one_run_month("max_compute_hours = 1\n\n[product_budget.nope]\nmax_usd = 1\n");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("[product_budget.nope]")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// Product `revenue_daily` builds its table (out), `ltv` reads that
+    /// version and pays for it (back in), then `revenue_daily` rebuilds with
+    /// no reader (out again): two events, and the first is not withdrawn.
+    fn out_in_out(state_path: &Path) {
+        let first = at(2026, 10, 5, 2, 0);
+        let second = at(2026, 10, 6, 2, 0);
+        let third = at(2026, 10, 7, 2, 0);
+        record(
+            state_path,
+            &[
+                sample_run_at("run-1", first, vec![exec_at("revenue_daily", first, 400)]),
+                sample_run_at(
+                    "run-2",
+                    second,
+                    vec![reading(exec_at("ltv", second, 50), "revenue_daily", 10)],
+                ),
+                sample_run_at("run-3", third, vec![exec_at("revenue_daily", third, 400)]),
+            ],
+        );
+    }
+
+    /// 300 ms: under one 400 ms build, over nothing.
+    const OUT_IN_OUT_BUDGET: &str =
+        "[product_budget.revenue_daily]\nmax_compute_hours = 0.00008333333333333333\n";
+
+    #[test]
+    fn out_in_out_is_two_breach_events() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let out = month(&config, &state);
+        assert_eq!(event_runs(&out, "revenue_daily"), ["run-1", "run-3"]);
+        assert_eq!(
+            verdict(&out, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
+    }
+
+    /// Still over at the next run is not a new event.
+    #[test]
+    fn staying_over_records_no_second_event() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        let first = at(2026, 10, 5, 2, 0);
+        let second = at(2026, 10, 6, 2, 0);
+        record(
+            &state,
+            &[
+                sample_run_at("run-1", first, vec![exec_at("revenue_daily", first, 400)]),
+                sample_run_at("run-2", second, vec![exec_at("raw", second, 5)]),
+            ],
+        );
+        let out = month(&config, &state);
+        assert_eq!(event_runs(&out, "revenue_daily"), ["run-1"]);
+    }
+
+    /// A product whose models did not run can still cross: its table's
+    /// storage accrues between runs, so another pipeline's run is the step
+    /// that finds it over. 1 GiB from 1 October against 0.5 GB-month crosses
+    /// past the middle of the month.
+    #[test]
+    fn a_product_that_did_not_run_can_still_cross() {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_storage_gb_month = 0.5\n",
+        );
+        let first = at(2026, 10, 1, 0, 0);
+        let mut build = exec_at("revenue_daily", first, 10);
+        build.stored_bytes = Some(StoredBytes {
+            bytes: 1 << 30,
+            basis: StoredBytesBasis::DataFiles,
+        });
+        let tenth = at(2026, 10, 10, 0, 0);
+        let twentieth = at(2026, 10, 20, 0, 0);
+        record(
+            &state,
+            &[
+                sample_run_at("build", first, vec![build]),
+                sample_run_at("other-10", tenth, vec![exec_at("raw", tenth, 5)]),
+                sample_run_at("other-20", twentieth, vec![exec_at("raw", twentieth, 5)]),
+            ],
+        );
+        let out = month(&config, &state);
+        assert_eq!(event_runs(&out, "revenue_daily"), ["other-20"]);
+        let check = &budget_of(&out, "revenue_daily").breach_events[0].breached[0];
+        assert_eq!(check.unit, Some(CostUnit::StorageByteHoursDataFiles));
+        assert!(check.actual.unwrap() > 0.5);
+    }
+
+    /// The end-of-run check reports an event only for the run that made the
+    /// transition: the hook fires once, at that run, and never again for
+    /// the same breach.
+    #[test]
+    fn the_run_check_reports_only_the_transition_at_this_run() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let fourth = at(2026, 10, 8, 2, 0);
+        record(
+            &state,
+            &[sample_run_at(
+                "run-4",
+                fourth,
+                vec![exec_at("raw", fourth, 5)],
+            )],
+        );
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let now = at(2026, 10, 9, 0, 0);
+        let at_run = |run_id: &str| {
+            let budgets = product_budgets_after_run(&store, &config, run_id, now).unwrap();
+            assert_eq!(budgets.len(), 1, "{budgets:?}");
+            assert_eq!(budgets[0].product, "revenue_daily");
+            assert_eq!(budgets[0].month, "2026-10");
+            budgets[0].breach_event.as_ref().map(|e| e.run_id.clone())
+        };
+        assert_eq!(at_run("run-1").as_deref(), Some("run-1"));
+        assert_eq!(at_run("run-2"), None, "run-2 moved it back in");
+        assert_eq!(at_run("run-3").as_deref(), Some("run-3"));
+        assert_eq!(at_run("run-4"), None, "still over is not a new breach");
+        assert!(
+            product_budgets_after_run(&store, &config, "no-such-run", now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The end-of-run check walks back only as far as it must, and agrees
+    /// with the full replay at every step, including a breach found at a run
+    /// of another pipeline.
+    #[test]
+    fn the_run_check_agrees_with_the_full_replay_at_every_step() {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_storage_gb_month = 0.5\nmax_usd = 1\n",
+        );
+        let first = at(2026, 10, 1, 0, 0);
+        let mut build = exec_at("revenue_daily", first, 10);
+        build.stored_bytes = Some(StoredBytes {
+            bytes: 1 << 30,
+            basis: StoredBytesBasis::DataFiles,
+        });
+        let mut runs = vec![sample_run_at("build", first, vec![build])];
+        for day in [5, 10, 15, 20, 25] {
+            let start = at(2026, 10, day, 0, 0);
+            runs.push(sample_run_at(
+                &format!("day-{day}"),
+                start,
+                vec![exec_at("raw", start, 5)],
+            ));
+        }
+        record(&state, &runs);
+        let replayed = event_runs(&month(&config, &state), "revenue_daily");
+        assert_eq!(
+            replayed,
+            ["day-20"],
+            "the unpriced max_usd does not hide it"
+        );
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let mut found = Vec::new();
+        for run in &runs {
+            let after =
+                product_budgets_after_run(&store, &config, &run.run_id, at(2026, 11, 2, 0, 0))
+                    .unwrap();
+            found.extend(
+                after
+                    .into_iter()
+                    .filter_map(|b| b.breach_event.map(|e| e.run_id)),
+            );
+        }
+        assert_eq!(found, replayed);
+    }
+
+    /// A shadow run is not a production run: no check, no event.
+    #[test]
+    fn a_shadow_run_checks_no_budget() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        let start = at(2026, 10, 5, 2, 0);
+        let mut shadow = sample_run_at(
+            "shadow-1",
+            start,
+            vec![exec_at("revenue_daily", start, 400)],
+        );
+        shadow.run_scope = Some(rocky_core::state::RunScope::Shadow { schema: None });
+        record(&state, &[shadow]);
+        {
+            let store = StateStore::open_read_only_or_empty(&state).unwrap();
+            let budgets =
+                product_budgets_after_run(&store, &config, "shadow-1", at(2026, 10, 6, 0, 0))
+                    .unwrap();
+            assert!(budgets.is_empty(), "{budgets:?}");
+        }
+        let out = month(&config, &state);
+        assert!(event_runs(&out, "revenue_daily").is_empty());
+    }
+
+    /// `rocky product status` carries the current month only for a product
+    /// that has a budget, with its verdict.
+    #[test]
+    fn product_status_gains_cost_month_only_with_a_budget() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let root = config.parent().unwrap();
+        let now = at(2026, 10, 9, 0, 0);
+        let status = |product: &str| {
+            let mut out =
+                crate::commands::product::product_status_in(root, Some(&state), product).unwrap();
+            crate::commands::product::attach_cost_month(&mut out, &config, &state, now);
+            out
+        };
+        let budgeted = status("revenue_daily");
+        assert_eq!(budgeted.cost_month_error, None);
+        let cost_month = budgeted
+            .cost_month
+            .expect("a budgeted product has cost_month");
+        assert_eq!(cost_month.month, "2026-10");
+        assert_eq!(
+            cost_month.cost.budget.map(|b| b.verdict),
+            Some(ProductBudgetVerdict::Breached)
+        );
+        assert_eq!(cost_month.cost.breach_events.len(), 2);
+        let unbudgeted = status("ltv");
+        assert!(unbudgeted.cost_month.is_none());
+        assert!(unbudgeted.cost_month_error.is_none());
+    }
+
+    #[test]
+    fn month_containing_cuts_in_the_project_time_zone() {
+        // 23:30 UTC on 31 October is still October in UTC, and already
+        // 1 November in Tokyo (UTC+9).
+        let late = at(2026, 10, 31, 23, 30);
+        assert_eq!(month_containing(late, "UTC").as_deref(), Some("2026-10"));
+        assert_eq!(
+            month_containing(late, "Asia/Tokyo").as_deref(),
+            Some("2026-11")
+        );
+        let early = at(2026, 11, 1, 2, 0);
+        assert_eq!(
+            month_containing(early, "America/New_York").as_deref(),
+            Some("2026-10")
+        );
+        assert_eq!(month_containing(early, "Not/AZone"), None);
+    }
+
+    /// The report lists breach events only up to the replay cap, counted as
+    /// executions split: three runs of one execution each split 1 + 2 + 3 =
+    /// 6. At the cap it replays; one over it skips the replay, says why with
+    /// the counts, and still checks the budget.
+    #[test]
+    fn the_report_replays_breach_events_only_up_to_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let now = at(2026, 11, 2, 0, 0);
+        let report = |cap| compute_month_cost_in(&store, &config, "2026-10", now, cap).unwrap();
+
+        let at_cap = report(6);
+        assert_eq!(event_runs(&at_cap, "revenue_daily"), ["run-1", "run-3"]);
+        assert_eq!(
+            budget_of(&at_cap, "revenue_daily").breach_events_skipped,
+            None
+        );
+
+        let over = report(5);
+        let product = budget_of(&over, "revenue_daily");
+        assert!(product.breach_events.is_empty());
+        let reason = product.breach_events_skipped.as_deref().expect("a reason");
+        assert!(reason.contains("3 production runs"), "{reason}");
+        assert!(reason.contains("split 6 executions"), "{reason}");
+        assert!(reason.contains("the 5 the report replays"), "{reason}");
+        assert!(
+            over.warnings.iter().any(|w| w == reason),
+            "{:?}",
+            over.warnings
+        );
+        assert_eq!(
+            verdict(&over, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
+        // A product without a budget carries no reason.
+        assert_eq!(budget_of(&over, "ltv").breach_events_skipped, None);
+        // The shipped cap: hourly runs of 20 executions over a 31-day month fit.
+        const { assert!(MAX_REPLAY_WORK >= 20 * (31 * 24) * (31 * 24 + 1) / 2) };
+    }
+
+    /// The end-of-run check splits at most `MAX_WALK_BACK_STEPS` earlier runs,
+    /// so its cost does not grow with the runs of the month. Five runs that
+    /// measure no storage are `not_evaluated` for a storage limit; the sixth
+    /// builds the table and is over.
+    #[test]
+    fn the_end_of_run_walk_back_is_bounded() {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_storage_gb_month = 0\n",
+        );
+        let mut runs = Vec::new();
+        for day in 1..=5 {
+            let start = at(2026, 10, day, 0, 0);
+            runs.push(sample_run_at(
+                &format!("raw-{day}"),
+                start,
+                vec![exec_at("raw", start, 5)],
+            ));
+        }
+        let start = at(2026, 10, 6, 0, 0);
+        let mut build = exec_at("revenue_daily", start, 10);
+        build.stored_bytes = Some(StoredBytes {
+            bytes: 1 << 30,
+            basis: StoredBytesBasis::DataFiles,
+        });
+        runs.push(sample_run_at("build", start, vec![build]));
+        record(&state, &runs);
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let inputs = load_month_inputs(&store, &config, "2026-10", at(2026, 11, 2, 0, 0)).unwrap();
+        let budgets = inputs.budgets().unwrap();
+        let last = inputs.runs.len() - 1;
+        let bounded = events_at_step(&inputs, budgets, last, 2).unwrap();
+        assert_eq!(bounded.earlier_splits, 2);
+        let open = events_at_step(&inputs, budgets, last, usize::MAX).unwrap();
+        assert_eq!(open.earlier_splits, 5);
+        // Both find the same first breach, at the build.
+        for check in [&bounded, &open] {
+            assert_eq!(
+                check.events.get("revenue_daily").map(|e| e.run_id.as_str()),
+                Some("build")
+            );
+        }
+        let report = compute_month_cost_in(
+            &store,
+            &config,
+            "2026-10",
+            at(2026, 11, 2, 0, 0),
+            MAX_REPLAY_WORK,
+        )
+        .unwrap();
+        assert_eq!(event_runs(&report, "revenue_daily"), ["build"]);
+        const { assert!(MAX_WALK_BACK_STEPS <= 8) };
+    }
+
+    /// The end-of-run verdict is the replay's verdict at that run: the same
+    /// split, as of the run's finish.
+    #[test]
+    fn the_end_of_run_verdict_is_the_replay_step_verdict() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let now = at(2026, 11, 2, 0, 0);
+        let inputs = load_month_inputs(&store, &config, "2026-10", now).unwrap();
+        let budgets = inputs.budgets().unwrap();
+        for (index, run) in inputs.runs.iter().enumerate() {
+            let replayed = step_verdicts(&inputs, budgets, index).unwrap();
+            let after = product_budgets_after_run(&store, &config, &run.run_id, now).unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].budget, replayed["revenue_daily"], "{}", run.run_id);
+        }
+    }
+
+    /// Timing probe, not a check (run it with `--ignored` in a release
+    /// build): `ROCKY_PERF_RUNS` production runs spread
+    /// over October, each building `revenue_daily` and 20 readers of it.
+    #[test]
+    #[ignore]
+    fn perf_probe_month_shape() {
+        let n: i64 = std::env::var("ROCKY_PERF_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(720);
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        let spacing = 31 * 24 * 60 * 60 / n;
+        let mut runs = Vec::new();
+        for i in 0..n {
+            let start = at(2026, 10, 1, 0, 0) + chrono::Duration::seconds(i * spacing);
+            let models = (0..20)
+                .map(|m| reading(exec_at(&format!("m{m}"), start, 50), "revenue_daily", 10))
+                .chain(std::iter::once(exec_at("revenue_daily", start, 400)))
+                .collect();
+            runs.push(sample_run_at(&format!("run-{i:05}"), start, models));
+        }
+        record(&state, &runs);
+        let last = format!("run-{:05}", n - 1);
+        let now = at(2026, 11, 2, 0, 0);
+        let t = std::time::Instant::now();
+        {
+            let store = StateStore::open_read_only_or_empty(&state).unwrap();
+            let after = product_budgets_after_run(&store, &config, &last, now).unwrap();
+            assert_eq!(after.len(), 1);
+        }
+        let end_of_run = t.elapsed();
+        {
+            let store = StateStore::open_read_only_or_empty(&state).unwrap();
+            let t = std::time::Instant::now();
+            let inputs = load_month_inputs(&store, &config, "2026-10", now).unwrap();
+            let load = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = inputs.split(&inputs.runs, now).unwrap();
+            let split = t.elapsed();
+            let budgets = inputs.budgets().unwrap();
+            let t = std::time::Instant::now();
+            let step = events_at_step(&inputs, budgets, inputs.runs.len() - 1, MAX_WALK_BACK_STEPS)
+                .unwrap();
+            eprintln!(
+                "PERF parts load={load:?} one_split={split:?} step_check={:?} earlier_splits={}",
+                t.elapsed(),
+                step.earlier_splits
+            );
+        }
+        let skip_report = std::env::var("ROCKY_PERF_SKIP_REPORT").is_ok();
+        let report = if skip_report {
+            None
+        } else {
+            let t = std::time::Instant::now();
+            let out = month(&config, &state);
+            Some((
+                t.elapsed(),
+                budget_of(&out, "revenue_daily").breach_events.len(),
+            ))
+        };
+        eprintln!("PERF runs={n} end_of_run={end_of_run:?} report={report:?}");
     }
 }

@@ -1087,6 +1087,31 @@ For the current month, money is month-to-date: storage counts up to now, at the 
 
 Rocky prices each figure on its own, in floating point. The money of the products plus `unallocated` is close to `measured_total_money`, but the command does not claim it is exact to the cent.
 
+#### Budgets
+
+A product with a [`[product_budget.NAME]`](/reference/configuration/#product_budgetname) gets two more fields. Both are left out for a product with no budget.
+
+- `budget`: the budget checked against `charged`, as of the report. `verdict` is `in_budget`, `breached` or `not_evaluated`. `checks` has one entry per limit set, with `limit_type`, `limit`, `actual` and its own `verdict`. A `max_storage_gb_month` check names its storage basis in `unit`, one check per basis the month measured. A check that is `not_evaluated` says why in `reason`. `max_usd` tests `money`, so it is `not_evaluated` whenever `money_status` is not `priced`.
+- `breach_events`: each time this month the product went from not over to over, in run order. Each event has the `run_id` of the production run after which it was over, the time that run finished (`at`), and the exceeded checks. An event is never withdrawn. The current `verdict` can read `in_budget` beside an earlier event.
+
+```json
+"budget": {
+  "verdict": "breached",
+  "on_breach": "warn",
+  "checks": [
+    { "limit_type": "max_compute_hours", "limit": 40.0, "actual": 41.2, "verdict": "breached" },
+    { "limit_type": "max_usd", "limit": 120.0, "actual": null, "verdict": "not_evaluated",
+      "reason": "a charged figure has no price in [cost] (compute_cost_per_machine_hour, storage_cost_per_gb_month)" }
+  ]
+},
+"breach_events": [
+  { "run_id": "run-20261014-020000-000", "at": "2026-10-14T02:41:07+00:00",
+    "breached": [ { "limit_type": "max_compute_hours", "limit": 40.0, "actual": 40.3, "verdict": "breached" } ] }
+]
+```
+
+Rocky finds the events by splitting the month again after each production run, over the runs whose records were written by then, in the order they finished. A month with many runs takes longer to report, because each run is one more split of the month: the work grows with the square of the number of runs. So the report lists breach events only while the replay stays under a cap on its work, counted as executions split: one split per production run, of every execution up to it. The cap fits 750 runs of 21 executions each, so hourly runs of about 20 models fit; more models per run fit fewer runs. Above it, `breach_events` is left out, `breach_events_skipped` gives the reason with the counts, the same reason is in `warnings`, and `budget` is still checked. The end-of-run check does not replay the month. It splits the month at the current run, as of that run's finish, and at the runs before it, back to the last run with a verdict, at most 8. Past 8 runs with no verdict, a breach counts as the product's first, so in that rare case the hook can fire again for a product that was already over. A breach found as of now, between runs, has no event until the next run.
+
 **Limits.**
 
 - `history_complete: false` means state retention may have swept runs the month needs. The few rows that remain look like a quiet month. Every figure is then partial. Raise `[state.retention] max_age_days` to cover the month.

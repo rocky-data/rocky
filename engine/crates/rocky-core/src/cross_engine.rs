@@ -622,6 +622,7 @@ mod tests {
             hooks: Default::default(),
             cost: Default::default(),
             budget: Default::default(),
+            product_budget: Default::default(),
             schema_evolution: Default::default(),
             retry: None,
             portability: Default::default(),

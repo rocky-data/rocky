@@ -158,6 +158,151 @@
       ],
       "type": "string"
     },
+    "ProductBudgetBreachAction": {
+      "description": "What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.",
+      "enum": [
+        "warn"
+      ],
+      "type": "string"
+    },
+    "ProductBudgetBreachEvent": {
+      "description": "One time a product went over its monthly budget.",
+      "properties": {
+        "at": {
+          "description": "When that run finished (RFC 3339). The budget was checked as of then.",
+          "type": "string"
+        },
+        "breached": {
+          "description": "The limits that were exceeded at that run.",
+          "items": {
+            "$ref": "#/definitions/ProductBudgetCheck"
+          },
+          "type": "array"
+        },
+        "run_id": {
+          "description": "The production run after which the product was first over.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "breached",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "ProductBudgetCheck": {
+      "description": "One limit of a product budget, checked against the product's charge.",
+      "properties": {
+        "actual": {
+          "description": "The month-to-date figure the limit tests. Absent when it is not known.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "The configured limit.",
+          "format": "double",
+          "type": "number"
+        },
+        "limit_type": {
+          "$ref": "#/definitions/ProductBudgetLimitType"
+        },
+        "reason": {
+          "description": "Why the limit is `not_evaluated`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CostUnit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For `max_storage_gb_month`, the storage basis checked. Absent for the other limits."
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetVerdict"
+            }
+          ],
+          "description": "`breached` when `actual` is greater than `limit`. Equal is in budget."
+        }
+      },
+      "required": [
+        "limit",
+        "limit_type",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "ProductBudgetLimitType": {
+      "description": "Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.",
+      "enum": [
+        "max_compute_hours",
+        "max_storage_gb_month",
+        "max_usd"
+      ],
+      "type": "string"
+    },
+    "ProductBudgetStatus": {
+      "description": "A product's monthly budget, checked once.",
+      "properties": {
+        "checks": {
+          "description": "One check per limit set (two for `max_storage_gb_month` when both storage bases were measured).",
+          "items": {
+            "$ref": "#/definitions/ProductBudgetCheck"
+          },
+          "type": "array"
+        },
+        "on_breach": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetBreachAction"
+            }
+          ],
+          "description": "What a breach does. Only `warn`: the run's exit code does not change."
+        },
+        "reasons": {
+          "description": "Why the budget as a whole is `not_evaluated`, when it is.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetVerdict"
+            }
+          ],
+          "description": "`breached` when any limit is breached. Otherwise `not_evaluated` when any limit could not be checked, or when run history does not cover the month (then always). Otherwise `in_budget`."
+        }
+      },
+      "required": [
+        "checks",
+        "on_breach",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "ProductBudgetVerdict": {
+      "description": "The verdict of a monthly product budget, or of one of its limits.",
+      "enum": [
+        "in_budget",
+        "breached",
+        "not_evaluated"
+      ],
+      "type": "string"
+    },
     "ProductMonthCost": {
       "description": "One product's month inside [`ProductMonthCostOutput`].",
       "properties": {
@@ -167,6 +312,31 @@
             "$ref": "#/definitions/AllocatedUpstreamCost"
           },
           "type": "array"
+        },
+        "breach_events": {
+          "description": "Each time this month the product went over its budget, in run order. Found by checking the budget again after each production run of the month. A product that goes over, back under and over again has two events. An event is never withdrawn, even when a later run moves the product back under. Empty (and omitted) when there was none.",
+          "items": {
+            "$ref": "#/definitions/ProductBudgetBreachEvent"
+          },
+          "type": "array"
+        },
+        "breach_events_skipped": {
+          "description": "Why `breach_events` was not computed, when it was not: replaying the month would split more executions than the report allows (the reason gives the runs, the executions and the cap). `budget` is still checked. Absent otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "budget": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProductBudgetStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget."
         },
         "built": {
           "description": "What the product's own executions cost, before any split. A memo for reading `kept` beside it: it is never summed and is not part of the invariant.",

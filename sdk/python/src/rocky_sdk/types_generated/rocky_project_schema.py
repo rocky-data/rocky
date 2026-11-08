@@ -1381,6 +1381,44 @@ class PortabilityConfig(BaseModel):
     """
 
 
+class ProductBudgetBreachAction(StrEnum):
+    """
+    What to do when a [`ProductBudgetConfig`] limit is crossed. Only `warn` exists: the breach is reported and the `on_budget_breach` hook fires, and the run's exit code does not change.
+    """
+
+    warn = "warn"
+
+
+class ProductBudgetConfig(BaseModel):
+    """
+    One `[product_budget.<name>]` table: a month-to-date budget for one data product, checked at the end of every production `rocky run`.
+
+    Each limit tests what the product is charged this month (`kept` plus `allocated_upstream` in `rocky cost --month --by product`), in the month of the project's `[schedule].timezone`. A limit left unset is not checked.
+
+    ```toml [product_budget.orders] max_compute_hours = 40 max_storage_gb_month = 200 max_usd = 120.0 on_breach = "warn" ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    max_compute_hours: float | None = None
+    """
+    Most model time the product may be charged this month, in hours.
+    """
+    max_storage_gb_month: float | None = None
+    """
+    Most stored data the product may be charged this month, in GB-months (1 GB = 2^30 bytes). Each storage basis is checked on its own.
+    """
+    max_usd: float | None = None
+    """
+    Most USD the product may be charged this month. Needs the matching `[cost]` prices (`compute_cost_per_machine_hour`, `storage_cost_per_gb_month`); without them it is not evaluated.
+    """
+    on_breach: ProductBudgetBreachAction | None = "warn"
+    """
+    What a breach does. Only `warn`.
+    """
+
+
 class Type31(StrEnum):
     not_null = "not_null"
 
@@ -4400,6 +4438,10 @@ class RockyConfig(BaseModel):
     )
     """
     Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
+    """
+    product_budget: dict[str, ProductBudgetConfig] | None = None
+    """
+    Monthly budgets per data product, keyed by product name. See [`ProductBudgetConfig`]. Absent means empty, and the key is not serialized, so a project without it keeps its config snapshot byte-identical.
     """
     residency: ResidencyConfig | None = None
     """

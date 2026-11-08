@@ -1611,3 +1611,140 @@ fn storage_matches_an_independent_interval_loop() {
     assert_eq!(storage(&split.products["A"].kept), data_files);
     assert!(split.invariant_violations().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// `plan_for` lookups against the linear scans they replace
+// ---------------------------------------------------------------------------
+
+/// The declared-child check and the chain position as `plan_for` computed
+/// them before `PlanLookup`: a linear search of every chain. The oracle for
+/// the differential test below.
+fn old_unmeasured_and_provisional(
+    index: usize,
+    nodes: &[Node<'_>],
+    versions: &BTreeMap<&str, Vec<usize>>,
+    rank: &[usize],
+    declared_children: &BTreeMap<String, BTreeSet<String>>,
+) -> (bool, bool) {
+    let node = &nodes[index];
+    let chain = versions.get(node.model);
+    let position = chain.and_then(|c| c.iter().position(|&i| i == index));
+    let next = chain.and_then(|c| position.and_then(|p| c.get(p + 1)));
+    let until = next.map(|&n| nodes[n].finished_at);
+    let unmeasured = declared_children.get(node.model).is_some_and(|children| {
+        children.iter().any(|child| {
+            versions.get(child.as_str()).is_some_and(|chain| {
+                chain.iter().any(|&i| {
+                    let candidate = &nodes[i];
+                    candidate.in_month
+                        && candidate.reads.is_none()
+                        && rank[i] > rank[index]
+                        && candidate.started_at + CLOCK_SLACK >= node.finished_at
+                        && until.is_none_or(|u| candidate.started_at + CLOCK_SLACK < u)
+                })
+            })
+        })
+    });
+    (unmeasured, next.is_none())
+}
+
+/// On seeded random chains, `plan_for` with `PlanLookup` decides "a declared
+/// child ran unmeasured" and "provisional" exactly as the linear scans did.
+/// The children include long outlier runs, runs that recorded reads, runs
+/// outside the month, executions that are not versions, and parents whose
+/// last version has no next.
+#[test]
+fn plan_lookup_agrees_with_the_linear_scans() {
+    let read = UpstreamRead {
+        table: "memory.main.p".to_string(),
+        rows_scanned: 10,
+        projected_columns: Vec::new(),
+        est_bytes: Some(10),
+    };
+    let mut rng = Rng(0x5eed_2551);
+    let mut checked = 0usize;
+    let mut unmeasured_seen = 0usize;
+    for _ in 0..300 {
+        let mut nodes: Vec<Node<'_>> = Vec::new();
+        for model in ["p", "c", "d"] {
+            for _ in 0..rng.below(12) + 1 {
+                let start = oct(1, 0, 0) + Duration::minutes(rng.below(600) as i64);
+                // Mostly short runs, now and then one that runs for hours.
+                let minutes = if rng.chance(10, 1) {
+                    rng.below(600) as i64
+                } else {
+                    rng.below(5) as i64
+                };
+                let reads = if model == "p" || rng.chance(3, 1) {
+                    Some(vec![&read])
+                } else {
+                    None
+                };
+                nodes.push(Node {
+                    model,
+                    is_version: !rng.chance(10, 1),
+                    started_at: start,
+                    finished_at: start + Duration::minutes(minutes) + Duration::seconds(1),
+                    in_month: !rng.chance(8, 1),
+                    compute_ms: 1,
+                    measured: None,
+                    reads,
+                });
+            }
+        }
+        let mut order: Vec<usize> = (0..nodes.len()).collect();
+        order.sort_by(|&a, &b| {
+            (nodes[a].finished_at, nodes[a].started_at, a).cmp(&(
+                nodes[b].finished_at,
+                nodes[b].started_at,
+                b,
+            ))
+        });
+        let mut rank = vec![0; nodes.len()];
+        for (position, &index) in order.iter().enumerate() {
+            rank[index] = position;
+        }
+        let mut versions: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for &index in &order {
+            if nodes[index].is_version {
+                versions.entry(nodes[index].model).or_default().push(index);
+            }
+        }
+        let children: BTreeMap<String, BTreeSet<String>> = [(
+            "p".to_string(),
+            ["c".to_string(), "d".to_string()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        let lookup = PlanLookup::new(&nodes, &versions);
+        let edge = [Edge {
+            reader: 0,
+            est_bytes: Some(10),
+            rows: 10,
+        }];
+        for index in 0..nodes.len() {
+            if nodes[index].model != "p" || !nodes[index].is_version {
+                continue;
+            }
+            let (unmeasured, last) =
+                old_unmeasured_and_provisional(index, &nodes, &versions, &rank, &children);
+            let plan = plan_for(
+                index, &nodes, &edge, &versions, &lookup, &rank, &children, true,
+            );
+            assert_eq!(
+                plan.basis == SplitBasis::OwnerPays,
+                unmeasured,
+                "version {index}"
+            );
+            assert_eq!(plan.provisional, last, "version {index}");
+            checked += 1;
+            unmeasured_seen += usize::from(unmeasured);
+        }
+    }
+    // The cases exercise both answers, not only one.
+    assert!(checked > 500, "{checked}");
+    assert!(
+        unmeasured_seen > 50 && unmeasured_seen + 50 < checked,
+        "{unmeasured_seen} of {checked}"
+    );
+}

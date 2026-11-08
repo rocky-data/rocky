@@ -405,6 +405,19 @@ pub async fn run_transformation(
         config_path,
     ));
 
+    // Monthly product budgets, now that this run's record is written. A breach
+    // fires `on_budget_breach` and never changes the exit code.
+    super::run::record_product_budgets(state_store.as_ref(), config_path, run_id, &mut output);
+    if let Some(hooks) = hook_registry {
+        super::run::fire_product_budget_breaches(
+            hooks,
+            run_id,
+            pipeline_name.unwrap_or(""),
+            &output.product_budgets,
+        )
+        .await;
+    }
+
     // Stamp the terminal status onto the emitted payload so a JSON
     // consumer reads it directly instead of re-deriving from counts. A
     // model that failed to compile makes this `Failure` / `PartialFailure`
@@ -1123,6 +1136,17 @@ pub async fn run_quality(
     if output.interrupted {
         return interrupted_result(recorded, run_id);
     }
+    // Monthly product budgets, now that this run's record is written. Only
+    // warns: the gate below decides the exit code. The JSON was printed above.
+    super::run::check_product_budgets_and_fire(
+        Some(&store),
+        Some(config_path),
+        &rocky_cfg.hooks,
+        run_id,
+        pipeline_name,
+        &mut output,
+    )
+    .await;
     // A quarantine that was refused or did not complete fails the run with the
     // check gate off too. Its `quarantine:compile` or `quarantine:execute`
     // check is among `error_failures`.
@@ -1906,6 +1930,18 @@ pub async fn run_snapshot(
         Some(pipeline_name),
         Some(config_path),
     );
+
+    // Monthly product budgets, now that this run's record is written. Only
+    // warns: it never changes the exit code.
+    super::run::check_product_budgets_and_fire(
+        Some(&store),
+        Some(config_path),
+        &rocky_cfg.hooks,
+        run_id,
+        pipeline_name,
+        &mut output,
+    )
+    .await;
 
     if tables_failed > 0 {
         anyhow::bail!("snapshot pipeline failed");

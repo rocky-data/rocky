@@ -531,8 +531,8 @@ impl MonthSplit {
 
 /// One version of one model's table: a production execution in the month, or
 /// the carry-in measurement before it.
-struct Node {
-    model: String,
+struct Node<'a> {
+    model: &'a str,
     /// Whether readers can link to this node: an execution that recorded the
     /// table it wrote, whatever its status (a volume breach fails the run but
     /// still replaces the table). An execution with no recorded target keeps
@@ -548,7 +548,8 @@ struct Node {
     /// The stored size right after this version was written.
     measured: Option<(u64, StoredBytesBasis)>,
     /// The upstream reads the execution recorded. `None` means not measured.
-    reads: Option<Vec<UpstreamRead>>,
+    /// Borrowed from the run records: a split clones no read.
+    reads: Option<Vec<&'a UpstreamRead>>,
 }
 
 struct Edge {
@@ -585,21 +586,21 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
             .then(a.run_id.cmp(&b.run_id))
     });
 
-    let mut nodes: Vec<Node> = Vec::new();
+    let mut nodes: Vec<Node<'_>> = Vec::new();
     for run in runs {
         let production = run.counts_as_production(UnrecordedScope::Count);
         let not_production = run.production_scope() == ProductionScope::NotProduction;
         // One run's executions of a model (partitions) form one version.
-        let mut merged: BTreeMap<String, usize> = BTreeMap::new();
+        let mut merged: BTreeMap<&str, usize> = BTreeMap::new();
         for exec in &run.models_executed {
             if !input.window.contains(exec.started_at) {
                 continue;
             }
             if production {
-                let model = exec.rocky_model_name().to_string();
+                let model = exec.rocky_model_name();
                 if is_unmeasured_failure(exec) {
                     // Entries like `<verify_after>` are not models.
-                    if !is_synthetic_name(&model) {
+                    if !is_synthetic_name(model) {
                         out.not_measured.failed_executions += 1;
                     }
                     // With no target it wrote no table: not a version.
@@ -612,8 +613,11 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                 // the table, so a failed execution with a target is a version.
                 let is_version = exec.output_target.is_some();
                 let measured = exec.stored_bytes.map(|s| (s.bytes, s.basis));
-                let reads = exec.upstream_reads.as_ref().map(|r| r.reads.clone());
-                if is_version && let Some(&held) = merged.get(&model) {
+                let reads = exec
+                    .upstream_reads
+                    .as_ref()
+                    .map(|r| r.reads.iter().collect::<Vec<_>>());
+                if is_version && let Some(&held) = merged.get(model) {
                     let node = &mut nodes[held];
                     node.started_at = node.started_at.min(exec.started_at);
                     if exec.finished_at >= node.finished_at {
@@ -637,7 +641,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                     continue;
                 }
                 if is_version {
-                    merged.insert(model.clone(), nodes.len());
+                    merged.insert(model, nodes.len());
                 }
                 nodes.push(Node {
                     model,
@@ -663,7 +667,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
             continue;
         };
         nodes.push(Node {
-            model: exec.rocky_model_name().to_string(),
+            model: exec.rocky_model_name(),
             is_version: true,
             started_at: exec.started_at,
             finished_at: exec.finished_at,
@@ -696,14 +700,11 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
     let mut measured_chains: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for &index in &order {
         if nodes[index].is_version {
-            versions
-                .entry(nodes[index].model.as_str())
-                .or_default()
-                .push(index);
+            versions.entry(nodes[index].model).or_default().push(index);
         }
         if nodes[index].measured.is_some() {
             measured_chains
-                .entry(nodes[index].model.as_str())
+                .entry(nodes[index].model)
                 .or_default()
                 .push(index);
         }
@@ -783,13 +784,19 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
         std::collections::BTreeSet::new();
 
     let mut edges: Vec<Vec<Edge>> = (0..nodes.len()).map(|_| Vec::new()).collect();
+    // A read's model depends only on the table name it wrote, so each distinct
+    // name is resolved once.
+    let mut resolved: std::collections::HashMap<&str, Option<&str>> =
+        std::collections::HashMap::new();
     for (reader, node) in nodes.iter().enumerate() {
         if !node.in_month {
             continue;
         }
-        for read in node.reads.as_deref().unwrap_or_default() {
-            let Some(upstream) = resolve_read(read, &by_table, &target_of, input.default_catalog)
-            else {
+        for &read in node.reads.as_deref().unwrap_or_default() {
+            let upstream = *resolved.entry(read.table.as_str()).or_insert_with(|| {
+                resolve_read(read, &by_table, &target_of, input.default_catalog)
+            });
+            let Some(upstream) = upstream else {
                 unattributed_tables.insert(read.table.to_ascii_lowercase());
                 continue;
             };
@@ -827,6 +834,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
 
     // ---- 5. The basis of each version's split. ------------------------
     let month_open = input.as_of < input.window.end;
+    let lookup = PlanLookup::new(&nodes, &versions);
     let plans: Vec<Plan> = (0..nodes.len())
         .map(|index| {
             plan_for(
@@ -834,6 +842,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                 &nodes,
                 &edges[index],
                 &versions,
+                &lookup,
                 &rank,
                 input.declared_children,
                 month_open,
@@ -845,7 +854,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
     let mut received: Vec<Amounts> = vec![Amounts::new(); nodes.len()];
     for &index in &order {
         let node = &nodes[index];
-        let owner = input.owners.get(&node.model);
+        let owner = input.owners.get(node.model);
         let mut own = Amounts::new();
         add(&mut own, Unit::ComputeMs, node.compute_ms);
         if let Some((unit, value)) = storage[index] {
@@ -885,7 +894,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                     continue;
                 }
                 let reader = &nodes[edge.reader];
-                let reader_owner = input.owners.get(&reader.model);
+                let reader_owner = input.owners.get(reader.model);
                 match owner {
                     Some(product) => {
                         let row = out.products.entry(product.clone()).or_default();
@@ -901,8 +910,8 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                                 add(&mut row.kept, unit, share);
                                 add(&mut row.owner_residual, unit, share);
                                 row.shared_not_charged.push(SharedNotCharged {
-                                    table: node.model.clone(),
-                                    reader: reader.model.clone(),
+                                    table: node.model.to_string(),
+                                    reader: reader.model.to_string(),
                                     unit,
                                     basis: plan.basis,
                                     amount: share,
@@ -911,8 +920,8 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                             _ => {
                                 add(&mut row.kept, unit, share);
                                 row.shared_not_charged.push(SharedNotCharged {
-                                    table: node.model.clone(),
-                                    reader: reader.model.clone(),
+                                    table: node.model.to_string(),
+                                    reader: reader.model.to_string(),
                                     unit,
                                     basis: plan.basis,
                                     amount: share,
@@ -931,7 +940,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                 record_allocation(
                     row,
                     AllocatedUpstream {
-                        table: node.model.clone(),
+                        table: node.model.to_string(),
                         unit,
                         basis: plan.basis,
                         amount: share,
@@ -1013,11 +1022,52 @@ fn record_allocation(row: &mut ProductSplit, entry: AllocatedUpstream) {
     }
 }
 
+/// What [`plan_for`] looks up for every version, computed once per split so
+/// a month with many versions of one model is not quadratic in them.
+struct PlanLookup<'n> {
+    /// Each node's place in its model's chain of versions, or `None` for a
+    /// node that is not a version.
+    chain_position: Vec<Option<usize>>,
+    /// Per model, its in-month versions that recorded no reads, in key
+    /// order, and the longest time any of them ran.
+    unread: BTreeMap<&'n str, (Vec<usize>, Duration)>,
+}
+
+impl<'n> PlanLookup<'n> {
+    fn new(nodes: &[Node<'_>], versions: &BTreeMap<&'n str, Vec<usize>>) -> Self {
+        let mut chain_position = vec![None; nodes.len()];
+        let mut unread = BTreeMap::new();
+        for (&model, chain) in versions {
+            for (position, &index) in chain.iter().enumerate() {
+                chain_position[index] = Some(position);
+            }
+            let list: Vec<usize> = chain
+                .iter()
+                .copied()
+                .filter(|&i| nodes[i].in_month && nodes[i].reads.is_none())
+                .collect();
+            if let Some(longest) = list
+                .iter()
+                .map(|&i| nodes[i].finished_at - nodes[i].started_at)
+                .max()
+            {
+                unread.insert(model, (list, longest));
+            }
+        }
+        Self {
+            chain_position,
+            unread,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn plan_for(
     index: usize,
     nodes: &[Node],
     edges: &[Edge],
     versions: &BTreeMap<&str, Vec<usize>>,
+    lookup: &PlanLookup<'_>,
     rank: &[usize],
     declared_children: &BTreeMap<String, BTreeSet<String>>,
     month_open: bool,
@@ -1029,8 +1079,8 @@ fn plan_for(
         provisional,
     };
     let node = &nodes[index];
-    let chain = versions.get(node.model.as_str());
-    let position = chain.and_then(|c| c.iter().position(|&i| i == index));
+    let chain = versions.get(node.model);
+    let position = lookup.chain_position[index];
     let next = chain.and_then(|c| position.and_then(|p| c.get(p + 1)));
     let provisional = month_open && next.is_none();
     if edges.is_empty() {
@@ -1040,18 +1090,29 @@ fn plan_for(
     // A declared child that ran while this version was current and recorded
     // no reads cannot be weighed: the split must not pretend it read nothing.
     let until = next.map(|&n| nodes[n].finished_at);
-    if let Some(children) = declared_children.get(&node.model) {
+    if let Some(children) = declared_children.get(node.model) {
+        // Candidates are the child's in-month versions with no reads, in key
+        // order (finish time first). Those ranked after this version start at
+        // a partition point. A candidate that finished `longest` or more past
+        // `until` (less the slack) started too late, and so does every one
+        // after it, so the walk stops there.
         let unmeasured = children.iter().any(|child| {
-            versions.get(child.as_str()).is_some_and(|chain| {
-                chain.iter().any(|&i| {
-                    let candidate = &nodes[i];
-                    candidate.in_month
-                        && candidate.reads.is_none()
-                        && rank[i] > rank[index]
-                        && candidate.started_at + CLOCK_SLACK >= node.finished_at
-                        && until.is_none_or(|u| candidate.started_at + CLOCK_SLACK < u)
+            lookup
+                .unread
+                .get(child.as_str())
+                .is_some_and(|(candidates, longest)| {
+                    let from = candidates.partition_point(|&i| rank[i] <= rank[index]);
+                    candidates[from..]
+                        .iter()
+                        .take_while(|&&i| {
+                            until.is_none_or(|u| nodes[i].finished_at - *longest + CLOCK_SLACK < u)
+                        })
+                        .any(|&i| {
+                            let candidate = &nodes[i];
+                            candidate.started_at + CLOCK_SLACK >= node.finished_at
+                                && until.is_none_or(|u| candidate.started_at + CLOCK_SLACK < u)
+                        })
                 })
-            })
         });
         if unmeasured {
             return owner_pays(provisional);
