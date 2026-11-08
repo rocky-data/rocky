@@ -3338,6 +3338,18 @@ mod tests {
         );
         assert_matches_from_scratch(&incremental, &scratch);
         assert_stays_incremental(&config, &decl, &first);
+
+        // `orders_v1` keeps its cached result for this edit. A silent edit
+        // of its SQL shows it: if a rule ever marks it, this test no longer
+        // guards the unmarked case and must move to a model that is not.
+        let v1 = models_dir.join("sub/orders_v1.sql");
+        std::fs::write(&v1, "SELECT 1 AS id, 2 AS silent\n").expect("silent edit");
+        let kept =
+            compile_incremental(&config, std::slice::from_ref(&decl), &first).expect("incremental");
+        assert_eq!(
+            kept.type_check.typed_models["orders_v1"], first.type_check.typed_models["orders_v1"],
+            "orders_v1 was marked, so its cached result is not what this test checks"
+        );
     }
 
     /// The guard behind the rules above. `compile_incremental` keeps a
@@ -3357,6 +3369,11 @@ mod tests {
         let models_dir = tmp.path().join("models");
         std::fs::create_dir_all(&models_dir).expect("models dir");
         write_versioned_project(&models_dir, Some(ORDERS_DECL_V2));
+        // A nullable `id`, so a typecheck that narrows it from a `not_null`
+        // test changes its output.
+        std::fs::write(models_dir.join("n.sql"), "SELECT CAST(NULL AS INT) AS id\n")
+            .expect("write n");
+        std::fs::write(models_dir.join("n.toml"), "name = \"n\"\n").expect("write n sidecar");
 
         let models = Project::load_models(&models_dir, None).expect("load models");
         assert!(
@@ -3395,8 +3412,22 @@ mod tests {
             (result.typed_models, diagnostics)
         };
 
-        let not_null_missing: rocky_core::tests::TestDecl =
-            toml::from_str("type = \"not_null\"\ncolumn = \"missing\"\n").expect("test decl");
+        // Tests on a column every model has, so a typecheck that narrows a
+        // tested column (nullability from `not_null`, say) sees them, plus
+        // one on a column no model has.
+        let tests: Vec<rocky_core::tests::TestDecl> = [
+            "type = \"not_null\"\ncolumn = \"id\"\n",
+            "type = \"unique\"\ncolumn = \"id\"\n",
+            "type = \"accepted_values\"\ncolumn = \"id\"\nvalues = [\"1\"]\n",
+            "type = \"not_null\"\ncolumn = \"missing\"\n",
+        ]
+        .iter()
+        .map(|decl| toml::from_str(decl).expect("test decl"))
+        .collect();
+        assert!(
+            models.iter().all(|m| m.config.tests.is_empty()),
+            "the change below must change every model's tests"
+        );
         let ghost = rocky_core::model_governance::ModelVersionInfo {
             model: "ghost".to_string(),
             version: Some(7),
@@ -3405,7 +3436,7 @@ mod tests {
         };
         let mut changed = models.clone();
         for m in &mut changed {
-            m.config.tests = vec![not_null_missing.clone()];
+            m.config.tests = tests.clone();
             m.config.governance.version = match m.config.governance.version {
                 Some(_) => None,
                 None => Some(ghost.clone()),
@@ -3416,6 +3447,10 @@ mod tests {
         assert!(
             typed.contains_key("r") && typed.contains_key("orders"),
             "the typecheck must cover the versioned models, or this test proves nothing"
+        );
+        assert!(
+            typed["n"].iter().any(|c| c.name == "id" && c.nullable),
+            "n's id must be nullable, or narrowing it proves nothing"
         );
         assert_eq!(cached(&changed), (typed, diagnostics));
     }
