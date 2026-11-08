@@ -101,9 +101,12 @@ pub async fn run_watch(
     // can miss the new inode. The directory watch with a filename
     // filter catches both shapes.
     //
-    // For transformation pipelines we additionally watch the resolved
-    // models directory recursively. For replication pipelines (no
-    // models/), the rocky.toml watch alone is sufficient.
+    // We additionally watch model directories recursively. An explicit
+    // `--models` directory is watched when it exists. Without `--models`,
+    // each selected transformation pipeline's models glob base is watched
+    // (`default_watch_set`): the directories the run reads. For
+    // replication pipelines (no models glob), the rocky.toml watch alone
+    // is sufficient.
     // -------------------------------------------------------------------
     let config_path_abs = config_path
         .canonicalize()
@@ -117,12 +120,21 @@ pub async fn run_watch(
         .with_context(|| format!("config has no filename: {}", config_path_abs.display()))?
         .to_owned();
 
-    let models_dir_abs: Option<PathBuf> = match models_dir {
-        Some(p) if p.exists() => Some(
-            p.canonicalize()
-                .with_context(|| format!("models dir not accessible: {}", p.display()))?,
-        ),
-        _ => None,
+    let watch_set = match models_dir {
+        // Explicit `--models`: today's behaviour, unchanged. The directory is
+        // watched when it exists, next to the non-recursive config watch.
+        Some(p) => WatchSet {
+            config_dir_recursive: false,
+            model_roots: if p.exists() {
+                vec![
+                    p.canonicalize()
+                        .with_context(|| format!("models dir not accessible: {}", p.display()))?,
+                ]
+            } else {
+                Vec::new()
+            },
+        },
+        None => default_watch_set(&config_path_abs, &config_dir, pipeline_name_arg),
     };
 
     // Channel for watcher → debounce task. The watcher callback runs on a
@@ -161,12 +173,19 @@ pub async fn run_watch(
 
     // Watch the config's parent dir non-recursively (just the rocky.toml).
     // Watching recursively here would double-up with the models-dir watch
-    // and produce duplicate events for every model edit.
+    // and produce duplicate events for every model edit. The one exception
+    // is a default models base that IS the config dir: then the config dir
+    // is watched once, recursively, and covers both.
+    let config_dir_mode = if watch_set.config_dir_recursive {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    };
     watcher
-        .watch(&config_dir, RecursiveMode::NonRecursive)
+        .watch(&config_dir, config_dir_mode)
         .with_context(|| format!("failed to watch config dir: {}", config_dir.display()))?;
 
-    if let Some(ref m) = models_dir_abs {
+    for m in &watch_set.model_roots {
         watcher
             .watch(m, RecursiveMode::Recursive)
             .with_context(|| format!("failed to watch models dir: {}", m.display()))?;
@@ -183,7 +202,17 @@ pub async fn run_watch(
     // Banner — stderr, never stdout. The non-JSON case still prints a
     // human summary per iteration on stdout via the inner `run`.
     let watched: Vec<String> = std::iter::once(config_path_abs.display().to_string())
-        .chain(models_dir_abs.iter().map(|p| p.display().to_string()))
+        .chain(
+            watch_set
+                .config_dir_recursive
+                .then(|| config_dir.display().to_string()),
+        )
+        .chain(
+            watch_set
+                .model_roots
+                .iter()
+                .map(|p| p.display().to_string()),
+        )
         .collect();
     eprintln!("[watch] watching {} (Ctrl-C to stop)", watched.join(", "));
 
@@ -804,6 +833,81 @@ async fn iter_once(
     }
 }
 
+/// The directories one `rocky run --watch` watches, beside `rocky.toml`.
+#[derive(Debug, PartialEq, Eq)]
+struct WatchSet {
+    /// Watch the config directory recursively instead of non-recursively.
+    /// Set when a default models base is the config directory itself, so
+    /// that directory is watched once and covers the config and the models.
+    config_dir_recursive: bool,
+    /// Directories watched recursively. No entry is equal to or inside
+    /// another entry, or inside the config directory when that is recursive.
+    model_roots: Vec<PathBuf>,
+}
+
+/// The watch set for `rocky run --watch` without `--models`.
+///
+/// Watches the models glob base of each selected transformation pipeline:
+/// the pipeline named by `--pipeline`, or every pipeline when none is named.
+/// The base is the directory part of the glob before its first wildcard, from
+/// the same `locate_models_dir` derivation the run uses. A base that does not
+/// exist, does not resolve, or escapes the project is not watched; the run
+/// reports that itself.
+///
+/// Read once, when the watcher starts. A config that does not load gives no
+/// model directory, because each iteration reloads the config and reports the
+/// error, and a fix to `rocky.toml` must still re-run. A pipeline added, or a
+/// base created, after start is watched only after a restart.
+fn default_watch_set(
+    config_path: &Path,
+    config_dir: &Path,
+    pipeline_name_arg: Option<&str>,
+) -> WatchSet {
+    let roots = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(config) => config
+            .pipelines
+            .iter()
+            .filter(|(name, _)| pipeline_name_arg.is_none_or(|selected| selected == name.as_str()))
+            .filter_map(|(_, pipeline)| pipeline.as_transformation())
+            .filter_map(|tx| {
+                match crate::models_loader::locate_models_dir(&tx.models, config_path) {
+                    Ok(crate::models_loader::ModelsDir::Present(dir)) => dir.canonicalize().ok(),
+                    Ok(crate::models_loader::ModelsDir::Absent(_)) | Err(_) => None,
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    dedupe_watch_roots(config_dir, roots)
+}
+
+/// Remove duplicate watches from `roots` (canonical paths).
+///
+/// A root equal to or inside another root is dropped: the outer recursive
+/// watch already covers it. A root equal to `config_dir` turns the config
+/// directory's watch recursive instead of adding a second watch on it, and
+/// then every root inside `config_dir` is covered by it too. Otherwise a root
+/// inside `config_dir` is kept: the config watch is non-recursive and does
+/// not see it.
+fn dedupe_watch_roots(config_dir: &Path, mut roots: Vec<PathBuf>) -> WatchSet {
+    let config_dir_recursive = roots.iter().any(|r| r == config_dir);
+    if config_dir_recursive {
+        roots.retain(|r| !r.starts_with(config_dir));
+    }
+    // Sorted, a parent comes before everything inside it.
+    roots.sort();
+    let mut model_roots: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if !model_roots.iter().any(|kept| root.starts_with(kept)) {
+            model_roots.push(root);
+        }
+    }
+    WatchSet {
+        config_dir_recursive,
+        model_roots,
+    }
+}
+
 /// Filter incoming filesystem events against the watcher's relevant set.
 ///
 /// We watch:
@@ -851,6 +955,150 @@ mod tests {
     // `Instant` re-imported here from `tokio::time` for `start.elapsed()`
     // assertions in `debounce_captures_events_during_window` — it's the
     // wall-clock variant since these tests don't pause time.
+
+    /// A project with one replication pipeline and transformation pipelines
+    /// whose models globs are `pipelines` (name, glob). Returns the canonical
+    /// project root and the config path.
+    fn watch_project(
+        pipelines: &[(&str, &str)],
+        dirs: &[&str],
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let mut toml = String::from(
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.raw]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\n\
+             [pipeline.raw.source.schema_pattern]\nprefix = \"src__\"\nseparator = \"__\"\n\
+             components = [\"source\"]\n\n\
+             [pipeline.raw.target]\nadapter = \"default\"\n\
+             catalog_template = \"wh\"\nschema_template = \"raw__{source}\"\n\n",
+        );
+        for (name, glob) in pipelines {
+            toml.push_str(&format!(
+                "[pipeline.{name}]\ntype = \"transformation\"\nmodels = \"{glob}\"\n\n\
+                 [pipeline.{name}.target.governance]\nauto_create_schemas = true\n\n"
+            ));
+        }
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, toml).unwrap();
+        (dir, root, config)
+    }
+
+    /// Without `--models`, every transformation pipeline's models glob base
+    /// is watched when no pipeline is selected. A base that does not exist
+    /// and the replication pipeline add nothing.
+    #[test]
+    fn default_watch_set_watches_every_pipelines_models_base() {
+        let (_dir, root, config) = watch_project(
+            &[
+                ("core", "models/**"),
+                ("reporting", "reporting/*.sql"),
+                ("gone", "gone/**"),
+            ],
+            &["models", "reporting"],
+        );
+        let set = default_watch_set(&config, &root, None);
+        assert_eq!(
+            set,
+            WatchSet {
+                config_dir_recursive: false,
+                model_roots: vec![root.join("models"), root.join("reporting")],
+            }
+        );
+    }
+
+    /// `--pipeline` limits the watch set to that pipeline's base. An unknown
+    /// or non-transformation pipeline watches only `rocky.toml`.
+    #[test]
+    fn default_watch_set_watches_only_the_selected_pipeline() {
+        let (_dir, root, config) = watch_project(
+            &[("core", "models/**"), ("reporting", "reporting/*.sql")],
+            &["models", "reporting"],
+        );
+        assert_eq!(
+            default_watch_set(&config, &root, Some("reporting")).model_roots,
+            vec![root.join("reporting")]
+        );
+        assert!(
+            default_watch_set(&config, &root, Some("raw"))
+                .model_roots
+                .is_empty()
+        );
+        assert!(
+            default_watch_set(&config, &root, Some("nope"))
+                .model_roots
+                .is_empty()
+        );
+    }
+
+    /// A base shared by two pipelines, or inside another pipeline's base, is
+    /// watched once.
+    #[test]
+    fn default_watch_set_drops_duplicate_and_nested_bases() {
+        let (_dir, root, config) = watch_project(
+            &[
+                ("a", "models/**"),
+                ("b", "models/*.sql"),
+                ("c", "models/staging/**"),
+            ],
+            &["models/staging"],
+        );
+        let set = default_watch_set(&config, &root, None);
+        assert_eq!(set.model_roots, vec![root.join("models")]);
+        assert!(!set.config_dir_recursive);
+        // The nested base is still watched when it is the only one selected.
+        assert_eq!(
+            default_watch_set(&config, &root, Some("c")).model_roots,
+            vec![root.join("models").join("staging")]
+        );
+    }
+
+    /// A models base equal to the config directory does not add a second
+    /// watch on it: the config directory is watched once, recursively, and
+    /// covers every other base inside it.
+    #[test]
+    fn default_watch_set_does_not_watch_the_config_dir_twice() {
+        let (_dir, root, config) =
+            watch_project(&[("flat", "./*.sql"), ("core", "models/**")], &["models"]);
+        let set = default_watch_set(&config, &root, None);
+        assert_eq!(
+            set,
+            WatchSet {
+                config_dir_recursive: true,
+                model_roots: Vec::new(),
+            }
+        );
+        // A base inside the config dir is kept while that watch is
+        // non-recursive: it is the normal layout.
+        assert_eq!(
+            default_watch_set(&config, &root, Some("core")),
+            WatchSet {
+                config_dir_recursive: false,
+                model_roots: vec![root.join("models")],
+            }
+        );
+    }
+
+    /// A config that does not load still starts the watcher: only
+    /// `rocky.toml` is watched, so a fix re-runs.
+    #[test]
+    fn default_watch_set_is_empty_for_a_config_that_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "[pipeline.core\n").unwrap();
+        assert_eq!(
+            default_watch_set(&config, &root, None),
+            WatchSet {
+                config_dir_recursive: false,
+                model_roots: Vec::new(),
+            }
+        );
+    }
 
     /// `event_path_is_relevant` accepts `rocky.toml` and rejects unrelated
     /// neighbors in the same dir.
