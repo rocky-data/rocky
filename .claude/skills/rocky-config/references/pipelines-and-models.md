@@ -67,6 +67,8 @@ connector-level `--filter id=<conn_id>` keys remain unchanged.
 type       = "transformation"
 models     = "models/silver/**"   # glob, relative to rocky.toml; default "models/**"
 depends_on = ["raw"]
+# A missing models directory fails `rocky run` (and is validate error V025).
+# Set `allow_empty_models = true` only for a pipeline with no models on purpose.
 
 # There is no contracts key: a model's contract is auto-discovered as the
 # sibling `<model>.contract.toml`, or passed at the CLI via `--contracts <dir>`.

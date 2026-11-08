@@ -162,6 +162,8 @@ path = "{db}"
 [pipeline.silver]
 type = "transformation"
 models = "models/**"
+# The no-op tests below run with no models directory on purpose.
+allow_empty_models = true
 
 [pipeline.silver.target]
 adapter = "wh"

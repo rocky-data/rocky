@@ -329,6 +329,19 @@ value = "my_udf(1)"                  # refused: not on the allowlist
 
 The check parses against the pipeline's **target** adapter, not its source, since the target is the warehouse that receives the expression. DuckDB, Snowflake, BigQuery and Databricks each parse under their own dialect. Trino has none of its own in Rocky's parser, so a Trino target parses under a generic dialect, which accepts more than those four share. A `value` that passes here can still be rejected by Trino itself. The allowlist applies either way.
 
+A `"transformation"` pipeline takes these fields instead:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `models` | string | No | `"models/**"` | Glob for the model files, relative to the config file. |
+| `allow_empty_models` | bool | No | `false` | Lets `rocky run` and `rocky run --dag` go on when the models directory does not exist. By default a missing directory fails the run, and `rocky validate` reports it as error `V025`. Set `true` only for a pipeline that has no models on purpose, for example one that only loads seeds. The key covers a missing directory only. A directory that exists but holds no models (or a glob that matches nothing in it) fails a single-pipeline `rocky run` with a compile error, whatever this key says; a `--dag` run plans that pipeline with no nodes. |
+
+```toml
+[pipeline.seeds_only]
+type = "transformation"
+allow_empty_models = true   # no models/ directory on purpose
+```
+
 ### `[pipeline.NAME.source]`
 
 Point the pipeline at the system it reads from.
