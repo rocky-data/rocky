@@ -122,7 +122,10 @@ pub async fn run_watch(
         .with_context(|| format!("config has no filename: {}", config_path_abs.display()))?
         .to_owned();
 
-    let replication_models = replication_models_dir(models_dir, run_all);
+    // The run resolves `models` against the working directory, so does this.
+    let replication_models = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| replication_models_dir(models_dir, run_all, &cwd));
     let watch_set = resolve_watch_set(
         models_dir,
         &config_path_abs,
@@ -945,12 +948,12 @@ fn default_watch_set(
 ///
 /// The run's own rule (`run.rs`, the compiled-model phase of the replication
 /// path): with `--all` or `--models`, it runs the models in `--models`, else
-/// in `models` under the working directory, when that directory exists.
-/// Without either flag it runs no model.
-fn replication_models_dir(models_dir: Option<&Path>, run_all: bool) -> Option<PathBuf> {
+/// in `models` under the working directory (`cwd`), when that directory
+/// exists. Without either flag it runs no model.
+fn replication_models_dir(models_dir: Option<&Path>, run_all: bool, cwd: &Path) -> Option<PathBuf> {
     let dir = match models_dir {
-        Some(dir) => dir,
-        None if run_all => Path::new("models"),
+        Some(dir) => cwd.join(dir),
+        None if run_all => cwd.join("models"),
         None => return None,
     };
     if !dir.exists() {
@@ -1463,19 +1466,30 @@ mod tests {
     fn replication_models_dir_follows_the_runs_rule() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        // `--all` without `--models`: `models` under the working directory,
+        // only when it exists.
+        assert_eq!(replication_models_dir(None, true, &root), None);
+        std::fs::create_dir_all(root.join("models")).unwrap();
         assert_eq!(
-            replication_models_dir(Some(&root), false),
-            Some(root.clone())
+            replication_models_dir(None, true, &root),
+            Some(root.join("models"))
+        );
+        assert_eq!(replication_models_dir(None, false, &root), None);
+        // `--models`, absolute or relative to the working directory.
+        assert_eq!(
+            replication_models_dir(Some(&other), false, &root),
+            Some(other.clone())
         );
         assert_eq!(
-            replication_models_dir(Some(&root), true),
-            Some(root.clone())
+            replication_models_dir(Some(Path::new("other")), true, &root),
+            Some(other.clone())
         );
         assert_eq!(
-            replication_models_dir(Some(&root.join("missing")), true),
+            replication_models_dir(Some(Path::new("missing")), true, &root),
             None
         );
-        assert_eq!(replication_models_dir(None, false), None);
     }
 
     /// A load pipeline reads files the watcher does not see; the banner says
