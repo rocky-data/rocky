@@ -3489,6 +3489,56 @@ mod tests {
         assert_eq!(changes["c.s.orders_sql"].status(), ModelDiffStatus::Added);
     }
 
+    /// `resolve_models_path` edge cases. A present directory resolves to
+    /// itself. A missing one resolves under its nearest existing ancestor,
+    /// which git then runs in.
+    #[test]
+    fn resolve_models_path_present_and_missing() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("models")).unwrap();
+        let (abs, anchor) = resolve_models_path(&root.join("models")).unwrap();
+        assert_eq!(
+            (abs.as_path(), anchor.as_path()),
+            (root.join("models").as_path(), root.join("models").as_path())
+        );
+
+        let (abs, anchor) = resolve_models_path(&root.join("gone/deeper")).unwrap();
+        assert_eq!(abs, root.join("gone/deeper"));
+        assert_eq!(anchor, root, "git runs in the nearest existing ancestor");
+    }
+
+    /// A `..` after the missing part, or a FILE where a directory belongs,
+    /// keeps the error rather than resolving somewhere else.
+    #[test]
+    fn resolve_models_path_refuses_dot_dot_and_a_file_ancestor() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            resolve_models_path(&root.join("gone/../models")).is_err(),
+            "a `..` under a missing component must not resolve"
+        );
+        std::fs::write(root.join("file"), "x").unwrap();
+        assert!(
+            resolve_models_path(&root.join("file/models")).is_err(),
+            "a file ancestor is not a missing directory"
+        );
+    }
+
+    /// A dangling symlink is treated as missing: the path resolves under the
+    /// symlink's parent by its own name, which is the name git tracks. It
+    /// never follows the link to another directory's models.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_models_path_treats_a_dangling_symlink_as_missing() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("models")).unwrap();
+        let (abs, anchor) = resolve_models_path(&root.join("models")).unwrap();
+        assert_eq!(abs, root.join("models"));
+        assert_eq!(anchor, root);
+    }
+
     #[test]
     fn project_ir_from_compile_stitches_typed_columns_from_type_check() {
         let dir = TempDir::new().unwrap();

@@ -989,8 +989,9 @@ pub(crate) fn run_approval_gate(
 ///
 /// - `Ok(Some(findings))` — the gate ran; the caller filters on
 ///   [`BreakingFinding::is_breaking`];
-/// - `Ok(None)` — the gate was SKIPPED (no models directory, no models at
-///   the base ref, or there is no git history), with a
+/// - `Ok(None)` — the gate was SKIPPED (no models at the base ref, no git
+///   history, or an unreadable base for a config that declares no
+///   transformation pipeline and has no models directory), with a
 ///   `BreakingChangesGateSkipped` audit event carrying the reason. The
 ///   caller lets the promote proceed;
 /// - `Err(_)` — the gate could not read the project (#1702), HEAD or the
@@ -2228,10 +2229,12 @@ fn breaking_block_output(
 ///   ran. `findings` is the full classified list, including `Info`-severity
 ///   entries — the caller filters on [`BreakingFinding::is_breaking`].
 /// - `None` when the gate was skipped: the base ref has no models, or there
-///   is no git history (no repository, or no commits yet). A HEAD with no
-///   models (the models directory is missing or empty) does not skip on its
-///   own: when the base has models, each one is a breaking `ModelRemoved`. A `BreakingChangesGateSkipped` audit event is appended to
-///   `audit` carrying the human-readable reason.
+///   is no git history (no repository, or no commits yet). A config that
+///   declares no transformation pipeline, with no models directory, also
+///   skips when its base cannot be read. A `BreakingChangesGateSkipped` audit event is appended to
+///   `audit` carrying the human-readable reason. A HEAD with no models (the
+///   models directory is missing or empty) does not skip on its own: when
+///   the base has models, each one is a breaking `ModelRemoved`.
 /// - `Err` when the gate cannot run and must refuse: the config is present
 ///   and unreadable (#1702), HEAD does not compile, the base ref names no
 ///   commit, git could not read the base ref, or the base ref's models do
@@ -2265,6 +2268,19 @@ fn evaluate_breaking_change_gate(
     // set is `None` below and the base decides. No models there either
     // skips; models there diff against an empty HEAD as removals.
     let head_has_dir = models_dir.is_dir();
+    // A config that declares no transformation pipeline and has no models
+    // directory used to skip before git was read. Its base is still read,
+    // because a replication `--all` run can execute models from that
+    // directory, so deleting them is still gated. But a base it cannot read
+    // (a `--base-ref` that does not exist locally, or a git read failure)
+    // skips, as it did before, instead of refusing. A project with no
+    // `rocky.toml` is not lenient: `models/` is its models directory by
+    // default. A config that does not load is refused below.
+    let lenient_base = !head_has_dir
+        && matches!(
+            rocky_core::config::load_optional_project_config(Some(config_path)),
+            Ok(Some(ref cfg)) if !crate::commands::review::declares_models_pipeline(cfg)
+        );
 
     // Seed both compiles with the cached source schemas so the resulting
     // IR uses real types rather than `Unknown`.
@@ -2338,7 +2354,7 @@ fn evaluate_breaking_change_gate(
         None,
     ) {
         Ok(r) => r,
-        Err(error) => match base_compile_gate_action(&error) {
+        Err(error) => match base_compile_gate_action_for(&error, lenient_base) {
             BaseCompileGateAction::Skip => {
                 push_skip(audit, format!("{error} — gate skipped"));
                 return Ok(None);
@@ -2402,6 +2418,28 @@ pub(crate) fn base_compile_gate_action(
         BaseCompileError::BadRef { .. }
         | BaseCompileError::DidNotCompile { .. }
         | BaseCompileError::Unreadable(_) => BaseCompileGateAction::Refuse,
+    }
+}
+
+/// [`base_compile_gate_action`], lenient for a project that declares no
+/// transformation pipeline and has no models directory at HEAD
+/// (`lenient_base`). Such a project skipped before git was read, so a base
+/// it cannot read (a ref that names no commit, or a git read failure) still
+/// skips. A base that was read and does not compile still refuses.
+pub(crate) fn base_compile_gate_action_for(
+    error: &super::ci_diff::BaseCompileError,
+    lenient_base: bool,
+) -> BaseCompileGateAction {
+    use super::ci_diff::BaseCompileError;
+    match error {
+        BaseCompileError::BadRef { .. } | BaseCompileError::Unreadable(_) if lenient_base => {
+            BaseCompileGateAction::Skip
+        }
+        BaseCompileError::NoHistory { .. }
+        | BaseCompileError::BadRef { .. }
+        | BaseCompileError::NoModelsAtBase(_)
+        | BaseCompileError::DidNotCompile { .. }
+        | BaseCompileError::Unreadable(_) => base_compile_gate_action(error),
     }
 }
 
@@ -4137,8 +4175,10 @@ mod tests {
         );
     }
 
-    /// When the models directory is absent entirely the gate must fail open
-    /// without invoking the compiler — `models_dir.is_dir()` check.
+    /// A missing models directory in a temp dir with no git repository
+    /// skips: the base read finds no git history. It no longer skips just
+    /// because the directory is missing; a repository whose base holds
+    /// models is gated (`gate_reports_removals_when_head_deletes_every_model`).
     #[test]
     fn gate_skips_when_models_dir_missing() {
         let tmp = TempDir::new().unwrap();
@@ -4252,6 +4292,47 @@ mod tests {
             );
             assert_eq!(audit.len(), 1);
             assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
+        }
+    }
+
+    /// A config with no transformation pipeline and no models directory
+    /// skips when its `--base-ref` does not exist, as it did before. A config
+    /// WITH a transformation pipeline and a missing directory refuses on the
+    /// same bad ref.
+    #[test]
+    fn gate_skips_a_project_with_no_models_pipeline_before_reading_git() {
+        let _cwd_guard = cwd_lock();
+        let adapter = "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n";
+        let with_tx = format!(
+            "{adapter}\n[pipeline.t]\ntype = \"transformation\"\n\n[pipeline.t.target]\nadapter = \"default\"\n"
+        );
+        for (config, skips) in [(adapter.to_string(), true), (with_tx, false)] {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            let models_dir = init_git_repo_with_models(dir, &config, &[]);
+            std::fs::remove_dir_all(&models_dir).unwrap();
+            let mut audit: Vec<AuditEvent> = Vec::new();
+            let saved_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            let result = evaluate_breaking_change_gate(
+                &dir.join("rocky.toml"),
+                &models_dir,
+                "no-such-ref",
+                &mut audit,
+                &dummy_actor(),
+                &sample_record("fix_price"),
+                "branch-state-hash",
+            );
+            std::env::set_current_dir(saved_cwd).unwrap();
+            if skips {
+                assert!(result.expect("no models pipeline skips").is_none());
+                assert_eq!(audit.len(), 1);
+                assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
+            } else {
+                let err = result.expect_err("a models project with a bad base ref refuses");
+                assert!(format!("{err:#}").contains("no-such-ref"), "{err:#}");
+                assert!(audit.is_empty());
+            }
         }
     }
 
