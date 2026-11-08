@@ -34,7 +34,7 @@ path.
                              │
    compile                   │ type check, resolve depends_on
                              ▼
-                        one ModelIr ────► compile errors E001-E060
+                        one ModelIr ────► compile errors E001-E061
                              │            (nothing runs)
    generate                  │ per-dialect SQL generation
                              ▼

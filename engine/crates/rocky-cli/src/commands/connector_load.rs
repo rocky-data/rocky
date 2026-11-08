@@ -28,7 +28,9 @@ use rocky_core::connector::{
     ConnectorConfig, ConnectorLimitsConfig, ConnectorManifest, ConnectorStateRecord,
     EffectiveLimits, StateEnvelope, local_output_dir,
 };
-use rocky_core::idempotency::{FinalOutcome, IdempotencyBackend, IdempotencyCheck};
+use rocky_core::idempotency::{
+    CORRUPT_PRIOR_RUN_ID, FinalOutcome, IdempotencyBackend, IdempotencyCheck,
+};
 use rocky_core::state::{LoadedFileRecord, StateStore};
 use rocky_core::state_sync::LedgerSeamSession;
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
@@ -50,6 +52,22 @@ const CLAIM_HEADROOM_SECS: u64 = 3600;
 
 /// Suffix of a connector's staging table; the run id follows.
 const STAGING_INFIX: &str = "__rocky_stg_";
+
+/// The staging table a run with `run_id` loads into: `<table>__rocky_stg_<run_id>`.
+fn staging_table_name(table: &str, run_id: &str) -> String {
+    format!("{table}{STAGING_INFIX}{run_id}")
+}
+
+/// The staging table a prior run of this connector left, if its claim names
+/// a run id that makes a valid table name. `None` for an unreadable claim.
+fn stale_staging_table(table: &str, prior_run_id: &str) -> Option<String> {
+    if prior_run_id.is_empty() || prior_run_id == CORRUPT_PRIOR_RUN_ID {
+        return None;
+    }
+    let name = staging_table_name(table, prior_run_id);
+    rocky_sql::validation::validate_identifier(&name).ok()?;
+    Some(name)
+}
 
 /// What a run needs, and the seams a test can move.
 #[derive(Debug, Clone)]
@@ -492,6 +510,9 @@ async fn drive(
                     "taking over the claim of a prior run that ended"
                 );
             }
+            // Before the child runs, so an empty batch or a failed child
+            // still cleans up. A failure here does not fail the run.
+            drop_stale_staging(loaded, prepared.config, prior_run_id).await;
         }
         IdempotencyCheck::SkipInFlight { run_id: prior } => {
             info!(
@@ -672,6 +693,68 @@ async fn drive(
     Ok(())
 }
 
+/// Drop the staging table a prior run left when it died holding the claim
+/// this run adopted. Only that one table, by its exact name: another
+/// connector may write the same target, and its staging tables share the
+/// prefix. A failure is a warning: the table stays, and the run goes on.
+///
+/// The prior run may still be alive after its claim expired. It then loses
+/// its staging table and its promote fails, so it loads nothing and nothing
+/// loads twice. Its `PromoteIssued` error says the batch may or may not be in
+/// the table; here it is not.
+///
+/// On Valkey the server deletes an expired claim, so the next run gets
+/// `Proceed`, not `AdoptStale`, and this drop does not run.
+async fn drop_stale_staging(loaded: &LoadedConfig, config: &ConnectorConfig, prior_run_id: &str) {
+    let Some(table) = stale_staging_table(&config.target.table, prior_run_id) else {
+        info!(
+            prior_run_id = %prior_run_id,
+            "the adopted claim names no readable run id; no staging table to drop"
+        );
+        return;
+    };
+    match drop_staging_table(loaded, config, &table).await {
+        Ok(staging_ref) => info!(
+            staging = %staging_ref,
+            prior_run_id = %prior_run_id,
+            "dropped the staging table of the prior run, if it was there"
+        ),
+        Err(e) => warn!(
+            error = %format!("{e:#}"),
+            staging = %table,
+            prior_run_id = %prior_run_id,
+            "failed to drop the staging table of the prior run; it stays in the warehouse"
+        ),
+    }
+}
+
+/// `DROP TABLE IF EXISTS` one table in the connector's target schema, and
+/// return the table reference.
+async fn drop_staging_table(
+    loaded: &LoadedConfig,
+    config: &ConnectorConfig,
+    table: &str,
+) -> Result<String> {
+    rocky_sql::validation::validate_identifier(&config.target.schema)
+        .with_context(|| format!("invalid target schema '{}'", config.target.schema))?;
+    rocky_sql::validation::validate_identifier(table)
+        .with_context(|| format!("invalid staging table name '{table}'"))?;
+    let registry = AdapterRegistry::from_config(&loaded.config)?;
+    let adapter_name = config.target.adapter.as_str();
+    let warehouse: Arc<dyn WarehouseAdapter> = registry
+        .warehouse_adapter(adapter_name)
+        .context("failed to resolve the target warehouse adapter")?;
+    let dialect = warehouse.dialect();
+    let staging_ref = dialect
+        .format_table_ref(&config.target.catalog, &config.target.schema, table)
+        .map_err(|e| anyhow!("failed to format the staging table ref: {e}"))?;
+    warehouse
+        .execute_statement(&dialect.drop_table_sql(&staging_ref))
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(staging_ref)
+}
+
 /// Remove a committed run's own scratch directory. Only that directory: the
 /// landing directory may be shared, and another run may be using its own
 /// scratch directory beside this one. A failure is a warning, because the
@@ -849,7 +932,7 @@ async fn stage_and_promote(
         schema: config.target.schema.clone(),
         table: config.target.table.clone(),
     };
-    let staging_name = format!("{}{STAGING_INFIX}{run_id}", target.table);
+    let staging_name = staging_table_name(&target.table, run_id);
     rocky_sql::validation::validate_identifier(&target.table)
         .with_context(|| format!("invalid target table name '{}'", target.table))?;
     rocky_sql::validation::validate_identifier(&target.schema)
@@ -882,7 +965,8 @@ async fn stage_and_promote(
     match outcome {
         Ok(()) => {
             // The staging table has done its job. A failed drop leaves a
-            // table behind; there is no cleanup of old staging tables yet.
+            // table behind that no later run drops: a later run drops only
+            // the staging table of a claim it adopts.
             if let Err(e) = warehouse.execute_statement(&drop_staging).await {
                 warn!(error = %e, staging = %staging_ref, "failed to drop the staging table after the promote");
             }
@@ -1146,7 +1230,25 @@ fn same_parquet_schema(first: &Path, other: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::remove_scratch;
+    use super::{CORRUPT_PRIOR_RUN_ID, remove_scratch, stale_staging_table};
+
+    #[test]
+    fn a_stale_claim_names_the_prior_runs_staging_table() {
+        assert_eq!(
+            stale_staging_table("events", "0a1b2c").as_deref(),
+            Some("events__rocky_stg_0a1b2c")
+        );
+    }
+
+    /// An unreadable claim, or a run id that cannot be part of a table name,
+    /// names no table, so nothing is dropped.
+    #[test]
+    fn an_unreadable_prior_run_id_names_no_staging_table() {
+        assert_eq!(stale_staging_table("events", CORRUPT_PRIOR_RUN_ID), None);
+        assert_eq!(stale_staging_table("events", ""), None);
+        assert_eq!(stale_staging_table("events", "x; DROP TABLE y"), None);
+        assert_eq!(stale_staging_table("events", "run-a"), None);
+    }
 
     #[test]
     fn remove_scratch_removes_a_directory_directly_inside_landing() {

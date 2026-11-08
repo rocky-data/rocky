@@ -780,6 +780,11 @@ fn compute_model_typecheck(
             &model.sql,
             &relation_columns,
         ));
+        // E061 / W002: the output repeats a column name. Error for strategies
+        // that write into the existing table, warning otherwise.
+        diagnostics.extend(crate::duplicate_output::check_duplicate_output_names(
+            model, target,
+        ));
     }
 
     // Step 3: SELECT * warning
@@ -7646,6 +7651,120 @@ mod tests {
             .filter(|d| d.model == "b" && (&*d.code == "I001" || &*d.code == "W002"))
             .collect();
         assert!(!star_diags.is_empty());
+    }
+
+    /// Codes the whole typecheck emits for one model whose strategy is
+    /// `strategy_toml` (a sidecar `[strategy]` table).
+    fn duplicate_output_codes(strategy_toml: &str, sql: &str) -> Vec<String> {
+        duplicate_output_codes_on(OperandTarget::Unconfigured, strategy_toml, sql)
+    }
+
+    /// [`duplicate_output_codes`] for a model that runs on `target`.
+    fn duplicate_output_codes_on(
+        target: OperandTarget,
+        strategy_toml: &str,
+        sql: &str,
+    ) -> Vec<String> {
+        let mut model = make_model("m", sql);
+        model.config.strategy = toml::from_str(strategy_toml).expect("strategy parses");
+        let project = Project::from_models(vec![model]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &HashMap::new(),
+            &project.models,
+            None,
+            &TargetDialects::uniform(target),
+        );
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E061" || &*d.code == "W002")
+            .map(|d| format!("{}:{:?}", d.code, d.severity))
+            .collect()
+    }
+
+    const DUPLICATE_ID_SQL: &str =
+        "SELECT a.id, b.id, a.ts FROM raw.s.a AS a JOIN raw.s.b AS b ON a.k = b.k";
+
+    #[test]
+    fn a_repeated_output_name_is_e061_for_strategies_that_write_into_the_table() {
+        for strategy in [
+            "type = \"incremental\"\ntimestamp_column = \"ts\"",
+            "type = \"delete_insert\"\npartition_by = [\"ts\"]",
+            "type = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"day\"",
+            "type = \"merge\"\nunique_key = [\"ts\"]",
+            "type = \"microbatch\"\ntimestamp_column = \"ts\"",
+        ] {
+            assert_eq!(
+                duplicate_output_codes(strategy, DUPLICATE_ID_SQL),
+                ["E061:Error"],
+                "{strategy}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_output_name_is_w002_for_strategies_that_rebuild_the_relation() {
+        for strategy in [
+            "type = \"full_refresh\"",
+            "type = \"view\"",
+            "type = \"snapshot\"\nunique_key = \"ts\"\nstrategy = \"timestamp\"\nupdated_at = \"ts\"",
+        ] {
+            assert_eq!(
+                duplicate_output_codes(strategy, DUPLICATE_ID_SQL),
+                ["W002:Warning"],
+                "{strategy}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_union_model_is_named_by_its_first_branch() {
+        let merge = "type = \"merge\"\nunique_key = [\"id\"]";
+        assert_eq!(
+            duplicate_output_codes(
+                merge,
+                "SELECT a.id, b.id FROM raw.s.a AS a JOIN raw.s.b AS b ON a.k = b.k \
+                 UNION ALL SELECT x, y FROM raw.s.c",
+            ),
+            ["E061:Error"]
+        );
+        assert!(
+            duplicate_output_codes(
+                merge,
+                "SELECT x AS id, y FROM raw.s.c \
+                 UNION ALL SELECT a.id, b.id FROM raw.s.a AS a JOIN raw.s.b AS b ON a.k = b.k",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn on_duckdb_a_quoted_name_repeats_an_unquoted_one() {
+        let sql = r#"SELECT a.id, b."ID", a.ts FROM raw.s.a AS a JOIN raw.s.b AS b ON a.k = b.k"#;
+        let incremental = "type = \"incremental\"\ntimestamp_column = \"ts\"";
+        assert_eq!(
+            duplicate_output_codes_on(Some(OperandDialect::DuckDb).into(), incremental, sql),
+            ["E061:Error"]
+        );
+        // With no known warehouse the fold is unknown, so nothing is claimed.
+        assert!(duplicate_output_codes(incremental, sql).is_empty());
+    }
+
+    #[test]
+    fn distinct_output_names_give_neither_e061_nor_w002() {
+        let sql =
+            "SELECT a.id, b.id AS b_id, a.ts FROM raw.s.a AS a JOIN raw.s.b AS b ON a.k = b.k";
+        for strategy in [
+            "type = \"full_refresh\"",
+            "type = \"merge\"\nunique_key = [\"id\"]",
+        ] {
+            assert!(
+                duplicate_output_codes(strategy, sql).is_empty(),
+                "{strategy}"
+            );
+        }
     }
 
     #[test]
