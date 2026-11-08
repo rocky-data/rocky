@@ -123,7 +123,7 @@ all. Those lines are info, not errors:
   help: give `rocky compile` source schemas so `user_id`'s type resolves — ...
 
   x error[E012]: column 'user_id' must be non-nullable per contract, but is nullable
-  help: filter out NULLs (e.g. `WHERE user_id IS NOT NULL`) or COALESCE `user_id` to a default, or relax `nullable = true` in the contract
+  help: COALESCE `user_id` with a NOT NULL column of the same type, as in `COALESCE(user_id, other_col)`. A literal default works only when it keeps the column's type ...
 
   (I003 repeats for the other eight declared columns; E012 repeats for
    total_events, first_event_date, last_event_date)
@@ -132,9 +132,11 @@ all. Those lines are info, not errors:
 Error: compilation failed with errors
 ```
 
-That is the gate doing its job. Follow either branch of the `help` line to
-clear it: add a NULL filter or a `COALESCE` in `fct_user_activity.rocky`, or
-set `nullable = true` for those columns in the contract.
+That is the gate doing its job. Follow the `help` line to clear it: add a
+`COALESCE` in `fct_user_activity.rocky`, give the compiler source schemas, or
+set `nullable = true` for those columns in the contract. A `where ... is not
+null` filter does not clear it, because Rocky does not read the filter when it
+infers nullability.
 
 ## What `rocky run` does here
 

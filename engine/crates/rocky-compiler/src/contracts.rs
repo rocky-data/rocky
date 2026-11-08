@@ -375,9 +375,19 @@ pub fn validate_contract_with(
                                 contract_col.name
                             ),
                         )
+                        // Name only remedies that change what the typechecker
+                        // infers. It does not read the WHERE clause, so a
+                        // `WHERE x IS NOT NULL` filter leaves `x` nullable.
                         .with_suggestion(format!(
-                            "filter out NULLs (e.g. `WHERE {0} IS NOT NULL`) or COALESCE `{0}` to a default, \
-                             or relax `nullable = true` in the contract",
+                            "COALESCE `{0}` with a NOT NULL column of the same type, as in `COALESCE({0}, other_col)`. \
+                             A literal default works only when it keeps the column's type (`''` for text, \
+                             `0` for BIGINT, `CAST(0 AS INT)` for INT once the warehouse is known), and \
+                             only when another column of the same SELECT is NOT NULL, a cast or an \
+                             expression. Or read `{0}` from a column that is NOT NULL in a source schema \
+                             Rocky has (`data/seed.sql`, or the schema cache that `rocky discover \
+                             --with-schemas` fills). Or relax `nullable = true` in the contract. A \
+                             `WHERE {0} IS NOT NULL` filter does not help: Rocky does not read the WHERE \
+                             clause when it infers nullability",
                             contract_col.name
                         )),
                     );
