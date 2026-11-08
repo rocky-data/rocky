@@ -671,10 +671,15 @@ fn compute_model_typecheck(
                 // No traceable source column. Only `COUNT(...)` is typed here:
                 // it is a non-null BIGINT whatever its argument (#2295). Other
                 // source-less projections (literals, multi-column arithmetic)
-                // stay Unknown.
+                // stay Unknown. A `COALESCE` whose column lineage cannot
+                // trace (an unqualified name in a join) still takes its
+                // non-null answer, type untouched (#2553).
                 if count {
                     col.data_type = inferred_col.data_type.clone();
                     col.nullable = inferred_col.nullable;
+                }
+                if coalesce_non_null {
+                    col.nullable = false;
                 }
                 continue;
             };
@@ -4535,6 +4540,9 @@ fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> Jo
                 | JoinOperator::LeftOuter(_)
                 | JoinOperator::FullOuter(_)
                 | JoinOperator::OuterApply
+                // Snowflake pads an unmatched left row with NULLs, as a left
+                // outer join does (#2553 red team).
+                | JoinOperator::AsOf { .. }
         ) {
             null_extend_scope(&mut right);
         }
@@ -5498,6 +5506,11 @@ mod tests {
                     "SELECT COALESCE(u.z, 0) AS c FROM t LEFT JOIN u ON t.z = u.z",
                     RockyType::Unknown,
                 ),
+                // Lineage cannot trace an unqualified name in a join.
+                (
+                    "SELECT COALESCE(b, 0) AS c FROM t JOIN u ON t.z = u.z",
+                    RockyType::Unknown,
+                ),
             ] {
                 let (got_ty, nullable, e012) = coalesce_column(sql, target.clone());
                 if nullable || e012 || got_ty != ty {
@@ -5553,6 +5566,9 @@ mod tests {
                 "SELECT COALESCE(b, ?) AS c FROM t",
                 "SELECT COALESCE(u.x, t.z) AS c FROM t LEFT JOIN u ON t.z = u.z",
                 "SELECT COALESCE(t.x, u.z) AS c FROM t RIGHT JOIN u ON t.z = u.z",
+                // An ASOF join null-pads an unmatched left row.
+                "SELECT COALESCE(u.x, LAG(u.x) OVER (ORDER BY t.x)) AS c \
+                 FROM t ASOF JOIN u MATCH_CONDITION (t.x >= u.x) ON t.z = u.z",
                 "SELECT COALESCE(b, 0) AS c FROM t UNION ALL SELECT b AS c FROM t",
                 "SELECT COALESCE(b, \"n/a\") AS c FROM t",
             ] {
