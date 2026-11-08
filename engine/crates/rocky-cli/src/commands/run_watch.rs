@@ -104,9 +104,9 @@ pub async fn run_watch(
     // We additionally watch model directories recursively. An explicit
     // `--models` directory is watched when it exists. Without `--models`,
     // each selected transformation pipeline's models glob base is watched
-    // (`default_watch_set`): the directories the run reads. For
-    // replication pipelines (no models glob), the rocky.toml watch alone
-    // is sufficient.
+    // (`default_watch_set`): the directories the run reads. A selected
+    // pipeline of another type reads no model files, so only a rocky.toml
+    // edit re-runs it; the banner says so (`config_only_pipelines`).
     // -------------------------------------------------------------------
     let config_path_abs = config_path
         .canonicalize()
@@ -209,16 +209,16 @@ pub async fn run_watch(
 
     // Banner — stderr, never stdout. The non-JSON case still prints a
     // human summary per iteration on stdout via the inner `run`.
-    let watched: Vec<String> = std::iter::once(config_path_abs.display().to_string())
-        .chain(config_dir_recursive.then(|| config_dir.display().to_string()))
-        .chain(
-            watch_set
-                .model_roots
-                .iter()
-                .map(|p| p.display().to_string()),
-        )
-        .collect();
-    eprintln!("[watch] watching {} (Ctrl-C to stop)", watched.join(", "));
+    let config_only = config_only_pipelines(&config_path_abs, pipeline_name_arg);
+    for line in watch_banner(
+        &config_path_abs,
+        &config_dir,
+        config_dir_recursive,
+        &watch_set,
+        &config_only,
+    ) {
+        eprintln!("{line}");
+    }
 
     // ONE long-lived registration per signal, built BEFORE the first run and
     // never dropped.
@@ -1051,6 +1051,102 @@ fn watch_registrations(config_dir: &Path, watch_set: &WatchSet) -> Vec<(PathBuf,
         .collect()
 }
 
+/// A selected pipeline that reads no file `--watch` watches, so only an edit
+/// to `rocky.toml` re-runs it.
+#[derive(Debug, PartialEq, Eq)]
+struct ConfigOnlyPipeline {
+    name: String,
+    kind: ConfigOnlyKind,
+}
+
+/// Why a [`ConfigOnlyPipeline`] has no file to watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigOnlyKind {
+    /// Replication, quality or snapshot: everything it reads is in the
+    /// warehouse or the source system, and its setup is in `rocky.toml`.
+    NoModelFiles(&'static str),
+    /// Load: it reads files from its `source_dir`, which `--watch` does not
+    /// watch.
+    SourceFilesNotWatched,
+}
+
+/// The selected pipelines (the one `--pipeline` names, or every pipeline)
+/// that are not transformation pipelines, in config order.
+///
+/// Replication has no input file of its own: its source (Fivetran, a manual
+/// table list, a DuckDB schema) is in `rocky.toml` or outside the project.
+/// A config that does not load gives none; each iteration reports the error.
+fn config_only_pipelines(
+    config_path: &Path,
+    pipeline_name_arg: Option<&str>,
+) -> Vec<ConfigOnlyPipeline> {
+    use rocky_core::config::PipelineConfig;
+
+    let Ok(config) = rocky_core::config::load_rocky_config(config_path) else {
+        return Vec::new();
+    };
+    config
+        .pipelines
+        .iter()
+        .filter(|(name, _)| pipeline_name_arg.is_none_or(|selected| selected == name.as_str()))
+        .filter_map(|(name, pipeline)| {
+            let kind = match pipeline {
+                PipelineConfig::Transformation(_) => return None,
+                PipelineConfig::Load(_) => ConfigOnlyKind::SourceFilesNotWatched,
+                PipelineConfig::Replication(_)
+                | PipelineConfig::Quality(_)
+                | PipelineConfig::Snapshot(_) => {
+                    ConfigOnlyKind::NoModelFiles(pipeline.pipeline_type_str())
+                }
+            };
+            Some(ConfigOnlyPipeline {
+                name: name.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// The startup lines `rocky run --watch` prints to stderr: every path it
+/// watches, then one line for each selected pipeline only a `rocky.toml`
+/// edit re-runs.
+fn watch_banner(
+    config_path: &Path,
+    config_dir: &Path,
+    config_dir_recursive: bool,
+    watch_set: &WatchSet,
+    config_only: &[ConfigOnlyPipeline],
+) -> Vec<String> {
+    let watched: Vec<String> = std::iter::once(config_path.display().to_string())
+        .chain(config_dir_recursive.then(|| config_dir.display().to_string()))
+        .chain(
+            watch_set
+                .model_roots
+                .iter()
+                .map(|p| p.display().to_string()),
+        )
+        .collect();
+    std::iter::once(format!(
+        "[watch] watching {} (Ctrl-C to stop)",
+        watched.join(", ")
+    ))
+    .chain(config_only.iter().map(|pipeline| match pipeline.kind {
+        ConfigOnlyKind::NoModelFiles(kind) => format!(
+            "[watch] pipeline '{}' is a {kind} pipeline and has no model files to watch: \
+             only an edit to {} re-runs it",
+            pipeline.name,
+            config_path.display()
+        ),
+        ConfigOnlyKind::SourceFilesNotWatched => format!(
+            "[watch] pipeline '{}' is a load pipeline; its source files are not watched: \
+             only an edit to {} re-runs it",
+            pipeline.name,
+            config_path.display()
+        ),
+    }))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1317,83 @@ mod tests {
         assert_eq!(
             resolve_watch_set(None, &config, &root, None).unwrap(),
             default_watch_set(&config, &root, None)
+        );
+    }
+
+    /// A replication pipeline is named as config-only, so the banner says
+    /// that only a `rocky.toml` edit re-runs it. A transformation pipeline is
+    /// not, and `--pipeline` limits the list to the pipeline it names.
+    #[test]
+    fn config_only_pipelines_names_the_replication_pipeline() {
+        let (_dir, root, config) = watch_project(&[("core", "models/**")], &["models"]);
+        let raw = vec![ConfigOnlyPipeline {
+            name: "raw".to_string(),
+            kind: ConfigOnlyKind::NoModelFiles("replication"),
+        }];
+        assert_eq!(config_only_pipelines(&config, None), raw);
+        assert_eq!(config_only_pipelines(&config, Some("raw")), raw);
+        assert!(config_only_pipelines(&config, Some("core")).is_empty());
+        assert!(config_only_pipelines(&config, Some("nope")).is_empty());
+        // A config that does not load names nothing: the run reports it.
+        assert!(config_only_pipelines(&root.join("missing.toml"), None).is_empty());
+    }
+
+    /// `--watch --all` over a project with only a replication pipeline
+    /// watches `rocky.toml` alone, and the banner says why: the pipeline has
+    /// no model files. Before, it listed `rocky.toml` and said nothing more.
+    #[test]
+    fn the_banner_says_a_replication_pipeline_has_no_model_files() {
+        let (_dir, root, config) = watch_project(&[], &[]);
+        let set = resolve_watch_set(None, &config, &root, None).unwrap();
+        assert!(set.model_roots.is_empty());
+        assert!(!set.config_dir_recursive);
+        let lines = watch_banner(
+            &config,
+            &root,
+            set.config_dir_recursive,
+            &set,
+            &config_only_pipelines(&config, None),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                format!("[watch] watching {} (Ctrl-C to stop)", config.display()),
+                format!(
+                    "[watch] pipeline 'raw' is a replication pipeline and has no model files \
+                     to watch: only an edit to {} re-runs it",
+                    config.display()
+                ),
+            ]
+        );
+    }
+
+    /// A load pipeline reads files the watcher does not see; the banner says
+    /// so rather than calling it a pipeline without input files.
+    #[test]
+    fn the_banner_says_a_load_pipelines_source_files_are_not_watched() {
+        let config = PathBuf::from("/proj/rocky.toml");
+        let set = WatchSet {
+            config_dir_recursive: false,
+            model_roots: vec![PathBuf::from("/proj/models")],
+        };
+        let lines = watch_banner(
+            &config,
+            Path::new("/proj"),
+            false,
+            &set,
+            &[ConfigOnlyPipeline {
+                name: "seeds".to_string(),
+                kind: ConfigOnlyKind::SourceFilesNotWatched,
+            }],
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "[watch] watching /proj/rocky.toml, /proj/models (Ctrl-C to stop)".to_string(),
+                "[watch] pipeline 'seeds' is a load pipeline; its source files are not \
+                 watched: only an edit to /proj/rocky.toml re-runs it"
+                    .to_string(),
+            ]
         );
     }
 
