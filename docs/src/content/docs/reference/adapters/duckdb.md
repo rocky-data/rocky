@@ -12,7 +12,7 @@ DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `path` | string | No | (in-memory) | Path to a persistent DuckDB file. Required when using the same DuckDB adapter for both discovery and execution, so the discovery side sees rows written by the warehouse side. |
-| `extension_directory` | string | No | (DuckDB's default, under the home directory) | Directory DuckDB keeps its extensions in. Rocky sets DuckDB's `extension_directory` to it at connect. Every extension Rocky loads uses this one directory. A relative path resolves against the working directory of the `rocky` process, not against `rocky.toml`. |
+| `extension_directory` | string | No | (DuckDB's default, under the home directory) | Directory DuckDB keeps its extensions in. Rocky sets DuckDB's `extension_directories` list to this one directory at connect. Every extension Rocky loads uses it. An empty string counts as unset. A relative path resolves against the working directory of the `rocky` process, not against `rocky.toml`. |
 | `offline` | bool | No | `false` | Rocky never runs `INSTALL` and turns DuckDB's auto-install off. See [Offline mode](#offline-mode). |
 
 Pick one. Each example is a complete adapter declaration, not a complete `rocky.toml`.
