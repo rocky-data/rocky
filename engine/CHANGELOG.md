@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `rocky load --connector` now drops the staging table a crashed run left behind. When a run takes over an expired claim from a prior run, it drops `<table>__rocky_stg_<prior run id>` in the target schema with `DROP TABLE IF EXISTS`, before the program starts. It drops only that exact name, never a pattern, because two connectors can write one target. A claim that cannot be read names no run, so nothing is dropped. A failed drop does not fail the run: Rocky logs a warning, leaves the table, and loads the batch. The claim and the state are not changed.
+- `rocky load --connector` now drops the staging table a crashed run left behind, on the local state file and object-store (`s3`, `gcs`) state backends. On `valkey` and `tiered` it almost never fires: the Valkey server deletes the crashed run's expired claim, so the next run finds no claim to take over and learns no prior run ID. There, drop `<table>__rocky_stg_<run id>` by hand. When a run takes over an expired claim from a prior run, it drops `<table>__rocky_stg_<prior run id>` in the target schema with `DROP TABLE IF EXISTS`, before the program starts. It drops only that exact name, never a pattern, because two connectors can write one target. A claim that cannot be read names no run, so nothing is dropped. A failed drop does not fail the run: Rocky logs a warning, leaves the table, and loads the batch. A prior run that is still alive after its claim expired loses its staging table and fails without loading its batch, so nothing loads twice. Its error says the batch may or may not be in the table; it is not. The claim and the state are not changed.
 
 ### Changed
 

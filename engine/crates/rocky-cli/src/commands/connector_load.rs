@@ -697,6 +697,14 @@ async fn drive(
 /// this run adopted. Only that one table, by its exact name: another
 /// connector may write the same target, and its staging tables share the
 /// prefix. A failure is a warning: the table stays, and the run goes on.
+///
+/// The prior run may still be alive after its claim expired. It then loses
+/// its staging table and its promote fails, so it loads nothing and nothing
+/// loads twice. Its `PromoteIssued` error says the batch may or may not be in
+/// the table; here it is not.
+///
+/// On Valkey the server deletes an expired claim, so the next run gets
+/// `Proceed`, not `AdoptStale`, and this drop does not run.
 async fn drop_stale_staging(loaded: &LoadedConfig, config: &ConnectorConfig, prior_run_id: &str) {
     let Some(table) = stale_staging_table(&config.target.table, prior_run_id) else {
         info!(
