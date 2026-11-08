@@ -121,7 +121,7 @@ Generated from `package.json` (`contributes.configuration`), which wins if the t
 
 - **Language ID**: `rocky` (`.rocky` files)
 - **Document Selector**: `.rocky` files + `.sql` files under `**/models/**`
-- **File Watchers**: `**/*.rocky`, `**/*.toml`, `**/models/**/*.sql`
+- **File Watchers**: `**/*.rocky`, `**/*.toml`, `**/models/**/*.sql`. The server registers these itself in `initialized` (dynamic registration); the client sets no `synchronize.fileEvents`, which would send every event twice.
 
 ## Related Projects
 
