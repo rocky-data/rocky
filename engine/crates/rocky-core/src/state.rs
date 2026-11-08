@@ -1132,7 +1132,8 @@ pub enum StateError {
     #[error(
         "state schema version mismatch: database has v{found}, binary expects v{expected}. \
          Upgrade rocky, or move the state file at {path} aside to continue \
-         ([state] on_schema_mismatch = \"recreate\" moves it to <file>.v{found}.bak). \
+         (`rocky run` with [state] on_schema_mismatch = \"recreate\" moves it to \
+         <file>.v{found}.bak). \
          See https://rocky.dev/docs/state-migration for instructions."
     )]
     SchemaMismatch {
