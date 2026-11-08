@@ -1027,6 +1027,8 @@ Each limit must be a finite number, 0 or more. A limit left unset is not checked
 
 **The hook.** `on_budget_breach` fires once for each exceeded limit, only at the run that made the change. A `max_storage_gb_month` over on both storage bases fires twice, with the same `limit_type`. Its metadata has `scope = "product_month"`, `product` and `month` beside the usual `limit_type`, `limit` and `actual`. See [Hooks](/concepts/hooks/).
 
+**Large months.** The end-of-run check costs one month split for the current run and one for each earlier run it needs, at most 8; usually 2 in all. `rocky cost --month` and `rocky product status` list breach events only for a month with at most 750 production runs; above that they say so in `breach_events_skipped`, and the hook and the end-of-run verdicts are not affected.
+
 **Where to read it.** `rocky run --output json` has `product_budgets` on replication, transformation and model-only runs (a quality or snapshot run prints its JSON before its record is written, so it checks the budget and fires the hook but its JSON has no `product_budgets`); `rocky cost --month <YYYY-MM> --by product` has `budget` and `breach_events` on each product; `rocky product status` has `cost_month`.
 
 `rocky validate` warns with **V065** when `NAME` matches no file in `products/`, and with **V066** when `[product_budget]` is set and `[state.retention] max_age_days` is below 62.

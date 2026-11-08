@@ -892,6 +892,7 @@ fn product_out(
         money_parts,
         budget: None,
         breach_events: Vec::new(),
+        breach_events_skipped: None,
     }
 }
 
@@ -1309,24 +1310,32 @@ fn events_at_step(
     inputs: &MonthInputs,
     budgets: &std::collections::BTreeMap<String, ProductBudgetConfig>,
     index: usize,
-) -> Result<std::collections::BTreeMap<String, ProductBudgetBreachEvent>> {
+    walk_back_cap: usize,
+) -> Result<StepCheck> {
     let mut events = std::collections::BTreeMap::new();
     let run = &inputs.runs[index];
+    let verdicts = step_verdicts(inputs, budgets, index)?;
     if !inputs.history_complete || !inputs.is_step(run) {
-        return Ok(events);
+        return Ok(StepCheck {
+            verdicts,
+            events,
+            earlier_splits: 0,
+        });
     }
-    let mut pending: std::collections::BTreeMap<String, ProductBudgetStatus> =
-        step_verdicts(inputs, budgets, index)?
-            .into_iter()
-            .filter(|(_, status)| status.verdict == ProductBudgetVerdict::Breached)
-            .collect();
+    let mut pending: std::collections::BTreeMap<String, ProductBudgetStatus> = verdicts
+        .iter()
+        .filter(|(_, status)| status.verdict == ProductBudgetVerdict::Breached)
+        .map(|(product, status)| (product.clone(), status.clone()))
+        .collect();
+    let mut earlier_splits = 0;
     for earlier in (0..index).rev() {
-        if pending.is_empty() {
+        if pending.is_empty() || earlier_splits == walk_back_cap {
             break;
         }
         if !inputs.is_step(&inputs.runs[earlier]) {
             continue;
         }
+        earlier_splits += 1;
         let before = step_verdicts(inputs, budgets, earlier)?;
         pending.retain(|product, status| {
             match before.get(product).map(|s| s.verdict) {
@@ -1340,12 +1349,41 @@ fn events_at_step(
             }
         });
     }
-    // No evaluated verdict before this step: this is the product's first.
+    // No evaluated verdict before this step, within the cap: this is the
+    // product's first.
     for (product, status) in pending {
         events.insert(product, breach_event(run, &status));
     }
-    Ok(events)
+    Ok(StepCheck {
+        verdicts,
+        events,
+        earlier_splits,
+    })
 }
+
+/// What [`events_at_step`] found at one replay step.
+struct StepCheck {
+    /// Every budgeted product's verdict as of the step.
+    verdicts: std::collections::BTreeMap<String, ProductBudgetStatus>,
+    /// The events the step records, by product.
+    events: std::collections::BTreeMap<String, ProductBudgetBreachEvent>,
+    /// How many earlier steps it split to find the last verdicts.
+    earlier_splits: usize,
+}
+
+/// The most production runs in a month for which the monthly report
+/// (`rocky cost --month`, and `cost_month` on `rocky product status`) lists
+/// breach events. Listing them splits the month once per production run, so
+/// the work grows with the square of the runs: about 3 s for 720 runs of 21
+/// models in a release build. Above this, the report skips the replay and
+/// says so.
+pub(crate) const MAX_REPLAY_RUNS: usize = 750;
+
+/// The most earlier runs the end-of-run check splits to find a breached
+/// product's last verdict. Earlier runs are `not_evaluated` only while the
+/// month has measured nothing a limit needs, so the walk almost always stops
+/// at the run before. Past the cap, the breach counts as the product's first.
+const MAX_WALK_BACK_STEPS: usize = 8;
 
 /// The typed payload behind `rocky cost --month YYYY-MM --by product`.
 ///
@@ -1370,15 +1408,17 @@ pub fn compute_month_cost(
 ) -> Result<ProductMonthCostOutput> {
     let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    compute_month_cost_in(&store, config_path, month, now)
+    compute_month_cost_in(&store, config_path, month, now, MAX_REPLAY_RUNS)
 }
 
-/// [`compute_month_cost`] over a store the caller already holds open.
+/// [`compute_month_cost`] over a store the caller already holds open, listing
+/// breach events only when the month has at most `replay_cap` production runs.
 fn compute_month_cost_in(
     store: &StateStore,
     config_path: &Path,
     month: &str,
     now: DateTime<Utc>,
+    replay_cap: usize,
 ) -> Result<ProductMonthCostOutput> {
     let mut inputs = load_month_inputs(store, config_path, month, now)?;
     let split = inputs.split(&inputs.runs, now)?;
@@ -1393,6 +1433,7 @@ fn compute_month_cost_in(
     let mut budget_status = std::collections::BTreeMap::new();
     let mut breach_events = std::collections::BTreeMap::new();
     let mut budget_warnings = Vec::new();
+    let mut events_skipped: Option<String> = None;
     if let Some(budgets) = inputs.budgets() {
         for product in budgets.keys() {
             if !split.products.contains_key(product) {
@@ -1402,9 +1443,18 @@ fn compute_month_cost_in(
                 ));
             }
         }
-        let production_ran = inputs.runs.iter().any(|run| inputs.is_step(run));
-        budget_status = evaluate_budgets(&inputs, budgets, &split, production_ran);
-        breach_events = replay_breach_events(&inputs, budgets)?;
+        let steps = inputs.runs.iter().filter(|run| inputs.is_step(run)).count();
+        budget_status = evaluate_budgets(&inputs, budgets, &split, steps > 0);
+        if steps <= replay_cap {
+            breach_events = replay_breach_events(&inputs, budgets)?;
+        } else {
+            let reason = format!(
+                "breach events are not listed: this month has {steps} production runs, more \
+                 than the {replay_cap} the report replays"
+            );
+            budget_warnings.push(reason.clone());
+            events_skipped = Some(reason);
+        }
     }
     inputs.warnings.extend(budget_warnings);
 
@@ -1425,6 +1475,9 @@ fn compute_month_cost_in(
             );
             out.budget = budget_status.remove(product);
             out.breach_events = breach_events.remove(product).unwrap_or_default();
+            if out.budget.is_some() {
+                out.breach_events_skipped.clone_from(&events_skipped);
+            }
             out
         })
         .collect();
@@ -1572,13 +1625,22 @@ pub fn product_budgets_after_run(
         let Some(budgets) = inputs.budgets() else {
             continue;
         };
-        let split = inputs.split(&inputs.runs, now)?;
-        let production_ran = inputs.runs.iter().any(|run| inputs.is_step(run));
-        let verdicts = evaluate_budgets(&inputs, budgets, &split, production_ran);
-        let mut events = match inputs.runs.iter().position(|run| run.run_id == run_id) {
-            Some(index) => events_at_step(&inputs, budgets, index)?,
-            None => std::collections::BTreeMap::new(),
+        // The record is in the scan, so the verdict is the one as of this
+        // run's finish, from the same split that decides its event.
+        let Some(index) = inputs.runs.iter().position(|run| run.run_id == run_id) else {
+            continue;
         };
+        let StepCheck {
+            verdicts,
+            mut events,
+            earlier_splits,
+        } = events_at_step(&inputs, budgets, index, MAX_WALK_BACK_STEPS)?;
+        tracing::debug!(
+            run_id,
+            month = %inputs.label,
+            earlier_splits,
+            "checked monthly product budgets"
+        );
         for (product, budget) in verdicts {
             out.push(RunProductBudget {
                 breach_event: events.remove(&product),
@@ -3416,5 +3478,184 @@ mod tests {
             Some("2026-10")
         );
         assert_eq!(month_containing(early, "Not/AZone"), None);
+    }
+
+    /// The report lists breach events only up to the replay cap: at the cap
+    /// it replays, one run over it skips the replay, says why with both
+    /// counts, and still checks the budget.
+    #[test]
+    fn the_report_replays_breach_events_only_up_to_the_cap() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let now = at(2026, 11, 2, 0, 0);
+        let report = |cap| compute_month_cost_in(&store, &config, "2026-10", now, cap).unwrap();
+
+        let at_cap = report(3);
+        assert_eq!(event_runs(&at_cap, "revenue_daily"), ["run-1", "run-3"]);
+        assert_eq!(
+            budget_of(&at_cap, "revenue_daily").breach_events_skipped,
+            None
+        );
+
+        let over = report(2);
+        let product = budget_of(&over, "revenue_daily");
+        assert!(product.breach_events.is_empty());
+        let reason = product.breach_events_skipped.as_deref().expect("a reason");
+        assert!(reason.contains("3 production runs"), "{reason}");
+        assert!(reason.contains("the 2 the report replays"), "{reason}");
+        assert!(
+            over.warnings.iter().any(|w| w == reason),
+            "{:?}",
+            over.warnings
+        );
+        assert_eq!(
+            verdict(&over, "revenue_daily"),
+            ProductBudgetVerdict::Breached
+        );
+        // A product without a budget carries no reason.
+        assert_eq!(budget_of(&over, "ltv").breach_events_skipped, None);
+        // The shipped cap: an hourly schedule over a 31-day month fits.
+        assert!(MAX_REPLAY_RUNS >= 31 * 24);
+    }
+
+    /// The end-of-run check splits at most `MAX_WALK_BACK_STEPS` earlier runs,
+    /// so its cost does not grow with the runs of the month. Five runs that
+    /// measure no storage are `not_evaluated` for a storage limit; the sixth
+    /// builds the table and is over.
+    #[test]
+    fn the_end_of_run_walk_back_is_bounded() {
+        use rocky_core::state::{StoredBytes, StoredBytesBasis};
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(
+            dir.path(),
+            "[product_budget.revenue_daily]\nmax_storage_gb_month = 0\n",
+        );
+        let mut runs = Vec::new();
+        for day in 1..=5 {
+            let start = at(2026, 10, day, 0, 0);
+            runs.push(sample_run_at(
+                &format!("raw-{day}"),
+                start,
+                vec![exec_at("raw", start, 5)],
+            ));
+        }
+        let start = at(2026, 10, 6, 0, 0);
+        let mut build = exec_at("revenue_daily", start, 10);
+        build.stored_bytes = Some(StoredBytes {
+            bytes: 1 << 30,
+            basis: StoredBytesBasis::DataFiles,
+        });
+        runs.push(sample_run_at("build", start, vec![build]));
+        record(&state, &runs);
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let inputs = load_month_inputs(&store, &config, "2026-10", at(2026, 11, 2, 0, 0)).unwrap();
+        let budgets = inputs.budgets().unwrap();
+        let last = inputs.runs.len() - 1;
+        let bounded = events_at_step(&inputs, budgets, last, 2).unwrap();
+        assert_eq!(bounded.earlier_splits, 2);
+        let open = events_at_step(&inputs, budgets, last, usize::MAX).unwrap();
+        assert_eq!(open.earlier_splits, 5);
+        // Both find the same first breach, at the build.
+        for check in [&bounded, &open] {
+            assert_eq!(
+                check.events.get("revenue_daily").map(|e| e.run_id.as_str()),
+                Some("build")
+            );
+        }
+        let report = compute_month_cost_in(
+            &store,
+            &config,
+            "2026-10",
+            at(2026, 11, 2, 0, 0),
+            MAX_REPLAY_RUNS,
+        )
+        .unwrap();
+        assert_eq!(event_runs(&report, "revenue_daily"), ["build"]);
+        assert!(MAX_WALK_BACK_STEPS <= 8);
+    }
+
+    /// The end-of-run verdict is the replay's verdict at that run: the same
+    /// split, as of the run's finish.
+    #[test]
+    fn the_end_of_run_verdict_is_the_replay_step_verdict() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        out_in_out(&state);
+        let store = StateStore::open_read_only_or_empty(&state).unwrap();
+        let now = at(2026, 11, 2, 0, 0);
+        let inputs = load_month_inputs(&store, &config, "2026-10", now).unwrap();
+        let budgets = inputs.budgets().unwrap();
+        for (index, run) in inputs.runs.iter().enumerate() {
+            let replayed = step_verdicts(&inputs, budgets, index).unwrap();
+            let after = product_budgets_after_run(&store, &config, &run.run_id, now).unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].budget, replayed["revenue_daily"], "{}", run.run_id);
+        }
+    }
+
+    /// Timing probe, not a check (run it with `--ignored` in a release
+    /// build): `ROCKY_PERF_RUNS` production runs spread
+    /// over October, each building `revenue_daily` and 20 readers of it.
+    #[test]
+    #[ignore]
+    fn perf_probe_month_shape() {
+        let n: i64 = std::env::var("ROCKY_PERF_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(720);
+        let dir = TempDir::new().unwrap();
+        let (config, state) = budget_project(dir.path(), OUT_IN_OUT_BUDGET);
+        let spacing = 31 * 24 * 60 * 60 / n;
+        let mut runs = Vec::new();
+        for i in 0..n {
+            let start = at(2026, 10, 1, 0, 0) + chrono::Duration::seconds(i * spacing);
+            let models = (0..20)
+                .map(|m| reading(exec_at(&format!("m{m}"), start, 50), "revenue_daily", 10))
+                .chain(std::iter::once(exec_at("revenue_daily", start, 400)))
+                .collect();
+            runs.push(sample_run_at(&format!("run-{i:05}"), start, models));
+        }
+        record(&state, &runs);
+        let last = format!("run-{:05}", n - 1);
+        let now = at(2026, 11, 2, 0, 0);
+        let t = std::time::Instant::now();
+        {
+            let store = StateStore::open_read_only_or_empty(&state).unwrap();
+            let after = product_budgets_after_run(&store, &config, &last, now).unwrap();
+            assert_eq!(after.len(), 1);
+        }
+        let end_of_run = t.elapsed();
+        {
+            let store = StateStore::open_read_only_or_empty(&state).unwrap();
+            let t = std::time::Instant::now();
+            let inputs = load_month_inputs(&store, &config, "2026-10", now).unwrap();
+            let load = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = inputs.split(&inputs.runs, now).unwrap();
+            let split = t.elapsed();
+            let budgets = inputs.budgets().unwrap();
+            let t = std::time::Instant::now();
+            let step = events_at_step(&inputs, budgets, inputs.runs.len() - 1, MAX_WALK_BACK_STEPS)
+                .unwrap();
+            eprintln!(
+                "PERF parts load={load:?} one_split={split:?} step_check={:?} earlier_splits={}",
+                t.elapsed(),
+                step.earlier_splits
+            );
+        }
+        let skip_report = std::env::var("ROCKY_PERF_SKIP_REPORT").is_ok();
+        let report = if skip_report {
+            None
+        } else {
+            let t = std::time::Instant::now();
+            let out = month(&config, &state);
+            Some((
+                t.elapsed(),
+                budget_of(&out, "revenue_daily").breach_events.len(),
+            ))
+        };
+        eprintln!("PERF runs={n} end_of_run={end_of_run:?} report={report:?}");
     }
 }

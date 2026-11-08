@@ -1110,7 +1110,7 @@ A product with a [`[product_budget.NAME]`](/reference/configuration/#product_bud
 ]
 ```
 
-Rocky finds the events by splitting the month again after each production run, over the runs whose records were written by then, in the order they finished. A month with many runs takes longer to report, because each run is one more split of the month: the work grows with the square of the number of runs. The end-of-run check does not replay the month; it splits it only at the current run and back to the last run with a verdict, usually one run. A breach found as of now, between runs, has no event until the next run.
+Rocky finds the events by splitting the month again after each production run, over the runs whose records were written by then, in the order they finished. A month with many runs takes longer to report, because each run is one more split of the month: the work grows with the square of the number of runs. So the report lists breach events only for a month with at most 750 production runs (one an hour fits). Above that, `breach_events` is left out, `breach_events_skipped` gives the reason with both counts, the same reason is in `warnings`, and `budget` is still checked. The end-of-run check does not replay the month: it splits it at the current run and at the runs before it, back to the last run with a verdict, at most 8. A breach found as of now, between runs, has no event until the next run.
 
 **Limits.**
 

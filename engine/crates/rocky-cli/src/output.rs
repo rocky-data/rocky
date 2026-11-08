@@ -12806,6 +12806,11 @@ pub struct ProductMonthCost {
     /// product back under. Empty (and omitted) when there was none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub breach_events: Vec<ProductBudgetBreachEvent>,
+    /// Why `breach_events` was not computed, when it was not: the month has
+    /// more production runs than the report replays (the reason gives both
+    /// counts). `budget` is still checked. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breach_events_skipped: Option<String>,
 }
 
 /// The verdict of a monthly product budget, or of one of its limits.
