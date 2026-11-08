@@ -127,14 +127,14 @@ load 3 0 3
 echo
 echo "=== target table poc.main.events ==="
 COUNTS="$(duckdb -readonly -csv -noheader poc.duckdb \
-    "SELECT count(*) || ',' || count(DISTINCT id) FROM poc.main.events")"
+    "SELECT count(*), count(DISTINCT id) FROM poc.main.events")"
 if [ "$COUNTS" != "24,24" ]; then
     echo "FAIL: expected 24 rows and 24 distinct ids, got '$COUNTS'"
     exit 1
 fi
 echo "    rows=24 distinct ids=24"
 HELD="$(duckdb -readonly -csv -noheader poc.duckdb \
-    "SELECT bool_or(id = 20)::INT || ',' || bool_or(id = 25)::INT FROM poc.main.events")"
+    "SELECT bool_or(id = 20)::INT, bool_or(id = 25)::INT FROM poc.main.events")"
 if [ "$HELD" != "1,0" ]; then
     echo "FAIL: expected id 20 loaded and id 25 held back, got '$HELD'"
     exit 1
