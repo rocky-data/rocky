@@ -5309,6 +5309,86 @@ mod tests {
         );
     }
 
+    /// The `E012` help names only remedies that change what inference
+    /// infers. Over `x INT NOT NULL`, `z INT NULL`, `b BIGINT NULL` and `s
+    /// STRING NULL` on DuckDB: a `WHERE z IS NOT NULL` filter, a `CAST` and
+    /// an `IS NULL` guard in a `CASE` leave the column nullable, so the help
+    /// must not offer them. `COALESCE` to a NOT NULL column, or to a literal
+    /// of the column's own type, makes it non-null.
+    ///
+    /// The literal rows project `x` beside the column on purpose. Rocky runs
+    /// expression inference only when some column needs it, so a `COALESCE`
+    /// over a literal in a model whose every other column is nullable stays
+    /// unknown. These rows test the literal rule, not that gate.
+    #[test]
+    fn e012_help_names_only_remedies_that_change_inference() {
+        let t: &[(&str, RockyType, bool)] = &[
+            ("x", RockyType::Int32, false),
+            ("z", RockyType::Int32, true),
+            ("b", RockyType::Int64, true),
+            ("s", RockyType::String, true),
+        ];
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: None,
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let e012 = |sql: &str| {
+            let sources = HashMap::from([("t".to_string(), source_schema(t))]);
+            let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            let result = typecheck_project_for_targets(
+                &graph,
+                &sources,
+                &project.models,
+                None,
+                &TargetDialects::uniform(duckdb()),
+            );
+            validate_contract("m", &result.typed_models["m"], &contract)
+                .into_iter()
+                .find(|d| &*d.code == "E012")
+        };
+        for (sql, fails) in [
+            // Not remedies: the column stays nullable. The `CASE` row is
+            // conservative: inference does not read the guard.
+            ("SELECT z AS c, x FROM t WHERE z IS NOT NULL", true),
+            ("SELECT CAST(z AS BIGINT) AS c, x FROM t", true),
+            (
+                "SELECT CASE WHEN b IS NULL THEN 0 ELSE b END AS c, x FROM t",
+                true,
+            ),
+            // Remedies the help names.
+            ("SELECT COALESCE(z, x) AS c FROM t", false),
+            ("SELECT COALESCE(s, '') AS c, x FROM t", false),
+            ("SELECT COALESCE(b, 0) AS c, x FROM t", false),
+            ("SELECT COALESCE(z, CAST(0 AS INT)) AS c, x FROM t", false),
+            ("SELECT x AS c FROM t", false),
+        ] {
+            assert_eq!(e012(sql).is_some(), fails, "{sql}");
+        }
+        let help = e012("SELECT z AS c FROM t")
+            .and_then(|d| d.suggestion)
+            .expect("E012 carries a suggestion");
+        for remedy in [
+            "COALESCE(c, other_col)",
+            "NOT NULL",
+            "CAST(0 AS INT)",
+            "another column of the same SELECT",
+            "nullable = true",
+        ] {
+            assert!(help.contains(remedy), "{remedy}: {help}");
+        }
+        assert!(
+            help.contains("`WHERE c IS NOT NULL` filter does not help"),
+            "{help}"
+        );
+        assert!(!help.contains("filter out NULLs"), "{help}");
+    }
+
     /// Typecheck one model over sources `t` and `u`, both `(x INT NOT NULL, n
     /// STRING NOT NULL, z INT NULL)`.
     fn typecheck_over_t_and_u(sql: &str) -> Vec<(String, RockyType, bool)> {
