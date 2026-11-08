@@ -3295,6 +3295,131 @@ mod tests {
         assert_stays_incremental(&config, &decl, &first);
     }
 
+    /// Only the deprecation date of `orders_v1` moves. The models of a
+    /// declaration get their `governance.version` from it, but only the
+    /// latest alias has the declaration as its file, so `orders_v1` is not
+    /// marked. That is sound only while no cached typecheck result reads
+    /// `governance.version`: the W048 check that reads the date runs over
+    /// the whole project on each compile. If this test fails, the typecheck
+    /// now reads it: mark every model a changed declaration governs in
+    /// `compile_incremental`.
+    #[test]
+    fn a_deprecation_date_edit_recomputes_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let decl = write_versioned_project(&models_dir, Some(ORDERS_DECL_V2));
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+
+        std::fs::write(
+            &decl,
+            "latest_version = 2\n[[versions]]\nv = 1\ndeprecation_date = \"2000-01-01\"\n\
+             [[versions]]\nv = 2\n",
+        )
+        .expect("edit declaration");
+        let incremental =
+            compile_incremental(&config, std::slice::from_ref(&decl), &first).expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert_ne!(
+            resolved_configs(&first)["orders_v1"],
+            resolved_configs(&scratch)["orders_v1"],
+            "the edit must change orders_v1's version, or this test proves nothing"
+        );
+        assert_ne!(
+            diagnostic_set(&first),
+            diagnostic_set(&scratch),
+            "the past date must raise W048 on the pin, or this test proves nothing"
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+        assert_stays_incremental(&config, &decl, &first);
+    }
+
+    /// The guard behind the rules above. `compile_incremental` keeps a
+    /// model's cached typecheck result unless the model is marked, and it
+    /// marks nothing for an edit of `test_definitions.toml`, nor the version
+    /// models whose `governance.version` a declaration edit rewrites. That is
+    /// sound only while the cached typecheck reads neither `config.tests` nor
+    /// `config.governance.version`. This changes only those two fields on
+    /// every model the cached typecheck receives, and asserts that its result
+    /// does not move. A typecheck that starts to read either field (and
+    /// changes its output for these values) fails here, instead of going
+    /// stale in the language server. If it does, add a marking rule for the
+    /// file that sets the field, next to the `_defaults.toml` rule.
+    #[test]
+    fn the_cached_typecheck_reads_neither_tests_nor_versions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_versioned_project(&models_dir, Some(ORDERS_DECL_V2));
+
+        let models = Project::load_models(&models_dir, None).expect("load models");
+        assert!(
+            models.iter().any(|m| m.config.governance.version.is_some()),
+            "the project must carry version metadata, or this test proves nothing"
+        );
+        let project = Project::from_models_with_externals(models.clone(), &Default::default())
+            .expect("project");
+        let graph = semantic::build_semantic_graph(&project, &source_column_info(&HashMap::new()))
+            .expect("semantic graph");
+        let everything: std::collections::HashSet<String> = graph.models.keys().cloned().collect();
+        // Every model typechecked by the function whose results the
+        // incremental compile caches, from an empty previous result.
+        let cached = |models: &[rocky_core::models::Model]| {
+            let empty = TypeCheckResult {
+                typed_models: IndexMap::new(),
+                diagnostics: Vec::new(),
+                reference_map: Default::default(),
+                model_typecheck_ms: HashMap::new(),
+            };
+            let result = typecheck::typecheck_project_incremental(
+                &graph,
+                &HashMap::new(),
+                models,
+                &everything,
+                &empty,
+                None,
+                &Default::default(),
+            );
+            let mut diagnostics: Vec<String> = result
+                .diagnostics
+                .iter()
+                .map(|d| format!("{d:?}"))
+                .collect();
+            diagnostics.sort();
+            (result.typed_models, diagnostics)
+        };
+
+        let not_null_missing: rocky_core::tests::TestDecl =
+            toml::from_str("type = \"not_null\"\ncolumn = \"missing\"\n").expect("test decl");
+        let ghost = rocky_core::model_governance::ModelVersionInfo {
+            model: "ghost".to_string(),
+            version: Some(7),
+            latest_version: 9,
+            deprecation_date: chrono::NaiveDate::from_ymd_opt(2000, 1, 1),
+        };
+        let mut changed = models.clone();
+        for m in &mut changed {
+            m.config.tests = vec![not_null_missing.clone()];
+            m.config.governance.version = match m.config.governance.version {
+                Some(_) => None,
+                None => Some(ghost.clone()),
+            };
+        }
+
+        let (typed, diagnostics) = cached(&models);
+        assert!(
+            typed.contains_key("r") && typed.contains_key("orders"),
+            "the typecheck must cover the versioned models, or this test proves nothing"
+        );
+        assert_eq!(cached(&changed), (typed, diagnostics));
+    }
+
     /// Adding a declaration adds the `orders` alias that `r` reads.
     #[test]
     fn adding_a_version_declaration_recomputes_like_a_from_scratch_compile() {
