@@ -1303,6 +1303,18 @@ pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateErro
 /// Open (creating if absent) the sidecar lock file for `path`.
 fn open_lock_file(path: &Path) -> Result<(std::fs::File, std::path::PathBuf), StateError> {
     let lock_path = path.with_extension("redb.lock");
+    // A writer creates the missing directories of the state path itself, so an
+    // explicit `--state-path .rocky/state.redb` works on a fresh checkout. Only
+    // the path's own parent chain, owner-only like the state files; an
+    // existing directory keeps its mode. Read-only opens never get here.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        crate::private_fs::create_private_dir_all(parent).map_err(|e| StateError::LockIo {
+            path: lock_path.display().to_string(),
+            source: e,
+        })?;
+    }
     // Owner-only when this open creates the sidecar; an existing one keeps its
     // mode.
     let file = crate::private_fs::private_file_options()
@@ -20800,6 +20812,39 @@ mod private_mode_tests {
         let ns_dir = dir.path().join(STATE_NAMESPACE_DIR);
         assert_eq!(resolved.path.parent().unwrap(), ns_dir);
         assert_eq!(mode_of(&ns_dir).unwrap(), 0o700);
+    }
+
+    /// Mutation: drop the `create_private_dir_all` call in `open_lock_file`
+    /// and the open fails with `LockIo`.
+    #[test]
+    fn a_writer_open_creates_the_missing_state_directory_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join(".rocky");
+        let inner = outer.join("nested");
+        let path = inner.join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        assert!(path.is_file());
+        assert_eq!(mode_of(&outer).unwrap(), 0o700, "outer state dir");
+        assert_eq!(mode_of(&inner).unwrap(), 0o700, "inner state dir");
+        drop(store);
+    }
+
+    #[test]
+    fn a_writer_open_leaves_an_existing_state_directory_mode_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("models");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(StateStore::open(&state_dir.join("state.redb")).unwrap());
+        assert_eq!(mode_of(&state_dir).unwrap(), 0o755);
+    }
+
+    #[test]
+    fn a_read_only_open_does_not_create_the_missing_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join(".rocky");
+        assert!(StateStore::open_read_only(&missing.join("state.redb")).is_err());
+        assert!(!missing.exists());
     }
 }
 
