@@ -187,6 +187,8 @@ pub fn build_system_prompt() -> String {
          ```\n\n",
     );
     p.push_str("# Rules\n\n");
+    // The `nullable = false` rule below follows the data alone. A claim Rocky
+    // cannot prove is withheld by `withhold_unproven_non_null`, not retried.
     p.push_str(
         "- Use ONLY the `type` names listed above; they must match the observed type for each column.\n\
          - Set `nullable = false` for any column with an observed null_rate of exactly 0; otherwise leave it nullable.\n\
@@ -306,6 +308,8 @@ fn verify_contract_toml(
 ///
 /// "Not proven" covers both a column Rocky knows may be NULL and one whose
 /// nullability it does not know: `TypedColumn::nullable` is `true` for both.
+/// Zero profiled NULLs is evidence about today's table, not proof about
+/// future runs, which is why the claim is dropped rather than kept.
 /// The withheld column keeps every other key, so its type and its place in
 /// `required` / `protected` still go through validation. Withholding only
 /// weakens the draft; it never makes it claim non-null. Returns one message
@@ -337,9 +341,10 @@ fn withhold_unproven_non_null(
         withheld.push(format!(
             "column '{}' had no NULLs in {} profiled row(s), but Rocky cannot prove it is \
              non-null from the model SQL and the source schemas it has, so the draft leaves \
-             `nullable` unset. To make `nullable = false` checkable, declare the source column \
-             NOT NULL and refresh the source schemas, or COALESCE it to a non-NULL default in \
-             the model",
+             `nullable` unset. To make `nullable = false` checkable, COALESCE it to a non-NULL \
+             default in the model, or declare the source column NOT NULL in the warehouse and \
+             refresh Rocky's schema cache (`rocky discover --with-schemas` or `rocky run`) so \
+             the constraint reaches the compiler",
             column.name, observed.rows
         ));
     }
@@ -768,6 +773,26 @@ type = "String"
             .expect("a proven non-null column verifies");
         assert_eq!(verified.contract.columns[0].nullable, Some(false));
         assert!(verified.unproven_non_null.is_empty());
+    }
+
+    /// A column Rocky KNOWS may be NULL (a typed source column with no
+    /// `NOT NULL`, or a LEFT JOIN's null-extended side) that held no NULL in
+    /// the profile is withheld too, while a proven column in the same draft
+    /// keeps its `nullable = false`.
+    #[test]
+    fn a_known_nullable_column_is_withheld_beside_a_proven_one() {
+        let schema = vec![
+            tc("id", RockyType::Int64, false),
+            tc("customer_id", RockyType::Int64, true),
+        ];
+        let profile = profile_of("orders", &["id", "customer_id"], 10, 0);
+        let verified =
+            verify_contract_toml(&non_null_draft(&["id", "customer_id"]), &profile, &schema)
+                .expect("the draft verifies");
+        assert_eq!(verified.contract.columns[0].nullable, Some(false));
+        assert_eq!(verified.contract.columns[1].nullable, None);
+        assert_eq!(verified.unproven_non_null.len(), 1);
+        assert!(verified.unproven_non_null[0].contains("'customer_id'"));
     }
 
     /// Proven nullable, and the data agrees: the profile counted NULLs, so the
