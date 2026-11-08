@@ -606,8 +606,9 @@ span, and sometimes a suggested fix.
 | `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
 | `E059` | A contract declares a type for a column whose type Rocky could not infer, and strict contracts are on (`--strict-contracts` or `[contracts] strict = true`). The `I003` note, as an error |
 | `E060` | A downstream-consumer file in `consumers/` is invalid: it does not parse, two consumers share a name, or `depends_on` names something that is not a model. See [Downstream consumers](/concepts/downstream-consumers/) |
+| `E061` | The model's output repeats a column name (`SELECT a.id, b.id`) and its strategy writes into the existing table: `incremental`, `delete_insert`, `time_interval` (or `microbatch`) or `merge`. The write cannot tell the columns apart; on DuckDB every run after the first fails. Alias the column (`b.id AS b_id`). Rocky checks aliased names and bare or qualified columns of the outermost `SELECT`; it does not check what a star (`*`, `b.*`) expands to |
 | `W001` | Unused model (no downstream consumers) |
-| `W002` | Duplicate column in model output |
+| `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |
 | `W005` | Temporal column present but no `freshness` declaration in scope |
 | `W006` | `merge` strategy declares a `unique_key` column the model does not output |

@@ -780,6 +780,9 @@ fn compute_model_typecheck(
             &model.sql,
             &relation_columns,
         ));
+        // E061 / W002: the output repeats a column name. Error for strategies
+        // that write into the existing table, warning otherwise.
+        diagnostics.extend(crate::duplicate_output::check_duplicate_output_names(model));
     }
 
     // Step 3: SELECT * warning
@@ -7646,6 +7649,65 @@ mod tests {
             .filter(|d| d.model == "b" && (&*d.code == "I001" || &*d.code == "W002"))
             .collect();
         assert!(!star_diags.is_empty());
+    }
+
+    /// Codes the whole typecheck emits for one model whose strategy is
+    /// `strategy_toml` (a sidecar `[strategy]` table).
+    fn duplicate_output_codes(strategy_toml: &str, sql: &str) -> Vec<String> {
+        let mut model = make_model("m", sql);
+        model.config.strategy = toml::from_str(strategy_toml).expect("strategy parses");
+        let project = Project::from_models(vec![model]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E061" || &*d.code == "W002")
+            .map(|d| format!("{}:{:?}", d.code, d.severity))
+            .collect()
+    }
+
+    const DUPLICATE_ID_SQL: &str =
+        "SELECT a.id, b.id, a.ts FROM raw.s.a AS a JOIN raw.s.b AS b ON a.k = b.k";
+
+    #[test]
+    fn a_repeated_output_name_is_e061_for_strategies_that_write_into_the_table() {
+        for strategy in [
+            "type = \"incremental\"\ntimestamp_column = \"ts\"",
+            "type = \"delete_insert\"\npartition_by = [\"ts\"]",
+            "type = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"day\"",
+            "type = \"merge\"\nunique_key = [\"ts\"]",
+        ] {
+            assert_eq!(
+                duplicate_output_codes(strategy, DUPLICATE_ID_SQL),
+                ["E061:Error"],
+                "{strategy}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_output_name_is_w002_for_full_refresh() {
+        assert_eq!(
+            duplicate_output_codes("type = \"full_refresh\"", DUPLICATE_ID_SQL),
+            ["W002:Warning"]
+        );
+    }
+
+    #[test]
+    fn distinct_output_names_give_neither_e061_nor_w002() {
+        let sql =
+            "SELECT a.id, b.id AS b_id, a.ts FROM raw.s.a AS a JOIN raw.s.b AS b ON a.k = b.k";
+        for strategy in [
+            "type = \"full_refresh\"",
+            "type = \"merge\"\nunique_key = [\"id\"]",
+        ] {
+            assert!(
+                duplicate_output_codes(strategy, sql).is_empty(),
+                "{strategy}"
+            );
+        }
     }
 
     #[test]

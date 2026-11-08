@@ -25,6 +25,7 @@ pub mod contracts;
 pub mod cost_check;
 pub mod cycle;
 pub mod diagnostic;
+pub mod duplicate_output;
 pub mod ephemeral;
 pub mod freshness;
 pub mod function_check;

@@ -235,6 +235,14 @@ pub const E058: &str = "E058";
 /// model that no longer exists is the failure this exists to catch: the dashboard would
 /// otherwise keep reading a table nobody maintains.
 pub const E060: &str = "E060";
+/// The model's output repeats a column name (`SELECT a.id, b.id`) and its
+/// strategy writes into the model's existing table: `incremental`,
+/// `delete_insert`, `time_interval` (and its alias `microbatch`) or `merge`.
+/// That write cannot tell the repeated columns apart; on DuckDB, which
+/// inserts by name, every run after the first fails. Emitted by
+/// `rocky compile` from [`crate::duplicate_output`]. Every other strategy
+/// gets [`W002`] for the same projection.
+pub const E061: &str = "E061";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
@@ -421,7 +429,10 @@ pub const E056: &str = "E056";
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
-/// Duplicate column in model output.
+/// Two meanings, both warnings: the model's output repeats a column name
+/// and its strategy rebuilds or defines the relation (the strategies that
+/// write into an existing table get [`E061`] instead), or a `SELECT *`
+/// reads an upstream whose schema is unknown.
 pub const W002: &str = "W002";
 /// Classification tag on a model column doesn't resolve to any `[mask]` /
 /// `[mask.<env>]` strategy and isn't listed in `[classifications.allow_unmasked]`.
