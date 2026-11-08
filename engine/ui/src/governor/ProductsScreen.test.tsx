@@ -94,6 +94,8 @@ function loaders(overrides: Partial<ProductLoaders> = {}): ProductLoaders {
     list: vi.fn(async () => LIST),
     status: vi.fn(async () => STATUS),
     journal: vi.fn(async () => JOURNAL),
+    costMonth: vi.fn(() => new Promise<never>(() => {})),
+    schedule: vi.fn(() => new Promise<never>(() => {})),
     ...overrides,
   };
 }

@@ -2,6 +2,8 @@ import { useCallback } from "react";
 import type { ProductJournalEntry, ProductJournalOutput } from "@rocky-types/product_journal";
 import type { ProductListEntry, ProductListOutput } from "@rocky-types/product_list";
 import type { ProductStatusOutput } from "@rocky-types/product_status";
+import type { ProductMonthCostOutput } from "@rocky-types/cost_by_product";
+import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { apiGet } from "../api";
 import { Clip, StatusCard } from "../components";
 import { useResource } from "../estate/useResource";
@@ -11,18 +13,25 @@ import { ResourceState } from "../review/ResourceState";
 import { reviewPath } from "../review/paths";
 import { AuditProductLink } from "./links";
 import { ProductApprove } from "./ProductApprove";
+import { DeliveryCostPanel } from "./DeliveryCostPanel";
 import { defaultJobClient, type JobClient } from "../operator";
 
 export interface ProductLoaders {
   list: () => Promise<ProductListOutput>;
   status: (name: string) => Promise<ProductStatusOutput>;
   journal: (name: string) => Promise<ProductJournalOutput>;
+  /** This month's cost by product (`rocky cost --month --by product`). */
+  costMonth: () => Promise<ProductMonthCostOutput>;
+  /** The scheduler snapshot, for the pipelines that deliver a product. */
+  schedule: () => Promise<ScheduleStatusOutput>;
 }
 
 export const defaultProductLoaders: ProductLoaders = {
   list: () => apiGet<ProductListOutput>("products"),
   status: (name) => apiGet<ProductStatusOutput>(`products/${encodeURIComponent(name)}`),
   journal: (name) => apiGet<ProductJournalOutput>(`products/${encodeURIComponent(name)}/journal`),
+  costMonth: () => apiGet<ProductMonthCostOutput>("cost/month"),
+  schedule: () => apiGet<ScheduleStatusOutput>("schedule"),
 };
 
 /** The path of one product's timeline. */
@@ -338,6 +347,8 @@ export function ProductTimeline({
   const loadJournal = useCallback(() => loaders.journal(name), [loaders, name]);
   const status = useResource(loadStatus, [loadStatus]);
   const journal = useResource(loadJournal, [loadJournal]);
+  const month = useResource(loaders.costMonth, [loaders.costMonth, name]);
+  const schedule = useResource(loaders.schedule, [loaders.schedule, name]);
 
   return (
     <div className="space-y-4">
@@ -360,6 +371,12 @@ export function ProductTimeline({
               status.reload();
               journal.reload();
             }}
+          />
+          <DeliveryCostPanel
+            name={name}
+            status={status.value}
+            month={month}
+            schedule={schedule}
           />
         </>
       ) : (
