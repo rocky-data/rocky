@@ -2109,14 +2109,13 @@ async fn try_claim_idempotency(
             mirror_to_redb: true,
             ..
         } => Some(
-            StateStore::open_with_policy(state_path, state_cfg.on_schema_mismatch).with_context(
-                || {
+            StateStore::open_with_policy(state_path, state_cfg.schema_mismatch_policy())
+                .with_context(|| {
                     format!(
                         "failed to open state store at {} for idempotency claim",
                         state_path.display()
                     )
-                },
-            )?,
+                })?,
         ),
         _ => None,
     };
@@ -4056,7 +4055,7 @@ pub async fn run_with_explicit_contracts(
         // whenever the state file was corrupted or unreadable.
         let state_store = match rocky_core::state::StateStore::open_with_policy(
             state_path,
-            rocky_cfg.state.on_schema_mismatch,
+            rocky_cfg.state.schema_mismatch_policy(),
         ) {
             Ok(store) => Some(store),
             Err(e) => {
@@ -4567,7 +4566,7 @@ pub async fn run_with_explicit_contracts(
             ) {
                 let policy_store = rocky_core::state::StateStore::open_with_policy(
                     state_path,
-                    rocky_cfg.state.on_schema_mismatch,
+                    rocky_cfg.state.schema_mismatch_policy(),
                 );
                 // The open can still fail — a corrupt store, or a newer one
                 // under `on_schema_mismatch = "fail"`. A bare `?` here would
@@ -4793,7 +4792,7 @@ pub async fn run_with_explicit_contracts(
                 // the transformation arm above.
                 let policy_store = match rocky_core::state::StateStore::open_with_policy(
                     state_path,
-                    rocky_cfg.state.on_schema_mismatch,
+                    rocky_cfg.state.schema_mismatch_policy(),
                 ) {
                     Ok(store) => store,
                     Err(e) => {
@@ -4935,7 +4934,7 @@ pub async fn run_with_explicit_contracts(
                 // the transformation arm above.
                 let policy_store = match rocky_core::state::StateStore::open_with_policy(
                     state_path,
-                    rocky_cfg.state.on_schema_mismatch,
+                    rocky_cfg.state.schema_mismatch_policy(),
                 ) {
                     Ok(store) => store,
                     Err(e) => {
@@ -5300,7 +5299,7 @@ pub async fn run_with_explicit_contracts(
     let governance_catalog_client: Option<std::sync::Arc<dyn GovernanceCatalogClient>> =
         adapter_registry.governance_catalog_client(&pipeline.target.adapter);
 
-    let state_store = StateStore::open_with_policy(state_path, rocky_cfg.state.on_schema_mismatch)
+    let state_store = StateStore::open_with_policy(state_path, rocky_cfg.state.schema_mismatch_policy())
         .context(format!(
             "failed to open state store at {}",
             state_path.display()
@@ -12410,7 +12409,7 @@ pub(crate) async fn execute_backfill_set(
             let state_store = Some(
                 rocky_core::state::StateStore::open_with_policy(
                     state_path,
-                    rocky_cfg.state.on_schema_mismatch,
+                    rocky_cfg.state.schema_mismatch_policy(),
                 )
                 .with_context(|| {
                     format!("failed to open state store at {}", state_path.display())

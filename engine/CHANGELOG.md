@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- On the default `local` state backend, an older `rocky` that opens a newer state file now refuses it instead of deleting it (#2450). Set `[state] on_schema_mismatch = "recreate"` to keep the old flow: one full-refresh run from fresh state. That flow now keeps the newer file as `<file>.v<N>.bak`.
+
+### Changed
+
+- `[state] on_schema_mismatch` no longer deletes a state file written by a newer binary (#2450). `recreate` renames it to `<file>.v<N>.bak` and names that path in its warning. If that `.bak` already exists, the open refuses, so a second recreate never overwrites the first backup. If the rename fails, the open refuses as `fail` does. The run still skips the end-of-run state upload after a recreate.
+- `[state] on_schema_mismatch` has no fixed default now (#2450). Unset means `fail` on the `local` backend, where the state file is the only copy, and `recreate` on `s3`, `gcs`, `valkey` and `tiered`. An explicit value applies on every backend. The `rocky doctor` hint and the schema-mismatch error message say so.
+
 ## [1.90.1] — 2026-11-07
 
 The first published release with the 1.90.0 changes below. It ships the same engine code as 1.90.0.

@@ -93,7 +93,7 @@ Compare-and-swap on the state backend does not make a rolling update safe. The d
 The state store carries a schema version. Two directions:
 
 - **A newer engine opens an older store.** It migrates the store forward on first open. Every command does this; there is no separate migration step.
-- **An older engine opens a newer store.** `rocky serve` and every inspection command (`state`, `history`, `doctor`, `metrics`, the branch commands) refuse to open it. `rocky run` and `rocky load` follow `[state] on_schema_mismatch`: the default, `recreate`, logs one warning, starts from a fresh local state, runs once as a full refresh, and never writes that downgraded state back to a shared backend; `fail` refuses like the rest.
+- **An older engine opens a newer store.** `rocky serve` and every inspection command (`state`, `history`, `doctor`, `metrics`, the branch commands) refuse to open it. `rocky run` and `rocky load` follow `[state] on_schema_mismatch`. `recreate` moves the newer file to `<file>.v<N>.bak`, logs one warning that names it, starts from a fresh local state, runs once as a full refresh, and never writes that downgraded state back to a shared backend. It refuses if that `.bak` already exists. `fail` refuses like the rest. Unset means `fail` on the `local` backend, where the file is the only copy, and `recreate` on the remote and tiered backends.
 
 On a remote backend, the newer engine finds no state under its own schema version and restores the newest older version's state instead. It never writes or deletes the older copy. See [What a schema upgrade does to remote state](/concepts/state-management/#what-a-schema-upgrade-does-to-remote-state).
 

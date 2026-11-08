@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -937,7 +937,8 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///
 ///   **On rollback.** The version check runs at OPEN.
 ///   [`SchemaMismatchPolicy::Fail`] refuses with the version pair.
-///   [`SchemaMismatchPolicy::Recreate`] (the default) logs a warning, starts
+///   [`SchemaMismatchPolicy::Recreate`] (the unset default on remote
+///   backends) keeps the newer file as a `.bak`, logs a warning, starts
 ///   from a fresh local store and runs one full refresh, never uploading the
 ///   downgraded state. That run re-copies and re-checks every target it
 ///   plans, so no owed check is left silently satisfied. The `superseded`
@@ -1130,7 +1131,8 @@ pub enum StateError {
 
     #[error(
         "state schema version mismatch: database has v{found}, binary expects v{expected}. \
-         Delete or migrate the state file at {path} to continue. \
+         Upgrade rocky, or move the state file at {path} aside to continue \
+         ([state] on_schema_mismatch = \"recreate\" moves it to <file>.v{found}.bak). \
          See https://rocky.dev/docs/state-migration for instructions."
     )]
     SchemaMismatch {
@@ -1363,8 +1365,8 @@ pub struct StateStore {
     // opens. Released automatically when the guard (and its `File`) is dropped.
     _lock: Option<StateWriterLock>,
     // `true` when this store was opened against a forward-incompatible on-disk
-    // schema under [`SchemaMismatchPolicy::Recreate`] and the local file was
-    // bootstrapped fresh. The run path reads this via
+    // schema under [`SchemaMismatchPolicy::Recreate`]: the newer file was
+    // moved to its `.bak` and the local file was bootstrapped fresh. The run path reads this via
     // [`StateStore::was_recreated_for_forward_incompat`] to suppress the
     // end-of-run upload, so a downgraded state is never written back over the
     // newer state that upgraded pods depend on.
@@ -1438,14 +1440,26 @@ pub fn force_run_progress_header(
     store.commit_write(txn)
 }
 
+/// Where [`SchemaMismatchPolicy::Recreate`] moves a forward-incompatible
+/// state file: `<file>.v{found}.bak`, beside the original.
+///
+/// Appends to the full file name (`state.redb` becomes `state.redb.v34.bak`)
+/// rather than replacing the extension.
+pub fn forward_incompat_backup_path(path: &Path, found: u32) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".v{found}.bak"));
+    PathBuf::from(name)
+}
+
 /// Outcome of [`StateStore::init_db`].
 enum InitOutcome {
     /// The version was stamped/upgraded and tables were created; the store is
     /// ready to use.
     Ready,
     /// The on-disk schema is newer than this binary supports and the policy is
-    /// [`SchemaMismatchPolicy::Recreate`]; the caller must delete and recreate
-    /// the file. Carries the on-disk version for the WARN message.
+    /// [`SchemaMismatchPolicy::Recreate`]; the caller must move the file aside
+    /// to its `.bak` and recreate it. Carries the on-disk version for the
+    /// backup name and the WARN message.
     RecreateForwardIncompat { found: u32 },
 }
 
@@ -1501,14 +1515,18 @@ impl StateStore {
     /// happens when the on-disk schema is *newer* than this binary supports.
     /// [`SchemaMismatchPolicy::Fail`] (what bare [`open`][Self::open] uses)
     /// aborts with [`StateError::SchemaMismatch`]; [`SchemaMismatchPolicy::Recreate`]
-    /// logs a `WARN`, bootstraps a fresh local state, and sets the
+    /// renames the newer file to `<file>.v{found}.bak` (see
+    /// [`forward_incompat_backup_path`]), logs a `WARN` naming it, bootstraps
+    /// a fresh local state, and sets the
     /// [`was_recreated_for_forward_incompat`][Self::was_recreated_for_forward_incompat]
     /// flag so the caller can suppress writing the downgraded state back to a
-    /// shared tier.
+    /// shared tier. If the `.bak` already exists, or the rename fails,
+    /// `Recreate` returns [`StateError::SchemaMismatch`] as `Fail` does and
+    /// leaves both files in place.
     ///
-    /// Only the `rocky run` and `rocky load` paths thread a non-default policy
-    /// here (from `[state] on_schema_mismatch`); every other caller uses the
-    /// hard-fail default via [`open`][Self::open].
+    /// Only the `rocky run` and `rocky load` paths thread a configured policy
+    /// here (from [`crate::config::StateConfig::schema_mismatch_policy`]);
+    /// every other caller uses the hard-fail default via [`open`][Self::open].
     pub fn open_with_policy(path: &Path, policy: SchemaMismatchPolicy) -> Result<Self, StateError> {
         Self::open_inner(path, OpenMode::ReadWrite, policy, None)
     }
@@ -1753,39 +1771,70 @@ impl StateStore {
             }),
             InitOutcome::RecreateForwardIncompat { found } => {
                 // Forward-incompatible store under `SchemaMismatchPolicy::Recreate`.
-                // Treat it as cold: drop the handle, delete the local file, and
-                // bootstrap fresh. The caller (run path) reads the
+                // Treat it as cold: drop the handle, move the newer file aside
+                // to `<file>.v{found}.bak`, and bootstrap fresh. The file is
+                // never deleted: on the `local` backend it is the only copy.
+                // The caller (run path) reads the
                 // `recreated_for_forward_incompat` flag and skips the end-of-run
                 // upload, so the newer shared state is never clobbered.
+                //
+                // Only the redb file moves. The advisory lock is the separate
+                // `<file>.lock`, which we hold, and redb keeps no WAL file.
+                let backup = forward_incompat_backup_path(path, found);
+                let mismatch = || StateError::SchemaMismatch {
+                    found,
+                    expected: CURRENT_SCHEMA_VERSION,
+                    path: path.display().to_string(),
+                };
+                // Never overwrite an earlier backup: a second bad open must not
+                // destroy the first one. `symlink_metadata` also sees a
+                // dangling symlink, which `rename` would replace. We hold the
+                // writer lock, so no other Rocky process races this check.
+                if std::fs::symlink_metadata(&backup).is_ok() {
+                    tracing::warn!(
+                        target: "rocky::state",
+                        found,
+                        expected = CURRENT_SCHEMA_VERSION,
+                        path = %path.display(),
+                        backup = %backup.display(),
+                        "state schema version mismatch: database has v{found}, binary expects \
+                         v{CURRENT_SCHEMA_VERSION}. on_schema_mismatch = recreate would move it \
+                         to {}, but that backup already exists. Refusing, so the existing \
+                         backup is not overwritten. Move or delete the backup, or upgrade rocky.",
+                        backup.display()
+                    );
+                    return Err(mismatch());
+                }
+                drop(db);
+                // If we cannot move the forward-incompatible file aside,
+                // reopening would just re-read the same newer version and loop.
+                // Degrade to the hard-fail error so the operator gets the
+                // actionable message rather than a silent spin.
+                if let Err(source) = std::fs::rename(path, &backup) {
+                    tracing::warn!(
+                        target: "rocky::state",
+                        error = %source,
+                        path = %path.display(),
+                        backup = %backup.display(),
+                        "could not move forward-incompatible state file to {} to recreate it; \
+                         falling back to hard failure",
+                        backup.display()
+                    );
+                    return Err(mismatch());
+                }
                 tracing::warn!(
                     target: "rocky::state",
                     found,
                     expected = CURRENT_SCHEMA_VERSION,
                     path = %path.display(),
+                    backup = %backup.display(),
                     "state schema version mismatch: database has v{found}, binary expects \
-                     v{CURRENT_SCHEMA_VERSION}. on_schema_mismatch = recreate: bootstrapping \
-                     fresh local state and running a full refresh. The newer shared state is \
-                     left intact (not overwritten) for already-upgraded pods."
+                     v{CURRENT_SCHEMA_VERSION}. on_schema_mismatch = recreate: moved the newer \
+                     state file to {} and bootstrapping fresh local state with a full refresh. \
+                     The newer shared state, if any, is left intact (not overwritten) for \
+                     already-upgraded pods.",
+                    backup.display()
                 );
-                drop(db);
-                // If we cannot remove the forward-incompatible file, reopening
-                // would just re-read the same newer version and loop. Degrade to
-                // the hard-fail error so the operator gets the actionable
-                // "delete or migrate" message rather than a silent spin.
-                if let Err(source) = std::fs::remove_file(path) {
-                    tracing::warn!(
-                        target: "rocky::state",
-                        error = %source,
-                        path = %path.display(),
-                        "could not delete forward-incompatible state file to recreate it; \
-                         falling back to hard failure"
-                    );
-                    return Err(StateError::SchemaMismatch {
-                        found,
-                        expected: CURRENT_SCHEMA_VERSION,
-                        path: path.display().to_string(),
-                    });
-                }
                 let db = open_redb_with_retry(path, cache_budget)?;
                 match Self::init_db(&db, path, mode, policy)? {
                     InitOutcome::Ready => Ok(StateStore {
@@ -19150,11 +19199,15 @@ mod tests {
         force_schema_version(&path, &future);
 
         // Recreate: opens fresh, flags the recreate, and the old watermark is gone.
-        let store = StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate).unwrap();
+        let logs = CapturedStateLogs::default();
+        let store = {
+            let _guard = logs.install();
+            StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate).unwrap()
+        };
         assert!(store.was_recreated_for_forward_incompat());
         assert!(
             store.list_watermarks().unwrap().is_empty(),
-            "recreate must discard the forward-incompatible state"
+            "recreate must start from an empty store"
         );
         drop(store);
         // The file is now re-stamped at the version this binary supports.
@@ -19162,6 +19215,143 @@ mod tests {
             StateStore::peek_schema_version(&path).unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
         );
+
+        // #2450: the newer file was moved aside, never deleted. The backup
+        // keeps the newer stamp and the data the newer binary wrote.
+        let backup = forward_incompat_backup_path(&path, CURRENT_SCHEMA_VERSION + 2);
+        assert_eq!(
+            backup.file_name().unwrap().to_string_lossy(),
+            format!("state.redb.v{}.bak", CURRENT_SCHEMA_VERSION + 2)
+        );
+        assert!(
+            backup.exists(),
+            "recreate must keep the newer file as a .bak"
+        );
+        assert_eq!(
+            StateStore::peek_schema_version(&backup).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION + 2),
+            "the .bak must hold the newer schema version"
+        );
+        assert!(
+            read_watermark_raw(&backup, "cat.sch.tbl").is_some(),
+            "the .bak must hold the newer binary's rows"
+        );
+        // The WARN names the backup, so an operator can find it.
+        let text = logs.text();
+        assert!(
+            text.contains(&backup.display().to_string()),
+            "the recreate WARN must name the .bak path; got: {text}"
+        );
+    }
+
+    /// Reads a watermark straight from a redb file, skipping the schema
+    /// check that would refuse a newer store.
+    fn read_watermark_raw(path: &Path, key: &str) -> Option<WatermarkState> {
+        let db = Database::open(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(WATERMARKS).unwrap();
+        table
+            .get(key)
+            .unwrap()
+            .map(|g| serde_json::from_slice(g.value()).unwrap())
+    }
+
+    /// Every `tracing` event emitted on this thread, as text.
+    #[derive(Clone, Default)]
+    struct CapturedStateLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedStateLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedStateLogs {
+        /// A thread-local subscriber that writes here.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// #2450: a second recreate must not overwrite the first backup. With the
+    /// `.bak` already present, the open refuses and leaves both files as
+    /// they were.
+    #[test]
+    fn open_with_policy_recreate_refuses_when_backup_exists() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let found = CURRENT_SCHEMA_VERSION + 1;
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .set_watermark("cat.sch.tbl", &sample_watermark())
+                .unwrap();
+        }
+        force_schema_version(&path, &found.to_string());
+        let backup = forward_incompat_backup_path(&path, found);
+        std::fs::write(&backup, b"first backup").unwrap();
+        let state_before = std::fs::read(&path).unwrap();
+
+        let err = match StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate) {
+            Ok(_) => panic!("recreate must refuse when the .bak already exists"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StateError::SchemaMismatch { found: f, expected, .. }
+                if f == found && expected == CURRENT_SCHEMA_VERSION),
+            "got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"first backup",
+            "the existing .bak must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            state_before,
+            "the newer state file must be left in place"
+        );
+    }
+
+    /// #2450: a second recreate with a real earlier backup refuses too, so a
+    /// repeated bad open keeps both newer files.
+    #[test]
+    fn open_with_policy_recreate_twice_keeps_both_files() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let found = CURRENT_SCHEMA_VERSION + 1;
+        StateStore::open(&path).unwrap();
+        force_schema_version(&path, &found.to_string());
+        drop(StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate).unwrap());
+        let backup = forward_incompat_backup_path(&path, found);
+        let backup_before = std::fs::read(&backup).unwrap();
+
+        // A newer binary writes the file again, then the old one opens it.
+        force_schema_version(&path, &found.to_string());
+        let err = match StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate) {
+            Ok(_) => panic!("the second recreate must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StateError::SchemaMismatch { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), backup_before);
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(found));
     }
 
     #[test]

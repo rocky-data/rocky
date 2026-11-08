@@ -419,7 +419,11 @@ export type StateNamespacing = "none" | "pipeline";
 /**
  * Policy applied when the engine opens a state store whose schema version is **newer** than the binary supports (a *forward*-incompatibility).
  *
- * This is the deploy-safety knob for rolling upgrades that cross a redb schema version. During a rolling bump, pods on the *old* binary can read state written by *already-upgraded* pods through a shared tiered backend. The default ([`Recreate`][Self::Recreate]) degrades that window instead of breaking it: the old pod does one full-refresh run and succeeds, rather than stranding the orchestrated run in an hour-long retry spiral.
+ * This is the deploy-safety knob for rolling upgrades that cross a redb schema version. During a rolling bump, pods on the *old* binary can read state written by *already-upgraded* pods through a shared tiered backend. [`Recreate`][Self::Recreate] degrades that window instead of breaking it: the old pod does one full-refresh run and succeeds, rather than stranding the orchestrated run in an hour-long retry spiral.
+ *
+ * The policy has no fixed default. When `[state] on_schema_mismatch` is unset, [`StateConfig::schema_mismatch_policy`] picks one from the backend: [`Fail`][Self::Fail] on `local`, where the state file is the only copy, and [`Recreate`][Self::Recreate] on the remote and tiered backends.
+ *
+ * Neither policy deletes the newer file. `Recreate` renames it to `<file>.v{found}.bak` first, and refuses if that backup already exists.
  *
  * Only the *forward* case (on-disk newer than binary) is governed here. *Backward*-compatibility — a newer binary reading older state — always auto-migrates forward as before; there is no knob for it.
  */
@@ -2728,9 +2732,11 @@ export interface StateConfig {
    */
   namespacing?: StateNamespacing & string;
   /**
-   * What to do when the engine opens a state store whose schema version is **newer** than this binary supports (a forward-incompatibility, which happens during a rolling upgrade that crosses a redb schema version). Defaults to [`SchemaMismatchPolicy::Recreate`] — the old pod bootstraps fresh, does one full-refresh run, and never clobbers the newer shared state. Set to `fail` to keep the historical hard-abort behaviour. Only the run path honours this; inspection/branch commands still hard-fail on a forward-incompatible store. See [`SchemaMismatchPolicy`].
+   * What to do when the engine opens a state store whose schema version is **newer** than this binary supports (a forward-incompatibility, which happens during a rolling upgrade that crosses a redb schema version).
+   *
+   * Unset means the backend default, resolved by [`StateConfig::schema_mismatch_policy`]: `fail` on `local` (the state file is the only copy, so the open refuses and leaves it untouched), and `recreate` on `s3`, `gcs`, `valkey` and `tiered` (the old pod renames the newer file to `<file>.v{found}.bak`, bootstraps fresh, does one full-refresh run, and never uploads over the newer shared state). An explicit value applies on every backend, so `recreate` on `local` also renames to the `.bak`. Only the run and load paths honour this; inspection/branch commands still hard-fail on a forward-incompatible store. See [`SchemaMismatchPolicy`].
    */
-  on_schema_mismatch?: SchemaMismatchPolicy & string;
+  on_schema_mismatch?: SchemaMismatchPolicy | null;
   /**
    * What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
    */

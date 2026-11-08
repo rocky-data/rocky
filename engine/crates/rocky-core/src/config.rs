@@ -842,27 +842,37 @@ pub enum StateUploadFailureMode {
 /// This is the deploy-safety knob for rolling upgrades that cross a redb
 /// schema version. During a rolling bump, pods on the *old* binary can read
 /// state written by *already-upgraded* pods through a shared tiered backend.
-/// The default ([`Recreate`][Self::Recreate]) degrades that window instead of
-/// breaking it: the old pod does one full-refresh run and succeeds, rather than
-/// stranding the orchestrated run in an hour-long retry spiral.
+/// [`Recreate`][Self::Recreate] degrades that window instead of breaking it:
+/// the old pod does one full-refresh run and succeeds, rather than stranding
+/// the orchestrated run in an hour-long retry spiral.
+///
+/// The policy has no fixed default. When `[state] on_schema_mismatch` is
+/// unset, [`StateConfig::schema_mismatch_policy`] picks one from the backend:
+/// [`Fail`][Self::Fail] on `local`, where the state file is the only copy,
+/// and [`Recreate`][Self::Recreate] on the remote and tiered backends.
+///
+/// Neither policy deletes the newer file. `Recreate` renames it to
+/// `<file>.v{found}.bak` first, and refuses if that backup already exists.
 ///
 /// Only the *forward* case (on-disk newer than binary) is governed here.
 /// *Backward*-compatibility — a newer binary reading older state — always
 /// auto-migrates forward as before; there is no knob for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SchemaMismatchPolicy {
-    /// Treat a forward-incompatible store as cold: log a single `WARN`,
+    /// Treat a forward-incompatible store as cold: rename the newer file to
+    /// `<file>.v{found}.bak`, log a single `WARN` that names the backup,
     /// bootstrap a fresh local state, and **never write the downgraded state
     /// back** to the shared tier (so the newer state upgraded pods depend on is
-    /// left intact). The run proceeds as a full refresh. Default — it turns a
-    /// hard, run-stranding failure into a graceful one-time full refresh during
-    /// the mixed-version window of a schema-changing upgrade.
-    #[default]
+    /// left intact). The run proceeds as a full refresh. If the backup path
+    /// already exists, the open refuses as [`Fail`][Self::Fail] does, so a
+    /// second recreate never overwrites the first backup. The unset default
+    /// on the remote and tiered backends.
     Recreate,
-    /// Abort the open with a clear error (the historical behaviour).
+    /// Abort the open with a clear error and leave the file untouched.
     /// Appropriate when an operator would rather an incompatible pod fail
-    /// loudly than do a full refresh against newer shared state.
+    /// loudly than do a full refresh against newer shared state. The unset
+    /// default on the `local` backend.
     Fail,
 }
 
@@ -978,13 +988,19 @@ pub struct StateConfig {
     /// What to do when the engine opens a state store whose schema version is
     /// **newer** than this binary supports (a forward-incompatibility, which
     /// happens during a rolling upgrade that crosses a redb schema version).
-    /// Defaults to [`SchemaMismatchPolicy::Recreate`] — the old pod bootstraps
-    /// fresh, does one full-refresh run, and never clobbers the newer shared
-    /// state. Set to `fail` to keep the historical hard-abort behaviour. Only
-    /// the run path honours this; inspection/branch commands still hard-fail on
-    /// a forward-incompatible store. See [`SchemaMismatchPolicy`].
+    ///
+    /// Unset means the backend default, resolved by
+    /// [`StateConfig::schema_mismatch_policy`]: `fail` on `local` (the state
+    /// file is the only copy, so the open refuses and leaves it untouched),
+    /// and `recreate` on `s3`, `gcs`, `valkey` and `tiered` (the old pod
+    /// renames the newer file to `<file>.v{found}.bak`, bootstraps fresh, does
+    /// one full-refresh run, and never uploads over the newer shared state).
+    /// An explicit value applies on every backend, so `recreate` on `local`
+    /// also renames to the `.bak`. Only the run and load paths honour this;
+    /// inspection/branch commands still hard-fail on a forward-incompatible
+    /// store. See [`SchemaMismatchPolicy`].
     #[serde(default)]
-    pub on_schema_mismatch: SchemaMismatchPolicy,
+    pub on_schema_mismatch: Option<SchemaMismatchPolicy>,
     /// Enable writing durable freeze/unfreeze marker objects (under
     /// `<prefix>/freeze/` and `<prefix>/unfreeze/`, beside the remote state
     /// file) when `rocky policy freeze` / `unfreeze` run against an
@@ -1032,9 +1048,33 @@ impl Default for StateConfig {
             idempotency: IdempotencyConfig::default(),
             retention: crate::retention::StateRetentionConfig::default(),
             namespacing: StateNamespacing::default(),
-            on_schema_mismatch: SchemaMismatchPolicy::default(),
+            on_schema_mismatch: None,
             freeze_marker_writes: false,
             concurrency_control: None,
+        }
+    }
+}
+
+impl StateConfig {
+    /// The forward-incompatibility policy this config resolves to.
+    ///
+    /// An explicit `on_schema_mismatch` wins on every backend. When it is
+    /// unset, `local` resolves to [`SchemaMismatchPolicy::Fail`], because the
+    /// local file is the only copy of the state. The remote and tiered
+    /// backends resolve to [`SchemaMismatchPolicy::Recreate`], which keeps the
+    /// newer file as a `.bak` and never uploads the fresh store.
+    ///
+    /// Every caller of [`crate::state::StateStore::open_with_policy`] that
+    /// reads `[state]` must go through this method.
+    pub fn schema_mismatch_policy(&self) -> SchemaMismatchPolicy {
+        if let Some(policy) = self.on_schema_mismatch {
+            return policy;
+        }
+        match self.backend {
+            StateBackend::Local => SchemaMismatchPolicy::Fail,
+            StateBackend::S3 | StateBackend::Gcs | StateBackend::Valkey | StateBackend::Tiered => {
+                SchemaMismatchPolicy::Recreate
+            }
         }
     }
 }
@@ -10649,6 +10689,42 @@ token = "pat"
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].name, "ROCKY_TEST_UNSET_WITH_DEFAULT");
         assert_eq!(report[0].value, "30");
+    }
+
+    /// #2450: an unset `on_schema_mismatch` refuses on `local` (the file is
+    /// the only copy) and recreates on the remote and tiered backends. An
+    /// explicit value wins on every backend.
+    #[test]
+    fn schema_mismatch_policy_defaults_by_backend() {
+        let resolve = |text: &str| {
+            toml::from_str::<StateConfig>(text)
+                .expect("parse [state]")
+                .schema_mismatch_policy()
+        };
+        assert_eq!(resolve(""), SchemaMismatchPolicy::Fail);
+        assert_eq!(resolve("backend = \"local\""), SchemaMismatchPolicy::Fail);
+        for backend in ["s3", "gcs", "valkey", "tiered"] {
+            assert_eq!(
+                resolve(&format!("backend = \"{backend}\"")),
+                SchemaMismatchPolicy::Recreate,
+                "unset on {backend}"
+            );
+            assert_eq!(
+                resolve(&format!(
+                    "backend = \"{backend}\"\non_schema_mismatch = \"fail\""
+                )),
+                SchemaMismatchPolicy::Fail,
+                "explicit fail on {backend}"
+            );
+        }
+        assert_eq!(
+            resolve("backend = \"local\"\non_schema_mismatch = \"recreate\""),
+            SchemaMismatchPolicy::Recreate
+        );
+        assert_eq!(
+            StateConfig::default().schema_mismatch_policy(),
+            SchemaMismatchPolicy::Fail
+        );
     }
 
     #[test]

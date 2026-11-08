@@ -185,6 +185,20 @@ max_retries = 0
             models_dir,
         }
     }
+
+    /// The same project on `[state] backend = "local"`, with `extra` lines
+    /// appended to the `[state]` table.
+    fn local(model_sql: &str, extra: &str) -> Self {
+        let project = Self::new(model_sql);
+        let text = std::fs::read_to_string(&project.config_path).expect("read rocky.toml");
+        let head = text.split("[state]").next().expect("text before [state]");
+        std::fs::write(
+            &project.config_path,
+            format!("{head}[state]\nbackend = \"local\"\n{extra}\n"),
+        )
+        .expect("rewrite rocky.toml");
+        project
+    }
 }
 
 /// Drive the real `commands::run` (ungoverned). `model` selects the
@@ -1239,6 +1253,16 @@ async fn transformation_forward_incompat_recreate_proceeds_and_suppresses_upload
          reachable, not vacuously skipped)"
     );
 
+    // #2450: with the policy unset on a remote backend, the recreate keeps
+    // the newer local file as a `.bak` instead of deleting it.
+    let backup =
+        rocky_core::state::forward_incompat_backup_path(&project.state_path, future_version);
+    assert_eq!(
+        StateStore::peek_schema_version(&backup).expect("peek .bak version"),
+        Some(future_version),
+        "the recreate must keep the newer file as <file>.v{{found}}.bak"
+    );
+
     // The no-clobber end state: a fresh pod still restores the NEWER blob.
     let _authority = harness
         .download(&harness.pod_b)
@@ -1248,5 +1272,60 @@ async fn transformation_forward_incompat_recreate_proceeds_and_suppresses_upload
         StateStore::peek_schema_version(&harness.pod_b.state_path).expect("peek pod B version"),
         Some(future_version),
         "the shared remote must still carry the newer pod's state, not a downgraded blob"
+    );
+}
+
+/// #2450: on `backend = "local"` the state file is the only copy, so an
+/// older binary with `on_schema_mismatch` unset refuses a newer file and
+/// leaves it untouched. Before the fix the default recreate deleted it.
+#[tokio::test]
+async fn local_forward_incompat_unset_policy_refuses_and_keeps_file() {
+    let _serial = remote_testing::serial_guard();
+    let project = ModelProject::local("SELECT 1 AS id\n", "");
+    let future_version = rocky_core::state::current_schema_version() + 1;
+    rocky_core::state::force_schema_version(&project.state_path, &future_version.to_string());
+    let before = std::fs::read(&project.state_path).expect("read state file");
+
+    let err = drive_run(&project, None, None)
+        .await
+        .expect_err("a local-backend run must refuse a newer state file by default");
+    assert!(
+        format!("{err:#}").contains(&format!("v{future_version}")),
+        "the refusal must name the newer version; got: {err:#}"
+    );
+    assert_eq!(
+        std::fs::read(&project.state_path).expect("read state file"),
+        before,
+        "the newer state file must be left untouched"
+    );
+    let backup =
+        rocky_core::state::forward_incompat_backup_path(&project.state_path, future_version);
+    assert!(!backup.exists(), "a refusal must not move the file");
+}
+
+/// #2450: an explicit `on_schema_mismatch = "recreate"` on the local backend
+/// still recreates, but moves the newer file to its `.bak` first.
+#[tokio::test]
+async fn local_forward_incompat_explicit_recreate_keeps_backup() {
+    let _serial = remote_testing::serial_guard();
+    let project = ModelProject::local("SELECT 1 AS id\n", "on_schema_mismatch = \"recreate\"");
+    let future_version = rocky_core::state::current_schema_version() + 1;
+    rocky_core::state::force_schema_version(&project.state_path, &future_version.to_string());
+
+    drive_run(&project, None, None)
+        .await
+        .expect("an explicit recreate proceeds as a full refresh");
+
+    assert_eq!(
+        StateStore::peek_schema_version(&project.state_path).expect("peek recreated version"),
+        Some(rocky_core::state::current_schema_version()),
+        "the run must have recreated the store"
+    );
+    let backup =
+        rocky_core::state::forward_incompat_backup_path(&project.state_path, future_version);
+    assert_eq!(
+        StateStore::peek_schema_version(&backup).expect("peek .bak version"),
+        Some(future_version),
+        "the recreate must keep the newer file as <file>.v{{found}}.bak"
     );
 }
