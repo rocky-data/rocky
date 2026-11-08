@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The generated types now come from `datamodel-code-generator` 0.91 (was below 0.84). The only change: `HealthCheck.details` is now `list[Detail]`, where `Detail` is a `list[str]` of exactly two items. A `details` row with any other length now fails validation. The dev dependency is pinned to `>=0.91.0,<0.92`.
+
 ## [0.30.0] — 2026-11-07
 
 ### Added

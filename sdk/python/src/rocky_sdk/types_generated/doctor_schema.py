@@ -4,8 +4,14 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, Field, conint
+from typing_extensions import TypeAliasType
+
+Detail = TypeAliasType(
+    "Detail", Annotated[list[str], Field(max_length=2, min_length=2)]
+)
 
 
 class HealthStatus(StrEnum):
@@ -23,7 +29,7 @@ class HealthCheck(BaseModel):
     A single health check result.
     """
 
-    details: list[list[str]] | None = None
+    details: list[Detail] | None = None
     duration_ms: conint(ge=0)
     message: str
     name: str
