@@ -320,6 +320,13 @@
           },
           "type": "array"
         },
+        "breach_events_skipped": {
+          "description": "Why `breach_events` was not computed, when it was not: the month has more production runs than the report replays (the reason gives both counts). `budget` is still checked. Absent otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "budget": {
           "anyOf": [
             {

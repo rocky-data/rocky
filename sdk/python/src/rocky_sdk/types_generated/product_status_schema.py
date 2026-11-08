@@ -503,6 +503,10 @@ class ProductMonthCost(BaseModel):
     """
     Each time this month the product went over its budget, in run order. Found by checking the budget again after each production run of the month. A product that goes over, back under and over again has two events. An event is never withdrawn, even when a later run moves the product back under. Empty (and omitted) when there was none.
     """
+    breach_events_skipped: str | None = None
+    """
+    Why `breach_events` was not computed, when it was not: the month has more production runs than the report replays (the reason gives both counts). `budget` is still checked. Absent otherwise.
+    """
     budget: ProductBudgetStatus | None = None
     """
     The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget.

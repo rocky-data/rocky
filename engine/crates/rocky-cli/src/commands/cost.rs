@@ -1039,6 +1039,21 @@ impl MonthInputs {
             .filter(|b| !b.is_empty())
     }
 
+    /// The executions the full replay splits: for each replay step, every
+    /// execution in the runs up to it. This, not the number of runs, is what
+    /// the replay costs.
+    fn replay_work(&self) -> usize {
+        let mut prefix = 0usize;
+        let mut work = 0usize;
+        for run in &self.runs {
+            prefix = prefix.saturating_add(run.models_executed.len());
+            if self.is_step(run) {
+                work = work.saturating_add(prefix);
+            }
+        }
+        work
+    }
+
     /// Whether `run` is a replay step: a production run with an execution
     /// that started inside the month.
     fn is_step(&self, run: &RunRecord) -> bool {
@@ -1371,13 +1386,14 @@ struct StepCheck {
     earlier_splits: usize,
 }
 
-/// The most production runs in a month for which the monthly report
-/// (`rocky cost --month`, and `cost_month` on `rocky product status`) lists
-/// breach events. Listing them splits the month once per production run, so
-/// the work grows with the square of the runs: about 3 s for 720 runs of 21
-/// models in a release build. Above this, the report skips the replay and
-/// says so.
-pub(crate) const MAX_REPLAY_RUNS: usize = 750;
+/// The most replay work for which the monthly report (`rocky cost --month`,
+/// and `cost_month` on `rocky product status`) lists breach events, counted
+/// as executions split (see `MonthInputs::replay_work`). Listing them splits
+/// the month once per production run, so the work grows with the square of
+/// the runs and with the executions in each. This cap is 750 runs of 21
+/// executions each (about 3 s in a release build); a month of hourly runs of
+/// about 20 models fits. Above it, the report skips the replay and says so.
+pub(crate) const MAX_REPLAY_WORK: usize = 750 * 751 / 2 * 21;
 
 /// The most earlier runs the end-of-run check splits to find a breached
 /// product's last verdict. Earlier runs are `not_evaluated` only while the
@@ -1408,7 +1424,7 @@ pub fn compute_month_cost(
 ) -> Result<ProductMonthCostOutput> {
     let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    compute_month_cost_in(&store, config_path, month, now, MAX_REPLAY_RUNS)
+    compute_month_cost_in(&store, config_path, month, now, MAX_REPLAY_WORK)
 }
 
 /// [`compute_month_cost`] over a store the caller already holds open, listing
@@ -1445,12 +1461,15 @@ fn compute_month_cost_in(
         }
         let steps = inputs.runs.iter().filter(|run| inputs.is_step(run)).count();
         budget_status = evaluate_budgets(&inputs, budgets, &split, steps > 0);
-        if steps <= replay_cap {
+        let work = inputs.replay_work();
+        if work <= replay_cap {
             breach_events = replay_breach_events(&inputs, budgets)?;
-        } else {
+        } else if inputs.history_complete {
+            // With history incomplete there are no events to list anyway.
             let reason = format!(
-                "breach events are not listed: this month has {steps} production runs, more \
-                 than the {replay_cap} the report replays"
+                "breach events are not listed: replaying this month's {steps} production \
+                 runs would split {work} executions, more than the {replay_cap} the report \
+                 replays"
             );
             budget_warnings.push(reason.clone());
             events_skipped = Some(reason);
@@ -1625,8 +1644,9 @@ pub fn product_budgets_after_run(
         let Some(budgets) = inputs.budgets() else {
             continue;
         };
-        // The record is in the scan, so the verdict is the one as of this
-        // run's finish, from the same split that decides its event.
+        // The verdict is the one as of this run's finish, from the same split
+        // that decides its event. A run the scan does not hold (it started
+        // more than a day before the month) gets no entry for the month.
         let Some(index) = inputs.runs.iter().position(|run| run.run_id == run_id) else {
             continue;
         };
@@ -3480,9 +3500,10 @@ mod tests {
         assert_eq!(month_containing(early, "Not/AZone"), None);
     }
 
-    /// The report lists breach events only up to the replay cap: at the cap
-    /// it replays, one run over it skips the replay, says why with both
-    /// counts, and still checks the budget.
+    /// The report lists breach events only up to the replay cap, counted as
+    /// executions split: three runs of one execution each split 1 + 2 + 3 =
+    /// 6. At the cap it replays; one over it skips the replay, says why with
+    /// the counts, and still checks the budget.
     #[test]
     fn the_report_replays_breach_events_only_up_to_the_cap() {
         let dir = TempDir::new().unwrap();
@@ -3492,19 +3513,20 @@ mod tests {
         let now = at(2026, 11, 2, 0, 0);
         let report = |cap| compute_month_cost_in(&store, &config, "2026-10", now, cap).unwrap();
 
-        let at_cap = report(3);
+        let at_cap = report(6);
         assert_eq!(event_runs(&at_cap, "revenue_daily"), ["run-1", "run-3"]);
         assert_eq!(
             budget_of(&at_cap, "revenue_daily").breach_events_skipped,
             None
         );
 
-        let over = report(2);
+        let over = report(5);
         let product = budget_of(&over, "revenue_daily");
         assert!(product.breach_events.is_empty());
         let reason = product.breach_events_skipped.as_deref().expect("a reason");
         assert!(reason.contains("3 production runs"), "{reason}");
-        assert!(reason.contains("the 2 the report replays"), "{reason}");
+        assert!(reason.contains("split 6 executions"), "{reason}");
+        assert!(reason.contains("the 5 the report replays"), "{reason}");
         assert!(
             over.warnings.iter().any(|w| w == reason),
             "{:?}",
@@ -3516,8 +3538,8 @@ mod tests {
         );
         // A product without a budget carries no reason.
         assert_eq!(budget_of(&over, "ltv").breach_events_skipped, None);
-        // The shipped cap: an hourly schedule over a 31-day month fits.
-        assert!(MAX_REPLAY_RUNS >= 31 * 24);
+        // The shipped cap: hourly runs of 20 executions over a 31-day month fit.
+        const { assert!(MAX_REPLAY_WORK >= 20 * (31 * 24) * (31 * 24 + 1) / 2) };
     }
 
     /// The end-of-run check splits at most `MAX_WALK_BACK_STEPS` earlier runs,
@@ -3569,11 +3591,11 @@ mod tests {
             &config,
             "2026-10",
             at(2026, 11, 2, 0, 0),
-            MAX_REPLAY_RUNS,
+            MAX_REPLAY_WORK,
         )
         .unwrap();
         assert_eq!(event_runs(&report, "revenue_daily"), ["build"]);
-        assert!(MAX_WALK_BACK_STEPS <= 8);
+        const { assert!(MAX_WALK_BACK_STEPS <= 8) };
     }
 
     /// The end-of-run verdict is the replay's verdict at that run: the same

@@ -158,6 +158,10 @@ export interface ProductMonthCost {
    */
   breach_events?: ProductBudgetBreachEvent[];
   /**
+   * Why `breach_events` was not computed, when it was not: the month has more production runs than the report replays (the reason gives both counts). `budget` is still checked. Absent otherwise.
+   */
+  breach_events_skipped?: string | null;
+  /**
    * The product's `[product_budget.<name>]` checked against `charged`, as of this report. Absent when the product has no budget.
    */
   budget?: ProductBudgetStatus | null;
