@@ -28118,6 +28118,7 @@ backend = "local"
 [pipeline.t]
 type = "transformation"
 models = "models_nonexistent/**"
+allow_empty_models = true
 
 [pipeline.t.target]
 adapter = "default"
@@ -28918,6 +28919,7 @@ backend = "local"
 [pipeline.t]
 type = "transformation"
 models = "models_nonexistent/**"
+allow_empty_models = true
 
 [pipeline.t.target]
 adapter = "default"

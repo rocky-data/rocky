@@ -1986,6 +1986,10 @@ export interface WorkspaceBindingConfig {
  */
 export interface TransformationPipelineConfig {
   /**
+   * Allow `rocky run` to succeed when the models directory does not exist. Default `false`: a missing models directory fails the run and is a `rocky validate` error, so a moved or mistyped directory is not a silent no-op. Set `true` for a pipeline that has no models on purpose, for example one that only loads seeds. An existing directory with no models still fails either way.
+   */
+  allow_empty_models?: boolean;
+  /**
    * Data quality checks run after model execution.
    */
   checks?: ChecksConfig;

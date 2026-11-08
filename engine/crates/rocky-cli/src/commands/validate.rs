@@ -637,7 +637,7 @@ fn validate_products(config_path: &Path, out: &mut ValidateOutput) {
 /// hold a models directory keeps reporting exactly what it reported before. The
 /// fallback deliberately does not fire for a project whose declared directory is
 /// merely missing: reporting a model count from a directory no pipeline names
-/// would contradict the V025 warning raised for the one that is absent.
+/// would contradict the V025 error raised for the one that is absent.
 ///
 /// A glob escaping the project root is skipped rather than propagated: the
 /// per-pipeline check already reports that same glob as a V047 error in this
@@ -1814,18 +1814,25 @@ fn validate_transformation_pipeline(
     // an empty project (#1268).
     match crate::models_loader::locate_models_dir(&pipeline.models, config_path) {
         Ok(crate::models_loader::ModelsDir::Present(_)) => {}
-        Ok(crate::models_loader::ModelsDir::Absent(path)) => {
+        // `rocky run` fails on a missing models directory unless the pipeline
+        // sets `allow_empty_models = true`, so validate reports the same
+        // verdict: an error without the key, and nothing with it.
+        Ok(crate::models_loader::ModelsDir::Absent(path)) if !pipeline.allow_empty_models => {
+            ok = false;
             msgs.push(ValidateMessage {
-                severity: "warn".into(),
+                severity: "error".into(),
                 code: "V025".into(),
                 message: format!(
-                    "pipeline.{name}: models directory '{}' does not exist",
+                    "pipeline.{name}: models directory '{}' does not exist. Fix the `models` \
+                     glob, or set `allow_empty_models = true` under `[pipeline.{name}]` if \
+                     this pipeline has no models on purpose",
                     path.display()
                 ),
                 file: None,
                 field: Some(format!("pipeline.{name}.models")),
             });
         }
+        Ok(crate::models_loader::ModelsDir::Absent(_)) => {}
         // A glob resolving outside the project root is a config error, not a
         // missing directory. `run` refuses to execute it and `scope` refuses to
         // resolve managed tables from it; before this, `validate` reported the
@@ -2571,6 +2578,7 @@ schema_template = "s__{source}"
 type = "duckdb"
 [pipeline.raw]
 type = "transformation"
+allow_empty_models = true
 [pipeline.raw.target]
 adapter = "db"
 "#;
@@ -3355,6 +3363,55 @@ table = "orders"
         assert!(!out.valid);
     }
 
+    /// A missing models directory is a V025 error, matching `rocky run`,
+    /// which now fails on it. The message names the opt-in key.
+    #[test]
+    fn missing_models_dir_is_a_v025_error() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+"#,
+        );
+        let v025: Vec<_> = out.messages.iter().filter(|m| m.code == "V025").collect();
+        assert_eq!(v025.len(), 1, "{:?}", out.messages);
+        assert_eq!(v025[0].severity, "error");
+        assert!(
+            v025[0].message.contains("allow_empty_models = true")
+                && v025[0].message.contains("[pipeline.raw]"),
+            "the message names the opt-in key: {}",
+            v025[0].message
+        );
+        assert!(!out.valid, "a missing models directory fails validate");
+    }
+
+    /// With `allow_empty_models = true` a missing models directory is not
+    /// reported, and validate passes.
+    #[test]
+    fn missing_models_dir_with_the_opt_in_is_valid() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+allow_empty_models = true
+[pipeline.raw.target]
+adapter = "db"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V025"),
+            "{:?}",
+            out.messages
+        );
+        assert!(out.valid, "{:?}", out.messages);
+    }
+
     #[test]
     fn schedule_inert_block_is_v040_warning() {
         let out = validate_toml(
@@ -3363,6 +3420,7 @@ table = "orders"
 type = "duckdb"
 [pipeline.raw]
 type = "transformation"
+allow_empty_models = true
 [pipeline.raw.target]
 adapter = "db"
 [pipeline.raw.schedule]
@@ -3396,6 +3454,7 @@ adapter = "db"
 enabled = true
 [pipeline.staging]
 type = "transformation"
+allow_empty_models = true
 [pipeline.staging.target]
 adapter = "db"
 [pipeline.staging.schedule]
@@ -3423,6 +3482,7 @@ expected_lag_seconds = 3600
 type = "duckdb"
 [pipeline.raw]
 type = "transformation"
+allow_empty_models = true
 [pipeline.raw.target]
 adapter = "db"
 [pipeline.raw.schedule]
@@ -3443,6 +3503,7 @@ freshness = true
 type = "duckdb"
 [pipeline.raw]
 type = "transformation"
+allow_empty_models = true
 [pipeline.raw.target]
 adapter = "db"
 [pipeline.raw.schedule]
@@ -4411,6 +4472,7 @@ path = ":memory:"
 
 [pipeline.xf]
 type = "transformation"
+allow_empty_models = true
 
 [pipeline.xf.target]
 adapter = "default"
