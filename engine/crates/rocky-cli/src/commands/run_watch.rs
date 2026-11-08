@@ -130,6 +130,7 @@ pub async fn run_watch(
 
     let config_filename_for_filter = config_filename.clone();
     let config_dir_for_filter = config_dir.clone();
+    let roots_for_filter = watch_set.model_roots.clone();
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
             Ok(event) => {
@@ -142,10 +143,11 @@ pub async fn run_watch(
                     return;
                 }
                 for p in event.paths {
-                    if event_path_is_relevant(
+                    if event_triggers_rerun(
                         &p,
                         &config_dir_for_filter,
                         &config_filename_for_filter,
+                        &roots_for_filter,
                     ) {
                         // Drop on full: the debounce loop will pick up
                         // any later event in the same burst anyway.
@@ -161,20 +163,36 @@ pub async fn run_watch(
     // Watching recursively here would double-up with the models-dir watch
     // and produce duplicate events for every model edit. The one exception
     // is a default models base that IS the config dir: then the config dir
-    // is watched once, recursively, and covers both.
-    let config_dir_mode = if watch_set.config_dir_recursive {
-        RecursiveMode::Recursive
-    } else {
-        RecursiveMode::NonRecursive
-    };
-    watcher
-        .watch(&config_dir, config_dir_mode)
-        .with_context(|| format!("failed to watch config dir: {}", config_dir.display()))?;
-
-    for m in &watch_set.model_roots {
-        watcher
-            .watch(m, RecursiveMode::Recursive)
-            .with_context(|| format!("failed to watch models dir: {}", m.display()))?;
+    // is watched once, recursively, and covers both. A recursive watch of the
+    // config dir that fails (on Linux, the inotify watch limit on a large
+    // project) falls back to the non-recursive config watch instead of
+    // refusing to start: the config still re-runs, model edits do not.
+    let mut config_dir_recursive = watch_set.config_dir_recursive;
+    for (dir, mode) in watch_registrations(&config_dir, &watch_set) {
+        let is_config_dir = dir == config_dir;
+        match watcher.watch(&dir, mode) {
+            Ok(()) => {}
+            Err(e) if is_config_dir && mode == RecursiveMode::Recursive => {
+                warn!(
+                    error = %e,
+                    dir = %dir.display(),
+                    "cannot watch the config dir recursively; watching rocky.toml only, \
+                     so a model edit does not re-run"
+                );
+                config_dir_recursive = false;
+                watcher
+                    .watch(&dir, RecursiveMode::NonRecursive)
+                    .with_context(|| format!("failed to watch config dir: {}", dir.display()))?;
+            }
+            Err(e) if is_config_dir => {
+                return Err(e)
+                    .with_context(|| format!("failed to watch config dir: {}", dir.display()));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to watch models dir: {}", dir.display()));
+            }
+        }
     }
 
     // Honour the newline-delimited-stream contract: each iteration's
@@ -188,11 +206,7 @@ pub async fn run_watch(
     // Banner — stderr, never stdout. The non-JSON case still prints a
     // human summary per iteration on stdout via the inner `run`.
     let watched: Vec<String> = std::iter::once(config_path_abs.display().to_string())
-        .chain(
-            watch_set
-                .config_dir_recursive
-                .then(|| config_dir.display().to_string()),
-        )
+        .chain(config_dir_recursive.then(|| config_dir.display().to_string()))
         .chain(
             watch_set
                 .model_roots
@@ -935,6 +949,9 @@ fn dedupe_watch_roots(config_dir: &Path, mut roots: Vec<PathBuf>) -> WatchSet {
 ///    `.sql` / `.rocky` / `.toml`. The recursive notify watcher already
 ///    scopes by directory, so we only need to filter extensions and
 ///    skip dotfiles / state-store artefacts.
+///
+/// The filter checks names only: a run that writes a `.sql`, `.rocky` or
+/// `.toml` file inside a watched directory would re-run itself in a loop.
 fn event_path_is_relevant(
     path: &Path,
     config_dir: &Path,
@@ -964,6 +981,70 @@ fn event_path_is_relevant(
         path.extension().and_then(|e| e.to_str()),
         Some("sql" | "rocky" | "toml")
     )
+}
+
+/// Whether an event re-runs the pipeline: [`event_path_is_relevant`], and
+/// not under a directory [`under_ignored_dir`] skips.
+fn event_triggers_rerun(
+    path: &Path,
+    config_dir: &Path,
+    config_filename: &std::ffi::OsStr,
+    watched_roots: &[PathBuf],
+) -> bool {
+    !under_ignored_dir(path, config_dir, watched_roots)
+        && event_path_is_relevant(path, config_dir, config_filename)
+}
+
+/// Whether `path` sits below a directory no model lives in: one whose name
+/// starts with `.` (`.git`, `.venv`), or is `target` or `node_modules`.
+///
+/// Only the components between the watched directory that holds `path` (the
+/// deepest of `config_dir` and `watched_roots`) and the file itself are
+/// checked, so a watched directory may itself be named that way. A recursive
+/// watch of the project root sees all of these; without this, a
+/// `pyproject.toml` or a vendored `Cargo.toml` anywhere would re-run.
+fn under_ignored_dir(path: &Path, config_dir: &Path, watched_roots: &[PathBuf]) -> bool {
+    let Some(base) = std::iter::once(config_dir)
+        .chain(watched_roots.iter().map(PathBuf::as_path))
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+    else {
+        return false;
+    };
+    let Ok(relative) = path.strip_prefix(base) else {
+        return false;
+    };
+    let Some(parent) = relative.parent() else {
+        return false;
+    };
+    parent.components().any(|component| match component {
+        std::path::Component::Normal(name) => name
+            .to_str()
+            .is_some_and(|n| n.starts_with('.') || n == "target" || n == "node_modules"),
+        std::path::Component::Prefix(_)
+        | std::path::Component::RootDir
+        | std::path::Component::CurDir
+        | std::path::Component::ParentDir => false,
+    })
+}
+
+/// The `(directory, mode)` pairs the watcher registers for `watch_set`: the
+/// config directory first (recursive only when a models base is that
+/// directory), then each models directory recursively.
+fn watch_registrations(config_dir: &Path, watch_set: &WatchSet) -> Vec<(PathBuf, RecursiveMode)> {
+    let config_dir_mode = if watch_set.config_dir_recursive {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    };
+    std::iter::once((config_dir.to_path_buf(), config_dir_mode))
+        .chain(
+            watch_set
+                .model_roots
+                .iter()
+                .map(|root| (root.clone(), RecursiveMode::Recursive)),
+        )
+        .collect()
 }
 
 #[cfg(test)]
@@ -1136,6 +1217,77 @@ mod tests {
         assert_eq!(
             resolve_watch_set(None, &config, &root, None).unwrap(),
             default_watch_set(&config, &root, None)
+        );
+    }
+
+    /// A recursive watch of the project root ignores files under `.git/`,
+    /// `.venv/`, `target/` and `node_modules/`, at any depth, but still
+    /// accepts a model under the root. A watched directory may itself carry
+    /// such a name: only components below it are checked.
+    #[test]
+    fn rerun_filter_ignores_tool_and_hidden_dirs() {
+        let root = PathBuf::from("/proj");
+        let name = std::ffi::OsString::from("rocky.toml");
+        let roots = vec![
+            PathBuf::from("/proj/models"),
+            PathBuf::from("/proj/.models"),
+            PathBuf::from("/srv/target"),
+        ];
+        let triggers = |p: &str| event_triggers_rerun(&PathBuf::from(p), &root, &name, &roots);
+        for ignored in [
+            "/proj/.git/config.toml",
+            "/proj/.venv/lib/pyproject.toml",
+            "/proj/target/debug/build/Cargo.toml",
+            "/proj/node_modules/pkg/x.sql",
+            "/proj/vendor/node_modules/pkg/x.sql",
+            "/proj/models/.cache/a.sql",
+            "/srv/target/sub/target/a.sql",
+        ] {
+            assert!(!triggers(ignored), "{ignored} must not re-run");
+        }
+        for accepted in [
+            "/proj/rocky.toml",
+            "/proj/a.sql",
+            "/proj/models/a.sql",
+            "/proj/models/staging/a.toml",
+            "/srv/target/a.sql",
+            "/srv/target/sub/a.rocky",
+            // A watched root inside the config dir is the base, not the
+            // config dir, so its own leading `.` is not checked.
+            "/proj/.models/a.sql",
+        ] {
+            assert!(triggers(accepted), "{accepted} must re-run");
+        }
+    }
+
+    /// The watcher registers the config dir first, non-recursively unless a
+    /// models base is that directory, then each models root recursively.
+    #[test]
+    fn watch_registrations_match_the_watch_set() {
+        let root = PathBuf::from("/proj");
+        assert_eq!(
+            watch_registrations(
+                &root,
+                &WatchSet {
+                    config_dir_recursive: false,
+                    model_roots: vec![root.join("models"), root.join("reporting")],
+                }
+            ),
+            vec![
+                (root.clone(), RecursiveMode::NonRecursive),
+                (root.join("models"), RecursiveMode::Recursive),
+                (root.join("reporting"), RecursiveMode::Recursive),
+            ]
+        );
+        assert_eq!(
+            watch_registrations(
+                &root,
+                &WatchSet {
+                    config_dir_recursive: true,
+                    model_roots: Vec::new(),
+                }
+            ),
+            vec![(root.clone(), RecursiveMode::Recursive)]
         );
     }
 
