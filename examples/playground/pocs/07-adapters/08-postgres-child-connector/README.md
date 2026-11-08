@@ -16,7 +16,7 @@
 | Rows with a NULL cursor value are skipped for good. | Make the cursor column `NOT NULL`. |
 | Delivery is at least once. | A crash between the promote and the state commit loads a batch twice. Deduplicate downstream on a key. |
 | Each run scans the whole source table. | The bounds compare `epoch_us(...)` integers, so DuckDB does not push the filter to Postgres. Fine for a demo; add an index-friendly filter for large tables. |
-| Python 3.8 or newer, standard library only. | `main.py` imports nothing outside the standard library. That is why the settings file is `source.json`, not TOML (`tomllib` needs 3.11). |
+| Python 3.8 or newer, standard library only. | `main.py` imports nothing outside the standard library. It reads its settings from `options.json`, which Rocky writes from `[connector.pg_events.options]`. |
 | It needs the standalone `duckdb` CLI on `PATH`. | `main.py` runs all SQL through it, with the DuckDB `postgres` extension. |
 | Egress: `extensions.duckdb.org` and your Postgres host. | The manifest declares only `extensions.duckdb.org`, the one fixed host. Rocky does not enforce the list. |
 
@@ -61,18 +61,17 @@ Rocky replaces a secret value of 8 bytes or more with `${NAME}` in its logs. Sho
 ```
 .
 ├── README.md              this file
-├── rocky.toml             DuckDB target + [connector.pg_events] with the PG* secrets
+├── rocky.toml             DuckDB target + [connector.pg_events] with the PG* secrets and the options
 ├── docker-compose.yml     postgres:16-alpine, seeded from seed.sql
 ├── seed.sql               public.events, 20 rows, distinct created_at values
 ├── run.sh                 validate → compose up → 3 loads with asserts → password grep → compose down
 └── connector/
     ├── connector.toml     manifest: command = ["./main.py"], state_schema_version = 1
     ├── main.py            the connector (Python 3.8+, stdlib only)
-    ├── source.json        schema, table, cursor_column, optional extension_directory
     └── .gitignore         ignores .duckdb-extensions/, the extension cache
 ```
 
-`main.py` finds `source.json` next to itself. The DuckDB extension cache defaults to `connector/.duckdb-extensions/`, also next to `main.py`. The program's `HOME` is a new scratch directory on every run, so a cache there would download the extension every time.
+The settings are in `[connector.pg_events.options]` in `rocky.toml`: `schema`, `table`, `cursor_column` and an optional `extension_directory`. Rocky writes the table as JSON to `options.json` in the scratch directory and passes its path as `options_path` in the request. The options are not secrets: the file is on disk in clear. The DuckDB extension cache defaults to `connector/.duckdb-extensions/`, also next to `main.py`. The program's `HOME` is a new scratch directory on every run, so a cache there would download the extension every time.
 
 ## Prerequisites
 
@@ -90,7 +89,7 @@ Rocky replaces a secret value of 8 bytes or more with `${NAME}` in its logs. Sho
 
 When Docker is absent, `run.sh` runs `rocky validate` and exits 0 with a SKIP message. Set `REQUIRE_DOCKER=1` to make that a failure.
 
-To point the connector at your own Postgres, export `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE`, edit `connector/source.json`, and run `rocky load --connector pg_events`. Do not run `run.sh` against your own database: it inserts rows.
+To point the connector at your own Postgres, export `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE`, edit `[connector.pg_events.options]` in `rocky.toml`, and run `rocky load --connector pg_events`. Do not run `run.sh` against your own database: it inserts rows.
 
 ## Expected output
 

@@ -19200,6 +19200,158 @@ target = { catalog = "raw", schema = "stripe", table = "charges" }
         assert!(errors(&body)[0].contains("HOME"));
     }
 
+    /// `[connector.demo.options]` whose JSON form is exactly `bytes` long:
+    /// `{"pad":"…"}` is 10 bytes plus the padding.
+    fn options_of_size(bytes: usize) -> String {
+        format!(
+            "{GOOD}\n[connector.stripe_charges.options]\npad = \"{}\"\n",
+            "x".repeat(bytes - 10)
+        )
+    }
+
+    #[test]
+    fn an_options_table_of_64_kib_passes_and_one_byte_more_is_refused() {
+        let at_cap = parse(&options_of_size(crate::connector::MAX_OPTIONS_BYTES));
+        assert_eq!(
+            at_cap.connectors["stripe_charges"]
+                .options
+                .to_json_bytes()
+                .len(),
+            65_536
+        );
+        assert!(validate_connectors(&at_cap).is_empty());
+
+        let errs = errors(&options_of_size(crate::connector::MAX_OPTIONS_BYTES + 1));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("[connector.stripe_charges]"), "{errs:?}");
+        assert!(errs[0].contains("options is 65537 bytes"), "{errs:?}");
+    }
+
+    #[test]
+    fn an_absent_options_table_serializes_no_options_key() {
+        let config = parse(GOOD);
+        assert!(config.connectors["stripe_charges"].options.is_empty());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("options"), "{json}");
+    }
+
+    #[test]
+    fn an_option_substituted_from_the_environment_is_refused() {
+        let name = "ROCKY_TEST_CONNECTOR_OPTION_SECRET";
+        let value = "rocky-connector-option-secret-3f9a1c";
+        // SAFETY: a unique variable name no other test reads or writes.
+        unsafe { std::env::set_var(name, value) };
+        let body = format!(
+            "{GOOD}\n[connector.stripe_charges.options]\nplain = \"public\"\n\
+             [connector.stripe_charges.options.auth]\ntoken = \"Bearer ${{{name}}}\"\n"
+        );
+        let config =
+            parse_rocky_config_str(&format!("[adapter.default]\ntype = \"duckdb\"\n\n{body}"))
+                .expect("config parses");
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(name) };
+        let errs: Vec<String> = validate_connectors(&config)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("[connector.stripe_charges]"), "{errs:?}");
+        assert!(errs[0].contains("options `auth.token`"), "{errs:?}");
+        assert!(errs[0].contains(&format!("Bearer ${{{name}}}")), "{errs:?}");
+        assert!(
+            !errs[0].contains(value),
+            "the error must not print the value"
+        );
+    }
+
+    /// Parse `options` (the body of `[connector.stripe_charges.options]`)
+    /// with `name` set to `value`, then drop the variable.
+    fn parse_with_env(name: &str, value: &str, options: &str) -> Result<RockyConfig, String> {
+        // SAFETY: each caller passes a unique variable name no other test
+        // reads or writes.
+        unsafe { std::env::set_var(name, value) };
+        let parsed = parse_rocky_config_str(&format!(
+            "[adapter.default]\ntype = \"duckdb\"\n\n{GOOD}\n\
+             [connector.stripe_charges.options]\n{options}"
+        ))
+        .map_err(|e| format!("{e:#}"));
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(name) };
+        parsed
+    }
+
+    #[test]
+    fn a_substituted_top_level_option_key_is_refused_without_printing_it() {
+        let name = "ROCKY_TEST_OPTION_TOP_KEY";
+        let secret = "rocky-option-top-key-secret-91b3";
+        let config = parse_with_env(name, secret, &format!("\"${{{name}}}\" = 1\n")).unwrap();
+        let errs: Vec<String> = validate_connectors(&config)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains(&format!("options `${{{name}}}`")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs[0].contains(secret),
+            "the error must not print the key"
+        );
+    }
+
+    #[test]
+    fn a_substituted_nested_option_key_is_refused_without_printing_it() {
+        let name = "ROCKY_TEST_OPTION_NESTED_KEY";
+        let secret = "rocky-option-nested-key-secret-5c0a";
+        let config = parse_with_env(
+            name,
+            secret,
+            &format!("[connector.stripe_charges.options.auth]\n\"${{{name}}}\" = true\n"),
+        )
+        .unwrap();
+        let errs: Vec<String> = validate_connectors(&config)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains(&format!("options `auth.${{{name}}}`")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs[0].contains(secret),
+            "the error must not print the key"
+        );
+    }
+
+    #[test]
+    fn a_nan_under_a_substituted_option_key_does_not_print_the_key() {
+        let name = "ROCKY_TEST_OPTION_KEY_ABOVE_NAN";
+        let secret = "rocky-option-key-above-nan-secret-e4";
+        let err = parse_with_env(
+            name,
+            secret,
+            &format!("[connector.stripe_charges.options.\"${{{name}}}\"]\nratio = nan\n"),
+        )
+        .unwrap_err();
+        assert!(err.contains(&format!("${{{name}}}")), "{err}");
+        assert!(
+            !err.contains(secret),
+            "the error must not print the key: {err}"
+        );
+    }
+
+    #[test]
+    fn a_nan_option_is_a_parse_error() {
+        let body = format!("{GOOD}\n[connector.stripe_charges.options]\nratio = nan\n");
+        let err =
+            parse_rocky_config_str(&format!("[adapter.default]\ntype = \"duckdb\"\n\n{body}"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("options `ratio`"), "{err}");
+    }
+
     #[test]
     fn an_unknown_connector_key_is_a_parse_error() {
         let body = GOOD.replace("secrets", "surprise = 1\nsecrets");
