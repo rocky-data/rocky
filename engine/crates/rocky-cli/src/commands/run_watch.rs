@@ -120,22 +120,8 @@ pub async fn run_watch(
         .with_context(|| format!("config has no filename: {}", config_path_abs.display()))?
         .to_owned();
 
-    let watch_set = match models_dir {
-        // Explicit `--models`: today's behaviour, unchanged. The directory is
-        // watched when it exists, next to the non-recursive config watch.
-        Some(p) => WatchSet {
-            config_dir_recursive: false,
-            model_roots: if p.exists() {
-                vec![
-                    p.canonicalize()
-                        .with_context(|| format!("models dir not accessible: {}", p.display()))?,
-                ]
-            } else {
-                Vec::new()
-            },
-        },
-        None => default_watch_set(&config_path_abs, &config_dir, pipeline_name_arg),
-    };
+    let watch_set =
+        resolve_watch_set(models_dir, &config_path_abs, &config_dir, pipeline_name_arg)?;
 
     // Channel for watcher → debounce task. The watcher callback runs on a
     // background thread owned by `notify`, so we use a `mpsc` channel and
@@ -845,6 +831,39 @@ struct WatchSet {
     model_roots: Vec<PathBuf>,
 }
 
+/// The watch set for `rocky run --watch`.
+///
+/// An explicit `--models` keeps the behaviour it always had: that directory
+/// is watched when it exists, next to the non-recursive config watch, and no
+/// pipeline's directory is added. Without `--models`, see
+/// [`default_watch_set`].
+fn resolve_watch_set(
+    models_dir: Option<&Path>,
+    config_path: &Path,
+    config_dir: &Path,
+    pipeline_name_arg: Option<&str>,
+) -> Result<WatchSet> {
+    let Some(p) = models_dir else {
+        return Ok(default_watch_set(
+            config_path,
+            config_dir,
+            pipeline_name_arg,
+        ));
+    };
+    let model_roots = if p.exists() {
+        vec![
+            p.canonicalize()
+                .with_context(|| format!("models dir not accessible: {}", p.display()))?,
+        ]
+    } else {
+        Vec::new()
+    };
+    Ok(WatchSet {
+        config_dir_recursive: false,
+        model_roots,
+    })
+}
+
 /// The watch set for `rocky run --watch` without `--models`.
 ///
 /// Watches the models glob base of each selected transformation pipeline:
@@ -1079,6 +1098,44 @@ mod tests {
                 config_dir_recursive: false,
                 model_roots: vec![root.join("models")],
             }
+        );
+    }
+
+    /// An explicit `--models` watches that directory only, as before: no
+    /// pipeline's directory is added. A `--models` that does not exist
+    /// watches only `rocky.toml`. Without `--models`, the pipelines' bases.
+    #[test]
+    fn explicit_models_keeps_todays_watch_set() {
+        let (_dir, root, config) = watch_project(
+            &[("core", "models/**"), ("reporting", "reporting/*.sql")],
+            &["models", "reporting", "elsewhere"],
+        );
+        let explicit = root.join("elsewhere");
+        assert_eq!(
+            resolve_watch_set(Some(&explicit), &config, &root, None).unwrap(),
+            WatchSet {
+                config_dir_recursive: false,
+                model_roots: vec![explicit],
+            }
+        );
+        // `--models` naming the config dir keeps today's two watches.
+        assert_eq!(
+            resolve_watch_set(Some(&root), &config, &root, None).unwrap(),
+            WatchSet {
+                config_dir_recursive: false,
+                model_roots: vec![root.clone()],
+            }
+        );
+        assert_eq!(
+            resolve_watch_set(Some(&root.join("missing")), &config, &root, None).unwrap(),
+            WatchSet {
+                config_dir_recursive: false,
+                model_roots: Vec::new(),
+            }
+        );
+        assert_eq!(
+            resolve_watch_set(None, &config, &root, None).unwrap(),
+            default_watch_set(&config, &root, None)
         );
     }
 
