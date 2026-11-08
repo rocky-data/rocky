@@ -322,6 +322,7 @@ AI_CONTEXT_RUN_SCRIPT_HASHES = (
     "8bfc0d6008dc300268cf8a9d52f996a9fcea008d3d70aa4bc74675bc59ab65ad",
 )
 LIVE_EVAL_RUN_SCRIPT_HASHES = (
+    "ab2abc9b9cdc9bc5fe335227f2c26226903903ca453744159b88f776c2cedb59",
     "bcc1fc2a2f26a4c70d47bf952209bc567c57169b787520e0a320c72a59354cc1",
     "768174df2e1667e0ab05237911fc6cd69e10e01d6784f4788e78e2f91700a355",
     "d7655e2a181e9c8ba42915c54fc87aa773ba121d64b9e7ffeef5864aabf21f45",
@@ -1598,6 +1599,7 @@ def _check_live_evals(workflow: Workflow, job: str) -> list[str]:
         "Check out exact trusted revision",
         None,
         None,
+        "Drop the cached bundled DuckDB sources",
         None,
         None,
         "Configure swap",
@@ -1613,6 +1615,7 @@ def _check_live_evals(workflow: Workflow, job: str) -> list[str]:
         ["name", "uses", "with"],
         ["uses"],
         ["uses", "with"],
+        ["name", "run"],
         ["uses"],
         ["uses", "with"],
         ["name", "run"],
@@ -1640,35 +1643,35 @@ def _check_live_evals(workflow: Workflow, job: str) -> list[str]:
         "key": "evals-live",
     }:
         violations.append("live eval Rust cache inputs are not exact")
-    if _scalar_mapping(steps[4], "with", indent=8) != {"node-version": "22"}:
+    if _scalar_mapping(steps[5], "with", indent=8) != {"node-version": "22"}:
         violations.append("live eval Node setup inputs are not exact")
-    for index in (6, 9, 10, 11):
+    for index in (7, 10, 11, 12):
         if _key_block(steps[index], "working-directory", indent=8) != (
             "        working-directory: engine"
-            if index == 6
+            if index == 7
             else "        working-directory: engine/evals"
         ):
             violations.append("live eval working directories are not exact")
             break
-    if _scalar_mapping(steps[10], "env", indent=8) != {
+    if _scalar_mapping(steps[11], "env", indent=8) != {
         "ROCKY_BIN": "${{ github.workspace }}/engine/target/debug/rocky"
     }:
         violations.append("live eval error-contract environment is not exact")
-    if _scalar_mapping(steps[11], "env", indent=8) != {
+    if _scalar_mapping(steps[12], "env", indent=8) != {
         "ROCKY_BIN": "${{ github.workspace }}/engine/target/debug/rocky",
         "ANTHROPIC_API_KEY": expected_secret,
     }:
         violations.append("live eval model-call environment is not exact")
-    if _key_block(steps[12], "if", indent=8) != "        if: always()" or (
-        _mapping_keys(steps[12], "with", indent=8)
+    if _key_block(steps[13], "if", indent=8) != "        if: always()" or (
+        _mapping_keys(steps[13], "with", indent=8)
         != ["name", "path", "if-no-files-found"]
-    ) or _key_block(steps[12], "name", indent=10) != (
+    ) or _key_block(steps[13], "name", indent=10) != (
         "          name: agent-eval-scorecard-${{ github.sha }}"
-    ) or _block_scalar(steps[12], "path", indent=10) != (
+    ) or _block_scalar(steps[13], "path", indent=10) != (
         "engine/evals/results/scorecard.json\n"
         "engine/evals/results/scorecard.md\n"
         "engine/evals/results/transcripts/"
-    ) or _key_block(steps[12], "if-no-files-found", indent=10) != (
+    ) or _key_block(steps[13], "if-no-files-found", indent=10) != (
         "          if-no-files-found: warn"
     ):
         violations.append("live eval artifact upload is not exact")
