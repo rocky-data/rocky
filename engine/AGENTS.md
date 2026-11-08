@@ -338,6 +338,8 @@ Implementation in `crates/rocky-core/src/hooks/` (mod.rs, webhook.rs, template.r
 
 Provides: diagnostics, hover, go-to-definition, find-references, rename, completion, signature help, document symbols, code actions, inlay hints, semantic tokens.
 
+In `initialized` it registers `workspace/didChangeWatchedFiles` for `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql` with any client that advertises dynamic registration, in a spawned task (awaiting the request there would stall the handshake).
+
 Implementation in `crates/rocky-server/`.
 
 ## When Helping Users

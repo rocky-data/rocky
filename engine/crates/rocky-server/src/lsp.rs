@@ -671,6 +671,51 @@ pub struct RockyLsp {
     /// The warehouse each model runs on, for typing a `CAST` whose width
     /// differs between warehouses (#2342). See [`CastTargets`].
     cast_targets: Arc<CastTargets>,
+    /// The client said in `initialize` that it lets a server register for
+    /// `workspace/didChangeWatchedFiles` at run time. `initialized` then
+    /// registers [`WATCHED_FILE_GLOBS`]. See [`client_registers_watched_files`].
+    watch_registration: Arc<AtomicBool>,
+}
+
+/// The files whose changes on disk reach the server as
+/// `workspace/didChangeWatchedFiles` events: every `.rocky` file, every
+/// `.toml` file (`rocky.toml`, sidecars, `_defaults.toml`, `groups/*.toml`)
+/// and every `.sql` file under a `models` directory. The server registers
+/// them with the client in `initialized`.
+const WATCHED_FILE_GLOBS: [&str; 3] = ["**/*.rocky", "**/*.toml", "**/models/**/*.sql"];
+
+/// The id of the one watched-files registration the server makes.
+const WATCHED_FILES_REGISTRATION_ID: &str = "rocky-watched-files";
+
+/// Whether `capabilities` lets the server register for
+/// `workspace/didChangeWatchedFiles` at run time. A client that does not say
+/// so gets no registration request: the protocol forbids sending one.
+fn client_registers_watched_files(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+        .and_then(|watched| watched.dynamic_registration)
+        .unwrap_or(false)
+}
+
+/// The `client/registerCapability` registration for [`WATCHED_FILE_GLOBS`].
+fn watched_files_registration() -> Registration {
+    let options = DidChangeWatchedFilesRegistrationOptions {
+        watchers: WATCHED_FILE_GLOBS
+            .iter()
+            .map(|glob| FileSystemWatcher {
+                glob_pattern: GlobPattern::String((*glob).to_string()),
+                // `None` is created, changed and deleted.
+                kind: None,
+            })
+            .collect(),
+    };
+    Registration {
+        id: WATCHED_FILES_REGISTRATION_ID.to_string(),
+        method: "workspace/didChangeWatchedFiles".to_string(),
+        register_options: serde_json::to_value(options).ok(),
+    }
 }
 
 impl RockyLsp {
@@ -1553,6 +1598,10 @@ async fn seed_salsa_source(
 #[tower_lsp::async_trait]
 impl LanguageServer for RockyLsp {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        self.watch_registration.store(
+            client_registers_watched_files(&params.capabilities),
+            Ordering::Release,
+        );
         if let Some(root) = params.root_uri
             && let Ok(path) = root.to_file_path()
         {
@@ -1637,6 +1686,31 @@ impl LanguageServer for RockyLsp {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("Rocky LSP initialized");
+        // Ask the client to send `didChangeWatchedFiles` for the project's
+        // files, so a `_defaults.toml` or `groups/*.toml` edit reaches the
+        // server in any editor, not only one configured to watch them.
+        //
+        // In a spawned task, never awaited here: `register_capability` is a
+        // request, so it waits for the client's reply, and its send waits
+        // for room in the outgoing channel. Awaited here, both would hold up
+        // the handshake and the startup compile below, against a client that
+        // has not begun reading yet (the deadlock `publish_project_config_
+        // diagnostic` documents).
+        if self.watch_registration.load(Ordering::Acquire) {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                if let Err(err) = client
+                    .register_capability(vec![watched_files_registration()])
+                    .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "the client refused the watched-files registration; \
+                         a change to a file that is not open is seen only at the next compile",
+                    );
+                }
+            });
+        }
         self.recompile().await;
         self.init_done.store(true, Ordering::Release);
         self.init_notify.notify_waiters();
@@ -1791,11 +1865,18 @@ impl LanguageServer for RockyLsp {
     }
 
     /// A file the editor watches changed on disk: created, edited or
-    /// deleted. The VS Code client sends these for `**/*.rocky`, `**/*.toml`
-    /// and `**/models/**/*.sql`, but `didChange` only for the open `.rocky`
-    /// and `.sql` documents it selects, so a `_defaults.toml` or sidecar edit
-    /// reaches the server through here alone. It schedules the same
-    /// debounced recompile as an edit, with every changed path, so the
+    /// deleted. The server registers [`WATCHED_FILE_GLOBS`] in `initialized`
+    /// with a client that supports it, and the client then sends these for
+    /// them, but `didChange` only for the open `.rocky` and `.sql` documents
+    /// it selects, so a `_defaults.toml` or sidecar edit reaches the server
+    /// through here alone.
+    ///
+    /// A path that two events name inside one debounce window joins one
+    /// recompile ([`PendingRecompile::record`] keeps it once), so a client
+    /// that also watches these files itself costs no second compile.
+    ///
+    /// It schedules the same debounced recompile as an edit, with every
+    /// changed path, so the
     /// incremental compile marks the models a directory `_defaults.toml`
     /// governs. A changed `rocky.toml` still compiles in full
     /// (`CastTargets::kept`).
@@ -5342,6 +5423,7 @@ pub async fn run_lsp() {
         salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
         salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         cast_targets: Arc::default(),
+        watch_registration: Arc::default(),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -5384,6 +5466,7 @@ mod tests {
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
             cast_targets: Arc::default(),
+            watch_registration: Arc::default(),
         });
 
         let root_uri = Url::from_directory_path(&root).unwrap();
@@ -5499,6 +5582,7 @@ mod tests {
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
             cast_targets: Arc::default(),
+            watch_registration: Arc::default(),
         });
 
         let root_uri = Url::from_directory_path(&root).unwrap();
@@ -5794,6 +5878,143 @@ mod tests {
             "the defaults edit was never compiled: {codes:?}"
         );
         assert!(!codes.contains(&"W002".to_string()), "{codes:?}");
+    }
+
+    /// Start a server over a project with an empty `models` directory, for a
+    /// client that sends `capabilities` in `initialize`. The socket is read
+    /// only after `initialized` returns, so a handshake that waits on its
+    /// own request to the client hangs here (and the timeout fails it).
+    /// Returns every request the server sent within `window` after that.
+    async fn requests_after_handshake(
+        capabilities: serde_json::Value,
+        window: std::time::Duration,
+    ) -> Vec<tower_lsp::jsonrpc::Request> {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let handshake = async {
+            for request in [
+                Request::build("initialize")
+                    .id(1)
+                    .params(serde_json::json!({
+                        "capabilities": capabilities,
+                        "rootUri": root_uri,
+                    }))
+                    .finish(),
+                Request::build("initialized")
+                    .params(serde_json::json!({}))
+                    .finish(),
+            ] {
+                service.ready().await.unwrap().call(request).await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), handshake)
+            .await
+            .expect("the handshake must not wait on a request to the client");
+
+        let mut requests = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(Some(request)) = tokio::time::timeout_at(deadline, socket.next()).await {
+            requests.push(request);
+        }
+        requests
+    }
+
+    /// A client that supports dynamic registration for watched files gets
+    /// one `client/registerCapability` for the three globs the server's
+    /// `didChangeWatchedFiles` handler compiles on. Without it, an editor
+    /// with no client-side watcher config of its own sends no watched-file
+    /// events, and a `_defaults.toml` edit never reaches the server.
+    #[tokio::test]
+    async fn a_client_with_dynamic_registration_is_asked_to_watch_the_project_files() {
+        let requests = requests_after_handshake(
+            serde_json::json!({
+                "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } },
+            }),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let registrations: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method() == "client/registerCapability")
+            .collect();
+        assert_eq!(registrations.len(), 1, "{requests:?}");
+        let params: RegistrationParams =
+            serde_json::from_value(registrations[0].params().cloned().unwrap()).unwrap();
+        assert_eq!(params.registrations.len(), 1, "{params:?}");
+        let registration = &params.registrations[0];
+        assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
+        let options: DidChangeWatchedFilesRegistrationOptions =
+            serde_json::from_value(registration.register_options.clone().unwrap()).unwrap();
+        let globs: Vec<_> = options
+            .watchers
+            .iter()
+            .map(|watcher| match &watcher.glob_pattern {
+                GlobPattern::String(glob) => glob.as_str(),
+                GlobPattern::Relative(relative) => panic!("unexpected {relative:?}"),
+            })
+            .collect();
+        assert_eq!(globs, ["**/*.rocky", "**/*.toml", "**/models/**/*.sql"]);
+        // Created, changed and deleted: a created or deleted file can change
+        // which models a pipeline loads.
+        assert!(
+            options
+                .watchers
+                .iter()
+                .all(|watcher| watcher.kind.is_none())
+        );
+    }
+
+    /// A client that does not advertise dynamic registration for watched
+    /// files gets no registration request: the protocol forbids it.
+    #[tokio::test]
+    async fn a_client_without_dynamic_registration_is_not_asked_to_watch_files() {
+        for capabilities in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": false } },
+            }),
+        ] {
+            let requests =
+                requests_after_handshake(capabilities, std::time::Duration::from_millis(500)).await;
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method() != "client/registerCapability"),
+                "{requests:?}"
+            );
+        }
+    }
+
+    /// The capability read the registration depends on: only an explicit
+    /// `dynamicRegistration: true` counts.
+    #[test]
+    fn only_explicit_dynamic_registration_enables_the_watch_request() {
+        let parse = |value: serde_json::Value| -> ClientCapabilities {
+            serde_json::from_value(value).unwrap()
+        };
+        assert!(!client_registers_watched_files(&parse(serde_json::json!(
+            {}
+        ))));
+        assert!(!client_registers_watched_files(&parse(
+            serde_json::json!({ "workspace": {} })
+        )));
+        assert!(!client_registers_watched_files(&parse(serde_json::json!({
+            "workspace": { "didChangeWatchedFiles": {} },
+        }))));
+        assert!(!client_registers_watched_files(&parse(serde_json::json!({
+            "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": false } },
+        }))));
+        assert!(client_registers_watched_files(&parse(serde_json::json!({
+            "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } },
+        }))));
     }
 
     /// A config group edit (`models/sub/groups/g.toml`) reaches the server
@@ -6541,6 +6762,7 @@ mod tests {
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
             cast_targets: Arc::default(),
+            watch_registration: Arc::default(),
         });
         // Collect what the editor receives; an undrained socket would stall
         // the handshake.
@@ -6673,6 +6895,7 @@ mod tests {
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
             cast_targets: Arc::default(),
+            watch_registration: Arc::default(),
         });
         let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
         let sink = seen.clone();
@@ -6768,6 +6991,7 @@ mod tests {
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
             cast_targets: Arc::default(),
+            watch_registration: Arc::default(),
         }
     }
 
@@ -7722,6 +7946,7 @@ mod tests {
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
             cast_targets: Arc::default(),
+            watch_registration: Arc::default(),
         });
 
         let root_uri = Url::from_directory_path(root).unwrap();
