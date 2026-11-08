@@ -1160,6 +1160,25 @@ pub enum StateError {
         backup: String,
     },
 
+    /// [`SchemaMismatchPolicy::Recreate`] found a store newer than this binary
+    /// but could not move it aside to `<file>.v{found}.bak` for a reason other
+    /// than the backup already existing: for example, the directory is
+    /// read-only. Nothing was moved; the state file is left as it was.
+    #[error(
+        "state schema version mismatch: database has v{found}, binary expects v{expected}. \
+         on_schema_mismatch = \"recreate\" could not move the state file at {path} to \
+         {backup}: {source}. Nothing was moved. Fix the cause (for example, make the \
+         directory writable), then re-run; or upgrade rocky."
+    )]
+    SchemaMismatchBackupFailed {
+        found: u32,
+        expected: u32,
+        path: String,
+        backup: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A read-only open found a store that holds something but lacks tables
     /// this binary reads.
     ///
@@ -1551,9 +1570,10 @@ impl StateStore {
     /// a fresh local state, and sets the
     /// [`was_recreated_for_forward_incompat`][Self::was_recreated_for_forward_incompat]
     /// flag so the caller can suppress writing the downgraded state back to a
-    /// shared tier. If the `.bak` already exists, or the rename fails,
-    /// `Recreate` returns [`StateError::SchemaMismatch`] as `Fail` does and
-    /// leaves both files in place.
+    /// shared tier. If the `.bak` already exists, `Recreate` returns
+    /// [`StateError::SchemaMismatchBackupExists`]; if the file cannot be moved
+    /// for another reason, it returns [`StateError::SchemaMismatchBackupFailed`]
+    /// with the OS error. Either way both files are left in place.
     ///
     /// Only the `rocky run` and `rocky load` paths thread a configured policy
     /// here (from [`crate::config::StateConfig::schema_mismatch_policy`]);
@@ -1812,11 +1832,16 @@ impl StateStore {
                 // Only the redb file moves. The advisory lock is the separate
                 // `<file>.lock`, which we hold, and redb keeps no WAL file.
                 let backup = forward_incompat_backup_path(path, found);
-                let mismatch = || StateError::SchemaMismatch {
-                    found,
-                    expected: CURRENT_SCHEMA_VERSION,
-                    path: path.display().to_string(),
-                };
+                // Not plain `SchemaMismatch`: its message says to set
+                // `recreate`, which the operator already did.
+                let backup_failed =
+                    |source: std::io::Error| StateError::SchemaMismatchBackupFailed {
+                        found,
+                        expected: CURRENT_SCHEMA_VERSION,
+                        path: path.display().to_string(),
+                        backup: backup.display().to_string(),
+                        source,
+                    };
                 // Never overwrite an earlier backup: a second bad open must not
                 // destroy the first one. Reserve the backup name first with
                 // `create_new`, which fails if anything (a file, a directory or
@@ -1858,18 +1883,18 @@ impl StateStore {
                             path = %path.display(),
                             backup = %backup.display(),
                             "could not reserve {} to move the forward-incompatible state file \
-                             aside; falling back to hard failure",
+                             aside; refusing the open",
                             backup.display()
                         );
-                        return Err(mismatch());
+                        return Err(backup_failed(source));
                     }
                 }
                 drop(db);
                 // If we cannot move the forward-incompatible file aside,
                 // reopening would just re-read the same newer version and loop.
-                // Remove our empty reservation and degrade to the hard-fail
-                // error so the operator gets the actionable message rather
-                // than a silent spin.
+                // Remove our empty reservation and refuse with the OS error so
+                // the operator gets the actionable message rather than a
+                // silent spin.
                 if let Err(source) = std::fs::rename(path, &backup) {
                     let _ = std::fs::remove_file(&backup);
                     tracing::warn!(
@@ -1878,10 +1903,10 @@ impl StateStore {
                         path = %path.display(),
                         backup = %backup.display(),
                         "could not move forward-incompatible state file to {} to recreate it; \
-                         falling back to hard failure",
+                         refusing the open",
                         backup.display()
                     );
-                    return Err(mismatch());
+                    return Err(backup_failed(source));
                 }
                 tracing::warn!(
                     target: "rocky::state",
@@ -19397,6 +19422,70 @@ mod tests {
             b"first backup",
             "the existing .bak must not be overwritten"
         );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            state_before,
+            "the newer state file must be left in place"
+        );
+    }
+
+    /// A backup that cannot be reserved for a reason other than "already
+    /// exists" (here, a read-only directory) refuses with its own error. It
+    /// names the backup and the OS error, and never advises setting
+    /// `recreate`, which the operator already did.
+    #[cfg(unix)]
+    #[test]
+    fn open_with_policy_recreate_names_the_backup_when_it_cannot_be_reserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let path = state_dir.join("state.redb");
+        let found = CURRENT_SCHEMA_VERSION + 1;
+        // Seeding also leaves the lock file, so the open below needs no new
+        // file in the directory before it reserves the backup.
+        StateStore::open(&path).unwrap();
+        force_schema_version(&path, &found.to_string());
+        let backup = forward_incompat_backup_path(&path, found);
+        let state_before = std::fs::read(&path).unwrap();
+
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A user that can write anyway (root) cannot show this failure.
+        if std::fs::write(state_dir.join("probe"), b"").is_ok() {
+            std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let result = StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate);
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = match result {
+            Ok(_) => panic!("recreate must refuse when the .bak cannot be reserved"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, StateError::SchemaMismatchBackupFailed { found: f, expected, backup: b, source, .. }
+                if *f == found && *expected == CURRENT_SCHEMA_VERSION
+                    && *b == backup.display().to_string()
+                    && source.kind() == std::io::ErrorKind::PermissionDenied),
+            "got {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&backup.display().to_string()),
+            "the refusal must name the backup; got: {text}"
+        );
+        let os_error = std::error::Error::source(&err)
+            .expect("the OS error is the source")
+            .to_string();
+        assert!(
+            text.contains(&os_error),
+            "the refusal must carry the OS error ({os_error}); got: {text}"
+        );
+        assert!(
+            !text.contains("moves it to"),
+            "the refusal must not advise the recreate that just refused; got: {text}"
+        );
+        assert!(!backup.exists(), "nothing may be left at the backup name");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             state_before,
