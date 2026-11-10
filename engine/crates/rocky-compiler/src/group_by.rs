@@ -863,7 +863,7 @@ impl Checker<'_> {
 
 /// Aggregate functions across DuckDB, Databricks, Snowflake, BigQuery, and
 /// Trino. A call to one of these without `OVER` makes the query aggregating.
-fn is_aggregate(name: &str) -> bool {
+pub(crate) fn is_aggregate(name: &str) -> bool {
     matches!(
         name,
         "COUNT"

@@ -74,6 +74,7 @@ pub struct TypeCheckResult {
 /// table + column keys look up independently (a flat `(String, String)`
 /// key would need `format!("{table}.{col}")` at the lookup site and
 /// re-introduce the allocation).
+#[derive(Clone)]
 pub(crate) struct TypeScope {
     /// column_name → (type, nullable) for all columns in scope.
     columns: HashMap<CiKey<'static>, (RockyType, bool)>,
@@ -643,14 +644,22 @@ fn compute_model_typecheck(
                 inferred.count_outputs.contains(&index),
                 inferred.cast_outputs.contains(&index),
                 inferred.coalesce_outputs.contains(&index),
+                inferred.subtotal_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count, cast, coalesce)) =
+            let Some(&(inferred_col, exact_type, count, cast, coalesce, subtotal)) =
                 inferred_by_name.get(col.name.as_str())
             else {
                 continue;
             };
+            // A subtotal row of `ROLLUP`, `CUBE` or `GROUPING SETS` can hold
+            // NULL here, whatever lineage says about the source column. No
+            // rule below narrows it back: each one that sets `false` needs
+            // inference's answer to be non-null (#2566).
+            if subtotal {
+                col.nullable = true;
+            }
             // A `COALESCE` is NULL only when every argument is. Inference
             // reads each argument in the SQL relation scope (outer-join side
             // included), so its non-null answer holds whatever the result
@@ -3967,6 +3976,10 @@ pub(crate) struct SelectInference {
     /// through parentheses. Such an output's nullable bit is exact: it is
     /// NULL only when every argument is (#2553).
     coalesce_outputs: HashSet<usize>,
+    /// Outputs that can be NULL in a subtotal row of `GROUP BY ROLLUP`,
+    /// `CUBE` or `GROUPING SETS` (#2566). Their nullable bit is already
+    /// `true`; the merge must not narrow it from lineage.
+    subtotal_outputs: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -4367,6 +4380,7 @@ fn combine_set_operation(
     let mut exact_type_outputs = HashSet::new();
     let mut relation_inexact = HashSet::new();
     let mut count_outputs = HashSet::new();
+    let mut subtotal_outputs = HashSet::new();
     let mut set_branches = Vec::with_capacity(left.columns.len());
     for (index, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
         let both_exact =
@@ -4395,6 +4409,9 @@ fn combine_set_operation(
         if left.count_outputs.contains(&index) && right.count_outputs.contains(&index) {
             count_outputs.insert(index);
         }
+        if left.subtotal_outputs.contains(&index) || right.subtotal_outputs.contains(&index) {
+            subtotal_outputs.insert(index);
+        }
         l.data_type = data_type;
         // Set, not `|=`: a side's own bit came from part of the set, and
         // only the whole set's bit is order-independent.
@@ -4412,6 +4429,7 @@ fn combine_set_operation(
         // A combined column may be NULL from any branch; the merge does not
         // narrow a set operation's nullability.
         coalesce_outputs: HashSet::new(),
+        subtotal_outputs,
         set_operation: true,
         set_branches,
     })
@@ -4448,10 +4466,15 @@ fn infer_select_types_in_scope(
     env: InferEnv<'_, '_>,
 ) -> Result<SelectInference, String> {
     let (from_scope, type_scope) = select_type_scope(select, env);
+    let subtotal = SubtotalKeys::of(select).map(|keys| {
+        let scope = keys.rolled_up_scope(&type_scope);
+        (keys, scope)
+    });
 
     let mut inferred = SelectInference::default();
 
-    for item in &select.projection {
+    for (position, item) in select.projection.iter().enumerate() {
+        let first = inferred.columns.len();
         match item {
             SelectItem::UnnamedExpr(expr) => {
                 inferred.push_expression(expr_name(expr), expr, &type_scope);
@@ -4497,9 +4520,185 @@ fn infer_select_types_in_scope(
             }
             SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::Expr(_), _) => {}
         }
+        if let Some((keys, rolled_scope)) = &subtotal {
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr)
+                | SelectItem::ExprWithAlias { expr, .. }
+                | SelectItem::ExprWithAliases { expr, .. } => Some(expr),
+                _ => None,
+            };
+            for index in first..inferred.columns.len() {
+                let column = &mut inferred.columns[index];
+                let null_in_subtotal = match expr {
+                    Some(expr) => {
+                        keys.output_can_be_null(expr, &column.name, position + 1, rolled_scope)
+                    }
+                    // A `*` column: NULL when it is a rolled-up key.
+                    None => keys.names_column(&column.name),
+                };
+                if null_in_subtotal {
+                    column.nullable = true;
+                    inferred.subtotal_outputs.insert(index);
+                }
+            }
+        }
     }
 
     Ok(inferred)
+}
+
+/// The grouping keys of a `SELECT` whose `GROUP BY` adds subtotal rows:
+/// `ROLLUP`, `CUBE`, `GROUPING SETS`, or a `WITH ROLLUP` / `WITH CUBE` /
+/// `WITH TOTALS` modifier. In a subtotal row a rolled-up key is NULL, after
+/// the `WHERE` has run, so a NOT NULL column used as such a key is nullable
+/// in the output (#2566).
+///
+/// A key that sits in every grouping set (`GROUPING SETS ((a), (a, b))`) is
+/// never NULL, but it is counted as rolled up anyway: "nullable" is always
+/// the sound answer for a contract.
+struct SubtotalKeys {
+    /// The rolled-up key expressions, as written in the `GROUP BY`.
+    keys: Vec<Expr>,
+    /// `GROUP BY ALL` with a modifier: every grouping key is rolled up, and
+    /// the keys are not spelled out.
+    all: bool,
+}
+
+impl SubtotalKeys {
+    fn of(select: &ast::Select) -> Option<Self> {
+        match &select.group_by {
+            ast::GroupByExpr::All(modifiers) => (!modifiers.is_empty()).then(|| Self {
+                keys: Vec::new(),
+                all: true,
+            }),
+            ast::GroupByExpr::Expressions(exprs, modifiers) => {
+                let mut keys = Vec::new();
+                for expr in exprs {
+                    match expr {
+                        Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
+                            for key in sets.iter().flatten() {
+                                match key {
+                                    Expr::Tuple(items) => keys.extend(items.iter().cloned()),
+                                    key => keys.push(key.clone()),
+                                }
+                            }
+                        }
+                        // A modifier rolls up every plain key.
+                        expr if !modifiers.is_empty() => keys.push(expr.clone()),
+                        _ => {}
+                    }
+                }
+                (!keys.is_empty()).then_some(Self { keys, all: false })
+            }
+        }
+    }
+
+    /// `scope` with every column a rolled-up key reads made nullable. An
+    /// expression over such a column, outside an aggregate, sees its NULL in
+    /// a subtotal row. A bare name also widens every relation's column of
+    /// that name, and a qualified one also widens the bare name: the scope
+    /// cannot tell which relation a key meant, and wider is sound.
+    fn rolled_up_scope(&self, scope: &TypeScope) -> TypeScope {
+        let mut rolled = scope.clone();
+        if self.all {
+            for value in rolled.columns.values_mut() {
+                value.1 = true;
+            }
+            for table in rolled.qualified.values_mut() {
+                for value in table.values_mut() {
+                    value.1 = true;
+                }
+            }
+            return rolled;
+        }
+        let mut widen = |name: &str| {
+            if let Some(value) = rolled.columns.get_mut(CiStr::new(name)) {
+                value.1 = true;
+            }
+            for table in rolled.qualified.values_mut() {
+                if let Some(value) = table.get_mut(CiStr::new(name)) {
+                    value.1 = true;
+                }
+            }
+        };
+        for key in &self.keys {
+            let _ = ast::visit_expressions(key, |expr| {
+                match expr {
+                    Expr::Identifier(ident) => widen(&ident.value),
+                    Expr::CompoundIdentifier(idents) => {
+                        if let Some(last) = idents.last() {
+                            widen(&last.value);
+                        }
+                    }
+                    _ => {}
+                }
+                std::ops::ControlFlow::<()>::Continue(())
+            });
+        }
+        rolled
+    }
+
+    /// Whether the projection `expr`, output as `name` at 1-based
+    /// `position`, can be NULL in a subtotal row.
+    ///
+    /// - It is a rolled-up key itself: the same expression, the output's
+    ///   alias, or its position (`ROLLUP(1)`).
+    /// - It is not a bare aggregate call, and it is nullable once every
+    ///   column a rolled-up key reads is nullable. So `COALESCE(k, 0)` under
+    ///   `ROLLUP(k)` stays non-null, and `k + 1` does not.
+    ///
+    /// A bare aggregate (`SUM(v)`, `COUNT(*)`, `MAX(k)`) reads the group's
+    /// rows, not the NULL key, so its own nullable bit stands.
+    fn output_can_be_null(
+        &self,
+        expr: &Expr,
+        name: &str,
+        position: usize,
+        rolled_scope: &TypeScope,
+    ) -> bool {
+        let text = key_text(expr);
+        let is_key = self.keys.iter().any(|key| match key {
+            Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case(name) => true,
+            Expr::Value(value) => {
+                matches!(&value.value, ast::Value::Number(n, _) if n.parse::<usize>().ok() == Some(position))
+            }
+            key => key_text(key) == text,
+        });
+        if is_key {
+            return true;
+        }
+        let bare_aggregate = function_call(expr).is_some_and(|func| {
+            func.over.is_none()
+                && func
+                    .name
+                    .0
+                    .last()
+                    .and_then(ast::ObjectNamePart::as_ident)
+                    .is_some_and(|ident| crate::group_by::is_aggregate(&ident.value.to_uppercase()))
+        });
+        !bare_aggregate && infer_expr_type(expr, rolled_scope).1
+    }
+
+    /// Whether a `*` output column named `name` is a rolled-up key.
+    fn names_column(&self, name: &str) -> bool {
+        self.all
+            || self.keys.iter().any(|key| match key {
+                Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(name),
+                Expr::CompoundIdentifier(idents) => idents
+                    .last()
+                    .is_some_and(|last| last.value.eq_ignore_ascii_case(name)),
+                _ => false,
+            })
+    }
+}
+
+/// An expression's text for comparing a projection with a grouping key:
+/// parentheses dropped, case folded.
+fn key_text(expr: &Expr) -> String {
+    match expr {
+        Expr::Nested(inner) => key_text(inner),
+        expr => expr.to_string().to_lowercase(),
+    }
 }
 
 /// Build the relation scope of one `SELECT`: its `FROM` / `JOIN` relations
@@ -5673,6 +5872,69 @@ mod tests {
                 let got = coalesce_column(&sql, target.clone());
                 if got != (ty, false, false) {
                     wrong.push(format!("{sql} on {target:?}: {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Under `ROLLUP`, `CUBE` or `GROUPING SETS` a subtotal row holds NULL in
+    /// each rolled-up key, after the `WHERE` has run. An output that is such
+    /// a key, or an expression over one, is nullable and keeps `E012`, even
+    /// when the source column is NOT NULL (#2566). `x` is NOT NULL here.
+    #[test]
+    fn grouping_set_keys_are_nullable() {
+        let mut wrong = Vec::new();
+        for target in [duckdb(), OperandTarget::Unconfigured] {
+            for sql in [
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY CUBE(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY GROUPING SETS ((x), ())",
+                "SELECT x AS c, z, COUNT(*) AS n FROM t GROUP BY ROLLUP((x, z))",
+                "SELECT t.x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(t.x)",
+                "SELECT x + 1 AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT CAST(x AS BIGINT) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                // The issue's shape: the key is the COALESCE itself.
+                "SELECT COALESCE(x, 0) AS c, SUM(z) AS n FROM t GROUP BY ROLLUP(COALESCE(x, 0))",
+                "SELECT IFNULL(x, 0) AS c, SUM(z) AS n FROM t GROUP BY ROLLUP(IFNULL(x, 0))",
+                "SELECT NVL(x, 0) AS c, SUM(z) AS n FROM t GROUP BY CUBE(NVL(x, 0))",
+                "SELECT COALESCE(z, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(COALESCE(z, 0))",
+                // By alias and by position.
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(c)",
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(1)",
+                // Through a CTE, and in one branch of a set operation.
+                "WITH r AS (SELECT x, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)) \
+                 SELECT x AS c FROM r",
+                "SELECT x AS c FROM t \
+                 UNION ALL SELECT x AS c FROM t GROUP BY ROLLUP(x)",
+            ] {
+                let (_, nullable, e012) = coalesce_column(sql, target.clone());
+                if !nullable || !e012 {
+                    wrong.push(format!("{sql} on {target:?}: {nullable} {e012}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// What a subtotal row does not make NULL stays non-null: a key outside
+    /// the `ROLLUP`, a `COALESCE` that replaces the NULL key, `COUNT`, and a
+    /// plain `GROUP BY` (#2566).
+    #[test]
+    fn grouping_sets_keep_what_a_subtotal_row_cannot_null() {
+        let mut wrong = Vec::new();
+        for target in [duckdb(), OperandTarget::Unconfigured] {
+            for sql in [
+                "SELECT x AS c, z, COUNT(*) AS n FROM t GROUP BY x, ROLLUP(z)",
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT COALESCE(z, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(z)",
+                "SELECT COUNT(*) AS c, x FROM t GROUP BY ROLLUP(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY x",
+            ] {
+                let (_, nullable, e012) = coalesce_column(sql, target.clone());
+                if nullable || e012 {
+                    wrong.push(format!("{sql} on {target:?}: {nullable} {e012}"));
                 }
             }
         }
