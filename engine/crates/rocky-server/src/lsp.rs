@@ -392,6 +392,32 @@ impl PendingRecompile {
         }
     }
 
+    /// Keep the files of a compile that failed for the next recompile,
+    /// without scheduling one. `None` keeps a full compile. The stored result
+    /// is older than what the failed compile read, so the next compile must
+    /// mark these files again. Compiling again now would read the same files
+    /// and fail the same way, so nothing runs until another change schedules
+    /// a recompile, and that one takes them.
+    ///
+    /// Leaves `scheduled` as it is: setting it with no task to clear it would
+    /// stop every later change from scheduling a recompile.
+    fn carry(&self, files: Option<Vec<std::path::PathBuf>>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match files {
+            Some(files) => {
+                for file in files {
+                    if !state.files.contains(&file) {
+                        state.files.push(file);
+                    }
+                }
+            }
+            None => state.unknown = true,
+        }
+    }
+
     /// Take the files for the recompile about to run, and clear the
     /// schedule. `None` when one change had no file path: compile in full.
     fn take(&self) -> Option<Vec<std::path::PathBuf>> {
@@ -571,6 +597,9 @@ impl RockyLsp {
                         // A newer compile that failed still outranks an older
                         // one that may yet succeed.
                         published_files.compile_failed(generation).await;
+                        // This window's files are not in the stored result.
+                        // Keep them for the next recompile (see `carry`).
+                        pending.carry(changed_files);
                         // Same as `recompile`: a failed compile builds no
                         // diagnostic, so surface the `.rocky` parse errors.
                         Self::publish_dsl_parse_diagnostics(
@@ -948,6 +977,13 @@ impl RockyLsp {
                 // A newer compile that failed still outranks an older one
                 // that may yet succeed: that one must not publish over it.
                 self.published_files.compile_failed(generation).await;
+                // This compile read every file, and its result is not stored.
+                // The next debounced pass would start from the result stored
+                // before it and mark only its own files, so the file
+                // `did_save` saved would keep its old types for the session.
+                // Make the next recompile a full one (see `carry`). At
+                // startup nothing is stored, so the next one is full anyway.
+                self.recompile_pending.carry(None);
                 // The log line above is the only place this failure went.
                 // The editor was left with NOTHING: no diagnostic (none was
                 // built), no message. A models directory that is a dangling
@@ -6422,6 +6458,163 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let stored = lsp.compile_result.read().await;
+        let stored = stored.as_ref().expect("a compile result is stored");
+        for (name, cols) in &scratch.type_check.typed_models {
+            assert_eq!(
+                stored.type_check.typed_models.get(name),
+                Some(cols),
+                "typed columns of {name}"
+            );
+        }
+    }
+
+    /// The full compile `did_save` runs reads the saved file from disk. When
+    /// it fails (another model's sidecar does not parse), its result is not
+    /// stored. The fix of that sidecar then arrives as a watched-file event,
+    /// and its debounced pass started from the result stored before the save
+    /// and marked only the sidecar. Before, nothing marked the saved file
+    /// again, so its new columns were lost for the session.
+    #[tokio::test]
+    async fn a_failed_save_compile_leaves_the_next_compile_full() {
+        a_failed_compile_keeps_its_files(FailedCompile::Save).await;
+    }
+
+    /// The same for a debounced pass that fails: the file it took must be
+    /// marked again by the pass after the fix.
+    #[tokio::test]
+    async fn a_failed_debounced_compile_keeps_its_files() {
+        a_failed_compile_keeps_its_files(FailedCompile::Watched).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum FailedCompile {
+        /// The saved file reaches the server through `did_save` only.
+        Save,
+        /// The changed file reaches the server as a watched-file event only.
+        Watched,
+    }
+
+    async fn a_failed_compile_keeps_its_files(how: FailedCompile) {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("project");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let sidecar = |i: usize| {
+            format!(
+                "name = \"m{i:02}\"\n[strategy]\ntype = \"full_refresh\"\n\
+                 [target]\ncatalog = \"c\"\nschema = \"s\"\n"
+            )
+        };
+        for i in 0..12 {
+            std::fs::write(models.join(format!("m{i:02}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(models.join(format!("m{i:02}.toml")), sidecar(i)).unwrap();
+        }
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        tokio::spawn(async move { while socket.next().await.is_some() {} });
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        let lsp = service.inner();
+        assert!(lsp.compile_result.read().await.is_some());
+        let has_column = |model: &'static str, column: &'static str| async move {
+            lsp.compile_result
+                .read()
+                .await
+                .as_ref()
+                .and_then(|r| r.type_check.typed_models.get(model).cloned())
+                .is_some_and(|cols| cols.iter().any(|c| c.name == column))
+        };
+        let watched = |path: &std::path::Path| DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: Url::from_file_path(path).unwrap(),
+                typ: FileChangeType::CHANGED,
+            }],
+        };
+        let config = CompilerConfig {
+            models_dir: models.clone(),
+            ..Default::default()
+        };
+
+        // Another model's sidecar no longer parses: the compile fails, it
+        // does not report a diagnostic.
+        let broken = models.join("m05.toml");
+        std::fs::write(&broken, "name = [").unwrap();
+        assert!(rocky_compiler::compile::compile(&config).is_err());
+
+        let saved = models.join("m02.sql");
+        std::fs::write(&saved, "SELECT 1 AS id, 2 AS saved").unwrap();
+        match how {
+            FailedCompile::Save => {
+                lsp.did_save(DidSaveTextDocumentParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: Url::from_file_path(&saved).unwrap(),
+                    },
+                    text: None,
+                })
+                .await;
+                assert!(
+                    lsp.published_files.state.lock().await.failed > 0,
+                    "the save's compile did not fail"
+                );
+            }
+            FailedCompile::Watched => {
+                lsp.did_change_watched_files(watched(&saved)).await;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while lsp.published_files.state.lock().await.failed == 0
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(
+                    lsp.published_files.state.lock().await.failed > 0,
+                    "the debounced compile did not fail"
+                );
+            }
+        }
+        assert!(!has_column("m02", "saved").await);
+        {
+            // Nothing is scheduled: a compile that fails runs no other one
+            // by itself. The failed compile's files wait for the next one.
+            let state = lsp.recompile_pending.state.lock().unwrap();
+            assert!(!state.scheduled, "a failed compile scheduled a recompile");
+            match how {
+                FailedCompile::Save => assert!(state.unknown, "the next compile is not full"),
+                FailedCompile::Watched => {
+                    assert!(state.files.contains(&saved), "the failed pass's file was lost");
+                }
+            }
+        }
+
+        // The sidecar is fixed outside the editor.
+        std::fs::write(&broken, sidecar(5)).unwrap();
+        lsp.did_change_watched_files(watched(&broken)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !has_column("m02", "saved").await && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            has_column("m02", "saved").await,
+            "the file the failed compile read was never compiled again"
+        );
+
+        // The final stored result equals a from-scratch compile.
+        let scratch = rocky_compiler::compile::compile(&config).unwrap();
         let stored = lsp.compile_result.read().await;
         let stored = stored.as_ref().expect("a compile result is stored");
         for (name, cols) in &scratch.type_check.typed_models {
