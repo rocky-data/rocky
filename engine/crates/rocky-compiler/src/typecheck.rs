@@ -1268,9 +1268,12 @@ fn check_time_interval_strategy(
             .with_suggestion(format!(
                 "In the outer SELECT's WHERE, compare `{time_column}` with `>=`, `>`, `<`, \
                  `<=`, `=` or `<>`, joined by AND, and select it as a bare column, as in \
-                 `WHERE {time_column} >= @start_date AND {time_column} < @end_date`. \
-                 `BETWEEN` and `OR` do not count. Or COALESCE it with a NOT NULL column, as \
-                 in `COALESCE({time_column}, other_col)`. Or read it from a column that is NOT \
+                 `WHERE {time_column} >= @start_date AND {time_column} < @end_date`. Spell \
+                 the column in the WHERE exactly as in the SELECT, with the same qualifier. \
+                 `BETWEEN` and `OR` do not count, and the WHERE does not help under GROUP BY \
+                 ROLLUP, CUBE or GROUPING SETS. Or COALESCE it with a NOT NULL column of the \
+                 same type, NOT NULL as Rocky knows it (declared or inferred), as in \
+                 `COALESCE({time_column}, other_col)`. Or read it from a column that is NOT \
                  NULL in a source schema Rocky has. A filter in an upstream model, or `WHERE \
                  {time_column} IS NOT NULL`, does not help: Rocky does not read them when it infers nullability"
             )),
@@ -11321,8 +11324,14 @@ mod tests {
             let result = time_interval_compile(sql, orders_with_dates());
             assert!(e022(&result).is_none(), "{sql}: {:?}", result.diagnostics);
         }
-        // Not remedies: `BETWEEN` and `OR` in this model's WHERE.
+        // Not remedies: `BETWEEN`, `OR`, a WHERE that spells the column
+        // without the SELECT's qualifier, and ROLLUP.
         for sql in [
+            "SELECT o.order_date FROM raw.orders AS o \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            "SELECT order_date, COUNT(*) AS n FROM raw.orders \
+             WHERE order_date >= @start_date AND order_date < @end_date \
+             GROUP BY ROLLUP(order_date)",
             "SELECT order_date FROM raw.orders \
              WHERE order_date BETWEEN @start_date AND @end_date",
             "SELECT order_date FROM raw.orders \
@@ -11331,6 +11340,17 @@ mod tests {
             let result = time_interval_compile(sql, orders_with_dates());
             assert!(e022(&result).is_some(), "{sql}: {:?}", result.diagnostics);
         }
+        // A NOT NULL column of another type: the supertype is lost, so E022
+        // is skipped for want of a type, not because non-null is proven.
+        // The help asks for the same type.
+        let sql = "SELECT COALESCE(order_date, ts) AS order_date FROM raw.orders \
+                   WHERE ts >= @start_date AND ts < @end_date";
+        let result = time_interval_compile(sql, orders_with_dates());
+        assert_eq!(
+            column(&result, "m", "order_date").data_type,
+            RockyType::Unknown,
+            "{sql}"
+        );
         // Not remedies: `IS NOT NULL` in this model's WHERE.
         let sql = "SELECT order_date FROM raw.orders \
                    WHERE order_date IS NOT NULL AND ts >= @start_date AND ts < @end_date";
@@ -11372,9 +11392,12 @@ mod tests {
         for remedy in [
             "`WHERE order_date >= @start_date AND order_date < @end_date`",
             "select it as a bare column",
+            "exactly as in the SELECT, with the same qualifier",
             "`BETWEEN` and `OR` do not count",
+            "GROUP BY ROLLUP, CUBE or GROUPING SETS",
             "`COALESCE(order_date, other_col)`",
-            "COALESCE it with a NOT NULL column",
+            "COALESCE it with a NOT NULL column of the same type",
+            "NOT NULL as Rocky knows it (declared or inferred)",
             "NOT NULL in a source schema",
             "A filter in an upstream model, or `WHERE order_date IS NOT NULL`, does not help",
         ] {
