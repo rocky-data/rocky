@@ -1266,12 +1266,13 @@ fn check_time_interval_strategy(
             // comparison on the bare column counts ([`where_rejects_null_column`]),
             // and `IS NOT NULL` is not such a comparison.
             .with_suggestion(format!(
-                "Compare `{time_column}` in this model's WHERE and select it as a bare \
-                 column, as in `WHERE {time_column} >= @start_date`. Or COALESCE it with a \
-                 NOT NULL column of the same type, as in `COALESCE({time_column}, other_col)`. \
-                 Or read it from a column that is NOT NULL in a source schema Rocky has. A \
-                 filter in an upstream model, or `WHERE {time_column} IS NOT NULL`, does not \
-                 help: Rocky does not read them when it infers nullability"
+                "In the outer SELECT's WHERE, compare `{time_column}` with `>=`, `>`, `<`, \
+                 `<=`, `=` or `<>`, joined by AND, and select it as a bare column, as in \
+                 `WHERE {time_column} >= @start_date AND {time_column} < @end_date`. \
+                 `BETWEEN` and `OR` do not count. Or COALESCE it with a NOT NULL column, as \
+                 in `COALESCE({time_column}, other_col)`. Or read it from a column that is NOT \
+                 NULL in a source schema Rocky has. A filter in an upstream model, or `WHERE \
+                 {time_column} IS NOT NULL`, does not help: Rocky does not read them when it infers nullability"
             )),
         );
     }
@@ -3428,8 +3429,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
 /// Whether `func` is a `COALESCE`: `COALESCE(...)` itself, or `IFNULL(a, b)` /
 /// `NVL(a, b)`, which are a two-argument `COALESCE` on every warehouse that
 /// has them (DuckDB, Snowflake, Databricks, BigQuery and Redshift spell one or
-/// both). An `IFNULL` or `NVL` with any other number of arguments is not one,
-/// so it is never read as non-null. Every site that reads a `COALESCE` by
+/// both). An `IFNULL` or `NVL` with any other number of arguments is not read
+/// as one (most warehouses refuse it; Redshift's `NVL` takes more), so it
+/// stays untyped and nullable: less precise, never wrongly non-null. Every site that reads a `COALESCE` by
 /// name goes through here, so the three spellings cannot drift apart.
 fn is_coalesce_call(func: &ast::Function) -> bool {
     match func.name.to_string().to_uppercase().as_str() {
@@ -11319,6 +11321,16 @@ mod tests {
             let result = time_interval_compile(sql, orders_with_dates());
             assert!(e022(&result).is_none(), "{sql}: {:?}", result.diagnostics);
         }
+        // Not remedies: `BETWEEN` and `OR` in this model's WHERE.
+        for sql in [
+            "SELECT order_date FROM raw.orders \
+             WHERE order_date BETWEEN @start_date AND @end_date",
+            "SELECT order_date FROM raw.orders \
+             WHERE (order_date >= @start_date OR ts >= @start_date) AND ts < @end_date",
+        ] {
+            let result = time_interval_compile(sql, orders_with_dates());
+            assert!(e022(&result).is_some(), "{sql}: {:?}", result.diagnostics);
+        }
         // Not remedies: `IS NOT NULL` in this model's WHERE.
         let sql = "SELECT order_date FROM raw.orders \
                    WHERE order_date IS NOT NULL AND ts >= @start_date AND ts < @end_date";
@@ -11358,10 +11370,11 @@ mod tests {
             result.diagnostics
         );
         for remedy in [
-            "`WHERE order_date >= @start_date`",
+            "`WHERE order_date >= @start_date AND order_date < @end_date`",
             "select it as a bare column",
+            "`BETWEEN` and `OR` do not count",
             "`COALESCE(order_date, other_col)`",
-            "NOT NULL column of the same type",
+            "COALESCE it with a NOT NULL column",
             "NOT NULL in a source schema",
             "A filter in an upstream model, or `WHERE order_date IS NOT NULL`, does not help",
         ] {
