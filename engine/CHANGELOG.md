@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky lsp` no longer loses a saved file's changes when the compile that the save starts fails. After a failed save or startup compile, the next compile runs in full, so it reads the saved file again. After a failed edit compile, the next compile marks that edit's files again. When another compile succeeds and is stored while the failed one runs, or after it fails, the server compiles once more after the usual short delay for the kept files. Compiles that only fail never start another compile, even when they overlap, so a project that cannot compile does not compile over and over.
+
 ## [1.92.0] — 2026-11-10
 
 ### Upgrade notes
@@ -26,7 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `rocky lsp` no longer loses a saved file's changes when the compile that the save starts fails. After a failed save or startup compile, the next compile runs in full, so it reads the saved file again. After a failed edit compile, the next compile marks that edit's files again. When another compile succeeds and is stored while the failed one runs, or after it fails, the server compiles once more at once for the kept files. Compiles that only fail never start another compile, even when they overlap, so a project that cannot compile does not compile over and over.
 - `rocky lsp` no longer loses a saved file's changes when the full compile that the save starts finishes after a newer edit's compile. That newer compile started from the result stored before the save and checked only its own file. The save's result was then dropped, and nothing checked the saved file again, so with an editor that sends no watched-file event for a save, its new columns and diagnostics were missing for the rest of the session. A dropped save result now starts one more full compile.
 - `rocky run --watch --all` on a replication pipeline now watches `models` under the working directory, which `--all` runs compiled models from. Before, it watched `rocky.toml` alone, so a model edit did not re-run. `--watch` also says at startup when the selected pipeline reads no file it watches: a replication pipeline without `--all` or `--models`, a quality or snapshot pipeline, or a load pipeline, whose source files are not watched. Then only an edit to `rocky.toml` re-runs it.
 - `rocky lsp` now asks the editor to watch `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql`, when the editor's LSP client supports dynamic registration of watched files. Before, only the VS Code extension watched them, so in other editors an edit to a `_defaults.toml` or `groups/*.toml` file that was not open never reached the server. The VS Code extension no longer sets its own watcher list, so each change reaches the server once. An extension from this release needs an engine from this release for watched-file events.
