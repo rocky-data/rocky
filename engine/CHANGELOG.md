@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky lsp` no longer loses a saved file's changes when the compile that the save starts fails. After a failed save or startup compile, the next compile runs in full, so it reads the saved file again. After a failed edit compile, the next compile marks that edit's files again. When another compile succeeds and is stored while the failed one runs, or after it fails, the server compiles once more after the usual short delay for the kept files. Compiles that only fail never start another compile, even when they overlap, so a project that cannot compile does not compile over and over.
+
 ## [1.92.0] — 2026-11-10
 
 ### Upgrade notes
