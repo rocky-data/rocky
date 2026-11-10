@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.92.0] — 2026-11-10
+
 ### Upgrade notes
 
 - A plan made before this release refuses to apply once with the "config has changed" re-plan message, unless its `[cost]` sets both `storage_cost_per_gb_month` and `compute_cost_per_dbu`. The plan's config snapshot no longer records the two unset prices. Re-run `rocky plan` and apply the new `plan_id`.
