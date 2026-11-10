@@ -418,6 +418,22 @@ impl PendingRecompile {
         }
     }
 
+    /// Schedule the recompile for the files [`Self::carry`] kept, when the
+    /// stored result is already newer than the failed compile that kept
+    /// them, so no later change may come to take them. `true` when files are
+    /// kept and no recompile was scheduled, so the caller runs one. When a
+    /// recompile already took them, it is newer and nothing is scheduled.
+    fn schedule_carried(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.unknown && state.files.is_empty() {
+            return false;
+        }
+        !std::mem::replace(&mut state.scheduled, true)
+    }
+
     /// Take the files for the recompile about to run, and clear the
     /// schedule. `None` when one change had no file path: compile in full.
     fn take(&self) -> Option<Vec<std::path::PathBuf>> {
@@ -442,179 +458,210 @@ impl RockyLsp {
             schedule |= self.recompile_pending.record(path);
         }
         if schedule {
-            let client = self.client.clone();
-            let compile_result = self.compile_result.clone();
-            let models_dir = self.models_dir.clone();
-            let pending = self.recompile_pending.clone();
-            // Share the throttle so the did_change debounced recompile
-            // doesn't re-emit the info log that `recompile()` already
-            // emitted for the same project.
-            let schema_cache_throttle = self.schema_cache_throttle.clone();
-            let config_diagnostic_published = self.config_diagnostic_published.clone();
-            let published_files = self.published_files.clone();
-            let salsa_db = self.salsa_db.clone();
-            let salsa_sources = self.salsa_sources.clone();
-            let cast_targets = self.cast_targets.clone();
+            self.spawn_recompile();
+        }
+    }
 
-            tokio::spawn(async move {
-                // One pass per debounce window. A pass whose result a newer
-                // compile outranked runs again (see the end of the loop).
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    // Every path recorded up to here; a change after this
-                    // schedules the next recompile.
-                    let changed_files = pending.take();
+    /// Schedule the recompile for the files a failed compile kept, when the
+    /// stored result is already newer than that failure (see
+    /// [`PendingRecompile::schedule_carried`]).
+    fn schedule_carried_recompile(&self) {
+        if self.recompile_pending.schedule_carried() {
+            self.spawn_recompile();
+        }
+    }
 
-                    let dir = models_dir.read().await;
-                    let Some(ref dir) = *dir else { return };
+    /// Start the debounced recompile task. The caller has set `scheduled`.
+    fn spawn_recompile(&self) {
+        let client = self.client.clone();
+        let compile_result = self.compile_result.clone();
+        let models_dir = self.models_dir.clone();
+        let pending = self.recompile_pending.clone();
+        // Share the throttle so the did_change debounced recompile
+        // doesn't re-emit the info log that `recompile()` already
+        // emitted for the same project.
+        let schema_cache_throttle = self.schema_cache_throttle.clone();
+        let config_diagnostic_published = self.config_diagnostic_published.clone();
+        let published_files = self.published_files.clone();
+        let salsa_db = self.salsa_db.clone();
+        let salsa_sources = self.salsa_sources.clone();
+        let cast_targets = self.cast_targets.clone();
 
-                    // Keep the per-keystroke typecheck grounded in real
-                    // warehouse types when the cache is warm. Throttle
-                    // guarantees the info log fires at most once per session
-                    // per project.
-                    let dir_path = std::path::PathBuf::from(dir);
-                    let source_schemas =
-                        Self::load_cached_source_schemas(&dir_path, &schema_cache_throttle, dir)
-                            .await;
+        tokio::spawn(async move {
+            // One pass per debounce window. A pass whose result a newer
+            // compile outranked runs again (see the end of the loop).
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // Every path recorded up to here; a change after this
+                // schedules the next recompile.
+                let changed_files = pending.take();
 
-                    // Same project inputs as the initial compile. Building
-                    // this from `Default` left W004 off and dropped the project
-                    // `[freshness]` block after the first edit, so a model's
-                    // inherited freshness vanished from the IDE's view of the
-                    // project the moment the user typed.
-                    let (mask, allow_unmasked, project_freshness, config_unreadable) =
-                        Self::project_compiler_inputs(&dir_path);
-                    Self::publish_project_config_diagnostic(
+                let dir = models_dir.read().await;
+                let Some(ref dir) = *dir else { return };
+
+                // Keep the per-keystroke typecheck grounded in real
+                // warehouse types when the cache is warm. Throttle
+                // guarantees the info log fires at most once per session
+                // per project.
+                let dir_path = std::path::PathBuf::from(dir);
+                let source_schemas =
+                    Self::load_cached_source_schemas(&dir_path, &schema_cache_throttle, dir).await;
+
+                // Same project inputs as the initial compile. Building
+                // this from `Default` left W004 off and dropped the project
+                // `[freshness]` block after the first edit, so a model's
+                // inherited freshness vanished from the IDE's view of the
+                // project the moment the user typed.
+                let (mask, allow_unmasked, project_freshness, config_unreadable) =
+                    Self::project_compiler_inputs(&dir_path);
+                Self::publish_project_config_diagnostic(
+                    &client,
+                    &config_diagnostic_published,
+                    &dir_path,
+                    config_unreadable.as_deref(),
+                )
+                .await;
+                let mut config = CompilerConfig {
+                    models_dir: dir_path,
+                    contracts_dir: None,
+                    required_explicit_contract_model: None,
+                    source_schemas,
+                    mask,
+                    allow_unmasked,
+                    project_freshness,
+                    run_vars: rocky_core::run_vars::RunVars::new(),
+                    source_provenance: Default::default(),
+                    strict_contracts: false,
+                    // Diagnostics and symbols map onto the authored text, so keep it
+                    // rather than the ephemeral-inlined form.
+                    preserve_authored_sql: true,
+                    external_dependencies: Default::default(),
+                    project: None,
+                    // Set below: kept for an incremental compile, resolved
+                    // afresh for a full one (see `CastTargets`).
+                    target_dialects: Default::default(),
+                };
+
+                // Try incremental compilation if we have a previous result.
+                //
+                // Full compile (§P3.3) is offloaded to the blocking pool via
+                // `spawn_blocking` so it can't starve hover / completion /
+                // semantic-token handlers on the async runtime's worker
+                // threads. The incremental path stays inline because it
+                // needs a live borrow of the previous result. It is fast
+                // (<50 ms on 100-model projects) when an edit reaches few
+                // models, but `compile_incremental` falls through to a
+                // full compile, still inline, below ten models or when an
+                // edit reaches over half of them (a root `_defaults.toml`,
+                // for example).
+                let generation = published_files.begin_compile();
+                // An incremental compile keeps the previous types of every
+                // model the edit does not reach, so it needs the targets the
+                // previous compile used. A changed `rocky.toml` can change
+                // them: compile in full then.
+                let kept_targets = if changed_files
+                    .as_ref()
+                    .is_some_and(|files| !files.is_empty())
+                    && compile_result.read().await.is_some()
+                {
+                    cast_targets.kept(&config.models_dir)
+                } else {
+                    None
+                };
+                // A full compile also returns the targets it resolved, kept
+                // only once its result is the stored one.
+                let new_result = if let Some(targets) = kept_targets {
+                    config.target_dialects = targets;
+                    let prev = compile_result.read().await;
+                    let prev_ref = prev.as_ref().expect("checked use_incremental above");
+                    let files = changed_files
+                        .as_deref()
+                        .expect("checked use_incremental above");
+                    compile_incremental(files, prev_ref, &config)
+                        .ok()
+                        .map(|result| (result, None))
+                } else {
+                    let mut config_for_blocking = config.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let resolved = CastTargets::resolve(&config_for_blocking.models_dir);
+                        config_for_blocking.target_dialects = resolved.targets.clone();
+                        rocky_compiler::compile::compile(&config_for_blocking)
+                            .ok()
+                            .map(|result| (result, Some(resolved)))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                };
+
+                if let Some((mut result, resolved)) = new_result {
+                    #[cfg(test)]
+                    publish_gate::wait(&config.models_dir).await;
+                    apply_project_gates(&config.models_dir, &mut result);
+                    let publication = Self::publish_compile_diagnostics(
                         &client,
-                        &config_diagnostic_published,
-                        &dir_path,
-                        config_unreadable.as_deref(),
+                        &published_files,
+                        &compile_result,
+                        generation,
+                        result,
                     )
                     .await;
-                    let mut config = CompilerConfig {
-                        models_dir: dir_path,
-                        contracts_dir: None,
-                        required_explicit_contract_model: None,
-                        source_schemas,
-                        mask,
-                        allow_unmasked,
-                        project_freshness,
-                        run_vars: rocky_core::run_vars::RunVars::new(),
-                        source_provenance: Default::default(),
-                        strict_contracts: false,
-                        // Diagnostics and symbols map onto the authored text, so keep it
-                        // rather than the ephemeral-inlined form.
-                        preserve_authored_sql: true,
-                        external_dependencies: Default::default(),
-                        project: None,
-                        // Set below: kept for an incremental compile, resolved
-                        // afresh for a full one (see `CastTargets`).
-                        target_dialects: Default::default(),
-                    };
-
-                    // Try incremental compilation if we have a previous result.
-                    //
-                    // Full compile (§P3.3) is offloaded to the blocking pool via
-                    // `spawn_blocking` so it can't starve hover / completion /
-                    // semantic-token handlers on the async runtime's worker
-                    // threads. The incremental path stays inline because it
-                    // needs a live borrow of the previous result. It is fast
-                    // (<50 ms on 100-model projects) when an edit reaches few
-                    // models, but `compile_incremental` falls through to a
-                    // full compile, still inline, below ten models or when an
-                    // edit reaches over half of them (a root `_defaults.toml`,
-                    // for example).
-                    let generation = published_files.begin_compile();
-                    // An incremental compile keeps the previous types of every
-                    // model the edit does not reach, so it needs the targets the
-                    // previous compile used. A changed `rocky.toml` can change
-                    // them: compile in full then.
-                    let kept_targets = if changed_files
-                        .as_ref()
-                        .is_some_and(|files| !files.is_empty())
-                        && compile_result.read().await.is_some()
-                    {
-                        cast_targets.kept(&config.models_dir)
-                    } else {
-                        None
-                    };
-                    // A full compile also returns the targets it resolved, kept
-                    // only once its result is the stored one.
-                    let new_result = if let Some(targets) = kept_targets {
-                        config.target_dialects = targets;
-                        let prev = compile_result.read().await;
-                        let prev_ref = prev.as_ref().expect("checked use_incremental above");
-                        let files = changed_files
-                            .as_deref()
-                            .expect("checked use_incremental above");
-                        compile_incremental(files, prev_ref, &config)
-                            .ok()
-                            .map(|result| (result, None))
-                    } else {
-                        let mut config_for_blocking = config.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let resolved = CastTargets::resolve(&config_for_blocking.models_dir);
-                            config_for_blocking.target_dialects = resolved.targets.clone();
-                            rocky_compiler::compile::compile(&config_for_blocking)
-                                .ok()
-                                .map(|result| (result, Some(resolved)))
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                    };
-
-                    if let Some((mut result, resolved)) = new_result {
-                        #[cfg(test)]
-                        publish_gate::wait(&config.models_dir).await;
-                        apply_project_gates(&config.models_dir, &mut result);
-                        let stored = Self::publish_compile_diagnostics(
-                            &client,
-                            &published_files,
-                            &compile_result,
-                            generation,
-                            result,
-                        )
-                        .await;
-                        if stored {
-                            if let Some(resolved) = resolved {
-                                cast_targets.keep(generation, resolved);
-                            }
-                            break;
+                    if publication.stored() {
+                        if let Some(resolved) = resolved {
+                            cast_targets.keep(generation, resolved);
                         }
-                        // A newer compile was stored first. It may have started
-                        // from the same previous result as this one and marked
-                        // only its own files, so this window's files are not in
-                        // it: a `_defaults.toml` edit taken here would be lost
-                        // for the session. Record them again, so they are marked
-                        // against the newer stored result. When a recompile is
-                        // already scheduled it takes them; otherwise this task
-                        // runs one more pass.
-                        if !pending.record_again(changed_files) {
-                            break;
+                        // A newer compile failed and kept its files, and
+                        // this older result does not have them. Run one
+                        // more pass for them, unless a recompile took
+                        // them already.
+                        if publication == Publication::StoredBeforeFailure
+                            && pending.schedule_carried()
+                        {
+                            continue;
                         }
-                    } else {
-                        // A newer compile that failed still outranks an older
-                        // one that may yet succeed.
-                        published_files.compile_failed(generation).await;
-                        // This window's files are not in the stored result.
-                        // Keep them for the next recompile (see `carry`).
-                        pending.carry(changed_files);
-                        // Same as `recompile`: a failed compile builds no
-                        // diagnostic, so surface the `.rocky` parse errors.
-                        Self::publish_dsl_parse_diagnostics(
-                            &client,
-                            &published_files,
-                            &salsa_db,
-                            &salsa_sources,
-                            &config.models_dir,
-                        )
-                        .await;
                         break;
                     }
+                    // A newer compile was stored first. It may have started
+                    // from the same previous result as this one and marked
+                    // only its own files, so this window's files are not in
+                    // it: a `_defaults.toml` edit taken here would be lost
+                    // for the session. Record them again, so they are marked
+                    // against the newer stored result. When a recompile is
+                    // already scheduled it takes them; otherwise this task
+                    // runs one more pass.
+                    if !pending.record_again(changed_files) {
+                        break;
+                    }
+                } else {
+                    #[cfg(test)]
+                    publish_gate::wait(&config.models_dir).await;
+                    // A newer compile that failed still outranks an older
+                    // one that may yet succeed.
+                    let newer_stored = published_files.compile_failed(generation).await;
+                    // This window's files are not in the stored result.
+                    // Keep them for the next recompile (see `carry`).
+                    pending.carry(changed_files);
+                    // Same as `recompile`: a failed compile builds no
+                    // diagnostic, so surface the `.rocky` parse errors.
+                    Self::publish_dsl_parse_diagnostics(
+                        &client,
+                        &published_files,
+                        &salsa_db,
+                        &salsa_sources,
+                        &config.models_dir,
+                    )
+                    .await;
+                    // A newer compile was stored first, and no later
+                    // change may come to take the kept files: run one
+                    // more pass for them now. It starts from the newer
+                    // result, so it can succeed where this one failed.
+                    if newer_stored && pending.schedule_carried() {
+                        continue;
+                    }
+                    break;
                 }
-            });
-        }
+            }
+        });
     }
 }
 
@@ -974,9 +1021,11 @@ impl RockyLsp {
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
+                #[cfg(test)]
+                publish_gate::wait(&dir_path).await;
                 // A newer compile that failed still outranks an older one
                 // that may yet succeed: that one must not publish over it.
-                self.published_files.compile_failed(generation).await;
+                let newer_stored = self.published_files.compile_failed(generation).await;
                 // This compile read every file, and its result is not stored.
                 // The next debounced pass would start from the result stored
                 // before it and mark only its own files, so the file
@@ -984,6 +1033,11 @@ impl RockyLsp {
                 // Make the next recompile a full one (see `carry`). At
                 // startup nothing is stored, so the next one is full anyway.
                 self.recompile_pending.carry(None);
+                // A newer compile was stored first, so no later change may
+                // come to take the mark: compile in full now.
+                if newer_stored {
+                    self.schedule_carried_recompile();
+                }
                 // The log line above is the only place this failure went.
                 // The editor was left with NOTHING: no diagnostic (none was
                 // built), no message. A models directory that is a dangling
@@ -1336,15 +1390,23 @@ impl RockyLsp {
         map
     }
 
+    /// Publish and store `result` (see [`Self::publish_compile_diagnostics`]).
+    /// Returns whether it was stored. When it was stored older than a newer
+    /// failed compile, it schedules the recompile for the files that failure
+    /// kept: this result does not have them.
     async fn publish_diagnostics(&self, generation: u64, result: CompileResult) -> bool {
-        Self::publish_compile_diagnostics(
+        let publication = Self::publish_compile_diagnostics(
             &self.client,
             &self.published_files,
             &self.compile_result,
             generation,
             result,
         )
-        .await
+        .await;
+        if publication == Publication::StoredBeforeFailure {
+            self.schedule_carried_recompile();
+        }
+        publication.stored()
     }
 
     /// Publish the compile diagnostics, clear the files that had some at
@@ -1360,7 +1422,8 @@ impl RockyLsp {
     /// newer compile that FAILED does not drop it: that failure cleared
     /// nothing, and the older success is the last good result. The
     /// publication lock is held across the sends and the store, so two
-    /// publications never interleave. Returns whether `result` was used.
+    /// publications never interleave. Returns whether `result` was used,
+    /// and whether it is older than a newer failed compile.
     ///
     /// An associated fn because the debounced `didChange` pass runs in a
     /// spawned task that holds clones, not `&self`.
@@ -1370,14 +1433,14 @@ impl RockyLsp {
         store: &RwLock<Option<CompileResult>>,
         generation: u64,
         result: CompileResult,
-    ) -> bool {
+    ) -> Publication {
         // Only publishers take this lock; no client handler waits on it, so
         // holding it across a send cannot block the handler the send needs.
         // Handlers that read `store` never take it either, so waiting for
         // the write below cannot deadlock.
         let mut last = published.state.lock().await;
         if generation < last.generation {
-            return false;
+            return Publication::Dropped;
         }
         // A result older than a newer failed compile is still the last good
         // one: the failure built nothing, so dropping it would leave the
@@ -1402,7 +1465,11 @@ impl RockyLsp {
             client.publish_diagnostics(uri, diags, None).await;
         }
         *store.write().await = Some(result);
-        true
+        if after_failure {
+            Publication::StoredBeforeFailure
+        } else {
+            Publication::Stored
+        }
     }
 
     /// Find the model name for a given file URI.
@@ -5296,9 +5363,36 @@ impl PublishedDiagnostics {
     /// and clears nothing, so an older success that finishes later is still
     /// the last good result and may publish and be stored. Only a success
     /// that started later than it ends that.
-    async fn compile_failed(&self, generation: u64) {
+    ///
+    /// Returns whether a result newer than `generation` is already stored.
+    /// It is checked under the lock a publication holds, so no newer result
+    /// is stored between the check and the record.
+    async fn compile_failed(&self, generation: u64) -> bool {
         let mut last = self.state.lock().await;
         last.failed = last.failed.max(generation);
+        last.generation > generation
+    }
+}
+
+/// What [`RockyLsp::publish_compile_diagnostics`] did with a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publication {
+    /// Older than the last result stored: not used.
+    Dropped,
+    /// Stored, newer than every failed compile.
+    Stored,
+    /// Stored, but older than a newer compile that failed. That failure kept
+    /// its files for the next recompile, and this result does not have them.
+    StoredBeforeFailure,
+}
+
+impl Publication {
+    /// Whether the result was stored.
+    fn stored(self) -> bool {
+        match self {
+            Self::Dropped => false,
+            Self::Stored | Self::StoredBeforeFailure => true,
+        }
     }
 }
 
@@ -6496,56 +6590,8 @@ mod tests {
     }
 
     async fn a_failed_compile_keeps_its_files(how: FailedCompile) {
-        use futures::StreamExt as _;
-        use tower::Service as _;
-        use tower::ServiceExt as _;
-        use tower_lsp::jsonrpc::Request;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap().join("project");
-        let models = root.join("models");
-        std::fs::create_dir_all(&models).unwrap();
-        let sidecar = |i: usize| {
-            format!(
-                "name = \"m{i:02}\"\n[strategy]\ntype = \"full_refresh\"\n\
-                 [target]\ncatalog = \"c\"\nschema = \"s\"\n"
-            )
-        };
-        for i in 0..12 {
-            std::fs::write(models.join(format!("m{i:02}.sql")), "SELECT 1 AS id").unwrap();
-            std::fs::write(models.join(format!("m{i:02}.toml")), sidecar(i)).unwrap();
-        }
-
-        let (mut service, mut socket) = LspService::new(test_lsp);
-        tokio::spawn(async move { while socket.next().await.is_some() {} });
-        let root_uri = Url::from_directory_path(&root).unwrap();
-        for request in [
-            Request::build("initialize")
-                .id(1)
-                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
-                .finish(),
-            Request::build("initialized")
-                .params(serde_json::json!({}))
-                .finish(),
-        ] {
-            service.ready().await.unwrap().call(request).await.unwrap();
-        }
+        let (_tmp, models, service) = started_twelve_model_project().await;
         let lsp = service.inner();
-        assert!(lsp.compile_result.read().await.is_some());
-        let has_column = |model: &'static str, column: &'static str| async move {
-            lsp.compile_result
-                .read()
-                .await
-                .as_ref()
-                .and_then(|r| r.type_check.typed_models.get(model).cloned())
-                .is_some_and(|cols| cols.iter().any(|c| c.name == column))
-        };
-        let watched = |path: &std::path::Path| DidChangeWatchedFilesParams {
-            changes: vec![FileEvent {
-                uri: Url::from_file_path(path).unwrap(),
-                typ: FileChangeType::CHANGED,
-            }],
-        };
         let config = CompilerConfig {
             models_dir: models.clone(),
             ..Default::default()
@@ -6560,34 +6606,20 @@ mod tests {
         let saved = models.join("m02.sql");
         std::fs::write(&saved, "SELECT 1 AS id, 2 AS saved").unwrap();
         match how {
-            FailedCompile::Save => {
-                lsp.did_save(DidSaveTextDocumentParams {
-                    text_document: TextDocumentIdentifier {
-                        uri: Url::from_file_path(&saved).unwrap(),
-                    },
-                    text: None,
-                })
-                .await;
-                assert!(
-                    lsp.published_files.state.lock().await.failed > 0,
-                    "the save's compile did not fail"
-                );
-            }
-            FailedCompile::Watched => {
-                lsp.did_change_watched_files(watched(&saved)).await;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-                while lsp.published_files.state.lock().await.failed == 0
-                    && std::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                assert!(
-                    lsp.published_files.state.lock().await.failed > 0,
-                    "the debounced compile did not fail"
-                );
-            }
+            FailedCompile::Save => lsp.did_save(save_of(&saved)).await,
+            FailedCompile::Watched => lsp.did_change_watched_files(changed(&[&saved])).await,
         }
-        assert!(!has_column("m02", "saved").await);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while lsp.published_files.state.lock().await.failed == 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            lsp.published_files.state.lock().await.failed > 0,
+            "the compile did not fail"
+        );
+        assert!(!has_column(lsp, "m02", "saved").await);
         {
             // Nothing is scheduled: a compile that fails runs no other one
             // by itself. The failed compile's files wait for the next one.
@@ -6605,19 +6637,273 @@ mod tests {
         }
 
         // The sidecar is fixed outside the editor.
-        std::fs::write(&broken, sidecar(5)).unwrap();
-        lsp.did_change_watched_files(watched(&broken)).await;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !has_column("m02", "saved").await && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        std::fs::write(&broken, twelve_model_sidecar(5)).unwrap();
+        lsp.did_change_watched_files(changed(&[&broken])).await;
         assert!(
-            has_column("m02", "saved").await,
+            wait_for_column(lsp, "m02", "saved").await,
             "the file the failed compile read was never compiled again"
         );
+        assert_equals_a_compile_from_scratch(lsp, &models).await;
+    }
 
-        // The final stored result equals a from-scratch compile.
-        let scratch = rocky_compiler::compile::compile(&config).unwrap();
+    /// An edit's debounced pass starts, then a save's full compile fails
+    /// while the pass is still running. The pass's older result is stored
+    /// after the failure, as the last good one. It does not have the saved
+    /// file, and when the failure was brief (a file read while an editor
+    /// wrote it) no later change comes to take the full-compile mark the
+    /// failure kept. Storing that older result must schedule the compile for
+    /// the mark.
+    #[tokio::test]
+    async fn an_older_result_stored_after_a_failed_save_compiles_its_files() {
+        let (_tmp, models, service) = started_twelve_model_project().await;
+        let lsp = service.inner();
+
+        // The edit's pass compiles, and is held before it publishes.
+        let gate = publish_gate::install(models.clone());
+        let edited = models.join("m01.sql");
+        std::fs::write(&edited, "SELECT 1 AS id, 2 AS marker").unwrap();
+        lsp.did_change_watched_files(changed(&[&edited])).await;
+        assert!(wait_for_gate(&gate).await, "the edit's pass never compiled");
+
+        // The save's full compile fails while that pass is held.
+        let broken = models.join("m05.toml");
+        std::fs::write(&broken, "name = [").unwrap();
+        let saved = models.join("m02.sql");
+        std::fs::write(&saved, "SELECT 1 AS id, 2 AS saved").unwrap();
+        lsp.did_save(save_of(&saved)).await;
+        assert!(lsp.published_files.state.lock().await.failed > 0);
+        assert!(!lsp.recompile_pending.state.lock().unwrap().scheduled);
+
+        // The failure goes away with no event for it.
+        std::fs::write(&broken, twelve_model_sidecar(5)).unwrap();
+        gate.release.notify_one();
+        assert!(
+            wait_for_column(lsp, "m01", "marker").await,
+            "the edit's pass was not stored"
+        );
+        let compiled_again = wait_for_column(lsp, "m02", "saved").await;
+        publish_gate::remove(&models);
+        assert!(compiled_again, "the saved file was never compiled again");
+        assert_equals_a_compile_from_scratch(lsp, &models).await;
+    }
+
+    /// The same, the other way round: a save's full compile succeeds and is
+    /// held, an edit's pass fails and keeps its file, and the save's older
+    /// result is then stored. It was compiled before the edit, so the kept
+    /// file must be compiled again.
+    #[tokio::test]
+    async fn an_older_save_result_stored_after_a_failed_edit_compiles_its_files() {
+        let (_tmp, models, service) = started_twelve_model_project().await;
+        let lsp = service.inner();
+
+        let gate = publish_gate::install(models.clone());
+        let saved = models.join("m01.sql");
+        std::fs::write(&saved, "SELECT 1 AS id, 2 AS marker").unwrap();
+        let save = lsp.did_save(save_of(&saved));
+        let drive = async {
+            // The save's compile, held before it publishes.
+            assert!(wait_for_gate(&gate).await, "the save never compiled");
+
+            // An edit's pass fails while the save is held.
+            let broken = models.join("m05.toml");
+            std::fs::write(&broken, "name = [").unwrap();
+            let edited = models.join("m02.sql");
+            std::fs::write(&edited, "SELECT 1 AS id, 2 AS saved").unwrap();
+            lsp.did_change_watched_files(changed(&[&edited])).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while lsp.published_files.state.lock().await.failed == 0
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                lsp.published_files.state.lock().await.failed > 0,
+                "the edit's pass did not fail"
+            );
+
+            // The failure goes away with no event for it.
+            std::fs::write(&broken, twelve_model_sidecar(5)).unwrap();
+            gate.release.notify_one();
+        };
+        tokio::join!(save, drive);
+
+        assert!(
+            has_column(lsp, "m01", "marker").await,
+            "the save was not stored"
+        );
+        let compiled_again = wait_for_column(lsp, "m02", "saved").await;
+        publish_gate::remove(&models);
+        assert!(compiled_again, "the edited file was never compiled again");
+        assert_equals_a_compile_from_scratch(lsp, &models).await;
+    }
+
+    /// A compile fails, and before it records the failure, a newer pass for
+    /// the fix of the broken file is stored. That pass started from the
+    /// result stored before the failed compile and marked only the fix. The
+    /// failed compile's files must be compiled again at once: no later
+    /// change may come to take them.
+    #[tokio::test]
+    async fn a_save_compile_that_fails_after_a_newer_result_compiles_again() {
+        a_compile_that_fails_after_a_newer_result_compiles_again(FailedCompile::Save).await;
+    }
+
+    #[tokio::test]
+    async fn a_debounced_compile_that_fails_after_a_newer_result_compiles_again() {
+        a_compile_that_fails_after_a_newer_result_compiles_again(FailedCompile::Watched).await;
+    }
+
+    async fn a_compile_that_fails_after_a_newer_result_compiles_again(how: FailedCompile) {
+        let (_tmp, models, service) = started_twelve_model_project().await;
+        let lsp = service.inner();
+
+        let gate = publish_gate::install(models.clone());
+        let broken = models.join("m05.toml");
+        std::fs::write(&broken, "name = [").unwrap();
+        let saved = models.join("m02.sql");
+        std::fs::write(&saved, "SELECT 1 AS id, 2 AS saved").unwrap();
+        let failing = async {
+            match how {
+                FailedCompile::Save => lsp.did_save(save_of(&saved)).await,
+                FailedCompile::Watched => {
+                    lsp.did_change_watched_files(changed(&[&saved])).await;
+                }
+            }
+        };
+        let drive = async {
+            // The failed compile, held before it records its failure.
+            assert!(wait_for_gate(&gate).await, "the compile never failed");
+
+            // The broken sidecar is fixed outside the editor, and that pass
+            // is stored first.
+            std::fs::write(&broken, twelve_model_sidecar(5)).unwrap();
+            let fixed = models.join("m05.sql");
+            std::fs::write(&fixed, "SELECT 1 AS id, 2 AS marker").unwrap();
+            lsp.did_change_watched_files(changed(&[&fixed, &broken]))
+                .await;
+            assert!(
+                wait_for_column(lsp, "m05", "marker").await,
+                "the fix was never stored"
+            );
+            assert!(
+                !has_column(lsp, "m02", "saved").await,
+                "the fix's pass marked only its own model"
+            );
+            gate.release.notify_one();
+        };
+        tokio::join!(failing, drive);
+
+        let compiled_again = wait_for_column(lsp, "m02", "saved").await;
+        publish_gate::remove(&models);
+        assert!(
+            compiled_again,
+            "the file the failed compile read was never compiled again"
+        );
+        assert_equals_a_compile_from_scratch(lsp, &models).await;
+    }
+
+    /// The sidecar of model `m{i:02}` in [`started_twelve_model_project`].
+    fn twelve_model_sidecar(i: usize) -> String {
+        format!(
+            "name = \"m{i:02}\"\n[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\n"
+        )
+    }
+
+    /// A started server over a project of twelve `.sql` models, `m00` to
+    /// `m11`, each `SELECT 1 AS id`. Twelve, so a change to one model
+    /// compiles incrementally. Returns the temp dir to keep, and the models
+    /// directory.
+    async fn started_twelve_model_project()
+    -> (tempfile::TempDir, std::path::PathBuf, LspService<RockyLsp>) {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("project");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for i in 0..12 {
+            std::fs::write(models.join(format!("m{i:02}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                models.join(format!("m{i:02}.toml")),
+                twelve_model_sidecar(i),
+            )
+            .unwrap();
+        }
+
+        let (mut service, mut socket) = LspService::new(test_lsp);
+        tokio::spawn(async move { while socket.next().await.is_some() {} });
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        for request in [
+            Request::build("initialize")
+                .id(1)
+                .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+                .finish(),
+            Request::build("initialized")
+                .params(serde_json::json!({}))
+                .finish(),
+        ] {
+            service.ready().await.unwrap().call(request).await.unwrap();
+        }
+        assert!(service.inner().compile_result.read().await.is_some());
+        (tmp, models, service)
+    }
+
+    async fn has_column(lsp: &RockyLsp, model: &str, column: &str) -> bool {
+        lsp.compile_result
+            .read()
+            .await
+            .as_ref()
+            .and_then(|r| r.type_check.typed_models.get(model).cloned())
+            .is_some_and(|cols| cols.iter().any(|c| c.name == column))
+    }
+
+    async fn wait_for_column(lsp: &RockyLsp, model: &str, column: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !has_column(lsp, model, column).await && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        has_column(lsp, model, column).await
+    }
+
+    async fn wait_for_gate(gate: &publish_gate::Gate) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate.arrived.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        gate.arrived.load(Ordering::SeqCst)
+    }
+
+    fn changed(paths: &[&std::path::Path]) -> DidChangeWatchedFilesParams {
+        DidChangeWatchedFilesParams {
+            changes: paths
+                .iter()
+                .map(|path| FileEvent {
+                    uri: Url::from_file_path(path).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                })
+                .collect(),
+        }
+    }
+
+    fn save_of(path: &std::path::Path) -> DidSaveTextDocumentParams {
+        DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::from_file_path(path).unwrap(),
+            },
+            text: None,
+        }
+    }
+
+    /// The stored result's typed columns equal a compile from scratch.
+    async fn assert_equals_a_compile_from_scratch(lsp: &RockyLsp, models: &std::path::Path) {
+        let scratch = rocky_compiler::compile::compile(&CompilerConfig {
+            models_dir: models.to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap();
         let stored = lsp.compile_result.read().await;
         let stored = stored.as_ref().expect("a compile result is stored");
         for (name, cols) in &scratch.type_check.typed_models {
