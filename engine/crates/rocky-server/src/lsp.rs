@@ -6596,7 +6596,10 @@ mod tests {
             match how {
                 FailedCompile::Save => assert!(state.unknown, "the next compile is not full"),
                 FailedCompile::Watched => {
-                    assert!(state.files.contains(&saved), "the failed pass's file was lost");
+                    assert!(
+                        state.files.contains(&saved),
+                        "the failed pass's file was lost"
+                    );
                 }
             }
         }
