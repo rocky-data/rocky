@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.54.0] — 2026-11-10
+
 ### Changed
 
-- The extension no longer sets its own list of watched files. The language server now registers `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql` itself when it starts, so each change on disk reaches it once, not twice. This needs an engine with that registration (the next engine release). With an older engine, an edit to a file that is not open, such as a `_defaults.toml`, shows only at the next recompile.
+- The extension no longer sets its own list of watched files. The language server now registers `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql` itself when it starts, so each change on disk reaches it once, not twice. This needs engine 1.92.0 or later. With an older engine, an edit to a file that is not open, such as a `_defaults.toml`, shows only at the next recompile.
 
 ## [1.53.0] — 2026-11-08
 
