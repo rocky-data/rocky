@@ -638,8 +638,8 @@ impl RockyLsp {
                 } else {
                     #[cfg(test)]
                     {
-                        publish_gate::wait(&config.models_dir).await;
                         publish_gate::wait_failure(&config.models_dir).await;
+                        publish_gate::wait(&config.models_dir).await;
                     }
                     // This window's files are not in the stored result.
                     // Keep them for the next recompile (see `carry`). Kept
@@ -700,7 +700,7 @@ mod publish_gate {
     /// failure before it keeps its files and records the failure.
     static GATES: Gates = std::sync::Mutex::new(Vec::new());
 
-    /// Gates only failed compiles stop at, after [`GATES`].
+    /// Gates only failed compiles stop at, before [`GATES`].
     static FAILURE_GATES: Gates = std::sync::Mutex::new(Vec::new());
 
     fn install_in(gates: &Gates, models_dir: PathBuf) -> Arc<Gate> {
@@ -1062,8 +1062,8 @@ impl RockyLsp {
                 info!(error = %e, "LSP compilation failed");
                 #[cfg(test)]
                 {
-                    publish_gate::wait(&dir_path).await;
                     publish_gate::wait_failure(&dir_path).await;
+                    publish_gate::wait(&dir_path).await;
                 }
                 // This compile read every file, and its result is not stored.
                 // The next debounced pass would start from the result stored
@@ -6834,6 +6834,58 @@ mod tests {
         };
         tokio::join!(save, drive);
 
+        let compiled_again = wait_for_column(lsp, "m02", "saved").await;
+        publish_gate::remove(&models);
+        assert!(compiled_again, "the saved file was never compiled again");
+        assert_equals_a_compile_from_scratch(lsp, &models).await;
+    }
+
+    /// A save's full compile fails. While it is held before it keeps its
+    /// mark, the fix of the broken file starts a newer pass, which takes only
+    /// the fix. That pass is stored after the failure is recorded, so it
+    /// never sees the mark. The failure must schedule a compile for the mark
+    /// because a newer compile began while it ran.
+    #[tokio::test]
+    async fn a_save_that_fails_while_a_newer_pass_runs_compiles_again() {
+        let (_tmp, models, service) = started_twelve_model_project().await;
+        let lsp = service.inner();
+
+        let gate = publish_gate::install(models.clone());
+        let failure_gate = publish_gate::install_failure(models.clone());
+        let broken = models.join("m05.toml");
+        std::fs::write(&broken, "name = [").unwrap();
+        let saved = models.join("m02.sql");
+        std::fs::write(&saved, "SELECT 1 AS id, 2 AS saved").unwrap();
+        let save = lsp.did_save(save_of(&saved));
+        let drive = async {
+            // The save failed, and is held before it keeps its mark.
+            assert!(wait_for_gate(&failure_gate).await, "the save never failed");
+            // The fix's pass begins, takes only the fix, and is held before
+            // it publishes.
+            std::fs::write(&broken, twelve_model_sidecar(5)).unwrap();
+            let fixed = models.join("m05.sql");
+            std::fs::write(&fixed, "SELECT 1 AS id, 2 AS marker").unwrap();
+            lsp.did_change_watched_files(changed(&[&fixed, &broken]))
+                .await;
+            assert!(wait_for_gate(&gate).await, "the fix's pass never compiled");
+            // The save keeps its mark and records the failure.
+            failure_gate.release.notify_one();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while lsp.published_files.state.lock().await.failed == 0
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(lsp.published_files.state.lock().await.failed > 0);
+            // Then the fix's pass is stored.
+            gate.release.notify_one();
+        };
+        tokio::join!(save, drive);
+
+        assert!(
+            wait_for_column(lsp, "m05", "marker").await,
+            "the fix was never stored"
+        );
         let compiled_again = wait_for_column(lsp, "m02", "saved").await;
         publish_gate::remove(&models);
         assert!(compiled_again, "the saved file was never compiled again");
