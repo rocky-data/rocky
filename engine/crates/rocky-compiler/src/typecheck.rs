@@ -1260,7 +1260,23 @@ fn check_time_interval_strategy(
                     "time_column '{time_column}' is nullable, but partition keys cannot be NULL"
                 ),
             )
-            .with_suggestion("Wrap the column in COALESCE(...) or filter out NULLs upstream"),
+            // Name only remedies that clear E022. A filter in an upstream
+            // model does not: inference does not read a WHERE clause, so the
+            // upstream column stays nullable. Only this model's own WHERE
+            // comparison on the bare column counts ([`where_rejects_null_column`]),
+            // and `IS NOT NULL` is not such a comparison.
+            .with_suggestion(format!(
+                "In the outer SELECT's WHERE, compare `{time_column}` with `>=`, `>`, `<`, \
+                 `<=`, `=` or `<>`, joined by AND, and select it as a bare column, as in \
+                 `WHERE {time_column} >= @start_date AND {time_column} < @end_date`. Spell \
+                 the column in the WHERE exactly as in the SELECT, with the same qualifier. \
+                 `BETWEEN` and `OR` do not count, and the WHERE does not help under GROUP BY \
+                 ROLLUP, CUBE or GROUPING SETS. Or COALESCE it with a NOT NULL column of the \
+                 same type, NOT NULL as Rocky knows it (declared or inferred), as in \
+                 `COALESCE({time_column}, other_col)`. Or read it from a column that is NOT \
+                 NULL in a source schema Rocky has. A filter in an upstream model, or `WHERE \
+                 {time_column} IS NOT NULL`, does not help: Rocky does not read them when it infers nullability"
+            )),
         );
     }
 
@@ -3327,7 +3343,7 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             let arg_type = first_arg_type(func, scope);
             (arg_type, true)
         }
-        "COALESCE" => {
+        "COALESCE" | "IFNULL" | "NVL" if is_coalesce_call(func) => {
             let (result, nullable) = infer_branch_set_type(function_branches(func), scope);
             (result.ty, nullable.all || result.over_cap)
         }
@@ -3410,6 +3426,24 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         // A project UDF (`functions/`) types to its declared return type.
         _ => crate::udf::infer_active_call(func, &|expr| infer_expr_type(expr, scope))
             .unwrap_or((RockyType::Unknown, true)),
+    }
+}
+
+/// Whether `func` is a `COALESCE`: `COALESCE(...)` itself, or `IFNULL(a, b)` /
+/// `NVL(a, b)`, which are a two-argument `COALESCE` on every warehouse that
+/// has them (DuckDB, Snowflake, Databricks, BigQuery and Redshift spell one or
+/// both). An `IFNULL` or `NVL` with any other number of arguments is not read
+/// as one (most warehouses refuse it; Redshift's `NVL` takes more), so it
+/// stays untyped and nullable: less precise, never wrongly non-null. Every site that reads a `COALESCE` by
+/// name goes through here, so the three spellings cannot drift apart.
+fn is_coalesce_call(func: &ast::Function) -> bool {
+    match func.name.to_string().to_uppercase().as_str() {
+        "COALESCE" => true,
+        "IFNULL" | "NVL" => matches!(
+            &func.args,
+            ast::FunctionArguments::List(list) if list.args.len() == 2
+        ),
+        _ => false,
     }
 }
 
@@ -3967,7 +4001,7 @@ impl SelectInference {
         if function.as_deref() == Some("COUNT") {
             self.count_outputs.insert(self.columns.len());
         }
-        if function.as_deref() == Some("COALESCE") {
+        if function_call(expr).is_some_and(is_coalesce_call) {
             self.coalesce_outputs.insert(self.columns.len());
         }
         // The cast's type was read for the model's warehouses
@@ -4022,6 +4056,15 @@ fn data_type_is_warehouse_independent(dt: &ast::DataType) -> bool {
                 | ast::DataType::Blob(_)
                 | ast::DataType::Date
         ),
+    }
+}
+
+/// The function `expr` calls, looking through parentheses.
+fn function_call(expr: &Expr) -> Option<&ast::Function> {
+    match expr {
+        Expr::Nested(inner) => function_call(inner),
+        Expr::Function(func) => Some(func),
+        _ => None,
     }
 }
 
@@ -4097,21 +4140,26 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
                 }
                 _ => false,
             },
-            "COALESCE" if func.over.is_none() && func.filter.is_none() => match &func.args {
-                ast::FunctionArguments::List(list)
-                    if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
-                {
-                    let mut branches = Vec::with_capacity(list.args.len());
-                    for arg in &list.args {
-                        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg else {
-                            return false;
-                        };
-                        branches.push(arg);
+            "COALESCE" | "IFNULL" | "NVL"
+                if func.over.is_none() && func.filter.is_none() && is_coalesce_call(func) =>
+            {
+                match &func.args {
+                    ast::FunctionArguments::List(list)
+                        if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
+                    {
+                        let mut branches = Vec::with_capacity(list.args.len());
+                        for arg in &list.args {
+                            let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg
+                            else {
+                                return false;
+                            };
+                            branches.push(arg);
+                        }
+                        branches_agree(&branches, &infer_expr_type(expr, scope).0, scope)
                     }
-                    branches_agree(&branches, &infer_expr_type(expr, scope).0, scope)
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
             _ => false,
         },
         // Simple `CASE x WHEN ...` and searched `CASE WHEN ...`: the type
@@ -5578,6 +5626,105 @@ mod tests {
                 }
             }
         }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `IFNULL(a, b)` and `NVL(a, b)` are a two-argument `COALESCE`: the same
+    /// type and the same nullable bit as `COALESCE(a, b)`, on a known and an
+    /// unknown warehouse.
+    #[test]
+    fn ifnull_and_nvl_with_a_non_null_argument_are_non_null() {
+        let mut wrong = Vec::new();
+        for target in [duckdb(), OperandTarget::Unconfigured] {
+            for (args, ty) in [
+                ("b, 0", RockyType::Int64),
+                ("s, ''", RockyType::String),
+                ("z, 0", RockyType::Unknown),
+                ("q, 0", RockyType::Unknown),
+                ("z, x", RockyType::Int32),
+                ("b, x", RockyType::Unknown),
+            ] {
+                for func in ["IFNULL", "NVL", "ifnull", "nvl"] {
+                    for sql in [
+                        format!("SELECT {func}({args}) AS c FROM t"),
+                        format!("SELECT ({func}({args})) AS c FROM t"),
+                        format!("SELECT {func}({args}) AS c, z FROM t"),
+                    ] {
+                        let got = coalesce_column(&sql, target.clone());
+                        let coalesce = coalesce_column(
+                            &sql.replace(&format!("{func}("), "COALESCE("),
+                            target.clone(),
+                        );
+                        if got != (ty.clone(), false, false) || got != coalesce {
+                            wrong.push(format!("{sql} on {target:?}: {got:?} vs {coalesce:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        // A cast whose width differs between warehouses has a type only once
+        // the warehouse is known, as for `COALESCE`.
+        for func in ["IFNULL", "NVL"] {
+            let sql = format!("SELECT {func}(z, CAST(0 AS INT)) AS c FROM t");
+            for (target, ty) in [
+                (duckdb(), RockyType::Int32),
+                (OperandTarget::Unconfigured, RockyType::Unknown),
+            ] {
+                let got = coalesce_column(&sql, target.clone());
+                if got != (ty, false, false) {
+                    wrong.push(format!("{sql} on {target:?}: {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// An `IFNULL` or `NVL` whose two arguments may both be NULL stays
+    /// nullable and keeps `E012`, as `COALESCE` does.
+    #[test]
+    fn ifnull_and_nvl_of_nullable_arguments_stay_nullable() {
+        let mut wrong = Vec::new();
+        for target in [duckdb(), OperandTarget::Unconfigured] {
+            for func in ["IFNULL", "NVL"] {
+                for sql in [
+                    format!("SELECT {func}(b, z) AS c FROM t"),
+                    format!("SELECT {func}(b, NULL) AS c FROM t"),
+                    format!("SELECT {func}(b, CAST(NULL AS BIGINT)) AS c FROM t"),
+                    format!("SELECT {func}(b, NULLIF(x, 0)) AS c FROM t"),
+                    format!("SELECT {func}(b, ?) AS c FROM t"),
+                    format!("SELECT {func}(u.x, t.z) AS c FROM t LEFT JOIN u ON t.z = u.z"),
+                    format!("SELECT {func}(b, 0) AS c FROM t UNION ALL SELECT b AS c FROM t"),
+                ] {
+                    let (_, nullable, e012) = coalesce_column(&sql, target.clone());
+                    if !nullable || !e012 {
+                        wrong.push(format!("{sql} on {target:?}: {nullable} {e012}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `IFNULL` and `NVL` take exactly two arguments. With one or three, the
+    /// warehouse refuses the call, so Rocky must not read it as a
+    /// `COALESCE`: it is untyped and nullable, whatever its arguments.
+    #[test]
+    fn ifnull_and_nvl_with_the_wrong_arity_are_not_a_coalesce() {
+        let mut wrong = Vec::new();
+        for target in [duckdb(), OperandTarget::Unconfigured] {
+            for func in ["IFNULL", "NVL"] {
+                for args in ["0", "x", "b, 0, 1", "z, x, 0", "s, '', ''"] {
+                    let sql = format!("SELECT {func}({args}) AS c FROM t");
+                    let got = coalesce_column(&sql, target.clone());
+                    if got != (RockyType::Unknown, true, true) {
+                        wrong.push(format!("{sql} on {target:?}: {got:?}"));
+                    }
+                }
+            }
+        }
+        // A three-argument `COALESCE` over the same arguments is non-null:
+        // the arity rule is only for the two-argument spellings.
+        assert!(!coalesce_column("SELECT COALESCE(z, x, 0) AS c FROM t", duckdb()).1);
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
@@ -7171,23 +7318,30 @@ mod tests {
         let previous = typecheck_project_with_models(&graph, &sources, None, &initial.models, None);
         assert!(previous.typed_models["downstream"][0].nullable);
 
-        let updated = Project::from_models(models("COALESCE(b, 0)")).unwrap();
-        let graph = build_semantic_graph(&updated, &HashMap::new()).unwrap();
-        let affected = HashSet::from(["m".to_string(), "downstream".to_string()]);
-        let incremental = typecheck_project_incremental(
-            &graph,
-            &sources,
-            &updated.models,
-            &affected,
-            &previous,
-            None,
-            &TargetDialects::default(),
-        );
-        let full = typecheck_project_with_models(&graph, &sources, None, &updated.models, None);
-        assert_eq!(incremental.typed_models, full.typed_models);
-        for name in ["m", "downstream"] {
-            assert_eq!(full.typed_models[name][0].data_type, RockyType::Int64);
-            assert!(!full.typed_models[name][0].nullable, "{name}");
+        // `IFNULL` and `NVL` are a two-argument `COALESCE`.
+        for projection in ["COALESCE(b, 0)", "IFNULL(b, 0)", "NVL(b, 0)"] {
+            let updated = Project::from_models(models(projection)).unwrap();
+            let graph = build_semantic_graph(&updated, &HashMap::new()).unwrap();
+            let affected = HashSet::from(["m".to_string(), "downstream".to_string()]);
+            let incremental = typecheck_project_incremental(
+                &graph,
+                &sources,
+                &updated.models,
+                &affected,
+                &previous,
+                None,
+                &TargetDialects::default(),
+            );
+            let full = typecheck_project_with_models(&graph, &sources, None, &updated.models, None);
+            assert_eq!(incremental.typed_models, full.typed_models, "{projection}");
+            for name in ["m", "downstream"] {
+                assert_eq!(
+                    full.typed_models[name][0].data_type,
+                    RockyType::Int64,
+                    "{projection}: {name}"
+                );
+                assert!(!full.typed_models[name][0].nullable, "{projection}: {name}");
+            }
         }
     }
 
@@ -11093,6 +11247,167 @@ mod tests {
         )]);
         let result = time_interval_compile(sql, sources);
         assert!(has_code(&result, "E022"), "{:?}", result.diagnostics);
+    }
+
+    /// `raw.orders` with a nullable `order_date`, a NOT NULL `fallback_date`,
+    /// a nullable `other_date` and a NOT NULL `ts`, all known.
+    fn orders_with_dates() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("order_date", RockyType::Date, true),
+                ("fallback_date", RockyType::Date, false),
+                ("other_date", RockyType::Date, true),
+                ("ts", RockyType::Timestamp, false),
+            ]),
+        )])
+    }
+
+    /// End to end through `compile`: an `IFNULL` / `NVL` time column is a
+    /// typed DATE, non-null with a NOT NULL fallback (no `E022`) and
+    /// nullable with a nullable one (`E022`).
+    #[test]
+    fn ifnull_and_nvl_time_columns_compile_like_coalesce() {
+        for func in ["COALESCE", "IFNULL", "NVL"] {
+            let non_null = format!(
+                "SELECT {func}(order_date, fallback_date) AS order_date FROM raw.orders \
+                 WHERE ts >= @start_date AND ts < @end_date"
+            );
+            let result = time_interval_compile(&non_null, orders_with_dates());
+            let col = column(&result, "m", "order_date");
+            assert_eq!(col.data_type, RockyType::Date, "{non_null}");
+            assert!(!col.nullable, "{non_null}");
+            assert!(
+                !has_code(&result, "E022"),
+                "{non_null}: {:?}",
+                result.diagnostics
+            );
+
+            let nullable = format!(
+                "SELECT {func}(order_date, other_date) AS order_date FROM raw.orders \
+                 WHERE ts >= @start_date AND ts < @end_date"
+            );
+            let result = time_interval_compile(&nullable, orders_with_dates());
+            let col = column(&result, "m", "order_date");
+            assert_eq!(col.data_type, RockyType::Date, "{nullable}");
+            assert!(col.nullable, "{nullable}");
+            assert!(
+                has_code(&result, "E022"),
+                "{nullable}: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    /// The `E022` help names only remedies that clear it. A comparison on
+    /// the bare column in the model's own WHERE and a `COALESCE` with a NOT
+    /// NULL value do. `WHERE order_date IS NOT NULL` and a filter in an
+    /// upstream model do not, so the help must not offer them.
+    #[test]
+    fn e022_help_names_only_remedies_that_clear_it() {
+        let e022 = |result: &crate::compile::CompileResult| {
+            result
+                .diagnostics
+                .iter()
+                .find(|d| &*d.code == "E022")
+                .cloned()
+        };
+        // Remedies the help names.
+        for sql in [
+            "SELECT order_date FROM raw.orders \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            "SELECT COALESCE(order_date, fallback_date) AS order_date FROM raw.orders \
+             WHERE ts >= @start_date AND ts < @end_date",
+            "SELECT fallback_date AS order_date FROM raw.orders \
+             WHERE ts >= @start_date AND ts < @end_date",
+        ] {
+            let result = time_interval_compile(sql, orders_with_dates());
+            assert!(e022(&result).is_none(), "{sql}: {:?}", result.diagnostics);
+        }
+        // Not remedies: `BETWEEN`, `OR`, a WHERE that spells the column
+        // without the SELECT's qualifier, and ROLLUP.
+        for sql in [
+            "SELECT o.order_date FROM raw.orders AS o \
+             WHERE order_date >= @start_date AND order_date < @end_date",
+            "SELECT order_date, COUNT(*) AS n FROM raw.orders \
+             WHERE order_date >= @start_date AND order_date < @end_date \
+             GROUP BY ROLLUP(order_date)",
+            "SELECT order_date FROM raw.orders \
+             WHERE order_date BETWEEN @start_date AND @end_date",
+            "SELECT order_date FROM raw.orders \
+             WHERE (order_date >= @start_date OR ts >= @start_date) AND ts < @end_date",
+        ] {
+            let result = time_interval_compile(sql, orders_with_dates());
+            assert!(e022(&result).is_some(), "{sql}: {:?}", result.diagnostics);
+        }
+        // A NOT NULL column of another type: the supertype is lost, so E022
+        // is skipped for want of a type, not because non-null is proven.
+        // The help asks for the same type.
+        let sql = "SELECT COALESCE(order_date, ts) AS order_date FROM raw.orders \
+                   WHERE ts >= @start_date AND ts < @end_date";
+        let result = time_interval_compile(sql, orders_with_dates());
+        assert_eq!(
+            column(&result, "m", "order_date").data_type,
+            RockyType::Unknown,
+            "{sql}"
+        );
+        // Not remedies: `IS NOT NULL` in this model's WHERE.
+        let sql = "SELECT order_date FROM raw.orders \
+                   WHERE order_date IS NOT NULL AND ts >= @start_date AND ts < @end_date";
+        let result = time_interval_compile(sql, orders_with_dates());
+        let help = e022(&result)
+            .and_then(|d| d.suggestion)
+            .expect("E022 carries a suggestion");
+        // Not remedies: a filter in an upstream model.
+        let up = make_model(
+            "up",
+            "SELECT order_date, ts FROM raw.orders WHERE order_date IS NOT NULL \
+             AND order_date > DATE '1900-01-01'",
+        );
+        let mut down = make_model(
+            "down",
+            "SELECT order_date FROM up WHERE ts >= @start_date AND ts < @end_date",
+        );
+        down.config.strategy = StrategyConfig::TimeInterval {
+            time_column: "order_date".to_string(),
+            granularity: TimeGrain::Day,
+            lookback: 0,
+            batch_size: NonZeroU32::new(1).unwrap(),
+            first_partition: None,
+        };
+        let config = crate::compile::CompilerConfig {
+            source_schemas: orders_with_dates(),
+            ..Default::default()
+        };
+        let result =
+            crate::compile::compile_preloaded_models(vec![up, down], &config).expect("compile");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| &*d.code == "E022" && d.model == "down"),
+            "{:?}",
+            result.diagnostics
+        );
+        for remedy in [
+            "`WHERE order_date >= @start_date AND order_date < @end_date`",
+            "select it as a bare column",
+            "exactly as in the SELECT, with the same qualifier",
+            "`BETWEEN` and `OR` do not count",
+            "GROUP BY ROLLUP, CUBE or GROUPING SETS",
+            "`COALESCE(order_date, other_col)`",
+            "COALESCE it with a NOT NULL column of the same type",
+            "NOT NULL as Rocky knows it (declared or inferred)",
+            "NOT NULL in a source schema",
+            "A filter in an upstream model, or `WHERE order_date IS NOT NULL`, does not help",
+        ] {
+            assert!(help.contains(remedy), "{remedy}: {help}");
+        }
+        assert!(!help.contains("filter out NULLs"), "{help}");
+        // A cast literal (`CAST('1970-01-01' AS DATE)`) can fail, so
+        // inference keeps it nullable and it does not clear E022: the help
+        // must not offer it.
+        assert!(!help.contains("CAST("), "{help}");
     }
 
     #[test]
