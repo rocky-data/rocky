@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `IFNULL(a, b)` and `NVL(a, b)` now get the type and the nullable bit of `COALESCE(a, b)`. Before, they were untyped and nullable, so `IFNULL(b, 0)` failed a `nullable = false` contract with `E012`. An `IFNULL` or `NVL` with one or three arguments stays untyped and nullable.
+- The `E022` help (a nullable `time_column`) no longer tells you to filter out NULLs upstream. A filter in an upstream model, or `WHERE x IS NOT NULL`, does not clear `E022`. The help now names fixes that do: a plain comparison (`>=`, `<` and the like, joined by AND) on the bare column in the model's own WHERE, spelled with the same qualifier as in the SELECT; `COALESCE` with a NOT NULL column of the same type; or a source column that is NOT NULL in a schema Rocky has. It also says that `BETWEEN` and `OR` do not count, and that the WHERE does not help under `GROUP BY ROLLUP`, `CUBE` or `GROUPING SETS`.
+
 ## [1.92.0] — 2026-11-10
 
 ### Upgrade notes
@@ -26,8 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `IFNULL(a, b)` and `NVL(a, b)` now get the type and the nullable bit of `COALESCE(a, b)`. Before, they were untyped and nullable, so `IFNULL(b, 0)` failed a `nullable = false` contract with `E012`. An `IFNULL` or `NVL` with one or three arguments stays untyped and nullable.
-- The `E022` help (a nullable `time_column`) no longer tells you to filter out NULLs upstream. A filter in an upstream model, or `WHERE x IS NOT NULL`, does not clear `E022`. The help now names fixes that do: a plain comparison (`>=`, `<` and the like, joined by AND) on the bare column in the model's own WHERE, spelled with the same qualifier as in the SELECT; `COALESCE` with a NOT NULL column of the same type; or a source column that is NOT NULL in a schema Rocky has. It also says that `BETWEEN` and `OR` do not count, and that the WHERE does not help under `GROUP BY ROLLUP`, `CUBE` or `GROUPING SETS`.
 - `rocky lsp` no longer loses a saved file's changes when the full compile that the save starts finishes after a newer edit's compile. That newer compile started from the result stored before the save and checked only its own file. The save's result was then dropped, and nothing checked the saved file again, so with an editor that sends no watched-file event for a save, its new columns and diagnostics were missing for the rest of the session. A dropped save result now starts one more full compile.
 - `rocky run --watch --all` on a replication pipeline now watches `models` under the working directory, which `--all` runs compiled models from. Before, it watched `rocky.toml` alone, so a model edit did not re-run. `--watch` also says at startup when the selected pipeline reads no file it watches: a replication pipeline without `--all` or `--models`, a quality or snapshot pipeline, or a load pipeline, whose source files are not watched. Then only an edit to `rocky.toml` re-runs it.
 - `rocky lsp` now asks the editor to watch `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql`, when the editor's LSP client supports dynamic registration of watched files. Before, only the VS Code extension watched them, so in other editors an edit to a `_defaults.toml` or `groups/*.toml` file that was not open never reached the server. The VS Code extension no longer sets its own watcher list, so each change reaches the server once. An extension from this release needs an engine from this release for watched-file events.
