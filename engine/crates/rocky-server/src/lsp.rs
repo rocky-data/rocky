@@ -418,9 +418,9 @@ impl PendingRecompile {
         }
     }
 
-    /// Schedule the recompile for the files [`Self::carry`] kept, when the
-    /// stored result is already newer than the failed compile that kept
-    /// them, so no later change may come to take them. `true` when files are
+    /// Schedule the recompile for the files [`Self::carry`] kept, when
+    /// another compile overlapped the failed one that kept them, so no later
+    /// change may come to take them. `true` when files are
     /// kept and no recompile was scheduled, so the caller runs one. When a
     /// recompile already took them, it is newer and nothing is scheduled.
     fn schedule_carried(&self) -> bool {
@@ -462,8 +462,8 @@ impl RockyLsp {
         }
     }
 
-    /// Schedule the recompile for the files a failed compile kept, when the
-    /// stored result is already newer than that failure (see
+    /// Schedule the recompile for the files a failed compile kept, when
+    /// another compile overlapped it (see
     /// [`PendingRecompile::schedule_carried`]).
     fn schedule_carried_recompile(&self) {
         if self.recompile_pending.schedule_carried() {
@@ -554,6 +554,9 @@ impl RockyLsp {
                 // full compile, still inline, below ten models or when an
                 // edit reaches over half of them (a root `_defaults.toml`,
                 // for example).
+                // Read before the generation is taken, so every result
+                // stored after this compile began changes it.
+                let stores_at_start = published_files.stores();
                 let generation = published_files.begin_compile();
                 // An incremental compile keeps the previous types of every
                 // model the edit does not reach, so it needs the targets the
@@ -634,13 +637,20 @@ impl RockyLsp {
                     }
                 } else {
                     #[cfg(test)]
-                    publish_gate::wait(&config.models_dir).await;
+                    {
+                        publish_gate::wait(&config.models_dir).await;
+                        publish_gate::wait_failure(&config.models_dir).await;
+                    }
+                    // This window's files are not in the stored result.
+                    // Keep them for the next recompile (see `carry`). Kept
+                    // before the failure is recorded, so a compile stored
+                    // after the record finds them.
+                    pending.carry(changed_files);
                     // A newer compile that failed still outranks an older
                     // one that may yet succeed.
-                    let newer_stored = published_files.compile_failed(generation).await;
-                    // This window's files are not in the stored result.
-                    // Keep them for the next recompile (see `carry`).
-                    pending.carry(changed_files);
+                    let overlapped = published_files
+                        .compile_failed(generation, stores_at_start)
+                        .await;
                     // Same as `recompile`: a failed compile builds no
                     // diagnostic, so surface the `.rocky` parse errors.
                     Self::publish_dsl_parse_diagnostics(
@@ -651,11 +661,11 @@ impl RockyLsp {
                         &config.models_dir,
                     )
                     .await;
-                    // A newer compile was stored first, and no later
-                    // change may come to take the kept files: run one
-                    // more pass for them now. It starts from the newer
+                    // Another compile ran while this one did, and may have
+                    // taken the change that would take the kept files: run
+                    // one more pass for them now. It starts from the stored
                     // result, so it can succeed where this one failed.
-                    if newer_stored && pending.schedule_carried() {
+                    if overlapped && pending.schedule_carried() {
                         continue;
                     }
                     break;
@@ -665,8 +675,9 @@ impl RockyLsp {
     }
 }
 
-/// A test-only pause before a debounced recompile publishes, so a test can
-/// order two compiles: the first one to reach it waits until released.
+/// A test-only pause before a compile publishes, or records that it failed,
+/// so a test can order two compiles: the first one to reach a gate waits
+/// until released.
 #[cfg(test)]
 mod publish_gate {
     use std::path::{Path, PathBuf};
@@ -681,34 +692,60 @@ mod publish_gate {
         pub(super) release: tokio::sync::Notify,
     }
 
+    type Gates = std::sync::Mutex<Vec<Arc<Gate>>>;
+
     /// One gate per test, each for its own models directory, so tests that
     /// run at the same time on threads do not replace each other's gate.
-    static GATES: std::sync::Mutex<Vec<Arc<Gate>>> = std::sync::Mutex::new(Vec::new());
+    /// Every compile stops at these: a success before it publishes, a
+    /// failure before it keeps its files and records the failure.
+    static GATES: Gates = std::sync::Mutex::new(Vec::new());
 
-    /// Install a gate for `models_dir`.
-    pub(super) fn install(models_dir: PathBuf) -> Arc<Gate> {
+    /// Gates only failed compiles stop at, after [`GATES`].
+    static FAILURE_GATES: Gates = std::sync::Mutex::new(Vec::new());
+
+    fn install_in(gates: &Gates, models_dir: PathBuf) -> Arc<Gate> {
         let gate = Arc::new(Gate {
             models_dir,
             arrived: AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
         });
-        GATES
+        gates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(gate.clone());
         gate
     }
 
-    /// Remove the gate for `models_dir`.
+    /// Install a gate for `models_dir`.
+    pub(super) fn install(models_dir: PathBuf) -> Arc<Gate> {
+        install_in(&GATES, models_dir)
+    }
+
+    /// Install a gate for `models_dir` that only failed compiles stop at.
+    pub(super) fn install_failure(models_dir: PathBuf) -> Arc<Gate> {
+        install_in(&FAILURE_GATES, models_dir)
+    }
+
+    /// Remove both gates for `models_dir`.
     pub(super) fn remove(models_dir: &Path) {
-        GATES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|gate| gate.models_dir != models_dir);
+        for gates in [&GATES, &FAILURE_GATES] {
+            gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|gate| gate.models_dir != models_dir);
+        }
     }
 
     pub(super) async fn wait(models_dir: &Path) {
-        let gate = GATES
+        wait_in(&GATES, models_dir).await;
+    }
+
+    pub(super) async fn wait_failure(models_dir: &Path) {
+        wait_in(&FAILURE_GATES, models_dir).await;
+    }
+
+    async fn wait_in(gates: &Gates, models_dir: &Path) {
+        let gate = gates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
@@ -996,6 +1033,8 @@ impl RockyLsp {
             target_dialects: cast_targets.targets.clone(),
         };
 
+        // Read before the generation is taken (see `compile_failed`).
+        let stores_at_start = self.published_files.stores();
         let generation = self.published_files.begin_compile();
         match rocky_compiler::compile::compile(&config) {
             Ok(mut result) => {
@@ -1022,20 +1061,28 @@ impl RockyLsp {
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
                 #[cfg(test)]
-                publish_gate::wait(&dir_path).await;
-                // A newer compile that failed still outranks an older one
-                // that may yet succeed: that one must not publish over it.
-                let newer_stored = self.published_files.compile_failed(generation).await;
+                {
+                    publish_gate::wait(&dir_path).await;
+                    publish_gate::wait_failure(&dir_path).await;
+                }
                 // This compile read every file, and its result is not stored.
                 // The next debounced pass would start from the result stored
                 // before it and mark only its own files, so the file
                 // `did_save` saved would keep its old types for the session.
                 // Make the next recompile a full one (see `carry`). At
                 // startup nothing is stored, so the next one is full anyway.
+                // Kept before the failure is recorded, so a compile stored
+                // after the record finds the mark.
                 self.recompile_pending.carry(None);
-                // A newer compile was stored first, so no later change may
-                // come to take the mark: compile in full now.
-                if newer_stored {
+                // A newer compile that failed still outranks an older one
+                // that may yet succeed: that one must not publish over it.
+                let overlapped = self
+                    .published_files
+                    .compile_failed(generation, stores_at_start)
+                    .await;
+                // Another compile ran while this one did, and may have taken
+                // the change that would take the mark: compile in full now.
+                if overlapped {
                     self.schedule_carried_recompile();
                 }
                 // The log line above is the only place this failure went.
@@ -1465,6 +1512,7 @@ impl RockyLsp {
             client.publish_diagnostics(uri, diags, None).await;
         }
         *store.write().await = Some(result);
+        published.stores.fetch_add(1, Ordering::SeqCst);
         if after_failure {
             Publication::StoredBeforeFailure
         } else {
@@ -5332,6 +5380,8 @@ fn diagnostics_by_uri(result: &CompileResult) -> HashMap<Url, Vec<Diagnostic>> {
 struct PublishedDiagnostics {
     /// The last generation handed out by [`Self::begin_compile`].
     started: std::sync::atomic::AtomicU64,
+    /// How many results have been stored. Bumped under `state`.
+    stores: std::sync::atomic::AtomicU64,
     /// Held across a whole publication. Only publishers take it.
     state: Mutex<PublishedState>,
 }
@@ -5359,18 +5409,28 @@ impl PublishedDiagnostics {
         self.started.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// How many results have been stored. A compile reads it before
+    /// [`Self::begin_compile`] and passes it to [`Self::compile_failed`].
+    fn stores(&self) -> u64 {
+        self.stores.load(Ordering::SeqCst)
+    }
+
     /// Record that the compile of `generation` failed. It publishes nothing
     /// and clears nothing, so an older success that finishes later is still
     /// the last good result and may publish and be stored. Only a success
     /// that started later than it ends that.
     ///
-    /// Returns whether a result newer than `generation` is already stored.
-    /// It is checked under the lock a publication holds, so no newer result
-    /// is stored between the check and the record.
-    async fn compile_failed(&self, generation: u64) -> bool {
+    /// Returns whether another compile overlapped this one: a result was
+    /// stored after it began (`stores_at_start` is [`Self::stores`] read
+    /// before its generation was taken), or a compile began after it. That
+    /// compile may have taken the change that would take the failed
+    /// compile's kept files, so the caller schedules a recompile for them.
+    /// A failed compile that nothing overlapped only keeps its files.
+    async fn compile_failed(&self, generation: u64, stores_at_start: u64) -> bool {
         let mut last = self.state.lock().await;
         last.failed = last.failed.max(generation);
-        last.generation > generation
+        self.stores.load(Ordering::SeqCst) != stores_at_start
+            || self.started.load(Ordering::SeqCst) > generation
     }
 }
 
@@ -6737,6 +6797,49 @@ mod tests {
         assert_equals_a_compile_from_scratch(lsp, &models).await;
     }
 
+    /// An edit's pass begins, then a save's full compile begins. The pass is
+    /// stored first, and only then does the save record that it failed. The
+    /// stored pass is older than the save, but it was stored while the save
+    /// ran, so the save's failure must still schedule a compile for its mark.
+    #[tokio::test]
+    async fn a_save_that_fails_after_an_older_result_is_stored_compiles_again() {
+        let (_tmp, models, service) = started_twelve_model_project().await;
+        let lsp = service.inner();
+
+        let gate = publish_gate::install(models.clone());
+        let failure_gate = publish_gate::install_failure(models.clone());
+        // The edit's pass compiles, and is held before it publishes.
+        let edited = models.join("m01.sql");
+        std::fs::write(&edited, "SELECT 1 AS id, 2 AS marker").unwrap();
+        lsp.did_change_watched_files(changed(&[&edited])).await;
+        assert!(wait_for_gate(&gate).await, "the edit's pass never compiled");
+
+        let broken = models.join("m05.toml");
+        std::fs::write(&broken, "name = [").unwrap();
+        let saved = models.join("m02.sql");
+        std::fs::write(&saved, "SELECT 1 AS id, 2 AS saved").unwrap();
+        let save = lsp.did_save(save_of(&saved));
+        let drive = async {
+            // The save failed, and is held before it keeps its mark.
+            assert!(wait_for_gate(&failure_gate).await, "the save never failed");
+            // The older edit's pass is stored first.
+            gate.release.notify_one();
+            assert!(
+                wait_for_column(lsp, "m01", "marker").await,
+                "the edit's pass was not stored"
+            );
+            // The failure goes away with no event for it.
+            std::fs::write(&broken, twelve_model_sidecar(5)).unwrap();
+            failure_gate.release.notify_one();
+        };
+        tokio::join!(save, drive);
+
+        let compiled_again = wait_for_column(lsp, "m02", "saved").await;
+        publish_gate::remove(&models);
+        assert!(compiled_again, "the saved file was never compiled again");
+        assert_equals_a_compile_from_scratch(lsp, &models).await;
+    }
+
     /// A compile fails, and before it records the failure, a newer pass for
     /// the fix of the broken file is stored. That pass started from the
     /// result stored before the failed compile and marked only the fix. The
@@ -7793,7 +7896,9 @@ mod tests {
         let lsp = service.inner();
         let first = lsp.published_files.begin_compile();
         let second = lsp.published_files.begin_compile();
-        lsp.published_files.compile_failed(second).await;
+        lsp.published_files
+            .compile_failed(second, lsp.published_files.stores())
+            .await;
         assert!(
             lsp.publish_diagnostics(first, older).await,
             "the older success is the last good result"
@@ -7860,7 +7965,9 @@ mod tests {
         let older = lsp.published_files.begin_compile();
         let failed = lsp.published_files.begin_compile();
         let newer = lsp.published_files.begin_compile();
-        lsp.published_files.compile_failed(failed).await;
+        lsp.published_files
+            .compile_failed(failed, lsp.published_files.stores())
+            .await;
         RockyLsp::publish_dsl_parse_diagnostics(
             &lsp.client,
             &lsp.published_files,
