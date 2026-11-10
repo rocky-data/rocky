@@ -613,11 +613,11 @@ impl RockyLsp {
                         if let Some(resolved) = resolved {
                             cast_targets.keep(generation, resolved);
                         }
-                        // A newer compile failed and kept its files, and
-                        // this older result does not have them. Run one
-                        // more pass for them, unless a recompile took
-                        // them already.
-                        if publication == Publication::StoredBeforeFailure
+                        // A compile failed since the last result was
+                        // stored and kept its files, and this result may
+                        // not have them. Run one more pass for them, unless
+                        // a recompile took them already.
+                        if publication == Publication::StoredSinceFailure
                             && pending.schedule_carried()
                         {
                             continue;
@@ -1438,9 +1438,9 @@ impl RockyLsp {
     }
 
     /// Publish and store `result` (see [`Self::publish_compile_diagnostics`]).
-    /// Returns whether it was stored. When it was stored older than a newer
-    /// failed compile, it schedules the recompile for the files that failure
-    /// kept: this result does not have them.
+    /// Returns whether it was stored. When a compile failed since the last
+    /// result was stored, it schedules the recompile for the files that
+    /// failure kept: this result may not have them.
     async fn publish_diagnostics(&self, generation: u64, result: CompileResult) -> bool {
         let publication = Self::publish_compile_diagnostics(
             &self.client,
@@ -1450,7 +1450,7 @@ impl RockyLsp {
             result,
         )
         .await;
-        if publication == Publication::StoredBeforeFailure {
+        if publication == Publication::StoredSinceFailure {
             self.schedule_carried_recompile();
         }
         publication.stored()
@@ -1470,7 +1470,7 @@ impl RockyLsp {
     /// nothing, and the older success is the last good result. The
     /// publication lock is held across the sends and the store, so two
     /// publications never interleave. Returns whether `result` was used,
-    /// and whether it is older than a newer failed compile.
+    /// and whether a compile failed since the last result was stored.
     ///
     /// An associated fn because the debounced `didChange` pass runs in a
     /// spawned task that holds clones, not `&self`.
@@ -1513,8 +1513,12 @@ impl RockyLsp {
         }
         *store.write().await = Some(result);
         published.stores.fetch_add(1, Ordering::SeqCst);
-        if after_failure {
-            Publication::StoredBeforeFailure
+        // A failure recorded since the last store kept its files, and this
+        // result may not have them: it is older than the failure, or it took
+        // its files before the failure kept them. A failure recorded before
+        // the last store was handled by that store.
+        if std::mem::take(&mut last.failed_since_store) {
+            Publication::StoredSinceFailure
         } else {
             Publication::Stored
         }
@@ -5401,6 +5405,10 @@ struct PublishedState {
     /// The `.rocky` files that carry an E028 parse error from a failed
     /// compile. A later successful compile clears them like `files`.
     parse_files: HashSet<Url>,
+    /// A compile failed since the last result was stored. Its kept files
+    /// may be missing from the next result stored, which then schedules a
+    /// recompile for them.
+    failed_since_store: bool,
 }
 
 impl PublishedDiagnostics {
@@ -5420,17 +5428,19 @@ impl PublishedDiagnostics {
     /// the last good result and may publish and be stored. Only a success
     /// that started later than it ends that.
     ///
-    /// Returns whether another compile overlapped this one: a result was
-    /// stored after it began (`stores_at_start` is [`Self::stores`] read
-    /// before its generation was taken), or a compile began after it. That
-    /// compile may have taken the change that would take the failed
-    /// compile's kept files, so the caller schedules a recompile for them.
-    /// A failed compile that nothing overlapped only keeps its files.
+    /// Returns whether a result was stored after this compile began
+    /// (`stores_at_start` is [`Self::stores`] read before its generation was
+    /// taken). That compile may have taken the change that would take the
+    /// failed compile's kept files, so the caller schedules a recompile for
+    /// them. A result stored later finds `failed_since_store` and does the
+    /// same. So every recompile a failure schedules needs a stored success:
+    /// compiles that only fail never start another one, even when they
+    /// overlap each other.
     async fn compile_failed(&self, generation: u64, stores_at_start: u64) -> bool {
         let mut last = self.state.lock().await;
         last.failed = last.failed.max(generation);
+        last.failed_since_store = true;
         self.stores.load(Ordering::SeqCst) != stores_at_start
-            || self.started.load(Ordering::SeqCst) > generation
     }
 }
 
@@ -5439,11 +5449,13 @@ impl PublishedDiagnostics {
 enum Publication {
     /// Older than the last result stored: not used.
     Dropped,
-    /// Stored, newer than every failed compile.
+    /// Stored, and no compile failed since the last result was stored.
     Stored,
-    /// Stored, but older than a newer compile that failed. That failure kept
-    /// its files for the next recompile, and this result does not have them.
-    StoredBeforeFailure,
+    /// Stored, and a compile failed since the last result was stored. That
+    /// failure kept its files for the next recompile, and this result may
+    /// not have them: it is older than the failure, or it took its files
+    /// before the failure kept them.
+    StoredSinceFailure,
 }
 
 impl Publication {
@@ -5451,7 +5463,7 @@ impl Publication {
     fn stored(self) -> bool {
         match self {
             Self::Dropped => false,
-            Self::Stored | Self::StoredBeforeFailure => true,
+            Self::Stored | Self::StoredSinceFailure => true,
         }
     }
 }
@@ -6890,6 +6902,58 @@ mod tests {
         publish_gate::remove(&models);
         assert!(compiled_again, "the saved file was never compiled again");
         assert_equals_a_compile_from_scratch(lsp, &models).await;
+    }
+
+    /// Two compiles of a broken project overlap and both fail: an edit's
+    /// pass is held, and a save's compile begins and fails after it. Neither
+    /// may schedule another compile, or each would see the other's newer
+    /// compile begin and they would reschedule each other while the project
+    /// stays broken. A failure kept beside another failure loses nothing.
+    #[tokio::test]
+    async fn two_overlapping_failed_compiles_start_no_other_compile() {
+        let (_tmp, models, service) = started_twelve_model_project().await;
+        let lsp = service.inner();
+
+        let failure_gate = publish_gate::install_failure(models.clone());
+        let broken = models.join("m05.toml");
+        std::fs::write(&broken, "name = [").unwrap();
+        let edited = models.join("m02.sql");
+        std::fs::write(&edited, "SELECT 1 AS id, 2 AS saved").unwrap();
+        // The edit's pass fails, and is held before it keeps its files.
+        lsp.did_change_watched_files(changed(&[&edited])).await;
+        assert!(
+            wait_for_gate(&failure_gate).await,
+            "the edit's pass never failed"
+        );
+        // A newer save compile fails meanwhile.
+        lsp.did_save(save_of(&edited)).await;
+        failure_gate.release.notify_one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !lsp
+            .recompile_pending
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .contains(&edited)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        publish_gate::remove(&models);
+
+        // Both kept their files, and no compile begins: not after the
+        // debounce, nor after several.
+        let started = lsp.published_files.started.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert_eq!(
+            lsp.published_files.started.load(Ordering::SeqCst),
+            started,
+            "a failed compile started another compile"
+        );
+        let state = lsp.recompile_pending.state.lock().unwrap();
+        assert!(!state.scheduled);
+        assert!(state.unknown && state.files.contains(&edited));
     }
 
     /// A compile fails, and before it records the failure, a newer pass for
