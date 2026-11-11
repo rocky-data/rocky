@@ -93,6 +93,29 @@ print("    status=loaded total_rows=%d commit_seq %d -> %d"
 PY
 }
 
+echo
+echo "=== at least once: a failure AFTER the shim succeeded must not move the state ==="
+# rocky-contract-fail.toml adds a contract the batch cannot meet. The shim
+# succeeds, the contract gate fails, and Rocky must keep the old state.
+if RUST_LOG=info rocky -c rocky-contract-fail.toml --state-path .rocky/state.redb \
+    load --connector faker_users --output json \
+    > expected/contract-fail.json 2> expected/contract-fail.log; then
+    echo "FAIL: the contract-gated load exited 0"
+    exit 1
+fi
+if ! grep -q "read 20 record(s) of stream 'users'" expected/contract-fail.log; then
+    echo "FAIL: the shim did not read the batch before the gate failed"
+    exit 1
+fi
+LEFT="$(duckdb -readonly -csv -noheader poc.duckdb \
+    "SELECT count(*) FROM information_schema.tables WHERE table_name = 'users'" 2>/dev/null || echo 0)"
+if [ "$LEFT" != "0" ] && [ "$(duckdb -readonly -csv -noheader poc.duckdb 'SELECT count(*) FROM poc.main.users')" != "0" ]; then
+    echo "FAIL: the failed load left rows in poc.main.users"
+    exit 1
+fi
+echo "    the load failed after the shim read 20 records; no rows landed"
+echo "    the next load must read the same 20 rows with commit_seq 0 -> 1:"
+
 load faker_users 1 20 1
 load faker_users 2 0 2
 load faker_users 3 0 3
@@ -115,8 +138,8 @@ python3 - <<'PY'
 import glob, json, os, sys
 runs = sorted(glob.glob(".rocky/landing/faker_users/*/_rocky_result.json"),
               key=os.path.getmtime)
-if len(runs) != 3:
-    print("FAIL: expected 3 kept scratch directories, found %d" % len(runs))
+if len(runs) != 4:
+    print("FAIL: expected 4 kept scratch directories (the contract failure and 3 loads), found %d" % len(runs))
     sys.exit(1)
 first = json.load(open(runs[0]))["state"]["value"]
 last = json.load(open(runs[-1]))["state"]["value"]
@@ -164,6 +187,15 @@ fails faker_bad_stream "the source has no stream 'orders'"
 echo
 echo "=== a source that reports an error TRACE message fails the run ==="
 fails faker_bad_config "the source reported an error"
+
+echo
+echo "=== no container of this POC is left running ==="
+if [ -n "$(docker ps -aq --filter name=rocky-)" ]; then
+    echo "FAIL: a rocky-* container is left:"
+    docker ps -a --filter name=rocky-
+    exit 1
+fi
+echo "    0 left"
 
 echo
 echo "POC complete: 3 loads (20, 0, 0 rows), Airbyte STREAM state carried in Rocky state."

@@ -1,0 +1,20 @@
+# The same connector as shop_orders in rocky.toml, plus a contract that the
+# batch cannot meet. run.sh runs it first: the load fails AFTER the shim
+# succeeded, so Rocky must not move the saved state.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.shop_orders]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/shop_orders"
+target     = { catalog = "poc", schema = "main", table = "orders" }
+retries    = 0
+contract   = { required_columns = [{ name = "no_such_column", type = "BIGINT", nullable = false }] }
+
+[connector.shop_orders.options]
+source_dir = "../shop_src"
+module     = "shop"
+source     = "shop"
+stream     = "orders"

@@ -12,7 +12,9 @@ Rocky ships no extractors. This file only adapts dlt to the protocol:
     source_dir     directory of the user's source module, relative to this file
     module         module name inside source_dir
     source         name of the function that returns a dlt source
-    stream         the one resource (table) to load; the shim fails when the
+    stream         the one resource to load. It must write exactly one table
+                   (dlt may rename the table; nested lists make child tables,
+                   which fail the run); the shim fails when the
                    source has no such resource
     source_args    optional table of keyword arguments for the function
     pipeline_name  optional, default "rocky_dlt"
@@ -21,9 +23,9 @@ Rocky ships no extractors. This file only adapts dlt to the protocol:
   That is dlt's source and incremental state: the cursors of every
   `dlt.sources.incremental`. It is restored with the public
   `Pipeline.managed_state()` before the run and read back from
-  `Pipeline.state` after it. dlt's own pipeline directory lives in the scratch
-  directory and is never read again, and dlt is told not to restore state from
-  the destination. Rocky's commit fence is the only thing that moves the
+  `Pipeline.state` after it. dlt's own pipeline directory is private to the
+  run, removed when it ends and never read again, and dlt is told not to
+  restore state from the destination. Rocky's commit fence is the only thing that moves the
   cursors, so a crash before the state commit replays the batch (at least
   once) instead of skipping it.
 
@@ -32,12 +34,15 @@ The module needs dlt and the standalone `duckdb` CLI (to count Parquet rows).
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 # Set before dlt is imported. The shim must call no host.
 os.environ["RUNTIME__DLTHUB_TELEMETRY"] = "false"
 os.environ["RESTORE_FROM_DESTINATION"] = "false"
+os.umask(0o077)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROTOCOL_VERSION = 0
@@ -157,6 +162,97 @@ def write_result(output_dir, files, state_value):
         json.dump(result, handle)
 
 
+def loaded_tables(pipeline, stream):
+    """Names of the tables the selected resource writes, by dlt's own schema.
+
+    dlt normalizes names (`order-items` becomes `order_items`), a resource can
+    set `table_name`, and nested lists become child tables (`orders__items`).
+    """
+    data_tables = pipeline.default_schema.data_tables()
+    names = set(t["name"] for t in data_tables if t.get("resource") == stream)
+    # A child table has a `parent`, not a `resource`. Follow the parents.
+    grew = True
+    while grew:
+        grew = False
+        for table in data_tables:
+            if table["name"] not in names and table.get("parent") in names:
+                names.add(table["name"])
+                grew = True
+    return sorted(names)
+
+
+def run_pipeline(dlt, filesystem, options, saved, source, dest_dir, work_dir):
+    stream = options["stream"]
+    pipeline = dlt.pipeline(
+        pipeline_name=options["pipeline_name"],
+        destination=filesystem(bucket_url="file://" + dest_dir),
+        dataset_name="rocky",
+        pipelines_dir=os.path.join(work_dir, "pipelines"),
+    )
+    if saved:
+        # Restore dlt's incremental state from Rocky's saved state.
+        with pipeline.managed_state(extract_state=False) as state:
+            state["sources"] = saved
+        log("restored dlt state for source(s): %s" % ", ".join(sorted(saved)))
+    else:
+        log("no saved state; first run")
+
+    try:
+        info = pipeline.run(source, loader_file_format="parquet")
+        info.raise_on_failed_jobs()
+    except Exception as error:  # dlt wraps every step failure in its own types
+        fail("dlt run failed: %s: %s" % (type(error).__name__, error))
+
+    # Rows dlt normalized for this resource, from its trace. Child tables count.
+    row_counts = {}
+    normalize = getattr(pipeline.last_trace, "last_normalize_info", None)
+    if normalize is not None:
+        row_counts = dict(normalize.row_counts)
+    tables = loaded_tables(pipeline, stream)
+    written = [t for t in tables if row_counts.get(t, 0) > 0]
+    extracted = sum(row_counts.get(t, 0) for t in tables)
+
+    if len(written) > 1:
+        fail(
+            "stream %r wrote %d tables with rows (%s). Rocky loads one table per "
+            "connector. Flatten the nested lists (max_table_nesting=0), or give the "
+            "resource one fixed table_name."
+            % (stream, len(written), ", ".join(sorted(written)))
+        )
+    files = []
+    table_name = written[0] if written else None
+    if table_name is not None:
+        table_dir = os.path.join(dest_dir, "rocky", table_name)
+        names = sorted(n for n in os.listdir(table_dir) if n.endswith(".parquet")) if os.path.isdir(table_dir) else []
+        for name in names:
+            path = os.path.join(table_dir, name)
+            files.append(
+                {
+                    "path": os.path.relpath(path, os.path.dirname(dest_dir)),
+                    "bytes": os.path.getsize(path),
+                    "rows": count_rows(path),
+                }
+            )
+    loaded = sum(item["rows"] for item in files)
+    if extracted > 0 and loaded == 0:
+        fail(
+            "dlt extracted %d row(s) for stream %r but the shim found no Parquet rows "
+            "for it; refusing to move the cursor past a lost batch" % (extracted, stream)
+        )
+    if extracted != loaded:
+        fail("dlt extracted %d row(s) for stream %r but the Parquet files hold %d" % (extracted, stream, loaded))
+
+    new_sources = pipeline.state.get("sources", {})
+    if loaded == 0 and new_sources != (saved or {}):
+        log("warning: the dlt state moved with 0 rows; the source advanced its cursor without records")
+    state_value = {"dlt_version": dlt.__version__, "sources": new_sources}
+    log(
+        "dlt %s wrote %d file(s), %d row(s) for table %s"
+        % (dlt.__version__, len(files), loaded, table_name)
+    )
+    return files, state_value
+
+
 def main():
     try:
         request = json.load(sys.stdin)
@@ -180,46 +276,14 @@ def main():
     source = build_source(options)
 
     dest_dir = os.path.join(output_dir, "dlt_destination")
-    pipeline = dlt.pipeline(
-        pipeline_name=options["pipeline_name"],
-        destination=filesystem(bucket_url="file://" + dest_dir),
-        dataset_name="rocky",
-        pipelines_dir=os.path.join(output_dir, "dlt_pipelines"),
-    )
-    if saved:
-        # Restore dlt's incremental state from Rocky's saved state.
-        with pipeline.managed_state(extract_state=False) as state:
-            state["sources"] = saved
-        log("restored dlt state for source(s): %s" % ", ".join(sorted(saved)))
-    else:
-        log("no saved state; first run")
-
+    # dlt keeps its resolved config and a trace of the run in the pipelines
+    # directory. It is private, and removed when the run ends, whatever the
+    # outcome (a SIGKILL can still leave it behind).
+    work_dir = tempfile.mkdtemp(prefix="dlt-work-", dir=output_dir)
     try:
-        info = pipeline.run(source, loader_file_format="parquet")
-        info.raise_on_failed_jobs()
-    except Exception as error:  # dlt wraps every step failure in its own types
-        fail("dlt run failed: %s: %s" % (type(error).__name__, error))
-
-    table_dir = os.path.join(dest_dir, "rocky", options["stream"])
-    files = []
-    if os.path.isdir(table_dir):
-        for name in sorted(os.listdir(table_dir)):
-            if not name.endswith(".parquet"):
-                continue
-            path = os.path.join(table_dir, name)
-            files.append(
-                {
-                    "path": os.path.relpath(path, output_dir),
-                    "bytes": os.path.getsize(path),
-                    "rows": count_rows(path),
-                }
-            )
-    new_sources = pipeline.state.get("sources", {})
-    state_value = {"dlt_version": dlt.__version__, "sources": new_sources}
-    log(
-        "dlt %s wrote %d file(s), %d row(s)"
-        % (dlt.__version__, len(files), sum(item["rows"] for item in files))
-    )
+        files, state_value = run_pipeline(dlt, filesystem, options, saved, source, dest_dir, work_dir)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
     write_result(output_dir, files, state_value)
 
 

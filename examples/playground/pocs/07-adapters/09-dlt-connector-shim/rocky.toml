@@ -50,3 +50,44 @@ source_dir = "../shop_src"
 module     = "shop"
 source     = "shop"
 stream     = "refunds"
+
+# dlt renames tables. This resource is called "order-items"; dlt writes it to
+# the table `order_items`. The shim finds the table through dlt's schema.
+[connector.shop_order_items]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/shop_order_items"
+target     = { catalog = "poc", schema = "main", table = "order_items" }
+retries    = 0
+
+[connector.shop_order_items.options]
+source_dir = "../shop_src"
+module     = "shop"
+source     = "shop"
+stream     = "order-items"
+
+# The resource sets table_name = "shop_refunds". Again the shim follows dlt.
+[connector.shop_refunds]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/shop_refunds"
+target     = { catalog = "poc", schema = "main", table = "refunds" }
+retries    = 0
+
+[connector.shop_refunds.options]
+source_dir = "../shop_src"
+module     = "shop"
+source     = "shop"
+stream     = "refunds_raw"
+
+# This resource has a nested list, so dlt writes a parent and a child table.
+# One connector loads one table: run.sh expects a clear failure.
+[connector.shop_nested]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/shop_nested"
+target     = { catalog = "poc", schema = "main", table = "nested" }
+retries    = 0
+
+[connector.shop_nested.options]
+source_dir = "../shop_src"
+module     = "shop"
+source     = "shop"
+stream     = "nested_orders"

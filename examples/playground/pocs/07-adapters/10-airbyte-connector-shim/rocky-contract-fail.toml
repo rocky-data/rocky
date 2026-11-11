@@ -1,0 +1,28 @@
+# The same connector as faker_users in rocky.toml, plus a contract that the
+# batch cannot meet. run.sh runs it first: the load fails AFTER the shim
+# succeeded, so Rocky must not move the saved state.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.faker_users]
+manifest     = "connector/connector.toml"
+keep_scratch = true
+output_uri   = "file://./.rocky/landing/faker_users"
+target       = { catalog = "poc", schema = "main", table = "users" }
+retries      = 0
+contract     = { required_columns = [{ name = "no_such_column", type = "BIGINT", nullable = false }] }
+
+[connector.faker_users.options]
+image          = "airbyte/source-faker:6.2.21"
+stream         = "users"
+sync_mode      = "auto"
+docker_network = "none"
+
+[connector.faker_users.options.config]
+count             = 20
+seed              = 7
+records_per_slice = 10
+parallelism       = 1
+always_updated    = false

@@ -2,6 +2,8 @@
 
 `orders` is incremental on `id`. `customers` exists to show that the shim
 loads the one stream named in the options and ignores the rest of the source.
+`order-items` and `refunds_raw` write to tables with other names than the
+resource. `nested_orders` writes two tables, which the shim refuses.
 """
 
 import json
@@ -33,4 +35,20 @@ def shop(data_dir: str = os.path.join(HERE, "data")):
     def customers():
         yield from _rows(os.path.join(data_dir, "customers.jsonl"))
 
-    return orders, customers
+    # dlt writes this resource to the table `order_items` (it normalizes the name).
+    @dlt.resource(name="order-items", write_disposition="append")
+    def order_items():
+        yield from _rows(os.path.join(data_dir, "order_items.jsonl"))
+
+    # The table name differs from the resource name.
+    @dlt.resource(name="refunds_raw", table_name="shop_refunds", write_disposition="append")
+    def refunds_raw():
+        yield from _rows(os.path.join(data_dir, "refunds.jsonl"))
+
+    # Each row has a list in `items`. dlt writes the list to a child table,
+    # `nested_orders__items`, so this resource writes two tables.
+    @dlt.resource(name="nested_orders", write_disposition="append")
+    def nested_orders():
+        yield from _rows(os.path.join(data_dir, "nested_orders.jsonl"))
+
+    return orders, customers, order_items, refunds_raw, nested_orders

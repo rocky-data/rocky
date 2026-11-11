@@ -27,6 +27,7 @@ Options (`[connector.<name>.options]`, read from options.json):
     config_env       table: config key -> NAME of an environment variable.
                      NAME must be declared under `secrets` in rocky.toml.
                      Use it for tokens and passwords.
+    namespace        optional; the stream's namespace, when two streams share a name
     sync_mode        "auto" (default) or "full_refresh"
     docker_network   passed to `docker run --network`. Omit for docker's
                      default. "none" cuts the container off (offline sources).
@@ -44,7 +45,9 @@ Python 3.8 or newer, standard library only, plus the docker and duckdb CLIs.
 
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -55,6 +58,9 @@ RESULT_FILE = "_rocky_result.json"
 BATCH_FILE = "batch-0.parquet"
 MOUNT = "/rocky_airbyte"
 MAX_STATE_BYTES = 900 * 1024
+# Names of the containers this run started. They are removed when the run ends.
+CONTAINERS = []
+CONTAINER_PREFIX = "rocky-airbyte"
 
 
 def log(message):
@@ -125,10 +131,36 @@ def read_state(request):
     return value["state_type"], value["message"]
 
 
-def docker_run(options, work_dir, args, capture_to=None):
+def remove_containers():
+    """`docker rm -f` every container this run named. Errors are ignored."""
+    for name in CONTAINERS:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", name], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False,
+            )
+        except OSError:
+            pass
+
+
+def on_sigterm(signum, frame):
+    # Rocky stops a run with SIGTERM to the process group. The docker client
+    # dies, but the container would go on, so remove it. SIGKILL cannot be
+    # caught: after a SIGKILL the container (named rocky-<run>-<attempt>-<step>)
+    # can outlive the run until it ends by itself.
+    remove_containers()
+    sys.exit(128 + signum)
+
+
+def docker_run(options, work_dir, args, step, capture_to=None):
     """Run the image with `args`. Returns (exit code, stdout lines or None)."""
+    name = "%s-%s" % (CONTAINER_PREFIX, step)
+    CONTAINERS.append(name)
+    # A container left by an earlier run with the same name would block this one.
+    subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, check=False)
     command = [
-        "docker", "run", "--rm", "--pull", "never",
+        "docker", "run", "--rm", "--pull", "never", "--name", name,
         # Files in work_dir are readable only by this user.
         "--user", "%d:%d" % (os.getuid(), os.getgid()),
         "-v", "%s:%s:ro" % (work_dir, MOUNT),
@@ -181,7 +213,7 @@ def check_trace_errors(message):
 
 
 def run_spec(options, work_dir):
-    code, lines = docker_run(options, work_dir, ["spec"])
+    code, lines = docker_run(options, work_dir, ["spec"], "spec")
     if code != 0:
         fail("`spec` exited with code %d" % code)
     for message in messages(lines):
@@ -194,7 +226,7 @@ def run_spec(options, work_dir):
 
 
 def run_discover(options, work_dir):
-    code, lines = docker_run(options, work_dir, ["discover", "--config", MOUNT + "/config.json"])
+    code, lines = docker_run(options, work_dir, ["discover", "--config", MOUNT + "/config.json"], "discover")
     streams = None
     for message in messages(lines):
         check_trace_errors(message)
@@ -208,15 +240,25 @@ def run_discover(options, work_dir):
 
 
 def configured_catalog(options, streams):
-    by_name = dict((s["name"], s) for s in streams)
     wanted = options["stream"]
-    if wanted not in by_name:
+    names = sorted(set(s["name"] for s in streams))
+    matching = [s for s in streams if s["name"] == wanted]
+    if not matching:
         fail(
             "the source has no stream %r; its streams are: %s. Rocky loads one "
             "stream per connector: set options.stream to one of them."
-            % (wanted, ", ".join(sorted(by_name)))
+            % (wanted, ", ".join(names))
         )
-    stream = by_name[wanted]
+    if options.get("namespace") is not None:
+        matching = [s for s in matching if s.get("namespace") == options["namespace"]]
+        if not matching:
+            fail("the source has no stream %r in namespace %r" % (wanted, options["namespace"]))
+    if len(matching) > 1:
+        fail(
+            "the source has %d streams named %r, in namespaces %s. Set options.namespace."
+            % (len(matching), wanted, ", ".join(repr(s.get("namespace")) for s in matching))
+        )
+    stream = matching[0]
     modes = stream.get("supported_sync_modes", [])
     if options["sync_mode"] == "auto" and "incremental" in modes:
         mode = "incremental"
@@ -225,13 +267,13 @@ def configured_catalog(options, streams):
     else:
         fail("stream %r supports neither incremental nor full_refresh (%r)" % (wanted, modes))
     log("streams in the source: %s; loading only %r (%s + append)"
-        % (", ".join(sorted(by_name)), wanted, mode))
+        % (", ".join(names), wanted, mode))
     entry = {"stream": stream, "sync_mode": mode, "destination_sync_mode": "append"}
     if mode == "incremental":
         entry["cursor_field"] = stream.get("default_cursor_field") or []
     if stream.get("source_defined_primary_key"):
         entry["primary_key"] = stream["source_defined_primary_key"]
-    return {"streams": [entry]}, mode
+    return {"streams": [entry]}, mode, stream.get("namespace")
 
 
 def state_file_value(state_type, message):
@@ -310,11 +352,14 @@ def main():
     # The work directory holds the config (it may hold secrets), the catalog
     # and the state. It is removed when the run ends. mkdtemp makes it 0700.
     work_dir = tempfile.mkdtemp(prefix="airbyte-work-", dir=output_dir)
+    global CONTAINER_PREFIX
+    CONTAINER_PREFIX = "rocky-" + re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(output_dir.rstrip("/")))
+    signal.signal(signal.SIGTERM, on_sigterm)
     try:
         write_private(os.path.join(work_dir, "config.json"), config)
         run_spec(options, work_dir)
         streams = run_discover(options, work_dir)
-        catalog, mode = configured_catalog(options, streams)
+        catalog, mode, namespace = configured_catalog(options, streams)
         write_private(os.path.join(work_dir, "catalog.json"), catalog)
 
         args = ["read", "--config", MOUNT + "/config.json", "--catalog", MOUNT + "/catalog.json"]
@@ -329,29 +374,42 @@ def main():
             log("no saved state; first run")
 
         raw_path = os.path.join(work_dir, "stdout.jsonl")
-        code, _ = docker_run(options, work_dir, args, capture_to=raw_path)
+        code, _ = docker_run(options, work_dir, args, "read", capture_to=raw_path)
 
         records_path = os.path.join(output_dir, "records.jsonl")
         records = 0
+        seen = 0
         last_state = None
         with open(raw_path, encoding="utf-8") as raw, open(records_path, "w", encoding="utf-8") as out:
             for message in messages(raw):
                 check_trace_errors(message)
                 if message["type"] == "RECORD":
                     record = message["record"]
-                    if record.get("stream") == options["stream"]:
+                    seen += 1
+                    # The namespace of a record must match the selected stream's.
+                    # A record with no namespace field is accepted.
+                    if record.get("stream") == options["stream"] and (
+                        namespace is None or record.get("namespace") in (None, namespace)
+                    ):
                         out.write(json.dumps(record["data"]) + "\n")
                         records += 1
                 elif message["type"] == "STATE":
                     last_state = split_state(message)
         if code != 0:
             fail("`read` exited with code %d" % code)
+        if seen > 0 and records == 0:
+            fail(
+                "the source emitted %d record(s) but none for stream %r (namespace %r); "
+                "refusing to move the state past a lost batch" % (seen, options["stream"], namespace)
+            )
 
         if last_state is None:
             # Full refresh sources emit no state. Carry the old state forward.
             last_state = saved if saved is not None else ("STREAM", None)
             log("the source emitted no STATE message; keeping the saved state")
         state_type, state_message = last_state
+        if records == 0 and saved is not None and last_state != saved:
+            log("warning: the state moved with 0 records; the source advanced its state without records")
 
         files = []
         if records > 0:
@@ -362,6 +420,7 @@ def main():
         log("read %d record(s) of stream %r; state type %s" % (records, options["stream"], state_type))
         write_result(output_dir, files, state_type, state_message)
     finally:
+        remove_containers()
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
