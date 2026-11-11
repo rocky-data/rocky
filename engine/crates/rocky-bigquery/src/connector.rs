@@ -2251,6 +2251,10 @@ mod tests {
         // An unreadable cell is nullable, never a NOT NULL proof.
         assert!(is_nullable_cell(&serde_json::Value::Null));
         assert!(is_nullable_cell(&serde_json::json!(0)));
+        // Only an explicit NO proves NOT NULL: any other text is nullable.
+        assert!(!is_nullable_cell(&serde_json::json!(" no ")));
+        assert!(is_nullable_cell(&serde_json::json!("")));
+        assert!(is_nullable_cell(&serde_json::json!("N")));
     }
 
     #[test]

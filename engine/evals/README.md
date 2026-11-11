@@ -173,8 +173,8 @@ and no unverified type. A drafted column the key does not list counts as one
 more overclaim. Underclaims are reported but do not gate. Only a nullable
 underclaim is safe: the contract promises less than the data gives. A key
 column left out of `required` / `protected` is not safe: the contract no
-longer stops that column being dropped. (Splitting "wrong" by direction was an advisor ruling of
-2026-11-11; Hugo to confirm.)
+longer stops that column being dropped. (Splitting "wrong" by direction was
+an advisor ruling of 2026-11-11; Hugo to confirm.)
 
 The three modes:
 
@@ -193,6 +193,70 @@ The three modes:
 - **`rehash`** keeps the recorded response texts and re-keys them to the
   current requests. Use it only after an intentional prompt change, and say
   so in the PR: the responses were not written for the new prompt.
+
+### Live rerun runbook
+
+The live rerun is the only real measure of draft quality. Results go on [#2577](https://github.com/rocky-data/rocky/issues/2577).
+
+**One command**, from the repo root on a fresh clone of `main`:
+
+```bash
+cd engine && cargo build -p rocky && cd evals && ANTHROPIC_API_KEY=<your key> python3 run_evals.py --contract-quality --contract-quality-mode live
+```
+
+**What it needs:**
+
+- A Rust toolchain (stable), to build `rocky`. The build compiles the bundled DuckDB from C++, so a C++ compiler is needed too, and the first build takes several minutes. To use a `rocky` binary you already have, set `ROCKY_BIN=/path/to/rocky` and skip `cargo build`.
+- Python 3.11 or newer. The harness uses only the standard library, so there is nothing to install; `uv run python` works too.
+- The `ANTHROPIC_API_KEY` environment variable. Nothing else: no Docker, no warehouse, no other credential.
+- Network access to `api.anthropic.com`.
+
+**What it reads and writes:**
+
+- It reads `fixtures/contract_quality/` (the project, its seed data and `answer_key.toml`).
+- It builds a DuckDB warehouse in a temporary directory and deletes it afterwards.
+- It sends four drafting requests, one per model, each retried at most twice. The prompt carries the model's schema and aggregate statistics, not raw rows.
+- It **overwrites** `fixtures/contract_quality/recordings/<model>.json` with the real responses.
+- It writes the scorecard to `results/contract_quality.md` and `results/contract_quality.json`. `results/` is git-ignored.
+
+**Reading the result.** The last block printed (also in `results/contract_quality.md`) starts with a line like this:
+
+```
+**PASS** — 75/80 matched (need >= 64), 1 overclaim(s) accepted (max 4), 0 unverified type(s) (max 0).
+```
+
+- `PASS` means all three conditions hold: at least 64 of 80 items matched, at most 4 overclaims, and no unverified type. An overclaim is a wrong item the compiler accepted that promises more than the data gives.
+- Underclaims are listed but do not gate.
+- `FAIL` is a finding, not a broken run. The exit code is 0 either way; a non-zero exit means the harness itself could not run.
+- The table under the summary gives the outcomes per model, and the list after it names every item that did not match.
+
+**Posting the result.** Comment on #2577 with:
+
+- the summary line;
+- the per-model table;
+- the list of items that did not match;
+- the commit SHA you ran.
+
+Do not paste the key, request bodies or raw responses. Write the comment in your own name, with no tool or agent attribution footer. To make CI pin the real responses, open a PR with:
+
+- the new recordings;
+- the scorecard;
+- a refreshed `expected_replay.json`: run `python3 run_evals.py --contract-quality`, then `python3 run_evals.py --contract-quality-update-expected`.
+
+The PR body gets no agent attribution either.
+
+**Can it run in a cloud agent session instead?** Yes, but only if the key owner chooses to. The session's network proxy can hold the key and add it to requests for `api.anthropic.com`:
+
+1. In the session, the agent asks for a credential for that host, sent in the `x-api-key` header.
+2. The key owner types the key into the secure form. The agent never sees it.
+3. The agent runs the command above with a dummy `ANTHROPIC_API_KEY`, which the proxy replaces.
+
+Two costs:
+
+- The key is saved on the cloud environment. The proxy then adds it to every session in that environment, other agents' sessions included, and to other people's sessions when the environment is shared.
+- It needs the owner present for the form.
+
+So only the key owner can start it. On a shared environment, a local run is simpler and keeps the key on one machine. Either way, the agent never handles the key.
 
 ## Determinism, flake, and reading a score
 

@@ -67,11 +67,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# retry N CMD...: runs CMD up to N times, 2 s, 4 s, 8 s ... apart.
+retry() {
+    local tries="$1" n=1 delay=2
+    shift
+    until "$@"; do
+        if [ "$n" -ge "$tries" ]; then
+            return 1
+        fi
+        echo "    attempt $n failed; retrying in ${delay}s"
+        sleep "$delay"
+        n=$((n + 1))
+        delay=$((delay * 2))
+    done
+}
+
+echo
+echo "=== fetch the two network dependencies, with retries ==="
+# The only steps that reach the internet: the Postgres image from Docker Hub
+# and the DuckDB postgres extension from extensions.duckdb.org. Fetching them
+# here, with retries, keeps a transient outage from failing a load below.
+# Both are cached, so a warm run fetches nothing.
+docker image inspect postgres:16-alpine >/dev/null 2>&1 \
+    || retry 6 docker compose pull --quiet postgres || {
+    echo "FAIL: could not pull the Postgres image after 6 attempts"
+    exit 1
+}
+EXT_DIR="$HERE/connector/.duckdb-extensions"
+retry 6 duckdb :memory: -c "SET extension_directories = ['$EXT_DIR']; INSTALL postgres;" >/dev/null || {
+    echo "FAIL: could not install the DuckDB postgres extension after 6 attempts"
+    exit 1
+}
+echo "    postgres:16-alpine and the DuckDB postgres extension are ready"
+
 echo
 echo "=== docker compose up -d --wait (postgres:16-alpine, 20 seeded rows) ==="
 # A container left by a killed run would hold the port.
 docker compose down -v >/dev/null 2>&1 || true
-docker compose up -d --wait
+retry 2 docker compose up -d --wait
 
 # Runs SQL inside the container, over the local socket.
 psql_in_container() {

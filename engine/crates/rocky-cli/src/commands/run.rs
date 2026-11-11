@@ -16775,6 +16775,22 @@ async fn execute_one_plain_model(
         )
         .map_err(anyhow::Error::from)?;
 
+    // A staged replace that stopped between moving the old table aside and
+    // renaming the new one in leaves the target missing and its data in the
+    // backup (ADR-REPLACE). Restore it before any probe below decides to
+    // bootstrap a fresh table. A no-op on a dialect that replaces atomically.
+    let swap_recovery = rocky_core::replace::recover_interrupted_swap(
+        warehouse,
+        &rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        },
+    )
+    .await
+    .map_err(anyhow::Error::from)
+    .with_context(|| format!("model '{model_name}' failed"))?;
+
     // A snapshot model reads its target's columns before generating SQL, so
     // it takes its own path (bootstrap, or close-and-open versions).
     if let rocky_ir::MaterializationStrategy::Snapshot(spec) = &model_ir.materialization {
@@ -17100,7 +17116,33 @@ async fn execute_one_plain_model(
     // same `bytes_scanned` / `bytes_written` shape that replication
     // tables already have. Skipped on a first-run bootstrap that already
     // loaded the data via CTAS (Incremental / DeleteInsert / Microbatch).
-    if !skip_strategy_exec {
+    // A full refresh on a dialect with no atomic replace (Trino) runs the
+    // staged swap through its executor, which adds the probes and the
+    // rollback that the plain statement list cannot (ADR-REPLACE). The swap
+    // is built by the same function that produced `exec_stmts`.
+    let full_refresh_swap = match (&model_ir.materialization, &pending_drop) {
+        (rocky_ir::MaterializationStrategy::FullRefresh, None) if !skip_strategy_exec => {
+            rocky_core::sql_gen::full_refresh_swap(&model_ir, dialect)?
+        }
+        _ => None,
+    };
+    let mut swap_notes: Vec<String> = swap_recovery.into_iter().collect();
+    if let Some(swap) = &full_refresh_swap {
+        let outcome = swap
+            .execute(warehouse)
+            .await
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("model '{model_name}' failed"))?;
+        bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, outcome.stats.bytes_scanned);
+        bytes_written_acc = accumulate_bytes(bytes_written_acc, outcome.stats.bytes_written);
+        if let Some(jid) = outcome.stats.job_id {
+            job_ids_acc.push(jid);
+        }
+        // The build ran outside the measured call: its reads are unknown.
+        reads_acc.mark_unmeasured();
+        swap_notes.extend(outcome.recovered);
+        swap_notes.extend(outcome.warning);
+    } else if !skip_strategy_exec {
         let mut atomic_create_done = false;
         if let Some((drop_sql, _, _)) = &pending_drop {
             if exec_stmts.len() != 1 {
@@ -17257,6 +17299,7 @@ async fn execute_one_plain_model(
             .into_iter()
             .chain(kind_probe_note)
             .chain(incremental_notes)
+            .chain(swap_notes)
             .collect(),
         attempts: Vec::new(),
         rows_copied: None,
@@ -19240,40 +19283,52 @@ async fn process_table(
         }
     }
 
+    // A staged replace that stopped between moving the old table aside and
+    // renaming the new one in leaves the target missing and its data in the
+    // backup (ADR-REPLACE). Restore it before the probe below, or this run
+    // would bootstrap a fresh table beside the backup. A no-op on a dialect
+    // that replaces atomically.
+    let swap_recovery = rocky_core::replace::recover_interrupted_swap(warehouse, &target_table)
+        .await
+        .map_err(anyhow::Error::from)?;
+
     // Drift detection — use pre-fetched columns when available (batch
     // information_schema query), falling back to individual DESCRIBE TABLE
-    // via WarehouseAdapter.
-    let (source_cols, target_cols) =
-        if task.prefetched_source_cols.is_some() && task.prefetched_target_cols.is_some() {
-            (
-                task.prefetched_source_cols.clone().unwrap_or_default(),
-                task.prefetched_target_cols.clone().unwrap_or_default(),
-            )
-        } else {
-            let (src, tgt) = tokio::join!(
-                warehouse.describe_table(&source_table),
-                warehouse.describe_table(&target_table),
-            );
-            // Source: a failed probe collapses to empty columns, which drift
-            // detection iterates as "no additive columns" (a no-op) — left as
-            // tolerable degradation rather than a hard failure. Target: a
-            // positively-transient probe failure propagates (fail closed)
-            // rather than collapse to "absent" and full-refresh a target that
-            // may be live; every other failure is treated as absent (the
-            // non-replacing CTAS backstops it — cf. #1206/#1207).
-            let target_cols = match tgt {
-                Ok(cols) => cols,
-                Err(e) if warehouse.classify_failure(&e).is_retryable() => {
-                    return Err(anyhow::Error::from(e).context(format!(
-                        "target existence probe for '{}' failed with a retryable \
+    // via WarehouseAdapter. A restored target was absent when the batch
+    // prefetch ran, so it is described afresh.
+    let (source_cols, target_cols) = if swap_recovery.is_none()
+        && task.prefetched_source_cols.is_some()
+        && task.prefetched_target_cols.is_some()
+    {
+        (
+            task.prefetched_source_cols.clone().unwrap_or_default(),
+            task.prefetched_target_cols.clone().unwrap_or_default(),
+        )
+    } else {
+        let (src, tgt) = tokio::join!(
+            warehouse.describe_table(&source_table),
+            warehouse.describe_table(&target_table),
+        );
+        // Source: a failed probe collapses to empty columns, which drift
+        // detection iterates as "no additive columns" (a no-op) — left as
+        // tolerable degradation rather than a hard failure. Target: a
+        // positively-transient probe failure propagates (fail closed)
+        // rather than collapse to "absent" and full-refresh a target that
+        // may be live; every other failure is treated as absent (the
+        // non-replacing CTAS backstops it — cf. #1206/#1207).
+        let target_cols = match tgt {
+            Ok(cols) => cols,
+            Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "target existence probe for '{}' failed with a retryable \
                          error; refusing to assume it is absent",
-                        target_table.full_name()
-                    )));
-                }
-                Err(_) => Vec::new(),
-            };
-            (src.unwrap_or_default(), target_cols)
+                    target_table.full_name()
+                )));
+            }
+            Err(_) => Vec::new(),
         };
+        (src.unwrap_or_default(), target_cols)
+    };
     // The batch source prefetch is useful even if the target prefetch missed
     // and drift detection fell back to per-table probes for both sides.
     // An empty description can also mean the source probe was unavailable.
@@ -19350,16 +19405,15 @@ async fn process_table(
         }
 
         if drift_result.action == DriftAction::DropAndRecreate {
+            // The rebuild is a full refresh of an existing target, so it
+            // replaces the table: one atomic statement, or the staged swap.
+            // The target is never dropped first: a failed rebuild must leave
+            // the old table (ADR-REPLACE, RD-009).
             info!(
                 table = target_table.full_name(),
                 drifted = drift_result.drifted_columns.len(),
-                "drift detected, dropping target"
+                "drift detected, rebuilding target"
             );
-            let drop_sql = drift::generate_drop_table_sql(&target_table, dialect)?;
-            warehouse
-                .execute_statement(&drop_sql)
-                .await
-                .map_err(anyhow::Error::from)?;
             use_full_refresh = true;
 
             let reason = drift_reason(&drift_result.drifted_columns, "changed");
@@ -19732,26 +19786,36 @@ async fn process_table(
         "copying data"
     );
 
-    // Idempotent replacement on dialects whose full-refresh CTAS isn't
-    // `CREATE OR REPLACE` (Trino). A bootstrap target is never pre-dropped:
-    // plain CREATE must fail closed if the metadata probe missed a live table.
-    if target_exists && strategy_name == "full_refresh" && dialect.full_refresh_needs_predrop() {
-        let target_ref = dialect.format_table_ref(
-            &target_table.catalog,
-            &target_table.schema,
-            &target_table.table,
-        )?;
-        let drop_sql = dialect.drop_table_sql(&target_ref);
-        debug!(
-            table = target_table.full_name(),
-            sql = drop_sql.as_str(),
-            "pre-drop for idempotent full refresh"
-        );
-        warehouse
-            .execute_statement(&drop_sql)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
+    // A full refresh of an existing target on a dialect with no atomic
+    // replace (Trino) runs as a staged swap: the same CTAS, built under the
+    // stage name, then renamed in (ADR-REPLACE). A bootstrap target is never
+    // swapped: plain CREATE must fail closed if the metadata probe missed a
+    // live table.
+    let swap = if target_exists && strategy_name == "full_refresh" {
+        match dialect.table_replace(&target_table.catalog) {
+            rocky_core::traits::TableReplace::Atomic => None,
+            rocky_core::traits::TableReplace::StagedSwap => {
+                let names = rocky_core::replace::SwapNames::for_target(&target_table)
+                    .map_err(anyhow::Error::from)?;
+                let ctas = |ir: &ModelIr| match held_max.as_ref() {
+                    Some(held) => {
+                        sql_gen::generate_held_back_bootstrap_create_table_as_sql(ir, dialect, held)
+                    }
+                    None => sql_gen::generate_bootstrap_create_table_as_sql(ir, dialect),
+                };
+                let mut stage_ir = model_ir.clone();
+                stage_ir.target.table.clone_from(&names.stage.table);
+                let build = ctas(&stage_ir)?;
+                let create = ctas(&model_ir)?;
+                Some(
+                    rocky_core::replace::StagedSwap::new(dialect, names, build, create)
+                        .map_err(anyhow::Error::from)?,
+                )
+            }
+        }
+    } else {
+        None
+    };
 
     // #2234: refuse to replace a view whose governance the replace would
     // drop. The pipeline's per-table tags are the declared set: the deferred
@@ -19766,10 +19830,24 @@ async fn process_table(
             .map_err(anyhow::Error::from)?;
     }
 
-    let exec_stats = warehouse
-        .execute_statement_with_stats(&sql)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let mut swap_notes: Vec<String> = swap_recovery.into_iter().collect();
+    let exec_stats = match &swap {
+        Some(swap) => {
+            debug!(
+                table = target_table.full_name(),
+                statements = ?swap.statements(),
+                "staged replace"
+            );
+            let outcome = swap.execute(warehouse).await.map_err(anyhow::Error::from)?;
+            swap_notes.extend(outcome.recovered);
+            swap_notes.extend(outcome.warning);
+            outcome.stats
+        }
+        None => warehouse
+            .execute_statement_with_stats(&sql)
+            .await
+            .map_err(anyhow::Error::from)?,
+    };
 
     // Tagging and watermark updates are deferred to post-run batch phase
     // to avoid blocking the concurrency semaphore with sequential SQL
@@ -19807,7 +19885,7 @@ async fn process_table(
     )
     .await?;
 
-    let mut notes = Vec::new();
+    let mut notes = swap_notes;
     if let Some(cutoff) = &hold_back {
         // Every row a full copy lands is in the target; every row an
         // incremental INSERT lands is above the prior watermark. So the copy
@@ -55633,6 +55711,209 @@ timestamp_column = "ts"
                 .owed_check_targets(&scope, &targets)
                 .unwrap()
                 .is_empty()
+        );
+    }
+}
+
+/// The run path's wiring of the staged replace (ADR-REPLACE): a transformation
+/// full refresh on a dialect with no atomic replace goes through
+/// `StagedSwap::execute` and the interrupted-swap recovery, not a plain
+/// statement list. Trino's dialect renders the SQL; an in-memory DuckDB runs
+/// it, with Trino's qualified `RENAME TO` target cut to the bare name DuckDB
+/// takes.
+#[cfg(all(test, feature = "duckdb"))]
+mod staged_swap_wiring_tests {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use rocky_core::models::load_model_pair;
+    use rocky_core::traits::{
+        AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+    };
+    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+    use rocky_ir::{ColumnInfo, TableRef};
+    use rocky_trino::dialect::TrinoDialect;
+
+    struct TrinoOnDuckDb {
+        inner: DuckDbWarehouseAdapter,
+        dialect: TrinoDialect,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl TrinoOnDuckDb {
+        async fn new(setup: &[&str]) -> Self {
+            let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+            for sql in setup {
+                inner.execute_statement(sql).await.unwrap();
+            }
+            Self {
+                inner,
+                dialect: TrinoDialect::new(),
+                log: Mutex::new(Vec::new()),
+            }
+        }
+        async fn tables(&self) -> Vec<String> {
+            let rows = self
+                .inner
+                .execute_query(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = 'tgt' ORDER BY table_name",
+                )
+                .await
+                .unwrap();
+            rows.rows
+                .into_iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect()
+        }
+        async fn ids(&self, table: &str) -> Vec<String> {
+            let rows = self
+                .inner
+                .execute_query(&format!("SELECT id FROM tgt.{table} ORDER BY id"))
+                .await
+                .unwrap();
+            rows.rows
+                .into_iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect()
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for TrinoOnDuckDb {
+        fn dialect(&self) -> &dyn SqlDialect {
+            &self.dialect
+        }
+        async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+            self.log.lock().unwrap().push(sql.to_string());
+            let sql = match sql.split_once(" RENAME TO ") {
+                Some((head, to)) => format!("{head} RENAME TO {}", to.rsplit('.').next().unwrap()),
+                None => sql.to_string(),
+            };
+            self.inner.execute_statement(&sql).await
+        }
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+        fn classify_failure(&self, e: &AdapterError) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(e)
+        }
+        async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    async fn run_full_refresh(
+        wh: &TrinoOnDuckDb,
+        select: &str,
+    ) -> anyhow::Result<crate::output::MaterializationOutput> {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+             catalog = \"memory\"\nschema = \"tgt\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), select).unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders.sql"),
+            &dir.path().join("orders.toml"),
+            None,
+        )
+        .unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        super::execute_one_plain_model(&model, wh, wh.dialect(), "orders", Instant::now(), exec_ctx)
+            .await
+    }
+
+    const SETUP: [&str; 4] = [
+        "CREATE SCHEMA src",
+        "CREATE SCHEMA tgt",
+        "CREATE TABLE src.events AS SELECT * FROM (VALUES (1), (2)) t(id)",
+        "CREATE TABLE tgt.orders AS SELECT 99 AS id",
+    ];
+
+    #[tokio::test]
+    async fn a_full_refresh_swaps_the_new_table_in() {
+        let wh = TrinoOnDuckDb::new(&SETUP).await;
+        run_full_refresh(&wh, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids("orders").await, ["1", "2"]);
+        assert_eq!(wh.tables().await, ["orders"]);
+        let log = wh.log();
+        assert!(
+            log.iter()
+                .any(|s| s.starts_with("CREATE TABLE \"memory\".\"tgt\".\"orders__rocky_stage\"")),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|s| s
+                .starts_with("DROP TABLE IF EXISTS \"memory\".\"tgt\".\"orders\"")
+                && !s.contains("__rocky_")),
+            "the target is never dropped: {log:?}"
+        );
+    }
+
+    /// RD-009 through the run path: a failing `SELECT` keeps the old table.
+    #[tokio::test]
+    async fn a_failed_select_keeps_the_old_table() {
+        let wh = TrinoOnDuckDb::new(&SETUP).await;
+        run_full_refresh(&wh, "SELECT id FROM src.missing")
+            .await
+            .unwrap_err();
+        assert_eq!(wh.ids("orders").await, ["99"]);
+        assert_eq!(wh.tables().await, ["orders"]);
+    }
+
+    /// A run that stopped between the two renames left only the backup. The
+    /// next run restores it, says so, and leaves nothing behind.
+    #[tokio::test]
+    async fn an_interrupted_swap_is_recovered_and_reported() {
+        let wh = TrinoOnDuckDb::new(&[
+            SETUP[0],
+            SETUP[1],
+            SETUP[2],
+            "CREATE TABLE tgt.orders__rocky_old AS SELECT 99 AS id",
+        ])
+        .await;
+        let output = run_full_refresh(&wh, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids("orders").await, ["1", "2"]);
+        assert_eq!(wh.tables().await, ["orders"]);
+        assert!(
+            output.notes.iter().any(|n| n.contains("orders__rocky_old")),
+            "{:?}",
+            output.notes
+        );
+    }
+
+    /// A first build needs no rename.
+    #[tokio::test]
+    async fn a_first_build_creates_the_target_directly() {
+        let wh = TrinoOnDuckDb::new(&SETUP[..3]).await;
+        run_full_refresh(&wh, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids("orders").await, ["1", "2"]);
+        assert!(
+            !wh.log().iter().any(|s| s.contains(" RENAME TO ")),
+            "{:?}",
+            wh.log()
         );
     }
 }

@@ -1,0 +1,152 @@
+# Short native runs of the scheduler soak harness (#1416).
+#
+# The 24 h soak cannot run here: a hosted job stops at 6 h, and the memory
+# gate needs a run of 16 h or more. What CI can do is prove the HARNESS on
+# both architectures before a person spends a day on it:
+#
+#   x86_64 / poll   a 20-minute soak on a native x86_64 runner, /runs polled
+#   arm64  / end    a 20-minute soak on a native arm64 runner, ledger read at the end
+#   x86_64 / stop   the harness is sent SIGTERM at minute 8 and must run its
+#                   end step: DONE with complete=false, the ledger, the verdict
+#                   (INCOMPLETE, exit 2) and a partial verdict over 8 minutes
+#
+# A green job says the harness works on that architecture. It never says memory
+# is flat: 20 minutes is far under the final-quarter window.
+#
+# `workflow_dispatch` runs the same jobs for longer (up to 300 minutes), which
+# is a native x86_64 arm with real hours in it, still short of the 24 h gate.
+name: Soak self-check
+
+on:
+  pull_request:
+    paths:
+      - "scripts/soak-scheduler.sh"
+      - "scripts/soak_verdict.py"
+      - ".github/workflows/soak-selfcheck.yml"
+      - "engine/crates/rocky-cli/src/commands/scheduler/**"
+      - "engine/crates/rocky-core/src/schedule/**"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Soak length in minutes (max 300)"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-selfcheck-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  CARGO_NET_RETRY: '10'
+
+jobs:
+  soak:
+    name: Soak ${{ matrix.arch }} / ${{ matrix.case }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            case: poll
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            case: end
+          - runner: ubuntu-24.04
+            arch: x86_64
+            case: stop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: engine
+          key: soak-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # See engine-ci.yml: a restored cache keeps duckdb-sources/ without its
+      # `.complete` marker and the build script then fails.
+      - name: Drop the cached bundled DuckDB sources
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
+      - name: Install cmake and lsof
+        run: |
+          command -v cmake >/dev/null 2>&1 && command -v lsof >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake lsof
+      - name: Build rocky (release)
+        working-directory: engine
+        run: cargo build --release -p rocky
+      - name: Run the soak
+        env:
+          CASE: ${{ matrix.case }}
+          MINUTES: ${{ inputs.minutes || '20' }}
+        run: |
+          set -uo pipefail
+          case "$MINUTES" in ''|*[!0-9]*) echo "minutes must be a whole number"; exit 1 ;; esac
+          # 300 leaves room under the 360-minute job timeout for a cold release
+          # build (up to 25 min), the 3-minute preflight and the end step.
+          (( MINUTES >= 12 && MINUTES <= 300 )) || { echo "minutes must be 12-300"; exit 1; }
+          out="$RUNNER_TEMP/soak"
+          export SELF_CHECK_MINUTES="$MINUTES"
+          if [[ "$CASE" == stop ]]; then
+            export HARVEST_MODE=end
+            bash scripts/soak-scheduler.sh --self-check "$out" &
+            pid=$!
+            # Preflight takes about 3 minutes; stop 5 minutes into the clock.
+            for _ in $(seq 1 120); do [[ -s "$out/meta.json" ]] && break; sleep 5; done
+            [[ -s "$out/meta.json" ]] || { echo "the soak never started"; exit 1; }
+            sleep 300
+            kill -TERM "$pid"
+            # The step shell is `bash -e`: a bare `wait` returning 2 (INCOMPLETE,
+            # the expected verdict here) would end the step before the checks.
+            code=0
+            wait "$pid" || code=$?
+            echo "harness exit: $code"
+            python3 - "$out" "$code" <<'PY'
+          import json, pathlib, sys
+          out, code = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+          done = json.loads((out / "DONE").read_text())
+          verdict = json.loads((out / "verdict.json").read_text())
+          fires = [l for l in (out / "harvest.jsonl").read_text().splitlines() if l.strip()]
+          checks = {
+              "exit 2 (INCOMPLETE)": code == 2,
+              "DONE says incomplete": done.get("complete") is False,
+              "DONE names the signal": done.get("reason") == "signal:SIGTERM",
+              "STOPPED written": (out / "STOPPED").is_file(),
+              "serve.exit written": (out / "serve.exit").is_file(),
+              "ledger read back": len(fires) > 0,
+              "verdict INCOMPLETE": verdict["verdict"] == "INCOMPLETE",
+              "partial verdict present": "partial" in verdict,
+          }
+          for name, ok in checks.items():
+              print(("PASS " if ok else "FAIL ") + name)
+          sys.exit(0 if all(checks.values()) else 1)
+          PY
+          else
+            export HARVEST_MODE="$CASE"
+            bash scripts/soak-scheduler.sh --self-check "$out"
+          fi
+      - name: Upload the run directory
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-${{ matrix.arch }}-${{ matrix.case }}
+          path: |
+            ${{ runner.temp }}/soak/*.json
+            ${{ runner.temp }}/soak/*.jsonl
+            ${{ runner.temp }}/soak/DONE
+            ${{ runner.temp }}/soak/STOPPED
+            ${{ runner.temp }}/soak/serve.exit
+          if-no-files-found: warn

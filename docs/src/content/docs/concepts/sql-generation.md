@@ -96,6 +96,17 @@ Rocky rebuilds the whole table when it finds drift it cannot fix in place, and w
 CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>
 ```
 
+A full refresh never drops the target before the new table exists. If the `SELECT` fails, the old table stays. Trino has no `CREATE OR REPLACE` on every connector, so there Rocky builds the new table under a stage name and swaps it in by rename:
+
+```sql
+CREATE TABLE <target>__rocky_stage AS SELECT * FROM <source>
+ALTER TABLE IF EXISTS <target> RENAME TO <target>__rocky_old
+ALTER TABLE <target>__rocky_stage RENAME TO <target>
+DROP TABLE IF EXISTS <target>__rocky_old
+```
+
+If the third statement fails, Rocky renames the old table back. If a run stops between the two renames, the next run restores `<target>` from `<target>__rocky_old` before it does anything else. Rocky never drops a `__rocky_stage` or `__rocky_old` table it did not create in the same run: it stops and names the table instead. A target whose name ends in `__rocky_stage` or `__rocky_old` is refused on Trino. Readers can get "table not found" for the short moment between the two renames. The design is in [ADR-REPLACE](https://github.com/rocky-data/rocky/blob/main/docs/adr/ADR-REPLACE.md).
+
 ## Merge (Upsert)
 
 For tables that require key-based deduplication:
@@ -207,11 +218,7 @@ Rocky reads both schemas before it copies a table:
 DESCRIBE TABLE <catalog>.<schema>.<table>
 ```
 
-When it finds a change it cannot apply in place, it drops the target and rebuilds it:
-
-```sql
-DROP TABLE IF EXISTS <target_catalog>.<target_schema>.<table>
-```
+When it finds a change it cannot apply in place, it rebuilds the target with a [full refresh](#full-refresh). The old table stays until the new one exists.
 
 ## Permission Grants
 

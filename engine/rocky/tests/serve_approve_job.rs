@@ -19,6 +19,8 @@
 //! server's `ROCKY_PRINCIPAL_ID` / `ROCKY_PRINCIPAL` name its operator, so the
 //! approve child drops them: the row names an `unnamed` human over `http_api`.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -142,9 +144,7 @@ fn serve(dir: &Path, root: &Path, gitconfig: &Path, env: &[(&str, &str)]) -> (Se
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && http(port, "GET", "/api/v1/health", "").0.contains("200")
-        {
+        if common::serve_health_ok(port) {
             break;
         }
         assert!(Instant::now() < deadline, "rocky serve did not come up");
