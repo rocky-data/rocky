@@ -19797,16 +19797,18 @@ async fn process_table(
             rocky_core::traits::TableReplace::StagedSwap => {
                 let names = rocky_core::replace::SwapNames::for_target(&target_table)
                     .map_err(anyhow::Error::from)?;
+                let ctas = |ir: &ModelIr| match held_max.as_ref() {
+                    Some(held) => {
+                        sql_gen::generate_held_back_bootstrap_create_table_as_sql(ir, dialect, held)
+                    }
+                    None => sql_gen::generate_bootstrap_create_table_as_sql(ir, dialect),
+                };
                 let mut stage_ir = model_ir.clone();
                 stage_ir.target.table.clone_from(&names.stage.table);
-                let build = match held_max.as_ref() {
-                    Some(held) => sql_gen::generate_held_back_bootstrap_create_table_as_sql(
-                        &stage_ir, dialect, held,
-                    )?,
-                    None => sql_gen::generate_bootstrap_create_table_as_sql(&stage_ir, dialect)?,
-                };
+                let build = ctas(&stage_ir)?;
+                let create = ctas(&model_ir)?;
                 Some(
-                    rocky_core::replace::StagedSwap::new(dialect, names, build)
+                    rocky_core::replace::StagedSwap::new(dialect, names, build, create)
                         .map_err(anyhow::Error::from)?,
                 )
             }
@@ -55709,6 +55711,209 @@ timestamp_column = "ts"
                 .owed_check_targets(&scope, &targets)
                 .unwrap()
                 .is_empty()
+        );
+    }
+}
+
+/// The run path's wiring of the staged replace (ADR-REPLACE): a transformation
+/// full refresh on a dialect with no atomic replace goes through
+/// `StagedSwap::execute` and the interrupted-swap recovery, not a plain
+/// statement list. Trino's dialect renders the SQL; an in-memory DuckDB runs
+/// it, with Trino's qualified `RENAME TO` target cut to the bare name DuckDB
+/// takes.
+#[cfg(all(test, feature = "duckdb"))]
+mod staged_swap_wiring_tests {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use rocky_core::models::load_model_pair;
+    use rocky_core::traits::{
+        AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+    };
+    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+    use rocky_ir::{ColumnInfo, TableRef};
+    use rocky_trino::dialect::TrinoDialect;
+
+    struct TrinoOnDuckDb {
+        inner: DuckDbWarehouseAdapter,
+        dialect: TrinoDialect,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl TrinoOnDuckDb {
+        async fn new(setup: &[&str]) -> Self {
+            let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+            for sql in setup {
+                inner.execute_statement(sql).await.unwrap();
+            }
+            Self {
+                inner,
+                dialect: TrinoDialect::new(),
+                log: Mutex::new(Vec::new()),
+            }
+        }
+        async fn tables(&self) -> Vec<String> {
+            let rows = self
+                .inner
+                .execute_query(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = 'tgt' ORDER BY table_name",
+                )
+                .await
+                .unwrap();
+            rows.rows
+                .into_iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect()
+        }
+        async fn ids(&self, table: &str) -> Vec<String> {
+            let rows = self
+                .inner
+                .execute_query(&format!("SELECT id FROM tgt.{table} ORDER BY id"))
+                .await
+                .unwrap();
+            rows.rows
+                .into_iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect()
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for TrinoOnDuckDb {
+        fn dialect(&self) -> &dyn SqlDialect {
+            &self.dialect
+        }
+        async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+            self.log.lock().unwrap().push(sql.to_string());
+            let sql = match sql.split_once(" RENAME TO ") {
+                Some((head, to)) => format!("{head} RENAME TO {}", to.rsplit('.').next().unwrap()),
+                None => sql.to_string(),
+            };
+            self.inner.execute_statement(&sql).await
+        }
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+        fn classify_failure(&self, e: &AdapterError) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(e)
+        }
+        async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    async fn run_full_refresh(
+        wh: &TrinoOnDuckDb,
+        select: &str,
+    ) -> anyhow::Result<crate::output::MaterializationOutput> {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+             catalog = \"memory\"\nschema = \"tgt\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), select).unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders.sql"),
+            &dir.path().join("orders.toml"),
+            None,
+        )
+        .unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        super::execute_one_plain_model(&model, wh, wh.dialect(), "orders", Instant::now(), exec_ctx)
+            .await
+    }
+
+    const SETUP: [&str; 4] = [
+        "CREATE SCHEMA src",
+        "CREATE SCHEMA tgt",
+        "CREATE TABLE src.events AS SELECT * FROM (VALUES (1), (2)) t(id)",
+        "CREATE TABLE tgt.orders AS SELECT 99 AS id",
+    ];
+
+    #[tokio::test]
+    async fn a_full_refresh_swaps_the_new_table_in() {
+        let wh = TrinoOnDuckDb::new(&SETUP).await;
+        run_full_refresh(&wh, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids("orders").await, ["1", "2"]);
+        assert_eq!(wh.tables().await, ["orders"]);
+        let log = wh.log();
+        assert!(
+            log.iter()
+                .any(|s| s.starts_with("CREATE TABLE \"memory\".\"tgt\".\"orders__rocky_stage\"")),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|s| s
+                .starts_with("DROP TABLE IF EXISTS \"memory\".\"tgt\".\"orders\"")
+                && !s.contains("__rocky_")),
+            "the target is never dropped: {log:?}"
+        );
+    }
+
+    /// RD-009 through the run path: a failing `SELECT` keeps the old table.
+    #[tokio::test]
+    async fn a_failed_select_keeps_the_old_table() {
+        let wh = TrinoOnDuckDb::new(&SETUP).await;
+        run_full_refresh(&wh, "SELECT id FROM src.missing")
+            .await
+            .unwrap_err();
+        assert_eq!(wh.ids("orders").await, ["99"]);
+        assert_eq!(wh.tables().await, ["orders"]);
+    }
+
+    /// A run that stopped between the two renames left only the backup. The
+    /// next run restores it, says so, and leaves nothing behind.
+    #[tokio::test]
+    async fn an_interrupted_swap_is_recovered_and_reported() {
+        let wh = TrinoOnDuckDb::new(&[
+            SETUP[0],
+            SETUP[1],
+            SETUP[2],
+            "CREATE TABLE tgt.orders__rocky_old AS SELECT 99 AS id",
+        ])
+        .await;
+        let output = run_full_refresh(&wh, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids("orders").await, ["1", "2"]);
+        assert_eq!(wh.tables().await, ["orders"]);
+        assert!(
+            output.notes.iter().any(|n| n.contains("orders__rocky_old")),
+            "{:?}",
+            output.notes
+        );
+    }
+
+    /// A first build needs no rename.
+    #[tokio::test]
+    async fn a_first_build_creates_the_target_directly() {
+        let wh = TrinoOnDuckDb::new(&SETUP[..3]).await;
+        run_full_refresh(&wh, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids("orders").await, ["1", "2"]);
+        assert!(
+            !wh.log().iter().any(|s| s.contains(" RENAME TO ")),
+            "{:?}",
+            wh.log()
         );
     }
 }

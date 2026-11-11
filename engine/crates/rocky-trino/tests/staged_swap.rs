@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::replace::{ReplaceError, StagedSwap, SwapNames, recover_interrupted_swap};
 use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
 use rocky_ir::{ColumnInfo, TableRef};
@@ -23,6 +24,11 @@ struct Catalog {
     log: Mutex<Vec<String>>,
     /// A statement starting with one of these fails without effect.
     fail: Mutex<Vec<String>>,
+    /// Probing one of these tables fails with a permanent error, which
+    /// reads as absent (a metastore that cannot see the table).
+    blind: Mutex<Vec<String>>,
+    /// Probing one of these tables fails with a retryable error.
+    flaky: Mutex<Vec<String>>,
 }
 
 impl Catalog {
@@ -37,6 +43,8 @@ impl Catalog {
             ),
             log: Mutex::new(Vec::new()),
             fail: Mutex::new(Vec::new()),
+            blind: Mutex::new(Vec::new()),
+            flaky: Mutex::new(Vec::new()),
         }
     }
     fn fail_on(&self, prefix: String) {
@@ -122,10 +130,24 @@ impl WarehouseAdapter for Catalog {
         Err(err("no queries in this script"))
     }
 
+    fn classify_failure(&self, e: &AdapterError) -> FailureClass {
+        if e.to_string().contains("timed out") {
+            FailureClass::Transient(TransientKind::Timeout)
+        } else {
+            FailureClass::Permanent
+        }
+    }
+
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
         let name = self
             .dialect
             .format_table_ref(&table.catalog, &table.schema, &table.table)?;
+        if self.flaky.lock().unwrap().contains(&name) {
+            return Err(err(format!("describe {name} timed out")));
+        }
+        if self.blind.lock().unwrap().contains(&name) {
+            return Err(err(format!("metastore error describing {name}")));
+        }
         if self.tables.lock().unwrap().contains_key(&name) {
             Ok(vec![ColumnInfo {
                 name: "id".into(),
@@ -142,7 +164,8 @@ fn swap() -> StagedSwap {
     let dialect = TrinoDialect::new();
     let names = SwapNames::for_target(&tref("orders")).unwrap();
     let build = dialect.create_table_as_new(&fq("orders__rocky_stage"), "SELECT 1 AS id");
-    StagedSwap::new(&dialect, names, build).unwrap()
+    let create = dialect.create_table_as_new(&fq("orders"), "SELECT 1 AS id");
+    StagedSwap::new(&dialect, names, build, create).unwrap()
 }
 
 #[tokio::test]
@@ -161,12 +184,51 @@ async fn a_full_refresh_replaces_the_table_and_leaves_nothing_behind() {
     );
 }
 
+/// A first build creates the target directly, so it needs no rename and
+/// works on a catalog that cannot rename tables (Hive on Glue).
 #[tokio::test]
-async fn a_first_run_builds_and_renames_without_a_backup() {
+async fn a_first_run_creates_the_target_without_a_rename() {
     let wh = Catalog::new(&[]);
+    wh.fail_on("ALTER TABLE".into());
     swap().execute(&wh).await.unwrap();
     assert_eq!(wh.table("orders").as_deref(), Some("new"));
     assert_eq!(wh.names(), [fq("orders")]);
+    assert_eq!(
+        wh.log(),
+        [format!("CREATE TABLE {} AS\nSELECT 1 AS id", fq("orders"))]
+    );
+}
+
+/// A stage the probe could not see (or that a concurrent run made after the
+/// probe) makes the build fail with "already exists". That table is not this
+/// run's, so it is kept.
+#[tokio::test]
+async fn a_stage_this_run_did_not_make_is_never_dropped() {
+    let wh = Catalog::new(&[("orders", "old"), ("orders__rocky_stage", "theirs")]);
+    wh.blind.lock().unwrap().push(fq("orders__rocky_stage"));
+    let e = swap().execute(&wh).await.unwrap_err();
+    assert!(matches!(e, ReplaceError::StageTaken { .. }), "{e}");
+    assert_eq!(wh.table("orders__rocky_stage").as_deref(), Some("theirs"));
+    assert_eq!(wh.table("orders").as_deref(), Some("old"));
+    assert!(
+        !wh.log().iter().any(|s| s.starts_with("DROP")),
+        "{:?}",
+        wh.log()
+    );
+}
+
+/// A retryable probe failure means absence cannot be assumed: the swap stops
+/// before it runs any statement.
+#[tokio::test]
+async fn a_retryable_probe_failure_runs_nothing() {
+    for table in ["orders", "orders__rocky_old", "orders__rocky_stage"] {
+        let wh = Catalog::new(&[("orders", "old")]);
+        wh.flaky.lock().unwrap().push(fq(table));
+        let e = swap().execute(&wh).await.unwrap_err();
+        assert!(matches!(e, ReplaceError::Probe { .. }), "{table}: {e}");
+        assert!(wh.log().is_empty(), "{table}: {:?}", wh.log());
+        assert_eq!(wh.table("orders").as_deref(), Some("old"));
+    }
 }
 
 /// RD-009 itself: the build fails, and the old table must survive.

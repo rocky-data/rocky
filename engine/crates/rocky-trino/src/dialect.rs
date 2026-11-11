@@ -375,7 +375,7 @@ mod tests {
         );
     }
     use rocky_core::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
-    use rocky_core::quarantine::{StatementRole, compile_quarantine_sql};
+    use rocky_core::quarantine::compile_quarantine_sql;
     use rocky_core::tests::{TestDecl, TestSeverity, TestType};
     use rocky_ir::TableRef;
 
@@ -419,9 +419,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let sql: Vec<&str> = plan.statements.iter().map(|s| s.sql.as_str()).collect();
+        assert!(
+            plan.statements.is_empty(),
+            "the valid table is written only by the swap: {:?}",
+            plan.statements
+        );
+        let swap = plan
+            .valid_swap
+            .expect("drop mode on Trino carries a staged swap");
         assert_eq!(
-            sql,
+            swap.statements(),
             [
                 "CREATE TABLE \"iceberg\".\"raw\".\"orders__valid__rocky_stage\" AS\n\
                  SELECT * FROM \"iceberg\".\"raw\".\"orders\" WHERE customer_id IS NOT NULL",
@@ -431,18 +438,6 @@ mod tests {
                  \"iceberg\".\"raw\".\"orders__valid\"",
                 "DROP TABLE IF EXISTS \"iceberg\".\"raw\".\"orders__valid__rocky_old\"",
             ]
-        );
-        assert_eq!(plan.statements[0].role, StatementRole::Valid);
-        assert!(
-            plan.statements[1..]
-                .iter()
-                .all(|s| s.role == StatementRole::SwapValid)
-        );
-        assert!(
-            !sql.iter().any(
-                |s| s.starts_with("DROP TABLE IF EXISTS \"iceberg\".\"raw\".\"orders__valid\"")
-            ),
-            "the valid table is never dropped before its replacement exists"
         );
     }
 

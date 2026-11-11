@@ -1567,6 +1567,34 @@ async fn execute_quarantine_plan(
         }
     }
 
+    // `drop` on a dialect with no atomic replace (Trino): the valid table is
+    // written by a staged swap, run with its probes, rollback and recovery
+    // rather than as a plain statement list (ADR-REPLACE).
+    if errors.is_empty()
+        && let Some(swap) = &plan.valid_swap
+    {
+        match swap.execute(warehouse).await {
+            Ok(outcome) => {
+                for note in outcome.recovered.iter().chain(outcome.warning.iter()) {
+                    warn!(target = plan.valid_table.as_str(), "{note}");
+                }
+            }
+            Err(e) => {
+                classified.get_or_insert((FailureKind::Unknown, None));
+                errors.push(format!(
+                    "{}: {}",
+                    role_label(rocky_core::quarantine::StatementRole::Valid),
+                    e
+                ));
+                warn!(
+                    target = plan.valid_table.as_str(),
+                    error = %e,
+                    "quarantine valid-table swap failed"
+                );
+            }
+        }
+    }
+
     // After the loop, not inside it: the drop has to run on the failure path
     // too, including when the label statement itself reported failure. A
     // CTAS can commit on the warehouse while the client sees a timeout, so
@@ -1622,7 +1650,6 @@ fn role_label(role: rocky_core::quarantine::StatementRole) -> &'static str {
         StatementRole::Quarantine => "quarantine",
         StatementRole::Valid => "valid",
         StatementRole::Tag => "tag",
-        StatementRole::SwapValid => "swap_valid",
         StatementRole::DropLabels => "drop_labels",
     }
 }

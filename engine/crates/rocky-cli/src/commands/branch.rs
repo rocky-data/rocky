@@ -1545,6 +1545,7 @@ fn promote_swap(
         step.target,
         step.source
     );
+    let create = dialect.create_table_as_new(&quote_fqn(dialect, &prod)?, &select);
     let names = rocky_core::replace::SwapNames::for_target(&TableRef {
         catalog: prod.catalog,
         schema: prod.schema,
@@ -1560,7 +1561,7 @@ fn promote_swap(
     )?;
     let build = dialect.create_table_as_new(&stage, &select);
     Ok(Some(rocky_core::replace::StagedSwap::new(
-        dialect, names, build,
+        dialect, names, build, create,
     )?))
 }
 

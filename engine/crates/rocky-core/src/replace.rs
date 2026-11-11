@@ -19,6 +19,9 @@
 //!
 //! [`StagedSwap::execute`] adds what a plain list cannot:
 //!
+//! - With no target (and no backup to restore), it skips the swap and runs a
+//!   plain `CREATE TABLE <target> AS <select>`. A first build needs no
+//!   rename, so it works on a catalog that cannot rename tables.
 //! - It probes first. A backup with no target is restored (a previous run
 //!   stopped between steps 2 and 3). A backup beside a live target, or a
 //!   leftover stage, is refused: Rocky cannot prove it made that table, so it
@@ -98,6 +101,29 @@ pub enum ReplaceError {
     Build {
         target: String,
         stage: String,
+        #[source]
+        source: AdapterError,
+    },
+
+    /// Building the stage failed because a table already sits at the stage
+    /// name: another run made it after this run's probe, or the probe could
+    /// not see it. Rocky did not make it, so it is kept.
+    #[error(
+        "building {stage} failed because a table already exists there; Rocky did not create it \
+         in this run, so it kept it. {target} is untouched. Another run may be replacing {target} \
+         right now; once none is, check {stage} and drop it: DROP TABLE {stage}. Error: {source}"
+    )]
+    StageTaken {
+        target: String,
+        stage: String,
+        #[source]
+        source: AdapterError,
+    },
+
+    /// Creating a missing target failed. Nothing was renamed or dropped.
+    #[error("creating {target} failed: {source}")]
+    Create {
+        target: String,
         #[source]
         source: AdapterError,
     },
@@ -230,6 +256,7 @@ pub struct StagedSwap {
     stage_sql: String,
     backup_sql: String,
     build: String,
+    create: String,
     move_aside: String,
     swap_in: String,
     restore: String,
@@ -256,7 +283,8 @@ impl StagedSwap {
     /// `names.stage` and must not replace an existing table there (a plain
     /// `CREATE TABLE … AS`, as [`SqlDialect::create_table_as_new`] renders),
     /// so a stage another run is filling makes this run fail, not take it
-    /// over.
+    /// over. `create` is the same statement aimed at `names.target`, run
+    /// instead of the swap when the target does not exist.
     ///
     /// # Errors
     ///
@@ -266,6 +294,7 @@ impl StagedSwap {
         dialect: &dyn SqlDialect,
         names: SwapNames,
         build: String,
+        create: String,
     ) -> Result<Self, ReplaceError> {
         let render = |source| ReplaceError::Render {
             target: names.target.full_name(),
@@ -290,6 +319,7 @@ impl StagedSwap {
             stage_sql,
             backup_sql,
             build,
+            create,
             move_aside,
             swap_in,
             restore,
@@ -354,11 +384,35 @@ impl StagedSwap {
             });
         }
 
+        if !target_exists {
+            // Nothing to replace: build the target directly. A plain CREATE
+            // fails rather than replace a table the probe missed, and a
+            // failure leaves nothing this run must clean up.
+            outcome.stats = warehouse
+                .execute_statement_with_stats(&self.create)
+                .await
+                .map_err(|source| ReplaceError::Create {
+                    target: self.target_sql.clone(),
+                    source,
+                })?;
+            return Ok(outcome);
+        }
+
         match warehouse.execute_statement_with_stats(&self.build).await {
             Ok(stats) => outcome.stats = stats,
+            Err(source) if says_already_exists(&source) => {
+                // The stage appeared after the probe (a concurrent run), or
+                // the probe could not see it. Either way it is not this
+                // run's table, so it is kept.
+                return Err(ReplaceError::StageTaken {
+                    target: self.target_sql.clone(),
+                    stage: self.stage_sql.clone(),
+                    source,
+                });
+            }
             Err(source) => {
-                // The probe above saw no stage, so whatever a failed build
-                // left there is this run's.
+                // The probe saw no stage and the build did not collide with
+                // one, so whatever a failed build left there is this run's.
                 self.drop_stage_quietly(warehouse).await;
                 return Err(ReplaceError::Build {
                     target: self.target_sql.clone(),
@@ -368,7 +422,7 @@ impl StagedSwap {
             }
         }
 
-        if target_exists && let Err(source) = warehouse.execute_statement(&self.move_aside).await {
+        if let Err(source) = warehouse.execute_statement(&self.move_aside).await {
             self.drop_stage_quietly(warehouse).await;
             return Err(ReplaceError::MoveAside {
                 target: self.target_sql.clone(),
@@ -377,14 +431,6 @@ impl StagedSwap {
         }
 
         if let Err(swap_error) = warehouse.execute_statement(&self.swap_in).await {
-            if !target_exists {
-                self.drop_stage_quietly(warehouse).await;
-                return Err(ReplaceError::SwapIn {
-                    target: self.target_sql.clone(),
-                    stage: self.stage_sql.clone(),
-                    source: swap_error,
-                });
-            }
             return match warehouse.execute_statement(&self.restore).await {
                 Ok(()) => {
                     self.drop_stage_quietly(warehouse).await;
@@ -404,7 +450,7 @@ impl StagedSwap {
             };
         }
 
-        if target_exists && let Err(e) = warehouse.execute_statement(&self.drop_backup).await {
+        if let Err(e) = warehouse.execute_statement(&self.drop_backup).await {
             let mut msg = String::new();
             let _ = write!(
                 msg,
@@ -445,6 +491,16 @@ impl StagedSwap {
             tracing::warn!(stage = %self.stage_sql, error = %e, "could not drop the stage of a failed replace");
         }
     }
+}
+
+/// Whether a failed `CREATE TABLE` collided with an existing table. Trino
+/// reports `TABLE_ALREADY_EXISTS` as "Table '…' already exists"; other
+/// engines use the same words.
+fn says_already_exists(error: &AdapterError) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("already exists")
 }
 
 /// Whether `table` exists. A retryable probe failure is an error (absence
@@ -489,7 +545,7 @@ pub async fn recover_interrupted_swap(
     if exists(warehouse, &names.target).await? || !exists(warehouse, &names.backup).await? {
         return Ok(None);
     }
-    let swap = StagedSwap::new(dialect, names, String::new())?;
+    let swap = StagedSwap::new(dialect, names, String::new(), String::new())?;
     swap.restore_backup(warehouse).await.map(Some)
 }
 

@@ -118,16 +118,19 @@ Names: `<table>__rocky_stage` and `<table>__rocky_old`, beside the target. A nam
 4. DROP TABLE IF EXISTS backup
 ```
 
-Run one after another, a failure at any step leaves the old table at the target name or the backup name, never neither. `rocky plan`, `emit_sql`, `estimate` and quarantine use this list, so their signatures do not change.
+Run one after another, a failure at any step leaves the old table at the target name or the backup name, never neither. `rocky plan`, `emit_sql` and `estimate` show this list, so their signatures do not change.
 
-`StagedSwap::execute()` is what `rocky run` and promote use. It adds:
+`StagedSwap::execute()` is what `rocky run`, promote and quarantine `drop` use. It adds:
 
 ```
 probe target, backup, stage
   backup and no target   → restore: rename backup → target, report it
   backup and target      → refuse (Rocky cannot prove it made the backup)
   stage exists           → refuse (another run, or a crash; never dropped)
-1 fails                  → drop the stage (the probe proved it was ours); target untouched
+no target                → plain CREATE TABLE target AS <select>; no rename
+1 fails, "already exists"→ refuse, keep the stage (another run made it after the probe,
+                           or the probe could not see it); target untouched
+1 fails otherwise        → drop the stage (the probe proved it was ours); target untouched
 2 fails                  → drop the stage; target untouched
 3 fails                  → rename backup → target (rollback)
 3 and rollback fail      → error names the exact RENAME that restores the table
@@ -161,7 +164,7 @@ The spike proves this is one atomic catalog commit, and that a failure at any st
 | Replication `full_refresh` of an existing target | Staged swap built from the bootstrap (non-replacing) CTAS aimed at the stage, held-back bound kept |
 | Replication drift `DropAndRecreate` | No `DROP`. The rebuild is a full refresh of an existing target: atomic replace, or the swap |
 | Branch promote | `promote_swap()` checks the recorded statement is exactly the replace, then executes the swap. New plans record no pre-drop; a legacy plan's `pre_drop_statement` is never run |
-| Quarantine `drop` | The valid table is built under the stage and swapped in (`StatementRole::SwapValid`) |
+| Quarantine `drop` | The valid table is written by the swap (`QuarantinePlan::valid_swap`), run with `StagedSwap::execute` |
 | Quarantine `tag` | Still refused on a swap dialect (it rewrites its own source) |
 | Seeds | Not changed here; see What this does not close |
 
@@ -181,7 +184,7 @@ A fresh read-only Fable agent ruled on the open questions of the draft. Recorded
 - RD-009 closes for full refresh, replication copy, drift rebuild, branch promote and quarantine `drop`, on every adapter Rocky ships.
 - On Trino, every full refresh of an existing table has a short window between the two renames where the target name does not resolve. A reader in that window gets "table not found". No data is lost.
 - On Trino, a full refresh costs two renames and three existence probes more than before.
-- On a Trino catalog that refuses rename (Hive on Glue), a full refresh of an existing table now fails at the move-aside step with the target untouched, where it used to drop and recreate. Opting such a catalog into a non-atomic drop-and-create, or into `CREATE OR REPLACE` for Iceberg and Delta Lake catalogs, is the Q1 follow-up config key.
+- On a Trino catalog that refuses rename (Hive on Glue), a full refresh of an existing table now fails at the move-aside step with the target untouched, where it used to drop and recreate. A first build still works there: with no target, the swap is a plain `CREATE TABLE … AS` and renames nothing. Opting such a catalog into a non-atomic drop-and-create, or into `CREATE OR REPLACE` for Iceberg and Delta Lake catalogs, is the Q1 follow-up config key.
 - A Trino Iceberg table rebuilt by the swap starts a new snapshot history, as the old drop-and-create did. `CREATE OR REPLACE` (the follow-up key) would keep it.
 - Drift rebuild without the `DROP`:
   - BigQuery refuses `CREATE OR REPLACE` when the existing table's partitioning or clustering differs from the new one. A rebuild that worked by dropping now fails with BigQuery's error and the old table kept. That is the intended fail-closed outcome.
@@ -189,7 +192,12 @@ A fresh read-only Fable agent ruled on the open questions of the draft. Recorded
   - ClickHouse: `CREATE OR REPLACE` is atomic on the `Atomic` database engine, ClickHouse's default.
 - `rocky plan` on Trino shows the four swap statements instead of `DROP` + `CREATE`.
 
+- A run that stops after step 3 (or whose step-4 drop fails) leaves the backup beside the live target. Every later replace of that table then refuses with `LeftoverBackup` until someone drops the backup by hand. That availability cost is the price of never dropping a table Rocky cannot prove it made (Q4).
+
 ### What this does not close
+
+- **No intent record.** Ownership of `<t>__rocky_old` is inferred from its name. A table at the backup name with no target (a user's table, or a backup whose drop failed long ago and whose target was later dropped) is restored as the target. For a full refresh it is then replaced; for an incremental or merge model it becomes the live target. Q2 ruled this acceptable: restoring is the only action that never loses data. A state-store intent record would close it.
+- **Two concurrent runs on one target are not supported.** The swap does not lock. Data is never lost, but a run can fail with a false error, and a recovery that races another run's swap-in can leave a stage that later runs refuse (`LeftoverStage`) until it is dropped by hand. A concurrent build that collides with another run's stage keeps that stage (`StageTaken`).
 
 - **Seeds** still drop, create and batch-insert on every dialect (`seeds.rs`, `SeedStrategy::DropAndRecreate`). A failed seed leaves the seed table missing or partial. The CSV is in the repository, so availability is lost, not data. Follow-up PR under this ADR.
 - **`drop_existing_kind`** (a table/view switch the model opts into) is unchanged: it already refuses unless the adapter offers `atomic_drop_and_create`.
@@ -202,7 +210,8 @@ A fresh read-only Fable agent ruled on the open questions of the draft. Recorded
 
 ## Validation
 
-- Unit (`rocky-core`, `rocky-trino`): the swap's statements; every failure point of `execute` against a scripted adapter (build, move aside, swap in, rollback, drop backup); the refusals (leftover stage, leftover backup, reserved name); recovery of a missing target from its backup; no statement drops the target.
+- Unit (`rocky-core`, `rocky-trino`): the swap's statements; every failure point of `execute` against a scripted adapter (build, move aside, swap in, rollback, drop backup); the refusals (leftover stage, leftover backup, reserved name, a stage the probe could not see); a retryable probe failure runs nothing; a first build renames nothing; recovery of a missing target from its backup; no statement drops the target.
+- Run path (`rocky-cli`, Trino's dialect over DuckDB): a transformation full refresh swaps, a failing `SELECT` keeps the old table, an interrupted swap is recovered and reported in `notes`, a first build creates the target directly.
 - CLI: Trino promote renders the swap and refuses a tampered statement; a legacy plan's pre-drop is never run (DuckDB, live).
 - Live: the Trino conformance harness runs a full refresh whose `SELECT` fails against a real coordinator and asserts the old rows survive, then a crash-between-renames recovery.
 - `scripts/mutation-check.sh` on the rollback and on the leftover-backup refusal.

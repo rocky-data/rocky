@@ -1057,18 +1057,30 @@ pub fn full_refresh_swap(
         schema: model_ir.target.schema.clone(),
         table: model_ir.target.table.clone(),
     };
+    // The swap builds a plain CTAS, so a lakehouse `format` would be lost.
+    // No staged-swap dialect renders lakehouse DDL today; refuse rather than
+    // drop the declared format if one ever does.
+    if model_ir.format.is_some() {
+        return Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': a lakehouse `format` cannot be replaced by a staged swap on {}",
+            model_ir.name,
+            dialect.name()
+        )));
+    }
     let names = crate::replace::SwapNames::for_target(&target)?;
-    let stage = dialect.format_table_ref(
-        &names.stage.catalog,
-        &names.stage.schema,
-        &names.stage.table,
-    )?;
-    let build = match ctas_with_table_options(model_ir, dialect, &stage, &model_ir.sql, false)? {
-        Some(stmt) => stmt,
-        None => dialect.create_table_as_new(&stage, &model_ir.sql),
+    let ctas = |table: &rocky_ir::TableRef| -> Result<String, SqlGenError> {
+        let name = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+        Ok(
+            match ctas_with_table_options(model_ir, dialect, &name, &model_ir.sql, false)? {
+                Some(stmt) => stmt,
+                None => dialect.create_table_as_new(&name, &model_ir.sql),
+            },
+        )
     };
+    let build = ctas(&names.stage)?;
+    let create = ctas(&names.target)?;
     Ok(Some(crate::replace::StagedSwap::new(
-        dialect, names, build,
+        dialect, names, build, create,
     )?))
 }
 

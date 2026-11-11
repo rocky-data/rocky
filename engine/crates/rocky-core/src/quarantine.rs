@@ -173,6 +173,11 @@ pub struct QuarantinePlan {
     /// a stray quarantine table (cheap to inspect) rather than a stale
     /// valid table downstream pipelines might read.
     pub statements: Vec<QuarantineStatement>,
+    /// `drop` only, on a dialect with no atomic replace: the staged swap
+    /// that writes the valid table (ADR-REPLACE). The runtime runs it with
+    /// [`StagedSwap::execute`], after [`Self::statements`] (empty in that
+    /// case), so its probes, rollback and recovery apply. `None` otherwise.
+    pub valid_swap: Option<StagedSwap>,
     /// `split` only: the statement that drops the intermediate label table.
     /// `None` for `drop` and `tag`, which write no intermediate table.
     ///
@@ -294,7 +299,7 @@ pub const MAX_GENERATED_IDENTIFIER_LEN: usize = 255;
 #[derive(Debug, Clone)]
 pub struct QuarantineStatement {
     /// Human-readable role of this statement (`"label"`, `"quarantine"`,
-    /// `"valid"`, `"tag"`, `"swap_valid"`, `"drop_labels"`). Used for logging and row-effect
+    /// `"valid"`, `"tag"`, `"drop_labels"`). Used for logging and row-effect
     /// attribution.
     pub role: StatementRole,
     /// Fully-qualified table name this statement writes to.
@@ -316,9 +321,6 @@ pub enum StatementRole {
     Valid,
     /// CTAS that rewrites the source table in-place with `_error_*` tags.
     Tag,
-    /// `drop` only, on a dialect with no atomic replace: one of the renames
-    /// or the drop that swap the staged valid table in (ADR-REPLACE).
-    SwapValid,
     /// `split` only: drops the intermediate table the [`Self::Label`]
     /// statement wrote.
     DropLabels,
@@ -452,6 +454,7 @@ fn compile_with_token(
     let mut statements = Vec::with_capacity(3);
     let mut drop_intermediate = None;
     let mut ownership_after = None;
+    let mut valid_swap = None;
     match config.mode {
         QuarantineMode::Split => {
             // In the intermediate table each label sits under a working name,
@@ -545,20 +548,8 @@ fn compile_with_token(
                     )?;
                     let select = format!("SELECT * FROM {source_table} WHERE {valid_where}");
                     let build = dialect.create_table_as_new(&stage, &select);
-                    let swap = StagedSwap::new(dialect, names, build)?;
-                    let mut steps = swap.statements().into_iter();
-                    if let Some(sql) = steps.next() {
-                        statements.push(QuarantineStatement {
-                            role: StatementRole::Valid,
-                            target: stage,
-                            sql,
-                        });
-                    }
-                    statements.extend(steps.map(|sql| QuarantineStatement {
-                        role: StatementRole::SwapValid,
-                        target: valid_table.clone(),
-                        sql,
-                    }));
+                    let create = dialect.create_table_as_new(&valid_table, &select);
+                    valid_swap = Some(StagedSwap::new(dialect, names, build, create)?);
                 }
             }
         }
@@ -603,6 +594,7 @@ fn compile_with_token(
             String::new()
         },
         statements,
+        valid_swap,
         drop_intermediate,
         ownership_after,
     }))
