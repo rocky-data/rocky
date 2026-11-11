@@ -644,22 +644,20 @@ fn compute_model_typecheck(
                 inferred.count_outputs.contains(&index),
                 inferred.cast_outputs.contains(&index),
                 inferred.coalesce_outputs.contains(&index),
-                inferred.subtotal_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count, cast, coalesce, subtotal)) =
+            let Some(&(inferred_col, exact_type, count, cast, coalesce)) =
                 inferred_by_name.get(col.name.as_str())
             else {
+                // Inference ran but names no output like this one: lineage
+                // and inference spell an unaliased expression differently
+                // (`CAST(x AS BIGINT)` is `x` to lineage). Lineage's bit
+                // is then unchecked against the relation scope (an outer
+                // join, a subtotal row), so it is not kept as non-null.
+                col.nullable = true;
                 continue;
             };
-            // A subtotal row of `ROLLUP`, `CUBE` or `GROUPING SETS` can hold
-            // NULL here, whatever lineage says about the source column. No
-            // rule below narrows it back: each one that sets `false` needs
-            // inference's answer to be non-null (#2566).
-            if subtotal {
-                col.nullable = true;
-            }
             // A `COALESCE` is NULL only when every argument is. Inference
             // reads each argument in the SQL relation scope (outer-join side
             // included), so its non-null answer holds whatever the result
@@ -2034,9 +2032,9 @@ fn where_rejects_null_column(sql: &str, column: &str) -> bool {
             !modifiers.is_empty()
                 || exprs.iter().any(|expr| {
                     matches!(
-                        expr,
+                        strip_nested(expr),
                         Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)
-                    )
+                    ) || is_grouping_construct_call(strip_nested(expr))
                 })
         }
     };
@@ -3976,10 +3974,6 @@ pub(crate) struct SelectInference {
     /// through parentheses. Such an output's nullable bit is exact: it is
     /// NULL only when every argument is (#2553).
     coalesce_outputs: HashSet<usize>,
-    /// Outputs that can be NULL in a subtotal row of `GROUP BY ROLLUP`,
-    /// `CUBE` or `GROUPING SETS` (#2566). Their nullable bit is already
-    /// `true`; the merge must not narrow it from lineage.
-    subtotal_outputs: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -4347,6 +4341,16 @@ fn infer_set_expr_types(body: &SetExpr, env: InferEnv<'_, '_>) -> Result<SelectI
     match body {
         SetExpr::Select(select) => infer_select_types_in_scope(select, env),
         SetExpr::Query(query) => infer_query_types(query, env),
+        // `UNION BY NAME` pairs columns by name and pads a column one side
+        // lacks with NULL, so the by-position combine below would pair the
+        // wrong columns. Rocky does not read it.
+        SetExpr::SetOperation {
+            set_quantifier:
+                ast::SetQuantifier::ByName
+                | ast::SetQuantifier::AllByName
+                | ast::SetQuantifier::DistinctByName,
+            ..
+        } => Err("set operation by name".to_string()),
         SetExpr::SetOperation { left, right, .. } => {
             let left = infer_set_expr_types(left, env)?;
             let right = infer_set_expr_types(right, env)?;
@@ -4380,7 +4384,6 @@ fn combine_set_operation(
     let mut exact_type_outputs = HashSet::new();
     let mut relation_inexact = HashSet::new();
     let mut count_outputs = HashSet::new();
-    let mut subtotal_outputs = HashSet::new();
     let mut set_branches = Vec::with_capacity(left.columns.len());
     for (index, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
         let both_exact =
@@ -4409,9 +4412,6 @@ fn combine_set_operation(
         if left.count_outputs.contains(&index) && right.count_outputs.contains(&index) {
             count_outputs.insert(index);
         }
-        if left.subtotal_outputs.contains(&index) || right.subtotal_outputs.contains(&index) {
-            subtotal_outputs.insert(index);
-        }
         l.data_type = data_type;
         // Set, not `|=`: a side's own bit came from part of the set, and
         // only the whole set's bit is order-independent.
@@ -4429,7 +4429,6 @@ fn combine_set_operation(
         // A combined column may be NULL from any branch; the merge does not
         // narrow a set operation's nullability.
         coalesce_outputs: HashSet::new(),
-        subtotal_outputs,
         set_operation: true,
         set_branches,
     })
@@ -4527,8 +4526,7 @@ fn infer_select_types_in_scope(
                 | SelectItem::ExprWithAliases { expr, .. } => Some(expr),
                 _ => None,
             };
-            for index in first..inferred.columns.len() {
-                let column = &mut inferred.columns[index];
+            for column in &mut inferred.columns[first..] {
                 let null_in_subtotal = match expr {
                     Some(expr) => keys.output_can_be_null(expr, rolled_scope),
                     // A `*` column: NULL when it is a rolled-up key.
@@ -4536,7 +4534,6 @@ fn infer_select_types_in_scope(
                 };
                 if null_in_subtotal {
                     column.nullable = true;
-                    inferred.subtotal_outputs.insert(index);
                 }
             }
         }
@@ -4585,14 +4582,24 @@ impl SubtotalKeys {
             }
             ast::GroupByExpr::Expressions(exprs, modifiers) => {
                 for expr in exprs {
-                    match expr {
+                    match strip_nested(expr) {
                         Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
                             flatten_grouping_keys(expr, &mut rolled);
                         }
+                        // `GROUP BY (ROLLUP(x))` parses as a call named
+                        // `ROLLUP`; Rocky does not read its keys.
+                        expr if is_grouping_construct_call(expr) => return Some(Self::Any),
                         // A `WITH ROLLUP` / `WITH CUBE` modifier rolls up
                         // every plain key.
                         expr if !modifiers.is_empty() => flatten_grouping_keys(expr, &mut rolled),
                         _ => {}
+                    }
+                }
+                // Spark's trailing `GROUP BY a GROUPING SETS ((a), ())`: the
+                // keys in the sets roll up too.
+                for modifier in modifiers {
+                    if let ast::GroupByWithModifier::GroupingSets(sets) = modifier {
+                        flatten_grouping_keys(sets, &mut rolled);
                     }
                 }
             }
@@ -4702,6 +4709,13 @@ impl SubtotalKeys {
     }
 }
 
+/// Whether `expr` is a call named `ROLLUP`, `CUBE` or `GROUPING SETS`: how
+/// `GROUP BY (ROLLUP(x))` parses.
+fn is_grouping_construct_call(expr: &Expr) -> bool {
+    function_name(expr)
+        .is_some_and(|name| matches!(name.as_str(), "ROLLUP" | "CUBE" | "GROUPING SETS"))
+}
+
 /// Push every key inside a grouping construct, looking through nested
 /// `ROLLUP` / `CUBE` / `GROUPING SETS`, tuples and parentheses.
 fn flatten_grouping_keys<'a>(expr: &'a Expr, keys: &mut Vec<&'a Expr>) {
@@ -4791,8 +4805,16 @@ fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> Jo
     use ast::JoinOperator;
 
     let mut left = infer_relation_columns(&from.relation, env);
+    let mut previous = &from.relation;
     for join in &from.joins {
         let mut right = infer_relation_columns(&join.relation, env);
+        // DuckDB's `a POSITIONAL JOIN b` parses as `a AS positional JOIN b`
+        // with no condition. It pads the shorter side with NULLs.
+        if is_positional_join(previous, &join.join_operator) {
+            null_extend_scope(&mut left);
+            null_extend_scope(&mut right);
+        }
+        previous = &join.relation;
         left.inexact.extend(std::mem::take(&mut right.inexact));
         let merged = merged_join_columns(&left.columns, &right.columns, &join.join_operator);
         if matches!(
@@ -4827,6 +4849,25 @@ fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> Jo
         left.relations.extend(right.relations);
     }
     left
+}
+
+/// Whether `join`, after the relation `previous`, is how DuckDB's
+/// `POSITIONAL JOIN` parses: `previous` has the unquoted alias `positional`
+/// and the join is a plain `JOIN` with no condition.
+fn is_positional_join(previous: &TableFactor, join: &ast::JoinOperator) -> bool {
+    let alias = match previous {
+        TableFactor::Table { alias, .. }
+        | TableFactor::Derived { alias, .. }
+        | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
+        _ => None,
+    };
+    alias.is_some_and(|alias| {
+        alias.name.quote_style.is_none() && alias.name.value.eq_ignore_ascii_case("positional")
+    }) && matches!(
+        join,
+        ast::JoinOperator::Join(ast::JoinConstraint::None)
+            | ast::JoinOperator::Inner(ast::JoinConstraint::None)
+    )
 }
 
 fn merged_join_columns(
@@ -5944,6 +5985,12 @@ mod tests {
                  FROM t GROUP BY ROLLUP(COALESCE(x, 0))",
                 "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n \
                  FROM t GROUP BY GROUPING SETS (ROLLUP(COALESCE(x, 0)))",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY (ROLLUP(x))",
+                // A `*` over a CTE takes the rolled-up key's name.
+                "WITH r AS (SELECT x AS c FROM t) SELECT * FROM r GROUP BY ROLLUP(c)",
+                // `GROUP BY ALL` and Spark's trailing form with grouping sets.
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ALL GROUPING SETS ((x), ())",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY x GROUPING SETS ((x), ())",
             ] {
                 let (_, nullable, e012) = coalesce_column(sql, target.clone());
                 if !nullable || !e012 {
@@ -5972,6 +6019,8 @@ mod tests {
                 // A qualified key widens only its own relation.
                 "SELECT a.x AS c, b.x AS d, COUNT(*) AS n \
                  FROM t AS a JOIN u AS b ON a.x = b.x GROUP BY a.x, ROLLUP(b.x)",
+                // A bare aggregate keeps its bit when a key is an expression.
+                "SELECT COUNT(*) AS c, x + 1 AS k FROM t GROUP BY ROLLUP(x + 1)",
             ] {
                 let (_, nullable, e012) = coalesce_column(sql, target.clone());
                 if nullable || e012 {
@@ -6009,7 +6058,80 @@ mod tests {
             "SELECT x + 1, COUNT(*) FROM t GROUP BY x + 1 WITH ROLLUP",
         ));
         assert!(matches!(keys, Some(SubtotalKeys::Any)));
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x, COUNT(*) FROM t GROUP BY ALL WITH ROLLUP",
+        ));
+        assert!(matches!(keys, Some(SubtotalKeys::Any)));
         assert!(SubtotalKeys::of(&select("SELECT x, COUNT(*) FROM t GROUP BY x")).is_none());
+    }
+
+    /// An output whose name lineage and inference spell differently (an
+    /// unaliased expression: lineage calls `CAST(x AS BIGINT)` `x`) does not
+    /// keep lineage's non-null bit, which never saw the subtotal row or the
+    /// outer join. Of two outputs with one name, the table keeps the first.
+    #[test]
+    fn an_output_inference_cannot_match_by_name_is_not_kept_non_null() {
+        let cols: Cols = &[
+            ("x", RockyType::Int32, false),
+            ("y", RockyType::Int32, false),
+        ];
+        let tables = [("t", cols), ("u", cols)];
+        let mut wrong = Vec::new();
+        for sql in [
+            "SELECT CAST(x AS BIGINT), COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+            "SELECT x::BIGINT, COUNT(*) AS n FROM t GROUP BY CUBE(x)",
+            "SELECT CAST(x AS BIGINT), COUNT(*) AS n FROM t GROUP BY ROLLUP(1)",
+            "SELECT CAST(u.x AS INT), t.y FROM t LEFT JOIN u ON t.x = u.x",
+            "SELECT b.x, a.x FROM t AS a JOIN u AS b ON a.x = b.x GROUP BY a.x, ROLLUP(b.x)",
+            "SELECT b.x, a.x FROM t AS a LEFT JOIN u AS b ON a.x = b.x",
+        ] {
+            let rows = typecheck_over(sql, &tables);
+            if rows
+                .iter()
+                .any(|(name, _, nullable)| name == "x" && !nullable)
+            {
+                wrong.push(format!("{sql}: {rows:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `UNION BY NAME` pairs columns by name, not position, and DuckDB's
+    /// `POSITIONAL JOIN` pads the shorter side with NULLs. Neither keeps a
+    /// NOT NULL source column non-null.
+    #[test]
+    fn by_name_unions_and_positional_joins_are_nullable() {
+        let cols: Cols = &[
+            ("x", RockyType::Int32, false),
+            ("y", RockyType::Int32, false),
+            ("z", RockyType::Int32, true),
+        ];
+        let tables = [("t", cols), ("u", cols)];
+        let mut wrong = Vec::new();
+        for sql in [
+            "SELECT x, y FROM t UNION BY NAME SELECT y, z AS x FROM t",
+            "SELECT x, y FROM t UNION ALL BY NAME SELECT y, z AS x FROM t",
+            "SELECT x, y FROM (SELECT x, y FROM t UNION ALL BY NAME SELECT y, z AS x FROM t) AS d",
+            "WITH a AS (SELECT x, y FROM t UNION BY NAME SELECT y FROM t) SELECT x, y FROM a",
+            "SELECT u.x, u.y FROM t POSITIONAL JOIN u",
+            "SELECT t.x, t.y FROM t POSITIONAL JOIN u",
+        ] {
+            let rows = typecheck_over(sql, &tables);
+            if rows
+                .iter()
+                .any(|(name, _, nullable)| name == "x" && !nullable)
+            {
+                wrong.push(format!("{sql}: {rows:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A table aliased `positional` in a join with a condition is a
+        // plain join.
+        let rows = typecheck_over(
+            "SELECT positional.x FROM t AS positional JOIN u ON positional.x = u.x",
+            &tables,
+        );
+        assert!(!rows[0].2, "{rows:?}");
     }
 
     /// An `IFNULL` or `NVL` whose two arguments may both be NULL stays
