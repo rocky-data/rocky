@@ -179,11 +179,11 @@ check load expected/load-2.json 5 2
 step "6. wait until the open deadline passes"
 # deliver_by is every minute. The last delivery covered the next minute, so
 # the deadline after it is still open. Wait past it, plus a margin.
-WAIT_S="$(python3 - expected/run-5.json <<'PY'
-import json, sys
+WAIT_S="$(python3 - <<'PY'
 from datetime import datetime, timezone
-# Run 5 finished in this minute and covered the next boundary. The open
-# deadline is the boundary after that one, at most 120 s away.
+# Run 5 finished at or before now, so it covered a boundary no later than
+# the next one. The open deadline is at most the boundary after that. Waking
+# 60 s past the next boundary, plus a margin, puts run 6 after it.
 now = datetime.now(timezone.utc)
 print((60 - now.second) + 60 + 3)
 PY
@@ -222,6 +222,11 @@ for _ in $(seq 1 60); do
     if curl -sf "$BASE/api/v1/health" >/dev/null 2>&1; then ready=1; break; fi
     sleep 0.5
 done
+# A health 200 from another server on the same port would pass the loop.
+# Our serve fails to bind then, so it must still be alive.
+if ! kill -0 "$SERVE_PID" 2>/dev/null; then
+    ready=""
+fi
 if [ -z "$ready" ]; then
     echo "FAIL: rocky serve did not become ready"
     tail -n 20 expected/serve.log
@@ -235,8 +240,14 @@ curl -sf "$BASE/api/v1/schedule" > expected/api-schedule.json
 check api-schedule expected/api-schedule.json
 
 step "13. password grep: JSON outputs, logs, scratch dirs, saved state"
-if grep -r -a -F -l -- "$PGPASSWORD" expected .rocky; then
+# grep exits 1 for no hit, 0 for a hit and 2 for a read error. Only 1 passes.
+rc=0
+grep -r -a -F -l -- "$PGPASSWORD" expected .rocky || rc=$?
+if [ "$rc" -eq 0 ]; then
     echo "FAIL: the Postgres password appears in the files above"
+    exit 1
+elif [ "$rc" -ne 1 ]; then
+    echo "FAIL: the password grep could not read every file (exit $rc)"
     exit 1
 fi
 echo "    0 hits"

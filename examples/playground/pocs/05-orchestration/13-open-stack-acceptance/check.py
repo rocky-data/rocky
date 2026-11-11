@@ -17,6 +17,7 @@ failed step with every problem it found. Python 3.8+, standard library only.
 """
 
 import json
+import os
 import sys
 
 PRODUCT = "events_by_type"
@@ -292,6 +293,9 @@ def check_tick(path):
 
 def check_hook(path):
     events = []
+    if not os.path.exists(path):
+        print("FAIL: the on_budget_breach hook never wrote %s" % path)
+        sys.exit(1)
     with open(path) as fh:
         for line in fh:
             line = line.strip()

@@ -89,13 +89,13 @@ echo "=== fetch the two network dependencies, with retries ==="
 # here, with retries, keeps a transient outage from failing a load below.
 # Both are cached, so a warm run fetches nothing.
 docker image inspect postgres:16-alpine >/dev/null 2>&1 \
-    || retry 4 docker compose pull --quiet postgres || {
-    echo "FAIL: could not pull the Postgres image after 4 attempts"
+    || retry 6 docker compose pull --quiet postgres || {
+    echo "FAIL: could not pull the Postgres image after 6 attempts"
     exit 1
 }
 EXT_DIR="$HERE/connector/.duckdb-extensions"
-retry 4 duckdb :memory: -c "SET extension_directories = ['$EXT_DIR']; INSTALL postgres;" >/dev/null || {
-    echo "FAIL: could not install the DuckDB postgres extension after 4 attempts"
+retry 6 duckdb :memory: -c "SET extension_directories = ['$EXT_DIR']; INSTALL postgres;" >/dev/null || {
+    echo "FAIL: could not install the DuckDB postgres extension after 6 attempts"
     exit 1
 }
 echo "    postgres:16-alpine and the DuckDB postgres extension are ready"

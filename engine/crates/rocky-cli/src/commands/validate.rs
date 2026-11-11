@@ -344,9 +344,9 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
 }
 
 /// **V067** — one message per `[connector.<name>]`: `ok` when its manifest
-/// reads and passes the same checks `rocky load --connector` runs, and
-/// `error` when the manifest is missing or invalid, or when its `command`
-/// names a relative program path that does not exist. Offline: nothing is
+/// reads and its program exists, and `error` when the manifest is missing
+/// or invalid, or when the first entry of its `command` is a path that
+/// does not exist. Later arguments and secrets are not checked. Offline: nothing is
 /// started. The block's own fields are checked when the config loads.
 fn validate_connectors(
     cfg: &rocky_core::config::RockyConfig,
@@ -5816,6 +5816,13 @@ target.adapter = "default"
     #[test]
     fn test_l002_fires_on_a_written_table_when_name_is_omitted() {
         assert_eq!(l001_l002_for("", "customer_facts"), vec!["L002"]);
+    }
+
+    /// `name` written as the stem, `target.table` omitted: only L001 fires.
+    /// Before, the omitted table read as the defaulted value and L002 fired.
+    #[test]
+    fn test_l001_fires_alone_when_only_the_name_is_written() {
+        assert_eq!(l001_l002_for("customer_facts", ""), vec!["L001"]);
     }
 
     /// Both written literally and redundant: both lints fire.

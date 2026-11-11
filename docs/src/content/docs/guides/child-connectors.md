@@ -90,7 +90,7 @@ wall_time_secs = 1800
 
 A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
 
-`rocky validate` reads each manifest offline and reports **V067** for each connector. It is `ok` when the manifest passes the checks `rocky load --connector` runs. It is an error when the manifest is missing or invalid, or when `command` names a program path that does not exist. A bare program name is looked up on `PATH` at run time, so validate does not check it. A project with connectors and no `[pipeline]` is valid: V020 ("No pipelines defined") does not warn.
+`rocky validate` reads each manifest offline and reports **V067** for each connector. It is `ok` when the manifest reads and is valid, and the program in `command` exists. It is an error when the manifest is missing or invalid, or when the first entry of `command` is a path that does not exist. Validate does not check that the program can run, nor any later argument such as a script path. A bare program name is looked up on `PATH` at run time, so validate does not check it. The `[connector.<name>]` fields themselves, such as `output_uri` and `limits`, are checked when the config loads. Secrets are read only at load time. A project with connectors and no `[pipeline]` is valid: V020 ("No pipelines defined") does not warn.
 
 ## The request and the result
 
