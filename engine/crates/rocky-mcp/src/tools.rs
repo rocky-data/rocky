@@ -2450,7 +2450,17 @@ impl RockyMcpServer {
     /// then falls back to `Unknown` for source-leaf columns — the same
     /// behaviour as `rocky compile` without a warm cache).
     fn compile_full(&self) -> anyhow::Result<CompilerResult> {
-        let source_schemas = self.load_source_schemas()?;
+        self.compile_full_with_live(&std::collections::HashMap::new())
+    }
+
+    /// [`Self::compile_full`], with `live` source schemas (read from the
+    /// warehouse by `describe_leaf_sources`) laid over the cached ones.
+    fn compile_full_with_live(
+        &self,
+        live: &std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    ) -> anyhow::Result<CompilerResult> {
+        let mut source_schemas = self.load_source_schemas()?;
+        rocky_cli::commands::overlay_live_schemas(&mut source_schemas, live);
         // Each model's warehouse, so a cast's column type matches `rocky
         // compile` (#2342). The schema load above refused an unreadable
         // `rocky.toml`.
@@ -3450,6 +3460,34 @@ impl RockyMcpServer {
         let compiled = self
             .compile_full()
             .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
+        if !compiled.type_check.typed_models.contains_key(&model_name) {
+            return Err(ToolError::model_not_found(&model_name));
+        }
+
+        // Type the leaf sources from the warehouse and compile again, for
+        // this tool only. A transformation-only project has an empty schema
+        // cache, so every leaf column is otherwise `Unknown`: the validator
+        // then checks no drafted type and proves no column non-null. The
+        // other tools keep the cache-only compile. Nothing is persisted.
+        let mut unresolved_sources = Vec::new();
+        let compiled = match self.warehouse_adapter() {
+            Ok(Some(adapter)) => {
+                let live = rocky_cli::commands::describe_leaf_sources(
+                    adapter.as_ref(),
+                    &compiled.project.models,
+                )
+                .await;
+                unresolved_sources = live.unresolved;
+                if live.schemas.is_empty() {
+                    compiled
+                } else {
+                    self.compile_full_with_live(&live.schemas)
+                        .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?
+                }
+            }
+            // No adapter: the profile below reports why it cannot run.
+            Ok(None) | Err(_) => compiled,
+        };
         let inferred_schema: Vec<rocky_compiler::types::TypedColumn> = compiled
             .type_check
             .typed_models
@@ -3484,6 +3522,7 @@ impl RockyMcpServer {
             unverified_types: drafted.unverified_types,
             unmatched_columns: drafted.unmatched_columns,
             unproven_non_null: drafted.unproven_non_null,
+            unresolved_sources,
         }))
     }
 

@@ -7,6 +7,8 @@ Usage:
     uv run python run_evals.py --model claude-opus-4-1 --max-attempts 2
     uv run python run_evals.py --selftest      # creds-free: score a recorded transcript
     uv run python run_evals.py --error-contract # rocky-binary only: assert the MCP error envelope
+    uv run python run_evals.py --contract-quality                            # replay, no key
+    uv run python run_evals.py --contract-quality --contract-quality-mode live  # real rerun
 
 The live suite is NOT creds-free — it drives a scripted Claude Code session and
 needs $ANTHROPIC_API_KEY (plus the `claude`, `rocky`, and `duckdb` CLIs). When
@@ -30,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from harness import contract_quality as contract_quality_mod
 from harness import error_contract as error_contract_mod
 from harness import selftest as selftest_mod
 from harness.driver import ClaudeCliDriver
@@ -210,7 +213,31 @@ def main(argv: list[str]) -> int:
         help="rocky-binary-only check: assert the structured MCP error envelope on bad input "
         "(no model key, no warehouse)",
     )
+    parser.add_argument(
+        "--contract-quality",
+        action="store_true",
+        help="score `rocky ai-contract` drafts against the contract_quality answer key "
+        "(replay mode needs only the `rocky` binary)",
+    )
+    parser.add_argument(
+        "--contract-quality-mode",
+        choices=("replay", "live", "rehash"),
+        default="replay",
+        help="replay: recorded responses, no key (default); live: call the Anthropic API "
+        "with $ANTHROPIC_API_KEY and record; rehash: re-key recordings after a prompt change",
+    )
+    parser.add_argument(
+        "--contract-quality-update-expected",
+        action="store_true",
+        help="write the last replay's outcomes to fixtures/contract_quality/expected_replay.json",
+    )
     args = parser.parse_args(argv)
+
+    if args.contract_quality_update_expected:
+        return contract_quality_mod.update_expected(args.output_dir)
+
+    if args.contract_quality:
+        return contract_quality_mod.main(args.contract_quality_mode, args.output_dir)
 
     if args.selftest:
         return selftest_mod.run()

@@ -3935,6 +3935,16 @@ pub struct AiContractOutput {
     /// Empty when every `nullable = false` in the draft was proven.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unproven_non_null: Vec<String>,
+    /// Leaf source tables Rocky could not describe in the warehouse, one
+    /// message each (`schema.table: reason`).
+    ///
+    /// `rocky ai-contract` reads the column types of every table the
+    /// project's models read and no model writes, so the drafted types and
+    /// `nullable = false` claims are checked against the warehouse. A table
+    /// listed here kept its schema-cache entry, or stayed untyped without one.
+    /// Empty when every leaf source was described.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_sources: Vec<String>,
 }
 
 /// Observed profile of one column, as reported by `rocky ai-contract`.

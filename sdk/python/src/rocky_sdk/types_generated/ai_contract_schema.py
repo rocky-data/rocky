@@ -68,6 +68,12 @@ class AiContractOutput(BaseModel):
 
     The column had no NULLs in the profiled table, but Rocky cannot prove it non-null from the model SQL and the source schemas it has, so `E012` would refuse the claim. The draft leaves `nullable` unset for it, which promises nothing, instead of writing `nullable = true`. Empty when every `nullable = false` in the draft was proven.
     """
+    unresolved_sources: list[str] | None = None
+    """
+    Leaf source tables Rocky could not describe in the warehouse, one message each (`schema.table: reason`).
+
+    `rocky ai-contract` reads the column types of every table the project's models read and no model writes, so the drafted types and `nullable = false` claims are checked against the warehouse. A table listed here kept its schema-cache entry, or stayed untyped without one. Empty when every leaf source was described.
+    """
     unverified_types: list[str] | None = None
     """
     Declared column types the compiler could NOT check, one message each.

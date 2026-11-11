@@ -1,0 +1,13 @@
+{
+  "model": "order_payments",
+  "exchanges": [
+    {
+      "request_sha256": "2f5e757617b008215f5e15bd26acea0ddee2a21aee25c94d5421722e1d3baa1d",
+      "response_text": "[[columns]]\nname = \"payment_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"method\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"paid_at\"\ntype = \"Timestamp\"\nnullable = false\n\n[rules]\nrequired = [\"payment_id\", \"order_id\"]\nprotected = [\"payment_id\", \"order_id\"]\n"
+    },
+    {
+      "request_sha256": "59924d59230ea56442be7b80cffc3c6e1dcf878a98b176a453ef7beaedf81825",
+      "response_text": "[[columns]]\nname = \"payment_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"method\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"paid_at\"\ntype = \"Timestamp\"\nnullable = true\n\n[rules]\nrequired = [\"payment_id\", \"order_id\"]\nprotected = [\"payment_id\", \"order_id\"]\n"
+    }
+  ]
+}

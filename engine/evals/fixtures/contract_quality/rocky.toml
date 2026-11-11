@@ -1,0 +1,22 @@
+# contract_quality — the pinned fixture for the `rocky ai-contract` quality eval.
+#
+# A DuckDB transformation pipeline over three raw tables (`raw.customers`,
+# `raw.orders`, `raw.payments`). The raw tables carry real NOT NULL
+# constraints, and some nullable columns hold no NULL today. A drafter that
+# trusts "no NULL observed" over "proven non-null" claims `nullable = false`
+# where it must not; one that sees untyped columns cannot be checked at all.
+#
+# `answer_key.toml` holds the expected contract per model. The harness seeds
+# `cq.duckdb` from `data/seed.sql`, materializes the models with `rocky run`,
+# then drafts and scores a contract per model. See `engine/evals/README.md`.
+
+[adapter]
+type = "duckdb"
+path = "cq.duckdb"
+
+[pipeline.cq]
+type = "transformation"
+models = "models/**"
+
+[pipeline.cq.target.governance]
+auto_create_schemas = true

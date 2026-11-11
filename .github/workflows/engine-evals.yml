@@ -78,3 +78,12 @@ jobs:
         env:
           ROCKY_BIN: ${{ github.workspace }}/engine/target/debug/rocky
         run: uv run python run_evals.py --error-contract
+
+      # Replays recorded model responses through the real `rocky ai-contract`
+      # and gates on every item's outcome matching expected_replay.json. No
+      # key and no network: the responses come from a local server.
+      - name: Contract-quality replay
+        working-directory: engine/evals
+        env:
+          ROCKY_BIN: ${{ github.workspace }}/engine/target/debug/rocky
+        run: uv run python run_evals.py --contract-quality
