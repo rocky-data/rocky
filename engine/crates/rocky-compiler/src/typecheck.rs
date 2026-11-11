@@ -4473,7 +4473,7 @@ fn infer_select_types_in_scope(
 
     let mut inferred = SelectInference::default();
 
-    for (position, item) in select.projection.iter().enumerate() {
+    for item in &select.projection {
         let first = inferred.columns.len();
         match item {
             SelectItem::UnnamedExpr(expr) => {
@@ -4530,9 +4530,7 @@ fn infer_select_types_in_scope(
             for index in first..inferred.columns.len() {
                 let column = &mut inferred.columns[index];
                 let null_in_subtotal = match expr {
-                    Some(expr) => {
-                        keys.output_can_be_null(expr, &column.name, position + 1, rolled_scope)
-                    }
+                    Some(expr) => keys.output_can_be_null(expr, rolled_scope),
                     // A `*` column: NULL when it is a rolled-up key.
                     None => keys.names_column(&column.name),
                 };
@@ -4547,126 +4545,135 @@ fn infer_select_types_in_scope(
     Ok(inferred)
 }
 
-/// The grouping keys of a `SELECT` whose `GROUP BY` adds subtotal rows:
-/// `ROLLUP`, `CUBE`, `GROUPING SETS`, or a `WITH ROLLUP` / `WITH CUBE` /
-/// `WITH TOTALS` modifier. In a subtotal row a rolled-up key is NULL, after
-/// the `WHERE` has run, so a NOT NULL column used as such a key is nullable
-/// in the output (#2566).
+/// The rolled-up keys of a `SELECT` whose `GROUP BY` adds subtotal rows:
+/// `ROLLUP`, `CUBE` or `GROUPING SETS`, nested or not. In a subtotal row a
+/// rolled-up key is NULL, after the `WHERE` has run, so an output over it is
+/// nullable even when the source column is NOT NULL (#2566).
 ///
-/// A key that sits in every grouping set (`GROUPING SETS ((a), (a, b))`) is
-/// never NULL, but it is counted as rolled up anyway: "nullable" is always
-/// the sound answer for a contract.
-struct SubtotalKeys {
-    /// The rolled-up key expressions, as written in the `GROUP BY`.
-    keys: Vec<Expr>,
-    /// `GROUP BY ALL` with a modifier: every grouping key is rolled up, and
-    /// the keys are not spelled out.
-    all: bool,
+/// The rule fails toward nullable. Only one shape is typed precisely: every
+/// rolled-up key is a plain column. Then a subtotal row is that row with
+/// those columns NULL wherever they appear outside an aggregate, so
+/// inference over a scope where they are nullable is exact
+/// (`COALESCE(k, 0)` under `ROLLUP(k)` stays non-null). Any other key (an
+/// expression, an output alias, a position such as `ROLLUP(1)`) or a
+/// `GROUP BY ALL` with a modifier makes every output but a bare aggregate
+/// nullable: matching a key to a projection by its spelling would miss
+/// `t.x` against `x` or `::` against `CAST`.
+///
+/// A key that sits in every grouping set (`GROUPING SETS ((a), (a, b))`),
+/// or one a `HAVING` filters, is never NULL but is counted as rolled up
+/// anyway: "nullable" is the sound answer for a contract.
+enum SubtotalKeys {
+    /// Every rolled-up key is a column reference.
+    Columns(Vec<ColumnKey>),
+    /// A rolled-up key Rocky does not resolve to a column.
+    Any,
+}
+
+/// A rolled-up key that is a column: `name`, or `qualifier.name`.
+struct ColumnKey {
+    qualifier: Option<String>,
+    name: String,
 }
 
 impl SubtotalKeys {
     fn of(select: &ast::Select) -> Option<Self> {
+        let mut rolled = Vec::new();
         match &select.group_by {
-            ast::GroupByExpr::All(modifiers) => (!modifiers.is_empty()).then(|| Self {
-                keys: Vec::new(),
-                all: true,
-            }),
+            ast::GroupByExpr::All(modifiers) => {
+                return (!modifiers.is_empty()).then_some(Self::Any);
+            }
             ast::GroupByExpr::Expressions(exprs, modifiers) => {
-                let mut keys = Vec::new();
                 for expr in exprs {
                     match expr {
-                        Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
-                            for key in sets.iter().flatten() {
-                                match key {
-                                    Expr::Tuple(items) => keys.extend(items.iter().cloned()),
-                                    key => keys.push(key.clone()),
-                                }
-                            }
+                        Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
+                            flatten_grouping_keys(expr, &mut rolled);
                         }
-                        // A modifier rolls up every plain key.
-                        expr if !modifiers.is_empty() => keys.push(expr.clone()),
+                        // A `WITH ROLLUP` / `WITH CUBE` modifier rolls up
+                        // every plain key.
+                        expr if !modifiers.is_empty() => flatten_grouping_keys(expr, &mut rolled),
                         _ => {}
                     }
                 }
-                (!keys.is_empty()).then_some(Self { keys, all: false })
             }
         }
+        if rolled.is_empty() {
+            return None;
+        }
+        let mut columns = Vec::new();
+        for key in rolled {
+            let key = strip_nested(key);
+            let column = match key {
+                Expr::Identifier(ident) => ColumnKey {
+                    qualifier: None,
+                    name: ident.value.clone(),
+                },
+                Expr::CompoundIdentifier(idents) if idents.len() >= 2 => ColumnKey {
+                    qualifier: Some(idents[idents.len() - 2].value.clone()),
+                    name: idents[idents.len() - 1].value.clone(),
+                },
+                _ => return Some(Self::Any),
+            };
+            // A bare name that is also an output alias for something other
+            // than that column may mean the alias.
+            if column.qualifier.is_none()
+                && select.projection.iter().any(|item| match item {
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        alias.value.eq_ignore_ascii_case(&column.name)
+                            && !matches!(strip_nested(expr), Expr::Identifier(i) if i.value.eq_ignore_ascii_case(&column.name))
+                    }
+                    SelectItem::ExprWithAliases { aliases, .. } => aliases
+                        .iter()
+                        .any(|alias| alias.value.eq_ignore_ascii_case(&column.name)),
+                    _ => false,
+                })
+            {
+                return Some(Self::Any);
+            }
+            columns.push(column);
+        }
+        Some(Self::Columns(columns))
     }
 
-    /// `scope` with every column a rolled-up key reads made nullable. An
-    /// expression over such a column, outside an aggregate, sees its NULL in
-    /// a subtotal row. A bare name also widens every relation's column of
-    /// that name, and a qualified one also widens the bare name: the scope
-    /// cannot tell which relation a key meant, and wider is sound.
+    /// `scope` with every rolled-up key column made nullable. A bare key
+    /// widens the bare name and every relation's column of that name. A
+    /// qualified key widens its own relation's column and the bare name;
+    /// an unknown qualifier widens like a bare key.
     fn rolled_up_scope(&self, scope: &TypeScope) -> TypeScope {
         let mut rolled = scope.clone();
-        if self.all {
-            for value in rolled.columns.values_mut() {
-                value.1 = true;
-            }
-            for table in rolled.qualified.values_mut() {
-                for value in table.values_mut() {
-                    value.1 = true;
-                }
-            }
+        let Self::Columns(keys) = self else {
             return rolled;
-        }
-        let mut widen = |name: &str| {
-            if let Some(value) = rolled.columns.get_mut(CiStr::new(name)) {
+        };
+        for key in keys {
+            if let Some(value) = rolled.columns.get_mut(CiStr::new(&key.name)) {
                 value.1 = true;
             }
-            for table in rolled.qualified.values_mut() {
-                if let Some(value) = table.get_mut(CiStr::new(name)) {
-                    value.1 = true;
+            let own_table = key
+                .qualifier
+                .as_deref()
+                .and_then(|q| rolled.qualified.get_mut(CiStr::new(q)));
+            match own_table {
+                Some(table) => {
+                    if let Some(value) = table.get_mut(CiStr::new(&key.name)) {
+                        value.1 = true;
+                    }
                 }
-            }
-        };
-        for key in &self.keys {
-            let _ = ast::visit_expressions(key, |expr| {
-                match expr {
-                    Expr::Identifier(ident) => widen(&ident.value),
-                    Expr::CompoundIdentifier(idents) => {
-                        if let Some(last) = idents.last() {
-                            widen(&last.value);
+                None => {
+                    for table in rolled.qualified.values_mut() {
+                        if let Some(value) = table.get_mut(CiStr::new(&key.name)) {
+                            value.1 = true;
                         }
                     }
-                    _ => {}
                 }
-                std::ops::ControlFlow::<()>::Continue(())
-            });
+            }
         }
         rolled
     }
 
-    /// Whether the projection `expr`, output as `name` at 1-based
-    /// `position`, can be NULL in a subtotal row.
-    ///
-    /// - It is a rolled-up key itself: the same expression, the output's
-    ///   alias, or its position (`ROLLUP(1)`).
-    /// - It is not a bare aggregate call, and it is nullable once every
-    ///   column a rolled-up key reads is nullable. So `COALESCE(k, 0)` under
-    ///   `ROLLUP(k)` stays non-null, and `k + 1` does not.
-    ///
-    /// A bare aggregate (`SUM(v)`, `COUNT(*)`, `MAX(k)`) reads the group's
-    /// rows, not the NULL key, so its own nullable bit stands.
-    fn output_can_be_null(
-        &self,
-        expr: &Expr,
-        name: &str,
-        position: usize,
-        rolled_scope: &TypeScope,
-    ) -> bool {
-        let text = key_text(expr);
-        let is_key = self.keys.iter().any(|key| match key {
-            Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case(name) => true,
-            Expr::Value(value) => {
-                matches!(&value.value, ast::Value::Number(n, _) if n.parse::<usize>().ok() == Some(position))
-            }
-            key => key_text(key) == text,
-        });
-        if is_key {
-            return true;
-        }
+    /// Whether the projection `expr` can be NULL in a subtotal row. A bare
+    /// aggregate (`SUM(v)`, `COUNT(*)`, `MAX(k)`) reads the group's rows,
+    /// not the NULL key, so its own nullable bit stands.
+    fn output_can_be_null(&self, expr: &Expr, rolled_scope: &TypeScope) -> bool {
         let bare_aggregate = function_call(expr).is_some_and(|func| {
             func.over.is_none()
                 && func
@@ -4676,28 +4683,41 @@ impl SubtotalKeys {
                     .and_then(ast::ObjectNamePart::as_ident)
                     .is_some_and(|ident| crate::group_by::is_aggregate(&ident.value.to_uppercase()))
         });
-        !bare_aggregate && infer_expr_type(expr, rolled_scope).1
+        if bare_aggregate {
+            return false;
+        }
+        match self {
+            Self::Any => true,
+            Self::Columns(_) => infer_expr_type(expr, rolled_scope).1,
+        }
     }
 
-    /// Whether a `*` output column named `name` is a rolled-up key.
+    /// Whether a `*` output column named `name` can be NULL in a subtotal
+    /// row.
     fn names_column(&self, name: &str) -> bool {
-        self.all
-            || self.keys.iter().any(|key| match key {
-                Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(name),
-                Expr::CompoundIdentifier(idents) => idents
-                    .last()
-                    .is_some_and(|last| last.value.eq_ignore_ascii_case(name)),
-                _ => false,
-            })
+        match self {
+            Self::Any => true,
+            Self::Columns(keys) => keys.iter().any(|key| key.name.eq_ignore_ascii_case(name)),
+        }
     }
 }
 
-/// An expression's text for comparing a projection with a grouping key:
-/// parentheses dropped, case folded.
-fn key_text(expr: &Expr) -> String {
+/// Push every key inside a grouping construct, looking through nested
+/// `ROLLUP` / `CUBE` / `GROUPING SETS`, tuples and parentheses.
+fn flatten_grouping_keys<'a>(expr: &'a Expr, keys: &mut Vec<&'a Expr>) {
     match expr {
-        Expr::Nested(inner) => key_text(inner),
-        expr => expr.to_string().to_lowercase(),
+        Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
+            for key in sets.iter().flatten() {
+                flatten_grouping_keys(key, keys);
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                flatten_grouping_keys(item, keys);
+            }
+        }
+        Expr::Nested(inner) => flatten_grouping_keys(inner, keys),
+        expr => keys.push(expr),
     }
 }
 
@@ -5908,6 +5928,22 @@ mod tests {
                  SELECT x AS c FROM r",
                 "SELECT x AS c FROM t \
                  UNION ALL SELECT x AS c FROM t GROUP BY ROLLUP(x)",
+                "SELECT c FROM (SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)) AS d",
+                "SELECT * FROM (SELECT x AS c FROM t) AS d GROUP BY ROLLUP(c)",
+                // A key that names another output, by alias or position,
+                // makes that column NULL too.
+                "SELECT x AS k, x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(k)",
+                "SELECT x AS k, CAST(x AS BIGINT) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(k)",
+                "SELECT COALESCE(x, 0) AS c, COALESCE(x, 0) AS d, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(2)",
+                // The key spelled another way, wrapped, or nested.
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(COALESCE(t.x, 0))",
+                "SELECT COALESCE(x, 0)::BIGINT AS c, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(CAST(COALESCE(x, 0) AS BIGINT))",
+                "SELECT CAST(COALESCE(x, 0) AS BIGINT) AS c, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(COALESCE(x, 0))",
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n \
+                 FROM t GROUP BY GROUPING SETS (ROLLUP(COALESCE(x, 0)))",
             ] {
                 let (_, nullable, e012) = coalesce_column(sql, target.clone());
                 if !nullable || !e012 {
@@ -5931,6 +5967,11 @@ mod tests {
                 "SELECT COALESCE(z, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(z)",
                 "SELECT COUNT(*) AS c, x FROM t GROUP BY ROLLUP(x)",
                 "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY x",
+                "SELECT CAST(COALESCE(x, 0) AS DOUBLE) AS c, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(x)",
+                // A qualified key widens only its own relation.
+                "SELECT a.x AS c, b.x AS d, COUNT(*) AS n \
+                 FROM t AS a JOIN u AS b ON a.x = b.x GROUP BY a.x, ROLLUP(b.x)",
             ] {
                 let (_, nullable, e012) = coalesce_column(sql, target.clone());
                 if nullable || e012 {
@@ -5939,6 +5980,36 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `WITH ROLLUP` and `GROUP BY ALL WITH ROLLUP` do not parse in the
+    /// dialect models are read with, so drive the key collection directly
+    /// with one that accepts them (#2566).
+    #[test]
+    fn grouping_modifiers_roll_up_every_key() {
+        let select = |sql: &str| {
+            let statements =
+                Parser::parse_sql(&sqlparser::dialect::MySqlDialect {}, sql).expect(sql);
+            let Statement::Query(query) = &statements[0] else {
+                panic!("{sql}")
+            };
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("{sql}")
+            };
+            select.as_ref().clone()
+        };
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x, COUNT(*) FROM t GROUP BY x, z WITH ROLLUP",
+        ));
+        assert!(
+            matches!(&keys, Some(SubtotalKeys::Columns(keys)) if keys.len() == 2),
+            "every plain key rolls up"
+        );
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x + 1, COUNT(*) FROM t GROUP BY x + 1 WITH ROLLUP",
+        ));
+        assert!(matches!(keys, Some(SubtotalKeys::Any)));
+        assert!(SubtotalKeys::of(&select("SELECT x, COUNT(*) FROM t GROUP BY x")).is_none());
     }
 
     /// An `IFNULL` or `NVL` whose two arguments may both be NULL stays
