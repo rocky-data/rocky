@@ -486,6 +486,24 @@ mod tests {
         );
     }
 
+    /// `from_env` both renders `${NAME}` and registers, like `secret`.
+    #[test]
+    fn a_library_secret_from_the_environment_renders_and_registers() {
+        let value = "ROCKY-LIB-ENV-5d8a0e3c-value";
+        // SAFETY: the variable name is unique to this test, and no other
+        // test reads or writes it.
+        unsafe { std::env::set_var("ROCKY_T_LIB_ENV_1919", value) };
+        let field = EnvString::from_env("ROCKY_T_LIB_ENV_1919");
+        unsafe { std::env::remove_var("ROCKY_T_LIB_ENV_1919") };
+        let field = field.expect("the variable was set");
+        assert_eq!(field.to_string(), "${ROCKY_T_LIB_ENV_1919}");
+        assert_eq!(field.expose(), value);
+        assert_eq!(
+            crate::secret_registry::render_placeholders(&format!("x {value} y")),
+            "x ${ROCKY_T_LIB_ENV_1919} y"
+        );
+    }
+
     #[test]
     fn a_library_secret_from_an_unset_variable_is_an_error() {
         let err = EnvString::from_env("ROCKY_TEST_1919_SURELY_UNSET_7f3a")

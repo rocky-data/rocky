@@ -204,6 +204,25 @@ impl JsonSchema for RedactedString {
 mod tests {
     use super::*;
 
+    /// `from_env` registers, like `secret`.
+    #[test]
+    fn a_library_credential_from_the_environment_registers() {
+        let value = "ROCKY-LIB-ENV-CRED-a91f3d07";
+        // SAFETY: the variable name is unique to this test, and no other
+        // test reads or writes it.
+        unsafe { std::env::set_var("ROCKY_T_LIB_CRED_1919", value) };
+        let cred = RedactedString::from_env("ROCKY_T_LIB_CRED_1919");
+        unsafe { std::env::remove_var("ROCKY_T_LIB_CRED_1919") };
+        let cred = cred.expect("the variable was set");
+        assert_eq!(format!("{cred:?}"), "***");
+        assert_eq!(cred.expose(), value);
+        assert_eq!(
+            crate::secret_registry::render_placeholders(value),
+            "${ROCKY_T_LIB_CRED_1919}"
+        );
+        assert!(RedactedString::from_env("ROCKY_T_LIB_CRED_1919_UNSET_x").is_err());
+    }
+
     /// `***` covers the field; registration covers text that echoes the
     /// credential elsewhere (#1919). `new` is the control.
     #[test]
