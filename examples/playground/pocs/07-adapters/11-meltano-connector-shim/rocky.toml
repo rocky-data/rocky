@@ -1,0 +1,50 @@
+# Meltano connector shim: a Singer tap run by Meltano -> Parquet -> DuckDB.
+#
+# `rocky load --connector orders_tap` runs connector/main.py once. The shim
+# runs `meltano invoke tap-orders` in the project under meltano_project/,
+# loads the records of the `orders` stream, and keeps the last Singer STATE
+# message as Rocky state.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.orders_tap]
+manifest     = "connector/connector.toml"
+# Keep each run's scratch directory, so run.sh can inspect it.
+keep_scratch = true
+output_uri   = "file://./.rocky/landing/orders_tap"
+# This POC needs no credential. A real tap reads its credentials from the
+# environment: Meltano maps a plugin setting to the variable
+# <PLUGIN>_<SETTING>. Declare each name here, and Rocky hands exactly those
+# variables to the shim, which leaves them in the environment of meltano:
+#   secrets = ["TAP_ORDERS_API_TOKEN"]
+# Never put a credential under options: options.json is on disk in clear.
+secrets      = []
+target       = { catalog = "poc", schema = "main", table = "orders" }
+retries      = 0
+
+# Settings for the shim. Rocky writes this table as JSON to options.json.
+[connector.orders_tap.options]
+# Required. The Meltano project directory, relative to connector/main.py.
+project_dir = "../meltano_project"
+# Required. The plugin name in meltano.yml.
+tap         = "tap-orders"
+# Required. The ONE stream to load. The tap also has `customers`; the shim
+# deselects it. A name the tap lacks fails the run.
+stream      = "orders"
+# Optional. The meltano executable, relative to connector/main.py.
+# meltano_bin = "../.venv/bin/meltano"
+
+# A second connector that names a stream the tap does not have. run.sh runs
+# it once and expects a clear failure.
+[connector.orders_missing_stream]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/orders_missing_stream"
+target     = { catalog = "poc", schema = "main", table = "missing" }
+retries    = 0
+
+[connector.orders_missing_stream.options]
+project_dir = "../meltano_project"
+tap         = "tap-orders"
+stream      = "refunds"

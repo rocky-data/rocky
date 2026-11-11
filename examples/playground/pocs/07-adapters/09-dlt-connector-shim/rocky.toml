@@ -1,0 +1,52 @@
+# dlt connector shim: a dlt source -> Parquet -> DuckDB.
+#
+# `rocky load --connector shop_orders` runs connector/main.py once. The shim
+# runs a user dlt source, writes Parquet with dlt's filesystem destination,
+# and hands dlt's incremental state back to Rocky as connector state.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.shop_orders]
+manifest     = "connector/connector.toml"
+# Keep each run's scratch directory, so run.sh can inspect it.
+keep_scratch = true
+output_uri   = "file://./.rocky/landing/shop_orders"
+# This POC needs no credential. A real dlt source reads its credentials from
+# the environment (for example SOURCES__MY_SOURCE__API_KEY). Declare each
+# name here and Rocky hands exactly those variables to the program:
+#   secrets = ["SOURCES__SHOP__API_KEY"]
+# Never put a credential under options: options.json is on disk in clear.
+secrets      = []
+target       = { catalog = "poc", schema = "main", table = "orders" }
+retries      = 0
+
+# Settings for the shim. Rocky writes this table as JSON to options.json.
+[connector.shop_orders.options]
+# Where the user's dlt source module lives, relative to connector/main.py.
+source_dir = "../shop_src"
+# `from shop import shop` -> module "shop", function "shop".
+module     = "shop"
+source     = "shop"
+# The ONE resource (table) to load. The source also has `customers`;
+# the shim ignores it. A name the source does not have fails the run.
+stream     = "orders"
+# Optional keyword arguments for the source function. Not secrets.
+# source_args   = { data_dir = "/abs/path" }
+# Optional. The dlt pipeline name. Default "rocky_dlt".
+# pipeline_name = "rocky_dlt"
+
+# A second connector that names a stream the source does not have. run.sh
+# runs it once and expects a clear failure.
+[connector.shop_missing_stream]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/shop_missing_stream"
+target     = { catalog = "poc", schema = "main", table = "missing" }
+retries    = 0
+
+[connector.shop_missing_stream.options]
+source_dir = "../shop_src"
+module     = "shop"
+source     = "shop"
+stream     = "refunds"
