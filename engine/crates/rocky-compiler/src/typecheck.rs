@@ -588,8 +588,12 @@ fn compute_model_typecheck(
     // A function over one column that Step 1 could not type from its name
     // (`COALESCE(b, 0)`) needs it too: only inference reads its other
     // arguments (#2553).
+    let renames_columns = model_by_name
+        .get(model_name)
+        .is_some_and(|m| sql_has_column_list_alias(&m.sql));
     let needs_inference = udf_scope.is_active()
         || mentions_set_operation
+        || renames_columns
         || typed_cols
             .iter()
             .any(|col| match graph.producing_edge(model_name, &col.name) {
@@ -721,6 +725,9 @@ fn compute_model_typecheck(
                     {
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    } else if edge.transform == rocky_sql::lineage::TransformKind::Direct {
+                        col.data_type =
+                            reconcile_lineage_type(&col.data_type, inferred_col, exact_type);
                     }
                 }
                 // A nested expression. Step 1 left it `(Unknown, true)`. Take
@@ -749,6 +756,9 @@ fn compute_model_typecheck(
                         col.nullable |= inferred_col.nullable;
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    } else if col.data_type != RockyType::Unknown {
+                        col.data_type =
+                            reconcile_lineage_type(&col.data_type, inferred_col, exact_type);
                     } else if col.data_type == RockyType::Unknown
                         && exact_type
                         && inferred_col.data_type != RockyType::Unknown
@@ -2845,6 +2855,26 @@ fn infer_aggregation_type(
     }
 }
 
+/// The type of a column lineage typed from its source column, checked
+/// against inference. Lineage does not apply a column-list alias
+/// (`FROM u AS q(a, b)`, `WITH c(a, b) AS ...`): it types the renamed column
+/// from the source column that has the new name (#2572). Inference applies
+/// the rename. When inference knows a different type, it wins if it reads
+/// it straight from the SQL, else neither is claimed.
+fn reconcile_lineage_type(
+    lineage: &RockyType,
+    inferred: &TypedColumn,
+    inferred_exact: bool,
+) -> RockyType {
+    if inferred.data_type == RockyType::Unknown || inferred.data_type == *lineage {
+        lineage.clone()
+    } else if inferred_exact {
+        inferred.data_type.clone()
+    } else {
+        RockyType::Unknown
+    }
+}
+
 /// Whether the source column a lineage edge reads has a known type.
 fn edge_input_is_known(
     edge: &crate::semantic::LineageEdge,
@@ -4881,7 +4911,18 @@ fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> Jo
 /// `POSITIONAL JOIN` parses: `previous` has the unquoted alias `positional`
 /// and the join is a plain `JOIN` with no condition.
 fn is_positional_join(previous: &TableFactor, join: &ast::JoinOperator) -> bool {
-    let alias = match previous {
+    table_factor_alias(previous).is_some_and(|alias| {
+        alias.name.quote_style.is_none() && alias.name.value.eq_ignore_ascii_case("positional")
+    }) && matches!(
+        join,
+        ast::JoinOperator::Join(ast::JoinConstraint::None)
+            | ast::JoinOperator::Inner(ast::JoinConstraint::None)
+    )
+}
+
+/// The alias of a table factor, when it has one.
+fn table_factor_alias(factor: &TableFactor) -> Option<&ast::TableAlias> {
+    match factor {
         TableFactor::Table { alias, .. }
         | TableFactor::Derived { alias, .. }
         | TableFactor::TableFunction { alias, .. }
@@ -4897,14 +4938,43 @@ fn is_positional_join(previous: &TableFactor, join: &ast::JoinOperator) -> bool 
         | TableFactor::SemanticView { alias, .. } => alias.as_ref(),
         // `UNPIVOT expr AS value`: its alias names a value, not the relation.
         TableFactor::UnpivotExpr { .. } => None,
-    };
-    alias.is_some_and(|alias| {
-        alias.name.quote_style.is_none() && alias.name.value.eq_ignore_ascii_case("positional")
-    }) && matches!(
-        join,
-        ast::JoinOperator::Join(ast::JoinConstraint::None)
-            | ast::JoinOperator::Inner(ast::JoinConstraint::None)
-    )
+    }
+}
+
+/// Whether `sql` renames columns with a column-list alias: a table or
+/// derived table `AS q(a, b)`, or a CTE `c(a, b) AS (...)`. Lineage does not
+/// apply such a rename, so the model needs inference to check its types
+/// (#2572). A query that does not parse answers `false`.
+fn sql_has_column_list_alias(sql: &str) -> bool {
+    use sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct Finder;
+    impl Visitor for Finder {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &ast::Query) -> ControlFlow<()> {
+            match &query.with {
+                Some(with)
+                    if with
+                        .cte_tables
+                        .iter()
+                        .any(|cte| !cte.alias.columns.is_empty()) =>
+                {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            if table_factor_alias(factor).is_some_and(|alias| !alias.columns.is_empty()) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql)
+        .is_ok_and(|statements| statements.visit(&mut Finder).is_break())
 }
 
 fn merged_join_columns(
@@ -6166,6 +6236,37 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A column-list alias renames columns by position. Lineage does not
+    /// apply it, so a column took the type of the source column that has
+    /// the new name (#2572).
+    #[test]
+    fn a_column_list_alias_takes_the_renamed_columns_type() {
+        let cols: Cols = &[
+            ("n", RockyType::String, false),
+            ("y", RockyType::Int32, false),
+            ("x", RockyType::Int32, false),
+        ];
+        let tables = [("t", cols), ("u", cols)];
+        let mut wrong = Vec::new();
+        for sql in [
+            "SELECT x FROM u AS q(x, y, n)",
+            "SELECT q.x FROM u AS q(x, y, n)",
+            "WITH c(x, w) AS (SELECT n, x FROM t) SELECT x FROM c",
+            "SELECT x FROM (SELECT n, y FROM t) AS d(x, w)",
+            "SELECT MAX(x) AS x FROM u AS q(x, y, n)",
+        ] {
+            let rows = typecheck_over(sql, &tables);
+            let x = rows.iter().find(|(name, _, _)| name == "x");
+            if !matches!(x, Some((_, RockyType::String | RockyType::Unknown, _))) {
+                wrong.push(format!("{sql}: {rows:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // Without a rename the source type stands.
+        let rows = typecheck_over("SELECT x FROM u AS q", &tables);
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
     }
 
     /// `UNION BY NAME` pairs columns by name, not position, and DuckDB's
