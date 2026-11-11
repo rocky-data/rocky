@@ -1921,12 +1921,22 @@ pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 /// Only warns: a failure to evaluate is logged, and no verdict changes the
 /// run's exit code. Does nothing without a store or a config path (the
 /// record was not written, or there is no `rocky.toml` to read budgets from).
+///
+/// First, a store held for writing drains the AI usage spool that `rocky ai*`,
+/// the LSP and MCP append to while the writer is held (see
+/// [`rocky_core::ai_usage`]). A failed drain only warns: the spool keeps its
+/// lines, and `rocky cost` reads them anyway.
 pub(crate) fn record_product_budgets(
     state_store: Option<&StateStore>,
     config_path: Option<&Path>,
     run_id: &str,
     output: &mut RunOutput,
 ) {
+    if let Some(store) = state_store
+        && let Err(error) = store.drain_ai_usage_spool()
+    {
+        warn!(error = %error, run_id, "the AI usage spool could not be drained");
+    }
     let (Some(store), Some(config_path)) = (state_store, config_path) else {
         return;
     };
@@ -16982,6 +16992,7 @@ async fn execute_one_plain_model(
     let model_started_at = Utc::now();
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
+    let mut egress_acc: Option<u64> = None;
     let mut job_ids_acc: Vec<String> = Vec::new();
     // What this build reads from each upstream table: recorded on a
     // production run, on an adapter that can profile, for a strategy that
@@ -17085,6 +17096,7 @@ async fn execute_one_plain_model(
                                 accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                             bytes_written_acc =
                                 accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                            egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                             if let Some(jid) = stats.job_id {
                                 job_ids_acc.push(jid);
                             }
@@ -17209,6 +17221,7 @@ async fn execute_one_plain_model(
                 Ok(Some(stats)) => {
                     bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                     bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                    egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                     if let Some(jid) = stats.job_id {
                         job_ids_acc.push(jid);
                     }
@@ -17246,6 +17259,7 @@ async fn execute_one_plain_model(
                     rows_reported = rows_reported
                         .zip(stats.rows_affected)
                         .map(|(sum, rows)| sum.saturating_add(rows));
+                    egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                     if let Some(jid) = stats.job_id {
                         job_ids_acc.push(jid);
                     }
@@ -17373,6 +17387,7 @@ async fn execute_one_plain_model(
         cost_usd: None,
         bytes_scanned: bytes_scanned_acc,
         bytes_written: bytes_written_acc,
+        egress_bytes: egress_acc,
         // Transformation models carry no tenant dimension (their asset
         // key is `[catalog, schema, table]`, not a source-schema parse).
         tenant: None,
@@ -17601,6 +17616,7 @@ async fn execute_snapshot_model(
 
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
+    let mut egress_acc: Option<u64> = None;
     let mut job_ids_acc: Vec<String> = Vec::new();
     for sql in &statements {
         let stats = warehouse
@@ -17609,6 +17625,7 @@ async fn execute_snapshot_model(
             .map_err(|e| anyhow::Error::from(e).context(format!("model '{model_name}' failed")))?;
         bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
         bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+        egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
         if let Some(jid) = stats.job_id {
             job_ids_acc.push(jid);
         }
@@ -17657,6 +17674,7 @@ async fn execute_snapshot_model(
         cost_usd: None,
         bytes_scanned: bytes_scanned_acc,
         bytes_written: bytes_written_acc,
+        egress_bytes: egress_acc,
         tenant: None,
         job_ids: job_ids_acc,
         skip_internal: None,
@@ -18219,12 +18237,14 @@ async fn run_one_partition(
     let mut exec_err: Option<anyhow::Error> = None;
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
+    let mut egress_acc: Option<u64> = None;
     let mut job_ids_acc: Vec<String> = Vec::new();
     for stmt in &stmts {
         match warehouse.execute_statement_with_stats(stmt).await {
             Ok(stats) => {
                 bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                 bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                 if let Some(jid) = stats.job_id {
                     job_ids_acc.push(jid);
                 }
@@ -18332,6 +18352,7 @@ async fn run_one_partition(
             cost_usd: None,
             bytes_scanned: bytes_scanned_acc,
             bytes_written: bytes_written_acc,
+            egress_bytes: egress_acc,
             // time_interval models carry no tenant dimension.
             tenant: None,
             job_ids: job_ids_acc,
@@ -20026,6 +20047,7 @@ async fn process_table(
             cost_usd: None,
             bytes_scanned: exec_stats.bytes_scanned,
             bytes_written: exec_stats.bytes_written,
+            egress_bytes: exec_stats.egress_bytes,
             // Tenant lifted from the discover-time schema-pattern
             // `{tenant}` component on the task. `None` for non-tenant
             // patterns; carried onto the persisted ModelExecution.

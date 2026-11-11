@@ -2541,12 +2541,18 @@ pub struct CostSection {
     /// monthly product view (`rocky cost --month`) prices model time with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_cost_per_machine_hour: Option<f64>,
-    /// Price of moving one GB of data across regions, in USD per GB. Unset
-    /// by default. Config only for now: no cost path reads it yet.
+    /// Price of moving one GB (2^30 bytes) of data across regions, in USD
+    /// per GB. Unset by default. The monthly product view
+    /// (`rocky cost --month`) prices reported egress with it. No adapter
+    /// reports egress yet, so it prices nothing today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_region_transfer_cost_per_gb: Option<f64>,
-    /// Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by
-    /// default. Config only for now: no cost path reads it yet.
+    /// Price of one million AI tokens, in USD per 1,000,000 tokens. One
+    /// blended price: input and output tokens are priced alike. Unset by
+    /// default. The monthly product view (`rocky cost --month`) prices the
+    /// AI calls this state store recorded with it; a month with recorded
+    /// calls and no price here has no money total. `0` is a valid explicit
+    /// price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_cost_per_million_tokens: Option<f64>,
 }

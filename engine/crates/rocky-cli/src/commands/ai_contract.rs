@@ -540,6 +540,12 @@ pub async fn run_ai_contract(
     };
 
     // Draft the contract via the LLM, compile-verified against the model.
+    // Every call (each retry too) is recorded for `rocky cost`, even when the
+    // draft fails.
+    let recorder = rocky_ai::usage::UsageRecorder::collect("ai_contract");
+    recorder.set_model(Some(model_name));
+    let _persist = recorder.persist_on_drop(state_path);
+    let client = client.with_usage_sink(recorder.sink());
     let drafted = draft_contract(&table_profile, &inferred_schema, &client, 3)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

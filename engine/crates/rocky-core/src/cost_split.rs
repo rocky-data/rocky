@@ -2,7 +2,8 @@
 //!
 //! A pure function over recorded run history. It takes the runs that cover a
 //! month and answers "which product paid for how much", in whole numbers:
-//! milliseconds of model time and byte-hours of stored data. It does no I/O,
+//! milliseconds of model time, byte-hours of stored data, bytes of egress
+//! where an adapter reported it, and AI tokens. It does no I/O,
 //! reads no clock and knows no prices. Money, if any, is applied by a caller
 //! that holds a user's price table.
 //!
@@ -43,10 +44,28 @@
 //! [`SplitBasis::Bytes`] is reserved for an adapter that reports exact bytes
 //! read; no producer on main sets it.
 //!
+//! # Egress
+//!
+//! Egress is a build cost of a version, split exactly like model time. Only
+//! reported values are summed: an execution that reported no egress adds
+//! nothing and is counted in [`NotMeasured::egress_unreported_executions`].
+//! No adapter reports egress yet.
+//!
+//! # AI tokens
+//!
+//! AI calls are not versions and have no readers, so they are not split.
+//! A call about a model a product owns is charged to that product's `kept`
+//! (and its `built` memo); every other call goes to `unallocated`. Only calls
+//! inside the month, at or before `as_of`, count. A call that did not report
+//! both token counts adds nothing and is counted in
+//! [`NotMeasured::ai_calls_without_usage`]. The figure covers the calls this
+//! state store recorded: developer spend, with no production scope.
+//!
 //! # The invariant
 //!
 //! For every unit, `sum(kept + allocated) + unallocated` equals the measured
-//! production total, exactly. Each split uses largest-remainder rounding, so
+//! production total, exactly, AI tokens included. Each split uses
+//! largest-remainder rounding, so
 //! the parts always add up to the whole. Shadow and branch spend sit on their
 //! own row, outside both sides, and so do executions that recorded no time.
 
@@ -55,6 +74,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 
+use crate::ai_usage::AiUsageRecord;
 use crate::state::{
     ModelExecution, ProductionScope, RunRecord, StoredBytesBasis, UnrecordedScope, UpstreamRead,
 };
@@ -85,14 +105,24 @@ pub enum Unit {
     /// Byte-hours of stored data measured as allocated storage blocks
     /// (an estimate).
     StorageAllocatedBlocks,
+    /// Bytes moved out of the warehouse's region, as an adapter reported
+    /// them. Only reported values are summed; no adapter reports it yet.
+    EgressBytes,
+    /// AI input tokens, as the provider reported them.
+    AiInputTokens,
+    /// AI output tokens, as the provider reported them.
+    AiOutputTokens,
 }
 
 impl Unit {
     /// Every unit, in output order.
-    pub const ALL: [Unit; 3] = [
+    pub const ALL: [Unit; 6] = [
         Unit::ComputeMs,
         Unit::StorageDataFiles,
         Unit::StorageAllocatedBlocks,
+        Unit::EgressBytes,
+        Unit::AiInputTokens,
+        Unit::AiOutputTokens,
     ];
 
     /// The stable name used in JSON.
@@ -102,6 +132,9 @@ impl Unit {
             Unit::ComputeMs => "compute_ms",
             Unit::StorageDataFiles => "storage_byte_hours_data_files",
             Unit::StorageAllocatedBlocks => "storage_byte_hours_allocated_blocks",
+            Unit::EgressBytes => "egress_bytes",
+            Unit::AiInputTokens => "ai_input_tokens",
+            Unit::AiOutputTokens => "ai_output_tokens",
         }
     }
 
@@ -168,14 +201,20 @@ pub enum OwnedBuildPolicy {
 ///   does not carry that time itself.
 /// * Storage: the owner pays. Storage accrues whether or not anyone reads the
 ///   table, so a reader's share would swing after the fact.
+/// * Egress: the readers pay, like model time. It is a build cost.
+/// * AI tokens: never split (a call has no readers). The answer is
+///   [`OwnedBuildPolicy::OwnerKeeps`] only so the match is total.
 ///
 /// Flipping compute to [`OwnedBuildPolicy::OwnerKeeps`] is a change to this
 /// function alone; the split, the invariant and the report follow from it.
 #[must_use]
 pub fn owned_build_policy(unit: Unit) -> OwnedBuildPolicy {
     match unit {
-        Unit::ComputeMs => OwnedBuildPolicy::ReadersPay,
-        Unit::StorageDataFiles | Unit::StorageAllocatedBlocks => OwnedBuildPolicy::OwnerKeeps,
+        Unit::ComputeMs | Unit::EgressBytes => OwnedBuildPolicy::ReadersPay,
+        Unit::StorageDataFiles
+        | Unit::StorageAllocatedBlocks
+        | Unit::AiInputTokens
+        | Unit::AiOutputTokens => OwnedBuildPolicy::OwnerKeeps,
     }
 }
 
@@ -403,6 +442,9 @@ pub struct SplitInput<'a> {
     pub declared_children: &'a BTreeMap<String, BTreeSet<String>>,
     /// The catalog a model target with no catalog resolves against.
     pub default_catalog: Option<&'a str>,
+    /// Recorded AI calls, in any order. Only those inside the month and at
+    /// or before `as_of` count.
+    pub ai_usage: &'a [AiUsageRecord],
 }
 
 /// Executions the split could not measure. Counts, never amounts.
@@ -422,6 +464,13 @@ pub struct NotMeasured {
     /// Rocky keeps or before the reader began. The same name can also be
     /// charged for later reads. The cost of an unlinked read is not split.
     pub unattributed_read_tables: u64,
+    /// Production executions this month that reported no egress, counted
+    /// only when at least one execution did report it. Zero otherwise: then
+    /// egress is not measured at all.
+    pub egress_unreported_executions: u64,
+    /// AI calls this month whose response did not report both token
+    /// counts. They add nothing to the AI amounts.
+    pub ai_calls_without_usage: u64,
 }
 
 /// What a product paid for one table it reads.
@@ -545,6 +594,8 @@ struct Node<'a> {
     /// only these have model time.
     in_month: bool,
     compute_ms: u128,
+    /// The egress the executions reported, summed. `None` when none did.
+    egress: Option<u128>,
     /// The stored size right after this version was written.
     measured: Option<(u64, StoredBytesBasis)>,
     /// The upstream reads the execution recorded. `None` means not measured.
@@ -587,6 +638,8 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
     });
 
     let mut nodes: Vec<Node<'_>> = Vec::new();
+    let mut egress_reported = false;
+    let mut egress_unreported: u64 = 0;
     for run in runs {
         let production = run.counts_as_production(UnrecordedScope::Count);
         let not_production = run.production_scope() == ProductionScope::NotProduction;
@@ -598,6 +651,13 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
             }
             if production {
                 let model = exec.rocky_model_name();
+                let egress = exec.egress_bytes.map(u128::from);
+                if !is_synthetic_name(model) {
+                    match egress {
+                        Some(_) => egress_reported = true,
+                        None => egress_unreported += 1,
+                    }
+                }
                 if is_unmeasured_failure(exec) {
                     // Entries like `<verify_after>` are not models.
                     if !is_synthetic_name(model) {
@@ -629,6 +689,10 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                         node.measured = measured;
                     }
                     node.compute_ms += execution_compute_ms(exec);
+                    node.egress = match (node.egress, egress) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        (a, b) => a.or(b),
+                    };
                     // A partition with no recorded reads makes the whole
                     // version unmeasured.
                     node.reads = match (node.reads.take(), reads) {
@@ -650,6 +714,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                     finished_at: exec.finished_at,
                     in_month: true,
                     compute_ms: execution_compute_ms(exec),
+                    egress,
                     measured,
                     reads,
                 });
@@ -659,8 +724,16 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                     Unit::ComputeMs,
                     execution_compute_ms(exec),
                 );
+                add(
+                    &mut out.shadow_branch,
+                    Unit::EgressBytes,
+                    exec.egress_bytes.map_or(0, u128::from),
+                );
             }
         }
+    }
+    if egress_reported {
+        out.not_measured.egress_unreported_executions = egress_unreported;
     }
     for exec in input.carry_in {
         let Some(stored) = exec.stored_bytes else {
@@ -673,6 +746,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
             finished_at: exec.finished_at,
             in_month: false,
             compute_ms: 0,
+            egress: None,
             measured: Some((stored.bytes, stored.basis)),
             reads: None,
         });
@@ -742,6 +816,11 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
     // ---- 3. The measured total. ---------------------------------------
     for (node, stored) in nodes.iter().zip(&storage) {
         add(&mut out.measured_total, Unit::ComputeMs, node.compute_ms);
+        add(
+            &mut out.measured_total,
+            Unit::EgressBytes,
+            node.egress.unwrap_or(0),
+        );
         if let Some((unit, value)) = *stored {
             add(&mut out.measured_total, unit, value);
         }
@@ -857,6 +936,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
         let owner = input.owners.get(node.model);
         let mut own = Amounts::new();
         add(&mut own, Unit::ComputeMs, node.compute_ms);
+        add(&mut own, Unit::EgressBytes, node.egress.unwrap_or(0));
         if let Some((unit, value)) = storage[index] {
             add(&mut own, unit, value);
         }
@@ -972,6 +1052,34 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
         row.shared_not_charged = merged;
         row.allocated_upstream
             .sort_by(|a, b| (&a.table, a.unit, a.basis).cmp(&(&b.table, b.unit, b.basis)));
+    }
+
+    // ---- 7. AI tokens, charged directly. ------------------------------
+    // Not split: a call is about one model, or about none. Each amount goes
+    // to exactly one side of the invariant and to the measured total.
+    for call in input.ai_usage {
+        if !input.window.contains(call.at) || call.at > input.as_of {
+            continue;
+        }
+        let (Some(tokens_in), Some(tokens_out)) = (call.input_tokens, call.output_tokens) else {
+            out.not_measured.ai_calls_without_usage += 1;
+            continue;
+        };
+        let owner = call.model.as_deref().and_then(|m| input.owners.get(m));
+        for (unit, value) in [
+            (Unit::AiInputTokens, u128::from(tokens_in)),
+            (Unit::AiOutputTokens, u128::from(tokens_out)),
+        ] {
+            add(&mut out.measured_total, unit, value);
+            match owner {
+                Some(product) => {
+                    let row = out.products.entry(product.clone()).or_default();
+                    add(&mut row.kept, unit, value);
+                    add(&mut row.built, unit, value);
+                }
+                None => add(&mut out.unallocated, unit, value),
+            }
+        }
     }
     out
 }

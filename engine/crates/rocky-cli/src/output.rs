@@ -1393,6 +1393,12 @@ pub struct MaterializationOutput {
     /// release can populate it without a schema break.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
+    /// Bytes the statements moved out of the warehouse's region, summed
+    /// over the statements that reported it. No adapter reports it yet, so
+    /// it is absent today. `bytes_scanned` and `bytes_written` are not
+    /// egress. Carried onto the run record for `rocky cost --month`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_bytes: Option<u64>,
     /// Tenant this materialization is attributed to, taken from the
     /// discover-time schema-pattern `{tenant}` component. Present only
     /// for replication pipelines whose schema pattern declares a
@@ -6884,6 +6890,7 @@ impl RunOutput {
                     .or_else(|| mat.consumed_column_baseline.clone()),
                 bytes_scanned: mat.bytes_scanned,
                 bytes_written: mat.bytes_written,
+                egress_bytes: mat.egress_bytes,
                 tenant: mat.tenant.clone(),
                 // Recipe identity. `recipe_hash` / `env_hash` / scheme come
                 // from the per-model carrier stamped at the execution site;
@@ -12742,6 +12749,15 @@ pub enum CostUnit {
     // Byte-hours of stored data, measured as allocated storage blocks (an
     // estimate).
     StorageByteHoursAllocatedBlocks,
+    // Bytes moved out of the warehouse's region, as an adapter reported
+    // them. No adapter reports it yet, so this unit does not appear today.
+    EgressBytes,
+    // AI input tokens recorded in this state store, as the provider
+    // reported them.
+    AiInputTokens,
+    // AI output tokens recorded in this state store, as the provider
+    // reported them.
+    AiOutputTokens,
 }
 
 impl From<rocky_core::cost_split::Unit> for CostUnit {
@@ -12751,6 +12767,9 @@ impl From<rocky_core::cost_split::Unit> for CostUnit {
             Unit::ComputeMs => Self::ComputeMs,
             Unit::StorageDataFiles => Self::StorageByteHoursDataFiles,
             Unit::StorageAllocatedBlocks => Self::StorageByteHoursAllocatedBlocks,
+            Unit::EgressBytes => Self::EgressBytes,
+            Unit::AiInputTokens => Self::AiInputTokens,
+            Unit::AiOutputTokens => Self::AiOutputTokens,
         }
     }
 }
@@ -12787,7 +12806,8 @@ impl From<rocky_core::cost_split::SplitBasis> for CostSplitBasis {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostAmount {
     pub unit: CostUnit,
-    /// Whole units. Milliseconds, or byte-hours rounded down per interval.
+    /// Whole units: milliseconds, byte-hours rounded down per interval,
+    /// bytes, or tokens.
     pub amount: u64,
 }
 
@@ -12844,8 +12864,11 @@ pub struct ProductMonthCost {
     /// What the product is charged: `kept` plus `allocated_upstream`.
     pub charged: Vec<CostAmount>,
     /// `charged` in USD, priced only from prices set in `[cost]`. Present
-    /// only when `money_status` is `priced`. It covers compute and storage;
-    /// egress and AI tokens are not measured and are not in it.
+    /// only when `money_status` is `priced`. It covers compute, storage,
+    /// egress when an adapter reported it this month, and AI tokens when
+    /// this state store recorded calls this month and recorded the whole
+    /// month. A figure whose part is `not_measured` or (for AI tokens)
+    /// `partial` is not in it.
     pub money: Option<f64>,
     /// Why `money` is or is not present.
     pub money_status: MoneyStatus,
@@ -12923,7 +12946,9 @@ pub struct ProductBudgetCheck {
     pub actual: Option<f64>,
     /// `breached` when `actual` is greater than `limit`. Equal is in budget.
     pub verdict: ProductBudgetVerdict,
-    /// Why the limit is `not_evaluated`.
+    /// Why the limit is `not_evaluated`. On a `max_usd` limit that is
+    /// `breached` from the priced figures alone (`actual` is then that
+    /// floor), what the figure leaves out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -12996,10 +13021,13 @@ pub enum MoneyStatus {
     // A measured figure has no price in `[cost]`. Rocky's shipped default
     // prices are never used here.
     NoPrice,
-    // Rocky does not measure this figure. It is unknown, not $0.
+    // Rocky did not measure this figure this month. It is unknown, not $0.
     NotMeasured,
     // Run history does not cover the whole month, so the amounts are
-    // partial and no money is shown for them.
+    // partial and no money is shown for them. On the `ai_tokens` part
+    // alone: the state store started recording AI calls after the month
+    // began, so calls before that are unknown; the part is left out of
+    // the total.
     Partial,
 }
 
@@ -13014,9 +13042,16 @@ pub enum MoneyFigure {
     // `storage_byte_hours_allocated_blocks`, priced by
     // `storage_cost_per_gb_month`.
     StorageAllocatedBlocks,
-    // Data moved across regions. Not measured.
+    // `egress_bytes`, priced by `cross_region_transfer_cost_per_gb`
+    // (1 GB = 2^30 bytes). `not_measured` when no production execution in
+    // the month reported egress, which is every month today: no adapter
+    // reports it yet.
     Egress,
-    // AI tokens. Not measured.
+    // `ai_input_tokens` plus `ai_output_tokens`, priced by
+    // `ai_cost_per_million_tokens`, one blended price for input and output.
+    // Covers the calls recorded in this state store only: developer spend,
+    // with no production scope. `not_measured` when the month has no
+    // recorded call with token counts.
     AiTokens,
 }
 
@@ -13046,6 +13081,16 @@ pub struct CostNotMeasured {
     /// Rocky keeps or before the reader began. The same name can also be
     /// charged for later reads. The cost of an unlinked read is not split.
     pub unattributed_read_tables: u64,
+    /// Production executions this month that reported no egress, counted
+    /// only when at least one execution did report it (then the egress
+    /// figure is a floor). Zero when none reported: egress is then not
+    /// measured at all.
+    #[serde(default)]
+    pub egress_unreported_executions: u64,
+    /// AI calls this month whose response did not report both token
+    /// counts. They add nothing to the AI amounts.
+    #[serde(default)]
+    pub ai_calls_without_usage: u64,
 }
 
 /// `rocky cost --month YYYY-MM --by product`: one month of production cost,
@@ -13053,8 +13098,10 @@ pub struct CostNotMeasured {
 /// `[cost]` sets a price.
 ///
 /// For every unit, `sum(charged) + unallocated` equals `measured_total`,
-/// exactly. Shadow and branch spend (`shadow_branch`) and `not_measured`
-/// sit outside that equation. Money is priced from each figure on its own,
+/// exactly, AI tokens included. Shadow and branch spend (`shadow_branch`)
+/// and `not_measured` sit outside that equation. An AI call about a model a
+/// product owns is charged to that product; every other call is
+/// `unallocated`. Money is priced from each figure on its own,
 /// so the money figures are floating point and are not claimed to add up
 /// to the cent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -13082,7 +13129,8 @@ pub struct ProductMonthCostOutput {
     pub products: Vec<ProductMonthCost>,
     /// Cost of tables no product owns that no measured reader took.
     pub unallocated: Vec<CostAmount>,
-    /// Shadow and branch compute. Real spend, but not production.
+    /// Shadow and branch compute, and egress where reported. Real spend,
+    /// but not production.
     pub shadow_branch: Vec<CostAmount>,
     /// Everything measured in production this month.
     pub measured_total: Vec<CostAmount>,

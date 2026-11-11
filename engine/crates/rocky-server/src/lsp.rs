@@ -906,6 +906,22 @@ impl RockyLsp {
     /// let it through, even under `[residency] enforce`. Only the arms whose
     /// prompt carries warehouse data call this; the `.rocky` syntax fix does
     /// not, so this read never stops it.
+    /// A recorder that spools each AI call of a code action for
+    /// `rocky cost`, next to the project's state file. `None` before
+    /// `initialize` sets the models directory.
+    async fn ai_usage_recorder(
+        &self,
+        command: &str,
+        model: Option<&str>,
+    ) -> Option<rocky_ai::usage::UsageRecorder> {
+        let models_dir = self.models_dir.read().await.clone()?;
+        let state_path =
+            rocky_core::state::resolve_state_path(None, std::path::Path::new(&models_dir)).path;
+        let recorder = rocky_ai::usage::UsageRecorder::spool(command, &state_path);
+        recorder.set_model(model);
+        Some(recorder)
+    }
+
     async fn ai_residency_for(
         &self,
         models: &[&str],
@@ -3182,9 +3198,17 @@ impl LanguageServer for RockyLsp {
                     }
                 };
 
-                let outcome =
-                    resolve_ai_contract_action(&resolved_data, &typed_models, base_url, residency)
-                        .await;
+                let usage = self
+                    .ai_usage_recorder("lsp_ai_contract_fix", Some(&resolved_data.model_name))
+                    .await;
+                let outcome = resolve_ai_contract_action(
+                    &resolved_data,
+                    &typed_models,
+                    base_url,
+                    residency,
+                    usage,
+                )
+                .await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
             }
             AI_CLASSIFICATION_FIX_KIND => {
@@ -3210,8 +3234,15 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
+                let usage = self
+                    .ai_usage_recorder(
+                        "lsp_ai_classification_fix",
+                        Some(&resolved_data.model_name),
+                    )
+                    .await;
                 let outcome =
-                    resolve_ai_classification_action(&resolved_data, base_url, residency).await;
+                    resolve_ai_classification_action(&resolved_data, base_url, residency, usage)
+                        .await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.rocky_toml_uri);
             }
             AI_DSL_FIX_KIND => {
@@ -3225,10 +3256,12 @@ impl LanguageServer for RockyLsp {
                 };
                 // The prompt carries the `.rocky` source and a parse
                 // diagnostic: text the user wrote, no warehouse data.
+                let usage = self.ai_usage_recorder("lsp_ai_dsl_fix", None).await;
                 let outcome = resolve_ai_dsl_action(
                     &resolved_data,
                     base_url,
                     rocky_ai::residency::AiResidency::no_warehouse_data(),
+                    usage,
                 )
                 .await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.uri);
@@ -3256,8 +3289,11 @@ impl LanguageServer for RockyLsp {
                         return Ok(action);
                     }
                 };
+                let usage = self
+                    .ai_usage_recorder("lsp_ai_freshness_fix", Some(&resolved_data.model_name))
+                    .await;
                 let outcome =
-                    resolve_ai_freshness_action(&resolved_data, base_url, residency).await;
+                    resolve_ai_freshness_action(&resolved_data, base_url, residency, usage).await;
                 apply_ai_outcome(&mut action, outcome, &resolved_data.sidecar_uri);
             }
             _ => {
@@ -4058,6 +4094,7 @@ async fn resolve_ai_contract_action(
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     base_url: Option<String>,
     residency: rocky_ai::residency::AiResidency,
+    usage: Option<rocky_ai::usage::UsageRecorder>,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -4100,6 +4137,12 @@ async fn resolve_ai_contract_action(
     let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+    // Recorded for `rocky cost` through the spool: the LSP never writes the
+    // state store.
+    let client = match &usage {
+        Some(recorder) => client.with_usage_sink(recorder.sink()),
+        None => client,
     };
 
     let response = match client.generate(&system_prompt, &user_prompt, None).await {
@@ -4302,6 +4345,7 @@ async fn resolve_ai_classification_action(
     data: &AiClassificationActionData,
     base_url: Option<String>,
     residency: rocky_ai::residency::AiResidency,
+    usage: Option<rocky_ai::usage::UsageRecorder>,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -4332,6 +4376,12 @@ async fn resolve_ai_classification_action(
     let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+    // Recorded for `rocky cost` through the spool: the LSP never writes the
+    // state store.
+    let client = match &usage {
+        Some(recorder) => client.with_usage_sink(recorder.sink()),
+        None => client,
     };
 
     let response = match client.generate(&system_prompt, &user_prompt, None).await {
@@ -4492,6 +4542,7 @@ async fn resolve_ai_freshness_action(
     data: &AiFreshnessActionData,
     base_url: Option<String>,
     residency: rocky_ai::residency::AiResidency,
+    usage: Option<rocky_ai::usage::UsageRecorder>,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -4521,6 +4572,12 @@ async fn resolve_ai_freshness_action(
     let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+    // Recorded for `rocky cost` through the spool: the LSP never writes the
+    // state store.
+    let client = match &usage {
+        Some(recorder) => client.with_usage_sink(recorder.sink()),
+        None => client,
     };
 
     let response = match client.generate(&system_prompt, &user_prompt, None).await {
@@ -4610,6 +4667,7 @@ async fn resolve_ai_dsl_action(
     data: &AiDslActionData,
     base_url: Option<String>,
     residency: rocky_ai::residency::AiResidency,
+    usage: Option<rocky_ai::usage::UsageRecorder>,
 ) -> AiResolveOutcome {
     let api_key = match std::env::var(AI_API_KEY_ENV) {
         Ok(v) if !v.is_empty() => v,
@@ -4636,6 +4694,12 @@ async fn resolve_ai_dsl_action(
     let client = match rocky_ai::client::LlmClient::new(ai_config, residency) {
         Ok(c) => c,
         Err(e) => return AiResolveOutcome::Disabled(format!("AI client init failed: {e}")),
+    };
+    // Recorded for `rocky cost` through the spool: the LSP never writes the
+    // state store.
+    let client = match &usage {
+        Some(recorder) => client.with_usage_sink(recorder.sink()),
+        None => client,
     };
 
     let response = match client.generate(&system_prompt, &user_prompt, None).await {
@@ -9616,6 +9680,7 @@ mod tests {
             &typed,
             None,
             rocky_ai::residency::AiResidency::no_warehouse_data(),
+            None,
         )
         .await;
         match outcome {
@@ -9728,6 +9793,7 @@ mod tests {
             &data,
             None,
             rocky_ai::residency::AiResidency::no_warehouse_data(),
+            None,
         )
         .await
         {
@@ -9839,6 +9905,7 @@ mod tests {
             &data,
             None,
             rocky_ai::residency::AiResidency::no_warehouse_data(),
+            None,
         )
         .await
         {

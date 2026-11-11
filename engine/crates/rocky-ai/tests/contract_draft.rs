@@ -140,3 +140,38 @@ async fn observed_nulls_still_send_e012_to_the_retry() {
     assert_eq!(drafted.attempts, 2, "E012 on observed NULLs is retried");
     assert!(drafted.unproven_non_null.is_empty());
 }
+
+/// Each compile-loop retry is its own call, so the usage sink records one
+/// row per attempt.
+#[tokio::test]
+async fn each_retry_of_the_loop_is_its_own_usage_record() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(reply(&draft(false)))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(reply(&draft(true)))
+        .mount(&server)
+        .await;
+
+    let recorder = rocky_ai::usage::UsageRecorder::collect("ai_contract");
+    recorder.set_model(Some("raw_orders"));
+    let client = client(&server).with_usage_sink(recorder.sink());
+    let drafted = draft_contract(&profile(7), &unknown_schema(), &client, 3)
+        .await
+        .expect("the retry verifies");
+    assert_eq!(drafted.attempts, 2);
+    let records = recorder.records();
+    assert_eq!(records.len(), 2, "one record per attempt");
+    for record in &records {
+        assert_eq!(record.model.as_deref(), Some("raw_orders"));
+        assert_eq!(
+            (record.input_tokens, record.output_tokens),
+            (Some(3), Some(5))
+        );
+    }
+}

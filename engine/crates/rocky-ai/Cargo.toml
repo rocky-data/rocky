@@ -12,6 +12,7 @@ rocky-core = { path = "../rocky-core" }
 rocky-ir = { path = "../rocky-ir" }
 rocky-lang = { path = "../rocky-lang" }
 rocky-sql = { path = "../rocky-sql" }
+chrono = { workspace = true }
 reqwest = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true }

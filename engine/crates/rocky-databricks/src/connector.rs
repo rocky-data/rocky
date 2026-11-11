@@ -1370,6 +1370,7 @@ fn stats_from_response(response: &StatementResponse) -> rocky_core::traits::Exec
     rocky_core::traits::ExecutionStats {
         bytes_scanned,
         bytes_written: None,
+        egress_bytes: None,
         rows_affected: None,
         // Databricks surfaces a statement identifier on the response;
         // wiring it is a follow-up wave (deferred along with the

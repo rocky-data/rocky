@@ -3379,7 +3379,8 @@ impl RockyMcpServer {
             base_url,
         };
         let client = rocky_ai::client::LlmClient::new(ai_config, residency)
-            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?
+            .with_usage_sink(self.ai_usage_sink("mcp_suggest_freshness_block", &args.model));
         let response = client
             .generate(&system_prompt, &user_prompt, None)
             .await
@@ -3443,7 +3444,8 @@ impl RockyMcpServer {
         let data = rocky_cli::commands::profile_data_regions(setup.project.as_ref(), &model_name);
         let client = setup
             .client(&data)
-            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?
+            .with_usage_sink(self.ai_usage_sink("mcp_ai_contract", &model_name));
 
         // The model's inferred output schema — the basis for compile-verifying
         // the drafted contract.
@@ -3520,7 +3522,8 @@ impl RockyMcpServer {
         let data = setup.model_data(&[model_name.as_str()], &[]);
         let client = setup
             .client(&data)
-            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?
+            .with_usage_sink(self.ai_usage_sink("mcp_ai_test", &model_name));
         let assertions = rocky_ai::testgen::generate_tests(&model, &compiled, &client)
             .await
             .map_err(|e| ToolError::ai_error(format!("test generation failed: {e}")))?;
@@ -3579,7 +3582,8 @@ impl RockyMcpServer {
         let data = setup.model_data(&models, &tables);
         let client = setup
             .client(&data)
-            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?
+            .with_usage_sink(self.ai_usage_sink("mcp_explain_model", &model_name));
         let intent = rocky_ai::explain::explain_model(&model, &compiled, &client)
             .await
             .map_err(|e| ToolError::ai_error(format!("explain failed: {e}")))?;
@@ -3589,6 +3593,16 @@ impl RockyMcpServer {
             intent: Some(intent),
             message: None,
         }))
+    }
+
+    /// The usage sink for one AI tool call about `model`: each response is
+    /// appended to the AI usage spool next to the state file, for
+    /// `rocky cost`. The MCP server never writes the state store; the next
+    /// process that holds its writer drains the spool.
+    fn ai_usage_sink(&self, command: &str, model: &str) -> rocky_ai::client::UsageSink {
+        let recorder = rocky_ai::usage::UsageRecorder::spool(command, &self.state_path());
+        recorder.set_model(Some(model));
+        recorder.sink()
     }
 
     /// The `[ai] max_tokens` ceiling for this project.
