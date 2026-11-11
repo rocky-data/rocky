@@ -64,6 +64,13 @@ recording/                       # Playwright-driven demo GIF recorder
 - Runtime: `vscode-languageclient`. Dev: `typescript`, `@vscode/vsce`, `mocha`, `vitest`.
 - Versions live in `package.json`. Read it before you quote one.
 
+### Accepted advisories
+- `GHSA-g3hv-75wg-m249` (minimatch globparts DoS, fixed only in minimatch `>=11.0.1`). The dev tools (`eslint`, `@eslint/config-array`, `@typescript-eslint/typescript-estree`, `@vscode/vsce`, `mocha`) take minimatch 11 through the scoped `overrides` in `package.json`.
+- One copy stays on minimatch 10: the one `vscode-languageclient` uses. It calls `new Minimatch(...).makeRe()` (`lib/common/utils/globPattern.js`, `lib/common/fileOperations.js`), and minimatch 11 removed `makeRe`. Forcing 11 there crashes the extension at runtime.
+- **Do not add a minimatch override for `vscode-languageclient`.**
+- Why the risk is tolerable: the advisory needs an attacker-supplied glob pattern. The patterns on that path come only from the extension's own document selectors and from the local `rocky lsp` it spawns over stdio. Whoever controls those already runs code on the machine.
+- Drop this note, and the alert dismissal, once `vscode-languageclient` ships on minimatch `>=11.0.1`.
+
 ## Common Commands
 
 ```bash

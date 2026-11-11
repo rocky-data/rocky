@@ -18,7 +18,6 @@
     "sharp": "^0.35.5"
   },
   "overrides": {
-    "@astrojs/sitemap": "3.6.1",
     "postcss-nested": {
       "postcss-selector-parser": "^7.1.6"
     }
