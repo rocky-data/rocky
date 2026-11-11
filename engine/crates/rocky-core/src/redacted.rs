@@ -122,6 +122,29 @@ impl RedactedString {
         Self(s)
     }
 
+    /// A credential that a library user resolved without `rocky.toml`.
+    ///
+    /// It prints as `***`, like [`RedactedString::new`], **and** it records
+    /// the value under `name` in the [`crate::secret_registry`] (#1919). So
+    /// an error that echoes the credential inside other text, which `***`
+    /// cannot cover, prints `${name}` there instead of the value. Values
+    /// shorter than the registry's 8-byte floor are not recorded.
+    pub fn secret(name: &str, value: String) -> Self {
+        crate::secret_registry::register_substitution(name, &value);
+        Self(value)
+    }
+
+    /// [`RedactedString::secret`] for a value read from the environment
+    /// variable `name`.
+    ///
+    /// # Errors
+    ///
+    /// The [`std::env::VarError`] from reading `name`: it is unset, or its
+    /// value is not valid Unicode. Nothing is registered then.
+    pub fn from_env(name: &str) -> Result<Self, std::env::VarError> {
+        std::env::var(name).map(|value| Self::secret(name, value))
+    }
+
     /// Returns the raw value. This is the only direct accessor for the
     /// inner string — every call site is greppable and audited.
     pub fn expose(&self) -> &str {
@@ -180,6 +203,28 @@ impl JsonSchema for RedactedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `***` covers the field; registration covers text that echoes the
+    /// credential elsewhere (#1919). `new` is the control.
+    #[test]
+    fn a_library_credential_is_rewritten_inside_text_that_echoes_it() {
+        let unregistered = "ROCKY-LIB-CRED-unregistered-0c6e18b2";
+        let _ = RedactedString::new(unregistered.into());
+        assert_eq!(
+            crate::secret_registry::render_placeholders(unregistered),
+            unregistered,
+            "control: new() does not register"
+        );
+
+        let value = "ROCKY-LIB-CRED-registered-d7a2f945";
+        let cred = RedactedString::secret("ROCKY_LIB_CRED", value.into());
+        assert_eq!(format!("{cred:?}"), "***");
+        assert_eq!(cred.expose(), value);
+        assert_eq!(
+            crate::secret_registry::render_placeholders(&format!("401 for token {value}")),
+            "401 for token ${ROCKY_LIB_CRED}"
+        );
+    }
 
     #[test]
     fn debug_does_not_leak_secret() {

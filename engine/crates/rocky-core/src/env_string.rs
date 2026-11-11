@@ -122,6 +122,50 @@ impl EnvString {
         }))
     }
 
+    /// A secret value that a library user resolved without `rocky.toml`.
+    ///
+    /// For code that builds adapter or config types directly, with no
+    /// `${VAR}` substitution (#1919). It prints as `${name}`, like
+    /// [`EnvString::substituted`], **and** it records the value in the
+    /// [`crate::secret_registry`]. That second step is what
+    /// [`EnvString::substituted`] does not do. Without it, an error that
+    /// echoes the value inside other text (a URL, a driver message) prints
+    /// it, because the renderers that rewrite such text find only
+    /// registered values.
+    ///
+    /// The registry's 8-byte floor applies to the second step only: a
+    /// shorter value still prints as `${name}` here, but is not rewritten
+    /// inside other text.
+    ///
+    /// ```
+    /// use rocky_core::env_string::EnvString;
+    /// use rocky_core::secret_registry::render_placeholders;
+    ///
+    /// let host = EnvString::secret("WAREHOUSE_HOST", "dbc-0f3e91.cloud.example.com");
+    /// assert_eq!(host.to_string(), "${WAREHOUSE_HOST}");
+    /// // Text that echoes the value elsewhere is rewritten too.
+    /// assert_eq!(
+    ///     render_placeholders("cannot reach https://dbc-0f3e91.cloud.example.com/api"),
+    ///     "cannot reach https://${WAREHOUSE_HOST}/api",
+    /// );
+    /// ```
+    pub fn secret(name: &str, value: impl Into<String>) -> Self {
+        let value = value.into();
+        crate::secret_registry::register_substitution(name, &value);
+        Self::substituted(name, value)
+    }
+
+    /// [`EnvString::secret`] for a value read from the environment variable
+    /// `name`, as a `${name}` in `rocky.toml` would read it.
+    ///
+    /// # Errors
+    ///
+    /// The [`std::env::VarError`] from reading `name`: it is unset, or its
+    /// value is not valid Unicode. Nothing is registered then.
+    pub fn from_env(name: &str) -> Result<Self, std::env::VarError> {
+        std::env::var(name).map(|value| Self::secret(name, value))
+    }
+
     /// A string that may hold resolved `${VAR}` values anywhere inside it.
     ///
     /// Every registered value in it prints as its `${NAME}`. A string that
@@ -410,6 +454,44 @@ mod tests {
 
     /// Distinctive, so no other test in this binary registers it.
     const SECRET: &str = "ROCKY-ENVSTRING-TEST-c41e7a09";
+
+    /// A library user builds the field without `rocky.toml` (#1919). The
+    /// value must print as `${NAME}` inside OTHER text too, which only
+    /// registration gives. `substituted` alone is the control: it renders
+    /// its own field but leaves the value in the echoed text.
+    #[test]
+    fn a_library_secret_is_rewritten_inside_text_that_echoes_it() {
+        let unregistered = "ROCKY-LIB-SECRET-unregistered-5b0d2c71";
+        let plain = EnvString::substituted("ROCKY_LIB_UNREG", unregistered);
+        assert_eq!(plain.to_string(), "${ROCKY_LIB_UNREG}");
+        assert_eq!(
+            crate::secret_registry::render_placeholders(&format!("echo {unregistered}")),
+            format!("echo {unregistered}"),
+            "control: substituted() does not register"
+        );
+
+        let value = "ROCKY-LIB-SECRET-registered-9e14a3f6";
+        let field = EnvString::secret("ROCKY_LIB_REG", value);
+        assert_eq!(field.to_string(), "${ROCKY_LIB_REG}");
+        assert_eq!(format!("{field:?}"), "\"${ROCKY_LIB_REG}\"");
+        assert_eq!(field.expose(), value);
+        assert_eq!(
+            crate::secret_registry::render_placeholders(&format!("cannot reach {value}/api")),
+            "cannot reach ${ROCKY_LIB_REG}/api"
+        );
+        // A field parsed later from text holding it renders it too.
+        assert_eq!(
+            EnvString::from_resolved(format!("https://{value}")).to_string(),
+            "https://${ROCKY_LIB_REG}"
+        );
+    }
+
+    #[test]
+    fn a_library_secret_from_an_unset_variable_is_an_error() {
+        let err = EnvString::from_env("ROCKY_TEST_1919_SURELY_UNSET_7f3a")
+            .expect_err("an unset variable has no value");
+        assert_eq!(err, std::env::VarError::NotPresent);
+    }
 
     #[test]
     fn an_extra_map_prints_resolved_values_as_names_and_exposes_plaintext() {
