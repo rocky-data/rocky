@@ -631,7 +631,9 @@ fn compute_model_typecheck(
                 .is_some_and(|edge| edge.transform == rocky_sql::lineage::TransformKind::Direct);
             // A `Direct` column of a model with a set operation reads only
             // the first branch's type, so it is `Unknown` too (#2304).
-            if !direct || mentions_set_operation {
+            // A renamed column's lineage type may be the wrong column's
+            // (#2572).
+            if !direct || mentions_set_operation || renames_columns {
                 col.data_type = RockyType::Unknown;
             }
         }
@@ -673,8 +675,12 @@ fn compute_model_typecheck(
                 // and inference spell an unaliased expression differently
                 // (`CAST(x AS BIGINT)` is `x` to lineage). Lineage's bit
                 // is then unchecked against the relation scope (an outer
-                // join, a subtotal row), so it is not kept as non-null.
+                // join, a subtotal row), so it is not kept as non-null. In
+                // a model that renames columns its type is unchecked too.
                 col.nullable = true;
+                if renames_columns {
+                    col.data_type = RockyType::Unknown;
+                }
                 continue;
             };
             // A `COALESCE` is NULL only when every argument is. Inference
@@ -726,8 +732,12 @@ fn compute_model_typecheck(
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
                     } else if edge.transform == rocky_sql::lineage::TransformKind::Direct {
-                        col.data_type =
-                            reconcile_lineage_type(&col.data_type, inferred_col, exact_type);
+                        col.data_type = reconcile_lineage_type(
+                            &col.data_type,
+                            inferred_col,
+                            exact_type,
+                            renames_columns,
+                        );
                     }
                 }
                 // A nested expression. Step 1 left it `(Unknown, true)`. Take
@@ -757,8 +767,12 @@ fn compute_model_typecheck(
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
                     } else if col.data_type != RockyType::Unknown {
-                        col.data_type =
-                            reconcile_lineage_type(&col.data_type, inferred_col, exact_type);
+                        col.data_type = reconcile_lineage_type(
+                            &col.data_type,
+                            inferred_col,
+                            exact_type,
+                            renames_columns,
+                        );
                     } else if col.data_type == RockyType::Unknown
                         && exact_type
                         && inferred_col.data_type != RockyType::Unknown
@@ -2861,12 +2875,18 @@ fn infer_aggregation_type(
 /// from the source column that has the new name (#2572). Inference applies
 /// the rename. When inference knows a different type, it wins if it reads
 /// it straight from the SQL, else neither is claimed.
+///
+/// In a model that renames columns, lineage's type is kept only when
+/// inference agrees: an `Unknown` there does not confirm it.
 fn reconcile_lineage_type(
     lineage: &RockyType,
     inferred: &TypedColumn,
     inferred_exact: bool,
+    renames_columns: bool,
 ) -> RockyType {
-    if inferred.data_type == RockyType::Unknown || inferred.data_type == *lineage {
+    if inferred.data_type == *lineage
+        || (inferred.data_type == RockyType::Unknown && !renames_columns)
+    {
         lineage.clone()
     } else if inferred_exact {
         inferred.data_type.clone()
@@ -6250,6 +6270,15 @@ mod tests {
         ];
         let tables = [("t", cols), ("u", cols)];
         let mut wrong = Vec::new();
+        let x_type = |sql: &str, tables: &[(&str, Cols)]| {
+            let rows = typecheck_over(sql, tables);
+            rows.iter()
+                .find(|(name, _, _)| name == "x")
+                .map(|(_, ty, _)| ty.clone())
+                .unwrap_or_else(|| panic!("no column x: {sql}: {rows:?}"))
+        };
+        // Inference reads the renamed column exactly: its type is the
+        // column it reads.
         for sql in [
             "SELECT x FROM u AS q(x, y, n)",
             "SELECT q.x FROM u AS q(x, y, n)",
@@ -6257,10 +6286,31 @@ mod tests {
             "SELECT x FROM (SELECT n, y FROM t) AS d(x, w)",
             "SELECT MAX(x) AS x FROM u AS q(x, y, n)",
         ] {
-            let rows = typecheck_over(sql, &tables);
-            let x = rows.iter().find(|(name, _, _)| name == "x");
-            if !matches!(x, Some((_, RockyType::String | RockyType::Unknown, _))) {
-                wrong.push(format!("{sql}: {rows:?}"));
+            let ty = x_type(sql, &tables);
+            if ty != RockyType::String {
+                wrong.push(format!("{sql}: {ty:?}"));
+            }
+        }
+        // Rocky cannot tell the renamed column's type: it is untyped, never
+        // the type of the source column that has the new name.
+        let untyped: Cols = &[
+            ("n", RockyType::Unknown, true),
+            ("y", RockyType::Int32, false),
+            ("x", RockyType::Int32, false),
+        ];
+        let with_untyped = [("t", cols), ("u", cols), ("uu", untyped)];
+        for sql in [
+            "WITH c(x, w) AS (SELECT some_fn(n), x FROM t) SELECT x FROM c",
+            "SELECT x FROM uu AS q(x, y, n)",
+            "SELECT MAX(x) AS x FROM uu AS q(x, y, n)",
+            // Inference fails on the `VALUES` CTE.
+            "WITH v(k) AS (VALUES (1)) SELECT x FROM u AS q(x, y, n)",
+            // Lineage names this `x`; inference names it `max`.
+            "SELECT MAX(x) FROM u AS q(x, y, n)",
+        ] {
+            let ty = x_type(sql, &with_untyped);
+            if ty != RockyType::Unknown {
+                wrong.push(format!("{sql}: {ty:?}"));
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
