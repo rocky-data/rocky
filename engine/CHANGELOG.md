@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[pipeline.<name>.source.discovery.sync]` now works on an Airbyte discovery adapter, not only on Fivetran. `wait = true` waits for a running Airbyte job before `rocky run` reads the source. `trigger = true` starts one sync first, with `POST /v1/jobs` and `jobType = "sync"`, never a reset. It needs the same two opt-ins as Fivetran: `allow_sync_trigger = true` on `[adapter.<name>]` and `trigger = true` on the pipeline. Without the adapter's opt-in the Airbyte adapter sends no request. Each poll reads the connection list and the 25 newest jobs of each selected connection. A connection is syncing while any of those jobs has not ended, a reset included. `succeeded_at` and `failed_at` are the latest `lastUpdatedAt` of a `sync` job that succeeded, or that failed or was cancelled. An `inactive` connection counts as paused, and a `deprecated` one is left out. A `409` (a sync already runs) is waited out and not counted, as on Fivetran. `rocky validate` now accepts `wait = true` on `type = "airbyte"`, and refuses `trigger = true` there without `allow_sync_trigger = true`. New page: the Airbyte adapter reference.
+
 ### Fixed
 
 - `IFNULL(a, b)` and `NVL(a, b)` now get the type and the nullable bit of `COALESCE(a, b)`. Before, they were untyped and nullable, so `IFNULL(b, 0)` failed a `nullable = false` contract with `E012`. An `IFNULL` or `NVL` with one or three arguments stays untyped and nullable.

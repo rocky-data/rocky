@@ -4090,6 +4090,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]

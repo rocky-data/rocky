@@ -242,7 +242,7 @@ pub trait DiscoveryAdapter: Send + Sync {
     ///
     /// Default: [`SourceSyncTriggerError::Unsupported`]. An adapter that
     /// implements it must also refuse unless its owner opted in (the Fivetran
-    /// adapter checks `allow_sync_trigger`), because `rocky validate` is only
+    /// and Airbyte adapters check `allow_sync_trigger`), because `rocky validate` is only
     /// one funnel into this call. `rocky run` calls it for
     /// `[...discovery.sync] trigger = true`.
     ///

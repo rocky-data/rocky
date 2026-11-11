@@ -151,6 +151,105 @@ pub struct StreamConfiguration {
     pub cursor_field: Option<Vec<String>>,
 }
 
+/// One page of `GET /v1/jobs`. Only the first page is read: the newest jobs
+/// are all the sync state needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobsListResponse {
+    pub data: Vec<Job>,
+}
+
+/// An Airbyte job (one sync or reset of one connection).
+///
+/// `status` and `job_type` stay strings, so a value Airbyte adds later does
+/// not fail the whole read. [`job_is_running`] treats an unknown status as
+/// running, the safe side for a wait. The times stay strings too: see
+/// [`parse_job_time`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Job {
+    pub job_id: i64,
+    pub status: String,
+    pub job_type: String,
+    #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub last_updated_at: Option<String>,
+}
+
+/// `true` unless the job has ended. Airbyte's ended states are `succeeded`,
+/// `failed` and `cancelled`. `pending`, `running` and `incomplete` (an attempt
+/// failed and Airbyte will try again) are running. A status this code does not
+/// know is also taken as running: the wait then lasts longer, but it never
+/// reads while a job may still write.
+pub fn job_is_running(job: &Job) -> bool {
+    !matches!(job.status.as_str(), "succeeded" | "failed" | "cancelled")
+}
+
+/// Parse a job time (`startTime`, `lastUpdatedAt`).
+///
+/// # Errors
+///
+/// Airbyte sends RFC 3339 (`2026-10-21T10:00:00Z`), but the API spec names no
+/// format. A value that is not RFC 3339 is an error, never a guess: a wrong
+/// time could make an old sync look like a new one.
+pub fn parse_job_time(raw: &str) -> Result<DateTime<Utc>, AirbyteError> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| {
+            AirbyteError::UnexpectedResponse(format!("job time {raw:?} is not RFC 3339: {e}"))
+        })
+}
+
+/// Why [`AirbyteClient::post_sync_job`] did not start a sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncRequestError {
+    /// HTTP 403: the token cannot start jobs. Holds the response body.
+    Forbidden(String),
+    /// The request was refused or could not be sent. No sync started.
+    Failed(String),
+    /// HTTP 409: Airbyte says the connection is busy (a sync already runs).
+    Conflict(String),
+    /// The request may have reached Airbyte (a timeout, a 5xx, a connection
+    /// lost mid-request). A sync may have started.
+    Unknown(String),
+}
+
+/// Longest response body kept in an error text.
+const MAX_ERROR_BODY_BYTES: usize = 512;
+
+/// Cut a response body for an error text, and render any resolved secret as
+/// its `${NAME}` placeholder.
+fn error_body(body: &str) -> String {
+    let body = rocky_core::secret_registry::render_placeholders(body);
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body;
+    }
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &body[..end])
+}
+
+/// The server's clock from a response's `Date` header (`None` when absent or
+/// unparseable). HTTP servers send the IMF-fixdate form
+/// (`Wed, 21 Oct 2026 10:00:00 GMT`), which RFC 2822 parsing accepts.
+fn parse_date_header(resp: &reqwest::Response) -> Option<DateTime<Utc>> {
+    let raw = resp.headers().get(reqwest::header::DATE)?.to_str().ok()?;
+    parse_date_value(raw)
+}
+
+fn parse_date_value(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(raw.trim())
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// How many of a connection's newest jobs one status read fetches.
+pub const JOBS_PAGE_LIMIT: u32 = 25;
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -160,6 +259,8 @@ pub struct StreamConfiguration {
 /// Targets the Airbyte Configuration API v1:
 /// - `GET /v1/connections` -- list all connections
 /// - `GET /v1/connections/{connectionId}` -- get a single connection
+/// - `GET /v1/jobs?connectionId=...` -- the newest jobs of one connection
+/// - `POST /v1/jobs` with `jobType = "sync"` -- start one sync
 pub struct AirbyteClient {
     client: Client,
     base_url: String,
@@ -186,6 +287,13 @@ impl AirbyteClient {
             auth_token: auth_token.map(RedactedString::new),
             retry,
         }
+    }
+
+    /// Swap the HTTP client, so a test can set short timeouts.
+    #[cfg(test)]
+    pub(crate) fn with_http_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// List all connections visible to the authenticated user.
@@ -231,8 +339,148 @@ impl AirbyteClient {
         self.get(&url).await
     }
 
+    /// The newest jobs of one connection, of every type, newest first
+    /// (`GET /v1/jobs?connectionId=<id>&limit=<n>&orderBy=createdAt|DESC`),
+    /// plus the `Date` header of the answer.
+    ///
+    /// Every job type is read, not only `sync`: a reset or clear job also
+    /// writes to the destination, so a caller that waits must see it running.
+    /// The connection id is percent-encoded into the query string.
+    pub async fn list_connection_jobs(
+        &self,
+        connection_id: &str,
+    ) -> Result<(Vec<Job>, Option<DateTime<Utc>>), AirbyteError> {
+        let url = format!(
+            "{}/v1/jobs?connectionId={}&limit={JOBS_PAGE_LIMIT}&orderBy=createdAt%7CDESC",
+            self.base_url,
+            encode_path_segment(connection_id)
+        );
+        let (resp, date): (JobsListResponse, _) = self.get_dated(&url).await?;
+        Ok((resp.data, date))
+    }
+
+    /// Ask Airbyte to start one sync on a connection: `POST /v1/jobs` with
+    /// `{"connectionId": "<id>", "jobType": "sync"}`.
+    ///
+    /// Always a `sync` job, never a `reset` or clear job. At most one request
+    /// reaches Airbyte for each call:
+    ///
+    /// - A connect error or a 429 means the request was not taken, so those
+    ///   retry (within the retry policy).
+    /// - A timeout, a 5xx or a connection lost mid-request may mean the job
+    ///   started, so those do not retry. They return
+    ///   [`SyncRequestError::Unknown`].
+    /// - A 403 returns [`SyncRequestError::Forbidden`].
+    /// - A 409 returns [`SyncRequestError::Conflict`]: a sync already runs.
+    ///
+    /// `Ok` carries the `Date` header of the accepting answer.
+    pub async fn post_sync_job(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, SyncRequestError> {
+        let url = format!("{}/v1/jobs", self.base_url);
+        let body = serde_json::json!({ "connectionId": connection_id, "jobType": "sync" });
+        for attempt in 0..=self.retry.max_retries {
+            debug!(connection_id, attempt, "POST sync job");
+            let mut req = self.client.post(&url).json(&body);
+            if let Some(token) = &self.auth_token {
+                req = req.bearer_auth(token.expose());
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) if e.is_connect() && attempt < self.retry.max_retries => {
+                    let backoff = retry_backoff(&self.retry, attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %AirbyteError::from(e),
+                        "could not connect for the sync request, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                Err(e) if e.is_timeout() => {
+                    return Err(SyncRequestError::Unknown(format!(
+                        "no answer to the sync request: {}",
+                        AirbyteError::from(e)
+                    )));
+                }
+                // A connect error means the request never went out. Any other
+                // send error (a connection lost mid-request) may have reached
+                // Airbyte.
+                Err(e) if e.is_connect() => {
+                    return Err(SyncRequestError::Failed(AirbyteError::from(e).to_string()));
+                }
+                Err(e) => {
+                    return Err(SyncRequestError::Unknown(format!(
+                        "no answer to the sync request: {}",
+                        AirbyteError::from(e)
+                    )));
+                }
+            };
+
+            let status = resp.status();
+            let server_date = parse_date_header(&resp);
+            if status == 429 {
+                if attempt < self.retry.max_retries {
+                    let backoff = retry_backoff(&self.retry, attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "rate limited on the sync request, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(SyncRequestError::Failed(
+                    AirbyteError::RateLimited.to_string(),
+                ));
+            }
+            let text = resp.text().await.unwrap_or_default();
+            if status == 403 {
+                return Err(SyncRequestError::Forbidden(error_body(&text)));
+            }
+            if status.is_server_error() {
+                return Err(SyncRequestError::Unknown(format!(
+                    "HTTP {status} to the sync request: {}",
+                    error_body(&text)
+                )));
+            }
+            if status == 409 {
+                return Err(SyncRequestError::Conflict(format!(
+                    "HTTP 409 to the sync request: {}",
+                    error_body(&text)
+                )));
+            }
+            if !status.is_success() {
+                return Err(SyncRequestError::Failed(format!(
+                    "HTTP {status} to the sync request: {}",
+                    error_body(&text)
+                )));
+            }
+            match serde_json::from_str::<Job>(&text) {
+                Ok(job) => debug!(
+                    connection_id,
+                    job_id = job.job_id,
+                    "Airbyte started a sync job"
+                ),
+                Err(e) => debug!(connection_id, error = %e, "sync job accepted; body not parsed"),
+            }
+            return Ok(server_date);
+        }
+        unreachable!("retry loop should always return")
+    }
+
     /// Internal GET with retry on transient errors.
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, AirbyteError> {
+        Ok(self.get_dated(url).await?.0)
+    }
+
+    /// [`Self::get`], plus the `Date` header of the answer.
+    async fn get_dated<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<(T, Option<DateTime<Utc>>), AirbyteError> {
         for attempt in 0..=self.retry.max_retries {
             debug!(url, attempt, "GET");
 
@@ -295,9 +543,11 @@ impl AirbyteClient {
                 });
             }
 
-            return resp.json().await.map_err(|e| {
+            let date = parse_date_header(&resp);
+            let value = resp.json().await.map_err(|e| {
                 AirbyteError::UnexpectedResponse(format!("failed to parse response: {e}"))
-            });
+            })?;
+            return Ok((value, date));
         }
 
         unreachable!("retry loop should always return")

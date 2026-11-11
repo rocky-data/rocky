@@ -642,7 +642,10 @@ impl AdapterRegistry {
                     let client =
                         AirbyteClient::with_retry(api_url, auth_token, adapter_cfg.retry.clone());
 
-                    let adapter = Arc::new(AirbyteDiscoveryAdapter::new(client));
+                    let adapter = Arc::new(
+                        AirbyteDiscoveryAdapter::new(client)
+                            .with_sync_trigger_allowed(adapter_cfg.allow_sync_trigger),
+                    );
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "iceberg" => {

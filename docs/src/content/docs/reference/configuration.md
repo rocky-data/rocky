@@ -225,13 +225,13 @@ The connection fields, authentication, and examples for each adapter type live o
 - [ClickHouse](/reference/adapters/clickhouse/) (Beta) — HTTP interface with user/password and TLS, plus table engine and sort keys
 - [Spark](/reference/adapters/spark/) (Beta) — Spark Connect with an optional bearer token, on Delta Lake or Iceberg tables
 - [Fivetran](/reference/adapters/fivetran/) — metadata-only source discovery
+- [Airbyte](/reference/adapters/airbyte/) — metadata-only source discovery
 
-Three types have no page yet. They read these top-level fields:
+Two types have no page yet. They read these top-level fields:
 
 | `type` | Role | Fields |
 |--------|------|--------|
 | `"trino"` | Warehouse | `host` (coordinator URL, required). `token` for JWT bearer auth, else `username` + `password` for Basic auth. `username` also names the Trino user. `database` sets the default catalog. `timeout_secs` defaults to `300`. |
-| `"airbyte"` | Discovery | `host` (Airbyte API URL, required). `token` (optional bearer token). |
 | `"iceberg"` | Discovery | `host` (REST catalog URL, required). `token` (optional bearer token). |
 
 
@@ -364,13 +364,13 @@ Use a different adapter to list schemas and tables than the one that reads the r
 | `adapter` | string | Yes | — | Adapter name to use for discovery. |
 | `report_new_sources` | bool | No | `false` | Diff the discovered source inventory against the prior persisted snapshot and report first-seen schemas in the discover output's `new_sources`. The first discover of a pipeline records the baseline and reports nothing. Off by default — the diff and its state write only happen when opted in. |
 | `on_collision` | `"off"` \| `"warn"` \| `"error"` | No | `"off"` | Cross-source collision detection. When the same external object (e.g. an ad account) is onboarded under two schemas, its data lands in two target tables and silently doubles any downstream `UNION ALL`. `warn` reports the pairs in the discover output's `collision_candidates` and emits a `source_collision_detected` event; `error` additionally fails the discover so a colliding onboard can't silently create a catalog. `off` (default) skips detection entirely. Only adapters that resolve external object ids (e.g. Fivetran) participate; others contribute nothing. |
-| `sync` | table | No | absent | `[pipeline.NAME.source.discovery.sync]`. Wait for a running source sync before `rocky run` reads the source, and optionally start one. Fivetran only. See the keys below. |
+| `sync` | table | No | absent | `[pipeline.NAME.source.discovery.sync]`. Wait for a running source sync before `rocky run` reads the source, and optionally start one. Fivetran and Airbyte only. See the keys below. |
 
 See [Cross-source duplicate detection](#cross-source-duplicate-detection) for the counterpart that runs during replication rather than at discovery.
 
 #### `[pipeline.NAME.source.discovery.sync]`
 
-Waits for a running source sync to finish before the run starts. With `wait` alone Rocky sends `GET` requests only. With `trigger` as well, and `allow_sync_trigger = true` on the adapter, it starts one sync per connector first. See [Fivetran adapter](/reference/adapters/fivetran/#wait-for-a-running-sync) for the full behaviour.
+Waits for a running source sync to finish before the run starts. With `wait` alone Rocky sends `GET` requests only. With `trigger` as well, and `allow_sync_trigger = true` on the adapter, it starts one sync per connector first. It works on a `fivetran` or `airbyte` discovery adapter. `rocky validate` refuses `wait = true` on any other known type. See [Fivetran adapter](/reference/adapters/fivetran/#wait-for-a-running-sync) for the full behaviour, and [Airbyte adapter](/reference/adapters/airbyte/#wait-for-a-running-sync) for what differs on Airbyte.
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
