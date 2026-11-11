@@ -175,7 +175,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::fulfill::FulfillState;
 use crate::product::lowering::{
-    Lowering, contract_rel, lower_phase_a, lower_phase_b, manifest_rel, sidecar_rel, sql_rel,
+    Lowering, VolumeLowering, contract_rel, lower_phase_a, lower_phase_b, manifest_rel,
+    sidecar_rel, sql_rel,
     state_dir_rel,
 };
 use crate::product::manifest::{
@@ -1909,18 +1910,23 @@ pub fn run_phase_a(
 /// `phase-a-tampered` when a lowered artifact's bytes drifted from the
 /// committed manifest, `sidecar-missing` before drafting, plus anything
 /// [`lower_phase_b`] or [`commit_generation`] refuses.
+///
+/// `volume_lowering` is passed through to [`lower_phase_b`]: whether the
+/// output's volume range lowers to a whole-table test.
 pub fn run_phase_b(
     project_root: &Path,
     spec_path: &str,
     parsed: &ParsedSpec,
+    volume_lowering: VolumeLowering,
 ) -> SpecResult<Lowering> {
-    run_phase_b_with_ops(project_root, spec_path, parsed, None)
+    run_phase_b_with_ops(project_root, spec_path, parsed, volume_lowering, None)
 }
 
 fn run_phase_b_with_ops(
     project_root: &Path,
     spec_path: &str,
     parsed: &ParsedSpec,
+    volume_lowering: VolumeLowering,
     ops: Option<CommitOps<'_>>,
 ) -> SpecResult<Lowering> {
     recover_generation(project_root, parsed)?;
@@ -1971,7 +1977,13 @@ fn run_phase_b_with_ops(
             &std::io::Error::new(std::io::ErrorKind::InvalidData, err),
         )
     })?;
-    let lowering = lower_phase_b(parsed, spec_path, &sidecar_text, &committed)?;
+    let lowering = lower_phase_b(
+        parsed,
+        spec_path,
+        &sidecar_text,
+        &committed,
+        volume_lowering,
+    )?;
     commit_generation_with_ops(project_root, parsed, &lowering, ops)?;
     Ok(lowering)
 }
@@ -2294,7 +2306,7 @@ mod tests {
             &project.join("models/revenue_daily.toml"),
             DRAFTED_SIDECAR.as_bytes(),
         );
-        run_phase_b(project, SPEC_PATH, parsed).expect("phase B");
+        run_phase_b(project, SPEC_PATH, parsed, VolumeLowering::TotalRowsTest).expect("phase B");
     }
 
     fn project_with_phase_a_and_draft(root: &Path, parsed: &ParsedSpec) -> PathBuf {
@@ -2477,6 +2489,7 @@ mod tests {
             project,
             SPEC_PATH,
             parsed,
+            VolumeLowering::TotalRowsTest,
             Some(CommitOps {
                 rename: Box::new(rename),
                 remove: Box::new(remove),
@@ -2515,7 +2528,7 @@ mod tests {
     fn phase_b_requires_phase_a() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = seeded_project(dir.path());
-        let error = run_phase_b(&project, SPEC_PATH, &parsed_d3()).expect_err("no phase A");
+        let error = run_phase_b(&project, SPEC_PATH, &parsed_d3(), VolumeLowering::TotalRowsTest).expect_err("no phase A");
         assert_eq!(error.code, "phase-a-missing");
     }
 
@@ -2525,7 +2538,7 @@ mod tests {
         let project = seeded_project(dir.path());
         let parsed = parsed_d3();
         run_phase_a(&project, SPEC_PATH, &parsed).expect("phase A");
-        let error = run_phase_b(&project, SPEC_PATH, &parsed).expect_err("no sidecar");
+        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect_err("no sidecar");
         assert_eq!(error.code, "sidecar-missing");
     }
 
@@ -2546,7 +2559,7 @@ mod tests {
             );
         let edited = parse_spec_bytes(edited_text.as_bytes(), SPEC_PATH).expect("valid");
         assert_ne!(edited.digest, parsed.digest);
-        let error = run_phase_b(&project, SPEC_PATH, &edited).expect_err("superseded");
+        let error = run_phase_b(&project, SPEC_PATH, &edited, VolumeLowering::TotalRowsTest).expect_err("superseded");
         assert_eq!(error.code, "spec-superseded");
         assert!(error.message.contains(&parsed.digest), "{error}");
         assert!(error.message.contains(&edited.digest), "{error}");
@@ -2568,7 +2581,7 @@ mod tests {
             &project.join("models/revenue_daily.toml"),
             DRAFTED_SIDECAR.as_bytes(),
         );
-        let error = run_phase_b(&project, SPEC_PATH, &parsed).expect_err("foreign");
+        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect_err("foreign");
         assert_eq!(error.code, "phase-a-identity-mismatch");
         assert!(error.message.contains("spec_path"), "{error}");
     }
@@ -2590,7 +2603,7 @@ mod tests {
             &project.join("models/revenue_daily.toml"),
             DRAFTED_SIDECAR.as_bytes(),
         );
-        let error = run_phase_b(&project, SPEC_PATH, &parsed).expect_err("tampered");
+        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect_err("tampered");
         assert_eq!(error.code, "phase-a-tampered");
     }
 
@@ -2654,7 +2667,7 @@ mod tests {
 
         // Round-trip: the next Phase B re-merges and re-records the
         // sidecar hash transactionally.
-        run_phase_b(&project, SPEC_PATH, &parsed).expect("phase B re-commits");
+        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect("phase B re-commits");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
         assert_eq!(leftovers(&project), Vec::<String>::new());
     }
@@ -2993,7 +3006,7 @@ mod tests {
             RecoveryAction::None
         );
         assert_eq!(without_orphans(snapshot(&project)), before);
-        run_phase_b(&project, SPEC_PATH, &parsed).expect("restages cleanly");
+        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect("restages cleanly");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
     }
 
@@ -3141,6 +3154,7 @@ mod tests {
             &project,
             SPEC_PATH,
             &parsed,
+            VolumeLowering::TotalRowsTest,
             Some(CommitOps {
                 rename: Box::new(rename),
                 remove: Box::new(remove),
@@ -3166,7 +3180,7 @@ mod tests {
         let project = project_with_phase_a_and_draft(dir.path(), &parsed);
         phase_b_with_rename_bomb(&project, &parsed, 3);
 
-        run_phase_b(&project, SPEC_PATH, &parsed).expect("recovers then commits");
+        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect("recovers then commits");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
         assert!(!journal_path(&project, "revenue_daily").exists());
     }
@@ -3369,7 +3383,7 @@ mod tests {
         std::fs::remove_file(&sidecar).expect("remove drafted sidecar");
         std::os::unix::fs::symlink(&secret, &sidecar).expect("symlink");
 
-        let error = run_phase_b(&project, SPEC_PATH, &parsed)
+        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest)
             .expect_err("a symlinked sidecar must be refused");
         assert_eq!(
             error.code, "commit-io",
@@ -5169,6 +5183,7 @@ mod tests {
             Path::new(&project),
             SPEC_PATH,
             &parsed,
+            VolumeLowering::TotalRowsTest,
             Some(CommitOps {
                 rename: Box::new(rename),
                 remove: Box::new(remove),

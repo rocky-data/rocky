@@ -3235,10 +3235,15 @@ pub struct ModelExecution {
     pub stored_bytes: Option<StoredBytes>,
 
     // --- Volume count (no schema bump) -------------------------------------
-    /// The output table's total rows (`SELECT COUNT(*)`), counted right
-    /// after a production build of a product output that declares
-    /// `[product.output.volume]`. Not [`Self::rows_affected`], which is the
-    /// rows this execution wrote.
+    /// The row count the product volume check judged, taken right after a
+    /// production build of a product output that declares
+    /// `[product.output.volume]`. Its basis follows the output's strategy:
+    /// the table's total rows for a full-refresh output, the rows the run
+    /// added for an incremental one, the rows its MERGE touched for a merge
+    /// one, and the rows in the partitions it wrote for a time-interval one
+    /// (recorded on the last partition's execution). Records written before
+    /// that change are always total rows. Not [`Self::rows_affected`], which
+    /// is the rows the adapter reported for a replication copy.
     ///
     /// `None` when nothing was counted: no volume declared, a shadow or
     /// branch run, a count that failed, or a record written before this

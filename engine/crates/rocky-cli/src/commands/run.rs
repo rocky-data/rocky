@@ -1804,6 +1804,10 @@ pub(crate) struct ExecutionContext<'a> {
     /// a production run, false on a shadow, branch or backfill run. See
     /// [`super::run_upstream_reads`].
     pub record_upstream_reads: bool,
+    /// The `[product.output.volume]` ranges this run checks. A model whose
+    /// range counts the rows a run adds takes a row count before its write.
+    /// `None` (tests, and paths that check no range) takes none.
+    pub product_volumes: Option<&'a super::run_volume::ProductVolumes>,
 }
 
 /// The first-run fills a governed plan recorded; see
@@ -14302,6 +14306,7 @@ async fn execute_models_phase(
             shadow_config,
             model_set,
         ),
+        product_volumes: Some(&product_volumes),
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -15211,6 +15216,7 @@ async fn execute_models_phase(
                         );
                         output.materializations.push(MaterializationOutput {
                             volume: None,
+                            write_evidence: None,
                             upstream_reads: None,
                             asset_key,
                             notes: vec![],
@@ -15482,6 +15488,9 @@ async fn execute_models_phase(
                 model.config.strategy,
                 rocky_core::models::StrategyConfig::TimeInterval { .. }
             ) {
+                // The partitions this run writes are pushed from here on; the
+                // volume check below counts exactly those.
+                let first_partition = output.materializations.len();
                 let time_interval_res = execute_time_interval_model(
                     model,
                     warehouse,
@@ -15525,6 +15534,44 @@ async fn execute_models_phase(
                         record_contained_cause(output, &mut containment, model_name, &e);
                         continue;
                     }
+                    output.fail_fast_model = Some(model_name.to_string());
+                    return Err(e);
+                }
+                // The product volume check over the partitions this run
+                // wrote. A cancelled run is `not_evaluated`. An `error`
+                // breach fails the model after its writes, as on the plain
+                // path: `model_error` fires, the success hook does not, and
+                // downstream is withheld (contained) or the run stops. The
+                // written partitions keep their `Computed` state: their rows
+                // are in the table.
+                if let Some(e) = super::run_volume::check_partition_volume(
+                    &product_volumes,
+                    warehouse,
+                    dialect,
+                    model,
+                    output,
+                    first_partition,
+                    cancel,
+                )
+                .await
+                {
+                    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                        let _ = reg
+                            .fire(&HookContext::model_error(
+                                run_id,
+                                pipe,
+                                model_name,
+                                &format!("{e:#}"),
+                            ))
+                            .await;
+                    }
+                    models_executed += 1;
+                    if resilience.contain_failures {
+                        record_contained_cause(output, &mut containment, model_name, &e);
+                        continue;
+                    }
+                    // The failed partition materializations are this model's
+                    // records (#2470).
                     output.fail_fast_model = Some(model_name.to_string());
                     return Err(e);
                 }
@@ -16404,7 +16451,7 @@ fn resolve_read_set_content_upstreams(
 /// Map a `MaterializationStrategy` (post-`to_plan()`) onto the string used
 /// in `MaterializationMetadata.strategy`. Mirrors the names used elsewhere
 /// in `run.rs` (replication path lines ~4024-4076).
-fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static str {
+pub(crate) fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static str {
     match strategy {
         MaterializationStrategy::FullRefresh => "full_refresh",
         MaterializationStrategy::Incremental { .. } => "incremental",
@@ -16984,6 +17031,9 @@ async fn execute_one_plain_model(
         rocky_ir::MaterializationStrategy::Merge { .. }
     );
     let mut skip_strategy_exec = false;
+    // This build created the target (first-run bootstrap): every row in it
+    // is this build's, which the volume check reads.
+    let mut bootstrapped = false;
     if strategy_mutates_existing_target {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
@@ -17070,8 +17120,44 @@ async fn execute_one_plain_model(
                 }
             }
             skip_strategy_exec = bootstrap_is_the_load;
+            bootstrapped = true;
         }
     }
+
+    // A product range on the rows this build adds needs the table's count
+    // before the write. Taken only for such a model, and only when the
+    // build appends to a table that already holds rows from earlier runs.
+    // A failed count is kept as the reason the check is not evaluated; it
+    // never fails the build.
+    let created_or_replaced = bootstrapped
+        || matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::FullRefresh
+        );
+    let declared_basis = rocky_core::product::spec::VolumeBasis::of(
+        &recipe_ir.as_ref().unwrap_or(&model_ir).materialization,
+    );
+    let rows_before = if !created_or_replaced
+        && declared_basis == Some(rocky_core::product::spec::VolumeBasis::RowsAdded)
+        && exec_ctx
+            .product_volumes
+            .is_some_and(|volumes| volumes.declares(model_name))
+    {
+        Some(
+            super::run_volume::count_rows(
+                warehouse,
+                &[
+                    model_ir.target.catalog.clone(),
+                    model_ir.target.schema.clone(),
+                    model_ir.target.table.clone(),
+                ],
+                None,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     // An incremental run against an existing target must have been planned
     // by `run_incremental::prepare` (column check, named INSERT). If that
@@ -17100,7 +17186,12 @@ async fn execute_one_plain_model(
     // same `bytes_scanned` / `bytes_written` shape that replication
     // tables already have. Skipped on a first-run bootstrap that already
     // loaded the data via CTAS (Incremental / DeleteInsert / Microbatch).
+    //
+    // The rows the warehouse reports the strategy statements changed,
+    // summed; None once any statement does not report.
+    let mut rows_reported: Option<u64> = None;
     if !skip_strategy_exec {
+        rows_reported = Some(0);
         let mut atomic_create_done = false;
         if let Some((drop_sql, _, _)) = &pending_drop {
             if exec_stmts.len() != 1 {
@@ -17152,6 +17243,9 @@ async fn execute_one_plain_model(
                 Ok(stats) => {
                     bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                     bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                    rows_reported = rows_reported
+                        .zip(stats.rows_affected)
+                        .map(|(sum, rows)| sum.saturating_add(rows));
                     if let Some(jid) = stats.job_id {
                         job_ids_acc.push(jid);
                     }
@@ -17247,6 +17341,11 @@ async fn execute_one_plain_model(
     let upstream_reads = reads_acc.finish(&model_ir.target, warehouse.default_catalog().as_deref());
     Ok(MaterializationOutput {
         volume: None,
+        write_evidence: Some(crate::output::WriteEvidence {
+            created_or_replaced,
+            rows_before,
+            rows_reported,
+        }),
         upstream_reads,
         asset_key,
         notes: pending_drop
@@ -17532,6 +17631,7 @@ async fn execute_snapshot_model(
     .await;
     Ok(MaterializationOutput {
         volume: None,
+        write_evidence: None,
         asset_key: vec![
             model_ir.target.catalog.clone(),
             model_ir.target.schema.clone(),
@@ -18208,6 +18308,7 @@ async fn run_one_partition(
         duration_ms: record.duration_ms,
         outcome: Ok(Some(MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.to_vec(),
             notes: vec![],
             attempts: Vec::new(),
@@ -19902,6 +20003,7 @@ async fn process_table(
         probe_rate_limited,
         materialization: MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.clone(),
             notes,
             attempts: Vec::new(),
@@ -26626,6 +26728,7 @@ auto_create_schemas = true
     ) -> crate::output::MaterializationOutput {
         crate::output::MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),
@@ -26975,6 +27078,7 @@ auto_create_schemas = true
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -27000,6 +27104,7 @@ auto_create_schemas = true
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30636,6 +30741,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30721,6 +30827,7 @@ email = "pii"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30890,6 +30997,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31022,6 +31130,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31104,6 +31213,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: true,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31163,6 +31273,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31325,6 +31436,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31455,6 +31567,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31573,6 +31686,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31645,6 +31759,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31770,6 +31885,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31885,6 +32001,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31994,6 +32111,7 @@ table = "fct_daily"
         let recorded = std::collections::BTreeSet::from(["fct_daily_orders".to_string()]);
         let ctx = |models| super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: Some(super::ReviewedFirstRunFills {
                 plan_id: "plan-x",
                 models,
@@ -32232,6 +32350,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -32356,6 +32475,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -32457,6 +32577,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -39283,6 +39404,7 @@ backend = "local"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -48591,6 +48713,7 @@ auto_create_schemas = true
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -48739,6 +48862,7 @@ auto_create_schemas = true
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,

@@ -1514,9 +1514,19 @@ pub struct MaterializationOutput {
     pub stored_bytes: Option<rocky_core::state::StoredBytes>,
     /// The product volume check on this output, when a product declares
     /// `[product.output.volume]` for the model and this was a production
-    /// build. Absent otherwise.
+    /// build. Absent otherwise. A `time_interval` model carries it on the
+    /// last partition this run wrote; it judges all of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<VolumeCheckOutput>,
+    /// State-internal facts about this build's write that the volume check
+    /// needs (the count before the write, the rows the warehouse reported).
+    /// Set by the plain transformation path; `None` everywhere else.
+    ///
+    /// Never serialized and never part of the JSON schema — same pattern as
+    /// [`Self::stored_bytes`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub write_evidence: Option<WriteEvidence>,
     /// What this build read from each upstream table, measured from the
     /// DuckDB query profile. Each read carries the rows scanned, the columns
     /// read and an estimated byte count (`est_bytes`, fixed-width columns
@@ -1532,19 +1542,44 @@ pub struct MaterializationOutput {
     pub upstream_reads: Option<rocky_core::state::UpstreamReads>,
 }
 
+/// What one build's write left behind for the product volume check, taken
+/// by the plain transformation path. State-internal: never serialized.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteEvidence {
+    /// The build created the table or replaced all of it (a first-run
+    /// bootstrap, `--full-refresh`, a full-refresh strategy), so every row
+    /// in it is this build's.
+    pub created_or_replaced: bool,
+    /// `SELECT COUNT(*)` on the table right before the write, taken only
+    /// when a `rows_added` volume needs it. `Err` is why the count failed.
+    pub rows_before: Option<Result<u64, String>>,
+    /// The rows the warehouse reported the strategy statements changed,
+    /// summed. `None` when no statement ran or any one did not report.
+    pub rows_reported: Option<u64>,
+}
+
 /// The row count `rocky run` took on a product output after its build,
 /// judged against the product's `[product.output.volume]`.
 ///
-/// The count is the table's total rows (`SELECT COUNT(*)`), not the rows
-/// this load wrote. Only a full-refresh output is counted.
+/// What is counted depends on the output model's strategy; `basis` says
+/// which (`total_rows`, `rows_added`, `rows_touched`, `partition_rows`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VolumeCheckOutput {
     /// The product that declares the range.
     pub product: String,
     /// The Rocky model counted: the product's output model.
     pub model: String,
-    /// The table's total rows after the build. Absent when no count was
-    /// taken or it could not be read (`verdict = "not_evaluated"`).
+    /// What `row_count` counts: `total_rows` (the whole table, for a
+    /// full-refresh output), `rows_added` (the rows this run appended,
+    /// for an incremental output), `rows_touched` (the rows this run's
+    /// MERGE inserted or updated, for a merge output or an incremental one
+    /// with a `unique_key`), or `partition_rows` (the rows in the
+    /// partitions this run wrote, for a time-interval output). Absent when
+    /// the strategy is not counted (`volume-strategy-unsupported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<rocky_core::product::spec::VolumeBasis>,
+    /// The count judged, on `basis`. Absent when no count was taken or it
+    /// could not be read (`verdict = "not_evaluated"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count: Option<u64>,
     /// The declared `min_rows` (inclusive), when set.
@@ -6781,6 +6816,18 @@ impl RunOutput {
             tracing::warn!("{summary}");
         }
 
+        // Models an `error` volume breach marks failed. A time-interval
+        // model records one execution per partition but carries the check
+        // on the last one, so every execution of the model is matched by
+        // its Rocky model name, not only the one that carries the check.
+        let volume_failed: std::collections::BTreeSet<String> = self
+            .materializations
+            .iter()
+            .filter_map(|mat| mat.volume.as_ref())
+            .filter(|volume| volume.fails_the_model())
+            .map(|volume| volume.model.clone())
+            .collect();
+
         for mat in &self.materializations {
             let duration_ms = mat.duration_ms;
             let model_started = mat.started_at;
@@ -6807,6 +6854,10 @@ impl RunOutput {
                     .volume
                     .as_ref()
                     .is_some_and(VolumeCheckOutput::fails_the_model)
+                    || mat
+                        .output_target
+                        .as_ref()
+                        .is_some_and(|target| volume_failed.contains(&target.model))
                 {
                     "failed".to_string()
                 } else {
@@ -6868,15 +6919,9 @@ impl RunOutput {
             });
         }
 
-        // Models whose materialization above already records the volume
-        // failure. Their `errors` entry would be a second execution.
-        let volume_failed: std::collections::BTreeSet<&str> = self
-            .materializations
-            .iter()
-            .filter_map(|mat| mat.volume.as_ref())
-            .filter(|volume| volume.fails_the_model())
-            .map(|volume| volume.model.as_str())
-            .collect();
+        // Models whose materializations above already record the volume
+        // failure (`volume_failed`). Their `errors` entry would be a
+        // second execution.
 
         for (idx, err) in self.errors.iter().enumerate() {
             // A run that stopped at its first failure reports one entry under
@@ -6890,7 +6935,7 @@ impl RunOutput {
                     .cloned()
                     .unwrap_or_else(|| "<unknown>".to_string())
             });
-            if volume_failed.contains(model_name.as_str()) {
+            if volume_failed.contains(&model_name) {
                 continue;
             }
             // The retry loop's measurement for this model, when it ran
@@ -8793,6 +8838,7 @@ mod cost_finalize_tests {
     fn mat(asset_key: &[&str], duration_ms: u64) -> MaterializationOutput {
         MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),
@@ -9094,6 +9140,7 @@ mod run_record_tests {
     ) -> MaterializationOutput {
         MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),

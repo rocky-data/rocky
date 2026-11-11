@@ -39,7 +39,7 @@ The scheduler status (`GET /api/v1/schedule`) derives a `latest_start` from each
 
 ### Volume range
 
-A product can say how many rows its output table should hold after a load. Add an optional table to `[product.output]`:
+A product can say how many rows one load of its output should hold. Add an optional table to `[product.output]`:
 
 ```toml
 [product.output.volume]
@@ -48,24 +48,38 @@ max_rows = 5_000_000     # optional, inclusive; at least one bound is required
 severity = "warning"     # "warning" (the default) or "error"
 ```
 
-The count is the table's total rows (`SELECT COUNT(*)`), not the rows one load wrote. So the output model must be a full-refresh table. A total on an incremental, merge or partitioned table only grows, and a view stores no rows.
+What `rocky run` counts depends on the output model's strategy. The JSON output names it in `basis`:
+
+| Strategy | `basis` | What is counted |
+|---|---|---|
+| `full_refresh` | `total_rows` | The table's rows after the build. The build replaces the whole table, so the total is the load. |
+| `incremental` | `rows_added` | The rows this run appended: the table's `COUNT(*)` after the write minus its `COUNT(*)` before. |
+| `merge`, or `incremental` with a `unique_key` | `rows_touched` | The rows this run's `MERGE` inserted or updated, as the warehouse reports them. A matched row counts even when its values did not change. |
+| `time_interval` | `partition_rows` | The rows in the partitions this run wrote, counted after the write with each partition's own time window. |
+
+A run that created the table (a first run) or rebuilt it (`rocky run --full-refresh`) counts every row in it, on any basis.
+
+A `COUNT(*)` cannot see an updated row, so `rows_touched` needs the warehouse's own count. DuckDB, PostgreSQL, SQL Server and Spark report it. Databricks, Snowflake, BigQuery, Trino and Redshift do not, so there a merge output is `not_evaluated`, with the reason in `reason`. `rows_added` assumes nothing else writes to the table during the run. If the table holds fewer rows after the write than before, the check is `not_evaluated`.
+
+A view, an ephemeral model, a materialized view and a dynamic table store no rows Rocky writes. A `delete_insert`, snapshot or content-addressed load has no one count that is its volume. These strategies are refused (`volume-strategy-unsupported`).
 
 The parser refuses a block with no bound (`volume-missing-bound`). `min_rows = 0` alone counts as a bound. It also refuses `min_rows` above `max_rows` (`volume-min-above-max`), a severity other than `warning` or `error` (`volume-severity-unknown`), an unknown key (`unknown-key`), and a negative or non-integer bound (`invalid-value`). The spec does not name the model's strategy, so `rocky product verify` checks it (`volume-strategy-unsupported`, below).
 
-The range lowers to one `row_count_range` test in the model sidecar, with the same bounds and severity. It replaces any `row_count_range` test the worker wrote, so the model has one range: the spec's. `rocky test --declarative` and `rocky run` then judge the same range.
+On a full-refresh output, the range also lowers to one `row_count_range` test in the model sidecar, with the same bounds and severity. It replaces any `row_count_range` test the worker wrote over the whole table, so the model has one range: the spec's. `rocky test --declarative` and `rocky run` then judge the same range. On any other output the range writes no test: a `row_count_range` test counts the whole table, and the range is about one load. Only `rocky run` judges it, and a worker's own `row_count_range` stays.
 
 After each successful production build of the output model, `rocky run` counts the rows once, on the same warehouse connection:
 
 ```
-build ok ──▶ COUNT(*) ──▶ in range ────────────▶ in_range
+build ok ──▶ count ────▶ in range ────────────▶ in_range
                 │      ├─▶ out of range, warning ─▶ a `volume_warnings` line; delivery as usual
                 │      └─▶ out of range, error ───▶ the model is marked failed
-                └─ count failed or cancelled ──────▶ not_evaluated (never a failure)
+                └─ count failed, not reported,
+                   or cancelled ────────────────────▶ not_evaluated (never a failure)
 ```
 
-At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A non-full-refresh output reaching `rocky run` is `not_evaluated` with `volume-strategy-unsupported` in its reason. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
+At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. For a time-interval output, every partition this run wrote is marked failed, and none gets a `due_at`. The partitions keep their `computed` state, because their rows are in the table. An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
 
-The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records `row_count` in its history, and `rocky product status` reports it. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
+The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `basis`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. A time-interval output carries it on the last partition the run wrote. The run records `row_count` in its history, and `rocky product status` reports it. The history does not store the basis, so after a strategy change `rocky product status` may show a count taken on the old basis until the next run. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
 
 ### Source volume ranges
 
@@ -130,7 +144,7 @@ Four checks run in order, fail-closed:
 1. **Trust posture.** `rocky.toml` must carry the frozen `propose_only` posture: a `[policy]` block with `default_agent_effect = "require_review"`, an agent `propose` rule that resolves `allow` and is scoped to exactly this product's output model (no `any`, no glob, no extra predicates, no autonomy budget), and agent `apply` resolving `require_review` or `deny`. A policy that merely *happens* to resolve safely is rejected — authority that reaches past the product is global agent authority. The verdicts come from the engine's own policy evaluator, run against the attributes the lowering is *about to create* (the post-image), so the gate cannot be evaded by the change under review.
 2. **Classification tags.** Every tag in `output.classifications` must resolve to a `[mask]` strategy, a `[mask.<env>]` override, or `[classifications].allow_unmasked`. This is an error here; plain `rocky compile` only warns (W004). Resolution only: whether masking is applied is warehouse-dependent.
 3. **Identity collisions.** The product name must not be claimed by another spec file, and the output model must not be claimed by another product.
-4. **Volume strategy.** When the spec declares `[product.output.volume]` and the model exists (`models/<model>.sql` or `models/<model>.rocky`, plus `models/<model>.toml`), the model must be a full-refresh table (`volume-strategy-unsupported`). The strategy is read the way the compiler reads it, including `_defaults.toml`. Before the model is drafted, verify cannot judge the strategy, so this check passes; the Phase-B compile runs it again. If a model that is not a full-refresh table still reaches `rocky run`, the run does not count it: the verdict is `not_evaluated` with reason `volume-strategy-unsupported`, never a failure.
+4. **Volume strategy.** When the spec declares `[product.output.volume]` and the model exists (`models/<model>.sql` or `models/<model>.rocky`, plus `models/<model>.toml`), the model must be a `full_refresh`, `incremental`, `merge` or `time_interval` model (`volume-strategy-unsupported`). The strategy is read the way the compiler reads it, including `_defaults.toml`. Before the model is drafted, verify cannot judge the strategy, so this check passes; the Phase-B compile runs it again. If a model with another strategy still reaches `rocky run`, the run does not count it: the verdict is `not_evaluated` with reason `volume-strategy-unsupported`, never a failure.
 
 Exit codes: `0` pass · `1` needs input (a paste-ready `[policy]` block is printed) · `2` fail.
 
@@ -151,7 +165,7 @@ rocky product compile revenue_daily
 Lowering runs in two phases because the drafting tool rewrites the model sidecar wholesale — metadata lowered before drafting would be destroyed:
 
 - **Phase A** (before drafting) renders `models/<model>.contract.toml` — the spec-owned contract the draft must compile against.
-- **Phase B** (after the drafted sidecar exists) merges the spec-owned metadata into `models/<model>.toml`: sources, the product tag, classifications, freshness, and the generated tests (grain uniqueness, `not_null` per non-nullable column, one `expression` test per check, one `row_count_range` for a declared volume). The worker's `name`, `intent`, and appended tests survive, except a worker `row_count_range` with no `filter` when the spec declares a volume. A filtered worker range survives. The generated range carries `generated_by = "product.output.volume"`, so removing the volume block removes that range on the next lowering; `rocky test` ignores the key.
+- **Phase B** (after the drafted sidecar exists) merges the spec-owned metadata into `models/<model>.toml`: sources, the product tag, classifications, freshness, and the generated tests (grain uniqueness, `not_null` per non-nullable column, one `expression` test per check, one `row_count_range` for a declared volume on a full-refresh output). The worker's `name`, `intent`, and appended tests survive, except a worker `row_count_range` with no `filter` when the spec's volume lowers to a test. A filtered worker range survives. Phase B reads the output model's strategy to decide; when the spec declares a volume and the model does not load, it refuses (`volume-strategy-unresolved`). The generated range carries `generated_by = "product.output.volume"`, so removing the volume block removes that range on the next lowering; `rocky test` ignores the key.
 
 The command picks the phase itself: Phase A on a fresh product, Phase B once `models/<model>.toml` exists. Re-running is safe — the merge is idempotent.
 

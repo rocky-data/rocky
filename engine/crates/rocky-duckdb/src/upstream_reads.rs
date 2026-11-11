@@ -229,9 +229,19 @@ impl DuckDbConnector {
         &self,
         sql: &str,
     ) -> Result<Option<UpstreamReads>, DuckDbError> {
+        self.execute_statement_measured(sql).map(|(_, reads)| reads)
+    }
+
+    /// [`Self::execute_statement_with_upstream_reads`], plus the rows the
+    /// statement changed when DuckDB counts them (see
+    /// [`DuckDbConnector::execute_statement_counting_rows`]).
+    pub fn execute_statement_measured(
+        &self,
+        sql: &str,
+    ) -> Result<(Option<u64>, Option<UpstreamReads>), DuckDbError> {
         if !is_single_statement(sql) {
-            self.execute_statement(sql)?;
-            return Ok(None);
+            let rows = self.execute_statement_counting_rows(sql)?;
+            return Ok((rows, None));
         }
         // Turn off any profiling a failed earlier statement left on. If that
         // still fails (the transaction is still aborted), profiling writes to
@@ -239,16 +249,16 @@ impl DuckDbConnector {
         self.ensure_profiling_off();
         if self.profile_file.borrow().is_some() {
             debug!("profiling is still on from an earlier statement; upstream reads not measured");
-            self.execute_statement(sql)?;
-            return Ok(None);
+            let rows = self.execute_statement_counting_rows(sql)?;
+            return Ok((rows, None));
         }
         // DuckDB picks the profile format from the file extension.
         let file = match tempfile::Builder::new().suffix(".json").tempfile() {
             Ok(file) => file,
             Err(e) => {
                 debug!(error = %e, "no temp file for the profile; upstream reads not measured");
-                self.execute_statement(sql)?;
-                return Ok(None);
+                let rows = self.execute_statement_counting_rows(sql)?;
+                return Ok((rows, None));
             }
         };
         let enable = format!(
@@ -262,13 +272,13 @@ impl DuckDbConnector {
             if self.conn.execute_batch(DISABLE_PROFILING).is_err() {
                 *self.profile_file.borrow_mut() = Some(file);
             }
-            self.execute_statement(sql)?;
-            return Ok(None);
+            let rows = self.execute_statement_counting_rows(sql)?;
+            return Ok((rows, None));
         }
         // Run the statement directly: `execute_statement` would turn the
         // profiling we just enabled off again.
         debug!(sql = sql, "executing DuckDB statement with profiling");
-        let result = self.conn.execute_batch(sql);
+        let result = self.run_counting_rows(sql);
         let disabled = self.conn.execute_batch(DISABLE_PROFILING);
         if disabled.is_err() {
             // An aborted transaction rejects the pragma. Profiling stays on
@@ -276,12 +286,12 @@ impl DuckDbConnector {
             // turns it off; dropping the file now would let DuckDB rewrite
             // it after it is gone.
             *self.profile_file.borrow_mut() = Some(file);
-            result?;
+            let rows = result?;
             debug!("could not disable profiling; upstream reads not measured");
-            return Ok(None);
+            return Ok((rows, None));
         }
-        result?;
-        Ok(self.read_profile(file.path()))
+        let rows = result?;
+        Ok((rows, self.read_profile(file.path())))
     }
 
     /// Turn profiling off if an earlier measured statement could not. Called

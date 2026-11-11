@@ -1167,8 +1167,11 @@ pub struct ProductVolumeStatus {
     pub max_rows: Option<u64>,
     /// The declared severity: `warning` (the default) or `error`.
     pub severity: rocky_core::product::spec::VolumeSeverity,
-    /// The newest production build that recorded a count. Absent when no
-    /// build has been counted yet.
+    /// The count the newest counted production build judged. Absent when
+    /// no build has been counted yet. It is on the basis that build's
+    /// strategy counted (`rocky run`'s `volume.basis`): the table's total
+    /// for a full-refresh output, that run's added, touched or partition
+    /// rows otherwise. The basis is not stored with the count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count: Option<u64>,
     /// When that build finished.
@@ -1360,29 +1363,21 @@ pub(crate) fn product_verify_outcome(
     Ok((parsed, posture))
 }
 
-/// Refuse `[product.output.volume]` on an output model that is not a
-/// full-refresh table (`volume-strategy-unsupported`).
-///
-/// The range is the table's total rows after a load. On an incremental,
-/// merge or partitioned table the total only grows, so the range would
-/// break by itself; a view or ephemeral model stores no rows.
-///
-/// The check lives here, not in the spec parser or the lowering, because
-/// neither can know the strategy: the spec does not name it, and the
-/// sidecar the lowering merges into often omits it (it resolves from
-/// `_defaults.toml` or a config group). This loads the model the way the
-/// compiler does. Before the worker drafts the model there is nothing to
-/// check, so the check passes; the Phase-B compile runs this verification
-/// again once the model exists. `rocky run` also refuses to count a
-/// non-full-refresh output (`not_evaluated`), so a strategy changed after
-/// verification never yields a false verdict.
-///
-/// A model that exists but does not load passes here: the compile reports
-/// that problem with its own diagnostics.
-pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecResult<()> {
-    if parsed.product().output.volume.is_none() {
-        return Ok(());
-    }
+/// The output model's strategy, read the way the compiler reads it.
+#[derive(Debug)]
+pub(crate) enum OutputStrategy {
+    /// The model's source or sidecar is not on disk yet (before drafting).
+    NotDrafted,
+    /// The model exists but does not load; the reason says why.
+    DoesNotLoad(String),
+    /// The model loads with this strategy.
+    Loaded(rocky_ir::MaterializationStrategy),
+}
+
+/// Resolve the output model's strategy. The spec does not name it, and the
+/// sidecar often omits it (it resolves from `_defaults.toml` or a config
+/// group), so this loads the model the way the compiler does.
+pub(crate) fn output_strategy(root: &Path, parsed: &ParsedSpec) -> OutputStrategy {
     let model_name = parsed.output_model();
     // The model's source is a `.sql` file or a `.rocky` DSL file. The
     // compiler's directory loader reads both; `rocky_core`'s reads only
@@ -1390,7 +1385,7 @@ pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecRes
     let sql = root.join(sql_rel(parsed));
     let has_source = sql.is_file() || sql.with_extension("rocky").is_file();
     if !has_source || !root.join(sidecar_rel(parsed)).is_file() {
-        return Ok(());
+        return OutputStrategy::NotDrafted;
     }
     let models_dir = root.join("models");
     let only_this_model = format!(
@@ -1404,7 +1399,45 @@ pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecRes
         None,
     ) {
         Ok(models) => models,
-        Err(err) => {
+        Err(err) => return OutputStrategy::DoesNotLoad(err.to_string()),
+    };
+    match models.iter().find(|model| model.config.name == model_name) {
+        Some(model) => OutputStrategy::Loaded(model.to_model_ir().materialization),
+        None => OutputStrategy::DoesNotLoad(format!(
+            "no model named '{model_name}' loads from models/"
+        )),
+    }
+}
+
+/// Refuse `[product.output.volume]` on an output model whose strategy
+/// `rocky run` does not count (`volume-strategy-unsupported`).
+///
+/// A full-refresh output is judged on its total rows, an incremental one
+/// on the rows a run adds, a merge one on the rows its MERGE touches, and a
+/// time-interval one on the rows in the partitions a run writes
+/// ([`rocky_core::product::spec::VolumeBasis`]). A view, ephemeral model,
+/// materialized view or dynamic table stores no rows Rocky writes, and a
+/// delete_insert, snapshot or content-addressed load has no one count that
+/// is its volume.
+///
+/// The check lives here, not in the spec parser or the lowering, because
+/// neither can know the strategy ([`output_strategy`]). Before the worker
+/// drafts the model there is nothing to check, so the check passes; the
+/// Phase-B compile runs this verification again once the model exists.
+/// `rocky run` also refuses to count an unsupported output
+/// (`not_evaluated`), so a strategy changed after verification never yields
+/// a false verdict.
+///
+/// A model that exists but does not load passes here: the compile reports
+/// that problem with its own diagnostics.
+pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecResult<()> {
+    if parsed.product().output.volume.is_none() {
+        return Ok(());
+    }
+    let model_name = parsed.output_model();
+    let strategy = match output_strategy(root, parsed) {
+        OutputStrategy::NotDrafted => return Ok(()),
+        OutputStrategy::DoesNotLoad(err) => {
             tracing::debug!(
                 model = model_name,
                 error = %err,
@@ -1412,23 +1445,64 @@ pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecRes
             );
             return Ok(());
         }
+        OutputStrategy::Loaded(strategy) => strategy,
     };
-    let Some(model) = models.iter().find(|model| model.config.name == model_name) else {
-        return Ok(());
-    };
-    if super::run_volume::counts_total_rows(&model.to_model_ir().materialization) {
+    if rocky_core::product::spec::VolumeBasis::of(&strategy).is_some() {
         return Ok(());
     }
     Err(SpecRejected::new(
         "volume-strategy-unsupported",
         format!(
-            "product.output.volume needs a full-refresh output, but model '{model_name}' \
-             is not one: the range is the table's total rows after a load, which an \
-             incremental, merge or partitioned table only grows, and a view or ephemeral \
-             model does not store. Remove [product.output.volume], or make the model \
-             `strategy = {{ type = \"full_refresh\" }}`"
+            "product.output.volume needs an output `rocky run` can count, but model \
+             '{model_name}' is a {} model: a view, ephemeral model, materialized view or \
+             dynamic table stores no rows Rocky writes, and a delete_insert, snapshot or \
+             content-addressed load has no one count that is its volume. Remove \
+             [product.output.volume], or give the model a full_refresh, incremental, merge \
+             or time_interval strategy",
+            super::run::transformation_strategy_name(&strategy)
         ),
     ))
+}
+
+/// How Phase B lowers `[product.output.volume]` for the drafted output
+/// model: a whole-table test for a full-refresh output, no test otherwise
+/// ([`rocky_core::product::lowering::VolumeLowering`]).
+///
+/// # Errors
+///
+/// `volume-strategy-unresolved` when the spec declares a volume and the
+/// output model's strategy cannot be read: the lowering would have to guess
+/// whether a whole-table test is right, and it refuses instead.
+pub(crate) fn phase_b_volume_lowering(
+    root: &Path,
+    parsed: &ParsedSpec,
+) -> SpecResult<rocky_core::product::lowering::VolumeLowering> {
+    use rocky_core::product::lowering::VolumeLowering;
+    if parsed.product().output.volume.is_none() {
+        // Nothing to lower; the choice writes nothing either way.
+        return Ok(VolumeLowering::TotalRowsTest);
+    }
+    let model_name = parsed.output_model();
+    match output_strategy(root, parsed) {
+        OutputStrategy::Loaded(strategy) => Ok(VolumeLowering::for_basis(
+            rocky_core::product::spec::VolumeBasis::of(&strategy),
+        )),
+        OutputStrategy::NotDrafted => Err(SpecRejected::new(
+            "volume-strategy-unresolved",
+            format!(
+                "product.output.volume lowers by the output model's strategy, but model \
+                 '{model_name}' has no SQL (or `.rocky`) file and sidecar to read it from. \
+                 Draft the model, then compile again"
+            ),
+        )),
+        OutputStrategy::DoesNotLoad(err) => Err(SpecRejected::new(
+            "volume-strategy-unresolved",
+            format!(
+                "product.output.volume lowers by the output model's strategy, but model \
+                 '{model_name}' does not load ({err}). Fix the model, then compile again"
+            ),
+        )),
+    }
 }
 
 pub(crate) fn verify_output_for(
@@ -1608,7 +1682,8 @@ pub(crate) fn product_compile_in(
         .as_ref()
         .is_some_and(|manifest| manifest.spec_digest == parsed.digest);
     let lowering = if committed.is_some() && sidecar_present && continues_generation {
-        run_phase_b(root, &spec_path, &parsed)
+        phase_b_volume_lowering(root, &parsed)
+            .and_then(|volume_lowering| run_phase_b(root, &spec_path, &parsed, volume_lowering))
     } else {
         run_phase_a(root, &spec_path, &parsed)
     }
@@ -5126,7 +5201,12 @@ effect = "require_review"
         // Phase B: the metadata merge. The engine consumes every block —
         // freshness clears W005; W004 stays silent because [mask]
         // resolves pii; the product tag lands on the compiled model.
-        run_phase_b(&root, "products/revenue_daily.toml", &parsed).expect("phase B");
+        run_phase_b(
+            &root,
+            "products/revenue_daily.toml",
+            &parsed,
+            rocky_core::product::lowering::VolumeLowering::TotalRowsTest,
+        ).expect("phase B");
         let result = compile_probe(&root).expect("compiles");
         assert!(!result.has_errors, "{:?}", result.diagnostics);
         assert!(
@@ -5571,6 +5651,7 @@ pub(crate) mod delivery_tests {
         let mut output = RunOutput::new(String::new(), 1, 1);
         output.materializations.push(MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: vec!["revenue_daily".to_string()],
             notes: vec![],
             attempts: Vec::new(),
