@@ -9664,7 +9664,7 @@ database = ":memory:"
         // Databricks) joins validated segments unquoted — Snowflake relies on
         // this to fold to its default uppercase casing rather than locking in
         // a case-sensitive quoted name.
-        let d = DuckDbSqlDialect;
+        let d = DuckDbSqlDialect::plain();
         // Three-part name (catalog.schema.table).
         assert_eq!(
             d.ground_table_ref(&["analytics", "raw", "orders"]).unwrap(),
@@ -9681,7 +9681,7 @@ database = ":memory:"
     fn ground_table_ref_default_rejects_bad_identifier_and_arity() {
         use rocky_core::traits::SqlDialect;
         use rocky_duckdb::dialect::DuckDbSqlDialect;
-        let d = DuckDbSqlDialect;
+        let d = DuckDbSqlDialect::plain();
         // Injection in any segment is rejected.
         assert!(
             d.ground_table_ref(&["raw", "orders; DROP TABLE x"])

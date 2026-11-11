@@ -21152,7 +21152,7 @@ mod tests {
             None,
             None,
         );
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let note = super::incremental_load_note(
             "fct",
             &model_ir,
@@ -30192,7 +30192,7 @@ merge_keys = ["id"]
             .await
             .unwrap();
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let source = TableRef {
             catalog: String::new(),
             schema: "source".into(),
@@ -30238,7 +30238,7 @@ merge_keys = ["id"]
             .await
             .unwrap();
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let source = TableRef {
             catalog: String::new(),
             schema: "source".into(),
@@ -30296,7 +30296,7 @@ merge_keys = ["id"]
             .await
             .unwrap();
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let source = TableRef {
             catalog: String::new(),
             schema: "source".into(),
@@ -30527,7 +30527,7 @@ merge_keys = ["id"]
         // Bind to the emitted statement, not just the struct: this is the
         // artifact the warehouse executes, and the bug was invisible in every
         // assertion that stopped short of it.
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let sql = rocky_core::sql_gen::generate_bootstrap_create_table_as_sql(
             &model_ir,
             &dialect as &dyn SqlDialect,
@@ -30708,7 +30708,7 @@ table = "fct_events"
         )
         .expect("load incremental model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -30962,7 +30962,7 @@ table = "orders_view"
         )
         .expect("load full_refresh model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -31109,7 +31109,7 @@ table = "orders_view"
         let output = super::execute_one_plain_model(
             &model,
             &FailingKindProbe(&warehouse),
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             "orders",
             std::time::Instant::now(),
             exec_ctx,
@@ -31134,7 +31134,7 @@ table = "orders_view"
         let output = super::execute_one_plain_model(
             &permitted,
             &FailingKindProbe(&warehouse),
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             "orders",
             std::time::Instant::now(),
             exec_ctx,
@@ -31191,7 +31191,7 @@ table = "orders_view"
         let output = super::execute_one_plain_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             "orders",
             std::time::Instant::now(),
             exec_ctx,
@@ -31253,7 +31253,7 @@ table = "orders_view"
                 inner: &warehouse,
                 inject_msg: "unused for full_refresh",
             },
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             "orders",
             std::time::Instant::now(),
             exec_ctx,
@@ -31269,7 +31269,7 @@ table = "orders_view"
         let error = super::execute_one_plain_model(
             &permitted,
             &FailingKindProbe(&warehouse),
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             "orders",
             std::time::Instant::now(),
             exec_ctx,
@@ -31300,7 +31300,7 @@ table = "orders_view"
         use rocky_core::traits::{ObjectKind, SqlDialect};
         let dialects: Vec<(Box<dyn SqlDialect>, &str)> = vec![
             (
-                Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
+                Box::new(rocky_duckdb::dialect::DuckDbSqlDialect::plain()),
                 "project123.sch.orders",
             ),
             (
@@ -31397,7 +31397,7 @@ table = "orders_view"
         )
         .expect("load view model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -31514,7 +31514,7 @@ table = "fct_daily"
         )
         .expect("load time_interval model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let dir_state = tempfile::tempdir().unwrap();
         let state = StateStore::open(&dir_state.path().join("state.redb")).unwrap();
         // --latest deterministically plans exactly one partition (the current
@@ -31669,7 +31669,7 @@ table = "fct_daily"
         super::execute_time_interval_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             Some(&state),
             &range,
             "cancel-before",
@@ -31744,7 +31744,7 @@ table = "fct_daily"
         super::execute_time_interval_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             Some(&state),
             &range,
             "cancel-between",
@@ -31865,7 +31865,7 @@ table = "fct_daily"
         super::execute_time_interval_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             Some(&state),
             &range,
             "batch-run",
@@ -31978,7 +31978,7 @@ table = "fct_daily"
         super::execute_time_interval_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             Some(&state),
             &no_flags,
             "first-run",
@@ -31995,7 +31995,7 @@ table = "fct_daily"
         super::execute_time_interval_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             Some(&state),
             &no_flags,
             "second-run",
@@ -32086,7 +32086,7 @@ table = "fct_daily"
         let error = super::execute_time_interval_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             Some(&state),
             &no_flags,
             "unreviewed",
@@ -32111,7 +32111,7 @@ table = "fct_daily"
         super::execute_time_interval_model(
             &model,
             &warehouse,
-            &DuckDbSqlDialect,
+            &DuckDbSqlDialect::plain(),
             Some(&state),
             &no_flags,
             "reviewed",
@@ -32304,7 +32304,7 @@ table = "fct_events"
         )
         .expect("load incremental model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -32428,7 +32428,7 @@ table = "fct_events"
         )
         .expect("load incremental model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -32529,7 +32529,7 @@ table = "fct_events"
         )
         .expect("load incremental model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -33763,7 +33763,7 @@ timestamp_column = "ts"
             adapter.execute_statement(ddl).await.unwrap();
         }
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "ts".to_string(),
             unique_key: Vec::new(),
@@ -34043,7 +34043,7 @@ timestamp_column = "ts"
             adapter.execute_statement(ddl).await.unwrap();
         }
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let strategy = MaterializationStrategy::Incremental {
             timestamp_column: "_loaded_at".to_string(),
             unique_key: Vec::new(),
@@ -35334,7 +35334,7 @@ backend = "local"
         use rocky_ir::TableRef;
 
         let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let source = TableRef {
             catalog: String::new(),
             schema: "source".into(),
@@ -39371,7 +39371,7 @@ backend = "local"
         let result = super::execute_time_interval_model(
             &model,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
-            &DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+            &DuckDbSqlDialect::plain() as &dyn rocky_core::traits::SqlDialect,
             Some(&state),
             &opts,
             "test-run",
@@ -39565,13 +39565,13 @@ backend = "local"
         struct BadKeyDialect;
         impl SqlDialect for BadKeyDialect {
             fn name(&self) -> &'static str {
-                DuckDbSqlDialect.name()
+                DuckDbSqlDialect::plain().name()
             }
             fn star_excluding(&self, columns: &[&str]) -> Option<String> {
-                DuckDbSqlDialect.star_excluding(columns)
+                DuckDbSqlDialect::plain().star_excluding(columns)
             }
             fn literal_escape(&self) -> LiteralEscape {
-                DuckDbSqlDialect.literal_escape()
+                DuckDbSqlDialect::plain().literal_escape()
             }
             fn format_table_ref(
                 &self,
@@ -39579,13 +39579,13 @@ backend = "local"
                 schema: &str,
                 table: &str,
             ) -> AdapterResult<String> {
-                DuckDbSqlDialect.format_table_ref(catalog, schema, table)
+                DuckDbSqlDialect::plain().format_table_ref(catalog, schema, table)
             }
             fn create_table_as(&self, target: &str, select_sql: &str) -> String {
-                DuckDbSqlDialect.create_table_as(target, select_sql)
+                DuckDbSqlDialect::plain().create_table_as(target, select_sql)
             }
             fn insert_into(&self, target: &str, select_sql: &str) -> String {
-                DuckDbSqlDialect.insert_into(target, select_sql)
+                DuckDbSqlDialect::plain().insert_into(target, select_sql)
             }
             fn merge_into(
                 &self,
@@ -39594,21 +39594,21 @@ backend = "local"
                 keys: &[Arc<str>],
                 update_cols: &ColumnSelection,
             ) -> AdapterResult<String> {
-                DuckDbSqlDialect.merge_into(target, source_sql, keys, update_cols)
+                DuckDbSqlDialect::plain().merge_into(target, source_sql, keys, update_cols)
             }
             fn select_clause(
                 &self,
                 columns: &ColumnSelection,
                 metadata: &[MetadataColumn],
             ) -> AdapterResult<String> {
-                DuckDbSqlDialect.select_clause(columns, metadata)
+                DuckDbSqlDialect::plain().select_clause(columns, metadata)
             }
             fn watermark_where(
                 &self,
                 timestamp_col: &str,
                 last_watermark: Option<&DateTime<Utc>>,
             ) -> AdapterResult<String> {
-                DuckDbSqlDialect.watermark_where(timestamp_col, last_watermark)
+                DuckDbSqlDialect::plain().watermark_where(timestamp_col, last_watermark)
             }
             fn watermark_hold_back(
                 &self,
@@ -39616,26 +39616,26 @@ backend = "local"
                 held_max: &DateTime<Utc>,
                 nulls: NullTimestamps,
             ) -> AdapterResult<String> {
-                DuckDbSqlDialect.watermark_hold_back(timestamp_col, held_max, nulls)
+                DuckDbSqlDialect::plain().watermark_hold_back(timestamp_col, held_max, nulls)
             }
             fn describe_table_sql(&self, table_ref: &str) -> String {
-                DuckDbSqlDialect.describe_table_sql(table_ref)
+                DuckDbSqlDialect::plain().describe_table_sql(table_ref)
             }
             fn drop_table_sql(&self, table_ref: &str) -> String {
-                DuckDbSqlDialect.drop_table_sql(table_ref)
+                DuckDbSqlDialect::plain().drop_table_sql(table_ref)
             }
             fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
-                DuckDbSqlDialect.create_catalog_sql(name)
+                DuckDbSqlDialect::plain().create_catalog_sql(name)
             }
             fn create_schema_sql(
                 &self,
                 catalog: &str,
                 schema: &str,
             ) -> Option<AdapterResult<String>> {
-                DuckDbSqlDialect.create_schema_sql(catalog, schema)
+                DuckDbSqlDialect::plain().create_schema_sql(catalog, schema)
             }
             fn tablesample_clause(&self, percent: u32) -> Option<String> {
-                DuckDbSqlDialect.tablesample_clause(percent)
+                DuckDbSqlDialect::plain().tablesample_clause(percent)
             }
             fn insert_overwrite_partition(
                 &self,
@@ -39643,16 +39643,20 @@ backend = "local"
                 partition_filter: &str,
                 select_sql: &str,
             ) -> AdapterResult<Vec<String>> {
-                DuckDbSqlDialect.insert_overwrite_partition(target, partition_filter, select_sql)
+                DuckDbSqlDialect::plain().insert_overwrite_partition(
+                    target,
+                    partition_filter,
+                    select_sql,
+                )
             }
             fn list_tables_sql(&self, catalog: &str, schema: &str) -> AdapterResult<String> {
-                DuckDbSqlDialect.list_tables_sql(catalog, schema)
+                DuckDbSqlDialect::plain().list_tables_sql(catalog, schema)
             }
             fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
-                DuckDbSqlDialect.regex_match_predicate(column, pattern)
+                DuckDbSqlDialect::plain().regex_match_predicate(column, pattern)
             }
             fn row_hash_expr(&self, columns: &[String]) -> AdapterResult<String> {
-                DuckDbSqlDialect.row_hash_expr(columns)
+                DuckDbSqlDialect::plain().row_hash_expr(columns)
             }
             fn surrogate_key_expr(&self, _columns: &[&str]) -> String {
                 // Measurable time inside the failing step.
@@ -40163,7 +40167,7 @@ backend = "local"
             ],
         );
         let surrogate_keys = std::collections::HashMap::new();
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
 
         let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect).unwrap();
         assert_eq!(
@@ -40530,7 +40534,7 @@ backend = "local"
                 }),
                 ..Default::default()
             },
-            &rocky_duckdb::dialect::DuckDbSqlDialect,
+            &rocky_duckdb::dialect::DuckDbSqlDialect::plain(),
         )
         .expect("defer rewrite");
         let stg = compiled
@@ -40562,7 +40566,7 @@ backend = "local"
                 }),
                 ..Default::default()
             },
-            &rocky_duckdb::dialect::DuckDbSqlDialect,
+            &rocky_duckdb::dialect::DuckDbSqlDialect::plain(),
         )
         .expect_err("orders has no recorded table");
         assert!(
@@ -40775,7 +40779,7 @@ auto_create_schemas = true
             })
             .expect("compile models");
 
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let hashes = |compiled: &rocky_compiler::compile::CompileResult| {
             let surrogate_keys = HashMap::new();
             compiled
@@ -41236,7 +41240,7 @@ auto_create_schemas = true
                 &rocky_snowflake::dialect::SnowflakeSqlDialect
                     as &dyn rocky_core::traits::SqlDialect,
             ),
-            ("duckdb", &rocky_duckdb::dialect::DuckDbSqlDialect),
+            ("duckdb", &rocky_duckdb::dialect::DuckDbSqlDialect::plain()),
         ] {
             let (_tmp, mut compiled) = build();
             let err = super::apply_shadow_rewrite(
@@ -41346,7 +41350,8 @@ auto_create_schemas = true
         for (name, dialect) in [
             (
                 "duckdb",
-                &rocky_duckdb::dialect::DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+                &rocky_duckdb::dialect::DuckDbSqlDialect::plain()
+                    as &dyn rocky_core::traits::SqlDialect,
             ),
             ("snowflake", &rocky_snowflake::dialect::SnowflakeSqlDialect),
             ("trino", &rocky_trino::dialect::TrinoDialect),
@@ -41411,7 +41416,7 @@ auto_create_schemas = true
             None,
             None,
             &rocky_core::shadow::ShadowConfig::default(),
-            &rocky_duckdb::dialect::DuckDbSqlDialect,
+            &rocky_duckdb::dialect::DuckDbSqlDialect::plain(),
             false,
         )
         .expect_err("a derived edge with no node to attach it to must not be dropped silently");
@@ -41475,7 +41480,7 @@ auto_create_schemas = true
             "premise: a two-part physical read must not auto-derive a dependency"
         );
 
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         super::apply_shadow_rewrite(
             &mut compiled,
             None,
@@ -41571,7 +41576,11 @@ auto_create_schemas = true
                 .clone()
         }
 
-        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect, "main", "orders");
+        let duck = rewritten_sql(
+            &rocky_duckdb::dialect::DuckDbSqlDialect::plain(),
+            "main",
+            "orders",
+        );
         assert!(
             duck.contains("orders_rocky_shadow") && !duck.contains('"'),
             "DuckDB renders bare identifiers: {duck}"
@@ -42011,7 +42020,8 @@ auto_create_schemas = true
         for (name, dialect) in [
             (
                 "duckdb",
-                &rocky_duckdb::dialect::DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+                &rocky_duckdb::dialect::DuckDbSqlDialect::plain()
+                    as &dyn rocky_core::traits::SqlDialect,
             ),
             ("trino", &rocky_trino::dialect::TrinoDialect),
         ] {
@@ -42216,7 +42226,7 @@ auto_create_schemas = true
             .expect("compile models");
         assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
         let config = rocky_core::shadow::ShadowConfig::default();
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect, false)
             .expect("an ephemeral model has nothing to shadow and must not block the run");
         let shadow_src = rocky_core::shadow::shadow_target(
@@ -42271,7 +42281,7 @@ auto_create_schemas = true
                 ..Default::default()
             })
             .expect("compile model");
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let config = rocky_core::shadow::ShadowConfig::default();
 
         let content_addressed =
@@ -42329,7 +42339,7 @@ auto_create_schemas = true
             })
             .expect("compile models")
         };
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
 
         let mut compiled = compile();
         let empty_suffix = rocky_core::shadow::ShadowConfig {
@@ -48681,7 +48691,7 @@ auto_create_schemas = true
             super::execute_time_interval_model(
                 &model,
                 &warehouse,
-                &DuckDbSqlDialect,
+                &DuckDbSqlDialect::plain(),
                 Some(&state),
                 &opts,
                 run_id,
@@ -48811,7 +48821,7 @@ auto_create_schemas = true
         )
         .expect("load model");
 
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();

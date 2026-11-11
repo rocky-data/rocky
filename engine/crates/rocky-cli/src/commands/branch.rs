@@ -3414,7 +3414,7 @@ mod tests {
     /// name proves the unquoted-emission parser-fail bug stays fixed.
     #[test]
     fn build_promote_sql_quotes_every_identifier() {
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let prod = TargetRef {
             catalog: "playground".to_string(),
             schema: "staging__orders".to_string(),
@@ -3560,7 +3560,7 @@ mod tests {
     /// unchecked parts.
     #[test]
     fn build_promote_sql_refuses_a_name_carrying_the_quote_delimiter() {
-        let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let databricks = rocky_databricks::dialect::DatabricksSqlDialect;
 
         let plain = |schema: &str| TargetRef {
@@ -3631,7 +3631,11 @@ mod tests {
     #[test]
     fn the_shipped_dialects_open_with_one_delimiter() {
         let cases: [(&str, &dyn rocky_core::traits::SqlDialect, char); 5] = [
-            ("duckdb", &rocky_duckdb::dialect::DuckDbSqlDialect, '"'),
+            (
+                "duckdb",
+                &rocky_duckdb::dialect::DuckDbSqlDialect::plain(),
+                '"',
+            ),
             (
                 "databricks",
                 &rocky_databricks::dialect::DatabricksSqlDialect,
@@ -3697,7 +3701,7 @@ mod tests {
             table: "orders".to_string(),
         };
         let bigquery = rocky_bigquery::dialect::BigQueryDialect;
-        let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let snowflake = rocky_snowflake::dialect::SnowflakeSqlDialect;
 
         build_promote_sql(
@@ -5462,7 +5466,7 @@ adapter = "default"
         assert_eq!(planned[0].prod.table, "original");
         let ir = planned[0].model_ir.as_ref().unwrap();
         assert_eq!(ir.target.table, "original");
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let (sql, _) = production_view_sql(&dialect, ir, &planned[0].upstreams).unwrap();
         assert_generated_promote_target(&dialect, PromoteKind::View, &planned[0].prod, &sql)
             .unwrap();

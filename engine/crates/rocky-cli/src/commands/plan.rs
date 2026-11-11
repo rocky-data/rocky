@@ -842,7 +842,7 @@ pub(crate) fn dialect_for_adapter_type(
         "sqlserver" => Box::new(rocky_sqlserver::SqlServerDialect::new()),
         "spark" => Box::new(rocky_spark::SparkDialect::new()),
         #[cfg(feature = "duckdb")]
-        "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect),
+        "duckdb" => Box::new(rocky_duckdb::dialect::DuckDbSqlDialect::plain()),
         other => {
             tracing::warn!(
                 adapter_type = other,

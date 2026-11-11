@@ -118,7 +118,7 @@ pub fn warehouse_dialect_for_type(
 ) -> Option<&'static dyn rocky_core::traits::SqlDialect> {
     match adapter_type {
         #[cfg(feature = "duckdb")]
-        "duckdb" => Some(&rocky_duckdb::dialect::DuckDbSqlDialect),
+        "duckdb" => Some(&DUCKDB_DIALECT),
         "databricks" => Some(&rocky_databricks::dialect::DatabricksSqlDialect),
         "snowflake" => Some(&rocky_snowflake::dialect::SnowflakeSqlDialect),
         "bigquery" => Some(&rocky_bigquery::dialect::BigQueryDialect),
@@ -246,6 +246,10 @@ pub(crate) fn sqlserver_dialect_for_config(
         flavor,
     )))
 }
+
+#[cfg(feature = "duckdb")]
+static DUCKDB_DIALECT: rocky_duckdb::dialect::DuckDbSqlDialect =
+    rocky_duckdb::dialect::DuckDbSqlDialect::plain();
 
 static POSTGRES_DIALECT: rocky_postgres::PostgresDialect =
     rocky_postgres::PostgresDialect::const_default();

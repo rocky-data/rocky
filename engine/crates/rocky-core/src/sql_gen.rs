@@ -1564,8 +1564,8 @@ pub fn archive_from_ir(
 ///
 /// // DuckDB's lexer reads no backslash escapes, so a quote is doubled and a
 /// // backslash stands for itself.
-/// assert_eq!(string_literal(&DuckDbSqlDialect, "it's"), "'it''s'");
-/// assert_eq!(string_literal(&DuckDbSqlDialect, r"C:\tmp"), r"'C:\tmp'");
+/// assert_eq!(string_literal(&DuckDbSqlDialect::plain(), "it's"), "'it''s'");
+/// assert_eq!(string_literal(&DuckDbSqlDialect::plain(), r"C:\tmp"), r"'C:\tmp'");
 /// ```
 #[must_use]
 pub fn string_literal(dialect: &dyn SqlDialect, value: &str) -> String {

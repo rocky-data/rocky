@@ -217,7 +217,7 @@ impl DuckDbWarehouseAdapter {
         let connector = DuckDbConnector::in_memory()?;
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: Some(crate::dialect::catalog_name_for_path(":memory:")),
         })
@@ -228,7 +228,7 @@ impl DuckDbWarehouseAdapter {
         let connector = DuckDbConnector::in_memory_with(opts)?;
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: Some(crate::dialect::catalog_name_for_path(":memory:")),
         })
@@ -247,7 +247,7 @@ impl DuckDbWarehouseAdapter {
         let connector = DuckDbConnector::open_with(path, opts)?;
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: Some(crate::dialect::catalog_name_for_path(
                 &path.to_string_lossy(),
@@ -259,7 +259,7 @@ impl DuckDbWarehouseAdapter {
     pub fn new(connector: DuckDbConnector) -> Self {
         Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: None,
         }
@@ -271,7 +271,7 @@ impl DuckDbWarehouseAdapter {
     pub fn from_shared(connector: Arc<Mutex<DuckDbConnector>>) -> Self {
         Self {
             connector,
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: None,
         }

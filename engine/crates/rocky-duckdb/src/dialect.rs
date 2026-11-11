@@ -52,9 +52,47 @@ fn watermark_literal(t: Option<&chrono::DateTime<chrono::Utc>>) -> String {
     format!("'{literal}+00:00'")
 }
 
-/// DuckDB SQL dialect.
-#[derive(Debug, Clone, Default)]
-pub struct DuckDbSqlDialect;
+/// DuckDB's SQL dialect. `iceberg_catalogs` names the attached catalogs that are
+/// Iceberg REST catalogs (lower-cased); it is empty for a plain DuckDB file or
+/// in-memory database. Nothing reads it yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DuckDbSqlDialect {
+    iceberg_catalogs: std::collections::BTreeSet<String>,
+}
+
+impl DuckDbSqlDialect {
+    /// The dialect of a DuckDB database with no attached Iceberg catalog.
+    #[must_use]
+    pub const fn plain() -> Self {
+        Self {
+            iceberg_catalogs: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// The dialect of a DuckDB database with these Iceberg catalogs attached.
+    #[must_use]
+    pub fn with_iceberg_catalogs<I, S>(catalogs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self {
+            iceberg_catalogs: catalogs
+                .into_iter()
+                .map(|c| c.as_ref().to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    /// Whether `catalog` is an attached Iceberg catalog (case-insensitive).
+    #[must_use]
+    pub fn is_iceberg_catalog(&self, catalog: &str) -> bool {
+        !self.iceberg_catalogs.is_empty()
+            && self
+                .iceberg_catalogs
+                .contains(&catalog.to_ascii_lowercase())
+    }
+}
 
 impl SqlDialect for DuckDbSqlDialect {
     fn name(&self) -> &'static str {
@@ -537,7 +575,7 @@ mod tests {
     /// is pinned in `rocky-core/tests/bisection_checksum.rs`.
     #[test]
     fn row_hash_expr_hashes_the_serialized_row() {
-        let sql = DuckDbSqlDialect
+        let sql = DuckDbSqlDialect::plain()
             .row_hash_expr(&["id".into(), "name".into()])
             .unwrap();
         assert_eq!(
@@ -547,7 +585,7 @@ mod tests {
     }
 
     fn dialect() -> DuckDbSqlDialect {
-        DuckDbSqlDialect
+        DuckDbSqlDialect::plain()
     }
 
     #[test]
