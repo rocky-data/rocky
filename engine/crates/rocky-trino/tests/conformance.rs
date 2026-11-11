@@ -249,7 +249,9 @@ async fn staged_replace_keeps_the_old_table_when_the_select_fails() {
         let stage = dialect
             .format_table_ref("memory", "default", &names.stage.table)
             .unwrap();
-        StagedSwap::new(dialect, names, dialect.create_table_as_new(&stage, select)).unwrap()
+        let build = dialect.create_table_as_new(&stage, select);
+        let create = dialect.create_table_as_new(&target_sql, select);
+        StagedSwap::new(dialect, names, build, create).unwrap()
     };
     let read = |sql: String| {
         let adapter = &adapter;
