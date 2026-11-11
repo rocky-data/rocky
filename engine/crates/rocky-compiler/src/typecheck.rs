@@ -635,7 +635,22 @@ fn compute_model_typecheck(
     let inferred_cols = inference.flatten();
     if let Some(inferred) = &inferred_cols {
         let mut inferred_by_name = HashMap::new();
+        // A name Rocky made up for an unaliased expression (`count` for
+        // `COUNT(*)`) is not matched against an output that really has that
+        // name: `SELECT COUNT(*), u.x AS count` must not give `count` the
+        // `COUNT`'s bits.
+        let real_names: HashSet<&str> = inferred
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !inferred.synthesized_names.contains(index))
+            .map(|(_, col)| col.name.as_str())
+            .collect();
         for (index, col) in inferred.columns.iter().enumerate() {
+            if inferred.synthesized_names.contains(&index) && real_names.contains(col.name.as_str())
+            {
+                continue;
+            }
             // Match semantic-graph star expansion, which keeps the first
             // occurrence when multiple relations expose the same name.
             inferred_by_name.entry(col.name.as_str()).or_insert((
@@ -3974,6 +3989,11 @@ pub(crate) struct SelectInference {
     /// through parentheses. Such an output's nullable bit is exact: it is
     /// NULL only when every argument is (#2553).
     coalesce_outputs: HashSet<usize>,
+    /// Outputs with no alias whose name Rocky made up from the expression
+    /// (`count` for `COUNT(*)`, `?column?`). The warehouse names them its
+    /// own way, so such a name says nothing about a real column of that
+    /// name.
+    synthesized_names: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -4298,14 +4318,16 @@ pub(crate) fn infer_query_types(
         for cte in &with.cte_tables {
             let inferred = {
                 let lookup = |name: &str| cte_relation(&ctes, name).or_else(|| (env.lookup)(name));
+                // A CTE Rocky cannot infer fails the query: lineage may still
+                // list its columns (through `*`), and inference would then
+                // have nothing to check them against.
                 infer_query_types(
                     &cte.query,
                     InferEnv {
                         lookup: &lookup,
                         target: env.target,
                     },
-                )
-                .unwrap_or_default()
+                )?
             };
             let mut columns = inferred.columns;
             rename_relation_columns(&mut columns, &cte.alias);
@@ -4429,6 +4451,7 @@ fn combine_set_operation(
         // A combined column may be NULL from any branch; the merge does not
         // narrow a set operation's nullability.
         coalesce_outputs: HashSet::new(),
+        synthesized_names: std::mem::take(&mut left.synthesized_names),
         set_operation: true,
         set_branches,
     })
@@ -4476,6 +4499,9 @@ fn infer_select_types_in_scope(
         let first = inferred.columns.len();
         match item {
             SelectItem::UnnamedExpr(expr) => {
+                if !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                    inferred.synthesized_names.insert(inferred.columns.len());
+                }
                 inferred.push_expression(expr_name(expr), expr, &type_scope);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
@@ -4858,8 +4884,19 @@ fn is_positional_join(previous: &TableFactor, join: &ast::JoinOperator) -> bool 
     let alias = match previous {
         TableFactor::Table { alias, .. }
         | TableFactor::Derived { alias, .. }
-        | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
-        _ => None,
+        | TableFactor::TableFunction { alias, .. }
+        | TableFactor::Function { alias, .. }
+        | TableFactor::UNNEST { alias, .. }
+        | TableFactor::JsonTable { alias, .. }
+        | TableFactor::OpenJsonTable { alias, .. }
+        | TableFactor::NestedJoin { alias, .. }
+        | TableFactor::Pivot { alias, .. }
+        | TableFactor::Unpivot { alias, .. }
+        | TableFactor::MatchRecognize { alias, .. }
+        | TableFactor::XmlTable { alias, .. }
+        | TableFactor::SemanticView { alias, .. } => alias.as_ref(),
+        // `UNPIVOT expr AS value`: its alias names a value, not the relation.
+        TableFactor::UnpivotExpr { .. } => None,
     };
     alias.is_some_and(|alias| {
         alias.name.quote_style.is_none() && alias.name.value.eq_ignore_ascii_case("positional")
@@ -6062,7 +6099,37 @@ mod tests {
             "SELECT x, COUNT(*) FROM t GROUP BY ALL WITH ROLLUP",
         ));
         assert!(matches!(keys, Some(SubtotalKeys::Any)));
+        // Spark's trailing grouping sets: the keys in the sets roll up, also
+        // one not in the list before them.
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x, COUNT(*) FROM t GROUP BY y GROUPING SETS ((x), ())",
+        ));
+        assert!(
+            matches!(&keys, Some(SubtotalKeys::Columns(keys)) if keys.iter().any(|k| k.name == "x")),
+            "a key inside the trailing sets rolls up"
+        );
         assert!(SubtotalKeys::of(&select("SELECT x, COUNT(*) FROM t GROUP BY x")).is_none());
+    }
+
+    /// A `WHERE` comparison does not clear `E022` under a rollup, also one
+    /// written `GROUP BY (ROLLUP(d))` (#2566).
+    #[test]
+    fn where_does_not_reject_null_under_a_parenthesised_rollup() {
+        let filter = "SELECT d, COUNT(*) AS n FROM t WHERE d >= '2024-01-01'";
+        assert!(where_rejects_null_column(
+            &format!("{filter} GROUP BY d"),
+            "d"
+        ));
+        for group_by in [
+            "GROUP BY ROLLUP(d)",
+            "GROUP BY (ROLLUP(d))",
+            "GROUP BY (CUBE(d))",
+        ] {
+            assert!(
+                !where_rejects_null_column(&format!("{filter} {group_by}"), "d"),
+                "{group_by}"
+            );
+        }
     }
 
     /// An output whose name lineage and inference spell differently (an
@@ -6084,12 +6151,17 @@ mod tests {
             "SELECT CAST(u.x AS INT), t.y FROM t LEFT JOIN u ON t.x = u.x",
             "SELECT b.x, a.x FROM t AS a JOIN u AS b ON a.x = b.x GROUP BY a.x, ROLLUP(b.x)",
             "SELECT b.x, a.x FROM t AS a LEFT JOIN u AS b ON a.x = b.x",
+            // A name Rocky makes up for an unaliased call is not a real
+            // column's name.
+            "SELECT COUNT(*), u.x AS count FROM t LEFT JOIN u ON t.x = u.x GROUP BY u.x",
+            "SELECT COUNT(*), x AS count FROM t GROUP BY ROLLUP(x)",
+            "SELECT COUNT(*), NULL AS count FROM t",
+            "SELECT COALESCE(t.x, 0), u.y AS coalesce FROM t LEFT JOIN u ON t.x = u.x",
         ] {
             let rows = typecheck_over(sql, &tables);
-            if rows
-                .iter()
-                .any(|(name, _, nullable)| name == "x" && !nullable)
-            {
+            if rows.iter().any(|(name, _, nullable)| {
+                matches!(name.as_str(), "x" | "count" | "coalesce") && !nullable
+            }) {
                 wrong.push(format!("{sql}: {rows:?}"));
             }
         }
@@ -6115,6 +6187,14 @@ mod tests {
             "WITH a AS (SELECT x, y FROM t UNION BY NAME SELECT y FROM t) SELECT x, y FROM a",
             "SELECT u.x, u.y FROM t POSITIONAL JOIN u",
             "SELECT t.x, t.y FROM t POSITIONAL JOIN u",
+            // The left side too, read through a bare name.
+            "SELECT COALESCE(x, x) AS x FROM t POSITIONAL JOIN (SELECT y AS w FROM u) AS d",
+            "SELECT u.x FROM t PIVOT (SUM(y) FOR n IN ('a')) POSITIONAL JOIN u",
+            // A `*` over a `BY NAME` CTE that lineage expands.
+            "WITH a AS (SELECT x, y FROM t UNION BY NAME SELECT y FROM t) \
+             SELECT * FROM a JOIN u ON TRUE",
+            "WITH a AS (SELECT x, y FROM t UNION BY NAME SELECT y FROM t), \
+             b AS (SELECT * FROM a) SELECT * FROM b, u",
         ] {
             let rows = typecheck_over(sql, &tables);
             if rows
