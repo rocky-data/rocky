@@ -43,3 +43,4 @@ These three ADRs were authored under adversarial review (Codex, 10 findings disp
 | ADR | Status | Closes |
 |---|---|---|
 | [`ADR-REPLACE.md`](ADR-REPLACE.md) | Accepted (advisor-ruled 2026-11-11, Hugo to confirm) | RD-009: a full refresh never leaves a missing table. Defines `TableReplace`, the staged swap with probes, rollback and recovery, and the DuckDB-Iceberg transactional overwrite the open-storage work builds on. Seeds are a follow-up. |
+| [`ADR-ICEBERG-DUCKDB.md`](ADR-ICEBERG-DUCKDB.md) | Accepted (advisor-ruled 2026-11-11, Hugo to confirm) | L-1: Iceberg tables through DuckDB and a REST catalog. The `[[attach]]` config, a config-carrying dialect, the `InPlaceOverwrite` replace, the v1 scope and its refusals. |
