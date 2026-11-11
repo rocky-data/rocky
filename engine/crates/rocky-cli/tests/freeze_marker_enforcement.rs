@@ -1017,3 +1017,150 @@ fn brief_notes_marker_list_failure() {
         "the note must qualify the all-clear; got: {note}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// scheduler parity: a scheduled run is fenced exactly as a manual one (#1416)
+// ---------------------------------------------------------------------------
+
+/// The scheduler's child is a bare `rocky run` whose only difference is its
+/// environment: `ROCKY_RUN_TRIGGER=schedule`, `ROCKY_SUBMISSION_ID`, and
+/// whatever `ROCKY_PRINCIPAL` the serve process carries (it neither sets nor
+/// removes it). This drives the same run with each of those environments and
+/// pins that the policy plane treats them identically: the same fence, the
+/// same exit, the same recorded status. Only the recorded trigger differs.
+///
+/// There is no `run` policy capability; a manual `rocky run` evaluates none,
+/// and a scheduled one must not either (stricter or looser would both break
+/// parity).
+#[tokio::test]
+async fn a_scheduled_run_is_fenced_exactly_like_a_manual_one() {
+    use rocky_core::state::RunTrigger;
+
+    let _serial = remote_testing::serial_guard();
+    let cases: [(&str, &[(&str, &str)], RunTrigger); 4] = [
+        ("manual", &[], RunTrigger::Manual),
+        (
+            "scheduled",
+            &[
+                ("ROCKY_RUN_TRIGGER", "schedule"),
+                ("ROCKY_SUBMISSION_ID", "sub-1"),
+            ],
+            RunTrigger::Schedule,
+        ),
+        (
+            "scheduled-agent",
+            &[
+                ("ROCKY_RUN_TRIGGER", "schedule"),
+                ("ROCKY_SUBMISSION_ID", "sub-2"),
+                ("ROCKY_PRINCIPAL", "agent"),
+            ],
+            RunTrigger::Schedule,
+        ),
+        (
+            "scheduled-human",
+            &[
+                ("ROCKY_RUN_TRIGGER", "schedule"),
+                ("ROCKY_SUBMISSION_ID", "sub-3"),
+                ("ROCKY_PRINCIPAL", "human"),
+            ],
+            RunTrigger::Schedule,
+        ),
+    ];
+    let keys = [
+        "ROCKY_RUN_TRIGGER",
+        "ROCKY_SUBMISSION_ID",
+        "ROCKY_PRINCIPAL",
+    ];
+
+    let mut outcomes = Vec::new();
+    for (label, env, want_trigger) in cases {
+        let harness = CrossPodHarness::new_s3_like();
+        let project = TwoModelProject::new();
+        freeze_marker::write_freeze_marker(
+            &harness.provider,
+            &seed_marker("f-sched", PolicyPrincipal::Agent, "model=keep"),
+        )
+        .await
+        .expect("seed marker");
+
+        // SAFETY: every test in this file that runs a pipeline holds
+        // `serial_guard`, so no other run reads these variables while they are
+        // set; they are cleared before the guard drops.
+        unsafe {
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            for (key, value) in env {
+                std::env::set_var(key, value);
+            }
+        }
+        let run_id = format!("run-parity-{label}");
+        let result = drive_run(
+            &project.config_path,
+            &project.state_path,
+            Some(&project.models_dir),
+            Some("keep"),
+            Some(&run_id),
+        )
+        .await;
+        unsafe {
+            for key in keys {
+                std::env::remove_var(key);
+            }
+        }
+
+        let err = result.expect_err("an agent freeze on `keep` fences every trigger");
+        let store = StateStore::open(&project.state_path).expect("open state");
+        let record = store
+            .get_run(&run_id)
+            .expect("read run record")
+            .expect("the fenced run is recorded");
+        assert_eq!(
+            std::mem::discriminant(&record.trigger),
+            std::mem::discriminant(&want_trigger),
+            "{label}: the trigger is the one difference, recorded as {:?}",
+            record.trigger
+        );
+        outcomes.push((
+            label,
+            format!("{err:#}").contains("model(s) failed"),
+            record.status,
+        ));
+    }
+
+    for (label, fenced, status) in &outcomes {
+        assert!(*fenced, "{label}: the exit is the recorded freeze failure");
+        assert_eq!(
+            *status,
+            RunStatus::Failure,
+            "{label}: recorded as a Failure"
+        );
+    }
+}
+
+/// The inert half of parity: without a freeze, every trigger runs to success.
+#[tokio::test]
+async fn a_scheduled_run_without_a_freeze_succeeds_like_a_manual_one() {
+    let _serial = remote_testing::serial_guard();
+    for (label, trigger) in [("manual", None), ("scheduled", Some("schedule"))] {
+        let _harness = CrossPodHarness::new_s3_like();
+        let project = TwoModelProject::new();
+        // SAFETY: as above; serialized by `serial_guard` and cleared after.
+        unsafe {
+            std::env::remove_var("ROCKY_RUN_TRIGGER");
+            if let Some(value) = trigger {
+                std::env::set_var("ROCKY_RUN_TRIGGER", value);
+            }
+        }
+        let result = drive_run(
+            &project.config_path,
+            &project.state_path,
+            Some(&project.models_dir),
+            Some("keep"),
+            Some(&format!("run-inert-{label}")),
+        )
+        .await;
+        unsafe { std::env::remove_var("ROCKY_RUN_TRIGGER") };
+        result.unwrap_or_else(|e| panic!("{label}: an unfrozen run succeeds: {e:#}"));
+    }
+}

@@ -371,6 +371,18 @@ clean:
 soak-scheduler *ARGS:
     bash scripts/soak-scheduler.sh {{ARGS}}
 
+# A 20-minute run that proves the soak harness end to end (not a memory result).
+soak-selfcheck *ARGS:
+    bash scripts/soak-scheduler.sh --self-check {{ARGS}}
+
+# Finish a soak whose harness was killed before its end step.
+soak-finish DIR:
+    bash scripts/soak-scheduler.sh --finish {{DIR}}
+
+# Both soak arms in Docker from a published engine image (run on the host).
+soak-docker VERSION *ARGS:
+    bash scripts/soak-docker.sh {{VERSION}} {{ARGS}}
+
 # Re-run the verdict over an existing soak directory.
 soak-verdict DIR:
     python3 scripts/soak_verdict.py {{DIR}}

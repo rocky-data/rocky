@@ -29,10 +29,36 @@
 # Usage:  bash scripts/soak-scheduler.sh [OUT_DIR]
 #         ROCKY_BIN=... DURATION_HOURS=24 SAMPLE_SECONDS=30 PORT=8420
 #         HARVEST_MODE=end  (unpolled arm: no /api/v1/runs read while sampling)
+#         bash scripts/soak-scheduler.sh --self-check [OUT_DIR]
+#             a 20-minute run (SELF_CHECK_MINUTES overrides) that proves the
+#             harness end to end. Too short for the memory gates, so a PASS
+#             says the harness works, never that memory is flat.
+#         bash scripts/soak-scheduler.sh --finish OUT_DIR
+#             finish a run whose harness was killed before its end step: read
+#             the ledger back from the state file, write the sentinels, and
+#             compute the verdict. serve must no longer be running.
 #
 # Exit 0 = PASS, 1 = FAIL, 2 = INCOMPLETE/INVALID, 3 = preflight aborted.
 #
-# NOT wired into CI: 24h exceeds every workflow budget in this repo.
+# STOPS. SIGTERM, SIGINT or SIGHUP end the sampling loop and run the same end
+# step a planned finish runs: a final harvest, a drain of serve, the end-mode
+# ledger read, the sentinels and the verdict. The DONE sentinel is written in
+# both cases, atomically, and says which it was (`"complete": false` and the
+# signal on a stop), so the verdict reports INCOMPLETE with the hours observed
+# and the gates computed over them. The end step needs time: give a container
+# `--stop-timeout 900` (Docker's default is 10 s, after which it sends
+# SIGKILL). `scripts/soak-docker.sh` does. If SIGKILL lands anyway, run
+# `--finish OUT_DIR`.
+#
+# SLEEP. Every sample records the wall clock and, on Linux, CLOCK_BOOTTIME
+# (`/proc/uptime`). A sampling gap past 3x the interval, or a wall-clock step
+# the boot clock did not take, is written to gaps.jsonl as it happens, and the
+# verdict marks the run INVALID with each gap's size. Inside a container the
+# harness cannot hold the HOST awake: `scripts/soak-docker.sh` runs
+# `caffeinate` on a macOS host for that.
+#
+# NOT a 24h CI job: 24h exceeds every workflow budget in this repo. The
+# self-check runs in CI (.github/workflows/soak-selfcheck.yml).
 
 # NOT `set -e`: `rocky doctor` exits nonzero on a Critical check and `curl`
 # exits nonzero on a 503, both of which are handled inline.
@@ -40,6 +66,23 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROCKY_BIN="${ROCKY_BIN:-$REPO/engine/target/release/rocky}"
+
+MODE=soak
+case "${1:-}" in
+  --self-check)
+    MODE=self-check
+    shift
+    DURATION_SECONDS=$(( ${SELF_CHECK_MINUTES:-20} * 60 ))
+    ;;
+  --finish)
+    MODE=finish
+    shift
+    ;;
+  -*)
+    echo "[soak] FATAL: unknown option '$1' (expected --self-check or --finish)" >&2
+    exit 3
+    ;;
+esac
 DURATION_HOURS="${DURATION_HOURS:-24}"
 SAMPLE_SECONDS="${SAMPLE_SECONDS:-30}"
 # Harvest far less often than we sample, because harvesting is NOT free and the
@@ -98,6 +141,40 @@ case "$HARVEST_MODE" in
   *) die "HARVEST_MODE must be 'poll' or 'end' (got '$HARVEST_MODE')" ;;
 esac
 
+# Write a file so a reader never sees half of it: a stop can land mid-write,
+# and a torn DONE would read as no DONE at all.
+write_atomic() { # PATH CONTENT
+  printf '%s\n' "$2" >"$1.tmp" && sync "$1.tmp" 2>/dev/null; mv -f "$1.tmp" "$1"
+}
+
+# Is this process running under a CPU translator (Rosetta, qemu-user)? The
+# kernel's /proc/cpuinfo describes the real CPU while `uname -m` reports the
+# emulated one, so a mismatch gives it away. A translator adds its own memory
+# to the RSS this soak measures, so the verdict refuses to judge such a run.
+# SOAK_EMULATED=1 (set by soak-docker.sh for a non-native platform) also counts.
+detect_emulation() {
+  local machine
+  machine=$(uname -m)
+  [[ "${SOAK_EMULATED:-}" == 1 ]] && { echo true; return; }
+  if [[ -r /proc/cpuinfo ]]; then
+    case "$machine" in
+      x86_64|i?86) grep -q '^CPU implementer' /proc/cpuinfo && { echo true; return; } ;;
+      aarch64|arm64) grep -q '^vendor_id' /proc/cpuinfo && { echo true; return; } ;;
+    esac
+  fi
+  echo false
+}
+
+# CLOCK_BOOTTIME in whole seconds, or empty where /proc/uptime does not exist
+# (macOS). It keeps counting through a suspend, while a paused VM's boot clock
+# stops and its wall clock jumps when it resyncs, so the pair tells the two
+# apart (see the gap check in the sampling loop).
+boot_seconds() {
+  local up _rest
+  [[ -r /proc/uptime ]] || return 0
+  read -r up _rest </proc/uptime && printf '%s' "${up%.*}"
+}
+
 # ---------------------------------------------------------------------------
 # Phase 0 — preconditions. Every one of these has cost a real debugging hour.
 # ---------------------------------------------------------------------------
@@ -128,6 +205,106 @@ fi
 # raise the ceiling so the gate observes the leak rather than its side effect.
 ulimit -n 10240 2>/dev/null || say "WARNING: could not raise ulimit -n (currently $(ulimit -n))"
 
+# ---------------------------------------------------------------------------
+# Shared functions: the ledger reads, used by the soak and by --finish.
+# ---------------------------------------------------------------------------
+# Run ids the children logged on their `run` span, one per line. `-R` +
+# `fromjson?` skips a torn or plain-text line instead of stopping there: parent
+# and child output interleave in one file (see soak_verdict.py `read_jsonl`), and
+# plain `jq` drops every line after the first one it cannot parse. The `run` span
+# may be the event's own span or an outer one in `spans`.
+logged_run_ids() { # FILE -> sorted unique run ids
+  jq -rR 'fromjson? | (.span, .spans[]?) | select(type=="object" and .name=="run") | .run_id // empty' \
+    "$1" 2>/dev/null | grep -E '^run-[0-9-]+$' | sort -u
+}
+
+harvest() { # -> appends projected Schedule runs, tagged with harvest time
+  local t=$1 body code
+  body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$BASE/api/v1/runs" 2>/dev/null)
+  code="${body##*$'\n'}"
+  if [[ "$code" != "200" ]]; then
+    # A 503 is the documented-retryable engine_busy; try once more.
+    sleep 2
+    body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$BASE/api/v1/runs" 2>/dev/null)
+    code="${body##*$'\n'}"
+  fi
+  if [[ "$code" == "200" ]]; then
+    printf '%s' "${body%$'\n'*}" | jq -c --argjson h "$t" '.runs[]
+      | select(.trigger=="Schedule")
+      | {h:$h, run_id, started_at, status, pipeline, submission_id, duration_ms}' \
+      >>"$OUT/harvest.jsonl" 2>/dev/null
+    return 0
+  fi
+  printf '{"t":%s,"code":"%s"}\n' "$t" "$code" >>"$OUT/harvest_errors.jsonl"
+  return 1
+}
+
+# HARVEST_MODE=end only; runs AFTER serve has exited, so nothing here can touch
+# serve's RSS. No CLI lists the whole run history (`rocky history` and
+# `GET /runs` both stop at the newest 50), so the ids come from the child runs'
+# own log spans and each row is then read back from the state file with
+# `history --run`. The newest-50 window is added too, so a recent row the log
+# never mentioned still lands in the ledger. A logged id the state file cannot
+# produce is counted in harvest_errors.jsonl and surfaces in G6 as an
+# execution with no durable record.
+harvest_from_state() { # -> same harvest.jsonl shape as harvest()
+  local t=$1 id raw="$OUT/harvest.raw" ids
+  : >"$raw"
+  ids=$(logged_run_ids "$OUT/serve.stderr.jsonl")
+  "$ROCKY_BIN" -c "$OUT/project/rocky.toml" --state-path "$STATE_PATH" --output json history \
+    >>"$raw" 2>/dev/null
+  for id in $ids; do
+    "$ROCKY_BIN" -c "$OUT/project/rocky.toml" --state-path "$STATE_PATH" --output json \
+      history --run "$id" >>"$raw" 2>/dev/null \
+      || printf '{"t":%s,"run_id":"%s","code":"history_run_failed"}\n' "$t" "$id" \
+        >>"$OUT/harvest_errors.jsonl"
+  done
+  jq -c --argjson h "$t" '.runs[]
+    | select(.trigger=="Schedule")
+    | {h:$h, run_id, started_at, status, pipeline, submission_id, duration_ms}' \
+    "$raw" >>"$OUT/harvest.jsonl"
+  say "read the run rows back from the state file ($(wc -w <<<"$ids") ids from the log)"
+}
+
+# The sentinels the verdict reads. DONE is written on EVERY ending the
+# harness lives to see, planned or not; `complete` is what tells "24h clean"
+# from "stopped at hour 21". Its absence now means the harness itself was
+# killed (SIGKILL, power loss) before its end step, which `--finish` repairs.
+write_done() { # END_EPOCH COMPLETE(true|false) REASON
+  local planned_end
+  planned_end=$(jq -r '.planned_end // 0' "$OUT/meta.json" 2>/dev/null || echo 0)
+  write_atomic "$OUT/DONE" "$(jq -cn --argjson end "$1" --argjson complete "$2" \
+    --arg reason "$3" --argjson planned_end "${planned_end:-0}" \
+    '{end:$end, complete:$complete, reason:$reason, planned_end:$planned_end}')"
+}
+
+if [[ "$MODE" == finish ]]; then
+  [[ -n "${1:-}" ]] || die "--finish needs the run directory"
+  [[ -s "$OUT/meta.json" ]] || die "no meta.json in $OUT — not a soak run directory"
+  STATE_PATH="$OUT/soak-state.redb"
+  [[ -f "$STATE_PATH" ]] || die "no state file at $STATE_PATH"
+  if [[ -s "$OUT/DONE" ]]; then
+    say "DONE already present; recomputing the verdict only"
+  else
+    # The state file must be quiet. serve holds the redb lock while it runs,
+    # so a live serve would make every read below fail or race.
+    pid=$(jq -r '.pid // empty' "$OUT/meta.json")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null \
+      && ps -o args= -p "$pid" 2>/dev/null | grep -q -- 'serve'; then
+      die "serve (pid $pid) is still running; stop it first"
+    fi
+    # Both modes read the state file: in poll mode it recovers the fires the
+    # last /runs poll never saw. harvest.jsonl is deduplicated by run id.
+    harvest_from_state "$(date +%s)"
+    last_t=$(tail -n 1 "$OUT/samples.jsonl" 2>/dev/null | jq -r '.t // empty' 2>/dev/null)
+    [[ -s "$OUT/serve.exit" ]] || write_atomic "$OUT/serve.exit" \
+      "$(jq -cn --argjson t "${last_t:-$(date +%s)}" '{exit:null, t:$t, expected:false}')"
+    write_done "${last_t:-$(date +%s)}" false "finished_offline"
+    say "wrote DONE (complete=false, finished offline)"
+  fi
+  python3 "$REPO/scripts/soak_verdict.py" "$OUT"
+  exit $?
+fi
 if lsof -i ":$PORT" >/dev/null 2>&1; then die "port $PORT is already in use"; fi
 
 # Hold a power assertion for the harness's lifetime. `-w $$` (not `caffeinate
@@ -231,6 +408,8 @@ echo "$out" | jq -e '.evaluated[] | select(.pipeline=="playground") | .sources[]
 pre_assert "schedule_block_attaches" $? "tick --dry-run must see a cron source for playground"
 
 PRE_PID=$(start_serve "$OUT/preflight.stderr.jsonl")
+# A stop during preflight has nothing to measure yet: stop serve, then abort.
+trap 'kill -TERM "$PRE_PID" 2>/dev/null; wait "$PRE_PID" 2>/dev/null; die "stopped by a signal during preflight"' TERM INT HUP
 wait_for_health
 pre_assert "server_binds_and_answers_health" $? "no 200 from /api/v1/health within 60s"
 
@@ -286,27 +465,19 @@ pre_assert "tick_line_carries_executed_field" $? \
   doctor --check scheduler 2>/dev/null | jq -e '.checks[] | select(.name=="scheduler")' >/dev/null 2>&1
 pre_assert "doctor_exposes_the_scheduler_check" $? "doctor --check scheduler emitted no 'scheduler' check"
 
-# Run ids the children logged on their `run` span, one per line. `-R` +
-# `fromjson?` skips a torn or plain-text line instead of stopping there: parent
-# and child output interleave in one file (see soak_verdict.py `read_jsonl`), and
-# plain `jq` drops every line after the first one it cannot parse. The `run` span
-# may be the event's own span or an outer one in `spans`.
-logged_run_ids() { # FILE -> sorted unique run ids
-  jq -rR 'fromjson? | (.span, .spans[]?) | select(type=="object" and .name=="run") | .run_id // empty' \
-    "$1" 2>/dev/null | grep -E '^run-[0-9-]+$' | sort -u
-}
 
 # The end-mode ledger is rebuilt from the run ids the children log, so prove the
 # log carries them BEFORE the clock starts, with the same extraction the ledger
 # uses. `poll` mode never reads them.
 if [[ "$HARVEST_MODE" == end ]]; then
-  [[ -n "$(logged_run_ids "$OUT/preflight.stderr.jsonl")" ]]
-  pre_assert "child_log_carries_run_id" $? \
+  if [[ -n "$(logged_run_ids "$OUT/preflight.stderr.jsonl")" ]]; then ok=0; else ok=1; fi
+  pre_assert "child_log_carries_run_id" "$ok" \
     "no run_id span in serve stderr — HARVEST_MODE=end could not find the runs to read back"
 fi
 
 kill -TERM "$PRE_PID" 2>/dev/null
 wait "$PRE_PID" 2>/dev/null
+trap - TERM INT HUP
 say "preflight: complete"
 
 if [[ "$PRE_OK" != true ]]; then
@@ -349,11 +520,13 @@ jq -n \
   --argjson drain "$DRAIN_SECONDS" --argjson port "$PORT" \
   --argjson token_was_set "$TOKEN_WAS_SET" \
   --argjson ulimit "$(ulimit -n)" \
+  --arg machine "$(uname -m)" --argjson emulated "$(detect_emulation)" \
   '{binary:$bin, version:$version, git_sha:$sha, branch:$branch, state_path:$state_path,
     t0:$t0, planned_end:$end_ts, pid:$pid, sample_interval:$sample, harvest_interval:$harvest, harvest_mode:$harvest_mode,
     poll_interval:$poll,
     drain_timeout:$drain, port:$port, cron:"* * * * *", timezone:"UTC", catchup:"latest",
-    retry_max:0, serve_token_was_unset:$token_was_set, ulimit_n:$ulimit}' \
+    retry_max:0, serve_token_was_unset:$token_was_set, ulimit_n:$ulimit,
+    machine:$machine, emulated:$emulated}' \
   >"$OUT/meta.json" || die "meta.json write failed (jq)"
 # The verdict hard-depends on meta.json; an empty file must abort the soak
 # NOW, not surface as INVALID after 24 hours.
@@ -365,59 +538,52 @@ jq -n \
 # delay the harvest. Absolute scheduling so per-iteration cost never drifts the
 # cadence.
 # ---------------------------------------------------------------------------
-harvest() { # -> appends projected Schedule runs, tagged with harvest time
-  local t=$1 body code
-  body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$BASE/api/v1/runs" 2>/dev/null)
-  code="${body##*$'\n'}"
-  if [[ "$code" != "200" ]]; then
-    # A 503 is the documented-retryable engine_busy; try once more.
-    sleep 2
-    body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$BASE/api/v1/runs" 2>/dev/null)
-    code="${body##*$'\n'}"
-  fi
-  if [[ "$code" == "200" ]]; then
-    printf '%s' "${body%$'\n'*}" | jq -c --argjson h "$t" '.runs[]
-      | select(.trigger=="Schedule")
-      | {h:$h, run_id, started_at, status, pipeline, submission_id, duration_ms}' \
-      >>"$OUT/harvest.jsonl" 2>/dev/null
-    return 0
-  fi
-  printf '{"t":%s,"code":"%s"}\n' "$t" "$code" >>"$OUT/harvest_errors.jsonl"
-  return 1
-}
 
-# HARVEST_MODE=end only; runs AFTER serve has exited, so nothing here can touch
-# serve's RSS. No CLI lists the whole run history (`rocky history` and
-# `GET /runs` both stop at the newest 50), so the ids come from the child runs'
-# own log spans and each row is then read back from the state file with
-# `history --run`. The newest-50 window is added too, so a recent row the log
-# never mentioned still lands in the ledger. A logged id the state file cannot
-# produce is counted in harvest_errors.jsonl and surfaces in G6 as an
-# execution with no durable record.
-harvest_from_state() { # -> same harvest.jsonl shape as harvest()
-  local t=$1 id raw="$OUT/harvest.raw" ids
-  : >"$raw"
-  ids=$(logged_run_ids "$OUT/serve.stderr.jsonl")
-  "$ROCKY_BIN" -c "$OUT/project/rocky.toml" --state-path "$STATE_PATH" --output json history \
-    >>"$raw" 2>/dev/null
-  for id in $ids; do
-    "$ROCKY_BIN" -c "$OUT/project/rocky.toml" --state-path "$STATE_PATH" --output json \
-      history --run "$id" >>"$raw" 2>/dev/null \
-      || printf '{"t":%s,"run_id":"%s","code":"history_run_failed"}\n' "$t" "$id" \
-        >>"$OUT/harvest_errors.jsonl"
-  done
-  jq -c --argjson h "$t" '.runs[]
-    | select(.trigger=="Schedule")
-    | {h:$h, run_id, started_at, status, pipeline, submission_id, duration_ms}' \
-    "$raw" >>"$OUT/harvest.jsonl"
-  say "read the run rows back from the state file ($(wc -w <<<"$ids") ids from the log)"
-}
+
+# A stop only sets a flag; the loop sees it within one interval and leaves
+# through the same end step as a planned finish. Bash runs a trap between
+# commands, so the sleep below runs in the background and `wait` (which a
+# signal interrupts) waits for it; a foreground `sleep 30` would hold the
+# trap for up to 30 s.
+STOP_SIGNAL=""
+trap 'STOP_SIGNAL=TERM' TERM
+trap 'STOP_SIGNAL=INT' INT
+trap 'STOP_SIGNAL=HUP' HUP
 
 say "sampling every ${SAMPLE_SECONDS}s, harvesting: $([[ "$HARVEST_MODE" == end ]] && echo "never (end-of-run read)" || echo "every ${HARVEST_SECONDS}s")"
+: >"$OUT/gaps.jsonl"
 n=0
 LAST_HARVEST=0
-while (( $(date +%s) < END )); do
+PREV_T=""
+PREV_UP=""
+# A gap is a sampling spacing past 3x the interval: the verdict's own G0
+# threshold. A clock step is the wall clock moving 10 s more (or less) than
+# the boot clock across one spacing; a 30 s spacing never drifts that far.
+GAP_LIMIT=$(( 3 * SAMPLE_SECONDS ))
+while [[ -z "$STOP_SIGNAL" ]] && (( $(date +%s) < END )); do
   T=$(date +%s)
+  UP=$(boot_seconds)
+
+  # The sleep detector. It writes as it goes, so a run that dies after a sleep
+  # still carries the evidence, and a reader can see a sleep mid-run.
+  if [[ -n "$PREV_T" ]]; then
+    wall_gap=$(( T - PREV_T ))
+    boot_gap=""
+    [[ -n "$UP" && -n "$PREV_UP" ]] && boot_gap=$(( UP - PREV_UP ))
+    kind=""
+    if (( wall_gap > GAP_LIMIT )); then
+      kind=sampling_gap
+    elif [[ -n "$boot_gap" ]] && (( wall_gap - boot_gap > 10 || boot_gap - wall_gap > 10 )); then
+      kind=clock_step
+    fi
+    if [[ -n "$kind" ]]; then
+      printf '{"kind":"%s","from":%s,"to":%s,"wall_gap_s":%s,"boot_gap_s":%s}\n' \
+        "$kind" "$PREV_T" "$T" "$wall_gap" "${boot_gap:-null}" >>"$OUT/gaps.jsonl"
+      say "WARNING: $kind of ${wall_gap}s wall / ${boot_gap:-?}s boot clock — host sleep or a paused VM; this run will be INVALID"
+    fi
+  fi
+  PREV_T=$T
+  PREV_UP=$UP
 
   if ! kill -0 "$SERVE_PID" 2>/dev/null; then
     printf '{"t":%s,"alive":0}\n' "$T" >>"$OUT/samples.jsonl"
@@ -451,21 +617,42 @@ while (( $(date +%s) < END )); do
       else oth++ }
     END{printf "%d %d %d %d %d %d\n", tot+0, redb+0, lock+0, tr+0, tcp+0, oth+0}')
 
-  printf '{"t":%s,"alive":1,"health":"%s","harvest":"%s","rss_kb":%s,"vsz_kb":%s,"stat":"%s","children":%s,"zombies":%s,"fd_total":%s,"fd_redb":%s,"fd_lock":%s,"fd_traces":%s,"fd_tcp":%s,"fd_other":%s}\n' \
-    "$T" "${HCODE:-000}" "$HARV" "${RSS:-null}" "${VSZ:-null}" "${STAT:-?}" \
+  printf '{"t":%s,"up":%s,"alive":1,"health":"%s","harvest":"%s","rss_kb":%s,"vsz_kb":%s,"stat":"%s","children":%s,"zombies":%s,"fd_total":%s,"fd_redb":%s,"fd_lock":%s,"fd_traces":%s,"fd_tcp":%s,"fd_other":%s}\n' \
+    "$T" "${UP:-null}" "${HCODE:-000}" "$HARV" "${RSS:-null}" "${VSZ:-null}" "${STAT:-?}" \
     "${CHILD:-null}" "${ZOMB:-null}" "${FTOT:-null}" "${FREDB:-null}" \
     "${FLOCK:-null}" "${FTRC:-null}" "${FTCP:-null}" "${FOTH:-null}" \
     >>"$OUT/samples.jsonl"
 
-  n=$(( n + 1 ))
-  NEXT=$(( T0 + n * SAMPLE_SECONDS ))
+  # Absolute scheduling. After a gap, jump to the next slot instead of firing
+  # every missed slot back to back: a burst of 1 s spacings is noise in the
+  # series, and the run is already INVALID for the gap.
   NOW=$(date +%s)
-  (( NEXT > NOW )) && sleep $(( NEXT - NOW ))
+  n=$(( (NOW - T0) / SAMPLE_SECONDS + 1 ))
+  NEXT=$(( T0 + n * SAMPLE_SECONDS ))
+  if (( NEXT > NOW )) && [[ -z "$STOP_SIGNAL" ]]; then
+    sleep $(( NEXT - NOW )) &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    # A signal interrupts `wait`; do not leave the sleep behind.
+    [[ -n "$STOP_SIGNAL" ]] && kill "$SLEEP_PID" 2>/dev/null
+  fi
 done
 
 # ---------------------------------------------------------------------------
-# Phase 5 — final harvest, shutdown, verdict
+# Phase 5 — the end step: final harvest, shutdown, sentinels, verdict. A
+# planned finish and a stop take this same path.
 # ---------------------------------------------------------------------------
+# A second signal must not cut the end step short; the container runtime's own
+# SIGKILL at the end of its grace is the hard limit (see the header).
+trap '' TERM INT HUP
+STOP_AT=$(date +%s)
+if [[ -n "$STOP_SIGNAL" ]]; then
+  say "stopped by SIG$STOP_SIGNAL $(( (STOP_AT - T0) / 60 )) min into a $(( DURATION / 60 )) min run; running the end step"
+  # Say so on disk before anything slow, so even a SIGKILL during the drain
+  # leaves the cause behind.
+  write_atomic "$OUT/STOPPED" "$(jq -cn --argjson t "$STOP_AT" --arg sig "SIG$STOP_SIGNAL" '{t:$t, signal:$sig}')"
+fi
+
 # The loop's last harvest can be up to SAMPLE_SECONDS stale; harvest again
 # BEFORE the SIGTERM so a trailing fire is not lost to the ledger.
 ALIVE_AT_END=false
@@ -488,12 +675,19 @@ fi
 printf '{"exit":%s,"t":%s,"expected":%s}\n' \
   "$EXIT_CODE" "$(date +%s)" "$ALIVE_AT_END" >"$OUT/serve.exit"
 
-# DONE is written ONLY on the planned path — its absence is how the verdict
-# tells "24h clean" from "died at hour 12".
-if [[ "$ALIVE_AT_END" == true ]]; then
-  printf '{"end":%s}\n' "$(date +%s)" >"$OUT/DONE"
+# DONE is complete ONLY on the planned path, with serve alive to the end.
+if [[ -n "$STOP_SIGNAL" ]]; then
+  write_done "$STOP_AT" false "signal:SIG$STOP_SIGNAL"
+elif [[ "$ALIVE_AT_END" == true ]]; then
+  write_done "$STOP_AT" true "planned"
+else
+  write_done "$STOP_AT" false "serve_died"
 fi
 
 say "computing verdict"
 python3 "$REPO/scripts/soak_verdict.py" "$OUT"
-exit $?
+VERDICT_EXIT=$?
+if [[ "$MODE" == self-check ]]; then
+  say "self-check ($(( DURATION / 60 )) min): verdict exit $VERDICT_EXIT — a PASS proves the harness, not flat memory"
+fi
+exit "$VERDICT_EXIT"

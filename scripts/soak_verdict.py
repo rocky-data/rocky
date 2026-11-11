@@ -19,6 +19,7 @@ must never be able to masquerade as a scheduler bug.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 import pathlib
 import sys
@@ -47,6 +48,21 @@ def read_jsonl(path: pathlib.Path) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def read_json(path: pathlib.Path) -> dict | None:
+    """A sentinel file, or None when it is absent, empty or torn.
+
+    The harness writes its sentinels atomically, but an older harness did not,
+    and a torn sentinel must read as missing rather than abort the verdict.
+    """
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def parse_ts(value: str) -> dt.datetime:
@@ -207,14 +223,51 @@ def gate_completeness(run: dict) -> list[dict]:
     findings = []
     meta, samples = run["meta"], run["samples"]
 
-    if not run["done"]:
+    done = run["done"]
+    if not done:
         exitinfo = run["exit"] or {}
         findings.append(
             {
                 "gate": "G0",
                 "status": "INCOMPLETE",
-                "detail": "no DONE sentinel — the harness did not reach its planned end",
+                "detail": "no DONE sentinel — the harness was killed before its end step "
+                "(SIGKILL or power loss; a stop by SIGTERM/SIGINT/SIGHUP writes one). "
+                "`scripts/soak-scheduler.sh --finish <dir>` reads the ledger back and "
+                "writes it",
                 "serve_exit": exitinfo,
+            }
+        )
+    elif done.get("complete") is False:
+        # A DONE that predates the `complete` field (`{"end": ...}`) was only
+        # ever written on the planned path, so a missing field reads as complete.
+        observed_h = (
+            (samples[-1]["t"] - samples[0]["t"]) / 3600.0 if len(samples) > 1 else 0.0
+        )
+        planned_h = (meta.get("planned_end", 0) - meta.get("t0", 0)) / 3600.0
+        findings.append(
+            {
+                "gate": "G0",
+                "status": "INCOMPLETE",
+                "cause": "early_stop",
+                "detail": f"the run stopped early ({done.get('reason', 'unknown reason')}) after "
+                f"{observed_h:.2f}h of a planned {planned_h:.2f}h. The end step ran, so the "
+                "ledger is whole; see `partial` for the gates over the hours observed. It "
+                "is not a soak result: the final-quarter window is the planned run's.",
+            }
+        )
+
+    # A CPU translator (Rosetta, qemu-user) adds its own memory to the RSS the
+    # memory gates judge, so an emulated run is evidence for no platform. It
+    # still proves the harness runs there.
+    if meta.get("emulated") is True:
+        findings.append(
+            {
+                "gate": "G0",
+                "status": "INVALID",
+                "cause": "emulated",
+                "detail": f"the binary ran under CPU emulation ({meta.get('machine', '?')} on a "
+                "different host CPU). Its RSS includes the translator's memory, so this run "
+                "is a harness check, not evidence for that platform. Run it on a native host.",
             }
         )
 
@@ -251,33 +304,73 @@ def gate_completeness(run: dict) -> list[dict]:
 
     interval = meta.get("sample_interval", 30)
     times = [s["t"] for s in samples]
-    gaps = [(b - a) for a, b in zip(times, times[1:])]
-    worst = max(gaps) if gaps else 0
-    if worst > 3 * interval:
-        idx = gaps.index(worst)
+    # Every gap, not just the worst: a reader re-running a sleeping host needs
+    # to know how many times and for how long it slept.
+    sleeps = [
+        {"from": a["t"], "to": b["t"], "wall_gap_s": b["t"] - a["t"]}
+        for a, b in itertools.pairwise(samples)
+        if b["t"] - a["t"] > 3 * interval
+    ]
+    # A clock step: the wall clock moved and the boot clock (CLOCK_BOOTTIME,
+    # `up`, Linux only) did not move with it. A paused VM does this on resume
+    # when it resyncs; the spacing alone can look normal if the step is small.
+    steps = []
+    for a, b in itertools.pairwise(samples):
+        if a.get("up") is None or b.get("up") is None:
+            continue
+        drift = (b["t"] - a["t"]) - (b["up"] - a["up"])
+        if abs(drift) > 10 and b["t"] - a["t"] <= 3 * interval:
+            steps.append({"from": a["t"], "to": b["t"], "wall_minus_boot_s": drift})
+    # The harness's own live record, for a gap the samples cannot show (the
+    # harness writes it even when it dies before the next sample lands).
+    logged = [g for g in run.get("gaps", []) if g.get("kind")]
+    if sleeps or steps or logged:
+        total = sum(g["wall_gap_s"] for g in sleeps)
+        first = (sleeps or steps or logged)[0]
+        parts = []
+        if sleeps:
+            parts.append(
+                f"{len(sleeps)} sampling gap(s) past 3x the {interval}s interval, "
+                f"{total}s in all, the longest {max(g['wall_gap_s'] for g in sleeps)}s "
+                f"(first from epoch {sleeps[0]['from']} to {sleeps[0]['to']})"
+            )
+        if steps:
+            parts.append(f"{len(steps)} wall-clock step(s) the boot clock did not take")
+        if logged and not (sleeps or steps):
+            parts.append(f"{len(logged)} gap(s) the harness logged live (gaps.jsonl)")
         findings.append(
             {
                 "gate": "G0",
                 "status": "INVALID",
-                "detail": (
-                    f"sampling gap of {worst}s (>3x the {interval}s interval) "
-                    f"between epoch {times[idx]} and {times[idx + 1]} — "
-                    "almost certainly host sleep, which coalesces occurrences "
-                    "under catchup=latest and is indistinguishable from missed fires"
-                ),
+                "cause": "host_sleep",
+                "detail": "; ".join(parts) + " — host sleep or a paused VM, which coalesces "
+                "occurrences under catchup=latest and is indistinguishable from missed fires. "
+                "Re-run on a host that cannot sleep.",
+                "gaps": sleeps[:20],
+                "clock_steps": steps[:20],
+                "first": first,
             }
         )
+        run["metrics"]["sleep"] = {
+            "gaps": len(sleeps),
+            "gap_total_s": total,
+            "clock_steps": len(steps),
+            "logged": len(logged),
+        }
 
     observed = times[-1] - times[0]
     planned = meta.get("planned_end", 0) - meta.get("t0", 0)
     if planned and observed < planned - 2 * interval:
-        findings.append(
-            {
-                "gate": "G0",
-                "status": "INVALID",
-                "detail": f"observed {observed}s of samples vs {planned}s planned",
-            }
-        )
+        finding = {
+            "gate": "G0",
+            "status": "INVALID",
+            "detail": f"observed {observed}s of samples vs {planned}s planned",
+        }
+        if done and done.get("complete") is False:
+            # Already reported above, with the reason; this is its consequence.
+            finding["cause"] = "early_stop"
+            finding["status"] = "INCOMPLETE"
+        findings.append(finding)
 
     null_fd = sum(1 for s in samples if s.get("fd_total") is None)
     if samples and null_fd / len(samples) > 0.05:
@@ -864,16 +957,40 @@ def load(run_dir: pathlib.Path) -> dict:
         "harvest": harvest,
         "fires": dedup_fires(harvest),
         "ticks": ticks,
-        "done": json.loads(done_path.read_text()) if done_path.exists() else None,
-        "exit": json.loads(exit_path.read_text()) if exit_path.exists() else None,
+        "done": read_json(done_path),
+        "gaps": read_jsonl(run_dir / "gaps.jsonl"),
+        "exit": read_json(exit_path),
         "harvest_errors": read_jsonl(run_dir / "harvest_errors.jsonl"),
         "fd_limit_errors": raw.count("too many open files"),
         "metrics": {},
     }
 
 
-def analyse(run: dict) -> dict:
+def partial_run(run: dict) -> dict | None:
+    """The same run, cut at its last sample and treated as planned to end there.
+
+    Only for a run whose sole blocking finding is an early stop: the gates
+    then say what the hours that WERE observed show, which is what a reader of
+    a stopped run otherwise works out by hand. It never changes the verdict.
+    """
+    samples = run["samples"]
+    if len(samples) < 2:
+        return None
+    end = samples[-1]["t"]
+    cut = dict(run)
+    cut["meta"] = dict(run["meta"], planned_end=end)
+    cut["done"] = {"end": end, "complete": True, "reason": "partial"}
+    cut["metrics"] = {}
+    return cut
+
+
+def analyse(run: dict, *, partial: bool = True) -> dict:
     findings = gate_completeness(run)
+    stop_only = bool(findings) and all(
+        f.get("cause") == "early_stop"
+        for f in findings
+        if f["status"] in ("INCOMPLETE", "CRASHED", "INVALID")
+    )
     blocking = [f for f in findings if f["status"] in ("INCOMPLETE", "CRASHED", "INVALID")]
     if not blocking:
         findings += gate_fires(run)
@@ -890,7 +1007,7 @@ def analyse(run: dict) -> dict:
     else:
         verdict = "PASS"
 
-    return {
+    result = {
         "verdict": verdict,
         "run_dir": run["dir"],
         "meta": run["meta"],
@@ -898,6 +1015,19 @@ def analyse(run: dict) -> dict:
         "findings": findings,
         "harvest_error_count": len(run["harvest_errors"]),
     }
+    if partial and stop_only:
+        cut = partial_run(run)
+        if cut is not None:
+            sub = analyse(cut, partial=False)
+            result["partial"] = {
+                "observed_h": round(
+                    (run["samples"][-1]["t"] - run["samples"][0]["t"]) / 3600.0, 2
+                ),
+                "verdict": sub["verdict"],
+                "metrics": sub["metrics"],
+                "findings": sub["findings"],
+            }
+    return result
 
 
 EXIT = {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2, "INVALID": 2, "CRASHED": 2}
@@ -1232,6 +1362,75 @@ def self_test() -> int:
         f["started_at"] = f["started_at"].replace(":03Z", ":35Z")
     check("systematic lateness is INVALID", analyse(many_late)["verdict"], "INVALID")
 
+    # A stop the harness lived through (SIGTERM from `docker stop`, a daemon
+    # restart) writes DONE with complete=false. It is INCOMPLETE, never PASS,
+    # and the gates over the hours observed come back as an advisory `partial`.
+    def stopped_at(minutes_run: int, **kw) -> dict:
+        r = synth(day, **kw)
+        cut = r["meta"]["t0"] + minutes_run * 60
+        r["samples"] = [x for x in r["samples"] if x["t"] < cut]
+        r["harvest"] = [h for h in r["harvest"] if parse_ts(h["started_at"]).timestamp() < cut]
+        r["fires"] = dedup_fires(r["harvest"])
+        r["ticks"] = r["ticks"][: len(r["fires"])]
+        r["done"] = {"end": cut, "complete": False, "reason": "signal:SIGTERM"}
+        return r
+
+    stop = analyse(stopped_at(1284))  # 21.4h, the engine 1.91.0 run
+    check("a stopped run is INCOMPLETE", stop["verdict"], "INCOMPLETE")
+    check("...with a partial verdict", stop.get("partial", {}).get("verdict"), "PASS")
+    check(
+        "...whose final quarter was evaluated",
+        gate_status(stop["partial"], "G3b") if "partial" in stop else "none",
+        "INFO",
+    )
+    stop_leak = analyse(stopped_at(1284, rss=lambda x: 50_000 + 490.0 * x / 3600.0))
+    check("a stopped leaking run is still INCOMPLETE", stop_leak["verdict"], "INCOMPLETE")
+    check("...and its partial verdict catches the leak", stop_leak["partial"]["verdict"], "FAIL")
+    legacy = synth(180)
+    legacy["done"] = {"end": legacy["done"]["end"]}
+    check("a DONE without `complete` (older harness) is complete", analyse(legacy)["verdict"], "PASS")
+    stop_crash = stopped_at(600)
+    stop_crash["samples"][-1]["alive"] = 0
+    crash_result = analyse(stop_crash)
+    check(
+        "a death in a stopped run is reported",
+        any(f["status"] == "CRASHED" for f in crash_result["findings"]),
+        True,
+    )
+    check("...and gets no partial verdict", "partial" in crash_result, False)
+
+    # Sleep: a wall-clock step the boot clock did not take is INVALID even when
+    # the spacing looks normal, and the harness's live gap log counts on its own.
+    stepped = synth(180)
+    for i, x in enumerate(stepped["samples"]):
+        x["up"] = 5_000 + i * 30 - (60 if i >= 200 else 0)
+    stepped_result = analyse(stepped)
+    check("a clock step without a spacing gap is INVALID", stepped_result["verdict"], "INVALID")
+    check(
+        "...attributed to sleep",
+        [f.get("cause") for f in stepped_result["findings"] if f["status"] == "INVALID"],
+        ["host_sleep"],
+    )
+    steady = synth(180)
+    for i, x in enumerate(steady["samples"]):
+        x["up"] = 5_000 + i * 30
+    check("a steady boot clock passes", analyse(steady)["verdict"], "PASS")
+    live_gap = synth(180)
+    live_gap["gaps"] = [{"kind": "sampling_gap", "from": 1, "to": 200, "wall_gap_s": 199}]
+    check("a gap the harness logged live is INVALID", analyse(live_gap)["verdict"], "INVALID")
+    two_sleeps = synth(180)
+    del two_sleeps["samples"][300:310]
+    del two_sleeps["samples"][40:50]
+    sleep_metrics = analyse(two_sleeps)["metrics"].get("sleep", {})
+    check("every sleep gap is counted, not just the worst", sleep_metrics.get("gaps"), 2)
+
+    emulated = synth(180)
+    emulated["meta"]["emulated"] = True
+    check("an emulated run is INVALID", analyse(emulated)["verdict"], "INVALID")
+    native = synth(180)
+    native["meta"]["emulated"] = False
+    check("a native run is judged", analyse(native)["verdict"], "PASS")
+
     for line in failures:
         print(f"  SELF-TEST FAIL: {line}")
     print(f"self-test: {'PASS' if not failures else str(len(failures)) + ' FAILURE(S)'}")
@@ -1285,6 +1484,12 @@ def main() -> int:
                 print(f"        {cls}: {v['delta']:+.0f}")
     for finding in result["findings"]:
         print(f"  [{finding['status']}] {finding['gate']}: {finding['detail']}")
+    if "partial" in result:
+        part = result["partial"]
+        print(f"\n  partial verdict over the {part['observed_h']:.2f}h observed: {part['verdict']} "
+              "(advisory: the run is still INCOMPLETE)")
+        for finding in part["findings"]:
+            print(f"    [{finding['status']}] {finding['gate']}: {finding['detail']}")
     print(f"\n  full report: {run_dir / 'verdict.json'}\n")
 
     return EXIT[result["verdict"]]
