@@ -313,7 +313,7 @@ pub struct ModelConfig {
     pub skip: Option<SkipConfig>,
 
     /// Pre-substitution value of the `name` field as it appeared in the
-    /// sidecar TOML (or the filename stem when `name` was omitted).
+    /// sidecar TOML, or empty when the sidecar omits `name`.
     ///
     /// Captured before `${VAR}` / `${VAR:-default}` env substitution so
     /// lint rules that judge author intent (L001 — name matches filename)
@@ -325,7 +325,7 @@ pub struct ModelConfig {
     pub name_declared: String,
 
     /// Pre-substitution value of `target.table` as it appeared in the
-    /// sidecar TOML (or `name_declared` when `target.table` was omitted).
+    /// sidecar TOML, or empty when the sidecar omits `target.table`.
     ///
     /// Captured before env substitution so L002 (target.table matches
     /// name) can compare raw templates against raw templates — a
@@ -1435,10 +1435,10 @@ fn resolve_group_schema(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DeclaredModelFields {
     /// Raw `name` as it appeared in the sidecar, pre-substitution.
-    /// Defaults to the filename stem when omitted.
+    /// `None` when omitted.
     pub name: Option<String>,
     /// Raw `target.table` as it appeared in the sidecar, pre-substitution.
-    /// Defaults to `name` (declared) when omitted.
+    /// `None` when omitted.
     pub target_table: Option<String>,
 }
 
@@ -1454,7 +1454,9 @@ fn resolve_model_config(
     declared: DeclaredModelFields,
 ) -> Result<ModelConfig, ModelError> {
     let name = raw.name.unwrap_or_else(|| file_stem.to_string());
-    let name_declared = declared.name.unwrap_or_else(|| file_stem.to_string());
+    // Empty when omitted: the L001/L002 lints say "you can omit it", which
+    // is only true of a key the author wrote.
+    let name_declared = declared.name.unwrap_or_default();
 
     // Resolve the opted-into config group (if any) once. An unknown group is a
     // hard error so a typo doesn't silently skip the shared routing/strategy.
@@ -1639,9 +1641,7 @@ fn resolve_model_config(
         })?;
 
     let table = raw_target.table.unwrap_or_else(|| name.clone());
-    let target_table_declared = declared
-        .target_table
-        .unwrap_or_else(|| name_declared.clone());
+    let target_table_declared = declared.target_table.unwrap_or_default();
 
     // Parse `retention = "<N>[dy]"` into a typed RetentionPolicy. Garbage
     // inputs surface as ModelError::InvalidRetention so the diagnostic
@@ -5122,13 +5122,12 @@ SELECT 1
         );
     }
 
-    /// When the sidecar omits `name` and/or `target.table` entirely, the
-    /// declared values must fall back to the same chain the resolved
-    /// values use — filename stem for `name`, and `name_declared` for
-    /// `target.table` — so the lints behave identically on minimal
-    /// configs that never touched env substitution.
+    /// When the sidecar omits `name` and/or `target.table`, the resolved
+    /// values fall back to the filename stem, but the declared values stay
+    /// empty. The author wrote neither key, so the L001/L002 lints ("you
+    /// can omit it") must not fire.
     #[test]
-    fn test_declared_fields_fallback_to_filename_stem() {
+    fn test_declared_fields_are_empty_when_omitted() {
         let content = r#"---toml
 [target]
 catalog = "analytics"
@@ -5140,8 +5139,8 @@ SELECT 1
         let model = parse_model_inline(content, Path::new("stg_orders.sql"), None).unwrap();
         assert_eq!(model.config.name, "stg_orders");
         assert_eq!(model.config.target.table, "stg_orders");
-        assert_eq!(model.config.name_declared, "stg_orders");
-        assert_eq!(model.config.target_table_declared, "stg_orders");
+        assert_eq!(model.config.name_declared, "");
+        assert_eq!(model.config.target_table_declared, "");
     }
 
     // ----- cost_ceiling / CostBudget sidecar tests -----

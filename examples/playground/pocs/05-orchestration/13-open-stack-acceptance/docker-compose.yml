@@ -1,0 +1,24 @@
+# Postgres 16 source for the open-stack acceptance journey.
+#
+# It seeds from the S-2 connector POC's seed.sql, so both journeys start
+# from the same 20 rows. Its own container name and port let it run beside
+# that POC. `docker compose down -v` removes the volume.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rocky-open-stack-acceptance
+    environment:
+      POSTGRES_USER: ${PGUSER:-rocky_reader}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-rocky-acceptance-reader-pw}
+      POSTGRES_DB: ${PGDATABASE:-rocky_src}
+    ports:
+      - "${PGPORT:-55433}:5432"
+    volumes:
+      - ../../07-adapters/08-postgres-child-connector/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s

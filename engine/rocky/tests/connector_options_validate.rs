@@ -33,6 +33,14 @@ pad = "{}"
         "x".repeat(bytes - 10)
     );
     std::fs::write(dir.path().join("rocky.toml"), toml).expect("write rocky.toml");
+    // `rocky validate` reads the manifest (V067). A bare program name is
+    // looked up on PATH at run time, so it needs no file here.
+    std::fs::create_dir(dir.path().join("connector")).expect("mkdir connector");
+    std::fs::write(
+        dir.path().join("connector/connector.toml"),
+        "protocol_version = 0\nname = \"demo\"\ncommand = [\"python3\"]\nstate_schema_version = 1\negress_hosts = []\n",
+    )
+    .expect("write connector.toml");
     dir
 }
 

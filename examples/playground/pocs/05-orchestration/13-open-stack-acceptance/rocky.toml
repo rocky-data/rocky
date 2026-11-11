@@ -1,0 +1,60 @@
+# Open-stack acceptance journey: one project, every open-stack feature.
+#
+#   Postgres ──rocky load --connector──▶ poc.main.events ──rocky run──▶ poc.main.events_by_type
+#                                              │                              │
+#                              [[product.source.volume]]          [product.output.volume]
+#                                                                 deliver_by, [product_budget]
+#
+# run.sh drives it and asserts every step's JSON. See README.md.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+# The S-2 reference connector, used as shipped: the manifest is the one the
+# connector POC tests, so both journeys run the same program.
+[connector.pg_events]
+manifest   = "../../07-adapters/08-postgres-child-connector/connector/connector.toml"
+output_uri = "file://./.rocky/landing/pg_events"
+secrets    = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]
+target     = { catalog = "poc", schema = "main", table = "events" }
+retries    = 0
+
+[connector.pg_events.options]
+schema        = "public"
+table         = "events"
+cursor_column = "created_at"
+
+# The transformation pipeline that builds the product's output model. It
+# declares a schedule, so `GET /api/v1/schedule` reports its delivery and
+# its latest start. run.sh starts the runs itself and never waits for 23:59.
+[pipeline.events]
+type   = "transformation"
+models = "models/**"
+
+[pipeline.events.target]
+adapter = "default"
+
+[pipeline.events.schedule]
+cron = "59 23 * * *"
+
+# User prices. `rocky cost --month --by product` prices only with these.
+[cost]
+compute_cost_per_machine_hour = 3.6     # $0.000001 per millisecond of model time
+storage_cost_per_gb_month     = 0.023
+
+# A monthly budget the journey breaches on purpose. The limit is 0.72 ms of
+# model time, so the first build that records 1 ms or more crosses it.
+[product_budget.events_by_type]
+max_compute_hours = 0.0000002
+on_breach         = "warn"
+
+# A budget needs run history for the whole month (V066 warns below 62 days).
+[state.retention]
+max_age_days = 90
+
+# Fires once per exceeded limit, at the run that crossed it. The event
+# context arrives as JSON on stdin; this keeps one compact line per call.
+[hook.on_budget_breach]
+command    = "python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))' >> expected/budget-breach-hook.jsonl"
+timeout_ms = 5000
