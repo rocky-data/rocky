@@ -1024,6 +1024,22 @@
   "overrides": {
     "serialize-javascript": "^7.0.5",
     "diff": "^8.0.3",
-    "fast-uri": "^3.1.7"
+    "fast-uri": "^3.1.7",
+    "eslint": {
+      "minimatch": "^11.0.5"
+    },
+    "@eslint/config-array": {
+      "minimatch": "^11.0.5"
+    },
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.5"
+    },
+    "@vscode/vsce": {
+      "minimatch": "^11.0.5"
+    },
+    "mocha": {
+      "glob": "^14.0.4",
+      "minimatch": "^11.0.5"
+    }
   }
 }
