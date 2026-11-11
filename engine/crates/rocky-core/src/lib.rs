@@ -62,6 +62,7 @@ pub mod project_docs;
 pub mod quarantine;
 pub mod recipe_identity;
 pub mod redacted;
+pub mod replace;
 pub mod retention;
 pub mod retry;
 pub mod retry_budget;

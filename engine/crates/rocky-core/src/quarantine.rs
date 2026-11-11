@@ -33,8 +33,9 @@ use rocky_sql::check_expression::ExpressionUse;
 use rocky_sql::validation::{self, ValidationError};
 
 use crate::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
+use crate::replace::{StagedSwap, SwapNames};
 use crate::tests::{TestSeverity, TestType};
-use crate::traits::{AdapterError, SqlDialect};
+use crate::traits::{AdapterError, SqlDialect, TableReplace};
 use rocky_ir::TableRef;
 
 /// Errors from quarantine SQL compilation.
@@ -70,9 +71,13 @@ pub enum QuarantineError {
     SplitNeedsStarExclusion { dialect: &'static str },
 
     #[error(
-        "quarantine mode = \"tag\" is not supported on {dialect}: it rewrites its source table, and this dialect requires a pre-drop before CREATE TABLE AS; use mode = \"drop\""
+        "quarantine mode = \"tag\" is not supported on {dialect}: it rewrites its source table in place, and this dialect has no atomic replace; use mode = \"drop\""
     )]
     TagNeedsSourceReplacement { dialect: &'static str },
+
+    /// The staged replace of the valid table could not be rendered.
+    #[error(transparent)]
+    Replace(Box<crate::replace::ReplaceError>),
 
     /// `tag` replaces a label column it wrote on an earlier run with
     /// star exclusion, and this warehouse has none.
@@ -133,6 +138,12 @@ pub enum QuarantineError {
         /// What to change, for this pair.
         fix: &'static str,
     },
+}
+
+impl From<crate::replace::ReplaceError> for QuarantineError {
+    fn from(e: crate::replace::ReplaceError) -> Self {
+        Self::Replace(Box::new(e))
+    }
 }
 
 impl From<AdapterError> for QuarantineError {
@@ -283,7 +294,7 @@ pub const MAX_GENERATED_IDENTIFIER_LEN: usize = 255;
 #[derive(Debug, Clone)]
 pub struct QuarantineStatement {
     /// Human-readable role of this statement (`"label"`, `"quarantine"`,
-    /// `"valid"`, `"tag"`, `"predrop_valid"`, `"drop_labels"`). Used for logging and row-effect
+    /// `"valid"`, `"tag"`, `"swap_valid"`, `"drop_labels"`). Used for logging and row-effect
     /// attribution.
     pub role: StatementRole,
     /// Fully-qualified table name this statement writes to.
@@ -305,9 +316,9 @@ pub enum StatementRole {
     Valid,
     /// CTAS that rewrites the source table in-place with `_error_*` tags.
     Tag,
-    /// `drop` only: removes the previous valid table before a dialect's
-    /// non-replacing CTAS.
-    PredropValid,
+    /// `drop` only, on a dialect with no atomic replace: one of the renames
+    /// or the drop that swap the staged valid table in (ADR-REPLACE).
+    SwapValid,
     /// `split` only: drops the intermediate table the [`Self::Label`]
     /// statement wrote.
     DropLabels,
@@ -390,10 +401,16 @@ fn compile_with_token(
         return Ok(None);
     }
 
-    if matches!(config.mode, QuarantineMode::Tag) && dialect.full_refresh_needs_predrop() {
-        return Err(QuarantineError::TagNeedsSourceReplacement {
-            dialect: dialect.name(),
-        });
+    let replace = dialect.table_replace(&table_ref.catalog);
+    if matches!(config.mode, QuarantineMode::Tag) {
+        match replace {
+            TableReplace::Atomic => {}
+            TableReplace::StagedSwap => {
+                return Err(QuarantineError::TagNeedsSourceReplacement {
+                    dialect: dialect.name(),
+                });
+            }
+        }
     }
 
     let source_table =
@@ -504,19 +521,46 @@ fn compile_with_token(
                 .map(|p| p.valid_pred.as_str())
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            if dialect.full_refresh_needs_predrop() {
-                statements.push(QuarantineStatement {
-                    role: StatementRole::PredropValid,
-                    target: valid_table.clone(),
-                    sql: dialect.drop_table_sql(&valid_table),
-                });
+            match replace {
+                TableReplace::Atomic => statements.push(build_valid_ctas(
+                    &valid_table,
+                    &source_table,
+                    &valid_where,
+                    dialect,
+                )),
+                // No atomic replace: build the valid rows under a stage name
+                // and swap it in (ADR-REPLACE). Run in order, a failure at
+                // any step leaves the previous valid table at its own name or
+                // at the backup name.
+                TableReplace::StagedSwap => {
+                    let names = SwapNames::for_target(&TableRef {
+                        catalog: table_ref.catalog.clone(),
+                        schema: table_ref.schema.clone(),
+                        table: valid_name.clone(),
+                    })?;
+                    let stage = dialect.format_table_ref(
+                        &names.stage.catalog,
+                        &names.stage.schema,
+                        &names.stage.table,
+                    )?;
+                    let select = format!("SELECT * FROM {source_table} WHERE {valid_where}");
+                    let build = dialect.create_table_as_new(&stage, &select);
+                    let swap = StagedSwap::new(dialect, names, build)?;
+                    let mut steps = swap.statements().into_iter();
+                    if let Some(sql) = steps.next() {
+                        statements.push(QuarantineStatement {
+                            role: StatementRole::Valid,
+                            target: stage,
+                            sql,
+                        });
+                    }
+                    statements.extend(steps.map(|sql| QuarantineStatement {
+                        role: StatementRole::SwapValid,
+                        target: valid_table.clone(),
+                        sql,
+                    }));
+                }
             }
-            statements.push(build_valid_ctas(
-                &valid_table,
-                &source_table,
-                &valid_where,
-                dialect,
-            ));
         }
         QuarantineMode::Tag => {
             // The label columns an earlier `tag` wrote are left out of `*`

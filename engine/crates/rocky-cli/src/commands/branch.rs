@@ -889,7 +889,10 @@ fn order_planned_promotes(
                 .into_iter()
                 .filter(|upstream| !selected.contains_key(&identity(upstream)))
                 .collect();
-            let pre_drop_statement = promote_pre_drop_sql(dialect, &p.prod, p.kind)?;
+            // A table promote never drops production first (ADR-REPLACE): a
+            // dialect with no atomic replace swaps the copy in at apply time.
+            // The field stays for plans written before that.
+            let pre_drop_statement = None;
             Ok(PlannedPromoteWithSql {
                 target: p.prod.full_name(),
                 source: p.branch_source.full_name(),
@@ -1160,8 +1163,7 @@ pub(crate) async fn run_promote_apply(
         let expected_kind = match step.strategy.as_str() {
             "full_refresh"
                 if step.statement.starts_with("CREATE OR REPLACE TABLE ")
-                    || (step.pre_drop_statement.is_some()
-                        && step.statement.starts_with("CREATE TABLE ")) =>
+                    || promote_swap(adapter.dialect(), step)?.is_some() =>
             {
                 rocky_core::traits::ObjectKind::Table
             }
@@ -1231,29 +1233,25 @@ pub(crate) async fn run_promote_apply(
     let mut overall_success = true;
 
     for (index, step) in targets.iter().enumerate() {
-        if let Some(drop_sql) = &step.pre_drop_statement
-            && let Err(e) = adapter.execute_statement(drop_sql).await
-        {
-            targets_out.push(crate::output::PromoteTarget {
-                target: step.target.clone(),
-                source: step.source.clone(),
-                statement: step.statement.clone(),
-                succeeded: false,
-                error: Some(format!("pre-drop failed: {e}")),
-            });
-            overall_success = false;
-            targets_out.extend(targets.iter().skip(index + 1).map(|remaining| {
-                crate::output::PromoteTarget {
-                    target: remaining.target.clone(),
-                    source: remaining.source.clone(),
-                    statement: remaining.statement.clone(),
-                    succeeded: false,
-                    error: Some("not attempted after an earlier write failed".to_string()),
-                }
-            }));
-            break;
-        }
-        match adapter.execute_statement(&step.statement).await {
+        // A legacy plan's `pre_drop_statement` is never run: dropping
+        // production before its replacement exists is RD-009. A dialect with
+        // no atomic replace swaps the copy in instead.
+        let written = match promote_swap(adapter.dialect(), step)? {
+            Some(swap) => swap
+                .execute(adapter.as_ref())
+                .await
+                .map(|outcome| {
+                    for note in outcome.recovered.iter().chain(&outcome.warning) {
+                        eprintln!("{note}");
+                    }
+                })
+                .map_err(anyhow::Error::from),
+            None => adapter
+                .execute_statement(&step.statement)
+                .await
+                .map_err(anyhow::Error::from),
+        };
+        match written {
             Ok(()) => targets_out.push(crate::output::PromoteTarget {
                 target: step.target.clone(),
                 source: step.source.clone(),
@@ -1267,11 +1265,7 @@ pub(crate) async fn run_promote_apply(
                     source: step.source.clone(),
                     statement: step.statement.clone(),
                     succeeded: false,
-                    error: Some(if step.pre_drop_statement.is_some() {
-                        format!("dropped but not replaced: {e}")
-                    } else {
-                        format!("{e}")
-                    }),
+                    error: Some(format!("{e:#}")),
                 });
                 overall_success = false;
                 targets_out.extend(targets.iter().skip(index + 1).map(|remaining| {
@@ -1300,16 +1294,6 @@ fn promote_failure_target_lines(targets: &[crate::output::PromoteTarget]) -> Vec
             } else if target.error.as_deref() == Some("not attempted after an earlier write failed")
             {
                 format!("not replaced: {} (not attempted)", target.target)
-            } else if target
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with("dropped but not replaced:"))
-            {
-                format!(
-                    "dropped, not replaced: {} ({})",
-                    target.target,
-                    target.error.as_deref().unwrap_or("unknown error")
-                )
             } else {
                 format!(
                     "not confirmed replaced: {} (write failed: {})",
@@ -1525,16 +1509,59 @@ fn build_promote_sql(
     })
 }
 
-fn promote_pre_drop_sql(
+/// The staged swap a table promote runs on a dialect with no atomic replace
+/// (ADR-REPLACE), or `None` for a view or an atomic dialect.
+///
+/// The plan records `statement` as the dialect's replace of production from
+/// the branch copy. The swap builds that same `SELECT` under the stage name,
+/// so it is checked first: a recorded statement that is not exactly that
+/// replace is refused rather than reinterpreted.
+fn promote_swap(
     dialect: &dyn rocky_core::traits::SqlDialect,
-    prod: &TargetRef,
-    kind: PromoteKind,
-) -> Result<Option<String>> {
-    if matches!(kind, PromoteKind::Table) && dialect.full_refresh_needs_predrop() {
-        Ok(Some(dialect.drop_table_sql(&quote_fqn(dialect, prod)?)))
-    } else {
-        Ok(None)
+    step: &crate::output::PromoteTargetPlan,
+) -> Result<Option<rocky_core::replace::StagedSwap>> {
+    if step.strategy != "full_refresh" {
+        return Ok(None);
     }
+    match dialect.table_replace(&step.target_catalog) {
+        rocky_core::traits::TableReplace::Atomic => return Ok(None),
+        rocky_core::traits::TableReplace::StagedSwap => {}
+    }
+    let prod = TargetRef {
+        catalog: step.target_catalog.clone(),
+        schema: step.target_schema.clone(),
+        table: step.target_table.clone(),
+    };
+    let source = TargetRef {
+        catalog: step.source_catalog.clone(),
+        schema: step.source_schema.clone(),
+        table: step.source_table.clone(),
+    };
+    let select = format!("SELECT * FROM {}", quote_fqn(dialect, &source)?);
+    anyhow::ensure!(
+        step.statement == dialect.create_table_as(&quote_fqn(dialect, &prod)?, &select),
+        "the promote statement recorded for '{}' is not the replace of it from '{}'; refusing \
+         to run it as a staged replace",
+        step.target,
+        step.source
+    );
+    let names = rocky_core::replace::SwapNames::for_target(&TableRef {
+        catalog: prod.catalog,
+        schema: prod.schema,
+        table: prod.table,
+    })?;
+    let stage = quote_fqn(
+        dialect,
+        &TargetRef {
+            catalog: names.stage.catalog.clone(),
+            schema: names.stage.schema.clone(),
+            table: names.stage.table.clone(),
+        },
+    )?;
+    let build = dialect.create_table_as_new(&stage, &select);
+    Ok(Some(rocky_core::replace::StagedSwap::new(
+        dialect, names, build,
+    )?))
 }
 
 fn assert_generated_promote_target(
@@ -3405,7 +3432,7 @@ mod tests {
     }
 
     #[test]
-    fn trino_promote_uses_full_refresh_predrop_and_portable_ctas() {
+    fn trino_promote_swaps_the_branch_copy_in_and_never_drops_production_first() {
         let dialect = rocky_trino::dialect::TrinoDialect::new();
         let prod = TargetRef {
             catalog: "lake".into(),
@@ -3417,18 +3444,44 @@ mod tests {
             schema: "branch".into(),
             table: "orders".into(),
         };
-        assert_eq!(
-            promote_pre_drop_sql(&dialect, &prod, PromoteKind::Table)
-                .unwrap()
-                .as_deref(),
-            Some("DROP TABLE IF EXISTS \"lake\".\"marts\".\"orders\"")
-        );
         let create = build_promote_sql(&dialect, &prod, &source, PromoteKind::Table).unwrap();
         assert!(
             create.starts_with("CREATE TABLE \"lake\".\"marts\".\"orders\" AS"),
             "{create}"
         );
-        assert!(!create.contains("OR REPLACE"));
+        let step = crate::output::PromoteTargetPlan {
+            target: prod.full_name(),
+            source: source.full_name(),
+            target_catalog: prod.catalog.clone(),
+            target_schema: prod.schema.clone(),
+            target_table: prod.table.clone(),
+            source_catalog: source.catalog.clone(),
+            source_schema: source.schema.clone(),
+            source_table: source.table.clone(),
+            strategy: "full_refresh".into(),
+            statement: create.clone(),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
+        };
+        let swap = promote_swap(&dialect, &step).unwrap().expect("trino swaps");
+        assert_eq!(
+            swap.statements(),
+            [
+                "CREATE TABLE \"lake\".\"marts\".\"orders__rocky_stage\" AS\n\
+                 SELECT * FROM \"lake\".\"branch\".\"orders\"",
+                "ALTER TABLE IF EXISTS \"lake\".\"marts\".\"orders\" RENAME TO \
+                 \"lake\".\"marts\".\"orders__rocky_old\"",
+                "ALTER TABLE \"lake\".\"marts\".\"orders__rocky_stage\" RENAME TO \
+                 \"lake\".\"marts\".\"orders\"",
+                "DROP TABLE IF EXISTS \"lake\".\"marts\".\"orders__rocky_old\"",
+            ]
+        );
+        // A recorded statement that is not exactly the replace is refused.
+        let tampered = crate::output::PromoteTargetPlan {
+            statement: format!("{create} WHERE 1 = 0"),
+            ..step
+        };
+        assert!(promote_swap(&dialect, &tampered).is_err());
     }
 
     #[test]
@@ -3444,10 +3497,10 @@ mod tests {
             schema: "branch_x".into(),
             table: "Orders".into(),
         };
-        // No separate pre-drop: the replace is one atomic script.
+        // No staged swap: the replace is one atomic script.
         assert_eq!(
-            promote_pre_drop_sql(&dialect, &prod, PromoteKind::Table).unwrap(),
-            None
+            rocky_core::traits::SqlDialect::table_replace(&dialect, &prod.catalog),
+            rocky_core::traits::TableReplace::Atomic
         );
         let create = build_promote_sql(&dialect, &prod, &source, PromoteKind::Table).unwrap();
         assert_eq!(
@@ -6099,7 +6152,7 @@ adapter = "default"
     }
 
     #[tokio::test]
-    async fn promote_reports_target_dropped_when_create_fails() {
+    async fn promote_never_runs_a_legacy_pre_drop() {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
@@ -6142,23 +6195,19 @@ adapter = "default"
             config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
             fingerprint: "fixture".into(),
         };
-        let (targets, success) = run_promote_apply(&loaded, &[step], None).await.unwrap();
-        assert!(!success);
-        assert!(
-            targets[0]
-                .error
-                .as_deref()
-                .unwrap()
-                .starts_with("dropped but not replaced:")
-        );
-        assert!(promote_failure_target_lines(&targets)[0].starts_with("dropped, not replaced:"));
+        // RD-009: a plan written before ADR-REPLACE may carry a pre-drop.
+        // It is never run. On an atomic dialect the plain CREATE is not a
+        // replace, so the plan is refused before any write.
+        let err = run_promote_apply(&loaded, &[step], None)
+            .await
+            .expect_err("a plain CREATE is not a replace on DuckDB");
+        assert!(err.to_string().contains("invalid promote SQL"), "{err:#}");
         let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
-        assert!(
-            adapter
-                .execute_query("SELECT * FROM marts.orders")
-                .await
-                .is_err()
-        );
+        let rows = adapter
+            .execute_query("SELECT id FROM marts.orders")
+            .await
+            .expect("production survives");
+        assert_eq!(rows.rows[0][0].as_str(), Some("0"));
     }
 
     #[tokio::test]
