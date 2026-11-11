@@ -1472,7 +1472,7 @@ fn record_incident(
 /// resolves a stuck claim when it re-evaluates that key, but a cron occurrence
 /// advances its anchor on submission (so its key never recurs) and a satisfied
 /// `after`/`freshness` demand goes not-due; either way the loop never revisits
-/// the orphan, so its `submitted` claim would leak (until the 7-day GC) and, for
+/// the orphan, so its `submitted` claim would leak (no claim GC runs; #2567) and, for
 /// a standing demand, keep the key un-re-claimable. The sweep record-joins each
 /// such claim and drives its CLAIM to a terminal state.
 ///
@@ -1490,12 +1490,12 @@ fn record_incident(
 /// still visible in `rocky history`; a still-due standing failure is instead
 /// resolved by the demand loop's own [`resolve_stuck`], which does apply it.)
 ///
-/// Record-present only: a `submitted` claim with NO run record is a genuine
-/// crash before the child recorded anything; it is left to the demand-path grace
-/// ([`resolve_missing_record`]) plus the 7-day claim GC, never force-terminated
-/// here. Restricting to record-present claims is also what makes the sweep
-/// double-resolve-safe — a claim already resolved is `released`/`completed`, not
-/// `submitted`.
+/// A `submitted` claim with NO run record is a crash or kill before the child
+/// recorded anything. A standing or webhook claim is left to the demand-path
+/// grace ([`resolve_missing_record`]). A cron claim's key never comes due again,
+/// so the sweep applies the same grace to it itself ([`sweep_lost_cron_claim`]).
+/// The sweep only ever moves a `submitted` claim, which is what makes it
+/// double-resolve-safe — a claim already resolved is `released`/`completed`.
 fn sweep_orphan_claims(
     schedules: &BTreeMap<String, ResolvedSchedule>,
     store: &StateStore,
@@ -1509,7 +1509,7 @@ fn sweep_orphan_claims(
         // The discriminator is deliberately ignored here: it is a timestamp for
         // cron/after/freshness but a `demand_uid` for a webhook, and the sweep
         // needs neither.
-        let Some((pipeline, source, _)) = parse_claim_key(&key) else {
+        let Some((pipeline, source, logical_ts)) = parse_claim_key(&key) else {
             continue;
         };
         // Only sweep claims for pipelines in this tick's scope (honors
@@ -1521,6 +1521,14 @@ fn sweep_orphan_claims(
             .find_terminal_run_by_submission_id(&claim.submission_id)?
             .and_then(|run| run.status.terminal_outcome())
         else {
+            // A record-less CRON claim is the one orphan no other path reaches:
+            // its anchor advanced on submission, so its key never comes due
+            // again and `resolve_missing_record` (the demand path) never sees
+            // it. Without this it stays `submitted` forever, the occurrence is
+            // lost with no incident. Same grace rule as the demand path.
+            if source == DemandKind::Cron {
+                sweep_lost_cron_claim(&key, &pipeline, logical_ts, &claim, store, rocky_dir, now)?;
+            }
             continue;
         };
         // Compute the terminal claim DIRECTLY (cron/webhook → completed; standing
@@ -1558,6 +1566,81 @@ fn sweep_orphan_claims(
                 now,
             );
         }
+    }
+    Ok(())
+}
+
+/// Resolve a record-less `submitted` cron claim: stamp the grace on first
+/// sight, then, once [`RECOVERY_GRACE`] has passed with still no run record,
+/// finalize it as a lost `Failure` (`completed`) and write its incident.
+///
+/// Reached when a child never recorded its run: the host lost power or the
+/// process was killed mid-child, or the child failed before opening the store
+/// and the post-child reopen was then busy. A live child cannot be cut short
+/// by the grace: on one host it holds the state file's writer lock until its
+/// record is written, so no tick can open the store, and no sweep runs, while
+/// it lives.
+///
+/// Claim-lifecycle only, like the rest of the sweep: no retry (the occurrence
+/// is past, and a cron's retries run inside the tick that claimed it) and no
+/// per-pipeline scalars (`ScheduleStateMutation::None`). A lost CAS is a no-op.
+fn sweep_lost_cron_claim(
+    key: &str,
+    pipeline: &str,
+    logical_ts: Option<DateTime<Utc>>,
+    claim: &ClaimRecord,
+    store: &StateStore,
+    rocky_dir: &Path,
+    now: DateTime<Utc>,
+) -> Result<(), TickError> {
+    let swept = claim
+        .first_swept_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    match swept {
+        None => {
+            let mut stamped = claim.clone();
+            stamped.first_swept_at = Some(now.to_rfc3339());
+            store.schedule_claim_cas(
+                key,
+                Some(claim),
+                &stamped,
+                pipeline,
+                &ScheduleStateMutation::None,
+            )?;
+        }
+        Some(swept_at) if now - swept_at >= RECOVERY_GRACE => {
+            let terminal =
+                sweep_terminal_claim(claim, DemandKind::Cron, TerminalOutcome::Failure, now);
+            let cas = store.schedule_claim_cas(
+                key,
+                Some(claim),
+                &terminal,
+                pipeline,
+                &ScheduleStateMutation::None,
+            )?;
+            if matches!(cas, ClaimCas::Won) {
+                tracing::warn!(
+                    pipeline,
+                    submission_id = %claim.submission_id,
+                    "scheduler: a cron occurrence's child left no run record; recorded as a lost failure"
+                );
+                record_incident(
+                    rocky_dir,
+                    pipeline,
+                    DemandKind::Cron,
+                    TerminalOutcome::Failure,
+                    logical_ts,
+                    &claim.submission_id,
+                    None,
+                    claim.cycle_attempts,
+                    None,
+                    now,
+                );
+            }
+        }
+        Some(_) => {}
     }
     Ok(())
 }
@@ -3273,6 +3356,164 @@ freshness = true
             "the sweep does not touch scalars, so it must not report them"
         );
         assert_eq!(bundle.logical_ts, None);
+    }
+
+    // --- sweep: a record-less cron claim is finalized after the grace --------
+
+    /// A cron claim left `submitted` with NO run record (the child never
+    /// recorded: power loss, kill, or a busy reopen after a child that failed
+    /// before opening the store). Its key never comes due again, so only the
+    /// sweep can finalize it.
+    fn lost_cron_fixture() -> (PathBuf, tempfile::TempDir, TickOptions, RockyConfig, String) {
+        let (state_path, dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let occ = at(2026, 5, 2, 3, 0);
+        let key = with_store(&state_path, |store| {
+            store.advance_schedule_fire_anchor("raw", occ).unwrap();
+            seed_submitted_claim(store, "raw", DemandKind::Cron, occ, "lost-1", occ)
+        });
+        (state_path, dir, opts, config, key)
+    }
+
+    fn sweep_tick(config: &RockyConfig, state_path: &Path, opts: &TickOptions, now: DateTime<Utc>) {
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(config, state_path, now, &spawner, opts))
+            .unwrap();
+        assert_eq!(spawner.run_count(), 0, "the sweep never spawns");
+    }
+
+    fn incident_count(opts: &TickOptions) -> usize {
+        std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .map(|d| d.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn sweep_finalizes_a_record_less_cron_claim_after_the_grace() {
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+
+        // First sight (04:00): stamped, still submitted, no incident.
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(
+                matches!(claim.state, ClaimState::Submitted),
+                "{:?}",
+                claim.state
+            );
+            assert!(claim.first_swept_at.is_some(), "the grace is stamped");
+        });
+        assert_eq!(incident_count(&opts), 0, "no incident inside the grace");
+
+        // Inside the grace (04:04): untouched.
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 4));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(
+                matches!(claim.state, ClaimState::Submitted),
+                "{:?}",
+                claim.state
+            );
+        });
+
+        // Past the grace (04:05): a lost failure, exactly one incident.
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 5));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(
+                matches!(
+                    claim.state,
+                    ClaimState::Completed {
+                        outcome: TerminalOutcome::Failure
+                    }
+                ),
+                "a lost cron occurrence is a terminal failure: {:?}",
+                claim.state
+            );
+            let cursor = store.get_schedule_state("raw").unwrap().unwrap();
+            assert_eq!(
+                cursor.consecutive_failures, 0,
+                "the sweep leaves the per-pipeline scalars untouched"
+            );
+        });
+        assert_eq!(
+            incident_count(&opts),
+            1,
+            "exactly one incident for the lost occurrence"
+        );
+        let bundle_path = std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let bundle: crate::schedule::incidents::IncidentBundle =
+            serde_json::from_slice(&std::fs::read(bundle_path).unwrap()).unwrap();
+        assert_eq!(bundle.submission_id, "lost-1");
+        assert_eq!(bundle.outcome, "failure");
+        assert_eq!(bundle.exit_code, None, "no child was observed");
+
+        // A later sweep is a no-op: no second incident.
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 30));
+        assert_eq!(incident_count(&opts), 1, "a second sweep adds nothing");
+    }
+
+    #[test]
+    fn sweep_resolves_a_lost_cron_claim_by_its_record_if_one_appears_inside_the_grace() {
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        // The record lands inside the grace (a slow child, a late commit).
+        with_store(&state_path, |store| {
+            seed_run(
+                store,
+                "raw",
+                Some("lost-1"),
+                RunStatus::Success,
+                at(2026, 5, 2, 3, 0),
+                at(2026, 5, 2, 3, 1),
+            );
+        });
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 2));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(
+                matches!(
+                    claim.state,
+                    ClaimState::Completed {
+                        outcome: TerminalOutcome::Success
+                    }
+                ),
+                "the record decides, not the grace: {:?}",
+                claim.state
+            );
+        });
+        assert_eq!(incident_count(&opts), 0, "a success is not an incident");
+    }
+
+    #[test]
+    fn sweep_leaves_a_record_less_standing_claim_to_the_demand_path() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let occ = at(2026, 5, 2, 3, 0);
+        let key = with_store(&state_path, |store| {
+            store.advance_schedule_fire_anchor("raw", occ).unwrap();
+            seed_submitted_claim(store, "raw", DemandKind::After, occ, "standing-1", occ)
+        });
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 5, 0));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(
+                matches!(claim.state, ClaimState::Submitted),
+                "{:?}",
+                claim.state
+            );
+            assert!(
+                claim.first_swept_at.is_none(),
+                "the sweep does not stamp a standing claim; the demand path owns it"
+            );
+        });
+        assert_eq!(incident_count(&opts), 0);
     }
 
     // --- webhook ingress (at-most-once spool consumption) --------------------

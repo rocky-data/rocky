@@ -160,8 +160,9 @@ pub struct ClaimRecord {
     /// bounded grace can elapse before it is force-resolved. RFC3339.
     #[serde(default)]
     pub first_swept_at: Option<String>,
-    /// The instant of the last transition. RFC3339. Drives the 7-day GC of
-    /// terminal claims.
+    /// The instant of the last transition. RFC3339. Read by
+    /// `StateStore::gc_schedule_claims`, which nothing calls yet: claim
+    /// retention is undecided (#2567).
     #[serde(default)]
     pub last_transition_at: Option<String>,
 }
