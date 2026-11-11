@@ -1037,7 +1037,9 @@ async fn a_scheduled_run_is_fenced_exactly_like_a_manual_one() {
     use rocky_core::state::RunTrigger;
 
     let _serial = remote_testing::serial_guard();
-    let cases: [(&str, &[(&str, &str)], RunTrigger); 4] = [
+    /// `(label, env to set, trigger the run must record)`.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], RunTrigger);
+    let cases: [Case; 4] = [
         ("manual", &[], RunTrigger::Manual),
         (
             "scheduled",
