@@ -12,6 +12,8 @@
 //! transformation project from the CLI. It is review-gated, so the test
 //! approves it first, with a pinned git identity.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -278,9 +280,7 @@ fn serve(dir: &Path, root: &Path) -> (Server, u16) {
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && http(port, "GET", "/api/v1/health", "").0.contains("200")
-        {
+        if common::serve_health_ok(port) {
             break;
         }
         assert!(Instant::now() < deadline, "rocky serve did not come up");

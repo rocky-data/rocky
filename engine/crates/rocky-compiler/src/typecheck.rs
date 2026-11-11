@@ -74,6 +74,7 @@ pub struct TypeCheckResult {
 /// table + column keys look up independently (a flat `(String, String)`
 /// key would need `format!("{table}.{col}")` at the lookup site and
 /// re-introduce the allocation).
+#[derive(Clone)]
 pub(crate) struct TypeScope {
     /// column_name → (type, nullable) for all columns in scope.
     columns: HashMap<CiKey<'static>, (RockyType, bool)>,
@@ -587,8 +588,12 @@ fn compute_model_typecheck(
     // A function over one column that Step 1 could not type from its name
     // (`COALESCE(b, 0)`) needs it too: only inference reads its other
     // arguments (#2553).
+    let renames_columns = model_by_name
+        .get(model_name)
+        .is_some_and(|m| sql_has_column_list_alias(&m.sql));
     let needs_inference = udf_scope.is_active()
         || mentions_set_operation
+        || renames_columns
         || typed_cols
             .iter()
             .any(|col| match graph.producing_edge(model_name, &col.name) {
@@ -626,7 +631,9 @@ fn compute_model_typecheck(
                 .is_some_and(|edge| edge.transform == rocky_sql::lineage::TransformKind::Direct);
             // A `Direct` column of a model with a set operation reads only
             // the first branch's type, so it is `Unknown` too (#2304).
-            if !direct || mentions_set_operation {
+            // A renamed column's lineage type may be the wrong column's
+            // (#2572).
+            if !direct || mentions_set_operation || renames_columns {
                 col.data_type = RockyType::Unknown;
             }
         }
@@ -634,7 +641,22 @@ fn compute_model_typecheck(
     let inferred_cols = inference.flatten();
     if let Some(inferred) = &inferred_cols {
         let mut inferred_by_name = HashMap::new();
+        // A name Rocky made up for an unaliased expression (`count` for
+        // `COUNT(*)`) is not matched against an output that really has that
+        // name: `SELECT COUNT(*), u.x AS count` must not give `count` the
+        // `COUNT`'s bits.
+        let real_names: HashSet<&str> = inferred
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !inferred.synthesized_names.contains(index))
+            .map(|(_, col)| col.name.as_str())
+            .collect();
         for (index, col) in inferred.columns.iter().enumerate() {
+            if inferred.synthesized_names.contains(&index) && real_names.contains(col.name.as_str())
+            {
+                continue;
+            }
             // Match semantic-graph star expansion, which keeps the first
             // occurrence when multiple relations expose the same name.
             inferred_by_name.entry(col.name.as_str()).or_insert((
@@ -649,6 +671,16 @@ fn compute_model_typecheck(
             let Some(&(inferred_col, exact_type, count, cast, coalesce)) =
                 inferred_by_name.get(col.name.as_str())
             else {
+                // Inference ran but names no output like this one: lineage
+                // and inference spell an unaliased expression differently
+                // (`CAST(x AS BIGINT)` is `x` to lineage). Lineage's bit
+                // is then unchecked against the relation scope (an outer
+                // join, a subtotal row), so it is not kept as non-null. In
+                // a model that renames columns its type is unchecked too.
+                col.nullable = true;
+                if renames_columns {
+                    col.data_type = RockyType::Unknown;
+                }
                 continue;
             };
             // A `COALESCE` is NULL only when every argument is. Inference
@@ -699,6 +731,13 @@ fn compute_model_typecheck(
                     {
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    } else if edge.transform == rocky_sql::lineage::TransformKind::Direct {
+                        col.data_type = reconcile_lineage_type(
+                            &col.data_type,
+                            inferred_col,
+                            exact_type,
+                            renames_columns,
+                        );
                     }
                 }
                 // A nested expression. Step 1 left it `(Unknown, true)`. Take
@@ -727,6 +766,13 @@ fn compute_model_typecheck(
                         col.nullable |= inferred_col.nullable;
                         col.data_type =
                             set_operation_column_type(&col.data_type, inferred_col, exact_type);
+                    } else if col.data_type != RockyType::Unknown {
+                        col.data_type = reconcile_lineage_type(
+                            &col.data_type,
+                            inferred_col,
+                            exact_type,
+                            renames_columns,
+                        );
                     } else if col.data_type == RockyType::Unknown
                         && exact_type
                         && inferred_col.data_type != RockyType::Unknown
@@ -2025,9 +2071,9 @@ fn where_rejects_null_column(sql: &str, column: &str) -> bool {
             !modifiers.is_empty()
                 || exprs.iter().any(|expr| {
                     matches!(
-                        expr,
+                        strip_nested(expr),
                         Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)
-                    )
+                    ) || is_grouping_construct_call(strip_nested(expr))
                 })
         }
     };
@@ -2820,6 +2866,32 @@ fn infer_aggregation_type(
         // `COUNT(DISTINCT x)` reaches here as "COUNT": lineage keys on the
         // function name, never on its DISTINCT modifier.
         _ => (RockyType::Unknown, true),
+    }
+}
+
+/// The type of a column lineage typed from its source column, checked
+/// against inference. Lineage does not apply a column-list alias
+/// (`FROM u AS q(a, b)`, `WITH c(a, b) AS ...`): it types the renamed column
+/// from the source column that has the new name (#2572). Inference applies
+/// the rename. When inference knows a different type, it wins if it reads
+/// it straight from the SQL, else neither is claimed.
+///
+/// In a model that renames columns, lineage's type is kept only when
+/// inference agrees: an `Unknown` there does not confirm it.
+fn reconcile_lineage_type(
+    lineage: &RockyType,
+    inferred: &TypedColumn,
+    inferred_exact: bool,
+    renames_columns: bool,
+) -> RockyType {
+    if inferred.data_type == *lineage
+        || (inferred.data_type == RockyType::Unknown && !renames_columns)
+    {
+        lineage.clone()
+    } else if inferred_exact {
+        inferred.data_type.clone()
+    } else {
+        RockyType::Unknown
     }
 }
 
@@ -3967,6 +4039,11 @@ pub(crate) struct SelectInference {
     /// through parentheses. Such an output's nullable bit is exact: it is
     /// NULL only when every argument is (#2553).
     coalesce_outputs: HashSet<usize>,
+    /// Outputs with no alias whose name Rocky made up from the expression
+    /// (`count` for `COUNT(*)`, `?column?`). The warehouse names them its
+    /// own way, so such a name says nothing about a real column of that
+    /// name.
+    synthesized_names: HashSet<usize>,
     /// The query is a `UNION` / `INTERSECT` / `EXCEPT`: its columns combine
     /// every branch, while lineage reads only the first (#2303).
     set_operation: bool,
@@ -4291,14 +4368,16 @@ pub(crate) fn infer_query_types(
         for cte in &with.cte_tables {
             let inferred = {
                 let lookup = |name: &str| cte_relation(&ctes, name).or_else(|| (env.lookup)(name));
+                // A CTE Rocky cannot infer fails the query: lineage may still
+                // list its columns (through `*`), and inference would then
+                // have nothing to check them against.
                 infer_query_types(
                     &cte.query,
                     InferEnv {
                         lookup: &lookup,
                         target: env.target,
                     },
-                )
-                .unwrap_or_default()
+                )?
             };
             let mut columns = inferred.columns;
             rename_relation_columns(&mut columns, &cte.alias);
@@ -4334,6 +4413,16 @@ fn infer_set_expr_types(body: &SetExpr, env: InferEnv<'_, '_>) -> Result<SelectI
     match body {
         SetExpr::Select(select) => infer_select_types_in_scope(select, env),
         SetExpr::Query(query) => infer_query_types(query, env),
+        // `UNION BY NAME` pairs columns by name and pads a column one side
+        // lacks with NULL, so the by-position combine below would pair the
+        // wrong columns. Rocky does not read it.
+        SetExpr::SetOperation {
+            set_quantifier:
+                ast::SetQuantifier::ByName
+                | ast::SetQuantifier::AllByName
+                | ast::SetQuantifier::DistinctByName,
+            ..
+        } => Err("set operation by name".to_string()),
         SetExpr::SetOperation { left, right, .. } => {
             let left = infer_set_expr_types(left, env)?;
             let right = infer_set_expr_types(right, env)?;
@@ -4412,6 +4501,7 @@ fn combine_set_operation(
         // A combined column may be NULL from any branch; the merge does not
         // narrow a set operation's nullability.
         coalesce_outputs: HashSet::new(),
+        synthesized_names: std::mem::take(&mut left.synthesized_names),
         set_operation: true,
         set_branches,
     })
@@ -4448,12 +4538,20 @@ fn infer_select_types_in_scope(
     env: InferEnv<'_, '_>,
 ) -> Result<SelectInference, String> {
     let (from_scope, type_scope) = select_type_scope(select, env);
+    let subtotal = SubtotalKeys::of(select).map(|keys| {
+        let scope = keys.rolled_up_scope(&type_scope);
+        (keys, scope)
+    });
 
     let mut inferred = SelectInference::default();
 
     for item in &select.projection {
+        let first = inferred.columns.len();
         match item {
             SelectItem::UnnamedExpr(expr) => {
+                if !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                    inferred.synthesized_names.insert(inferred.columns.len());
+                }
                 inferred.push_expression(expr_name(expr), expr, &type_scope);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
@@ -4497,9 +4595,220 @@ fn infer_select_types_in_scope(
             }
             SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::Expr(_), _) => {}
         }
+        if let Some((keys, rolled_scope)) = &subtotal {
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr)
+                | SelectItem::ExprWithAlias { expr, .. }
+                | SelectItem::ExprWithAliases { expr, .. } => Some(expr),
+                _ => None,
+            };
+            for column in &mut inferred.columns[first..] {
+                let null_in_subtotal = match expr {
+                    Some(expr) => keys.output_can_be_null(expr, rolled_scope),
+                    // A `*` column: NULL when it is a rolled-up key.
+                    None => keys.names_column(&column.name),
+                };
+                if null_in_subtotal {
+                    column.nullable = true;
+                }
+            }
+        }
     }
 
     Ok(inferred)
+}
+
+/// The rolled-up keys of a `SELECT` whose `GROUP BY` adds subtotal rows:
+/// `ROLLUP`, `CUBE` or `GROUPING SETS`, nested or not. In a subtotal row a
+/// rolled-up key is NULL, after the `WHERE` has run, so an output over it is
+/// nullable even when the source column is NOT NULL (#2566).
+///
+/// The rule fails toward nullable. Only one shape is typed precisely: every
+/// rolled-up key is a plain column. Then a subtotal row is that row with
+/// those columns NULL wherever they appear outside an aggregate, so
+/// inference over a scope where they are nullable is exact
+/// (`COALESCE(k, 0)` under `ROLLUP(k)` stays non-null). Any other key (an
+/// expression, an output alias, a position such as `ROLLUP(1)`) or a
+/// `GROUP BY ALL` with a modifier makes every output but a bare aggregate
+/// nullable: matching a key to a projection by its spelling would miss
+/// `t.x` against `x` or `::` against `CAST`.
+///
+/// A key that sits in every grouping set (`GROUPING SETS ((a), (a, b))`),
+/// or one a `HAVING` filters, is never NULL but is counted as rolled up
+/// anyway: "nullable" is the sound answer for a contract.
+enum SubtotalKeys {
+    /// Every rolled-up key is a column reference.
+    Columns(Vec<ColumnKey>),
+    /// A rolled-up key Rocky does not resolve to a column.
+    Any,
+}
+
+/// A rolled-up key that is a column: `name`, or `qualifier.name`.
+struct ColumnKey {
+    qualifier: Option<String>,
+    name: String,
+}
+
+impl SubtotalKeys {
+    fn of(select: &ast::Select) -> Option<Self> {
+        let mut rolled = Vec::new();
+        match &select.group_by {
+            ast::GroupByExpr::All(modifiers) => {
+                return (!modifiers.is_empty()).then_some(Self::Any);
+            }
+            ast::GroupByExpr::Expressions(exprs, modifiers) => {
+                for expr in exprs {
+                    match strip_nested(expr) {
+                        Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
+                            flatten_grouping_keys(expr, &mut rolled);
+                        }
+                        // `GROUP BY (ROLLUP(x))` parses as a call named
+                        // `ROLLUP`; Rocky does not read its keys.
+                        expr if is_grouping_construct_call(expr) => return Some(Self::Any),
+                        // A `WITH ROLLUP` / `WITH CUBE` modifier rolls up
+                        // every plain key.
+                        expr if !modifiers.is_empty() => flatten_grouping_keys(expr, &mut rolled),
+                        _ => {}
+                    }
+                }
+                // Spark's trailing `GROUP BY a GROUPING SETS ((a), ())`: the
+                // keys in the sets roll up too.
+                for modifier in modifiers {
+                    if let ast::GroupByWithModifier::GroupingSets(sets) = modifier {
+                        flatten_grouping_keys(sets, &mut rolled);
+                    }
+                }
+            }
+        }
+        if rolled.is_empty() {
+            return None;
+        }
+        let mut columns = Vec::new();
+        for key in rolled {
+            let key = strip_nested(key);
+            let column = match key {
+                Expr::Identifier(ident) => ColumnKey {
+                    qualifier: None,
+                    name: ident.value.clone(),
+                },
+                Expr::CompoundIdentifier(idents) if idents.len() >= 2 => ColumnKey {
+                    qualifier: Some(idents[idents.len() - 2].value.clone()),
+                    name: idents[idents.len() - 1].value.clone(),
+                },
+                _ => return Some(Self::Any),
+            };
+            // A bare name that is also an output alias for something other
+            // than that column may mean the alias.
+            if column.qualifier.is_none()
+                && select.projection.iter().any(|item| match item {
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        alias.value.eq_ignore_ascii_case(&column.name)
+                            && !matches!(strip_nested(expr), Expr::Identifier(i) if i.value.eq_ignore_ascii_case(&column.name))
+                    }
+                    SelectItem::ExprWithAliases { aliases, .. } => aliases
+                        .iter()
+                        .any(|alias| alias.value.eq_ignore_ascii_case(&column.name)),
+                    _ => false,
+                })
+            {
+                return Some(Self::Any);
+            }
+            columns.push(column);
+        }
+        Some(Self::Columns(columns))
+    }
+
+    /// `scope` with every rolled-up key column made nullable. A bare key
+    /// widens the bare name and every relation's column of that name. A
+    /// qualified key widens its own relation's column and the bare name;
+    /// an unknown qualifier widens like a bare key.
+    fn rolled_up_scope(&self, scope: &TypeScope) -> TypeScope {
+        let mut rolled = scope.clone();
+        let Self::Columns(keys) = self else {
+            return rolled;
+        };
+        for key in keys {
+            if let Some(value) = rolled.columns.get_mut(CiStr::new(&key.name)) {
+                value.1 = true;
+            }
+            let own_table = key
+                .qualifier
+                .as_deref()
+                .and_then(|q| rolled.qualified.get_mut(CiStr::new(q)));
+            match own_table {
+                Some(table) => {
+                    if let Some(value) = table.get_mut(CiStr::new(&key.name)) {
+                        value.1 = true;
+                    }
+                }
+                None => {
+                    for table in rolled.qualified.values_mut() {
+                        if let Some(value) = table.get_mut(CiStr::new(&key.name)) {
+                            value.1 = true;
+                        }
+                    }
+                }
+            }
+        }
+        rolled
+    }
+
+    /// Whether the projection `expr` can be NULL in a subtotal row. A bare
+    /// aggregate (`SUM(v)`, `COUNT(*)`, `MAX(k)`) reads the group's rows,
+    /// not the NULL key, so its own nullable bit stands.
+    fn output_can_be_null(&self, expr: &Expr, rolled_scope: &TypeScope) -> bool {
+        let bare_aggregate = function_call(expr).is_some_and(|func| {
+            func.over.is_none()
+                && func
+                    .name
+                    .0
+                    .last()
+                    .and_then(ast::ObjectNamePart::as_ident)
+                    .is_some_and(|ident| crate::group_by::is_aggregate(&ident.value.to_uppercase()))
+        });
+        if bare_aggregate {
+            return false;
+        }
+        match self {
+            Self::Any => true,
+            Self::Columns(_) => infer_expr_type(expr, rolled_scope).1,
+        }
+    }
+
+    /// Whether a `*` output column named `name` can be NULL in a subtotal
+    /// row.
+    fn names_column(&self, name: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Columns(keys) => keys.iter().any(|key| key.name.eq_ignore_ascii_case(name)),
+        }
+    }
+}
+
+/// Whether `expr` is a call named `ROLLUP`, `CUBE` or `GROUPING SETS`: how
+/// `GROUP BY (ROLLUP(x))` parses.
+fn is_grouping_construct_call(expr: &Expr) -> bool {
+    function_name(expr)
+        .is_some_and(|name| matches!(name.as_str(), "ROLLUP" | "CUBE" | "GROUPING SETS"))
+}
+
+/// Push every key inside a grouping construct, looking through nested
+/// `ROLLUP` / `CUBE` / `GROUPING SETS`, tuples and parentheses.
+fn flatten_grouping_keys<'a>(expr: &'a Expr, keys: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Rollup(sets) | Expr::Cube(sets) | Expr::GroupingSets(sets) => {
+            for key in sets.iter().flatten() {
+                flatten_grouping_keys(key, keys);
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                flatten_grouping_keys(item, keys);
+            }
+        }
+        Expr::Nested(inner) => flatten_grouping_keys(inner, keys),
+        expr => keys.push(expr),
+    }
 }
 
 /// Build the relation scope of one `SELECT`: its `FROM` / `JOIN` relations
@@ -4572,8 +4881,16 @@ fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> Jo
     use ast::JoinOperator;
 
     let mut left = infer_relation_columns(&from.relation, env);
+    let mut previous = &from.relation;
     for join in &from.joins {
         let mut right = infer_relation_columns(&join.relation, env);
+        // DuckDB's `a POSITIONAL JOIN b` parses as `a AS positional JOIN b`
+        // with no condition. It pads the shorter side with NULLs.
+        if is_positional_join(previous, &join.join_operator) {
+            null_extend_scope(&mut left);
+            null_extend_scope(&mut right);
+        }
+        previous = &join.relation;
         left.inexact.extend(std::mem::take(&mut right.inexact));
         let merged = merged_join_columns(&left.columns, &right.columns, &join.join_operator);
         if matches!(
@@ -4608,6 +4925,76 @@ fn infer_join_relations(from: &ast::TableWithJoins, env: InferEnv<'_, '_>) -> Jo
         left.relations.extend(right.relations);
     }
     left
+}
+
+/// Whether `join`, after the relation `previous`, is how DuckDB's
+/// `POSITIONAL JOIN` parses: `previous` has the unquoted alias `positional`
+/// and the join is a plain `JOIN` with no condition.
+fn is_positional_join(previous: &TableFactor, join: &ast::JoinOperator) -> bool {
+    table_factor_alias(previous).is_some_and(|alias| {
+        alias.name.quote_style.is_none() && alias.name.value.eq_ignore_ascii_case("positional")
+    }) && matches!(
+        join,
+        ast::JoinOperator::Join(ast::JoinConstraint::None)
+            | ast::JoinOperator::Inner(ast::JoinConstraint::None)
+    )
+}
+
+/// The alias of a table factor, when it has one.
+fn table_factor_alias(factor: &TableFactor) -> Option<&ast::TableAlias> {
+    match factor {
+        TableFactor::Table { alias, .. }
+        | TableFactor::Derived { alias, .. }
+        | TableFactor::TableFunction { alias, .. }
+        | TableFactor::Function { alias, .. }
+        | TableFactor::UNNEST { alias, .. }
+        | TableFactor::JsonTable { alias, .. }
+        | TableFactor::OpenJsonTable { alias, .. }
+        | TableFactor::NestedJoin { alias, .. }
+        | TableFactor::Pivot { alias, .. }
+        | TableFactor::Unpivot { alias, .. }
+        | TableFactor::MatchRecognize { alias, .. }
+        | TableFactor::XmlTable { alias, .. }
+        | TableFactor::SemanticView { alias, .. } => alias.as_ref(),
+        // `UNPIVOT expr AS value`: its alias names a value, not the relation.
+        TableFactor::UnpivotExpr { .. } => None,
+    }
+}
+
+/// Whether `sql` renames columns with a column-list alias: a table or
+/// derived table `AS q(a, b)`, or a CTE `c(a, b) AS (...)`. Lineage does not
+/// apply such a rename, so the model needs inference to check its types
+/// (#2572). A query that does not parse answers `false`.
+fn sql_has_column_list_alias(sql: &str) -> bool {
+    use sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct Finder;
+    impl Visitor for Finder {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &ast::Query) -> ControlFlow<()> {
+            match &query.with {
+                Some(with)
+                    if with
+                        .cte_tables
+                        .iter()
+                        .any(|cte| !cte.alias.columns.is_empty()) =>
+                {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            if table_factor_alias(factor).is_some_and(|alias| !alias.columns.is_empty()) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql)
+        .is_ok_and(|statements| statements.visit(&mut Finder).is_break())
 }
 
 fn merged_join_columns(
@@ -5677,6 +6064,305 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Under `ROLLUP`, `CUBE` or `GROUPING SETS` a subtotal row holds NULL in
+    /// each rolled-up key, after the `WHERE` has run. An output that is such
+    /// a key, or an expression over one, is nullable and keeps `E012`, even
+    /// when the source column is NOT NULL (#2566). `x` is NOT NULL here.
+    #[test]
+    fn grouping_set_keys_are_nullable() {
+        let mut wrong = Vec::new();
+        for target in [duckdb(), OperandTarget::Unconfigured] {
+            for sql in [
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY CUBE(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY GROUPING SETS ((x), ())",
+                "SELECT x AS c, z, COUNT(*) AS n FROM t GROUP BY ROLLUP((x, z))",
+                "SELECT t.x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(t.x)",
+                "SELECT x + 1 AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT CAST(x AS BIGINT) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                // The issue's shape: the key is the COALESCE itself.
+                "SELECT COALESCE(x, 0) AS c, SUM(z) AS n FROM t GROUP BY ROLLUP(COALESCE(x, 0))",
+                "SELECT IFNULL(x, 0) AS c, SUM(z) AS n FROM t GROUP BY ROLLUP(IFNULL(x, 0))",
+                "SELECT NVL(x, 0) AS c, SUM(z) AS n FROM t GROUP BY CUBE(NVL(x, 0))",
+                "SELECT COALESCE(z, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(COALESCE(z, 0))",
+                // By alias and by position.
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(c)",
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(1)",
+                // Through a CTE, and in one branch of a set operation.
+                "WITH r AS (SELECT x, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)) \
+                 SELECT x AS c FROM r",
+                "SELECT x AS c FROM t \
+                 UNION ALL SELECT x AS c FROM t GROUP BY ROLLUP(x)",
+                "SELECT c FROM (SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)) AS d",
+                "SELECT * FROM (SELECT x AS c FROM t) AS d GROUP BY ROLLUP(c)",
+                // A key that names another output, by alias or position,
+                // makes that column NULL too.
+                "SELECT x AS k, x AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(k)",
+                "SELECT x AS k, CAST(x AS BIGINT) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(k)",
+                "SELECT COALESCE(x, 0) AS c, COALESCE(x, 0) AS d, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(2)",
+                // The key spelled another way, wrapped, or nested.
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(COALESCE(t.x, 0))",
+                "SELECT COALESCE(x, 0)::BIGINT AS c, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(CAST(COALESCE(x, 0) AS BIGINT))",
+                "SELECT CAST(COALESCE(x, 0) AS BIGINT) AS c, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(COALESCE(x, 0))",
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n \
+                 FROM t GROUP BY GROUPING SETS (ROLLUP(COALESCE(x, 0)))",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY (ROLLUP(x))",
+                // A `*` over a CTE takes the rolled-up key's name.
+                "WITH r AS (SELECT x AS c FROM t) SELECT * FROM r GROUP BY ROLLUP(c)",
+                // `GROUP BY ALL` and Spark's trailing form with grouping sets.
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY ALL GROUPING SETS ((x), ())",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY x GROUPING SETS ((x), ())",
+            ] {
+                let (_, nullable, e012) = coalesce_column(sql, target.clone());
+                if !nullable || !e012 {
+                    wrong.push(format!("{sql} on {target:?}: {nullable} {e012}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// What a subtotal row does not make NULL stays non-null: a key outside
+    /// the `ROLLUP`, a `COALESCE` that replaces the NULL key, `COUNT`, and a
+    /// plain `GROUP BY` (#2566).
+    #[test]
+    fn grouping_sets_keep_what_a_subtotal_row_cannot_null() {
+        let mut wrong = Vec::new();
+        for target in [duckdb(), OperandTarget::Unconfigured] {
+            for sql in [
+                "SELECT x AS c, z, COUNT(*) AS n FROM t GROUP BY x, ROLLUP(z)",
+                "SELECT COALESCE(x, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+                "SELECT COALESCE(z, 0) AS c, COUNT(*) AS n FROM t GROUP BY ROLLUP(z)",
+                "SELECT COUNT(*) AS c, x FROM t GROUP BY ROLLUP(x)",
+                "SELECT x AS c, COUNT(*) AS n FROM t GROUP BY x",
+                "SELECT CAST(COALESCE(x, 0) AS DOUBLE) AS c, COUNT(*) AS n \
+                 FROM t GROUP BY ROLLUP(x)",
+                // A qualified key widens only its own relation.
+                "SELECT a.x AS c, b.x AS d, COUNT(*) AS n \
+                 FROM t AS a JOIN u AS b ON a.x = b.x GROUP BY a.x, ROLLUP(b.x)",
+                // A bare aggregate keeps its bit when a key is an expression.
+                "SELECT COUNT(*) AS c, x + 1 AS k FROM t GROUP BY ROLLUP(x + 1)",
+            ] {
+                let (_, nullable, e012) = coalesce_column(sql, target.clone());
+                if nullable || e012 {
+                    wrong.push(format!("{sql} on {target:?}: {nullable} {e012}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `WITH ROLLUP` and `GROUP BY ALL WITH ROLLUP` do not parse in the
+    /// dialect models are read with, so drive the key collection directly
+    /// with one that accepts them (#2566).
+    #[test]
+    fn grouping_modifiers_roll_up_every_key() {
+        let select = |sql: &str| {
+            let statements =
+                Parser::parse_sql(&sqlparser::dialect::MySqlDialect {}, sql).expect(sql);
+            let Statement::Query(query) = &statements[0] else {
+                panic!("{sql}")
+            };
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("{sql}")
+            };
+            select.as_ref().clone()
+        };
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x, COUNT(*) FROM t GROUP BY x, z WITH ROLLUP",
+        ));
+        assert!(
+            matches!(&keys, Some(SubtotalKeys::Columns(keys)) if keys.len() == 2),
+            "every plain key rolls up"
+        );
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x + 1, COUNT(*) FROM t GROUP BY x + 1 WITH ROLLUP",
+        ));
+        assert!(matches!(keys, Some(SubtotalKeys::Any)));
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x, COUNT(*) FROM t GROUP BY ALL WITH ROLLUP",
+        ));
+        assert!(matches!(keys, Some(SubtotalKeys::Any)));
+        // Spark's trailing grouping sets: the keys in the sets roll up, also
+        // one not in the list before them.
+        let keys = SubtotalKeys::of(&select(
+            "SELECT x, COUNT(*) FROM t GROUP BY y GROUPING SETS ((x), ())",
+        ));
+        assert!(
+            matches!(&keys, Some(SubtotalKeys::Columns(keys)) if keys.iter().any(|k| k.name == "x")),
+            "a key inside the trailing sets rolls up"
+        );
+        assert!(SubtotalKeys::of(&select("SELECT x, COUNT(*) FROM t GROUP BY x")).is_none());
+    }
+
+    /// A `WHERE` comparison does not clear `E022` under a rollup, also one
+    /// written `GROUP BY (ROLLUP(d))` (#2566).
+    #[test]
+    fn where_does_not_reject_null_under_a_parenthesised_rollup() {
+        let filter = "SELECT d, COUNT(*) AS n FROM t WHERE d >= '2024-01-01'";
+        assert!(where_rejects_null_column(
+            &format!("{filter} GROUP BY d"),
+            "d"
+        ));
+        for group_by in [
+            "GROUP BY ROLLUP(d)",
+            "GROUP BY (ROLLUP(d))",
+            "GROUP BY (CUBE(d))",
+        ] {
+            assert!(
+                !where_rejects_null_column(&format!("{filter} {group_by}"), "d"),
+                "{group_by}"
+            );
+        }
+    }
+
+    /// An output whose name lineage and inference spell differently (an
+    /// unaliased expression: lineage calls `CAST(x AS BIGINT)` `x`) does not
+    /// keep lineage's non-null bit, which never saw the subtotal row or the
+    /// outer join. Of two outputs with one name, the table keeps the first.
+    #[test]
+    fn an_output_inference_cannot_match_by_name_is_not_kept_non_null() {
+        let cols: Cols = &[
+            ("x", RockyType::Int32, false),
+            ("y", RockyType::Int32, false),
+        ];
+        let tables = [("t", cols), ("u", cols)];
+        let mut wrong = Vec::new();
+        for sql in [
+            "SELECT CAST(x AS BIGINT), COUNT(*) AS n FROM t GROUP BY ROLLUP(x)",
+            "SELECT x::BIGINT, COUNT(*) AS n FROM t GROUP BY CUBE(x)",
+            "SELECT CAST(x AS BIGINT), COUNT(*) AS n FROM t GROUP BY ROLLUP(1)",
+            "SELECT CAST(u.x AS INT), t.y FROM t LEFT JOIN u ON t.x = u.x",
+            "SELECT b.x, a.x FROM t AS a JOIN u AS b ON a.x = b.x GROUP BY a.x, ROLLUP(b.x)",
+            "SELECT b.x, a.x FROM t AS a LEFT JOIN u AS b ON a.x = b.x",
+            // A name Rocky makes up for an unaliased call is not a real
+            // column's name.
+            "SELECT COUNT(*), u.x AS count FROM t LEFT JOIN u ON t.x = u.x GROUP BY u.x",
+            "SELECT COUNT(*), x AS count FROM t GROUP BY ROLLUP(x)",
+            "SELECT COUNT(*), NULL AS count FROM t",
+            "SELECT COALESCE(t.x, 0), u.y AS coalesce FROM t LEFT JOIN u ON t.x = u.x",
+        ] {
+            let rows = typecheck_over(sql, &tables);
+            if rows.iter().any(|(name, _, nullable)| {
+                matches!(name.as_str(), "x" | "count" | "coalesce") && !nullable
+            }) {
+                wrong.push(format!("{sql}: {rows:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A column-list alias renames columns by position. Lineage does not
+    /// apply it, so a column took the type of the source column that has
+    /// the new name (#2572).
+    #[test]
+    fn a_column_list_alias_takes_the_renamed_columns_type() {
+        let cols: Cols = &[
+            ("n", RockyType::String, false),
+            ("y", RockyType::Int32, false),
+            ("x", RockyType::Int32, false),
+        ];
+        let tables = [("t", cols), ("u", cols)];
+        let mut wrong = Vec::new();
+        let x_type = |sql: &str, tables: &[(&str, Cols)]| {
+            let rows = typecheck_over(sql, tables);
+            rows.iter()
+                .find(|(name, _, _)| name == "x")
+                .map(|(_, ty, _)| ty.clone())
+                .unwrap_or_else(|| panic!("no column x: {sql}: {rows:?}"))
+        };
+        // Inference reads the renamed column exactly: its type is the
+        // column it reads.
+        for sql in [
+            "SELECT x FROM u AS q(x, y, n)",
+            "SELECT q.x FROM u AS q(x, y, n)",
+            "WITH c(x, w) AS (SELECT n, x FROM t) SELECT x FROM c",
+            "SELECT x FROM (SELECT n, y FROM t) AS d(x, w)",
+            "SELECT MAX(x) AS x FROM u AS q(x, y, n)",
+        ] {
+            let ty = x_type(sql, &tables);
+            if ty != RockyType::String {
+                wrong.push(format!("{sql}: {ty:?}"));
+            }
+        }
+        // Rocky cannot tell the renamed column's type: it is untyped, never
+        // the type of the source column that has the new name.
+        let untyped: Cols = &[
+            ("n", RockyType::Unknown, true),
+            ("y", RockyType::Int32, false),
+            ("x", RockyType::Int32, false),
+        ];
+        let with_untyped = [("t", cols), ("u", cols), ("uu", untyped)];
+        for sql in [
+            "WITH c(x, w) AS (SELECT some_fn(n), x FROM t) SELECT x FROM c",
+            "SELECT x FROM uu AS q(x, y, n)",
+            "SELECT MAX(x) AS x FROM uu AS q(x, y, n)",
+            // Inference fails on the `VALUES` CTE.
+            "WITH v(k) AS (VALUES (1)) SELECT x FROM u AS q(x, y, n)",
+            // Lineage names this `x`; inference names it `max`.
+            "SELECT MAX(x) FROM u AS q(x, y, n)",
+        ] {
+            let ty = x_type(sql, &with_untyped);
+            if ty != RockyType::Unknown {
+                wrong.push(format!("{sql}: {ty:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // Without a rename the source type stands.
+        let rows = typecheck_over("SELECT x FROM u AS q", &tables);
+        assert_eq!(rows[0].1, RockyType::Int32, "{rows:?}");
+    }
+
+    /// `UNION BY NAME` pairs columns by name, not position, and DuckDB's
+    /// `POSITIONAL JOIN` pads the shorter side with NULLs. Neither keeps a
+    /// NOT NULL source column non-null.
+    #[test]
+    fn by_name_unions_and_positional_joins_are_nullable() {
+        let cols: Cols = &[
+            ("x", RockyType::Int32, false),
+            ("y", RockyType::Int32, false),
+            ("z", RockyType::Int32, true),
+        ];
+        let tables = [("t", cols), ("u", cols)];
+        let mut wrong = Vec::new();
+        for sql in [
+            "SELECT x, y FROM t UNION BY NAME SELECT y, z AS x FROM t",
+            "SELECT x, y FROM t UNION ALL BY NAME SELECT y, z AS x FROM t",
+            "SELECT x, y FROM (SELECT x, y FROM t UNION ALL BY NAME SELECT y, z AS x FROM t) AS d",
+            "WITH a AS (SELECT x, y FROM t UNION BY NAME SELECT y FROM t) SELECT x, y FROM a",
+            "SELECT u.x, u.y FROM t POSITIONAL JOIN u",
+            "SELECT t.x, t.y FROM t POSITIONAL JOIN u",
+            // The left side too, read through a bare name.
+            "SELECT COALESCE(x, x) AS x FROM t POSITIONAL JOIN (SELECT y AS w FROM u) AS d",
+            "SELECT u.x FROM t PIVOT (SUM(y) FOR n IN ('a')) POSITIONAL JOIN u",
+            // A `*` over a `BY NAME` CTE that lineage expands.
+            "WITH a AS (SELECT x, y FROM t UNION BY NAME SELECT y FROM t) \
+             SELECT * FROM a JOIN u ON TRUE",
+            "WITH a AS (SELECT x, y FROM t UNION BY NAME SELECT y FROM t), \
+             b AS (SELECT * FROM a) SELECT * FROM b, u",
+        ] {
+            let rows = typecheck_over(sql, &tables);
+            if rows
+                .iter()
+                .any(|(name, _, nullable)| name == "x" && !nullable)
+            {
+                wrong.push(format!("{sql}: {rows:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A table aliased `positional` in a join with a condition is a
+        // plain join.
+        let rows = typecheck_over(
+            "SELECT positional.x FROM t AS positional JOIN u ON positional.x = u.x",
+            &tables,
+        );
+        assert!(!rows[0].2, "{rows:?}");
     }
 
     /// An `IFNULL` or `NVL` whose two arguments may both be NULL stays

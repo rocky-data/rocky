@@ -8,6 +8,8 @@
 //! tests of `rocky-cli`; this test closes the CLI-dispatch and server-input
 //! links only.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -89,11 +91,8 @@ fn real_server_answers_the_real_cli_review_queue_bytes() {
     let _keep_alive = &server;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            let (status, _) = http_get(port, "/api/v1/health");
-            if status.contains("200") {
-                break;
-            }
+        if common::serve_health_ok(port) {
+            break;
         }
         assert!(
             Instant::now() < deadline,
