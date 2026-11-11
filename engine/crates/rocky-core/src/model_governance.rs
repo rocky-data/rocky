@@ -376,9 +376,10 @@ pub fn owner_of(
 fn latest_alias_model(base: &str, latest: &Model, decl: &VersionDecl, path: &Path) -> Model {
     let mut config = latest.config.clone();
     config.name = base.to_string();
-    config.name_declared = base.to_string();
+    // A generated alias: its author declared neither key.
+    config.name_declared = String::new();
     config.target.table = base.to_string();
-    config.target_table_declared = base.to_string();
+    config.target_table_declared = String::new();
     config.depends_on = Vec::new();
     config.strategy = StrategyConfig::View;
     config.sources = Vec::new();

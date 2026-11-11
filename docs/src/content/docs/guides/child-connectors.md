@@ -90,6 +90,8 @@ wall_time_secs = 1800
 
 A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
 
+`rocky validate` reads each manifest offline and reports **V067** for each connector. It is `ok` when the manifest passes the checks `rocky load --connector` runs. It is an error when the manifest is missing or invalid, or when `command` names a program path that does not exist. A bare program name is looked up on `PATH` at run time, so validate does not check it. A project with connectors and no `[pipeline]` is valid: V020 ("No pipelines defined") does not warn.
+
 ## The request and the result
 
 Rocky writes one JSON document to the stdin of the program.
@@ -284,7 +286,9 @@ The limits of this design:
 - Delivery is at least once, as for every child connector.
 - Each run scans the whole source table.
 
-The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file.
+The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file. The weekly CI runs it as a gate: a failure turns the weekly job red.
+
+The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the same connector inside a full project, with a data product, a deadline, volume ranges, a monthly cost and a budget.
 
 ## Related
 

@@ -455,16 +455,32 @@ jobs:
         continue-on-error: true
         run: bash examples/playground/scripts/run-all-parse-validate.sh
 
-      # The reference Postgres child connector. run-all-duckdb.sh skips it
-      # because it needs Docker; the runner has Docker, so run it here with
-      # REQUIRE_DOCKER=1 (a missing daemon fails instead of skipping). It
-      # pulls postgres:16-alpine from Docker Hub and the DuckDB postgres
-      # extension from extensions.duckdb.org. Either can rate-limit or go
-      # down, so this step is last and cannot turn the weekly job red.
+      # The reference Postgres child connector (S-2). run-all-duckdb.sh skips
+      # it because it needs Docker; the runner has Docker, so run it here
+      # with REQUIRE_DOCKER=1 (a missing daemon fails instead of skipping).
+      # A gate: a failure turns the weekly job red. It was continue-on-error
+      # while its two downloads could fail it: postgres:16-alpine from Docker
+      # Hub and the DuckDB postgres extension from extensions.duckdb.org.
+      # run.sh now fetches both first, with 4 attempts each and backoff, and
+      # skips the pull when the image is cached, so a transient outage or a
+      # Docker Hub 429 is retried rather than failing a load. An outage that
+      # outlasts the retries still fails the step, and says which download.
       - name: Postgres child connector POC (Docker)
         working-directory: ${{ github.workspace }}
-        continue-on-error: true
         timeout-minutes: 10
         env:
           REQUIRE_DOCKER: "1"
         run: bash examples/playground/pocs/07-adapters/08-postgres-child-connector/run.sh
+
+      # The open-stack acceptance journey: the same connector in one project
+      # with a product deadline, volume ranges, a monthly cost split, a
+      # budget breach and the HTTP API, every step's JSON asserted. About 4
+      # minutes, most of it one wait for a per-minute deadline to pass. It
+      # reuses the image and the extension the step above fetched.
+      - name: Open-stack acceptance journey (Docker)
+        if: ${{ !cancelled() }}
+        working-directory: ${{ github.workspace }}
+        timeout-minutes: 15
+        env:
+          REQUIRE_DOCKER: "1"
+        run: bash examples/playground/pocs/05-orchestration/13-open-stack-acceptance/run.sh
