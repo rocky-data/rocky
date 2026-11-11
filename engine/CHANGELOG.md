@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rocky validate` checks each `[connector.<name>]` manifest offline (`V067`): `ok` when the manifest reads and its program exists, and an error when the manifest is missing or invalid, or when its `command` names a program path that does not exist. A bare program name is looked up on `PATH` at run time and is not checked.
 - `EnvString::secret(name, value)`, `EnvString::from_env(name)`, `RedactedString::secret(name, value)` and `RedactedString::from_env(name)`, for library users who build adapter or config types without `rocky.toml`. Each records the value under `name` in the secret registry, so an error that echoes it inside other text prints `${name}` instead. `EnvString::substituted` and `RedactedString::new` do not record it. The registry's 8-byte floor applies: a shorter value is not rewritten inside other text (#1919).
 
 ### Fixed
@@ -24,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `E022` help (a nullable `time_column`) no longer tells you to filter out NULLs upstream. A filter in an upstream model, or `WHERE x IS NOT NULL`, does not clear `E022`. The help now names fixes that do: a plain comparison (`>=`, `<` and the like, joined by AND) on the bare column in the model's own WHERE, spelled with the same qualifier as in the SELECT; `COALESCE` with a NOT NULL column of the same type; or a source column that is NOT NULL in a schema Rocky has. It also says that `BETWEEN` and `OR` do not count, and that the WHERE does not help under `GROUP BY ROLLUP`, `CUBE` or `GROUPING SETS`.
 - `rocky lsp` no longer loses a saved file's changes when the compile that the save starts fails. After a failed save or startup compile, the next compile runs in full, so it reads the saved file again. After a failed edit compile, the next compile marks that edit's files again. When another compile succeeds and is stored while the failed one runs, or after it fails, the server compiles once more after the usual short delay for the kept files. Compiles that only fail never start another compile, even when they overlap, so a project that cannot compile does not compile over and over.
 - The scheduler no longer loses a cron occurrence in silence when its child never records a run, for example after a power loss or a kill mid-run. Such a claim stayed `submitted` forever, with no incident: its key never comes due again, so no recovery path reached it. The orphan sweep now waits 5 minutes after it first sees the claim, then records the occurrence as a lost failure and writes its incident bundle. It does not re-run the occurrence or change `consecutive_failures`.
+- `rocky validate` no longer tells you to omit `name` or `target.table` from a model sidecar that does not set them. Lints `L001` and `L002` fired on every model whose sidecar left both keys out, because the omitted keys defaulted to the file name before the check. They now fire only on a key the sidecar writes: `L001` when `name` equals the file name, `L002` when `target.table` equals the name (or the file name, when `name` is omitted).
+- `rocky validate` no longer warns `V020` ("No pipelines defined") on a project whose only work is child connectors (`[connector.<name>]`, run by `rocky load --connector`).
 
 ### Changed
 

@@ -1,0 +1,40 @@
+# The data product: event count and amount per event type.
+#
+# deliver_by = "* * * * *" makes every minute a deadline. run.sh can then
+# record an on-time delivery and a late one without waiting a day.
+
+[product]
+name       = "events_by_type"
+intent     = "Event count and amount per event type, from the Postgres events table"
+deliver_by = "* * * * *"
+timezone   = "UTC"
+
+[product.source]
+tables = ["poc.main.events"]
+
+# Counted when each production run starts. Load 1 lands 19 rows: in range.
+# Load 2 brings the table to 24 rows, above 20: a warning, and the output
+# still builds.
+[[product.source.volume]]
+table    = "poc.main.events"
+min_rows = 1
+max_rows = 20
+severity = "warning"
+
+[product.output]
+model   = "events_by_type"
+grain   = ["event_type"]
+columns = [
+    { name = "event_type", type = "String", nullable = false },
+    { name = "events", type = "Int64", nullable = false },
+    { name = "amount_cents", type = "Int64", nullable = false },
+]
+
+# Counted after each production build: the seed has three event types.
+[product.output.volume]
+min_rows = 1
+max_rows = 3
+severity = "error"
+
+[product.trust]
+agent = "propose_only"
