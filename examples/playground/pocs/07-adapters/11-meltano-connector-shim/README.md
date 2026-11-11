@@ -34,7 +34,7 @@ The shim uses `meltano invoke` and never `meltano run`. `meltano run` keeps Sing
 | Delivery is at least once. | A crash between the promote and the state commit loads a batch twice. Deduplicate downstream on a key. |
 | No catalog beyond the tap's own. | The shim asks the tap for its catalog with `--discover` and edits only the selection. |
 | Only `RECORD` and `STATE` messages are used. | `SCHEMA` is ignored: DuckDB infers the types. A `BATCH` message fails the run. A tap that emits no `STATE` message keeps the old state. |
-| Runs share the project directory. | `meltano invoke` writes under `meltano_project/.meltano/`. Do not run two loads of the same project at the same time. |
+| Secrets stay out of the project. | Meltano writes the tap's resolved config to its system directory. The shim points `MELTANO_SYS_DIR_ROOT` at a private temp dir (mode 0700) per run and removes it. The shim always passes `--state` (`{}` on the first run), so a stale Meltano state file is never read. |
 | Egress: `[]`. | Meltano usage tracking is switched off (`MELTANO_DISABLE_TRACKING=true`). The POC tap reads local files. A real tap calls its own hosts: list them in the manifest. |
 
 ## Options

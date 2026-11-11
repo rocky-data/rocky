@@ -144,7 +144,7 @@ def remove_containers():
 
 
 def on_sigterm(signum, frame):
-    # Rocky stops a run with SIGTERM to the process group. The docker client
+    # Rocky stops a run with SIGTERM (a terminal Ctrl-C sends SIGINT). The docker client
     # dies, but the container would go on, so remove it. SIGKILL cannot be
     # caught: after a SIGKILL the container (named rocky-<run>-<attempt>-<step>)
     # can outlive the run until it ends by itself.
@@ -355,6 +355,7 @@ def main():
     global CONTAINER_PREFIX
     CONTAINER_PREFIX = "rocky-" + re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(output_dir.rstrip("/")))
     signal.signal(signal.SIGTERM, on_sigterm)
+    signal.signal(signal.SIGINT, on_sigterm)
     try:
         write_private(os.path.join(work_dir, "config.json"), config)
         run_spec(options, work_dir)

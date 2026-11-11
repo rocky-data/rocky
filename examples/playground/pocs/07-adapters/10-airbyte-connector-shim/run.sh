@@ -141,7 +141,7 @@ runs = sorted(glob.glob(".rocky/landing/faker_users/*/_rocky_result.json"),
 if len(runs) != 4:
     print("FAIL: expected 4 kept scratch directories (the contract failure and 3 loads), found %d" % len(runs))
     sys.exit(1)
-first = json.load(open(runs[0]))["state"]["value"]
+first = json.load(open(runs[1]))["state"]["value"]
 last = json.load(open(runs[-1]))["state"]["value"]
 for label, value in (("load 1", first), ("load 3", last)):
     stream_state = value["message"]["stream"]["stream_state"]

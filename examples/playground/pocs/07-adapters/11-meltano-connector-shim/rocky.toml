@@ -48,3 +48,18 @@ retries    = 0
 project_dir = "../meltano_project"
 tap         = "tap-orders"
 stream      = "refunds"
+
+# The tap run emits records under another name than the selected stream. The
+# shim fails (the connector uses fake-meltano.sh in place of meltano to force
+# it).
+[connector.orders_name_mismatch]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/orders_name_mismatch"
+target     = { catalog = "poc", schema = "main", table = "mismatch" }
+retries    = 0
+
+[connector.orders_name_mismatch.options]
+project_dir = "../meltano_project"
+tap         = "tap-orders"
+stream      = "orders"
+meltano_bin = "../fake-meltano.sh"

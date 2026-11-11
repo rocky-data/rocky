@@ -11,17 +11,25 @@ Meltano to the Rocky child connector protocol:
   1. `meltano invoke <tap> --discover` prints the tap's catalog.
   2. The shim marks only the stream named in the options as selected. The
      stream must exist, or the run fails and lists the choices.
-  3. `meltano invoke <tap> --catalog <file> [--state <file>]` runs the tap.
-     `--state` is passed only when Rocky has saved state.
+  3. `meltano invoke <tap> --catalog <file> --state <file>` runs the tap.
+     `--state` is always passed: the saved state, or `{}` when Rocky has none.
+     Without it Meltano would pick up a stale state file of its own.
   4. RECORD messages of the stream go to JSONL, then to Parquet through the
      duckdb CLI. SCHEMA messages are ignored (DuckDB infers the types).
   5. The LAST STATE message is the Rocky state. A non-zero exit fails the
-     run and the state does not move.
+     run and the state does not move. So does a run where the tap emitted
+     records but none for the selected stream.
 
 The shim runs `meltano invoke` only. It never uses `meltano run` or
 `meltano elt`, which keep Singer state in Meltano's own state backend
 (`.meltano/`). That state would live where Rocky's commit fence cannot see
 it. The only Singer state is the one in Rocky state.
+
+Meltano writes the tap's resolved config (secrets included) to a file under
+its system directory on every invoke. The shim gives each run a private
+system directory (mode 0700, in the temp dir) with MELTANO_SYS_DIR_ROOT, links
+the installed plugins into it, and removes it when the run ends. Nothing is
+written into the project directory.
 
 Options (`[connector.<name>.options]`, read from options.json):
     project_dir   Meltano project directory, relative to this file (required)
@@ -45,8 +53,10 @@ Python 3.8 or newer, standard library only, plus the duckdb CLI.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 PROTOCOL_VERSION = 0
 STATE_SCHEMA_VERSION = 1
@@ -54,6 +64,7 @@ RESULT_FILE = "_rocky_result.json"
 BATCH_FILE = "batch-0.parquet"
 MAX_STATE_BYTES = 900 * 1024
 HERE = os.path.dirname(os.path.abspath(__file__))
+os.umask(0o077)
 
 
 def log(message):
@@ -104,27 +115,54 @@ def read_saved_state(request):
     return value
 
 
-def invoke(options, args):
-    """Run `meltano invoke <tap> args`. Returns (exit code, stdout lines)."""
+def make_sys_dir(options):
+    """A private Meltano system directory for this run.
+
+    Plugin virtualenvs are linked in from the project's own `.meltano`. The
+    run directory (where Meltano writes the resolved tap config) is new.
+    """
+    sys_dir = tempfile.mkdtemp(prefix="meltano-sys-")
+    project_sys = os.path.join(options["project_dir"], ".meltano")
+    if os.path.isdir(project_sys):
+        for name in os.listdir(project_sys):
+            if name not in ("run", "logs"):
+                os.symlink(os.path.join(project_sys, name), os.path.join(sys_dir, name))
+    return sys_dir
+
+
+def invoke(options, sys_dir, args, on_line):
+    """Run `meltano invoke <tap> args`, calling on_line(line) per stdout line.
+
+    Returns the exit code. Stdout is read as it arrives, never held whole.
+    """
     env = dict(os.environ)
     env["MELTANO_PROJECT_ROOT"] = options["project_dir"]
+    env["MELTANO_SYS_DIR_ROOT"] = sys_dir
     env["MELTANO_DISABLE_TRACKING"] = "true"
     command = [options["meltano_bin"], "invoke", options["tap"]] + args
+    err_path = os.path.join(sys_dir, "stderr.log")
     # The tap resolves relative paths in its settings against the project.
     try:
-        done = subprocess.run(
-            command, cwd=options["project_dir"], env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, universal_newlines=True, check=False,
-        )
+        with open(err_path, "w", encoding="utf-8") as err:
+            proc = subprocess.Popen(
+                command, cwd=options["project_dir"], env=env, stdout=subprocess.PIPE,
+                stderr=err, universal_newlines=True,
+            )
+            for line in proc.stdout:
+                on_line(line)
+            code = proc.wait()
     except OSError as error:
         fail("cannot start meltano: %s" % error)
-    for line in done.stderr.splitlines():
-        log("meltano: " + line)
-    return done.returncode, done.stdout
+    with open(err_path, encoding="utf-8", errors="replace") as err:
+        for line in err.read().splitlines():
+            log("meltano: " + line)
+    return code
 
 
-def select_stream(options, work_dir):
-    code, stdout = invoke(options, ["--discover"])
+def select_stream(options, sys_dir, work_dir):
+    chunks = []
+    code = invoke(options, sys_dir, ["--discover"], chunks.append)
+    stdout = "".join(chunks)
     if code != 0:
         fail("`meltano invoke --discover` exited with code %d" % code)
     try:
@@ -202,42 +240,66 @@ def main():
     options = load_options(request)
     saved = read_saved_state(request)
 
-    catalog_path = select_stream(options, output_dir)
-    args = ["--catalog", catalog_path]
-    if saved is not None:
-        state_path = os.path.join(output_dir, "state.json")
-        with open(state_path, "w", encoding="utf-8") as handle:
-            json.dump(saved, handle)
-        args += ["--state", state_path]
-        log("resuming from saved state (--state)")
-    else:
-        log("no saved state; first run")
+    sys_dir = make_sys_dir(options)
+    try:
+        run_tap(options, saved, output_dir, sys_dir)
+    finally:
+        shutil.rmtree(sys_dir, ignore_errors=True)
 
-    code, stdout = invoke(options, args)
-    if code != 0:
-        fail("`meltano invoke %s` exited with code %d" % (options["tap"], code))
+
+def run_tap(options, saved, output_dir, sys_dir):
+    catalog_path = select_stream(options, sys_dir, output_dir)
+    # Always pass --state: with none, Meltano may read a stale state.json of
+    # its own from an earlier run. Rocky state is the only source of truth.
+    state_path = os.path.join(output_dir, "state.json")
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(saved if saved is not None else {}, handle)
+    args = ["--catalog", catalog_path, "--state", state_path]
+    log("resuming from saved state (--state)" if saved is not None
+        else "no saved state; first run (--state {})")
 
     records_path = os.path.join(output_dir, "records.jsonl")
-    records = 0
-    last_state = None
-    with open(records_path, "w", encoding="utf-8") as out:
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except ValueError:
-                log("ignored a non-JSON line on stdout (%d bytes)" % len(line))
-                continue
-            kind = message.get("type") if isinstance(message, dict) else None
-            if kind == "RECORD" and message.get("stream") == options["stream"]:
+    counts = {"records": 0, "seen": 0}
+    other = {}
+    box = {"state": None}
+
+    def on_line(line):
+        line = line.strip()
+        if not line:
+            return
+        try:
+            message = json.loads(line)
+        except ValueError:
+            log("ignored a non-JSON line on stdout (%d bytes)" % len(line))
+            return
+        kind = message.get("type") if isinstance(message, dict) else None
+        if kind == "RECORD":
+            counts["seen"] += 1
+            if message.get("stream") == options["stream"]:
                 out.write(json.dumps(message["record"]) + "\n")
-                records += 1
-            elif kind == "STATE":
-                last_state = message.get("value")
-            elif kind == "BATCH":
-                fail("the tap emitted BATCH messages; this shim reads RECORD messages only")
+                counts["records"] += 1
+            else:
+                name = str(message.get("stream"))
+                other[name] = other.get(name, 0) + 1
+        elif kind == "STATE":
+            box["state"] = message.get("value")
+        elif kind == "BATCH":
+            fail("the tap emitted BATCH messages; this shim reads RECORD messages only")
+
+    with open(records_path, "w", encoding="utf-8") as out:
+        code = invoke(options, sys_dir, args, on_line)
+    if code != 0:
+        fail("`meltano invoke %s` exited with code %d" % (options["tap"], code))
+    records, last_state = counts["records"], box["state"]
+    if other:
+        log("ignored records of other streams: %s" % ", ".join(
+            "%s=%d" % (k, v) for k, v in sorted(other.items())))
+    if counts["seen"] > 0 and records == 0:
+        fail(
+            "the tap emitted %d record(s) but none for stream %r (it emitted: %s); "
+            "refusing to move the state past a lost batch"
+            % (counts["seen"], options["stream"], ", ".join(sorted(other)))
+        )
 
     if last_state is None:
         # A tap with no state support emits no STATE. Carry the old state.

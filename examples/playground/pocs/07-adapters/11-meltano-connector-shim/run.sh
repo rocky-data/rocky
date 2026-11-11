@@ -117,6 +117,38 @@ print("    status=loaded total_rows=%d commit_seq %d -> %d"
 PY
 }
 
+# A stale state file of Meltano's own must never reach the tap.
+mkdir -p meltano_project/.meltano/run/tap-orders
+echo '{"bookmarks": {"orders": {"replication_key": "id", "replication_key_value": 99}}}' \
+    > meltano_project/.meltano/run/tap-orders/state.json
+
+echo
+echo "=== at least once: a failure AFTER the shim succeeded must not move the state ==="
+# rocky-contract-fail.toml adds a contract the batch cannot meet. The shim
+# succeeds, the contract gate fails, and Rocky must keep the old state.
+if RUST_LOG=info rocky -c rocky-contract-fail.toml --state-path .rocky/state.redb \
+    load --connector orders_tap --output json \
+    > expected/contract-fail.json 2> expected/contract-fail.log; then
+    echo "FAIL: the contract-gated load exited 0"
+    exit 1
+fi
+if ! grep -q "read 4 record(s) of stream 'orders'" expected/contract-fail.log; then
+    echo "FAIL: the shim did not read the batch before the gate failed"
+    exit 1
+fi
+if grep -q "resuming from saved state" expected/contract-fail.log; then
+    echo "FAIL: the first run resumed from a state (a stale file reached the tap?)"
+    exit 1
+fi
+LEFT="$(duckdb -readonly -csv -noheader poc.duckdb \
+    "SELECT count(*) FROM information_schema.tables WHERE table_name = 'orders'" 2>/dev/null || echo 0)"
+if [ "$LEFT" != "0" ] && [ "$(duckdb -readonly -csv -noheader poc.duckdb 'SELECT count(*) FROM poc.main.orders')" != "0" ]; then
+    echo "FAIL: the failed load left rows in poc.main.orders"
+    exit 1
+fi
+echo "    the load failed after the shim read 4 records; no rows landed"
+echo "    the next load must read the same 4 rows with commit_seq 0 -> 1:"
+
 load 1 4 1
 
 echo
@@ -156,10 +188,10 @@ python3 - <<'PY'
 import glob, json, os, sys
 runs = sorted(glob.glob(".rocky/landing/orders_tap/*/_rocky_result.json"),
               key=os.path.getmtime)
-if len(runs) != 3:
-    print("FAIL: expected 3 kept scratch directories, found %d" % len(runs))
+if len(runs) != 4:
+    print("FAIL: expected 4 kept scratch directories (the contract failure and 3 loads), found %d" % len(runs))
     sys.exit(1)
-for label, path, expected in (("load 1", runs[0], 4), ("load 3", runs[-1], 7)):
+for label, path, expected in (("load 1", runs[1], 4), ("load 3", runs[-1], 7)):
     value = json.load(open(path))["state"]["value"]
     bookmark = value["bookmarks"]["orders"]
     print("    %s: bookmark %s=%s" % (label, bookmark["replication_key"],
@@ -183,6 +215,30 @@ if ! grep -q "the tap has no stream 'refunds'" expected/missing.log; then
     exit 1
 fi
 echo "    failed as expected: $(grep -o -m1 "the tap has no stream[^\"]*" expected/missing.log)"
+
+echo
+echo "=== records under another stream name fail the run ==="
+if rocky -c rocky.toml --state-path .rocky/state.redb \
+    load --connector orders_name_mismatch --output json \
+    > expected/mismatch.json 2> expected/mismatch.log; then
+    echo "FAIL: a stream-name mismatch exited 0"
+    exit 1
+fi
+if ! grep -q "none for stream 'orders'" expected/mismatch.log; then
+    echo "FAIL: the log does not report the mismatch. Last log lines:"
+    tail -n 10 expected/mismatch.log
+    exit 1
+fi
+echo "    failed as expected: $(grep -o -m1 "emitted [0-9]* record(s) but none for stream[^;]*" expected/mismatch.log)"
+
+echo
+echo "=== no tap config or Meltano temp dir is left behind ==="
+if find meltano_project .rocky -name 'tap.*.config.json' 2>/dev/null | grep -q . \
+    || ls -d "${TMPDIR:-/tmp}"/meltano-sys-* >/dev/null 2>&1; then
+    echo "FAIL: a tap.*.config.json (it can hold secrets) or a meltano-sys-* dir is left"
+    exit 1
+fi
+echo "    0 left"
 
 echo
 echo "POC complete: 3 loads (4, 3, 0 rows), 7 rows total, Singer bookmark carried in Rocky state."
