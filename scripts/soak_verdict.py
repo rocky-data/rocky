@@ -19,7 +19,6 @@ must never be able to masquerade as a scheduler bug.
 from __future__ import annotations
 
 import datetime as dt
-import itertools
 import json
 import pathlib
 import sys
@@ -308,14 +307,14 @@ def gate_completeness(run: dict) -> list[dict]:
     # to know how many times and for how long it slept.
     sleeps = [
         {"from": a["t"], "to": b["t"], "wall_gap_s": b["t"] - a["t"]}
-        for a, b in itertools.pairwise(samples)
+        for a, b in zip(samples, samples[1:])
         if b["t"] - a["t"] > 3 * interval
     ]
     # A clock step: the wall clock moved and the boot clock (CLOCK_BOOTTIME,
     # `up`, Linux only) did not move with it. A paused VM does this on resume
     # when it resyncs; the spacing alone can look normal if the step is small.
     steps = []
-    for a, b in itertools.pairwise(samples):
+    for a, b in zip(samples, samples[1:]):
         if a.get("up") is None or b.get("up") is None:
             continue
         drift = (b["t"] - a["t"]) - (b["up"] - a["up"])

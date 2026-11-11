@@ -18,7 +18,8 @@
 #   SELF_CHECK=1                          a 20-minute run of each container instead
 #   ROCKY_IMAGE=...                       use another image (a local build)
 #
-# Exit: 0 when every container's verdict is PASS, else the highest verdict exit.
+# Exit: 0 when every container's verdict is PASS; 1 when any is FAIL; else the
+# highest verdict exit (2 INCOMPLETE/INVALID, 3 aborted).
 #
 # What this wrapper adds over `docker run` by hand, and why each one matters:
 #
@@ -58,7 +59,16 @@ DURATION_HOURS="${DURATION_HOURS:-24}"
 LABEL="rocky-soak=$STAMP"
 
 say() { printf '[soak-docker %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
-die() { printf '[soak-docker] FATAL: %s\n' "$*" >&2; exit 3; }
+CONTAINERS=()
+# A failure after some containers started must not leave them soaking alone.
+die() {
+  printf '[soak-docker] FATAL: %s\n' "$*" >&2
+  local name
+  for name in ${CONTAINERS[@]+"${CONTAINERS[@]}"}; do
+    docker rm -f "$name" >/dev/null 2>&1 && printf '[soak-docker] removed %s\n' "$name" >&2
+  done
+  exit 3
+}
 
 command -v docker >/dev/null || die "docker is required"
 docker info >/dev/null 2>&1 || die "the Docker daemon is not reachable"
@@ -118,7 +128,9 @@ else
   say "WARNING: no caffeinate or systemd-inhibit; make sure this host cannot sleep"
 fi
 
-CONTAINERS=()
+if [[ " $PLATFORMS " == *" $NATIVE "* && "$PLATFORMS" != "$NATIVE" ]]; then
+  say "WARNING: a native and an emulated platform run side by side here; the emulated containers' CPU and memory load disturbs the native arm. Run the native arm alone for evidence."
+fi
 for platform in $PLATFORMS; do
   if [[ "$platform" != "$NATIVE" ]]; then
     say "WARNING: $platform is emulated on this host; its RSS includes the translator's memory, so its verdict is INVALID (a harness check only)"
@@ -139,6 +151,7 @@ for platform in $PLATFORMS; do
     docker run -d --name "$name" --label "$LABEL" --platform "$platform" \
       --init --restart no --stop-timeout 900 \
       -e HARVEST_MODE="$mode" -e DURATION_HOURS="$DURATION_HOURS" \
+      -e SELF_CHECK_MINUTES="${SELF_CHECK_MINUTES:-20}" \
       -e ROCKY_BIN=/usr/local/bin/rocky -e SOAK_EMULATED="$([[ "$platform" == "$NATIVE" ]] && echo 0 || echo 1)" \
       -v "$REPO:/repo:ro" -v "$OUT:/out" \
       "$tag" "${args[@]}" >/dev/null || die "docker run failed for $name"
@@ -149,12 +162,16 @@ done
 
 say "waiting for ${#CONTAINERS[@]} container(s); follow with: docker logs -f <name>"
 worst=0
+any_fail=false
 for name in "${CONTAINERS[@]}"; do
   code=$(docker wait "$name" 2>/dev/null || echo 3)
   docker logs "$name" >"$OUT/$name.log" 2>&1
   say "$name exited $code"
+  [[ "$code" == 1 ]] && any_fail=true
   (( code > worst )) && worst=$code
 done
+# A FAIL is a finding; an INCOMPLETE elsewhere must not hide it.
+[[ "$any_fail" == true ]] && worst=1
 
 kill "$EVENTS_PID" 2>/dev/null
 for dir in "$OUT"/*/; do

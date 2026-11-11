@@ -477,7 +477,16 @@ fi
 
 kill -TERM "$PRE_PID" 2>/dev/null
 wait "$PRE_PID" 2>/dev/null
-trap - TERM INT HUP
+# From here a stop only sets a flag. Before the measured serve starts there is
+# nothing to record, so the launch below aborts; after it, the sampling loop
+# sees the flag and leaves through the end step. Bash runs a trap between
+# commands, so the loop's sleep runs in the background and `wait` (which a
+# signal interrupts) waits for it; a foreground `sleep 30` would hold the
+# trap for up to 30 s.
+STOP_SIGNAL=""
+trap 'STOP_SIGNAL=TERM' TERM
+trap 'STOP_SIGNAL=INT' INT
+trap 'STOP_SIGNAL=HUP' HUP
 say "preflight: complete"
 
 if [[ "$PRE_OK" != true ]]; then
@@ -498,6 +507,7 @@ say "re-scaffolded clean for the measured run (state reset)"
 # ---------------------------------------------------------------------------
 # Phase 3 — launch
 # ---------------------------------------------------------------------------
+[[ -z "$STOP_SIGNAL" ]] || die "stopped by SIG$STOP_SIGNAL before the measured run started; nothing to record"
 T0=$(date +%s)
 END=$(( T0 + DURATION ))
 SERVE_PID=$(start_serve "$OUT/serve.stderr.jsonl")
@@ -539,16 +549,6 @@ jq -n \
 # cadence.
 # ---------------------------------------------------------------------------
 
-
-# A stop only sets a flag; the loop sees it within one interval and leaves
-# through the same end step as a planned finish. Bash runs a trap between
-# commands, so the sleep below runs in the background and `wait` (which a
-# signal interrupts) waits for it; a foreground `sleep 30` would hold the
-# trap for up to 30 s.
-STOP_SIGNAL=""
-trap 'STOP_SIGNAL=TERM' TERM
-trap 'STOP_SIGNAL=INT' INT
-trap 'STOP_SIGNAL=HUP' HUP
 
 say "sampling every ${SAMPLE_SECONDS}s, harvesting: $([[ "$HARVEST_MODE" == end ]] && echo "never (end-of-run read)" || echo "every ${HARVEST_SECONDS}s")"
 : >"$OUT/gaps.jsonl"

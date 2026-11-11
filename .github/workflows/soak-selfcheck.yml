@@ -13,7 +13,7 @@
 # A green job says the harness works on that architecture. It never says memory
 # is flat: 20 minutes is far under the final-quarter window.
 #
-# `workflow_dispatch` runs the same jobs for longer (up to 330 minutes), which
+# `workflow_dispatch` runs the same jobs for longer (up to 300 minutes), which
 # is a native x86_64 arm with real hours in it, still short of the 24 h gate.
 name: Soak self-check
 
@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       minutes:
-        description: "Soak length in minutes (max 330)"
+        description: "Soak length in minutes (max 300)"
         required: false
         default: "20"
 
@@ -95,7 +95,9 @@ jobs:
         run: |
           set -uo pipefail
           case "$MINUTES" in ''|*[!0-9]*) echo "minutes must be a whole number"; exit 1 ;; esac
-          (( MINUTES >= 12 && MINUTES <= 330 )) || { echo "minutes must be 12-330"; exit 1; }
+          # 300 leaves room under the 360-minute job timeout for a cold release
+          # build (up to 25 min), the 3-minute preflight and the end step.
+          (( MINUTES >= 12 && MINUTES <= 300 )) || { echo "minutes must be 12-300"; exit 1; }
           out="$RUNNER_TEMP/soak"
           export SELF_CHECK_MINUTES="$MINUTES"
           if [[ "$CASE" == stop ]]; then
@@ -107,7 +109,10 @@ jobs:
             [[ -s "$out/meta.json" ]] || { echo "the soak never started"; exit 1; }
             sleep 300
             kill -TERM "$pid"
-            wait "$pid"; code=$?
+            # The step shell is `bash -e`: a bare `wait` returning 2 (INCOMPLETE,
+            # the expected verdict here) would end the step before the checks.
+            code=0
+            wait "$pid" || code=$?
             echo "harness exit: $code"
             python3 - "$out" "$code" <<'PY'
           import json, pathlib, sys
