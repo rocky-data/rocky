@@ -217,6 +217,94 @@ async fn round_trip_create_insert_select_drop() {
         .expect("DROP should succeed");
 }
 
+/// RD-009 against a live coordinator (ADR-REPLACE): a full refresh whose
+/// `SELECT` fails at run time leaves the old rows, and a successful one
+/// replaces them with nothing left behind. `memory` refuses `CREATE OR
+/// REPLACE` and multi-statement transactions, so it is the connector the
+/// staged swap exists for.
+#[tokio::test]
+#[ignore = "requires a live Trino coordinator at TRINO_HOST:TRINO_PORT (default localhost:8080); run with `--ignored`"]
+async fn staged_replace_keeps_the_old_table_when_the_select_fails() {
+    use rocky_core::replace::{ReplaceError, StagedSwap, SwapNames, recover_interrupted_swap};
+    use rocky_ir::TableRef;
+
+    let adapter = build_adapter();
+    let dialect = adapter.dialect();
+    let table = unique_table_name();
+    let target = TableRef {
+        catalog: "memory".into(),
+        schema: "default".into(),
+        table: table.clone(),
+    };
+    let target_sql = dialect
+        .format_table_ref("memory", "default", &table)
+        .expect("identifiers are valid");
+    adapter
+        .execute_statement(&dialect.create_table_as_new(&target_sql, "SELECT 1 AS id"))
+        .await
+        .expect("seed the old table");
+
+    let swap_for = |select: &str| {
+        let names = SwapNames::for_target(&target).unwrap();
+        let stage = dialect
+            .format_table_ref("memory", "default", &names.stage.table)
+            .unwrap();
+        let build = dialect.create_table_as_new(&stage, select);
+        let create = dialect.create_table_as_new(&target_sql, select);
+        StagedSwap::new(dialect, names, build, create).unwrap()
+    };
+    let read = |sql: String| {
+        let adapter = &adapter;
+        async move { adapter.execute_query(&sql).await }
+    };
+
+    // 1) The SELECT fails inside Trino: the old row survives, no stage stays.
+    let failing = swap_for("SELECT CAST(fail('rocky conformance: boom') AS integer) AS id");
+    let err = failing.execute(&adapter).await.unwrap_err();
+    assert!(matches!(err, ReplaceError::Build { .. }), "{err}");
+    let rows = read(format!("SELECT id FROM {target_sql}"))
+        .await
+        .expect("old table is live");
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0][0].as_i64(), Some(1));
+
+    // 2) A good SELECT replaces it; neither working table is left.
+    let good = swap_for("SELECT 2 AS id");
+    good.execute(&adapter).await.expect("swap succeeds");
+    let rows = read(format!("SELECT id FROM {target_sql}")).await.unwrap();
+    assert_eq!(rows.rows[0][0].as_i64(), Some(2));
+    let leftovers = read(format!(
+        "SELECT table_name FROM memory.information_schema.tables \
+         WHERE table_schema = 'default' AND table_name LIKE '{table}\\_\\_rocky\\_%' ESCAPE '\\'"
+    ))
+    .await
+    .unwrap();
+    assert!(leftovers.rows.is_empty(), "{:?}", leftovers.rows);
+
+    // 3) A run that died between the two renames: the target is gone and its
+    //    data sits at the backup name. Recovery restores it.
+    let backup_sql = dialect
+        .format_table_ref("memory", "default", &format!("{table}__rocky_old"))
+        .unwrap();
+    adapter
+        .execute_statement(
+            &dialect
+                .rename_table_sql(&target_sql, &backup_sql, false)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let restored = recover_interrupted_swap(&adapter, &target).await.unwrap();
+    assert!(restored.is_some());
+    let rows = read(format!("SELECT id FROM {target_sql}")).await.unwrap();
+    assert_eq!(rows.rows[0][0].as_i64(), Some(2));
+
+    adapter
+        .execute_statement(&dialect.drop_table_sql(&target_sql))
+        .await
+        .expect("cleanup");
+}
+
 /// Live Iceberg type-widening receipt (#1157): the SQL Rocky emits for a scoped
 /// safe widening — `detect_drift` → `generate_alter_column_sql` →
 /// `ALTER … SET DATA TYPE` — is accepted by Trino's Iceberg connector and

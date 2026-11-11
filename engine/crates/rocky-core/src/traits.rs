@@ -1148,6 +1148,17 @@ fn parse_i128(v: &serde_json::Value) -> AdapterResult<i128> {
 // SQL Dialect
 // ---------------------------------------------------------------------------
 
+/// How a dialect replaces an existing table on a full refresh. See
+/// [`SqlDialect::table_replace`] and ADR-REPLACE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableReplace {
+    /// [`SqlDialect::create_table_as`] replaces the table in one atomic call.
+    Atomic,
+    /// No atomic replace: build a stage, then swap it in by rename
+    /// ([`crate::replace::StagedSwap`]).
+    StagedSwap,
+}
+
 /// Generates warehouse-specific SQL syntax.
 ///
 /// Each warehouse adapter provides a dialect implementation. rocky-core's
@@ -1198,18 +1209,41 @@ pub trait SqlDialect: Send + Sync {
         false
     }
 
-    /// Whether a full-refresh write must be preceded by an explicit
-    /// `DROP TABLE IF EXISTS` to be idempotent.
+    /// How a full refresh replaces an existing table in `catalog`
+    /// (ADR-REPLACE). A full refresh must never leave the target missing.
     ///
-    /// Most warehouses (`Databricks`, `Snowflake`, `BigQuery`, `DuckDB`)
-    /// implement `create_table_as` as an atomic `CREATE OR REPLACE
-    /// TABLE`, so re-running a full refresh is a no-op-safe overwrite —
-    /// the default is `false`. Trino's portable `CREATE TABLE … AS` has
-    /// no `OR REPLACE` across all connectors (Hive pre-414), so a second
-    /// run hits "table already exists"; Trino overrides this to `true`
-    /// and the runtime issues a leading `DROP TABLE IF EXISTS`.
-    fn full_refresh_needs_predrop(&self) -> bool {
-        false
+    /// The default, [`TableReplace::Atomic`], says
+    /// [`SqlDialect::create_table_as`] already replaces in one call:
+    /// `CREATE OR REPLACE TABLE … AS` (Databricks, Snowflake, BigQuery,
+    /// DuckDB, ClickHouse, Spark), or a script the warehouse runs as one
+    /// transaction (PostgreSQL, Redshift, SQL Server).
+    ///
+    /// A dialect with no atomic replace (Trino: no `CREATE OR REPLACE` on
+    /// every connector, no multi-statement transactions) returns
+    /// [`TableReplace::StagedSwap`]. Rocky then builds the new table under a
+    /// stage name and swaps it in by rename ([`crate::replace::StagedSwap`]),
+    /// so a failed build leaves the old table untouched.
+    ///
+    /// Keyed on the catalog because one dialect can serve catalogs with
+    /// different capabilities.
+    fn table_replace(&self, catalog: &str) -> TableReplace {
+        let _ = catalog;
+        TableReplace::Atomic
+    }
+
+    /// `ALTER TABLE <from> RENAME TO <to>`, both formatted table refs in the
+    /// same catalog and schema. `if_exists` renders the form that is a no-op
+    /// when `from` is missing.
+    ///
+    /// Required by every dialect that returns [`TableReplace::StagedSwap`].
+    /// The default refuses, so a dialect that forgets it fails at SQL
+    /// generation, before any statement runs.
+    fn rename_table_sql(&self, from: &str, to: &str, if_exists: bool) -> AdapterResult<String> {
+        let _ = (from, to, if_exists);
+        Err(AdapterError::msg(format!(
+            "the {} dialect cannot rename a table",
+            self.name()
+        )))
     }
 
     /// CREATE TABLE AS SELECT (full refresh).

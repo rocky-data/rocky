@@ -919,7 +919,10 @@ mod tests {
             three.contains("EXEC [db].sys.sp_rename N'[marts].[fct__rocky_new]', N'fct';"),
             "{three}"
         );
-        assert!(!d().full_refresh_needs_predrop());
+        assert_eq!(
+            d().table_replace("any"),
+            rocky_core::traits::TableReplace::Atomic
+        );
     }
 
     #[test]

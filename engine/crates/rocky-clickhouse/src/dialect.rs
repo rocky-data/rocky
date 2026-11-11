@@ -567,7 +567,10 @@ mod tests {
             d().create_table_as("m.t", "SELECT 1 AS a"),
             "CREATE OR REPLACE TABLE m.t ENGINE = MergeTree ORDER BY tuple() AS\nSELECT 1 AS a"
         );
-        assert!(!d().full_refresh_needs_predrop());
+        assert_eq!(
+            d().table_replace("any"),
+            rocky_core::traits::TableReplace::Atomic
+        );
         // A bootstrap create must never replace a table.
         assert_eq!(
             d().create_table_as_new("m.t", "SELECT 1"),
