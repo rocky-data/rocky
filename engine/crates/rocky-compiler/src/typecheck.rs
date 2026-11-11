@@ -2774,6 +2774,23 @@ fn sum_keeps_decimal_scale(target: &OperandTarget) -> bool {
         })
 }
 
+/// The type of `SUM` over a `FLOAT` column: `Float64` when every warehouse
+/// of `target` is DuckDB, else `Unknown`.
+///
+/// DuckDB sums a `FLOAT` into a `DOUBLE` (probed with `typeof` on the bundled
+/// DuckDB). Other warehouses differ: PostgreSQL and Trino keep `REAL`, Spark
+/// widens to `DOUBLE`. Keeping the input's `Float32` would fail a correct
+/// `Float64` contract with `E011`, so Rocky claims a type only where it was
+/// probed.
+fn sum_of_float_type(target: &OperandTarget) -> RockyType {
+    let dialects = target.known_dialects();
+    if !dialects.is_empty() && dialects.iter().all(|d| *d == OperandDialect::DuckDb) {
+        RockyType::Float64
+    } else {
+        RockyType::Unknown
+    }
+}
+
 /// Infer the result type of an aggregate function on the warehouses of
 /// `target`.
 fn infer_aggregation_type(
@@ -2791,6 +2808,8 @@ fn infer_aggregation_type(
             // `s` is kept only where every target warehouse keeps it (#2398).
             let ty = if input_type.is_integer() {
                 RockyType::Int64
+            } else if *input_type == RockyType::Float32 {
+                sum_of_float_type(target)
             } else if input_type.is_decimal() {
                 RockyType::DecimalUnsized {
                     scale: input_type
@@ -3205,6 +3224,10 @@ fn infer_binary_op_type(
     }
 }
 
+/// The most digits a number literal can have and still be an integer or a
+/// decimal in DuckDB (`DECIMAL(38, s)`); a longer one is a `DOUBLE`.
+const MAX_DECIMAL_LITERAL_DIGITS: usize = 38;
+
 /// The type of `left / right` when every warehouse the model runs on is
 /// DuckDB, else `Unknown`.
 ///
@@ -3238,15 +3261,19 @@ fn duckdb_division_type(left: &RockyType, right: &RockyType, target: &OperandTar
 }
 
 /// Whether an operand of a DuckDB `/` has a category Rocky is sure of: an
-/// exact expression, or a numeric literal without an exponent. Rocky types
-/// every number literal `Int64`; DuckDB reads `2` as an integer and `1.5` as a
-/// decimal, which divide the same way, but `1e3` as a `DOUBLE`, which does
-/// not.
+/// exact expression, or a numeric literal without an exponent and with at
+/// most 38 digits. Rocky types every number literal `Int64`; DuckDB reads `2`
+/// as an integer and `1.5` as a decimal, which divide the same way, but `1e3`
+/// as a `DOUBLE`, which does not. A literal with more than 38 digits fits no
+/// DuckDB integer or decimal, so DuckDB reads it as a `DOUBLE` too.
 fn division_operand_is_exact(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
-        Expr::Value(v) => {
-            matches!(&v.value, ast::Value::Number(n, _) if !n.contains(['e', 'E']))
-        }
+        Expr::Value(v) => matches!(
+            &v.value,
+            ast::Value::Number(n, _)
+                if !n.contains(['e', 'E'])
+                    && n.bytes().filter(u8::is_ascii_digit).count() <= MAX_DECIMAL_LITERAL_DIGITS
+        ),
         Expr::Nested(inner) => division_operand_is_exact(inner, scope),
         Expr::UnaryOp {
             op: ast::UnaryOperator::Minus | ast::UnaryOperator::Plus,
@@ -10843,6 +10870,15 @@ mod tests {
             ("(cents) / -(2)", RockyType::Float64),
             // `1e3` is a DOUBLE in DuckDB, so a FLOAT over it is not a FLOAT.
             ("ratio / 1e3", RockyType::Unknown),
+            // 38 digits is a DECIMAL in DuckDB; 39 is a DOUBLE.
+            (
+                "ratio / 12345678901234567890123456789012345678",
+                RockyType::Float32,
+            ),
+            (
+                "ratio / 123456789012345678901234567890123456789",
+                RockyType::Unknown,
+            ),
             ("status / 2", RockyType::Unknown),
         ];
         for (expr, expected) in &cases {
@@ -10869,6 +10905,98 @@ mod tests {
                     "{expr} on {other:?}"
                 );
             }
+        }
+    }
+
+    /// Each `/` Rocky types exactly on DuckDB has that type on the bundled
+    /// DuckDB, probed with `typeof`. A DuckDB upgrade that changes a cell
+    /// fails here instead of turning a correct contract into a false `E011`.
+    /// `SUM` of a `FLOAT` is a `DOUBLE` in DuckDB, so Rocky must not claim
+    /// the `FLOAT` it infers for it.
+    #[test]
+    fn duckdb_division_types_match_the_bundled_duckdb() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE SCHEMA raw; CREATE TABLE raw.orders (cents INTEGER, qty BIGINT, \
+             price DECIMAL(12, 2), ratio FLOAT, weight DOUBLE); \
+             INSERT INTO raw.orders VALUES (1, 2, 3.50, 0.5, 0.25);",
+        )
+        .unwrap();
+        let exprs = [
+            "cents / 100",
+            "cents / qty",
+            "price / price",
+            "price / 1.5",
+            "CAST(price AS DECIMAL(12, 2)) / 100",
+            "ratio / 2",
+            "ratio / price",
+            "ratio / ratio",
+            "ratio / weight",
+            "weight / cents",
+            "(cents) / -(2)",
+            "ratio / 1e3",
+            "ratio / 12345678901234567890123456789012345678",
+            "ratio / 123456789012345678901234567890123456789",
+            "SUM(ratio) / 2",
+            "SUM(ratio)",
+            "SUM(cents) / 2",
+            "MAX(ratio) / 2",
+        ];
+        for expr in exprs {
+            let duck: String = conn
+                .query_row(&format!("SELECT typeof({expr}) FROM raw.orders"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let duck_type = match duck.as_str() {
+                "DOUBLE" => "Float64",
+                "FLOAT" => "Float32",
+                "HUGEINT" | "BIGINT" | "INTEGER" => "Int64",
+                other => panic!("{expr}: unmapped DuckDB type {other}"),
+            };
+            let sql = format!("SELECT {expr} AS v FROM raw.orders");
+            let r = compile_typed_on(&[("m", &sql)], division_sources(), duckdb_target());
+            let contract: crate::contracts::CompilerContract = toml::from_str(&format!(
+                "[[columns]]\nname = \"v\"\ntype = \"{duck_type}\"\n"
+            ))
+            .unwrap();
+            let diags = crate::contracts::validate_contract(
+                "m",
+                &r.type_check.typed_models["m"],
+                &contract,
+            );
+            assert!(
+                diags.iter().all(|d| &*d.code != "E011"),
+                "{expr}: DuckDB says {duck}, Rocky says {:?}: {diags:?}",
+                column(&r, "m", "v").data_type
+            );
+        }
+    }
+
+    /// `SUM` over a `FLOAT` is `Float64` on DuckDB alone and untyped on any
+    /// other or unknown target, never the input's `Float32`.
+    #[test]
+    fn sum_of_a_float_is_a_double_on_duckdb_only() {
+        let sql = "SELECT SUM(ratio) AS v FROM raw.orders";
+        let r = compile_typed_on(&[("m", sql)], division_sources(), duckdb_target());
+        assert_eq!(column(&r, "m", "v").data_type, RockyType::Float64);
+        for other in [
+            OperandTarget::Unconfigured,
+            OperandTarget::Targets {
+                dialects: vec![OperandDialect::Postgres],
+                unruled: vec![],
+            },
+            OperandTarget::Targets {
+                dialects: vec![OperandDialect::DuckDb, OperandDialect::Databricks],
+                unruled: vec![],
+            },
+        ] {
+            let r = compile_typed_on(&[("m", sql)], division_sources(), other.clone());
+            assert_eq!(
+                column(&r, "m", "v").data_type,
+                RockyType::Unknown,
+                "{other:?}"
+            );
         }
     }
 

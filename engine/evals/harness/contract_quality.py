@@ -45,8 +45,11 @@ gets one outcome:
 Every item of an accepted draft passed the compiler, so an overclaim or an
 underclaim is a wrong item the compiler accepted. The pass line (from the
 answer key's ``[pass_line]``) is: matches >= ``min_matched``, overclaims <=
-``max_overclaims``, and unverified <= ``max_unverified``. Underclaims are
-reported but do not gate: they are wrong but safe.
+``max_overclaims``, and unverified <= ``max_unverified``. A drafted column
+the key does not list is one more overclaim. Underclaims are reported but do
+not gate. Only a nullable underclaim is safe: the contract promises less than
+the data gives. A key column left out of ``required`` / ``protected`` is not
+safe: the contract no longer stops that column being dropped.
 """
 
 from __future__ import annotations
@@ -55,6 +58,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -127,6 +131,9 @@ def load_answer_key(path: Path) -> AnswerKey:
 # ---------------------------------------------------------------------------
 
 
+_I003_COLUMN = re.compile(r"column '([^']*)'")
+
+
 @dataclass(frozen=True)
 class Draft:
     """What one accepted draft claims, as the scorer reads it."""
@@ -141,9 +148,10 @@ class Draft:
         raw = tomllib.loads(contract_toml) if contract_toml.strip() else {}
         columns = {c["name"]: c for c in raw.get("columns", [])}
         rules = raw.get("rules", {})
-        unverified = frozenset(
-            name for name in columns if any(f"'{name}'" in msg for msg in unverified_types)
-        )
+        # Each I003 message starts with "column '<name>'": read that name
+        # exactly, so a column never matches another column's message.
+        named = {m.group(1) for msg in unverified_types if (m := _I003_COLUMN.match(msg))}
+        unverified = frozenset(name for name in columns if name in named)
         return Draft(
             columns=columns,
             required=frozenset(rules.get("required", [])),
@@ -213,6 +221,17 @@ def score_model(model: str, key_columns: list[KeyColumn], draft: Draft | None) -
     if draft is not None:
         known = {c.name for c in key_columns}
         score.extra_columns = sorted(set(draft.columns) - known)
+        # A column the model does not have is a claim the key refutes.
+        for name in score.extra_columns:
+            score.items.append(
+                {
+                    "column": name,
+                    "attribute": "exists",
+                    "expected": False,
+                    "drafted": True,
+                    "outcome": "overclaim",
+                }
+            )
     return score
 
 

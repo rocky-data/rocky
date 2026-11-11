@@ -173,7 +173,13 @@ pub struct LiveLeafSchemas {
 /// default schema) and is skipped. A two- or three-part name that matches a
 /// model's own `schema.table` target is that model, not a leaf, and is
 /// skipped too, the same rule as the `E045` missing-table check.
-pub fn leaf_source_reads(models: &[rocky_core::models::Model]) -> BTreeSet<String> {
+///
+/// Only the reads of the models named in `scope` count (see
+/// [`live_describe_scope`]); every model's target still counts as written.
+pub fn leaf_source_reads(
+    models: &[rocky_core::models::Model],
+    scope: &HashSet<String>,
+) -> BTreeSet<String> {
     let written: HashSet<String> = models
         .iter()
         .map(|m| {
@@ -185,7 +191,7 @@ pub fn leaf_source_reads(models: &[rocky_core::models::Model]) -> BTreeSet<Strin
         })
         .collect();
     let mut leaves = BTreeSet::new();
-    for model in models {
+    for model in models.iter().filter(|m| scope.contains(&m.config.name)) {
         let Ok(reads) = rocky_sql::lineage::referenced_tables(&model.sql) else {
             continue;
         };
@@ -224,9 +230,10 @@ pub fn leaf_source_reads(models: &[rocky_core::models::Model]) -> BTreeSet<Strin
 pub async fn describe_leaf_sources(
     adapter: &dyn WarehouseAdapter,
     models: &[rocky_core::models::Model],
+    scope: &HashSet<String>,
 ) -> LiveLeafSchemas {
     let mut out = LiveLeafSchemas::default();
-    for read in leaf_source_reads(models) {
+    for read in leaf_source_reads(models, scope) {
         let parts: Vec<&str> = read.split('.').collect();
         let (catalog, schema, table) = match parts.as_slice() {
             [s, t] => ("", *s, *t),
@@ -257,6 +264,64 @@ pub async fn describe_leaf_sources(
         }
     }
     out
+}
+
+/// The models whose leaf reads a live describe for `model_name` may type:
+/// the model itself and every model upstream of it, each kept only when every
+/// warehouse it runs on is the default pipeline's target adapter, the one the
+/// describe runs on.
+///
+/// A live entry replaces the cached entry for every model that reads the same
+/// table, so a leaf read by a model on another warehouse would be typed by the
+/// wrong warehouse. A model whose warehouses are unknown, or include another
+/// adapter, is left out and keeps its cached schema. A config that does not
+/// load gives an empty scope: no live describe at all.
+pub fn live_describe_scope(
+    config_path: &Path,
+    project: &rocky_compiler::project::Project,
+    model_name: &str,
+) -> HashSet<String> {
+    let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) else {
+        return HashSet::new();
+    };
+    let Ok((_, pipeline)) = crate::registry::resolve_pipeline(&cfg, None) else {
+        return HashSet::new();
+    };
+    let Some(adapter) = cfg.adapters.get(pipeline.target_adapter()) else {
+        return HashSet::new();
+    };
+    let targets = rocky_compiler::model_targets::ModelTargets::resolve(&cfg, config_path);
+    upstream_kept(project, model_name, |name| {
+        let on = targets.for_model(name);
+        !on.is_empty() && on.iter().all(|a| std::ptr::eq(*a, adapter))
+    })
+}
+
+/// `model_name` and every model upstream of it, through the resolved DAG,
+/// that `keep` accepts. The walk goes through a model `keep` refuses, so a
+/// model above it can still be kept.
+fn upstream_kept(
+    project: &rocky_compiler::project::Project,
+    model_name: &str,
+    keep: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    let deps: HashMap<&str, &[String]> = project
+        .dag_nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+        .collect();
+    let mut upstream = HashSet::new();
+    let mut stack = vec![model_name.to_string()];
+    while let Some(name) = stack.pop() {
+        if !upstream.insert(name.clone()) {
+            continue;
+        }
+        if let Some(parents) = deps.get(name.as_str()) {
+            stack.extend(parents.iter().cloned());
+        }
+    }
+    upstream.retain(|name| keep(name));
+    upstream
 }
 
 /// Lay `live` over `cached`: a live entry replaces the cached entry of the
@@ -638,8 +703,13 @@ pub async fn run_ai_contract(
     // then compile again. Without this a transformation-only project has an
     // empty schema cache, every leaf column is `Unknown`, and the validator
     // checks no declared type and proves no column non-null.
-    let live =
-        describe_leaf_sources(prepared.adapter.as_ref(), &compile_result.project.models).await;
+    let scope = live_describe_scope(config_path, &compile_result.project, model_name);
+    let live = describe_leaf_sources(
+        prepared.adapter.as_ref(),
+        &compile_result.project.models,
+        &scope,
+    )
+    .await;
     let compile_result = if live.schemas.is_empty() {
         compile_result
     } else {
@@ -1177,13 +1247,24 @@ adapter = "warehouse"
                 .all(|c| c.data_type == rocky_compiler::types::RockyType::Unknown && c.nullable),
             "a cold cache types nothing: {cold_stg:?}"
         );
+        let scope = live_describe_scope(&config_path, &cold.project, "downstream");
         assert_eq!(
-            leaf_source_reads(&cold.project.models),
+            scope,
+            HashSet::from(["downstream".to_string(), "stg".to_string()]),
+            "the drafted model and its upstream chain, all on the one warehouse"
+        );
+        assert_eq!(
+            live_describe_scope(&config_path, &cold.project, "stg"),
+            HashSet::from(["stg".to_string()]),
+            "a downstream model is not in the scope"
+        );
+        assert_eq!(
+            leaf_source_reads(&cold.project.models, &scope),
             BTreeSet::from(["raw.orders".to_string()]),
             "`main.stg` is a model's target, not a leaf"
         );
 
-        let live = describe_leaf_sources(adapter.as_ref(), &cold.project.models).await;
+        let live = describe_leaf_sources(adapter.as_ref(), &cold.project.models, &scope).await;
         assert!(live.unresolved.is_empty(), "{:?}", live.unresolved);
         let warm =
             compile_project_with_live(&config_path, &state_path, models, None, &live.schemas)
@@ -1239,13 +1320,64 @@ adapter = "warehouse"
         )
         .unwrap();
         let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
-        let live = describe_leaf_sources(&adapter, &compiled.project.models).await;
+        let live = describe_leaf_sources(
+            &adapter,
+            &compiled.project.models,
+            &HashSet::from(["m".to_string()]),
+        )
+        .await;
         assert!(live.schemas.is_empty());
         assert_eq!(live.unresolved.len(), 1);
         assert!(
             live.unresolved[0].starts_with("nowhere.missing: "),
             "{:?}",
             live.unresolved
+        );
+    }
+
+    /// The scope follows the DAG upstream only, and leaves out a model the
+    /// filter refuses (one on another warehouse) without cutting off the
+    /// models above it. A model outside the scope adds no leaf.
+    #[test]
+    fn the_live_scope_is_the_upstream_chain_on_the_one_warehouse() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (name, sql, deps) in [
+            ("base", "SELECT a FROM raw.base", ""),
+            (
+                "mid",
+                "SELECT a FROM raw.elsewhere JOIN base USING (a)",
+                "\"base\"",
+            ),
+            ("top", "SELECT a FROM mid", "\"mid\""),
+            ("side", "SELECT a FROM raw.side", ""),
+        ] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "depends_on = [{deps}]\n[target]\ncatalog = \"w\"\nschema = \"main\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let compiled = compile_project(
+            &dir.path().join("rocky.toml"),
+            &dir.path().join("state.redb"),
+            models_dir.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let scope = upstream_kept(&compiled.project, "top", |name| name != "mid");
+        assert_eq!(
+            scope,
+            HashSet::from(["top".to_string(), "base".to_string()])
+        );
+        assert_eq!(
+            leaf_source_reads(&compiled.project.models, &scope),
+            BTreeSet::from(["raw.base".to_string()]),
+            "`raw.elsewhere` is read only by the refused model, `raw.side` by none in scope"
         );
     }
 

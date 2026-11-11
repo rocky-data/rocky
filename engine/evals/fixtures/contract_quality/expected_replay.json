@@ -59,7 +59,7 @@
   "stg_customers.signup_date.protected": "match",
   "stg_customers.signup_date.required": "match",
   "stg_customers.signup_date.type": "match",
-  "stg_orders.amount.nullable": "underclaim",
+  "stg_orders.amount.nullable": "match",
   "stg_orders.amount.protected": "match",
   "stg_orders.amount.required": "match",
   "stg_orders.amount.type": "match",

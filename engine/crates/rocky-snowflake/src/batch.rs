@@ -166,7 +166,9 @@ fn parse_batch_describe_rows(result: &QueryResult) -> HashMap<String, Vec<Column
         let nullable = row
             .get(3)
             .and_then(|v| v.as_str())
-            .map(|s| s.eq_ignore_ascii_case("YES"))
+            // Only an explicit NO proves NOT NULL; any other value fails
+            // safe to nullable.
+            .map(|s| !s.trim().eq_ignore_ascii_case("NO"))
             .unwrap_or(true);
 
         if table.is_empty() || col_name.is_empty() {
@@ -419,6 +421,27 @@ mod tests {
         );
         assert!(drift.drifted_columns.is_empty());
         assert_eq!(drift.action, DriftAction::Ignore);
+    }
+
+    /// Only an explicit `NO` proves NOT NULL. An empty, unexpected or
+    /// missing cell is nullable, so a column is never wrongly proven non-null.
+    #[test]
+    fn batch_nullability_fails_safe() {
+        let with = |name: &str, cell: serde_json::Value| {
+            let mut row = info_row(name, "TEXT", [None; 4]);
+            row[3] = cell;
+            row
+        };
+        let rows = vec![
+            with("no", serde_json::json!("no")),
+            with("empty", serde_json::json!("")),
+            with("odd", serde_json::json!("N")),
+            with("missing", serde_json::Value::Null),
+        ];
+        let map = parse_batch_describe_rows(&query_result(&BATCH_HEADERS, rows));
+        let cols = &map["t"];
+        assert!(!cols[0].nullable, "NO is NOT NULL");
+        assert!(cols[1..].iter().all(|c| c.nullable), "{cols:?}");
     }
 
     #[test]

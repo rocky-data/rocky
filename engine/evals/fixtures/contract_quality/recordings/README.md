@@ -6,8 +6,9 @@ exercise every path of the drafting loop and every scoring outcome:
 - `stg_customers`: lists `email` as a key (overclaim) and claims
   `referral_code` is non-null, which the loop withholds (unclaimed).
 - `stg_orders`: declares `amount` as `Decimal`. The compiler types it
-  `Float64` and refuses with `E011`; the retry fixes the type but writes
-  `amount` as `nullable = true` (underclaim).
+  `Float64` and refuses with `E011`; the retry fixes the type. `amount` is a
+  `COALESCE` over a division, so the compiler proves it non-null and the
+  retry's `nullable = false` is accepted (match).
 - `customer_orders`: correct, and wrapped in a markdown fence.
 - `order_payments`: claims `paid_at` non-null although the profile counted
   NULLs; `E012` goes back to the retry. `method` is withheld, and

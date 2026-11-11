@@ -116,8 +116,8 @@ pub use ai::{
     SchemaBuckets, build_schema_context, run_ai, run_ai_explain, run_ai_sync, run_ai_test,
 };
 pub use ai_contract::{
-    LiveLeafSchemas, describe_leaf_sources, leaf_source_reads, overlay_live_schemas,
-    profile_data_regions, run_ai_contract,
+    LiveLeafSchemas, describe_leaf_sources, leaf_source_reads, live_describe_scope,
+    overlay_live_schemas, profile_data_regions, run_ai_contract,
 };
 pub use apply::{
     EmptyTouched, PolicyGate, evaluate_apply_policy, evaluate_apply_policy_durable,

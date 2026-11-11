@@ -2,12 +2,12 @@
   "model": "stg_orders",
   "exchanges": [
     {
-      "request_sha256": "dd0fa8b7fa82fa9c2474b15508bd42f06252d1cacb8d87d98b3fffb1332953bb",
+      "request_sha256": "8c88687baeb5cd8f02e9615813e527289186db8f07b58d0b9481b643223bcdfc",
       "response_text": "[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"amount\"\ntype = \"Decimal\"\nnullable = false\n\n[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"coupon\"\ntype = \"String\"\nnullable = true\n\n[rules]\nrequired = [\"order_id\", \"customer_id\"]\nprotected = [\"order_id\", \"customer_id\"]\n"
     },
     {
-      "request_sha256": "c8aba0b5931457b4977ed9f8946b1da14e230aed5ce7e9fca9c1e0be0e0b4087",
-      "response_text": "[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"amount\"\ntype = \"Float64\"\nnullable = true\n\n[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"coupon\"\ntype = \"String\"\nnullable = true\n\n[rules]\nrequired = [\"order_id\", \"customer_id\"]\nprotected = [\"order_id\", \"customer_id\"]\n"
+      "request_sha256": "dfbc5a202ee689d33d9b506280dc49b5f954a71cf700540801ee39353abe89f1",
+      "response_text": "[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"amount\"\ntype = \"Float64\"\nnullable = false\n\n[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"coupon\"\ntype = \"String\"\nnullable = true\n\n[rules]\nrequired = [\"order_id\", \"customer_id\"]\nprotected = [\"order_id\", \"customer_id\"]\n"
     }
   ]
 }

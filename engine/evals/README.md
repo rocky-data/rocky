@@ -169,8 +169,11 @@ Each item gets one outcome:
 Every item of a returned draft passed the compiler, so an overclaim or an
 underclaim is a wrong item the compiler accepted. The pass line is in the
 answer key's `[pass_line]`: at least 64 of 80 matched, at most 4 overclaims,
-and no unverified type. Underclaims are reported but do not gate: they are
-wrong but safe. (Splitting "wrong" by direction was an advisor ruling of
+and no unverified type. A drafted column the key does not list counts as one
+more overclaim. Underclaims are reported but do not gate. Only a nullable
+underclaim is safe: the contract promises less than the data gives. A key
+column left out of `required` / `protected` is not safe: the contract no
+longer stops that column being dropped. (Splitting "wrong" by direction was an advisor ruling of
 2026-11-11; Hugo to confirm.)
 
 The three modes:
