@@ -3235,10 +3235,7 @@ impl LanguageServer for RockyLsp {
                     }
                 };
                 let usage = self
-                    .ai_usage_recorder(
-                        "lsp_ai_classification_fix",
-                        Some(&resolved_data.model_name),
-                    )
+                    .ai_usage_recorder("lsp_ai_classification_fix", Some(&resolved_data.model_name))
                     .await;
                 let outcome =
                     resolve_ai_classification_action(&resolved_data, base_url, residency, usage)

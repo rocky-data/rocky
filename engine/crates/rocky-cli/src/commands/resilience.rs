@@ -433,6 +433,7 @@ mod tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: vec![],
             attempts: Vec::new(),

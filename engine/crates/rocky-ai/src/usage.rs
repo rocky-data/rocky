@@ -42,10 +42,7 @@ impl UsageRecorder {
     /// as the call returns. Never opens the state store.
     #[must_use]
     pub fn spool(command: &str, state_path: &Path) -> Self {
-        Self::new(
-            command,
-            Some(rocky_core::ai_usage::spool_path(state_path)),
-        )
+        Self::new(command, Some(rocky_core::ai_usage::spool_path(state_path)))
     }
 
     fn new(command: &str, spool: Option<PathBuf>) -> Self {

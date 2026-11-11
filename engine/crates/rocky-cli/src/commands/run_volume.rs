@@ -128,7 +128,7 @@ pub(crate) async fn check_volume(
         Some(basis) => count_load(warehouse, basis, materialization).await,
     };
     let judged = judge(range, model, basis, counted);
-    materialization.volume = Some(judged.check);
+    materialization.volume = Some(judged.check.clone());
     judged.settle(output)
 }
 
@@ -167,9 +167,9 @@ pub(crate) async fn check_partition_volume(
     let basis = VolumeBasis::of(&strategy);
     let counted = match (&strategy, basis) {
         (_, None) => Err(unsupported_reason()),
-        _ if cancel.is_cancelled() => Err(
-            "the run was cancelled before every partition ran or before the count".into(),
-        ),
+        _ if cancel.is_cancelled() => {
+            Err("the run was cancelled before every partition ran or before the count".into())
+        }
         (MaterializationStrategy::TimeInterval { time_column, .. }, Some(_)) => {
             if windows.len() != written.len() {
                 Err("a written partition recorded no time window; not counted".to_string())
@@ -193,13 +193,13 @@ pub(crate) async fn check_partition_volume(
                 }
             }
         }
-        (_, Some(_)) => Err(
-            "the model is not a time_interval model, so its partitions are not counted".into(),
-        ),
+        (_, Some(_)) => {
+            Err("the model is not a time_interval model, so its partitions are not counted".into())
+        }
     };
     let judged = judge(range, model_name, basis, counted);
     if let Some(last) = output.materializations.last_mut() {
-        last.volume = Some(judged.check);
+        last.volume = Some(judged.check.clone());
     }
     judged.settle(output)
 }
@@ -419,7 +419,10 @@ mod tests {
         for (basis, words) in [
             (VolumeBasis::TotalRows, "model 'm' has 5 row(s), below"),
             (VolumeBasis::RowsAdded, "this run added 5 row(s), below"),
-            (VolumeBasis::RowsTouched, "this run's MERGE touched 5 row(s), below"),
+            (
+                VolumeBasis::RowsTouched,
+                "this run's MERGE touched 5 row(s), below",
+            ),
             (
                 VolumeBasis::PartitionRows,
                 "the partitions this run wrote hold 5 row(s), below",
@@ -464,6 +467,7 @@ mod tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: vec![],
             attempts: Vec::new(),
@@ -1638,7 +1642,9 @@ mod tests {
             ]
         }
 
-        fn borrowed(models: &[(&'static str, String, &'static str)]) -> Vec<(&str, &str, &str)> {
+        fn borrowed<'a>(
+            models: &'a [(&'static str, String, &'static str)],
+        ) -> Vec<(&'a str, &'a str, &'a str)> {
             models
                 .iter()
                 .map(|(name, sql, toml)| (*name, sql.as_str(), *toml))
@@ -1707,10 +1713,17 @@ mod tests {
                 .map(|m| m["volume"].clone())
                 .unwrap();
             assert_eq!(first_volume["basis"], "rows_added", "{first_volume}");
-            assert_eq!(first_volume["row_count"], 95, "the first run created the table");
+            assert_eq!(
+                first_volume["row_count"], 95,
+                "the first run created the table"
+            );
 
             ran.result.as_ref().expect("in range");
-            assert_eq!(table_total(&ran, "vol"), 100, "the table total is not judged");
+            assert_eq!(
+                table_total(&ran, "vol"),
+                100,
+                "the table total is not judged"
+            );
             let volume = ran.volume("vol");
             assert_eq!(volume["basis"], "rows_added", "{volume}");
             assert_eq!(volume["row_count"], 5, "{volume}");
@@ -1817,7 +1830,10 @@ mod tests {
                 .map(|m| m["volume"].clone())
                 .unwrap();
             assert_eq!(first_volume["basis"], "rows_touched", "{first_volume}");
-            assert_eq!(first_volume["row_count"], 4, "the first run created the table");
+            assert_eq!(
+                first_volume["row_count"], 4,
+                "the first run created the table"
+            );
 
             ran.result.as_ref().expect("4 touched is in range");
             assert_eq!(table_total(&ran, "vol"), 6);
@@ -1830,8 +1846,16 @@ mod tests {
         #[tokio::test]
         async fn a_merge_output_out_of_range_names_the_touched_rows() {
             for (volume, verdict, words) in [
-                ("min_rows = 5", "below_min", "MERGE touched 4 row(s), below min_rows = 5"),
-                ("max_rows = 3", "above_max", "MERGE touched 4 row(s), above max_rows = 3"),
+                (
+                    "min_rows = 5",
+                    "below_min",
+                    "MERGE touched 4 row(s), below min_rows = 5",
+                ),
+                (
+                    "max_rows = 3",
+                    "above_max",
+                    "MERGE touched 4 row(s), above max_rows = 3",
+                ),
             ] {
                 let (ran, _) = two_runs(
                     |run| {
@@ -1931,7 +1955,10 @@ mod tests {
             assert_eq!(table_total(&ran, "vol"), 9);
             let volumes = partition_volumes(&ran);
             assert_eq!(volumes.len(), 2, "two partitions written: {volumes:?}");
-            assert!(volumes[0].is_null(), "the check rides on the last: {volumes:?}");
+            assert!(
+                volumes[0].is_null(),
+                "the check rides on the last: {volumes:?}"
+            );
             let volume = &volumes[1];
             assert_eq!(volume["basis"], "partition_rows", "{volume}");
             assert_eq!(volume["row_count"], 5, "{volume}");
@@ -1955,7 +1982,10 @@ mod tests {
         async fn a_time_interval_output_below_min_warns() {
             let ran = two_partition_runs("min_rows = 6").await;
             ran.result.as_ref().expect("a warning never fails the run");
-            let line = ran.output["volume_warnings"][0].as_str().unwrap().to_string();
+            let line = ran.output["volume_warnings"][0]
+                .as_str()
+                .unwrap()
+                .to_string();
             assert!(
                 line.contains("the partitions this run wrote hold 5 row(s), below min_rows = 6"),
                 "{line}"
@@ -1972,7 +2002,11 @@ mod tests {
             assert!(ran.result.is_err(), "an error breach fails the run");
             assert_eq!(ran.record.status, RunStatus::PartialFailure);
             let executions = ran.executions("vol");
-            assert_eq!(executions.len(), 2, "no extra failed record: {executions:?}");
+            assert_eq!(
+                executions.len(),
+                2,
+                "no extra failed record: {executions:?}"
+            );
             assert!(
                 executions.iter().all(|e| e.status == "failed"),
                 "{executions:?}"

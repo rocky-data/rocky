@@ -35,6 +35,7 @@ fn exec(model: &str, started: DateTime<Utc>, ms: u64) -> ModelExecution {
         upstream_freshness: None,
         bytes_scanned: None,
         bytes_written: None,
+        egress_bytes: None,
         tenant: None,
         recipe_hash: None,
         input_hash: None,
@@ -304,7 +305,9 @@ fn assert_f1(split: &MonthSplit) {
         NotMeasured {
             failed_executions: 1,
             storage_unknown_tables: 0,
-            unattributed_read_tables: 0
+            unattributed_read_tables: 0,
+            egress_unreported_executions: 0,
+            ai_calls_without_usage: 0,
         }
     );
     assert!(split.invariant_violations().is_empty());
@@ -1084,8 +1087,8 @@ fn random_case(seed: u64) -> Case {
     }
     let mut ai_usage = Vec::new();
     for c in 0..rng.below(12) {
-        let at = utc(2026, 9, 28, 0, 0, 0)
-            + Duration::hours(i64::try_from(rng.below(36 * 24)).unwrap());
+        let at =
+            utc(2026, 9, 28, 0, 0, 0) + Duration::hours(i64::try_from(rng.below(36 * 24)).unwrap());
         // About a model (owned or not), about an unknown name, or about none.
         let model = match rng.below(4) {
             0 => None,
@@ -1924,8 +1927,18 @@ fn an_ai_call_without_both_counts_adds_nothing_and_is_counted() {
 fn ai_calls_outside_the_month_or_after_as_of_do_not_count() {
     let (o, c) = (owners(), BTreeMap::new());
     let calls = [
-        call("sep", utc(2026, 9, 30, 23, 59, 59), Some("fct_orders"), Some((1, 1))),
-        call("nov", utc(2026, 11, 1, 0, 0, 0), Some("fct_orders"), Some((2, 2))),
+        call(
+            "sep",
+            utc(2026, 9, 30, 23, 59, 59),
+            Some("fct_orders"),
+            Some((1, 1)),
+        ),
+        call(
+            "nov",
+            utc(2026, 11, 1, 0, 0, 0),
+            Some("fct_orders"),
+            Some((2, 2)),
+        ),
         call("late", oct(20, 0, 0), Some("fct_orders"), Some((4, 4))),
         call("in", oct(1, 0, 0), Some("fct_orders"), Some((8, 8))),
     ];

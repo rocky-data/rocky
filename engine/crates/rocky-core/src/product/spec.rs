@@ -2154,7 +2154,10 @@ include = ["stripe.*"]"#,
             lookback: None,
             filter_column: None,
         };
-        assert_eq!(VolumeBasis::of(&S::FullRefresh), Some(VolumeBasis::TotalRows));
+        assert_eq!(
+            VolumeBasis::of(&S::FullRefresh),
+            Some(VolumeBasis::TotalRows)
+        );
         assert_eq!(
             VolumeBasis::of(&incremental(Vec::new())),
             Some(VolumeBasis::RowsAdded)

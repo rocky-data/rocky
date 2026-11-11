@@ -6922,6 +6922,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    egress_bytes: None,
                     tenant: None,
                     recipe_hash: None,
                     input_hash: None,

@@ -97,7 +97,9 @@ impl VolumeLowering {
         use crate::product::spec::VolumeBasis;
         match basis {
             Some(VolumeBasis::TotalRows) => Self::TotalRowsTest,
-            Some(VolumeBasis::RowsAdded | VolumeBasis::RowsTouched | VolumeBasis::PartitionRows)
+            Some(
+                VolumeBasis::RowsAdded | VolumeBasis::RowsTouched | VolumeBasis::PartitionRows,
+            )
             | None => Self::RunOnly,
         }
     }
@@ -2250,9 +2252,8 @@ agent = "propose_only"
             &drafted_sidecar_text(),
             "[[tests]]\ntype = \"row_count_range\"\nmin = 1\n",
         );
-        let ranges = row_count_ranges(
-            &parse_ordered(&merged_run_only(&parsed, &worker)).expect("toml"),
-        );
+        let ranges =
+            row_count_ranges(&parse_ordered(&merged_run_only(&parsed, &worker)).expect("toml"));
         assert_eq!(ranges.len(), 1, "the worker's range survives: {ranges:?}");
         assert!(ranges[0].get(GENERATED_BY_KEY).is_none(), "{ranges:?}");
         let once = merged_run_only(&parsed, &worker);
@@ -2290,10 +2291,7 @@ agent = "propose_only"
         let row = &phase_b.fields["product.output.volume"];
         assert_eq!(row.disposition, Disposition::Verified);
         assert!(row.locations.is_empty(), "{row:?}");
-        assert!(
-            row.note.contains("rocky run"),
-            "{row:?}"
-        );
+        assert!(row.note.contains("rocky run"), "{row:?}");
     }
 
     #[test]

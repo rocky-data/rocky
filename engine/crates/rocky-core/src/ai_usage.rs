@@ -194,7 +194,11 @@ pub(crate) fn drain_spool<E>(
     path: &Path,
     commit: impl FnOnce(&SpoolRead) -> Result<(), E>,
 ) -> Result<Option<SpoolRead>, DrainError<E>> {
-    let mut file = match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(DrainError::Io(error)),
@@ -207,7 +211,9 @@ pub(crate) fn drain_spool<E>(
         commit(&read).map_err(DrainError::Commit)?;
         #[cfg(test)]
         if FAIL_TRUNCATE.with(std::cell::Cell::get) {
-            return Err(DrainError::Io(std::io::Error::other("injected truncate failure")));
+            return Err(DrainError::Io(std::io::Error::other(
+                "injected truncate failure",
+            )));
         }
         file.set_len(0).map_err(DrainError::Io)?;
         Ok(read)

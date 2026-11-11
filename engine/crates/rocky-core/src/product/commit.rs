@@ -176,8 +176,7 @@ use serde::{Deserialize, Serialize};
 use crate::fulfill::FulfillState;
 use crate::product::lowering::{
     Lowering, VolumeLowering, contract_rel, lower_phase_a, lower_phase_b, manifest_rel,
-    sidecar_rel, sql_rel,
-    state_dir_rel,
+    sidecar_rel, sql_rel, state_dir_rel,
 };
 use crate::product::manifest::{
     MANIFEST_FILENAME, Manifest, ManifestPhase, contained_artifact_path, content_digest,
@@ -2528,7 +2527,13 @@ mod tests {
     fn phase_b_requires_phase_a() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = seeded_project(dir.path());
-        let error = run_phase_b(&project, SPEC_PATH, &parsed_d3(), VolumeLowering::TotalRowsTest).expect_err("no phase A");
+        let error = run_phase_b(
+            &project,
+            SPEC_PATH,
+            &parsed_d3(),
+            VolumeLowering::TotalRowsTest,
+        )
+        .expect_err("no phase A");
         assert_eq!(error.code, "phase-a-missing");
     }
 
@@ -2538,7 +2543,8 @@ mod tests {
         let project = seeded_project(dir.path());
         let parsed = parsed_d3();
         run_phase_a(&project, SPEC_PATH, &parsed).expect("phase A");
-        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect_err("no sidecar");
+        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest)
+            .expect_err("no sidecar");
         assert_eq!(error.code, "sidecar-missing");
     }
 
@@ -2559,7 +2565,8 @@ mod tests {
             );
         let edited = parse_spec_bytes(edited_text.as_bytes(), SPEC_PATH).expect("valid");
         assert_ne!(edited.digest, parsed.digest);
-        let error = run_phase_b(&project, SPEC_PATH, &edited, VolumeLowering::TotalRowsTest).expect_err("superseded");
+        let error = run_phase_b(&project, SPEC_PATH, &edited, VolumeLowering::TotalRowsTest)
+            .expect_err("superseded");
         assert_eq!(error.code, "spec-superseded");
         assert!(error.message.contains(&parsed.digest), "{error}");
         assert!(error.message.contains(&edited.digest), "{error}");
@@ -2581,7 +2588,8 @@ mod tests {
             &project.join("models/revenue_daily.toml"),
             DRAFTED_SIDECAR.as_bytes(),
         );
-        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect_err("foreign");
+        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest)
+            .expect_err("foreign");
         assert_eq!(error.code, "phase-a-identity-mismatch");
         assert!(error.message.contains("spec_path"), "{error}");
     }
@@ -2603,7 +2611,8 @@ mod tests {
             &project.join("models/revenue_daily.toml"),
             DRAFTED_SIDECAR.as_bytes(),
         );
-        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect_err("tampered");
+        let error = run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest)
+            .expect_err("tampered");
         assert_eq!(error.code, "phase-a-tampered");
     }
 
@@ -2667,7 +2676,8 @@ mod tests {
 
         // Round-trip: the next Phase B re-merges and re-records the
         // sidecar hash transactionally.
-        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect("phase B re-commits");
+        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest)
+            .expect("phase B re-commits");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
         assert_eq!(leftovers(&project), Vec::<String>::new());
     }
@@ -3006,7 +3016,8 @@ mod tests {
             RecoveryAction::None
         );
         assert_eq!(without_orphans(snapshot(&project)), before);
-        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect("restages cleanly");
+        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest)
+            .expect("restages cleanly");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
     }
 
@@ -3180,7 +3191,8 @@ mod tests {
         let project = project_with_phase_a_and_draft(dir.path(), &parsed);
         phase_b_with_rename_bomb(&project, &parsed, 3);
 
-        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest).expect("recovers then commits");
+        run_phase_b(&project, SPEC_PATH, &parsed, VolumeLowering::TotalRowsTest)
+            .expect("recovers then commits");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
         assert!(!journal_path(&project, "revenue_daily").exists());
     }

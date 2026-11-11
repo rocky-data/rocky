@@ -1403,9 +1403,9 @@ pub(crate) fn output_strategy(root: &Path, parsed: &ParsedSpec) -> OutputStrateg
     };
     match models.iter().find(|model| model.config.name == model_name) {
         Some(model) => OutputStrategy::Loaded(model.to_model_ir().materialization),
-        None => OutputStrategy::DoesNotLoad(format!(
-            "no model named '{model_name}' loads from models/"
-        )),
+        None => {
+            OutputStrategy::DoesNotLoad(format!("no model named '{model_name}' loads from models/"))
+        }
     }
 }
 
@@ -5206,7 +5206,8 @@ effect = "require_review"
             "products/revenue_daily.toml",
             &parsed,
             rocky_core::product::lowering::VolumeLowering::TotalRowsTest,
-        ).expect("phase B");
+        )
+        .expect("phase B");
         let result = compile_probe(&root).expect("compiles");
         assert!(!result.has_errors, "{:?}", result.diagnostics);
         assert!(
@@ -5670,6 +5671,7 @@ pub(crate) mod delivery_tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,

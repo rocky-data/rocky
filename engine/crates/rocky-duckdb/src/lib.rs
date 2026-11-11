@@ -713,8 +713,10 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            db.execute_statement_counting_rows("INSERT INTO t VALUES (9, 9); INSERT INTO t VALUES (8, 8)")
-                .unwrap(),
+            db.execute_statement_counting_rows(
+                "INSERT INTO t VALUES (9, 9); INSERT INTO t VALUES (8, 8)"
+            )
+            .unwrap(),
             None,
             "a batch is not counted"
         );

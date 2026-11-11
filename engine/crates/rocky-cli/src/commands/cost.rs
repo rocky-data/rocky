@@ -1977,7 +1977,10 @@ fn print_month_table(output: &ProductMonthCostOutput) {
         );
     }
     for (unit, label) in [
-        (CostUnit::EgressBytes, "egress, bytes (as adapters reported it)"),
+        (
+            CostUnit::EgressBytes,
+            "egress, bytes (as adapters reported it)",
+        ),
         (
             CostUnit::AiInputTokens,
             "AI input tokens (calls recorded in this state store)",
@@ -2190,6 +2193,7 @@ pub(crate) mod tests {
             upstream_freshness: None,
             bytes_scanned,
             bytes_written,
+            egress_bytes: None,
             tenant: tenant.map(str::to_string),
             recipe_hash: None,
             input_hash: None,
@@ -3200,7 +3204,7 @@ pub(crate) mod tests {
         };
 
         let both = cost("compute_cost_per_machine_hour = 2.0\nstorage_cost_per_gb_month = 0.5\n");
-        let pricing = MonthPricing::new(Some(&both), &window, true, &measured);
+        let pricing = MonthPricing::new(Some(&both), &window, true, &measured, None);
         let (usd, status, parts) = pricing.price(&measured);
         assert_eq!(status, MoneyStatus::Priced);
         let usd_of = |figure| part(&parts, figure).usd.unwrap();
@@ -3211,7 +3215,7 @@ pub(crate) mod tests {
 
         // Storage priced, compute not: no total.
         let storage_only = cost("storage_cost_per_gb_month = 0.5\n");
-        let pricing = MonthPricing::new(Some(&storage_only), &window, true, &measured);
+        let pricing = MonthPricing::new(Some(&storage_only), &window, true, &measured, None);
         let (usd, status, parts) = pricing.price(&measured);
         assert_eq!(status, MoneyStatus::NoPrice);
         assert_eq!(usd, None);
@@ -3227,7 +3231,7 @@ pub(crate) mod tests {
         // No prices at all, and nothing charged: $0, priced. With no config
         // the same holds.
         for section in [Some(cost("")), None] {
-            let pricing = MonthPricing::new(section.as_ref(), &window, true, &measured);
+            let pricing = MonthPricing::new(section.as_ref(), &window, true, &measured, None);
             let (usd, status, parts) = pricing.price(&[]);
             assert_eq!(status, MoneyStatus::Priced);
             assert_eq!(usd, Some(0.0));

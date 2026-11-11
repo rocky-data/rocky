@@ -4057,6 +4057,7 @@ dependencies = [
 name = "rocky-ai"
 version = "1.92.0"
 dependencies = [
+ "chrono",
  "indexmap",
  "reqwest",
  "rocky-compiler",

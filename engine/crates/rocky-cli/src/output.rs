@@ -6967,6 +6967,7 @@ impl RunOutput {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 // Errors carry only the asset key, not the parsed schema
                 // components, so the tenant dimension is unavailable here.
                 tenant: None,
@@ -8864,6 +8865,7 @@ mod cost_finalize_tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,
@@ -9166,6 +9168,7 @@ mod run_record_tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,

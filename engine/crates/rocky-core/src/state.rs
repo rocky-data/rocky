@@ -1746,7 +1746,7 @@ impl StateStore {
                     _lock: None,
                     recreated_for_forward_incompat: false,
                     write_epoch: AtomicU64::new(0),
-                ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
+                    ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
                 })
             }
             Err(error) => Err(error),
@@ -2003,7 +2003,7 @@ impl StateStore {
                         _lock: lock,
                         recreated_for_forward_incompat: true,
                         write_epoch: AtomicU64::new(0),
-                ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
+                        ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
                     }),
                     // A file we just created cannot carry a newer schema version.
                     InitOutcome::RecreateForwardIncompat { found } => {
@@ -10159,12 +10159,12 @@ impl StateStore {
     /// `malformed` counts spool lines that did not parse.
     pub fn ai_usage_including_spool(&self) -> Result<crate::ai_usage::SpoolRead, StateError> {
         let spooled = match &self.ai_usage_spool {
-            Some(path) => crate::ai_usage::read_spool(path).map_err(|source| {
-                StateError::AiUsageSpool {
+            Some(path) => {
+                crate::ai_usage::read_spool(path).map_err(|source| StateError::AiUsageSpool {
                     path: path.display().to_string(),
                     source,
-                }
-            })?,
+                })?
+            }
             None => crate::ai_usage::SpoolRead::default(),
         };
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -10818,6 +10818,7 @@ pub fn run_with_output_versions(
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -13019,6 +13020,7 @@ mod tests {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -13224,6 +13226,7 @@ mod tests {
                 upstream_freshness: None,
                 bytes_scanned: Some(1),
                 bytes_written: Some(1),
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -13528,6 +13531,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: None,
             input_hash: None,
@@ -13626,6 +13630,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    egress_bytes: None,
                     tenant: None,
                     recipe_hash: None,
                     input_hash: None,
@@ -13654,6 +13659,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    egress_bytes: None,
                     tenant: None,
                     recipe_hash: None,
                     input_hash: None,
@@ -13697,6 +13703,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    egress_bytes: None,
                     tenant: None,
                     recipe_hash: None,
                     input_hash: None,
@@ -14253,6 +14260,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some("rh".to_string()),
             input_hash: Some("ih".to_string()),
@@ -14315,6 +14323,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some("recipe-abc".to_string()),
             input_hash: Some("input-def".to_string()),
