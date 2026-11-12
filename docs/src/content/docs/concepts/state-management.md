@@ -55,8 +55,6 @@ Schema v34 adds one table, `connector_state`. It holds the saved state and the c
 
 Schema v35 adds one table, `ai_usage`. It holds one row for each AI call that returned a response: the command, the Rocky model, the provider's model, and the input and output tokens. `rocky cost --month <YYYY-MM> --by product` reads it. The table also holds two reserved rows: `ai_usage_since` stamps when the store started recording, and `ai_usage_dropped` counts spooled lines that could not be read. They live in this local-only table, not in the replicated metadata. A v34 store opened for writing gets the empty table and the stamp, and keeps every record. A month that began before the stamp reports its AI part as `partial`. `rocky ai` does not upgrade an older store in place: it spools its calls until `rocky run` upgrades the store. A read-only command on a store stamped below v35 reads the table as empty. A store stamped v35 that lacks it is refused. The table is local-only: it never goes to remote state, so a call is counted in the store of the machine that made it. The LSP and MCP servers never write the store. They append calls to `<state file>.ai-usage.jsonl`, and the next process that holds the store's writer moves the lines in. An engine at v34 refuses a v35 store when it opens it. During a rolling upgrade, a v34 process keeps reading and writing the `v34/` remote key.
 
-Schema v36 adds one table, `product_volume_breaches`. It holds one marker for each product output model whose `error` volume range was breached and not yet rebuilt. While a marker is open, `rocky run` fails that model. `rocky product clear-breach` deletes a marker, and `rocky product status` lists them. See [product volume ranges](/reference/commands/products/). A v35 store opened for writing gets the empty table and the v36 stamp, and keeps every record. A read-only command on a store stamped below v36 reads the table as empty. A store stamped v36 that lacks it is refused. The table replicates with the rest of the shared state. An engine at v35 refuses a v36 store when it opens it. During a rolling upgrade, a v35 process keeps reading and writing the `v35/` remote key, and does not see a breach recorded under `v36/`.
-
 ### Environments (state only, preview)
 
 From v32, the engine API can record **environments**: named sets of pointers, such as `staging` or `prod`. Each pointer names a model and the output version that one run recorded for it. A publish moves pointers and appends one row to the publish history. There is no CLI verb yet.
@@ -330,16 +328,16 @@ If the download fails, Rocky logs a warning and starts fresh from target-table m
 
 ### What a Schema Upgrade Does to Remote State
 
-This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v36/state.redb` on S3 or GCS and `<valkey_prefix>v36:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
+This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v35/state.redb` on S3 or GCS and `<valkey_prefix>v35:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
 
 When the current key is absent, Rocky looks for an older key. It probes older versions newest first, down to `v22`, and restores the first one it finds. The run then opens that state, migrates it in place, and uploads it under the current key. The policy ledger, the run history, and the watermarks all carry over.
 
 ```
-   download: v36 key? ── present ──▶ restore v36
+   download: v35 key? ── present ──▶ restore v35
                  │
                absent
                  ▼
-             v35 key? ── present ──▶ restore v35, upload writes v36
+             v34 key? ── present ──▶ restore v34, upload writes v35
                  │
                absent
                  ▼

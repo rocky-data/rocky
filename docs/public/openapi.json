@@ -18503,48 +18503,6 @@
         ],
         "type": "string"
       },
-      "ProductClearBreachOutput": {
-        "description": "JSON output of `rocky product clear-breach`.",
-        "properties": {
-          "cleared": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ProductVolumeBreachStatus"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The marker that was deleted, when one was open."
-          },
-          "command": {
-            "type": "string"
-          },
-          "model": {
-            "description": "The output model whose breach marker was cleared.",
-            "type": "string"
-          },
-          "product": {
-            "description": "The product name.",
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          },
-          "was_open": {
-            "description": "True when a marker was open and was deleted. False when none was open, so a second call changes nothing.",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "command",
-          "model",
-          "product",
-          "version",
-          "was_open"
-        ],
-        "type": "object"
-      },
       "ProductCompileOutput": {
         "description": "JSON output of `rocky product compile`.",
         "properties": {
@@ -19340,13 +19298,6 @@
             "minimum": 0.0,
             "type": "integer"
           },
-          "open_volume_breaches": {
-            "description": "The volume breaches still open for this product: an `error` range breached and not yet rebuilt or cleared. Each holds its output model failed in every run. Empty (and omitted) when none is open.",
-            "items": {
-              "$ref": "#/components/schemas/ProductVolumeBreachStatus"
-            },
-            "type": "array"
-          },
           "output_model": {
             "description": "The resolved output model, when the spec parses.",
             "type": [
@@ -19504,77 +19455,6 @@
           "spec_digest",
           "status",
           "version"
-        ],
-        "type": "object"
-      },
-      "ProductVolumeBreachStatus": {
-        "description": "An open volume breach: the output model stays failed in every run until it is rebuilt or the breach is cleared (#2581).",
-        "properties": {
-          "max_rows": {
-            "description": "The declared `max_rows` at the newest breach.",
-            "format": "uint64",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "min_rows": {
-            "description": "The declared `min_rows` at the newest breach.",
-            "format": "uint64",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "model": {
-            "description": "The output model held failed.",
-            "type": "string"
-          },
-          "opened_at": {
-            "description": "When the breach was first recorded.",
-            "format": "date-time",
-            "type": "string"
-          },
-          "partitions": {
-            "default": [],
-            "description": "For a `time_interval` output, the partition keys still breached. Empty means the whole output.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "product": {
-            "description": "The product that declares the range.",
-            "type": "string"
-          },
-          "reason": {
-            "default": "",
-            "description": "The newest breach, in words.",
-            "type": "string"
-          },
-          "rows": {
-            "description": "The row count of the newest breach, when it was counted.",
-            "format": "uint64",
-            "minimum": 0.0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "run_id": {
-            "description": "The run that recorded it, when known.",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "model",
-          "opened_at",
-          "product"
         ],
         "type": "object"
       },
@@ -28215,10 +28095,6 @@
               }
             ],
             "description": "What `row_count` counts: `total_rows` (the whole table, for a full-refresh output), `rows_added` (the rows this run appended, for an incremental output), `rows_touched` (the rows this run's MERGE inserted or updated, matched rows included even when their values did not change, for a merge output or an incremental one with a `unique_key`), or `partition_rows` (the rows in this partition, for a time-interval output, which is judged one partition at a time). Absent when the strategy is not counted (`volume-strategy-unsupported`)."
-          },
-          "held_by_open_breach": {
-            "description": "True when an open volume breach, from this run or an earlier one, holds the model failed (#2581). The count itself may be in range. The model stays failed until the breached rows are rebuilt or the breach is cleared with `rocky product clear-breach`.",
-            "type": "boolean"
           },
           "max_rows": {
             "description": "The declared `max_rows` (inclusive), when set.",

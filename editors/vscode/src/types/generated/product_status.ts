@@ -104,10 +104,6 @@ export interface ProductStatusOutput {
    */
   journal_rows: number;
   /**
-   * The volume breaches still open for this product: an `error` range breached and not yet rebuilt or cleared. Each holds its output model failed in every run. Empty (and omitted) when none is open.
-   */
-  open_volume_breaches?: ProductVolumeBreachStatus[];
-  /**
    * The resolved output model, when the spec parses.
    */
   output_model?: string | null;
@@ -483,48 +479,6 @@ export interface DurationEstimateStatus {
    * The most runs it reads (the newest 20).
    */
   window: number;
-  [k: string]: unknown;
-}
-/**
- * An open volume breach: the output model stays failed in every run until it is rebuilt or the breach is cleared (#2581).
- */
-export interface ProductVolumeBreachStatus {
-  /**
-   * The declared `max_rows` at the newest breach.
-   */
-  max_rows?: number | null;
-  /**
-   * The declared `min_rows` at the newest breach.
-   */
-  min_rows?: number | null;
-  /**
-   * The output model held failed.
-   */
-  model: string;
-  /**
-   * When the breach was first recorded.
-   */
-  opened_at: string;
-  /**
-   * For a `time_interval` output, the partition keys still breached. Empty means the whole output.
-   */
-  partitions?: string[];
-  /**
-   * The product that declares the range.
-   */
-  product: string;
-  /**
-   * The newest breach, in words.
-   */
-  reason?: string;
-  /**
-   * The row count of the newest breach, when it was counted.
-   */
-  rows?: number | null;
-  /**
-   * The run that recorded it, when known.
-   */
-  run_id?: string | null;
   [k: string]: unknown;
 }
 /**

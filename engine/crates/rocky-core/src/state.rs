@@ -334,24 +334,6 @@ const AI_USAGE_SINCE_SCHEMA_VERSION: u32 = 35;
 /// stamped below [`AI_USAGE_SINCE_SCHEMA_VERSION`]. The reader maps it to "no
 /// recorded AI usage, recording not started".
 const READ_ONLY_TOLERATED_ABSENT_BEFORE_V35: &[&str] = &["ai_usage"];
-/// Open volume breaches (schema v36): one
-/// [`crate::product::breach::VolumeBreachMarker`] per `(product, output model)`
-/// whose `error`-severity volume range was breached and not yet rebuilt,
-/// keyed by [`crate::product::breach::breach_key`] (`"{product}|{model}"`).
-/// Written by `rocky run` right after the model's volume judgment and by
-/// `rocky product clear-breach`.
-///
-/// **Replicated** (NOT in [`LOCAL_ONLY_TABLE_NAMES`]): every pod must see the
-/// same open breach, or a second pod would build downstream over breached
-/// rows.
-const PRODUCT_VOLUME_BREACHES: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("product_volume_breaches");
-/// The schema version that added [`PRODUCT_VOLUME_BREACHES`].
-const PRODUCT_VOLUME_BREACHES_SINCE_SCHEMA_VERSION: u32 = 36;
-/// The table a read-only open tolerates being absent, and only in a store
-/// stamped below [`PRODUCT_VOLUME_BREACHES_SINCE_SCHEMA_VERSION`]. The reader
-/// maps it to "no open breach".
-const READ_ONLY_TOLERATED_ABSENT_BEFORE_V36: &[&str] = &["product_volume_breaches"];
 /// The schema version that added [`ENVIRONMENTS`] and [`PUBLISH_HISTORY`].
 const ENVIRONMENT_TABLES_SINCE_SCHEMA_VERSION: u32 = 32;
 /// Tables a read-only open tolerates being absent, and only in a store
@@ -507,7 +489,6 @@ const SNAPSHOT_TABLE_REGISTRY: &[(&str, TableShape)] = &[
     ("publish_history", TableShape::StrBytes),
     ("connector_state", TableShape::StrBytes),
     ("ai_usage", TableShape::StrBytes),
-    ("product_volume_breaches", TableShape::StrBytes),
     ("metadata", TableShape::StrStr),
 ];
 
@@ -1102,24 +1083,6 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   a v35 store (or, under `on_schema_mismatch = "recreate"`, moves it aside
 ///   and starts a fresh local store).
 ///
-/// - **v36** — adds the [`PRODUCT_VOLUME_BREACHES`] table: one marker per
-///   product output model whose `error` volume range was breached and not yet
-///   rebuilt (#2581). Pure additive table change (the v35 shape). The table
-///   replicates. Guarded by `test_v35_opens_and_creates_volume_breach_table`.
-///
-///   **On upgrade.** A v35 store opened read-write is stamped v36 in place and
-///   gets the empty table; every record is kept. A read-only open of a store
-///   stamped below v36 tolerates the table being absent and reads it as "no
-///   open breach" ([`READ_ONLY_TOLERATED_ABSENT_BEFORE_V36`]); a store stamped
-///   v36 that lacks it is refused. Remote state carries forward from the
-///   `v35/` key ([`crate::state_sync`]); the first upload creates the `v36/`
-///   key.
-///
-///   **On rollback.** The version check runs at OPEN, so a v35 binary refuses
-///   a v36 store (or, under `on_schema_mismatch = "recreate"`, moves it aside
-///   and starts a fresh local store). A v35 binary keeps the `v35/` remote key
-///   and never sees a breach a v36 pod recorded.
-///
 /// # Fields added without a bump
 ///
 /// A serde-additive field needs no bump when an older binary that ignores it
@@ -1188,7 +1151,7 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   `None`, which means "not recorded". Guarded by
 ///   `test_pre_delivery_timing_model_execution_forward_deserializes_to_none`
 ///   and `test_pre_queued_ms_run_record_forward_deserializes_to_none`.
-const CURRENT_SCHEMA_VERSION: u32 = 36;
+const CURRENT_SCHEMA_VERSION: u32 = 35;
 
 /// Errors from the embedded redb state store.
 #[derive(Error)]
@@ -2127,7 +2090,6 @@ impl StateStore {
             PUBLISH_HISTORY.name(),
             CONNECTOR_STATE.name(),
             AI_USAGE.name(),
-            PRODUCT_VOLUME_BREACHES.name(),
         ]
     }
 
@@ -2211,9 +2173,6 @@ impl StateStore {
             found.is_some_and(|v| v < CONNECTOR_STATE_SINCE_SCHEMA_VERSION);
         // And for the v35 AI usage table.
         let tolerate_ai_usage_table = found.is_some_and(|v| v < AI_USAGE_SINCE_SCHEMA_VERSION);
-        // And for the v36 volume breach table.
-        let tolerate_breach_table =
-            found.is_some_and(|v| v < PRODUCT_VOLUME_BREACHES_SINCE_SCHEMA_VERSION);
         let missing: Vec<String> = Self::table_names()
             .into_iter()
             .filter(|name| !present.contains(*name))
@@ -2225,9 +2184,6 @@ impl StateStore {
             })
             .filter(|name| {
                 !(tolerate_ai_usage_table && READ_ONLY_TOLERATED_ABSENT_BEFORE_V35.contains(name))
-            })
-            .filter(|name| {
-                !(tolerate_breach_table && READ_ONLY_TOLERATED_ABSENT_BEFORE_V36.contains(name))
             })
             .map(str::to_string)
             .collect();
@@ -2349,7 +2305,6 @@ impl StateStore {
             let _table = txn.open_table(ENVIRONMENTS)?;
             let _table = txn.open_table(PUBLISH_HISTORY)?;
             let _table = txn.open_table(CONNECTOR_STATE)?;
-            let _table = txn.open_table(PRODUCT_VOLUME_BREACHES)?;
             // A store that has no "recording began" row (a new table, or one
             // a remote restore emptied) starts recording now.
             let mut ai_usage = txn.open_table(AI_USAGE)?;
@@ -10462,98 +10417,6 @@ impl StateStore {
         };
         self.commit_write(txn)?;
         Ok(new_seq)
-    }
-}
-
-// --- Open volume breaches (schema v36) -------------------------------------
-
-impl StateStore {
-    /// The open volume breach of `model` of `product`, or `None`. A store
-    /// stamped below v36 opened read-only has no table and answers `None`.
-    pub fn volume_breach_get(
-        &self,
-        product: &str,
-        model: &str,
-    ) -> Result<Option<crate::product::breach::VolumeBreachMarker>, StateError> {
-        let txn = self.db.begin_read()?;
-        let table = match txn.open_table(PRODUCT_VOLUME_BREACHES) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(StateError::Table(e)),
-        };
-        let key = crate::product::breach::breach_key(product, model);
-        match table.get(key.as_str())? {
-            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Every open volume breach, in key order.
-    pub fn volume_breach_list(
-        &self,
-    ) -> Result<Vec<crate::product::breach::VolumeBreachMarker>, StateError> {
-        self.volume_breach_scan(None)
-    }
-
-    /// Every open volume breach of `product`, in key order.
-    pub fn volume_breach_list_for_product(
-        &self,
-        product: &str,
-    ) -> Result<Vec<crate::product::breach::VolumeBreachMarker>, StateError> {
-        self.volume_breach_scan(Some(product))
-    }
-
-    fn volume_breach_scan(
-        &self,
-        product: Option<&str>,
-    ) -> Result<Vec<crate::product::breach::VolumeBreachMarker>, StateError> {
-        let txn = self.db.begin_read()?;
-        let table = match txn.open_table(PRODUCT_VOLUME_BREACHES) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(StateError::Table(e)),
-        };
-        let prefix = product.map(crate::product::breach::breach_key_prefix);
-        let mut markers = Vec::new();
-        for entry in table.iter()? {
-            let (key, value) = entry?;
-            if prefix
-                .as_deref()
-                .is_some_and(|p| !key.value().starts_with(p))
-            {
-                continue;
-            }
-            markers.push(serde_json::from_slice(value.value())?);
-        }
-        Ok(markers)
-    }
-
-    /// Write (open or update) the breach marker for its `(product, model)`.
-    pub fn volume_breach_put(
-        &self,
-        marker: &crate::product::breach::VolumeBreachMarker,
-    ) -> Result<(), StateError> {
-        let key = crate::product::breach::breach_key(&marker.product, &marker.model);
-        let bytes = serde_json::to_vec(marker)?;
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PRODUCT_VOLUME_BREACHES)?;
-            table.insert(key.as_str(), bytes.as_slice())?;
-        }
-        self.commit_write(txn)?;
-        Ok(())
-    }
-
-    /// Delete the breach marker. Returns whether one was open.
-    pub fn volume_breach_delete(&self, product: &str, model: &str) -> Result<bool, StateError> {
-        let key = crate::product::breach::breach_key(product, model);
-        let txn = self.db.begin_write()?;
-        let removed = {
-            let mut table = txn.open_table(PRODUCT_VOLUME_BREACHES)?;
-            table.remove(key.as_str())?.is_some()
-        };
-        self.commit_write(txn)?;
-        Ok(removed)
     }
 }
 
@@ -20774,10 +20637,7 @@ mod tests {
         // v35 adds the `ai_usage` table (recorded AI token usage) — a new
         // table, so it IS in EXPECTED_TABLES below; guarded by
         // `test_v34_opens_and_creates_ai_usage_table`. It is local-only.
-        // v36 adds the `product_volume_breaches` table (open volume breaches,
-        // #2581) — a new table, so it IS in EXPECTED_TABLES below; guarded by
-        // `test_v35_opens_and_creates_volume_breach_table`. It replicates.
-        const EXPECTED_VERSION: u32 = 36;
+        const EXPECTED_VERSION: u32 = 35;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
@@ -20818,7 +20678,6 @@ mod tests {
             "partitions",
             "policy_decisions",
             "product_approvals",
-            "product_volume_breaches",
             "publish_history",
             "quality_history",
             "run_history",
@@ -22127,125 +21986,6 @@ mod connector_state_tests {
 }
 
 #[cfg(test)]
-mod volume_breach_state_tests {
-    use super::*;
-    use crate::product::breach::VolumeBreachMarker;
-
-    fn marker(product: &str, model: &str) -> VolumeBreachMarker {
-        VolumeBreachMarker {
-            product: product.to_string(),
-            model: model.to_string(),
-            opened_at: chrono::Utc::now(),
-            run_id: Some("run-1".into()),
-            partitions: vec!["2026-01-02".into()],
-            rows: Some(1),
-            min_rows: Some(5),
-            max_rows: None,
-            reason: "below".into(),
-        }
-    }
-
-    /// Make the store at `path` look like one a v35 binary wrote.
-    fn force_pre_v36_store(path: &Path) {
-        force_schema_version(path, "35");
-        let db = Database::open(path).expect("reopen to drop the v36 table");
-        let txn = db.begin_write().expect("write txn");
-        txn.delete_table(PRODUCT_VOLUME_BREACHES)
-            .expect("drop product_volume_breaches");
-        txn.commit().expect("commit");
-    }
-
-    /// Mutation: drop the table creation in `init_db` and the upgraded store
-    /// cannot write a marker.
-    #[test]
-    fn test_v35_opens_and_creates_volume_breach_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.redb");
-        {
-            let store = StateStore::open(&path).unwrap();
-            store.volume_breach_put(&marker("p", "m")).unwrap();
-        }
-        force_pre_v36_store(&path);
-        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(35));
-
-        drop(StateStore::open(&path).unwrap());
-        assert_eq!(
-            StateStore::peek_schema_version(&path).unwrap(),
-            Some(CURRENT_SCHEMA_VERSION)
-        );
-        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
-        let store = StateStore::open(&path).unwrap();
-        assert!(store.volume_breach_list().unwrap().is_empty());
-        store.volume_breach_put(&marker("p", "m")).unwrap();
-        assert_eq!(store.volume_breach_list().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_marker_round_trips_lists_per_product_and_deletes_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        assert!(store.volume_breach_get("p", "m").unwrap().is_none());
-        let opened = marker("p", "m");
-        store.volume_breach_put(&opened).unwrap();
-        store.volume_breach_put(&marker("p", "n")).unwrap();
-        store.volume_breach_put(&marker("pp", "m")).unwrap();
-        assert_eq!(store.volume_breach_get("p", "m").unwrap(), Some(opened));
-        assert_eq!(store.volume_breach_list().unwrap().len(), 3);
-        let of_p = store.volume_breach_list_for_product("p").unwrap();
-        assert_eq!(of_p.len(), 2, "product 'pp' is not product 'p'");
-        assert!(store.volume_breach_delete("p", "m").unwrap());
-        assert!(!store.volume_breach_delete("p", "m").unwrap());
-        assert!(store.volume_breach_get("p", "m").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_v35_store_read_only_open_tolerates_the_missing_breach_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.redb");
-        drop(StateStore::open(&path).unwrap());
-        force_pre_v36_store(&path);
-        let store = StateStore::open_read_only(&path).expect("a v35 store opens read-only");
-        assert!(store.volume_breach_list().unwrap().is_empty());
-        assert!(store.volume_breach_get("p", "m").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_v36_store_missing_breach_table_read_only_refuses() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.redb");
-        drop(StateStore::open(&path).unwrap());
-        {
-            let db = Database::open(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            assert!(txn.delete_table(PRODUCT_VOLUME_BREACHES).unwrap());
-            txn.commit().unwrap();
-        }
-        match StateStore::open_read_only(&path).map(|_| ()) {
-            Err(StateError::ReadOnlyNeedsInit { missing, .. }) => {
-                assert_eq!(missing, vec!["product_volume_breaches".to_string()]);
-            }
-            other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
-        }
-    }
-
-    /// The table replicates: a snapshot that excludes the local-only tables
-    /// still carries the marker.
-    #[test]
-    fn the_snapshot_carries_volume_breaches() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        store.volume_breach_put(&marker("p", "m")).unwrap();
-        let dest = dir.path().join("snapshot.redb");
-        store
-            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
-            .unwrap();
-        let snapshot = StateStore::open(&dest).unwrap();
-        assert!(snapshot.volume_breach_get("p", "m").unwrap().is_some());
-        assert!(!LOCAL_ONLY_TABLE_NAMES.contains(&"product_volume_breaches"));
-    }
-}
-
-#[cfg(test)]
 mod ai_usage_state_tests {
     use super::tests::CapturedStateLogs;
     use super::*;
@@ -22307,6 +22047,7 @@ mod ai_usage_state_tests {
             StateStore::peek_schema_version(&path).unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
         );
+        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
 
         let store = StateStore::open(&path).unwrap();
         let since = store

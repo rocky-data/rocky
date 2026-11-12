@@ -13419,11 +13419,6 @@ async fn execute_models_phase(
             .map(|project| project.root.as_path()),
         shadow_config.is_none(),
     )?;
-    // Where the volume check keeps its open-breach markers (#2581).
-    let breach_ledger = super::run_volume::BreachLedger {
-        store: state_store,
-        run_id,
-    };
 
     // Build the run-scoped classified-retry plan once. The budget + breaker
     // carry interior atomics, so their caps are observed across the whole run
@@ -14847,7 +14842,6 @@ async fn execute_models_phase(
                         );
                         let volume_failure = super::run_volume::check_volume(
                             &product_volumes,
-                            &breach_ledger,
                             warehouse,
                             name,
                             &strategy,
@@ -15560,7 +15554,6 @@ async fn execute_models_phase(
                 // `--missing` rewrites and judges it again.
                 let volume_failure = super::run_volume::check_partition_volume(
                     &product_volumes,
-                    &breach_ledger,
                     warehouse,
                     dialect,
                     model,
@@ -15713,7 +15706,6 @@ async fn execute_models_phase(
                     );
                     let volume_failure = super::run_volume::check_volume(
                         &product_volumes,
-                        &breach_ledger,
                         warehouse,
                         model_name,
                         &strategy,

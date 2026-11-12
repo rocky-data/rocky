@@ -16,13 +16,10 @@
 //!   field, and its mechanized totality check.
 //! - [`toml_compat`] — the order-preserving reader and the byte-stable
 //!   writer the lowered artifacts are rendered through.
-//! - [`breach`] — the open volume-breach marker that keeps a breached output
-//!   failed until it is rebuilt.
 //! - [`commit`] — the staged filesystem commit protocol (manifest rename
 //!   as the marker), its untrusted-journal recovery, and the two phase
 //!   orchestrators.
 
-pub mod breach;
 pub mod commit;
 pub mod lowering;
 pub mod manifest;
