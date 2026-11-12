@@ -1521,7 +1521,8 @@ pub struct MaterializationOutput {
     /// The product volume check on this output, when a product declares
     /// `[product.output.volume]` for the model and this was a production
     /// build. Absent otherwise. A `time_interval` model carries one on each
-    /// partition this run wrote, judging that partition's rows.
+    /// partition this run wrote, judging that partition's rows. That includes
+    /// partitions written in a run where another partition failed to run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<VolumeCheckOutput>,
     /// State-internal facts about this build's write that the volume check

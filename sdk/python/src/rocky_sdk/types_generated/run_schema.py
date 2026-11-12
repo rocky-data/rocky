@@ -1351,7 +1351,7 @@ class MaterializationOutput(BaseModel):
     """
     volume: VolumeCheckOutput | None = None
     """
-    The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise. A `time_interval` model carries one on each partition this run wrote, judging that partition's rows.
+    The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise. A `time_interval` model carries one on each partition this run wrote, judging that partition's rows. That includes partitions written in a run where another partition failed to run.
     """
 
 

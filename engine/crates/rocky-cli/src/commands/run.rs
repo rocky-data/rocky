@@ -15527,6 +15527,32 @@ async fn execute_models_phase(
                         ))
                         .await;
                 }
+                // The product volume check over the partitions this run wrote,
+                // made even when another partition failed: the written
+                // partitions hold rows, and each is judged on its own. A
+                // cancelled run is `not_evaluated`. An `error` breach marks
+                // that partition `Failed` in the partition state, so
+                // `--missing` rewrites and judges it again.
+                let volume_failure = super::run_volume::check_partition_volume(
+                    &product_volumes,
+                    warehouse,
+                    dialect,
+                    model,
+                    output,
+                    first_partition,
+                    cancel,
+                )
+                .await;
+                if volume_failure.is_some()
+                    && let Some(store) = state_store
+                {
+                    super::run_volume::mark_breaching_partitions_failed(
+                        store,
+                        model_name,
+                        output,
+                        first_partition,
+                    );
+                }
                 // Containment: a partitioned model whose run reported any failed
                 // partition has already materialized its healthy partitions (and
                 // marked only the failed one `Failed` in per-partition state).
@@ -15548,24 +15574,12 @@ async fn execute_models_phase(
                     output.fail_fast_model = Some(model_name.to_string());
                     return Err(e);
                 }
-                // The product volume check over the partitions this run
-                // wrote. A cancelled run is `not_evaluated`. An `error`
-                // breach fails the model after its writes, as on the plain
-                // path: `model_error` fires, the success hook does not, and
-                // downstream is withheld (contained) or the run stops. The
-                // written partitions keep their `Computed` state: their rows
-                // are in the table.
-                if let Some(e) = super::run_volume::check_partition_volume(
-                    &product_volumes,
-                    warehouse,
-                    dialect,
-                    model,
-                    output,
-                    first_partition,
-                    cancel,
-                )
-                .await
-                {
+                // An `error` breach fails the model after its writes, as on
+                // the plain path: `model_error` fires, the success hook does
+                // not, and downstream is withheld (contained) or the run
+                // stops. The rows stay in the table. Only the breaching
+                // partitions were marked `Failed` above.
+                if let Some(e) = volume_failure {
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                         let _ = reg
                             .fire(&HookContext::model_error(

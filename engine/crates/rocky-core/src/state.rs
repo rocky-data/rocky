@@ -4004,6 +4004,18 @@ pub struct RunRecord {
     pub output_volumes: Vec<OutputVolumeRecord>,
 }
 
+/// Read a [`crate::product::spec::VolumeBasis`] leniently: a name this build
+/// does not know reads as `None`.
+fn lenient_volume_basis<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::product::spec::VolumeBasis>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 /// One product output volume check a production run made: the count it
 /// judged, the basis it counted on and the verdict it reached.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4015,8 +4027,15 @@ pub struct OutputVolumeRecord {
     /// The partition key, for a `time_interval` model's partition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<String>,
-    /// What `row_count` counts. `None` when the strategy is not counted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// What `row_count` counts. `None` when the strategy is not counted, or
+    /// when the record names a basis this build does not know (a record a
+    /// newer engine wrote): one unknown name must not make the whole run
+    /// record unreadable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_volume_basis"
+    )]
     pub basis: Option<crate::product::spec::VolumeBasis>,
     /// The count judged. `None` when no count was taken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5484,6 +5503,9 @@ impl StateStore {
     /// Matches on [`ModelExecution::rocky_model_name`], the model name, not
     /// the table name.
     ///
+    /// A run where the model also has a non-success execution (for example
+    /// one partition that breached a volume range) is not a delivery.
+    ///
     /// `exclude_run_id` skips that run. A run persisted twice under one id
     /// (for example after a failed `verify_after`) must not be its own
     /// previous delivery.
@@ -5499,6 +5521,15 @@ impl StateStore {
     ) -> Result<Option<ModelExecution>, StateError> {
         let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
             if exclude_run_id == Some(run.run_id.as_str()) || !run.counts_as_production(unrecorded)
+            {
+                return None;
+            }
+            // A model with any failed execution in the run did not deliver,
+            // even where some of its partitions succeeded.
+            if run
+                .models_executed
+                .iter()
+                .any(|m| m.status != "success" && m.rocky_model_name() == model_name)
             {
                 return None;
             }
@@ -12621,6 +12652,61 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
         assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
         assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
+    }
+
+    /// A run record written before `output_volumes` existed, as the literal
+    /// JSON an older binary stored: it must read back with no output
+    /// volumes, and an `output_volumes` row that names a basis this binary
+    /// does not know must read with no basis instead of failing the record.
+    #[test]
+    fn a_pre_output_volumes_run_record_reads_and_an_unknown_basis_is_lenient() {
+        let literal = r#"{
+            "run_id": "run-old",
+            "started_at": "2026-05-01T05:00:00Z",
+            "finished_at": "2026-05-01T05:30:00Z",
+            "status": "Success",
+            "models_executed": [{
+                "model_name": "revenue_daily",
+                "started_at": "2026-05-01T05:00:00Z",
+                "finished_at": "2026-05-01T05:30:00Z",
+                "duration_ms": 1,
+                "rows_affected": null,
+                "status": "success",
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null,
+                "row_count": 12
+            }],
+            "trigger": "Manual",
+            "config_hash": "config-hash",
+            "session_source": "cli",
+            "hostname": "test-host",
+            "rocky_version": "1.0.0"
+        }"#;
+        let old: RunRecord =
+            serde_json::from_str(literal).expect("a pre-output_volumes record must deserialize");
+        assert!(old.output_volumes.is_empty());
+        assert_eq!(old.models_executed[0].row_count, Some(12));
+
+        let mut value: serde_json::Value = serde_json::from_str(literal).unwrap();
+        value["output_volumes"] = serde_json::json!([
+            {
+                "product": "p", "model": "m", "basis": "partition_rows",
+                "row_count": 3, "severity": "error", "verdict": "in_range"
+            },
+            {
+                "product": "p", "model": "m", "basis": "a_basis_from_a_newer_engine",
+                "row_count": 4, "severity": "error", "verdict": "in_range"
+            }
+        ]);
+        let record: RunRecord = serde_json::from_value(value)
+            .expect("an unknown basis must not make the run record unreadable");
+        let bases: Vec<_> = record.output_volumes.iter().map(|v| v.basis).collect();
+        assert_eq!(
+            bases,
+            [Some(crate::product::spec::VolumeBasis::PartitionRows), None]
+        );
+        assert_eq!(record.output_volumes[1].row_count, Some(4));
     }
 
     #[test]

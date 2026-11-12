@@ -80,7 +80,18 @@ build ok ──▶ count ────▶ in range ──────────
                                                       a `volume_warnings` line says why)
 ```
 
-At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A time-interval output is judged one partition at a time. If any partition breaches at `error`, the model fails. Only the breaching partitions are marked failed in the run record, and they get no `due_at`. The other partitions stay successes. Every partition keeps its `computed` state, because its rows are in the table. An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Every `not_evaluated` check adds a `volume_warnings` line with its reason, at either severity. It never fails the run. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
+At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A time-interval output is judged one partition at a time. If any partition breaches at `error`, the model fails. Only the breaching partitions are marked failed in the run record. The model delivers nothing in that run, so no partition of it gets a `due_at`. The other partitions stay successes in the record. Partitions written before another partition failed to run are judged too.
+
+What an `error` breach does and does not do:
+
+1. It fails the model for the run that wrote the rows. It withholds downstream for that run only. The rows are not rolled back.
+2. Time-interval: the breaching partition is recorded `failed` in the partition state. `--missing`, `--partition` and `--from`/`--to` rewrite it and judge it again. A default run (latest) does not revisit it. Downstream can build over the breached rows until the partition is rewritten.
+3. Incremental and merge: each load is judged alone. The next in-range load passes, and the breached rows stay. The remedy is `--full-refresh`, which judges the whole table.
+4. `rocky product status` shows the newest build's verdict. An earlier breach is not shown.
+
+Keeping a breached output failed until it is rebuilt is planned work (#2581).
+
+An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Every `not_evaluated` check adds a `volume_warnings` line with its reason, at either severity. It never fails the run. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
 
 The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `basis`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. A time-interval output carries one on each partition the run wrote. The run records each check in its history with its basis, and `rocky product status` reports the newest build's check. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
 

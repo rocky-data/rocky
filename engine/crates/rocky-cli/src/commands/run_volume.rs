@@ -32,7 +32,25 @@
 //! A time-interval output is judged once per written partition, each against
 //! the whole range, and the check sits on that partition's own
 //! materialization. One partition out of range at `error` fails the model;
-//! only the breaching partitions are marked failed in the run record.
+//! only the breaching partitions are marked failed in the run record. A
+//! partition run that itself failed still judges the partitions it wrote.
+//!
+//! What an `error` breach does and does not do:
+//!
+//! 1. It fails the model for the run that wrote the rows and withholds
+//!    downstream for that run only. The rows are not rolled back.
+//! 2. Time-interval: the breaching partition is recorded `Failed` in the
+//!    partition state. `--missing`, `--partition` or `--from`/`--to` rewrite
+//!    it and judge it again. A default run (latest) does not revisit it, so
+//!    downstream can build over the breached rows until it is rewritten.
+//! 3. Incremental and merge: each load is judged alone. The next in-range
+//!    load passes. The remedy is `--full-refresh`, which judges the whole
+//!    table.
+//! 4. `rocky product status` shows the newest build's verdict. An earlier
+//!    breach is not shown.
+//!
+//! Keeping a breached output failed until it is rebuilt is planned work
+//! (#2581).
 //!
 //! Counting assumes this run is the table's only writer. A reported count
 //! needs no such assumption, but the cross-check against the table's own
@@ -156,7 +174,8 @@ pub(crate) async fn check_volume(
 /// partition records no check. Returns an error when any partition breaches
 /// at `error`, naming each breaching partition; otherwise `None`. Only the
 /// breaching partitions are marked failed in the run record
-/// ([`crate::output::RunOutput::to_run_record`]).
+/// ([`crate::output::RunOutput::to_run_record`]) and, through
+/// [`mark_breaching_partitions_failed`], in the partition state.
 pub(crate) async fn check_partition_volume(
     volumes: &ProductVolumes,
     warehouse: &dyn WarehouseAdapter,
@@ -219,6 +238,57 @@ pub(crate) async fn check_partition_volume(
             "{n} partitions of model '{model_name}' breach the volume range: {}",
             failures.join("; ")
         )),
+    }
+}
+
+/// Record the partitions that breached at `error` as `Failed` in the
+/// partition state, so `--missing` plans them again and judges them again.
+///
+/// `output.materializations[first..]` are the partitions this run wrote. A
+/// partition that is in range, or that breached at `warning`, or whose count
+/// was not taken keeps its `Computed` state. A batched partition marks every
+/// key it covers. A state write that fails only warns: the verdict stands.
+pub(crate) fn mark_breaching_partitions_failed(
+    store: &rocky_core::state::StateStore,
+    model: &str,
+    output: &RunOutput,
+    first: usize,
+) {
+    use rocky_core::incremental::PartitionStatus;
+    let mut failed = Vec::new();
+    for mat in &output.materializations[first..] {
+        let (Some(check), Some(partition)) = (&mat.volume, &mat.partition) else {
+            continue;
+        };
+        if !check.fails_the_model() {
+            continue;
+        }
+        for key in std::iter::once(&partition.key).chain(&partition.batched_with) {
+            match store.get_partition(model, key) {
+                Ok(Some(mut record)) => {
+                    record.status = PartitionStatus::Failed;
+                    failed.push(record);
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    model,
+                    partition = key.as_str(),
+                    error = %e,
+                    "could not read the partition state to mark a volume breach failed"
+                ),
+            }
+        }
+    }
+    if failed.is_empty() {
+        return;
+    }
+    if let Err(e) = store.record_partitions(&failed) {
+        warn!(
+            model,
+            error = %e,
+            "could not mark the breaching partitions failed; they stay computed and --missing \
+             will not rewrite them"
+        );
     }
 }
 
@@ -2407,6 +2477,17 @@ mod tests {
             ]
         }
 
+        /// `partitioned_models`, except that the SQL fails for the rows of
+        /// 2024-01-03, so that partition fails to run.
+        fn failing_partition_models() -> Vec<(&'static str, String, &'static str)> {
+            let mut models = partitioned_models(0);
+            models[1].1 = "SELECT d, CASE WHEN d = DATE '2024-01-03' \
+                 THEN CAST(CAST(x AS VARCHAR) || 'z' AS INTEGER) ELSE x END AS x \
+                 FROM main.src WHERE d >= @start_date AND d < @end_date\n"
+                .to_string();
+            models
+        }
+
         fn days(from: &str, to: &str) -> PartitionRunOptions {
             PartitionRunOptions {
                 from: Some(from.into()),
@@ -2546,8 +2627,10 @@ mod tests {
 
         /// Above max at `error` for one partition (3 rows over max 2): the
         /// model fails, the run is partial, downstream is withheld. Only the
-        /// breaching partition is marked failed; the other stays a success.
-        /// Every partition stays `Computed`: its rows are in the table.
+        /// breaching partition is marked failed; the other stays a success
+        /// as a record, but the model delivered nothing, so neither carries
+        /// a `due_at`. The breaching partition is `Failed` in the partition
+        /// state, so `--missing` rewrites it; the others stay `Computed`.
         #[tokio::test]
         async fn a_time_interval_output_above_max_at_error_fails_only_the_breaching_partition() {
             let ran = two_partition_runs("max_rows = 2\nseverity = \"error\"").await;
@@ -2571,6 +2654,10 @@ mod tests {
             assert_eq!(by_partition[1].1["verdict"], "above_max");
             assert!(by_partition[1].0.due_at.is_none());
             assert!(
+                by_partition[0].0.due_at.is_none(),
+                "a passing partition of a failed model is not a delivery"
+            );
+            assert!(
                 ran.executions("down").iter().all(|e| e.status != "success"),
                 "the downstream model is withheld: {:?}",
                 ran.record.models_executed
@@ -2578,11 +2665,101 @@ mod tests {
             let state = StateStore::open(&ran._tmp.path().join("state.redb")).unwrap();
             let partitions = state.list_partitions("vol").unwrap();
             assert_eq!(partitions.len(), 3, "{partitions:?}");
+            let failed: Vec<_> = state
+                .list_failed_partitions("vol")
+                .unwrap()
+                .into_iter()
+                .map(|p| p.partition_key)
+                .collect();
+            assert_eq!(failed, ["2024-01-02"], "only the breaching partition");
+        }
+
+        /// A breach leaves its partition `Failed`, so a later run that names
+        /// it writes it again and judges it again: still out of range stays
+        /// failed, and in range is `Computed` once more.
+        #[tokio::test]
+        async fn a_breaching_partition_is_rewritten_and_judged_again() {
+            let ran = two_partition_runs("max_rows = 2\nseverity = \"error\"").await;
+            assert!(ran.result.is_err());
+            let root = ran._tmp.path();
+            let state = StateStore::open(&root.join("state.redb")).unwrap();
+            let failed = |state: &StateStore| -> Vec<String> {
+                state
+                    .list_failed_partitions("vol")
+                    .unwrap()
+                    .into_iter()
+                    .map(|p| p.partition_key)
+                    .collect()
+            };
+            assert_eq!(failed(&state), ["2024-01-02"]);
+            drop(state);
+
+            let one = PartitionRunOptions {
+                partition: Some("2024-01-02".into()),
+                parallel: 1,
+                ..Default::default()
+            };
+            // Still above max: judged again, still failed.
+            let (result, record, output) = run_in(root, None, &one).await;
+            assert!(result.is_err(), "the rewrite breaches again");
+            let rejudged: Vec<_> = output["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .map(|m| m["volume"]["verdict"].clone())
+                .collect();
+            assert_eq!(rejudged, ["above_max"]);
+            assert_eq!(record.status, RunStatus::PartialFailure);
+            let state = StateStore::open(&root.join("state.redb")).unwrap();
+            assert_eq!(failed(&state), ["2024-01-02"]);
+            drop(state);
+
+            // The range now admits it: the rewrite passes and heals it.
+            write_project(
+                root,
+                &spec("max_rows = 3\nseverity = \"error\""),
+                &borrowed(&partitioned_models(0)),
+                "",
+            );
+            let (result, _, _) = run_in(root, None, &one).await;
+            result.expect("3 rows are in range now");
+            let state = StateStore::open(&root.join("state.redb")).unwrap();
+            assert!(failed(&state).is_empty());
+        }
+
+        /// A partition that fails to run does not stop the partitions that
+        /// did write from being judged: the breaching one is recorded and
+        /// marked failed. Here 2024-01-01 (2 rows) is in range and
+        /// 2024-01-02 (3 rows) breaches max 2, while 2024-01-03 fails to
+        /// run.
+        #[tokio::test]
+        async fn written_partitions_are_judged_when_another_partition_fails() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_project(
+                tmp.path(),
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &borrowed(&failing_partition_models()),
+                "",
+            );
+            let (result, record, output) =
+                run_in(tmp.path(), None, &days("2024-01-01", "2024-01-03")).await;
+            assert!(result.is_err());
+            let verdicts: Vec<_> = output["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .map(|m| m["volume"]["verdict"].clone())
+                .collect();
             assert!(
-                partitions
-                    .iter()
-                    .all(|p| p.status == rocky_core::incremental::PartitionStatus::Computed),
-                "{partitions:?}"
+                verdicts.contains(&serde_json::json!("in_range")),
+                "the partitions written before the failure are judged: {verdicts:?}"
+            );
+            assert!(
+                record.output_volumes.iter().any(|v| v.partition.is_some()),
+                "{:?}",
+                record.output_volumes
             );
         }
 
