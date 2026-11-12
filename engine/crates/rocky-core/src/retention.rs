@@ -189,7 +189,8 @@ impl std::str::FromStr for RetentionPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum StateRetentionDomain {
     /// Pipeline run records (`run_history` table). Each row carries
-    /// `started_at`/`finished_at` and the governance audit trail.
+    /// `started_at`/`finished_at` and the governance audit trail. Also
+    /// sweeps recorded AI calls (`ai_usage`) older than `max_age_days`.
     History,
     /// DAG snapshots (`dag_snapshots` table). Each entry carries the graph
     /// hash and the diff against the prior snapshot.
@@ -377,6 +378,13 @@ pub struct SweepReport {
     pub audit_deleted: u64,
     /// Quality snapshots kept.
     pub audit_kept: u64,
+    /// Recorded AI calls (`ai_usage`) deleted. Swept with the `history`
+    /// domain, by age only: `min_runs_kept` does not apply to them.
+    #[serde(default)]
+    pub ai_usage_deleted: u64,
+    /// Recorded AI calls kept.
+    #[serde(default)]
+    pub ai_usage_kept: u64,
     /// JSONL trace files (`.rocky/traces/*.jsonl`) deleted by the
     /// last-N-by-mtime sweep. Independent of `applies_to` (traces are
     /// always swept up to `ROCKY_TRACE_RETAIN_RUNS`, default 20); stays

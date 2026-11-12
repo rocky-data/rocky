@@ -67,7 +67,7 @@ outside system.
 
 - `rocky-fivetran`: calls the Fivetran REST API to list connectors and their enabled tables in the destination
 - `rocky-duckdb`: queries `information_schema` to discover schemas and tables in a local DuckDB database
-- `rocky-airbyte` and `rocky-iceberg`: discover from the Airbyte API and from an Iceberg REST catalog
+- `rocky-airbyte` and `rocky-iceberg`: discover from the Airbyte API and from an Iceberg REST catalog. Like Fivetran, the Airbyte adapter can wait for a running sync, and can start one when both opt-ins are set
 - Manual source (built into `rocky-core`): reads schema/table definitions from `rocky.toml`
 
 **Warehouse adapters** handle *execution*: running SQL, managing catalog lifecycle, and applying governance (tags, permissions, workspace isolation).

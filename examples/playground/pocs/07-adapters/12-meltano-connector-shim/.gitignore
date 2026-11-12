@@ -1,0 +1,5 @@
+# Generated at run time by run.sh.
+meltano_project/data/
+meltano_project/.meltano/
+__pycache__/
+*.egg-info/

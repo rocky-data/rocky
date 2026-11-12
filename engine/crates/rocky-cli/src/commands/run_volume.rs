@@ -1,19 +1,27 @@
 //! The product volume check `rocky run` makes after a production build.
 //!
-//! A product may declare `[product.output.volume]`: a row-count range its
-//! output table must hold after a load. Right after a successful production
-//! build of that output, the run counts the table's rows once and judges the
-//! count:
+//! A product may declare `[product.output.volume]`: a row-count range one
+//! load of its output must hold. Right after a successful production build
+//! of that output, the run counts the load once and judges the count. What
+//! "the load" is depends on the output model's strategy
+//! ([`VolumeBasis`]):
 //!
 //! ```text
 //!   build ok ── production? ──no──▶ nothing counted (no `volume` field)
 //!                   │ yes
 //!          volume declared for the model? ──no──▶ nothing counted
 //!                   │ yes
-//!          full-refresh strategy? ──no──▶ not_evaluated (never a failure)
+//!          a counted strategy? ──no──▶ not_evaluated (never a failure)
 //!                   │ yes
-//!          SELECT COUNT(*) ── cancelled / error / unreadable ──▶ not_evaluated
-//!                   │ count
+//!          full_refresh ── SELECT COUNT(*) ─────────────────── total_rows
+//!          incremental ─── the INSERT's reported rows ──────── rows_added
+//!                          (the count after - before is the fallback; the two
+//!                          disagreeing is not_evaluated)
+//!          merge ───────── the MERGE's reported row count ──── rows_touched
+//!          time_interval ─ COUNT(*) per partition written ───── partition_rows
+//!                   │ cancelled / error / not reported ──▶ not_evaluated
+//!                   │ count                                (never a failure, but
+//!                   │                                      a `volume_warnings` line)
 //!          in range ─────────────────▶ in_range
 //!          out of range, warning ────▶ a `volume_warnings` line; delivery as usual
 //!          out of range, error ──────▶ the model fails after the fact:
@@ -21,14 +29,41 @@
 //!                                      run partial, no `due_at`
 //! ```
 //!
-//! The count is the total rows, not the rows this load wrote, which is why
-//! only a full-refresh output is counted: a total on an incremental or merge
-//! table only grows.
+//! A time-interval output is judged once per written partition, each against
+//! the whole range, and the check sits on that partition's own
+//! materialization. One partition out of range at `error` fails the model;
+//! only the breaching partitions are marked failed in the run record. A
+//! partition run that itself failed still judges the partitions it wrote.
+//!
+//! What an `error` breach does and does not do:
+//!
+//! 1. It fails the model for the run that wrote the rows and withholds
+//!    downstream for that run only. The rows are not rolled back.
+//! 2. Time-interval: the breaching partition is recorded `Failed` in the
+//!    partition state. `--missing`, `--partition` or `--from`/`--to` rewrite
+//!    it and judge it again. A default run (latest) does not revisit it, so
+//!    downstream can build over the breached rows until it is rewritten.
+//! 3. Incremental and merge: each load is judged alone. The next in-range
+//!    load passes. The remedy is `--full-refresh`, which judges the whole
+//!    table.
+//! 4. `rocky product status` shows the newest build's verdict. An earlier
+//!    breach is not shown.
+//!
+//! Keeping a breached output failed until it is rebuilt is planned work
+//! (#2581).
+//!
+//! Counting assumes this run is the table's only writer. A reported count
+//! needs no such assumption, but the cross-check against the table's own
+//! count does: another writer makes the two disagree and the verdict
+//! `not_evaluated`.
+//!
+//! A build that created the table (a first run) or replaced it whole
+//! (`--full-refresh`) counts every row in it as this load's, on any basis.
 
 use std::path::Path;
 
-use rocky_core::product::spec::{VolumeSeverity, VolumeVerdict};
-use rocky_core::traits::WarehouseAdapter;
+use rocky_core::product::spec::{VolumeBasis, VolumeSeverity, VolumeVerdict};
+use rocky_core::traits::{SqlDialect, WarehouseAdapter};
 use rocky_ir::MaterializationStrategy;
 use tracing::warn;
 
@@ -48,6 +83,11 @@ impl ProductVolumes {
 
     fn for_model(&self, model: &str) -> Option<&ProductVolume> {
         self.ranges.iter().find(|range| range.output_model == model)
+    }
+
+    /// True when a product declares a range for `model`.
+    pub(crate) fn declares(&self, model: &str) -> bool {
+        self.for_model(model).is_some()
     }
 }
 
@@ -85,38 +125,23 @@ pub(crate) fn load_ranges(
     ))
 }
 
-/// Whether a total-row count on one write of this strategy says something
-/// about that write.
-///
-/// Exhaustive on purpose (no `_ =>`): a new strategy fails to compile here
-/// until someone decides whether its total row count is a load's volume.
-pub(crate) fn counts_total_rows(strategy: &MaterializationStrategy) -> bool {
-    match strategy {
-        // The whole table is this load.
-        MaterializationStrategy::FullRefresh => true,
-        // No stored table, or a warehouse-managed one Rocky does not write.
-        MaterializationStrategy::View
-        | MaterializationStrategy::Ephemeral
-        | MaterializationStrategy::MaterializedView
-        | MaterializationStrategy::DynamicTable { .. } => false,
-        // The table accumulates across loads, so its total only grows.
-        MaterializationStrategy::Incremental { .. }
-        | MaterializationStrategy::Merge { .. }
-        | MaterializationStrategy::DeleteInsert { .. }
-        | MaterializationStrategy::Microbatch { .. }
-        | MaterializationStrategy::TimeInterval { .. }
-        | MaterializationStrategy::Snapshot(_)
-        | MaterializationStrategy::ContentAddressed { .. } => false,
-    }
+/// The reason an output whose strategy is not counted is `not_evaluated`.
+fn unsupported_reason() -> String {
+    "[volume-strategy-unsupported] the output model's strategy (a view, ephemeral, \
+     materialized view, dynamic table, delete_insert, snapshot or content-addressed \
+     model) has no count that is one load's volume; not counted"
+        .to_string()
 }
 
 /// Count and judge `model`'s output when a product declares a volume for it.
 ///
-/// Records the check on `materialization.volume` and, for a `warning`
-/// breach, a line in `output.volume_warnings`. Returns the error the caller
-/// must treat as this model's failure for an `error` breach, and `None`
-/// otherwise. A count that cannot be taken is `not_evaluated`, never an
-/// error.
+/// For a model built by the plain transformation path: full refresh,
+/// incremental, merge (`time_interval` goes through
+/// [`check_partition_volume`]). Records the check on
+/// `materialization.volume` and, for a `warning` breach, a line in
+/// `output.volume_warnings`. Returns the error the caller must treat as
+/// this model's failure for an `error` breach, and `None` otherwise. A
+/// count that cannot be taken is `not_evaluated`, never an error.
 pub(crate) async fn check_volume(
     volumes: &ProductVolumes,
     warehouse: &dyn WarehouseAdapter,
@@ -127,25 +152,272 @@ pub(crate) async fn check_volume(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<anyhow::Error> {
     let range = volumes.for_model(model)?;
-    let (row_count, reason) = if !counts_total_rows(strategy) {
-        (
-            None,
-            Some(
-                "[volume-strategy-unsupported] the output model is not a full-refresh table, \
-                 so its total row count is not a load's volume; not counted"
-                    .to_string(),
+    let basis = VolumeBasis::of(strategy);
+    let counted = match basis {
+        None => Err(unsupported_reason()),
+        Some(_) if cancel.is_cancelled() => Err("the run was cancelled before the count".into()),
+        Some(basis) => count_load(warehouse, basis, materialization).await,
+    };
+    let judged = judge(range, model, basis, None, counted);
+    materialization.volume = Some(judged.check.clone());
+    judged.settle(output)
+}
+
+/// Count and judge a `time_interval` model's output, one partition at a
+/// time: `output.materializations[first..]` holds one entry per partition
+/// this run wrote.
+///
+/// Each partition is counted with the predicate its overwrite used
+/// ([`rocky_core::sql_gen::time_interval_partition_filter`]), in one
+/// `COUNT(*)` of its own, and judged against the whole range. The check is
+/// recorded on that partition's own materialization. A run that wrote no
+/// partition records no check. Returns an error when any partition breaches
+/// at `error`, naming each breaching partition; otherwise `None`. Only the
+/// breaching partitions are marked failed in the run record
+/// ([`crate::output::RunOutput::to_run_record`]) and, through
+/// [`mark_breaching_partitions_failed`], in the partition state.
+pub(crate) async fn check_partition_volume(
+    volumes: &ProductVolumes,
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn SqlDialect,
+    model: &rocky_core::models::Model,
+    output: &mut RunOutput,
+    first: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<anyhow::Error> {
+    let model_name = model.config.name.as_str();
+    let range = volumes.for_model(model_name)?;
+    let strategy = model.to_model_ir().materialization;
+    let basis = VolumeBasis::of(&strategy);
+    let mut failures: Vec<String> = Vec::new();
+    for index in first..output.materializations.len() {
+        let (asset_key, partition) = {
+            let mat = &output.materializations[index];
+            (mat.asset_key.clone(), mat.partition.clone())
+        };
+        let counted = match (&strategy, basis) {
+            (_, None) => Err(unsupported_reason()),
+            _ if cancel.is_cancelled() => {
+                Err("the run was cancelled before every partition ran or before the count".into())
+            }
+            (MaterializationStrategy::TimeInterval { time_column, .. }, Some(_)) => {
+                match &partition {
+                    None => Err("this partition recorded no time window; not counted".to_string()),
+                    Some(partition) => {
+                        let window = rocky_ir::PartitionWindow {
+                            key: partition.key.clone(),
+                            start: partition.start,
+                            end: partition.end,
+                        };
+                        match rocky_core::sql_gen::time_interval_partition_filter(
+                            time_column,
+                            &window,
+                            dialect,
+                        ) {
+                            Ok(filter) => count_rows(warehouse, &asset_key, Some(&filter)).await,
+                            Err(e) => Err(format!("could not render the partition filter: {e}")),
+                        }
+                    }
+                }
+            }
+            (_, Some(_)) => Err(
+                "the model is not a time_interval model, so its partitions are not counted".into(),
             ),
-        )
-    } else if cancel.is_cancelled() {
-        (
-            None,
-            Some("the run was cancelled before the count".to_string()),
-        )
-    } else {
-        match count_rows(warehouse, &materialization.asset_key).await {
-            Ok(count) => (Some(count), None),
-            Err(reason) => (None, Some(reason)),
+        };
+        let key = partition.as_ref().map(|partition| partition.key.as_str());
+        let judged = judge(range, model_name, basis, key, counted);
+        output.materializations[index].volume = Some(judged.check.clone());
+        if let Some(failure) = judged.settle(output) {
+            failures.push(format!("{failure:#}"));
         }
+    }
+    match failures.len() {
+        0 => None,
+        1 => failures.pop().map(|line| anyhow::anyhow!("{line}")),
+        n => Some(anyhow::anyhow!(
+            "{n} partitions of model '{model_name}' breach the volume range: {}",
+            failures.join("; ")
+        )),
+    }
+}
+
+/// Record the partitions that breached at `error` as `Failed` in the
+/// partition state, so `--missing` plans them again and judges them again.
+///
+/// `output.materializations[first..]` are the partitions this run wrote. A
+/// partition that is in range, or that breached at `warning`, or whose count
+/// was not taken keeps its `Computed` state. A batched partition marks every
+/// key it covers. A state write that fails only warns: the verdict stands.
+pub(crate) fn mark_breaching_partitions_failed(
+    store: &rocky_core::state::StateStore,
+    model: &str,
+    output: &RunOutput,
+    first: usize,
+) {
+    use rocky_core::incremental::PartitionStatus;
+    let mut failed = Vec::new();
+    for mat in &output.materializations[first..] {
+        let (Some(check), Some(partition)) = (&mat.volume, &mat.partition) else {
+            continue;
+        };
+        if !check.fails_the_model() {
+            continue;
+        }
+        for key in std::iter::once(&partition.key).chain(&partition.batched_with) {
+            match store.get_partition(model, key) {
+                Ok(Some(mut record)) => {
+                    record.status = PartitionStatus::Failed;
+                    failed.push(record);
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    model,
+                    partition = key.as_str(),
+                    error = %e,
+                    "could not read the partition state to mark a volume breach failed"
+                ),
+            }
+        }
+    }
+    if failed.is_empty() {
+        return;
+    }
+    if let Err(e) = store.record_partitions(&failed) {
+        warn!(
+            model,
+            error = %e,
+            "could not mark the breaching partitions failed; they stay computed and --missing \
+             will not rewrite them"
+        );
+    }
+}
+
+/// The rows one build's write changed, from what each statement it ran
+/// reported. Only a build that ran exactly one statement has a count, and
+/// only when that statement reported: summing several would count a
+/// statement that is not the write.
+pub(crate) fn single_statement_rows(reported: &[Option<u64>]) -> Option<u64> {
+    match reported {
+        [only] => *only,
+        _ => None,
+    }
+}
+
+/// The table's growth over one write, as far as it could be read.
+enum Growth {
+    /// The count after the write minus the count before.
+    Rows(u64),
+    /// The table holds fewer rows after the write than before it.
+    Shrank { before: u64, after: u64 },
+    /// A count was not taken or failed; the reason.
+    Unavailable(String),
+}
+
+/// The count for one plain build on `basis`, or why it was not taken.
+///
+/// - `rows_added`: the rows the adapter reported for the INSERT. The table's
+///   growth (count after minus count before) is the fallback when nothing
+///   was reported, and a cross-check when both exist: if they disagree,
+///   something else wrote to the table and nothing is counted.
+/// - `rows_touched`: the rows the adapter reported for the single MERGE.
+async fn count_load(
+    warehouse: &dyn WarehouseAdapter,
+    basis: VolumeBasis,
+    materialization: &MaterializationOutput,
+) -> Result<u64, String> {
+    let evidence = materialization.write_evidence.as_ref();
+    let created_or_replaced = evidence.is_some_and(|e| e.created_or_replaced);
+    match basis {
+        VolumeBasis::TotalRows => count_rows(warehouse, &materialization.asset_key, None).await,
+        // A table this build created or replaced holds only this build's rows.
+        VolumeBasis::RowsAdded | VolumeBasis::RowsTouched if created_or_replaced => {
+            count_rows(warehouse, &materialization.asset_key, None).await
+        }
+        VolumeBasis::RowsAdded => {
+            let reported = evidence.and_then(|e| e.rows_reported);
+            let growth = match evidence.and_then(|e| e.rows_before.as_ref()) {
+                Some(Ok(before)) => {
+                    match count_rows(warehouse, &materialization.asset_key, None).await {
+                        Ok(after) => match after.checked_sub(*before) {
+                            Some(rows) => Growth::Rows(rows),
+                            None => Growth::Shrank {
+                                before: *before,
+                                after,
+                            },
+                        },
+                        Err(reason) => Growth::Unavailable(reason),
+                    }
+                }
+                Some(Err(reason)) => {
+                    Growth::Unavailable(format!("the count before the write failed: {reason}"))
+                }
+                None => Growth::Unavailable("no row count was taken before the write".into()),
+            };
+            match (reported, growth) {
+                (Some(reported), Growth::Rows(grew)) if reported != grew => Err(format!(
+                    "the warehouse reported {reported} inserted row(s) but the table grew by \
+                     {grew}, so the two disagree (another writer?); not counted"
+                )),
+                (Some(reported), Growth::Shrank { before, after }) => Err(format!(
+                    "the warehouse reported {reported} inserted row(s) but the table holds \
+                     fewer rows after the write ({after}) than before it ({before}), so the \
+                     two disagree (another writer?); not counted"
+                )),
+                (Some(reported), _) => Ok(reported),
+                (None, Growth::Rows(grew)) => Ok(grew),
+                (None, Growth::Shrank { before, after }) => Err(format!(
+                    "the table holds fewer rows after the write ({after}) than before it \
+                     ({before}), so something else changed it during the run; not counted"
+                )),
+                (None, Growth::Unavailable(reason)) => Err(reason),
+            }
+        }
+        VolumeBasis::RowsTouched => evidence.and_then(|e| e.rows_reported).ok_or_else(|| {
+            "the warehouse adapter did not report how many rows the one MERGE inserted or \
+             updated, and a row count cannot see an update; not counted"
+                .to_string()
+        }),
+        VolumeBasis::PartitionRows => Err(
+            "a time_interval output is counted over the partitions its run wrote, not per \
+             build; not counted"
+                .into(),
+        ),
+    }
+}
+
+/// One judged check, and what it does to the run.
+struct Judged {
+    check: VolumeCheckOutput,
+    /// The `volume_warnings` line of a `warning` breach.
+    warning: Option<String>,
+    /// The model's failure for an `error` breach.
+    failure: Option<anyhow::Error>,
+}
+
+impl Judged {
+    /// Record the warning, if any, and hand back the failure.
+    fn settle(self, output: &mut RunOutput) -> Option<anyhow::Error> {
+        if let Some(line) = self.warning {
+            output.volume_warnings.push(line);
+        }
+        self.failure
+    }
+}
+
+/// Judge `counted` against `range`. A count not taken (`Err`) is
+/// `not_evaluated`, with the error as its reason, and still earns a
+/// `volume_warnings` line: it never fails the run, and it is never silent.
+/// `partition` names the partition of a `time_interval` model.
+fn judge(
+    range: &ProductVolume,
+    model: &str,
+    basis: Option<VolumeBasis>,
+    partition: Option<&str>,
+    counted: Result<u64, String>,
+) -> Judged {
+    let (row_count, reason) = match counted {
+        Ok(count) => (Some(count), None),
+        Err(reason) => (None, Some(reason)),
     };
     let verdict = row_count.map_or(VolumeVerdict::NotEvaluated, |count| {
         range.volume.judge(count)
@@ -154,6 +426,7 @@ pub(crate) async fn check_volume(
     let mut check = VolumeCheckOutput {
         product: range.product.clone(),
         model: model.to_string(),
+        basis,
         row_count,
         min_rows: range.volume.min_rows,
         max_rows: range.volume.max_rows,
@@ -161,48 +434,97 @@ pub(crate) async fn check_volume(
         verdict,
         reason,
     };
-    let breach = describe_breach(&check);
-    let failure = match (breach, severity) {
-        (None, _) => None,
-        (Some(line), VolumeSeverity::Warning) => {
+    let (warning, failure) = match (
+        describe_breach(&check, partition),
+        describe_not_evaluated(&check, partition),
+        severity,
+    ) {
+        (None, None, _) => (None, None),
+        (None, Some(line), _) | (Some(line), _, VolumeSeverity::Warning) => {
             warn!(model, product = %check.product, "{line}");
-            output.volume_warnings.push(line);
-            None
+            (Some(line), None)
         }
-        (Some(line), VolumeSeverity::Error) => {
+        (Some(line), _, VolumeSeverity::Error) => {
             check.reason = Some(
-                "the table is written, but the model is marked failed: downstream models \
+                if partition.is_some() {
+                    "the partition's rows are written, but this partition and the model are \
+                 marked failed: downstream models are withheld and the partition is not \
+                 recorded as a delivery"
+                } else {
+                    "the table is written, but the model is marked failed: downstream models \
                  are withheld and the build is not recorded as a delivery"
-                    .to_string(),
+                }
+                .to_string(),
             );
-            Some(anyhow::anyhow!("{line}"))
+            (None, Some(anyhow::anyhow!("{line}")))
         }
     };
-    materialization.volume = Some(check);
-    failure
+    Judged {
+        check,
+        warning,
+        failure,
+    }
+}
+
+/// What names the model, and the partition when there is one.
+fn subject(model: &str, partition: Option<&str>) -> String {
+    match partition {
+        Some(key) => format!("model '{model}', partition '{key}'"),
+        None => format!("model '{model}'"),
+    }
+}
+
+/// The sentence for a range that was not evaluated, or `None` when it was.
+fn describe_not_evaluated(check: &VolumeCheckOutput, partition: Option<&str>) -> Option<String> {
+    if check.verdict != VolumeVerdict::NotEvaluated {
+        return None;
+    }
+    Some(format!(
+        "{}: the volume range was not evaluated, so nothing was checked: {} \
+         (product '{}', [product.output.volume] severity = \"{}\"; this never fails the run)",
+        subject(&check.model, partition),
+        check.reason.as_deref().unwrap_or("no reason recorded"),
+        check.product,
+        check.severity.as_str()
+    ))
 }
 
 /// The sentence for an out-of-range count, or `None` when the count is in
 /// range or was not taken.
-fn describe_breach(check: &VolumeCheckOutput) -> Option<String> {
+fn describe_breach(check: &VolumeCheckOutput, partition: Option<&str>) -> Option<String> {
     let count = check.row_count?;
     let bound = match check.verdict {
         VolumeVerdict::BelowMin => format!("below min_rows = {}", check.min_rows?),
         VolumeVerdict::AboveMax => format!("above max_rows = {}", check.max_rows?),
         VolumeVerdict::InRange | VolumeVerdict::NotEvaluated => return None,
     };
+    let subject = subject(&check.model, partition);
+    let counted = match check.basis {
+        Some(VolumeBasis::TotalRows) | None => format!("{subject} has {count} row(s)"),
+        Some(VolumeBasis::RowsAdded) => {
+            format!("{subject}: this run added {count} row(s)")
+        }
+        Some(VolumeBasis::RowsTouched) => {
+            format!("{subject}: this run's MERGE inserted or updated {count} row(s)")
+        }
+        Some(VolumeBasis::PartitionRows) => {
+            format!("{subject}: the partition this run wrote holds {count} row(s)")
+        }
+    };
     Some(format!(
-        "model '{}' has {count} row(s), {bound} (product '{}', \
-         [product.output.volume] severity = \"{}\")",
-        check.model,
+        "{counted}, {bound} (product '{}', [product.output.volume] severity = \"{}\")",
         check.product,
         check.severity.as_str()
     ))
 }
 
-/// `SELECT COUNT(*)` on the written table. The error is the reason the
-/// verdict is `not_evaluated`.
-async fn count_rows(warehouse: &dyn WarehouseAdapter, asset_key: &[String]) -> Result<u64, String> {
+/// `SELECT COUNT(*)` on a written table, over the rows `filter` selects
+/// when given. The error is the reason the verdict is `not_evaluated`.
+pub(crate) async fn count_rows(
+    warehouse: &dyn WarehouseAdapter,
+    asset_key: &[String],
+    filter: Option<&str>,
+) -> Result<u64, String> {
     let [catalog, schema, table] = asset_key else {
         return Err(format!(
             "the output is not a three-part table ({}); not counted",
@@ -213,8 +535,12 @@ async fn count_rows(warehouse: &dyn WarehouseAdapter, asset_key: &[String]) -> R
         .dialect()
         .format_table_ref(catalog, schema, table)
         .map_err(|e| format!("could not address the table: {e}"))?;
+    let sql = match filter {
+        Some(filter) => format!("SELECT COUNT(*) FROM {table_ref} WHERE {filter}"),
+        None => format!("SELECT COUNT(*) FROM {table_ref}"),
+    };
     let result = warehouse
-        .execute_query(&format!("SELECT COUNT(*) FROM {table_ref}"))
+        .execute_query(&sql)
         .await
         .map_err(|e| format!("the count failed: {e}"))?;
     rocky_core::checks::cell_as_u64(result.rows.first().and_then(|row| row.first()))
@@ -230,6 +556,7 @@ mod tests {
         VolumeCheckOutput {
             product: "p".into(),
             model: "m".into(),
+            basis: Some(VolumeBasis::TotalRows),
             row_count: Some(5),
             min_rows: Some(10),
             max_rows: Some(20),
@@ -250,20 +577,277 @@ mod tests {
 
     #[test]
     fn a_breach_names_the_bound_it_crossed() {
-        let below = describe_breach(&check(VolumeVerdict::BelowMin, VolumeSeverity::Warning))
-            .expect("a breach");
+        let below = describe_breach(
+            &check(VolumeVerdict::BelowMin, VolumeSeverity::Warning),
+            None,
+        )
+        .expect("a breach");
         assert!(below.contains("5 row(s), below min_rows = 10"), "{below}");
-        assert!(describe_breach(&check(VolumeVerdict::InRange, VolumeSeverity::Warning)).is_none());
+        assert!(
+            describe_breach(
+                &check(VolumeVerdict::InRange, VolumeSeverity::Warning),
+                None
+            )
+            .is_none()
+        );
         let mut uncounted = check(VolumeVerdict::NotEvaluated, VolumeSeverity::Error);
         uncounted.row_count = None;
-        assert!(describe_breach(&uncounted).is_none());
+        assert!(describe_breach(&uncounted, None).is_none());
     }
 
+    /// The breach sentence says what was counted.
     #[test]
-    fn only_full_refresh_counts_total_rows() {
-        assert!(counts_total_rows(&MaterializationStrategy::FullRefresh));
-        assert!(!counts_total_rows(&MaterializationStrategy::View));
-        assert!(!counts_total_rows(&MaterializationStrategy::Ephemeral));
+    fn a_breach_names_what_was_counted() {
+        let mut breach = check(VolumeVerdict::BelowMin, VolumeSeverity::Warning);
+        for (basis, words) in [
+            (VolumeBasis::TotalRows, "model 'm' has 5 row(s), below"),
+            (VolumeBasis::RowsAdded, "this run added 5 row(s), below"),
+            (
+                VolumeBasis::RowsTouched,
+                "this run's MERGE inserted or updated 5 row(s), below",
+            ),
+            (
+                VolumeBasis::PartitionRows,
+                "the partition this run wrote holds 5 row(s), below",
+            ),
+        ] {
+            breach.basis = Some(basis);
+            let line = describe_breach(&breach, None).expect("a breach");
+            assert!(line.contains(words), "{basis:?}: {line}");
+        }
+    }
+
+    /// Only a build that ran exactly one statement has a reported count.
+    #[test]
+    fn a_reported_count_comes_from_exactly_one_statement() {
+        assert_eq!(single_statement_rows(&[Some(4)]), Some(4));
+        assert_eq!(single_statement_rows(&[Some(0)]), Some(0));
+        assert_eq!(single_statement_rows(&[None]), None);
+        assert_eq!(single_statement_rows(&[]), None);
+        assert_eq!(
+            single_statement_rows(&[Some(1), Some(4)]),
+            None,
+            "two statements are not one MERGE"
+        );
+        assert_eq!(single_statement_rows(&[None, Some(4)]), None);
+    }
+
+    fn volume_range(severity: Option<VolumeSeverity>) -> ProductVolume {
+        ProductVolume {
+            product: "p".into(),
+            output_model: "m".into(),
+            volume: VolumeSpec {
+                min_rows: Some(2),
+                max_rows: Some(3),
+                severity,
+            },
+        }
+    }
+
+    /// Every `not_evaluated` leaves a `volume_warnings` line with its reason,
+    /// at either severity, and never fails the model.
+    #[test]
+    fn a_range_that_was_not_evaluated_warns_and_never_fails() {
+        for severity in [None, Some(VolumeSeverity::Error)] {
+            let judged = judge(
+                &volume_range(severity),
+                "m",
+                Some(VolumeBasis::RowsTouched),
+                None,
+                Err("the adapter did not report".into()),
+            );
+            assert_eq!(judged.check.verdict, VolumeVerdict::NotEvaluated);
+            assert!(judged.failure.is_none(), "not_evaluated never fails");
+            let line = judged.warning.as_deref().expect("a warning line");
+            assert!(line.contains("not evaluated"), "{line}");
+            assert!(line.contains("the adapter did not report"), "{line}");
+            assert!(line.contains("model 'm'"), "{line}");
+            let mut output = RunOutput::new(String::new(), 1, 1);
+            assert!(judged.settle(&mut output).is_none());
+            assert_eq!(
+                output.volume_warnings.len(),
+                1,
+                "{:?}",
+                output.volume_warnings
+            );
+        }
+        // An in-range count says nothing.
+        let judged = judge(&volume_range(None), "m", None, None, Ok(2));
+        assert!(judged.warning.is_none() && judged.failure.is_none());
+    }
+
+    /// A partition's line names the partition, and an `error` breach marks
+    /// that partition failed.
+    #[test]
+    fn a_partition_breach_names_the_partition() {
+        let judged = judge(
+            &volume_range(Some(VolumeSeverity::Error)),
+            "m",
+            Some(VolumeBasis::PartitionRows),
+            Some("2024-01-02"),
+            Ok(9),
+        );
+        let failure = judged.failure.expect("an error breach fails").to_string();
+        assert!(failure.contains("partition '2024-01-02'"), "{failure}");
+        assert!(
+            failure.contains("holds 9 row(s), above max_rows = 3"),
+            "{failure}"
+        );
+        assert!(judged.check.fails_the_model());
+    }
+
+    /// `count_load` against a DuckDB table of 100 rows, for each basis and
+    /// each way the evidence can fall short.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn the_load_count_follows_the_basis_and_never_guesses() {
+        use crate::output::WriteEvidence;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE TABLE main.t AS SELECT range AS x FROM range(100)")
+            .await
+            .unwrap();
+        let mat = |write_evidence: Option<WriteEvidence>| MaterializationOutput {
+            volume: None,
+            write_evidence,
+            asset_key: vec!["memory".into(), "main".into(), "t".into()],
+            notes: vec![],
+            rows_copied: None,
+            duration_ms: 1,
+            started_at: chrono::Utc::now(),
+            metadata: crate::output::MaterializationMetadata {
+                strategy: "incremental".into(),
+                watermark: None,
+                target_table_full_name: None,
+                sql_hash: None,
+                column_count: None,
+                compile_time_ms: None,
+            },
+            partition: None,
+            cost_usd: None,
+            bytes_scanned: None,
+            bytes_written: None,
+            egress_bytes: None,
+            tenant: None,
+            job_ids: vec![],
+            attempts: Vec::new(),
+            skip_internal: None,
+            recipe_identity: None,
+            output_column_hashes: None,
+            consumed_column_baseline: None,
+            output_version: None,
+            stored_bytes: None,
+            upstream_reads: None,
+            output_target: None,
+        };
+        let appended = |before: Option<Result<u64, String>>| {
+            mat(Some(WriteEvidence {
+                created_or_replaced: false,
+                rows_before: before,
+                rows_reported: None,
+            }))
+        };
+        let count = |basis, mat: MaterializationOutput| {
+            let warehouse = &warehouse;
+            async move { count_load(warehouse, basis, &mat).await }
+        };
+
+        // The key case: a total of 100 with 95 before the write is 5 added.
+        assert_eq!(
+            count(VolumeBasis::RowsAdded, appended(Some(Ok(95)))).await,
+            Ok(5)
+        );
+        assert_eq!(
+            count(VolumeBasis::TotalRows, appended(Some(Ok(95)))).await,
+            Ok(100)
+        );
+        let no_before = count(VolumeBasis::RowsAdded, appended(None))
+            .await
+            .expect_err("no count before");
+        assert!(no_before.contains("no row count was taken"), "{no_before}");
+        let failed_before = count(VolumeBasis::RowsAdded, appended(Some(Err("boom".into()))))
+            .await
+            .expect_err("a failed count before");
+        assert!(failed_before.contains("boom"), "{failed_before}");
+        let shrank = count(VolumeBasis::RowsAdded, appended(Some(Ok(120))))
+            .await
+            .expect_err("fewer rows after than before");
+        assert!(shrank.contains("fewer rows after"), "{shrank}");
+        assert!(
+            count(VolumeBasis::RowsAdded, mat(None)).await.is_err(),
+            "no evidence at all is not a count"
+        );
+
+        // An INSERT's reported rows are the count. The table's growth is the
+        // fallback, and a cross-check when both exist.
+        let reported = |before: Option<Result<u64, String>>, rows: u64| {
+            mat(Some(WriteEvidence {
+                created_or_replaced: false,
+                rows_before: before,
+                rows_reported: Some(rows),
+            }))
+        };
+        assert_eq!(
+            count(VolumeBasis::RowsAdded, reported(Some(Ok(95)), 5)).await,
+            Ok(5),
+            "the report and the growth agree"
+        );
+        assert_eq!(
+            count(VolumeBasis::RowsAdded, reported(None, 5)).await,
+            Ok(5),
+            "a report needs no count before the write"
+        );
+        assert_eq!(
+            count(
+                VolumeBasis::RowsAdded,
+                reported(Some(Err("boom".into())), 5)
+            )
+            .await,
+            Ok(5),
+            "a failed count before leaves the report standing"
+        );
+        let grew_more = count(VolumeBasis::RowsAdded, reported(Some(Ok(90)), 5))
+            .await
+            .expect_err("reported 5, grew 10");
+        assert!(
+            grew_more.contains("reported 5") && grew_more.contains("grew by 10"),
+            "{grew_more}"
+        );
+        assert!(grew_more.contains("disagree"), "{grew_more}");
+        let shrank_reported = count(VolumeBasis::RowsAdded, reported(Some(Ok(120)), 5))
+            .await
+            .expect_err("reported 5, table shrank");
+        assert!(shrank_reported.contains("disagree"), "{shrank_reported}");
+
+        // A merge counts what the warehouse reported, never a total.
+        let merged = |reported| {
+            mat(Some(WriteEvidence {
+                created_or_replaced: false,
+                rows_before: None,
+                rows_reported: reported,
+            }))
+        };
+        assert_eq!(
+            count(VolumeBasis::RowsTouched, merged(Some(7))).await,
+            Ok(7)
+        );
+        let unreported = count(VolumeBasis::RowsTouched, merged(None))
+            .await
+            .expect_err("not reported");
+        assert!(unreported.contains("did not report"), "{unreported}");
+
+        // A build that created the table counts every row in it.
+        let created = || {
+            mat(Some(WriteEvidence {
+                created_or_replaced: true,
+                rows_before: None,
+                rows_reported: Some(3),
+            }))
+        };
+        assert_eq!(count(VolumeBasis::RowsAdded, created()).await, Ok(100));
+        assert_eq!(count(VolumeBasis::RowsTouched, created()).await, Ok(100));
     }
 
     const SPEC_WITH_RANGES: &str = "[product]\nname = \"p\"\nintent = \"x\"\n\n\
@@ -467,6 +1051,217 @@ mod tests {
         super::super::product::check_volume_strategy(root, &parsed).expect("a .rocky full refresh");
     }
 
+    /// A merge-basis range at `error` is refused on an adapter that reports
+    /// no MERGE count, and only then.
+    #[test]
+    fn verify_refuses_an_error_range_on_a_merge_the_adapter_cannot_count() {
+        use super::super::product::check_volume_merge_adapter;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let spec = |volume: &str| {
+            write(
+                "products/vol_product.toml",
+                &format!(
+                    "[product]\nname = \"vol_product\"\nintent = \"x\"\n\n\
+                     [product.source]\ntables = [\"c.s.t\"]\n\n\
+                     [product.output]\nmodel = \"vol\"\ngrain = [\"x\"]\n\
+                     columns = [{{ name = \"x\", type = \"Int32\", nullable = false }}]\n\n\
+                     [product.output.volume]\n{volume}\n\n\
+                     [product.trust]\nagent = \"propose_only\"\n"
+                ),
+            );
+            super::super::product::load_spec(root, "vol_product").expect("spec")
+        };
+        let model = |sidecar: &str| {
+            write("models/vol.sql", "SELECT 1 AS x\n");
+            write(
+                "models/vol.toml",
+                &format!("name = \"vol\"\n{sidecar}\n[target]\ncatalog = \"c\"\nschema = \"s\"\n"),
+            );
+        };
+        const MERGE: &str = "[strategy]\ntype = \"merge\"\nunique_key = [\"x\"]\n";
+        let config = |adapters: &str, pipelines: &str| {
+            write("rocky.toml", &format!("{adapters}\n{pipelines}"));
+            rocky_core::config::parse_rocky_config(&root.join("rocky.toml")).expect("config")
+        };
+        let one_pipeline = |kind: &str| {
+            config(
+                &format!("[adapter.default]\ntype = \"{kind}\"\n"),
+                "[pipeline.tx]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 [pipeline.tx.target]\nadapter = \"default\"\n",
+            )
+        };
+        let error = "min_rows = 1\nseverity = \"error\"";
+
+        // Not drafted: nothing to judge.
+        let parsed = spec(error);
+        assert_eq!(
+            check_volume_merge_adapter(root, &one_pipeline("databricks"), &parsed).unwrap(),
+            None
+        );
+
+        model(MERGE);
+        for kind in ["databricks", "snowflake", "bigquery", "trino", "redshift"] {
+            let reject =
+                check_volume_merge_adapter(root, &one_pipeline(kind), &parsed).expect_err(kind);
+            assert_eq!(reject.code, "volume-merge-count-unavailable", "{kind}");
+            assert!(reject.message.contains(kind), "{}", reject.message);
+        }
+        for kind in ["duckdb", "postgres", "sqlserver", "clickhouse"] {
+            assert_eq!(
+                check_volume_merge_adapter(root, &one_pipeline(kind), &parsed).unwrap(),
+                None,
+                "{kind} reports MERGE counts"
+            );
+        }
+
+        // At `warning` the range only informs: it passes.
+        let warning = spec("min_rows = 1");
+        assert_eq!(
+            check_volume_merge_adapter(root, &one_pipeline("databricks"), &warning).unwrap(),
+            None
+        );
+
+        // An incremental model with a unique_key MERGEs too; without one it
+        // INSERTs, and the table's growth is a fallback count.
+        model(
+            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\nunique_key = [\"x\"]\n",
+        );
+        assert!(check_volume_merge_adapter(root, &one_pipeline("snowflake"), &parsed).is_err());
+        model("[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n");
+        assert_eq!(
+            check_volume_merge_adapter(root, &one_pipeline("snowflake"), &parsed).unwrap(),
+            None
+        );
+        model("[strategy]\ntype = \"full_refresh\"\n");
+        assert_eq!(
+            check_volume_merge_adapter(root, &one_pipeline("snowflake"), &parsed).unwrap(),
+            None
+        );
+
+        // The model's own `adapter` wins over its pipeline's.
+        model(&format!("adapter = \"wh\"\n{MERGE}"));
+        let overridden = config(
+            "[adapter.default]\ntype = \"duckdb\"\n\n[adapter.wh]\ntype = \"databricks\"\n",
+            "[pipeline.tx]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.tx.target]\nadapter = \"default\"\n",
+        );
+        assert!(check_volume_merge_adapter(root, &overridden, &parsed).is_err());
+
+        // The pipeline whose `models` glob matches the file decides.
+        model(MERGE);
+        let two = |first: &str| {
+            config(
+                "[adapter.default]\ntype = \"duckdb\"\n\n[adapter.wh]\ntype = \"databricks\"\n",
+                &format!(
+                    "[pipeline.a]\ntype = \"transformation\"\nmodels = \"{first}\"\n\
+                     [pipeline.a.target]\nadapter = \"wh\"\n\n\
+                     [pipeline.b]\ntype = \"transformation\"\nmodels = \"elsewhere/**\"\n\
+                     [pipeline.b.target]\nadapter = \"default\"\n"
+                ),
+            )
+        };
+        assert!(check_volume_merge_adapter(root, &two("models/**"), &parsed).is_err());
+
+        // No pipeline matches and the pipelines disagree: the adapter cannot
+        // be told, and verify says so instead of guessing.
+        let warning_text = check_volume_merge_adapter(root, &two("nowhere/**"), &parsed)
+            .expect("an unknown adapter is a warning, not a refusal")
+            .expect("a warning");
+        assert!(
+            warning_text.contains("volume-merge-count-unknown-adapter"),
+            "{warning_text}"
+        );
+    }
+
+    /// `rocky product verify` accepts a volume on an incremental, merge or
+    /// time-interval output and still refuses one `rocky run` cannot count.
+    /// Phase B lowers a whole-table test only for a full-refresh output,
+    /// and refuses when it cannot read the strategy.
+    #[test]
+    fn verify_accepts_the_counted_strategies_and_phase_b_lowers_by_basis() {
+        use rocky_core::product::lowering::VolumeLowering;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "products/vol_product.toml",
+            "[product]\nname = \"vol_product\"\nintent = \"x\"\n\n\
+             [product.source]\ntables = [\"c.s.t\"]\n\n\
+             [product.output]\nmodel = \"vol\"\ngrain = [\"x\"]\n\
+             columns = [{ name = \"x\", type = \"Int32\", nullable = false }]\n\n\
+             [product.output.volume]\nmin_rows = 1\n\n\
+             [product.trust]\nagent = \"propose_only\"\n",
+        );
+        let parsed = super::super::product::load_spec(root, "vol_product").expect("spec");
+        let lowering = || super::super::product::phase_b_volume_lowering(root, &parsed);
+
+        let refused = lowering().expect_err("no model to read the strategy from");
+        assert_eq!(refused.code, "volume-strategy-unresolved");
+
+        write("models/vol.sql", "SELECT 1 AS x, CURRENT_DATE AS d\n");
+        let cases = [
+            (
+                "[strategy]\ntype = \"full_refresh\"\n",
+                Some(VolumeLowering::TotalRowsTest),
+            ),
+            (
+                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"d\"\n",
+                Some(VolumeLowering::RunOnly),
+            ),
+            (
+                "[strategy]\ntype = \"merge\"\nunique_key = [\"x\"]\n",
+                Some(VolumeLowering::RunOnly),
+            ),
+            (
+                "[strategy]\ntype = \"time_interval\"\ntime_column = \"d\"\ngranularity = \"day\"\n",
+                Some(VolumeLowering::RunOnly),
+            ),
+            (
+                "[strategy]\ntype = \"delete_insert\"\npartition_by = [\"d\"]\n",
+                None,
+            ),
+            ("[strategy]\ntype = \"view\"\n", None),
+        ];
+        for (strategy, lowers) in cases {
+            write(
+                "models/vol.toml",
+                &format!(
+                    "name = \"vol\"\nintent = \"x\"\n\n{strategy}\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\n"
+                ),
+            );
+            let verified = super::super::product::check_volume_strategy(root, &parsed);
+            match lowers {
+                Some(expected) => {
+                    verified.unwrap_or_else(|e| panic!("{strategy}: {e}"));
+                    assert_eq!(lowering().expect("lowers"), expected, "{strategy}");
+                }
+                None => {
+                    let reject = verified.expect_err(strategy);
+                    assert_eq!(reject.code, "volume-strategy-unsupported", "{strategy}");
+                    assert!(
+                        reject.message.contains("full_refresh, incremental, merge"),
+                        "{reject}"
+                    );
+                }
+            }
+        }
+
+        write("models/vol.toml", "name = [broken\n");
+        let refused = lowering().expect_err("a model that does not load");
+        assert_eq!(refused.code, "volume-strategy-unresolved");
+    }
+
     /// `rocky run` end to end on DuckDB (no credentials): a product output
     /// with a volume range, counted after its production build.
     #[cfg(feature = "duckdb")]
@@ -543,7 +1338,26 @@ mod tests {
             extra_config: &str,
         ) -> Ran {
             let tmp = tempfile::TempDir::new().unwrap();
-            let dir = tmp.path();
+            write_project(tmp.path(), spec_text, models, extra_config);
+            let (result, record, output) =
+                run_in(tmp.path(), shadow, &PartitionRunOptions::default()).await;
+            Ran {
+                result,
+                record,
+                output,
+                _tmp: tmp,
+            }
+        }
+
+        /// Write (or overwrite) the project: the models, the product spec
+        /// and `rocky.toml`. A second call between runs changes the data a
+        /// later run reads, on the same warehouse and state store.
+        fn write_project(
+            dir: &std::path::Path,
+            spec_text: &str,
+            models: &[(&str, &str, &str)],
+            extra_config: &str,
+        ) {
             let models_dir = dir.join("models");
             std::fs::create_dir_all(&models_dir).unwrap();
             for (name, sql, toml) in models {
@@ -552,9 +1366,8 @@ mod tests {
             }
             std::fs::create_dir_all(dir.join("products")).unwrap();
             std::fs::write(dir.join("products/vol_product.toml"), spec_text).unwrap();
-            let config_path = dir.join("rocky.toml");
             std::fs::write(
-                &config_path,
+                dir.join("rocky.toml"),
                 format!(
                     "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
                      [state]\nbackend = \"local\"\n\n\
@@ -565,6 +1378,16 @@ mod tests {
                 ),
             )
             .unwrap();
+        }
+
+        /// `rocky run` on the project in `dir`: the result, the run's
+        /// record and its JSON output.
+        async fn run_in(
+            dir: &std::path::Path,
+            shadow: Option<&rocky_core::shadow::ShadowConfig>,
+            partitions: &PartitionRunOptions,
+        ) -> (anyhow::Result<()>, RunRecord, serde_json::Value) {
+            let config_path = dir.join("rocky.toml");
             let state_path = dir.join("state.redb");
             let run_id = format!("volume-{}", uuid::Uuid::new_v4());
             let loaded = std::sync::Arc::new(
@@ -583,7 +1406,7 @@ mod tests {
                 None,
                 false,
                 shadow,
-                &PartitionRunOptions::default(),
+                partitions,
                 None,
                 None,
                 None,
@@ -607,12 +1430,7 @@ mod tests {
             let state = StateStore::open(&state_path).unwrap();
             let record = state.list_runs(1).unwrap().remove(0);
             drop(state);
-            Ran {
-                result,
-                record,
-                output,
-                _tmp: tmp,
-            }
+            (result, record, output)
         }
 
         fn one_model() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -901,6 +1719,25 @@ mod tests {
             let executions = ran.executions("vol");
             assert_eq!(executions[0].status, "success");
             assert_eq!(executions[0].row_count, None);
+            // Never a failure, but never silent either.
+            let warnings = ran.output["volume_warnings"].as_array().expect("warnings");
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            let line = warnings[0].as_str().unwrap();
+            assert!(line.contains("not evaluated"), "{line}");
+            assert!(line.contains("volume-strategy-unsupported"), "{line}");
+            // The run record keeps the verdict and its reason.
+            let [stored] = ran.record.output_volumes.as_slice() else {
+                panic!("one stored check: {:?}", ran.record.output_volumes);
+            };
+            assert_eq!(stored.verdict, VolumeVerdict::NotEvaluated);
+            assert_eq!(stored.row_count, None);
+            assert!(
+                stored
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("volume-strategy-unsupported")),
+                "{stored:?}"
+            );
         }
 
         /// `rocky product status` reads the latest count back with its
@@ -926,6 +1763,129 @@ mod tests {
             assert_eq!(volume.verdict, VolumeVerdict::AboveMax);
             assert_eq!(volume.severity, VolumeSeverity::Error);
             assert_eq!(volume.run_id.as_deref(), Some(ran.record.run_id.as_str()));
+        }
+
+        fn volume_status_of(
+            root: &std::path::Path,
+        ) -> super::super::super::product::ProductVolumeStatus {
+            super::super::super::product::product_status_in(
+                root,
+                Some(&root.join("state.redb")),
+                "vol_product",
+            )
+            .expect("status")
+            .volume
+            .expect("a volume status")
+        }
+
+        /// An older count never stands in for a newer build that took none:
+        /// `status` reports the newest production build's verdict.
+        #[tokio::test]
+        async fn product_status_reports_the_newest_build_not_an_older_count() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_project(
+                tmp.path(),
+                &spec("min_rows = 1\nmax_rows = 10"),
+                &one_model(),
+                "",
+            );
+            let (first, first_record, _) =
+                run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            first.expect("in range");
+            let counted = volume_status_of(tmp.path());
+            assert_eq!(counted.verdict, VolumeVerdict::InRange);
+            assert_eq!(counted.row_count, Some(3));
+            assert_eq!(
+                counted.basis,
+                Some(rocky_core::product::spec::VolumeBasis::TotalRows)
+            );
+
+            // A newer production build of the output that took no count.
+            let hour = chrono::Duration::hours(1);
+            let mut newer = first_record.clone();
+            newer.run_id = "newer-build".into();
+            newer.started_at += hour;
+            newer.finished_at += hour;
+            for execution in &mut newer.models_executed {
+                execution.started_at += hour;
+                execution.finished_at += hour;
+                execution.row_count = None;
+            }
+            newer.output_volumes = vec![rocky_core::state::OutputVolumeRecord {
+                product: "vol_product".into(),
+                model: "vol".into(),
+                partition: None,
+                basis: Some(rocky_core::product::spec::VolumeBasis::RowsTouched),
+                row_count: None,
+                min_rows: Some(1),
+                max_rows: Some(10),
+                severity: VolumeSeverity::Warning,
+                verdict: VolumeVerdict::NotEvaluated,
+                reason: Some("the adapter did not report".into()),
+            }];
+            StateStore::open(&tmp.path().join("state.redb"))
+                .unwrap()
+                .record_run(&newer)
+                .unwrap();
+            let status = volume_status_of(tmp.path());
+            assert_eq!(status.verdict, VolumeVerdict::NotEvaluated, "{status:?}");
+            assert_eq!(status.row_count, None, "the older count is not shown");
+            assert_eq!(status.run_id.as_deref(), Some("newer-build"));
+            assert_eq!(status.reason.as_deref(), Some("the adapter did not report"));
+        }
+
+        /// A stored count is judged only on the basis it was taken on. Once
+        /// the output model counts on another basis, the stored count says
+        /// nothing about the range.
+        #[tokio::test]
+        async fn product_status_does_not_judge_a_count_on_another_basis() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_project(tmp.path(), &spec("max_rows = 2"), &one_model(), "");
+            let (first, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            first.expect("a warning never fails the run");
+            let counted = volume_status_of(tmp.path());
+            assert_eq!(counted.verdict, VolumeVerdict::AboveMax, "{counted:?}");
+
+            // The model is now a merge: its range counts MERGE rows.
+            std::fs::write(
+                tmp.path().join("models/vol.toml"),
+                "[strategy]\ntype = \"merge\"\nunique_key = [\"x\"]\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\n",
+            )
+            .unwrap();
+            let status = volume_status_of(tmp.path());
+            assert_eq!(status.verdict, VolumeVerdict::NotEvaluated, "{status:?}");
+            assert_eq!(status.row_count, None);
+            assert!(
+                status
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("basis")),
+                "{status:?}"
+            );
+        }
+
+        /// A record written before checks stored a basis holds a total-rows
+        /// count: `status` still reads it, as total rows.
+        #[tokio::test]
+        async fn product_status_reads_a_record_from_before_the_basis_was_stored() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_project(tmp.path(), &spec("max_rows = 2"), &one_model(), "");
+            let (first, mut record, _) =
+                run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            first.expect("a warning never fails the run");
+            record.output_volumes.clear();
+            StateStore::open(&tmp.path().join("state.redb"))
+                .unwrap()
+                .record_run(&record)
+                .unwrap();
+            let status = volume_status_of(tmp.path());
+            assert_eq!(status.row_count, Some(3), "{status:?}");
+            assert_eq!(
+                status.basis,
+                Some(rocky_core::product::spec::VolumeBasis::TotalRows)
+            );
+            assert_eq!(status.verdict, VolumeVerdict::AboveMax);
         }
 
         /// The intra-layer concurrent path (`--parallel`) applies the same
@@ -1224,6 +2184,602 @@ mod tests {
                     fired.model_error
                 );
             }
+        }
+
+        // ----- incremental, merge and time-interval outputs (T-6) -----
+
+        /// `src`: `n` rows with strictly increasing timestamps, so an
+        /// incremental run past the target's `MAX(ts)` loads exactly the new
+        /// ones.
+        fn src_rows(n: u32) -> String {
+            format!(
+                "SELECT range AS x, TIMESTAMP '2024-01-01 00:00:00' + to_minutes(range) AS ts \
+                 FROM range({n})\n"
+            )
+        }
+
+        const SRC_TOML: &str =
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n";
+        const INCREMENTAL_TOML: &str = "depends_on = [\"src\"]\n\n\
+             [strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\n";
+        const INCREMENTAL_SQL: &str = "SELECT x, ts FROM main.src WHERE @incremental_filter\n";
+        const DOWN_TOML: &str = "depends_on = [\"vol\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\n";
+
+        fn incremental_models(src: &str) -> Vec<(&'static str, String, &'static str)> {
+            vec![
+                ("src", src.to_string(), SRC_TOML),
+                ("vol", INCREMENTAL_SQL.to_string(), INCREMENTAL_TOML),
+                ("down", "SELECT x FROM main.vol\n".to_string(), DOWN_TOML),
+            ]
+        }
+
+        fn borrowed<'a>(
+            models: &'a [(&'static str, String, &'static str)],
+        ) -> Vec<(&'a str, &'a str, &'a str)> {
+            models
+                .iter()
+                .map(|(name, sql, toml)| (*name, sql.as_str(), *toml))
+                .collect()
+        }
+
+        /// Ran twice on one project: the first run with `first` rows and an
+        /// always-in-range spec, the second with `second` rows and `volume`.
+        async fn two_runs(
+            models: impl Fn(u32) -> Vec<(&'static str, String, &'static str)>,
+            first: u32,
+            second: u32,
+            volume: &str,
+            partitions: [&PartitionRunOptions; 2],
+        ) -> (Ran, serde_json::Value) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_project(
+                tmp.path(),
+                &spec("min_rows = 0"),
+                &borrowed(&models(first)),
+                "",
+            );
+            let (first_result, _, first_output) = run_in(tmp.path(), None, partitions[0]).await;
+            first_result.expect("the first run succeeds");
+            write_project(tmp.path(), &spec(volume), &borrowed(&models(second)), "");
+            let (result, record, output) = run_in(tmp.path(), None, partitions[1]).await;
+            (
+                Ran {
+                    result,
+                    record,
+                    output,
+                    _tmp: tmp,
+                },
+                first_output,
+            )
+        }
+
+        fn table_total(ran: &Ran, table: &str) -> u64 {
+            let db = rocky_duckdb::DuckDbConnector::open(&ran._tmp.path().join("w.duckdb"))
+                .expect("open the warehouse");
+            let rows = db
+                .execute_sql(&format!("SELECT COUNT(*) FROM main.{table}"))
+                .expect("count")
+                .rows;
+            rocky_core::checks::cell_as_u64(rows[0].first()).expect("a count")
+        }
+
+        /// The key case: the table holds 100 rows, of which this run added
+        /// 5. The range judges 5, not 100. The first run created the table,
+        /// so all its 95 rows were that run's.
+        #[tokio::test]
+        async fn an_incremental_output_judges_only_the_rows_this_run_added() {
+            let (ran, first) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                "min_rows = 1\nmax_rows = 10",
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            let first_volume = first["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .map(|m| m["volume"].clone())
+                .unwrap();
+            assert_eq!(first_volume["basis"], "rows_added", "{first_volume}");
+            assert_eq!(
+                first_volume["row_count"], 95,
+                "the first run created the table"
+            );
+
+            ran.result.as_ref().expect("in range");
+            assert_eq!(
+                table_total(&ran, "vol"),
+                100,
+                "the table total is not judged"
+            );
+            let volume = ran.volume("vol");
+            assert_eq!(volume["basis"], "rows_added", "{volume}");
+            assert_eq!(volume["row_count"], 5, "{volume}");
+            assert_eq!(volume["verdict"], "in_range", "{volume}");
+            let executions = ran.executions("vol");
+            assert_eq!(executions[0].status, "success");
+            assert_eq!(executions[0].row_count, Some(5));
+            assert!(executions[0].due_at.is_some(), "a delivery is stamped");
+        }
+
+        #[tokio::test]
+        async fn an_incremental_output_below_min_warns_on_the_added_rows() {
+            let (ran, _) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                "min_rows = 6",
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            ran.result.as_ref().expect("a warning never fails the run");
+            assert_eq!(ran.volume("vol")["verdict"], "below_min");
+            let warnings = ran.output["volume_warnings"].as_array().expect("warnings");
+            let line = warnings[0].as_str().unwrap();
+            assert!(
+                line.contains("this run added 5 row(s), below min_rows = 6"),
+                "{line}"
+            );
+        }
+
+        /// Above max at `error`: the model is failed after its write, the
+        /// downstream model is withheld, the run is partial and no delivery
+        /// is stamped.
+        #[tokio::test]
+        async fn an_incremental_output_above_max_at_error_fails_the_model() {
+            let (ran, _) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                "max_rows = 4\nseverity = \"error\"",
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            assert!(ran.result.is_err(), "an error breach fails the run");
+            assert_eq!(ran.record.status, RunStatus::PartialFailure);
+            let executions = ran.executions("vol");
+            assert_eq!(executions.len(), 1, "{executions:?}");
+            assert_eq!(executions[0].status, "failed");
+            assert_eq!(executions[0].row_count, Some(5));
+            assert_eq!(executions[0].due_at, None);
+            assert_eq!(table_total(&ran, "vol"), 100, "the rows are written");
+            let volume = ran.volume("vol");
+            assert_eq!(volume["verdict"], "above_max", "{volume}");
+            assert!(
+                ran.executions("down").iter().all(|e| e.status != "success"),
+                "the downstream model is withheld: {:?}",
+                ran.record.models_executed
+            );
+        }
+
+        /// `src` for a merge: keys `from..to` with a value that changes on
+        /// every run (`v = x * 10 + run`).
+        fn keyed_src(from: u32, to: u32, run: u32) -> String {
+            format!("SELECT range AS x, range * 10 + {run} AS v FROM range({from}, {to})\n")
+        }
+
+        fn merge_models(src: String) -> Vec<(&'static str, String, &'static str)> {
+            vec![
+                ("src", src, SRC_TOML),
+                (
+                    "vol",
+                    "SELECT x, v FROM main.src\n".to_string(),
+                    "depends_on = [\"src\"]\n\n\
+                     [strategy]\ntype = \"merge\"\nunique_key = [\"x\"]\nupdate_columns = [\"v\"]\n\n\
+                     [target]\ncatalog = \"\"\nschema = \"main\"\n",
+                ),
+            ]
+        }
+
+        /// A merge counts what its MERGE touched: the second run updates
+        /// keys 2 and 3 and inserts 4 and 5, so 4, though the table grows
+        /// by only 2 and holds 6.
+        #[tokio::test]
+        async fn a_merge_output_judges_the_rows_its_merge_touched() {
+            let (ran, first) = two_runs(
+                |run| {
+                    if run == 1 {
+                        merge_models(keyed_src(0, 4, 1))
+                    } else {
+                        merge_models(keyed_src(2, 6, 2))
+                    }
+                },
+                1,
+                2,
+                "min_rows = 3\nmax_rows = 4\nseverity = \"error\"",
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            let first_volume = first["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .map(|m| m["volume"].clone())
+                .unwrap();
+            assert_eq!(first_volume["basis"], "rows_touched", "{first_volume}");
+            assert_eq!(
+                first_volume["row_count"], 4,
+                "the first run created the table"
+            );
+
+            ran.result.as_ref().expect("4 touched is in range");
+            assert_eq!(table_total(&ran, "vol"), 6);
+            let volume = ran.volume("vol");
+            assert_eq!(volume["basis"], "rows_touched", "{volume}");
+            assert_eq!(volume["row_count"], 4, "{volume}");
+            assert_eq!(volume["verdict"], "in_range");
+        }
+
+        #[tokio::test]
+        async fn a_merge_output_out_of_range_names_the_touched_rows() {
+            for (volume, verdict, words) in [
+                (
+                    "min_rows = 5",
+                    "below_min",
+                    "MERGE inserted or updated 4 row(s), below min_rows = 5",
+                ),
+                (
+                    "max_rows = 3",
+                    "above_max",
+                    "MERGE inserted or updated 4 row(s), above max_rows = 3",
+                ),
+            ] {
+                let (ran, _) = two_runs(
+                    |run| {
+                        if run == 1 {
+                            merge_models(keyed_src(0, 4, 1))
+                        } else {
+                            merge_models(keyed_src(2, 6, 2))
+                        }
+                    },
+                    1,
+                    2,
+                    volume,
+                    [&PartitionRunOptions::default(); 2],
+                )
+                .await;
+                ran.result.as_ref().expect("a warning never fails the run");
+                assert_eq!(ran.volume("vol")["verdict"], verdict, "{volume}");
+                let warnings = ran.output["volume_warnings"].as_array().expect("warnings");
+                assert!(
+                    warnings[0].as_str().unwrap().contains(words),
+                    "{volume}: {warnings:?}"
+                );
+            }
+        }
+
+        /// Rows on three days: 2, 3 and 4.
+        const DAYS_SRC: &str = "SELECT CAST(d AS DATE) AS d, x FROM (VALUES \
+             ('2024-01-01', 1), ('2024-01-01', 2), \
+             ('2024-01-02', 3), ('2024-01-02', 4), ('2024-01-02', 5), \
+             ('2024-01-03', 6), ('2024-01-03', 7), ('2024-01-03', 8), ('2024-01-03', 9)) \
+             AS t(d, x)\n";
+
+        fn partitioned_models(_: u32) -> Vec<(&'static str, String, &'static str)> {
+            vec![
+                ("src", DAYS_SRC.to_string(), SRC_TOML),
+                (
+                    "vol",
+                    "SELECT d, x FROM main.src WHERE d >= @start_date AND d < @end_date\n"
+                        .to_string(),
+                    "depends_on = [\"src\"]\n\n\
+                     [strategy]\ntype = \"time_interval\"\ntime_column = \"d\"\n\
+                     granularity = \"day\"\nfirst_partition = \"2024-01-01\"\n\n\
+                     [target]\ncatalog = \"\"\nschema = \"main\"\n",
+                ),
+                ("down", "SELECT x FROM main.vol\n".to_string(), DOWN_TOML),
+            ]
+        }
+
+        /// `partitioned_models`, except that the SQL fails for the rows of
+        /// 2024-01-03, so that partition fails to run.
+        fn failing_partition_models() -> Vec<(&'static str, String, &'static str)> {
+            let mut models = partitioned_models(0);
+            models[1].1 = "SELECT d, CASE WHEN d = DATE '2024-01-03' \
+                 THEN CAST(CAST(x AS VARCHAR) || 'z' AS INTEGER) ELSE x END AS x \
+                 FROM main.src WHERE d >= @start_date AND d < @end_date\n"
+                .to_string();
+            models
+        }
+
+        fn days(from: &str, to: &str) -> PartitionRunOptions {
+            PartitionRunOptions {
+                from: Some(from.into()),
+                to: Some(to.into()),
+                parallel: 1,
+                ..Default::default()
+            }
+        }
+
+        /// The first run writes 2024-01-03 (4 rows); the second writes
+        /// 2024-01-01 and 2024-01-02 (2 + 3 rows). The second judges 5, not
+        /// the table's 9.
+        async fn two_partition_runs(volume: &str) -> Ran {
+            let (ran, first) = two_runs(
+                partitioned_models,
+                1,
+                2,
+                volume,
+                [
+                    &days("2024-01-03", "2024-01-03"),
+                    &days("2024-01-01", "2024-01-02"),
+                ],
+            )
+            .await;
+            let first_volume = &first["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rfind(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .unwrap()["volume"];
+            assert_eq!(first_volume["row_count"], 4, "{first_volume}");
+            ran
+        }
+
+        fn partition_volumes(ran: &Ran) -> Vec<serde_json::Value> {
+            ran.output["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .map(|m| m["volume"].clone())
+                .collect()
+        }
+
+        /// The one error entry the run output holds for the model.
+        fn model_error(ran: &Ran) -> String {
+            let errors = ran.output["errors"].as_array().expect("errors");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            errors[0]["error"]
+                .as_str()
+                .expect("an error text")
+                .to_string()
+        }
+
+        fn executions_by_partition(ran: &Ran) -> Vec<(&ModelExecution, serde_json::Value)> {
+            // Executions and materializations are in the same order.
+            let executions = ran.executions("vol");
+            let volumes = partition_volumes(ran);
+            assert_eq!(executions.len(), volumes.len());
+            executions.into_iter().zip(volumes).collect()
+        }
+
+        /// Each partition is counted and judged on its own. The partitions
+        /// hold 2 and 3 rows: both are in range 2..=3, though their sum (5)
+        /// is not. Each carries its own check, and both deliver.
+        #[tokio::test]
+        async fn a_time_interval_output_judges_each_partition_on_its_own() {
+            let ran = two_partition_runs("min_rows = 2\nmax_rows = 3\nseverity = \"error\"").await;
+            ran.result
+                .as_ref()
+                .expect("2 and 3 rows are each in range, though 5 is not");
+            assert_eq!(table_total(&ran, "vol"), 9);
+            let volumes = partition_volumes(&ran);
+            assert_eq!(volumes.len(), 2, "two partitions written: {volumes:?}");
+            let counts: Vec<_> = volumes.iter().map(|v| v["row_count"].clone()).collect();
+            assert_eq!(counts, [2, 3], "{volumes:?}");
+            for volume in &volumes {
+                assert_eq!(volume["basis"], "partition_rows", "{volume}");
+                assert_eq!(volume["verdict"], "in_range", "{volume}");
+            }
+            let executions = ran.executions("vol");
+            assert_eq!(executions.len(), 2, "{executions:?}");
+            assert!(executions.iter().all(|e| e.status == "success"));
+            assert!(executions.iter().all(|e| e.due_at.is_some()));
+            assert_eq!(
+                executions.iter().map(|e| e.row_count).collect::<Vec<_>>(),
+                [Some(2), Some(3)],
+                "each execution records its own partition's count"
+            );
+            assert_eq!(
+                ran.record
+                    .output_volumes
+                    .iter()
+                    .map(|v| (v.partition.clone(), v.row_count))
+                    .collect::<Vec<_>>(),
+                [
+                    (Some("2024-01-01".to_string()), Some(2)),
+                    (Some("2024-01-02".to_string()), Some(3))
+                ]
+            );
+            // `rocky product status` judges the newest build: in range.
+            let root = ran._tmp.path();
+            let status = super::super::super::product::product_status_in(
+                root,
+                Some(&root.join("state.redb")),
+                "vol_product",
+            )
+            .expect("status");
+            let volume = status.volume.expect("volume");
+            assert_eq!(volume.verdict, VolumeVerdict::InRange);
+            assert_eq!(
+                volume.basis,
+                Some(rocky_core::product::spec::VolumeBasis::PartitionRows)
+            );
+        }
+
+        /// One partition (2 rows) is below min 3; the other (3 rows) is not.
+        /// The sum (5) would pass. One warning, naming the partition.
+        #[tokio::test]
+        async fn a_time_interval_output_below_min_warns_for_that_partition_only() {
+            let ran = two_partition_runs("min_rows = 3").await;
+            ran.result.as_ref().expect("a warning never fails the run");
+            let warnings = ran.output["volume_warnings"].as_array().expect("warnings");
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            let line = warnings[0].as_str().unwrap();
+            assert!(line.contains("partition '2024-01-01'"), "{line}");
+            assert!(
+                line.contains("the partition this run wrote holds 2 row(s), below min_rows = 3"),
+                "{line}"
+            );
+            let verdicts: Vec<_> = partition_volumes(&ran)
+                .iter()
+                .map(|v| v["verdict"].clone())
+                .collect();
+            assert_eq!(verdicts, ["below_min", "in_range"]);
+        }
+
+        /// Above max at `error` for one partition (3 rows over max 2): the
+        /// model fails, the run is partial, downstream is withheld. Only the
+        /// breaching partition is marked failed; the other stays a success
+        /// as a record, but the model delivered nothing, so neither carries
+        /// a `due_at`. The breaching partition is `Failed` in the partition
+        /// state, so `--missing` rewrites it; the others stay `Computed`.
+        #[tokio::test]
+        async fn a_time_interval_output_above_max_at_error_fails_only_the_breaching_partition() {
+            let ran = two_partition_runs("max_rows = 2\nseverity = \"error\"").await;
+            assert!(ran.result.is_err(), "an error breach fails the run");
+            assert_eq!(ran.record.status, RunStatus::PartialFailure);
+            let err = model_error(&ran);
+            assert!(err.contains("partition '2024-01-02'"), "{err}");
+            assert!(!err.contains("partition '2024-01-01'"), "{err}");
+            let by_partition = executions_by_partition(&ran);
+            assert_eq!(
+                by_partition.len(),
+                2,
+                "no extra failed record: {by_partition:?}"
+            );
+            let statuses: Vec<_> = by_partition
+                .iter()
+                .map(|(e, _)| e.status.as_str())
+                .collect();
+            assert_eq!(statuses, ["success", "failed"], "{by_partition:?}");
+            assert_eq!(by_partition[0].1["verdict"], "in_range");
+            assert_eq!(by_partition[1].1["verdict"], "above_max");
+            assert!(by_partition[1].0.due_at.is_none());
+            assert!(
+                by_partition[0].0.due_at.is_none(),
+                "a passing partition of a failed model is not a delivery"
+            );
+            assert!(
+                ran.executions("down").iter().all(|e| e.status != "success"),
+                "the downstream model is withheld: {:?}",
+                ran.record.models_executed
+            );
+            let state = StateStore::open(&ran._tmp.path().join("state.redb")).unwrap();
+            let partitions = state.list_partitions("vol").unwrap();
+            assert_eq!(partitions.len(), 3, "{partitions:?}");
+            let failed: Vec<_> = state
+                .list_failed_partitions("vol")
+                .unwrap()
+                .into_iter()
+                .map(|p| p.partition_key)
+                .collect();
+            assert_eq!(failed, ["2024-01-02"], "only the breaching partition");
+        }
+
+        /// A breach leaves its partition `Failed`, so a later run that names
+        /// it writes it again and judges it again: still out of range stays
+        /// failed, and in range is `Computed` once more.
+        #[tokio::test]
+        async fn a_breaching_partition_is_rewritten_and_judged_again() {
+            let ran = two_partition_runs("max_rows = 2\nseverity = \"error\"").await;
+            assert!(ran.result.is_err());
+            let root = ran._tmp.path();
+            let state = StateStore::open(&root.join("state.redb")).unwrap();
+            let failed = |state: &StateStore| -> Vec<String> {
+                state
+                    .list_failed_partitions("vol")
+                    .unwrap()
+                    .into_iter()
+                    .map(|p| p.partition_key)
+                    .collect()
+            };
+            assert_eq!(failed(&state), ["2024-01-02"]);
+            drop(state);
+
+            let one = PartitionRunOptions {
+                partition: Some("2024-01-02".into()),
+                parallel: 1,
+                ..Default::default()
+            };
+            // Still above max: judged again, still failed.
+            let (result, record, output) = run_in(root, None, &one).await;
+            assert!(result.is_err(), "the rewrite breaches again");
+            let rejudged: Vec<_> = output["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .map(|m| m["volume"]["verdict"].clone())
+                .collect();
+            assert_eq!(rejudged, ["above_max"]);
+            assert_eq!(record.status, RunStatus::PartialFailure);
+            let state = StateStore::open(&root.join("state.redb")).unwrap();
+            assert_eq!(failed(&state), ["2024-01-02"]);
+            drop(state);
+
+            // The range now admits it: the rewrite passes and heals it.
+            write_project(
+                root,
+                &spec("max_rows = 3\nseverity = \"error\""),
+                &borrowed(&partitioned_models(0)),
+                "",
+            );
+            let (result, _, _) = run_in(root, None, &one).await;
+            result.expect("3 rows are in range now");
+            let state = StateStore::open(&root.join("state.redb")).unwrap();
+            assert!(failed(&state).is_empty());
+        }
+
+        /// A partition that fails to run does not stop the partitions that
+        /// did write from being judged: the breaching one is recorded and
+        /// marked failed. Here 2024-01-01 (2 rows) is in range and
+        /// 2024-01-02 (3 rows) breaches max 2, while 2024-01-03 fails to
+        /// run.
+        #[tokio::test]
+        async fn written_partitions_are_judged_when_another_partition_fails() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_project(
+                tmp.path(),
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &borrowed(&failing_partition_models()),
+                "",
+            );
+            let (result, record, output) =
+                run_in(tmp.path(), None, &days("2024-01-01", "2024-01-03")).await;
+            assert!(result.is_err());
+            let verdicts: Vec<_> = output["materializations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&"vol".into()))
+                .map(|m| m["volume"]["verdict"].clone())
+                .collect();
+            assert!(
+                verdicts.contains(&serde_json::json!("in_range")),
+                "the partitions written before the failure are judged: {verdicts:?}"
+            );
+            assert!(
+                record.output_volumes.iter().any(|v| v.partition.is_some()),
+                "{:?}",
+                record.output_volumes
+            );
+        }
+
+        /// Every partition over max at `error` fails: all are marked failed
+        /// and the one error names both.
+        #[tokio::test]
+        async fn a_time_interval_output_marks_every_breaching_partition_failed() {
+            let ran = two_partition_runs("max_rows = 1\nseverity = \"error\"").await;
+            let err = model_error(&ran);
+            assert!(err.contains("2 partitions"), "{err}");
+            assert!(
+                err.contains("2024-01-01") && err.contains("2024-01-02"),
+                "{err}"
+            );
+            let executions = ran.executions("vol");
+            assert_eq!(executions.len(), 2, "{executions:?}");
+            assert!(
+                executions.iter().all(|e| e.status == "failed"),
+                "{executions:?}"
+            );
         }
     }
 }

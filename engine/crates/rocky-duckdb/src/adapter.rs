@@ -394,6 +394,31 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         .map_err(|e| join_error(&e))?
     }
 
+    /// Reports `rows_affected` for one `INSERT`, `UPDATE`, `DELETE` or
+    /// `MERGE` statement (DuckDB's changed-row count); `None` for anything
+    /// else. See [`DuckDbConnector::execute_statement_counting_rows`].
+    async fn execute_statement_with_stats(
+        &self,
+        sql: &str,
+    ) -> AdapterResult<rocky_core::traits::ExecutionStats> {
+        let conn = Arc::clone(&self.connector);
+        let sql = sql.to_string();
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let rows_affected = conn
+                .execute_statement_counting_rows(&sql)
+                .map_err(AdapterError::new)?;
+            Ok(rocky_core::traits::ExecutionStats {
+                rows_affected,
+                ..rocky_core::traits::ExecutionStats::default()
+            })
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
     fn measures_upstream_reads(&self) -> bool {
         true
     }
@@ -414,10 +439,16 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             let conn = conn
                 .lock()
                 .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-            let reads = conn
-                .execute_statement_with_upstream_reads(&sql)
+            let (rows_affected, reads) = conn
+                .execute_statement_measured(&sql)
                 .map_err(AdapterError::new)?;
-            Ok((rocky_core::traits::ExecutionStats::default(), reads))
+            Ok((
+                rocky_core::traits::ExecutionStats {
+                    rows_affected,
+                    ..rocky_core::traits::ExecutionStats::default()
+                },
+                reads,
+            ))
         })
         .await
         .map_err(|e| join_error(&e))?

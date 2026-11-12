@@ -69,6 +69,42 @@ pub struct Artifact {
     pub content: Vec<u8>,
 }
 
+/// How Phase B lowers `[product.output.volume]`, chosen by what `rocky run`
+/// counts for the output model's strategy
+/// ([`crate::product::spec::VolumeBasis`]).
+///
+/// The spec does not name the strategy, and the sidecar often leaves it to
+/// `_defaults.toml`, so the caller resolves it the way the compiler does
+/// and passes the answer in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeLowering {
+    /// A full-refresh output: the range is the table's total rows, so it
+    /// also lowers to a whole-table `row_count_range` test that
+    /// `rocky test` runs.
+    TotalRowsTest,
+    /// Any other output (incremental, merge, time-interval): the range
+    /// judges the rows one run adds, touches or rewrites. A whole-table
+    /// test would judge the total instead, so no test is written and only
+    /// `rocky run` judges the range.
+    RunOnly,
+}
+
+impl VolumeLowering {
+    /// The lowering for an output whose volume `rocky run` counts on
+    /// `basis`. `None` (a strategy `rocky run` does not count) writes no
+    /// test either: a total-row test would judge something else.
+    pub fn for_basis(basis: Option<crate::product::spec::VolumeBasis>) -> Self {
+        use crate::product::spec::VolumeBasis;
+        match basis {
+            Some(VolumeBasis::TotalRows) => Self::TotalRowsTest,
+            Some(
+                VolumeBasis::RowsAdded | VolumeBasis::RowsTouched | VolumeBasis::PartitionRows,
+            )
+            | None => Self::RunOnly,
+        }
+    }
+}
+
 /// A lowering run's output: the artifacts plus the total manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lowering {
@@ -173,14 +209,19 @@ pub fn render_contract(parsed: &ParsedSpec) -> Vec<u8> {
 ///   data.
 /// - Every declared check becomes an `expression` test at error
 ///   severity.
-/// - A declared `volume` becomes one `row_count_range` test with the
-///   same bounds and severity.
+/// - A declared `volume` on a full-refresh output
+///   ([`VolumeLowering::TotalRowsTest`]) becomes one `row_count_range`
+///   test with the same bounds and severity. On any other output it
+///   becomes no test: the range is not about the table's total.
 ///
 /// # Errors
 ///
 /// Returns `volume-unrepresentable` when a volume bound does not fit a
 /// TOML integer (unreachable from a parsed spec).
-pub fn generated_tests(parsed: &ParsedSpec) -> SpecResult<Vec<TomlTable>> {
+pub fn generated_tests(
+    parsed: &ParsedSpec,
+    volume_lowering: VolumeLowering,
+) -> SpecResult<Vec<TomlTable>> {
     let product = parsed.product();
     let mut tests: Vec<TomlTable> = Vec::new();
 
@@ -218,7 +259,10 @@ pub fn generated_tests(parsed: &ParsedSpec) -> SpecResult<Vec<TomlTable>> {
     }
 
     if let Some(volume) = &product.output.volume {
-        tests.push(volume_test(volume)?);
+        match volume_lowering {
+            VolumeLowering::TotalRowsTest => tests.push(volume_test(volume)?),
+            VolumeLowering::RunOnly => {}
+        }
     }
     Ok(tests)
 }
@@ -310,9 +354,11 @@ fn is_unscoped_row_count_range(test: &TomlTable) -> bool {
 /// [`GENERATED_BY_KEY`] names the volume field is spec-owned and is
 /// rebuilt from the spec, so it
 /// is dropped when its field is gone; and when the spec declares a
-/// `volume`, a worker `row_count_range` over the whole table (no
-/// `filter`) is dropped, so the spec's range is the model's only
-/// whole-table one. A filtered worker range survives.
+/// `volume` that lowers to a test ([`VolumeLowering::TotalRowsTest`]), a
+/// worker `row_count_range` over the whole table (no `filter`) is
+/// dropped, so the spec's range is the model's only whole-table one. A
+/// filtered worker range survives, and so does every worker range when the
+/// volume lowers to no test ([`VolumeLowering::RunOnly`]).
 ///
 /// The output order is fixed, so merging twice is byte-identical: the
 /// header comment, `name`, `intent`, the remaining preserved scalars in
@@ -329,6 +375,7 @@ pub fn merge_sidecar_text(
     parsed: &ParsedSpec,
     sidecar_text: &str,
     source_name: &str,
+    volume_lowering: VolumeLowering,
 ) -> SpecResult<String> {
     let document = parse_ordered(sidecar_text).map_err(|err| {
         SpecRejected::new(
@@ -466,14 +513,19 @@ pub fn merge_sidecar_text(
         merged.insert("freshness".to_string(), TomlValue::Table(block));
     }
 
-    let owned_tests = generated_tests(parsed)?;
+    let owned_tests = generated_tests(parsed, volume_lowering)?;
     let mut tests: Vec<TomlValue> = owned_tests.iter().cloned().map(TomlValue::Table).collect();
-    // A declared volume owns the model's whole-table row-count range: a
-    // worker `row_count_range` with no `filter` is replaced, not kept
-    // beside it. A filtered range counts a subset, which the volume does
-    // not, so it survives. Without a volume, a worker range survives like
-    // any other worker test.
-    let spec_owns_row_count = product.output.volume.is_some();
+    // A declared volume that lowers to a test owns the model's whole-table
+    // row-count range: a worker `row_count_range` with no `filter` is
+    // replaced, not kept beside it. A filtered range counts a subset, which
+    // the volume does not, so it survives. Without a volume, or with one
+    // only `rocky run` judges (it counts one load, not the table), a worker
+    // range survives like any other worker test.
+    let spec_owns_row_count = product.output.volume.is_some()
+        && match volume_lowering {
+            VolumeLowering::TotalRowsTest => true,
+            VolumeLowering::RunOnly => false,
+        };
     if let Some(existing) = document.get("tests").and_then(TomlValue::as_array) {
         for test in existing {
             // A worker test identical to a generated one is absorbed, not
@@ -510,7 +562,8 @@ pub fn merge_sidecar_text(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     A,
-    B,
+    /// Phase B, with how this generation lowers `[product.output.volume]`.
+    B(VolumeLowering),
 }
 
 /// Every spec field's disposition.
@@ -719,19 +772,27 @@ fn field_rows(parsed: &ParsedSpec, phase: Phase) -> BTreeMap<String, FieldRow> {
         ),
     );
     if product.output.volume.is_some() {
-        rows.insert(
-            "product.output.volume".to_string(),
-            row(
+        let volume_row = match phase {
+            // Phase A cannot know the output's strategy yet; the row stays
+            // pending on the test Phase B writes for a full-refresh output.
+            Phase::A | Phase::B(VolumeLowering::TotalRowsTest) => row(
                 Vec::new(),
                 vec![Location::new(
                     &sidecar,
                     "[[tests]] type=row_count_range {min, max, severity}",
                     LocationPhase::B,
                 )],
-                "replaces any worker row_count_range; `rocky run` also counts the rows after a \
-                 production build of a full-refresh output and applies the same severity",
+                "replaces any worker row_count_range on a full-refresh output; `rocky run` \
+                 also counts the rows after each production build and applies the same \
+                 severity",
             ),
-        );
+            Phase::B(VolumeLowering::RunOnly) => FieldRow::new(Disposition::Verified).with_note(
+                "no artifact: the output is not a full-refresh table, so the range judges the \
+                 rows one run adds, touches or rewrites, not the table's total; `rocky run` \
+                 counts them after each production build and applies the severity",
+            ),
+        };
+        rows.insert("product.output.volume".to_string(), volume_row);
     }
     rows.insert(
         "product.trust.agent".to_string(),
@@ -784,7 +845,7 @@ fn build_manifest(
         output_model: parsed.output_model().to_string(),
         phase: match phase {
             Phase::A => ManifestPhase::LoweredContract,
-            Phase::B => ManifestPhase::Merged,
+            Phase::B(_) => ManifestPhase::Merged,
         },
         fields: field_rows(parsed, phase),
         artifacts: artifact_hashes,
@@ -836,6 +897,10 @@ pub fn lower_phase_a(parsed: &ParsedSpec, spec_path: &str) -> SpecResult<Lowerin
 /// this run never wrote and never verified were on disk, detaching the
 /// verification target from reality the moment the two could differ.
 ///
+/// `volume_lowering` says whether `[product.output.volume]` lowers to a
+/// whole-table test; the caller resolves it from the output model's
+/// strategy ([`VolumeLowering`]).
+///
 /// # Errors
 ///
 /// Returns `phase-a-identity-mismatch` for a foreign generation,
@@ -847,6 +912,7 @@ pub fn lower_phase_b(
     spec_path: &str,
     sidecar_text: &str,
     phase_a_manifest: &Manifest,
+    volume_lowering: VolumeLowering,
 ) -> SpecResult<Lowering> {
     let output_model = parsed.output_model().to_string();
     let product_id = parsed.product_id();
@@ -901,10 +967,11 @@ pub fn lower_phase_b(
     }
 
     let sidecar_relpath = sidecar_rel(parsed);
-    let merged = merge_sidecar_text(parsed, sidecar_text, &sidecar_relpath)?.into_bytes();
+    let merged =
+        merge_sidecar_text(parsed, sidecar_text, &sidecar_relpath, volume_lowering)?.into_bytes();
     let mut hashes = phase_a_manifest.artifacts.clone();
     hashes.insert(sidecar_relpath.clone(), content_digest(&merged));
-    let manifest = build_manifest(parsed, spec_path, Phase::B, hashes)?;
+    let manifest = build_manifest(parsed, spec_path, Phase::B(volume_lowering), hashes)?;
     Ok(Lowering {
         artifacts: vec![Artifact {
             relpath: sidecar_relpath,
@@ -918,6 +985,41 @@ pub fn lower_phase_b(
 mod tests {
     use super::*;
     use crate::product::spec::parse_spec_bytes;
+
+    // The tests below predate `VolumeLowering` and pin the full-refresh
+    // lowering. These shadow the glob-imported functions with that choice;
+    // the tests of the other choice call `super::` explicitly.
+    fn generated_tests(parsed: &ParsedSpec) -> SpecResult<Vec<TomlTable>> {
+        super::generated_tests(parsed, VolumeLowering::TotalRowsTest)
+    }
+
+    fn merge_sidecar_text(
+        parsed: &ParsedSpec,
+        sidecar_text: &str,
+        source_name: &str,
+    ) -> SpecResult<String> {
+        super::merge_sidecar_text(
+            parsed,
+            sidecar_text,
+            source_name,
+            VolumeLowering::TotalRowsTest,
+        )
+    }
+
+    fn lower_phase_b(
+        parsed: &ParsedSpec,
+        spec_path: &str,
+        sidecar_text: &str,
+        phase_a_manifest: &Manifest,
+    ) -> SpecResult<Lowering> {
+        super::lower_phase_b(
+            parsed,
+            spec_path,
+            sidecar_text,
+            phase_a_manifest,
+            VolumeLowering::TotalRowsTest,
+        )
+    }
 
     const SPEC_PATH: &str = "products/revenue_daily.toml";
 
@@ -2111,5 +2213,105 @@ agent = "propose_only"
             .expect("phase A")
             .manifest;
         assert!(!plain.fields.contains_key("product.output.volume"));
+    }
+
+    fn merged_run_only(parsed: &ParsedSpec, sidecar_text: &str) -> String {
+        super::merge_sidecar_text(
+            parsed,
+            sidecar_text,
+            "models/revenue_daily.toml",
+            VolumeLowering::RunOnly,
+        )
+        .expect("merges")
+    }
+
+    /// On an output that is not a full-refresh table, the range judges one
+    /// run's rows. A whole-table `row_count_range` would judge the total
+    /// instead, so the volume lowers to no test, and a worker's own range
+    /// is not the spec's to replace.
+    #[test]
+    fn a_run_only_volume_writes_no_row_count_range_and_keeps_the_worker_s() {
+        let parsed = parsed_with_volume("min_rows = 5\nmax_rows = 50\nseverity = \"error\"");
+        let tests = super::generated_tests(&parsed, VolumeLowering::RunOnly).expect("lowers");
+        assert!(!tests.iter().any(is_row_count_range), "{tests:?}");
+        // The other generated tests are unchanged.
+        assert_eq!(
+            tests,
+            generated_tests(&parsed)
+                .expect("lowers")
+                .into_iter()
+                .filter(|t| !is_row_count_range(t))
+                .collect::<Vec<_>>()
+        );
+
+        let document = parse_ordered(&merged_run_only(&parsed, &drafted_sidecar_text()))
+            .expect("the merge output is TOML");
+        assert!(row_count_ranges(&document).is_empty(), "{document:?}");
+
+        let worker = draft_check_append(
+            &drafted_sidecar_text(),
+            "[[tests]]\ntype = \"row_count_range\"\nmin = 1\n",
+        );
+        let ranges =
+            row_count_ranges(&parse_ordered(&merged_run_only(&parsed, &worker)).expect("toml"));
+        assert_eq!(ranges.len(), 1, "the worker's range survives: {ranges:?}");
+        assert!(ranges[0].get(GENERATED_BY_KEY).is_none(), "{ranges:?}");
+        let once = merged_run_only(&parsed, &worker);
+        assert_eq!(merged_run_only(&parsed, &once), once);
+    }
+
+    /// An output that moved off full refresh drops the range an earlier
+    /// lowering wrote: it carries the `generated_by` marker, and nothing
+    /// generates it now.
+    #[test]
+    fn a_run_only_volume_drops_the_range_a_full_refresh_lowering_wrote() {
+        let parsed = parsed_with_volume("min_rows = 5");
+        let full_refresh = merged_text(&parsed, &drafted_sidecar_text());
+        assert_eq!(
+            row_count_ranges(&parse_ordered(&full_refresh).expect("toml")).len(),
+            1
+        );
+        let moved = parse_ordered(&merged_run_only(&parsed, &full_refresh)).expect("toml");
+        assert!(row_count_ranges(&moved).is_empty(), "{moved:?}");
+    }
+
+    #[test]
+    fn a_run_only_volume_is_a_verified_manifest_row_with_no_location() {
+        let parsed = parsed_with_volume("max_rows = 9");
+        let phase_a = lower_phase_a(&parsed, SPEC_PATH).expect("phase A").manifest;
+        let phase_b = super::lower_phase_b(
+            &parsed,
+            SPEC_PATH,
+            &drafted_sidecar_text(),
+            &phase_a,
+            VolumeLowering::RunOnly,
+        )
+        .expect("phase B")
+        .manifest;
+        let row = &phase_b.fields["product.output.volume"];
+        assert_eq!(row.disposition, Disposition::Verified);
+        assert!(row.locations.is_empty(), "{row:?}");
+        assert!(row.note.contains("rocky run"), "{row:?}");
+    }
+
+    #[test]
+    fn only_a_total_rows_basis_lowers_to_a_test() {
+        use crate::product::spec::VolumeBasis;
+        assert_eq!(
+            VolumeLowering::for_basis(Some(VolumeBasis::TotalRows)),
+            VolumeLowering::TotalRowsTest
+        );
+        for basis in [
+            Some(VolumeBasis::RowsAdded),
+            Some(VolumeBasis::RowsTouched),
+            Some(VolumeBasis::PartitionRows),
+            None,
+        ] {
+            assert_eq!(
+                VolumeLowering::for_basis(basis),
+                VolumeLowering::RunOnly,
+                "{basis:?}"
+            );
+        }
     }
 }

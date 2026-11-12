@@ -1,0 +1,13 @@
+# Manifest for the Meltano connector shim.
+# The tap's credentials are declared in rocky.toml (`secrets`), not here:
+# the manifest refuses unknown keys.
+protocol_version     = 0
+name                 = "meltano-shim"
+command              = ["./main.py"]
+state_schema_version = 1
+# Meltano usage tracking is switched off, and the POC tap reads local files.
+# A real tap calls its own API hosts: list them here, as a statement of intent.
+egress_hosts         = []
+
+[limits]
+wall_time_secs = 600

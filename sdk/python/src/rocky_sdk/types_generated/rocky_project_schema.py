@@ -383,7 +383,7 @@ class CostSection(BaseModel):
     )
     ai_cost_per_million_tokens: float | None = None
     """
-    Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by default. Config only for now: no cost path reads it yet.
+    Price of one million AI tokens, in USD per 1,000,000 tokens. One blended price: input and output tokens are priced alike. Unset by default. The monthly product view (`rocky cost --month`) prices the AI calls this state store recorded with it; a month with recorded calls and no price here has no money total. `0` is a valid explicit price.
     """
     compute_cost_per_dbu: float | None = None
     """
@@ -395,7 +395,7 @@ class CostSection(BaseModel):
     """
     cross_region_transfer_cost_per_gb: float | None = None
     """
-    Price of moving one GB of data across regions, in USD per GB. Unset by default. Config only for now: no cost path reads it yet.
+    Price of moving one GB (2^30 bytes) of data across regions, in USD per GB. Unset by default. The monthly product view (`rocky cost --month`) prices reported egress with it. No adapter reports egress yet, so it prices nothing today.
     """
     min_history_runs: conint(ge=0) | None = 5
     """
@@ -2028,7 +2028,7 @@ class StateNamespacing2(StrEnum):
 
 class StateRetentionDomain1(StrEnum):
     """
-    Pipeline run records (`run_history` table). Each row carries `started_at`/`finished_at` and the governance audit trail.
+    Pipeline run records (`run_history` table). Each row carries `started_at`/`finished_at` and the governance audit trail. Also sweeps recorded AI calls (`ai_usage`) older than `max_age_days`.
     """
 
     history = "history"
@@ -2358,7 +2358,7 @@ class DiscoverySyncConfig(BaseModel):
     """
     trigger: bool | None = None
     """
-    Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.
+    Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter (fivetran or airbyte). One `POST` per connector: never a Fivetran `force`, never an Airbyte reset. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.
     """
     wait: bool | None = False
     """
@@ -3997,7 +3997,7 @@ class AdapterConfig(BaseModel):
     """
     allow_sync_trigger: bool | None = None
     """
-    The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
+    The credential owner's opt-in to let Rocky start a sync with this adapter's key. On Fivetran that is `POST /v1/connections/{id}/sync`, never `force`. On Airbyte it is `POST /v1/jobs` with `jobType = "sync"`, never a reset. A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
     """
     api_key: str | None = None
     api_secret: str | None = None

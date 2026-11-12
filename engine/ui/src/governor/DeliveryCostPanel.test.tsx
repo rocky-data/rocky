@@ -8,9 +8,11 @@ import {
   DeliveryCostPanel,
   basisState,
   chargedUnitState,
+  formatAmount,
   formatUsd,
   moneyState,
   pipelinesFor,
+  unitState,
 } from "./DeliveryCostPanel";
 
 function row(overrides: Partial<ProductMonthCost> = {}): ProductMonthCost {
@@ -261,6 +263,39 @@ describe("the five states of a cost figure", () => {
     expect(screen.getByText(/names no product that owns a model/)).toBeInTheDocument();
     expect(screen.getByText(/2 failed executions recorded no time/)).toBeInTheDocument();
     expect(screen.getByText(/3 tables read with no recorded build/)).toBeInTheDocument();
+  });
+
+  it("shows AI tokens and egress with their caveats, and a partial AI part is not money", () => {
+    const product = row({
+      charged: [
+        { unit: "compute_ms", amount: 1400 },
+        { unit: "egress_bytes", amount: 2 * 1024 ** 3 },
+        { unit: "ai_input_tokens", amount: 1500 },
+        { unit: "ai_output_tokens", amount: 700 },
+      ],
+      money_parts: [
+        { figure: "compute", status: "priced", usd: 1.4 },
+        { figure: "egress", status: "priced", usd: 1 },
+        { figure: "ai_tokens", status: "partial", usd: null },
+      ],
+    });
+    expect(unitState("egress_bytes")).toBe("measured");
+    expect(unitState("ai_input_tokens")).toBe("measured");
+    expect(formatAmount("ai_output_tokens", 700)).toBe("700 AI output tokens");
+    expect(formatAmount("egress_bytes", 2 * 1024 ** 3)).toBe("2 GiB egress");
+    const base = report(product);
+    renderPanel({
+      ...base,
+      not_measured: {
+        ...base.not_measured,
+        egress_unreported_executions: 3,
+        ai_calls_without_usage: 1,
+      },
+    });
+    expect(screen.getByText(/1500 AI input tokens/)).toBeInTheDocument();
+    expect(screen.getByText(/2 GiB egress/)).toBeInTheDocument();
+    expect(screen.getByText(/3 production executions reported no egress/)).toBeInTheDocument();
+    expect(screen.getByText(/1 AI call reported no token counts/)).toBeInTheDocument();
   });
 
   it("a priced zero is a real $0.00, and a tiny figure keeps its digits", () => {

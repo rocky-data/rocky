@@ -2535,6 +2535,7 @@ auto_create_schemas = true
             upstream_freshness: None,
             bytes_scanned: Some(4096),
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some("recipe-abc".to_string()),
             input_hash: None,
@@ -2576,6 +2577,7 @@ auto_create_schemas = true
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
+                output_volumes: Vec::new(),
             })
             .unwrap();
     }

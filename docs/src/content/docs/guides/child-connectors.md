@@ -290,6 +290,27 @@ The POC runs three loads against a Postgres container and checks the row counts,
 
 The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the same connector inside a full project, with a data product, a deadline, volume ranges, a monthly cost and a budget.
 
+## Connector shims
+
+Three POCs show how to run a third-party extraction tool as a child connector. Each one is a short program that adapts the tool's output and state to the protocol. Rocky ships no extractors and no catalog. You bring the tool and its configuration.
+
+| Tool | POC | What the shim runs |
+|---|---|---|
+| dlt | [`07-adapters/10-dlt-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-dlt-connector-shim) | A dlt source, named by module and function, with the `filesystem` destination writing Parquet. |
+| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An open-source Airbyte source image with `docker run`: `spec`, `discover`, then `read`. |
+| Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. |
+
+All three follow the same rules.
+
+- **One stream per connector.** The options name the one stream (table) to load. If the tool emits several, the shim loads that one. If the name does not exist, the run fails and lists the streams that do.
+- **The tool's state lives in Rocky state.** The shim restores the tool's own incremental state from the request, and returns the new state in the result. Rocky's commit fence then governs it. Never keep the tool's state anywhere Rocky does not commit it, such as Meltano's own state backend or an Airbyte database. A crash before the state commit would then skip a batch, and the at-least-once guarantee would break.
+- **Delivery is at least once.** A crash between the promote and the state commit loads a batch twice. Deduplicate downstream on a key.
+- **No catalog.** Rocky does not discover or list sources. The options name the module, the image or the tap.
+- **Credentials go under `secrets`.** Each tool reads its credentials from the environment. Declare the variable names under `secrets`. Never put a credential under `options`.
+- **The tool, not Rocky, calls the network.** The manifest `egress_hosts` lists the hosts the tool calls. Rocky does not enforce the list.
+
+The POCs run offline once the tool is installed. Each skips with exit 0 when its tool is missing. Set `REQUIRE_DLT=1`, `REQUIRE_DOCKER=1` or `REQUIRE_MELTANO=1` to make that a failure.
+
 ## Related
 
 - [`rocky load`](/reference/cli/#rocky-load) for loading files from a directory

@@ -352,8 +352,9 @@ impl SqlServerClient {
         })
     }
 
-    /// Run one or more statements. Returns the last non-zero row count the
-    /// statements reported.
+    /// Run one or more statements. Returns the one non-zero row count the
+    /// statements reported, or `None` when two or more reported a non-zero
+    /// count (see [`reported_rows`]).
     ///
     /// # Errors
     ///
@@ -369,16 +370,7 @@ impl SqlServerClient {
             .await
             .map_err(|e| map_error(e, self.config.timeout))?;
         pooled.release();
-        // A script reports a count per statement, and 0 for statements that
-        // touch no rows (DDL, `sp_rename`, `COMMIT`); the last non-zero count
-        // is the write's (`SELECT INTO`, or the INSERT after a DELETE).
-        let counts = result.rows_affected();
-        Ok(counts
-            .iter()
-            .rev()
-            .find(|n| **n > 0)
-            .or(counts.last())
-            .copied())
+        Ok(reported_rows(result.rows_affected()))
     }
 
     /// Run a query and return its last result set as text cells (`NULL` is
@@ -429,6 +421,23 @@ impl SqlServerClient {
     /// See [`Self::query`].
     pub async fn ping(&self) -> Result<(), SqlServerError> {
         self.query("SELECT 1").await.map(|_| ())
+    }
+}
+
+/// The row count a batch reported for its write.
+///
+/// A script reports a count per statement, and 0 for statements that touch
+/// no rows (DDL, `sp_rename`, `COMMIT`). Exactly one non-zero count is the
+/// write's (`SELECT INTO`, a single `MERGE`). Two or more are ambiguous: a
+/// trigger's rows are counted too, so the last one may not be the write's.
+/// That reports `None`. A batch with no non-zero count reports its last
+/// count, `0`, or `None` when it reported none.
+fn reported_rows(counts: &[u64]) -> Option<u64> {
+    let mut non_zero = counts.iter().copied().filter(|n| *n > 0);
+    match (non_zero.next(), non_zero.next()) {
+        (Some(only), None) => Some(only),
+        (Some(_), Some(_)) => None,
+        (None, _) => counts.last().copied(),
     }
 }
 
@@ -544,6 +553,16 @@ mod tests {
         assert!(debug.contains("${RV_MSSQL_DBG}"), "{debug}");
     }
     use std::borrow::Cow;
+
+    #[test]
+    fn one_non_zero_count_is_the_writes_and_two_are_ambiguous() {
+        assert_eq!(reported_rows(&[0, 7, 0]), Some(7));
+        assert_eq!(reported_rows(&[7]), Some(7));
+        // A trigger's count after the write's must not stand in for it.
+        assert_eq!(reported_rows(&[7, 3]), None);
+        assert_eq!(reported_rows(&[0, 0]), Some(0));
+        assert_eq!(reported_rows(&[]), None);
+    }
 
     #[test]
     fn transient_and_missing_classification() {

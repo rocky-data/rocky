@@ -13,3 +13,4 @@ pub mod residency;
 pub mod sidecar;
 pub mod sync;
 pub mod testgen;
+pub mod usage;

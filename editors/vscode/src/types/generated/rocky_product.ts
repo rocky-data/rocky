@@ -142,7 +142,7 @@ export interface FreshnessSpec {
   warn_after?: string | null;
 }
 /**
- * The declared row-count range: the output table's total rows after a load, checked by `rocky run` on a full-refresh output.
+ * The declared row-count range one load of the output must hold, checked by `rocky run` after a production build. What is counted depends on the output model's strategy: see [`VolumeBasis`].
  *
  * At least one bound is present. `min_rows = 0` alone counts as one.
  */

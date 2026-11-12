@@ -15,26 +15,53 @@
 //! [PR #631]: https://github.com/rocky-data/rocky/pull/631
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt};
 use tracing::{debug, warn};
 
 use rocky_core::source::{DiscoveredConnector, DiscoveredTable, DiscoveryResult};
+use rocky_core::source_sync::{SourceSyncState, SourceSyncTriggerError};
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
-use crate::client::{AirbyteClient, Connection, ConnectionStatus};
+use crate::client::{
+    AirbyteClient, AirbyteError, Connection, ConnectionStatus, Job, SyncRequestError,
+    job_is_running, parse_job_time,
+};
+
+/// How many jobs reads one sync state poll runs at once.
+const JOBS_READ_CONCURRENCY: usize = 10;
 
 /// Airbyte source discovery adapter.
 ///
 /// Discovers connections and their configured streams from Airbyte
-/// by calling the Airbyte Configuration API v1. Connections are filtered
+/// by calling the Airbyte public API (`/v1`). Connections are filtered
 /// to active-only and optionally by a namespace prefix (analogous to
 /// Fivetran's schema prefix filtering).
+///
+/// It also reports sync state ([`DiscoveryAdapter::source_sync_states`]) and,
+/// when its owner opted in, starts syncs
+/// ([`DiscoveryAdapter::trigger_source_sync`]).
 pub struct AirbyteDiscoveryAdapter {
     client: AirbyteClient,
+    /// The token owner's opt-in (`allow_sync_trigger`). Without it the
+    /// adapter refuses every sync request before any HTTP call.
+    allow_sync_trigger: bool,
 }
 
 impl AirbyteDiscoveryAdapter {
     pub fn new(client: AirbyteClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            allow_sync_trigger: false,
+        }
+    }
+
+    /// Set the token owner's opt-in to let Rocky start syncs
+    /// (`[adapter.<name>] allow_sync_trigger`).
+    #[must_use]
+    pub fn with_sync_trigger_allowed(mut self, allowed: bool) -> Self {
+        self.allow_sync_trigger = allowed;
+        self
     }
 }
 
@@ -65,6 +92,92 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
         // the way Fivetran's per-connector schema fetch can. Either the list
         // call succeeds (no `failed`) or the whole call errors out.
         Ok(DiscoveryResult::ok(connectors))
+    }
+
+    /// One connection list read, then one jobs read per selected active
+    /// connection (`GET /v1/jobs?connectionId=<id>&limit=25&orderBy=createdAt|DESC`),
+    /// up to 10 at a time.
+    ///
+    /// The connections are the ones [`Self::discover`] would return for the
+    /// prefix (same [`matches_prefix`]), plus inactive ones, reported as
+    /// paused so the wait names them. A paused connection has no jobs read.
+    /// A connection with a status this code does not know is treated the same
+    /// way. A deprecated connection is left out: Airbyte has deleted it, it
+    /// cannot sync, and discovery never returns it, so the run never reads it.
+    ///
+    /// Each state is built from the connection's newest jobs; see
+    /// [`sync_state_of`]. `observed_at` is the `Date` header of that
+    /// connection's jobs read, the server time at which it was seen.
+    async fn source_sync_states(
+        &self,
+        schema_prefix: &str,
+    ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
+        let connections = self
+            .client
+            .list_connections()
+            .await
+            .map_err(AdapterError::new)?;
+        let selected: Vec<Connection> = connections
+            .into_iter()
+            .filter(|c| c.status != ConnectionStatus::Deprecated)
+            .filter(|c| matches_prefix(c, schema_prefix))
+            .collect();
+        // Only an active connection has its jobs read. An inactive or unknown
+        // one is paused, and the wait skips paused connections, so its jobs
+        // could not change the outcome. Reads run concurrently, at most
+        // `JOBS_READ_CONCURRENCY` at a time, in the order of the list. The
+        // first failed read fails the whole poll.
+        let states: Vec<SourceSyncState> = futures::stream::iter(selected)
+            .map(|conn| async move {
+                if conn.status != ConnectionStatus::Active {
+                    return sync_state_of(&conn, &[], None).map_err(AdapterError::new);
+                }
+                let (jobs, observed_at) = self
+                    .client
+                    .list_connection_jobs(&conn.connection_id)
+                    .await
+                    .map_err(AdapterError::new)?;
+                sync_state_of(&conn, &jobs, observed_at).map_err(AdapterError::new)
+            })
+            .buffered(JOBS_READ_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(Some(states))
+    }
+
+    /// Start one sync: `POST /v1/jobs` with `jobType = "sync"`, never a
+    /// reset or clear job.
+    ///
+    /// Refuses without the owner's opt-in, before any request. A 403 names
+    /// the fix. A 409 is `Conflict`: a sync already runs, so the caller waits
+    /// for it. A refusal (400, 404, an exhausted 429, a connect error) is
+    /// `Failed`: no sync started. A timeout, a 5xx or a connection lost
+    /// mid-request is `Unknown`: the caller treats the request as sent, and
+    /// never retries it. `Ok` carries the `Date` header of the answer.
+    ///
+    /// Airbyte answers with the new job's id. The shared wait has no place
+    /// for it, so it is logged only; the sync is identified by the shared
+    /// timestamp rules (see [`rocky_core::source_sync`]).
+    async fn trigger_source_sync(
+        &self,
+        connector_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, SourceSyncTriggerError> {
+        if !self.allow_sync_trigger {
+            return Err(SourceSyncTriggerError::NotAllowed);
+        }
+        self.client
+            .post_sync_job(connector_id)
+            .await
+            .map_err(|e| match e {
+                SyncRequestError::Forbidden(body) => SourceSyncTriggerError::Forbidden(format!(
+                    "Airbyte refused the sync request for connection {connector_id} (HTTP 403): \
+                     this token cannot start syncs. Use a token whose role can run syncs on \
+                     this workspace, or set trigger = false. {body}"
+                )),
+                SyncRequestError::Failed(message) => SourceSyncTriggerError::Failed(message),
+                SyncRequestError::Conflict(message) => SourceSyncTriggerError::Conflict(message),
+                SyncRequestError::Unknown(message) => SourceSyncTriggerError::Unknown(message),
+            })
     }
 
     async fn ping(&self) -> AdapterResult<()> {
@@ -98,12 +211,81 @@ fn matches_prefix(conn: &Connection, prefix: &str) -> bool {
     conn.name.starts_with(prefix)
 }
 
+/// The destination schema of a connection: its `namespace_format`, else its
+/// name. The same value discovery reports.
+fn schema_of(conn: &Connection) -> String {
+    conn.namespace_format
+        .clone()
+        .unwrap_or_else(|| conn.name.clone())
+}
+
+/// Build one connection's sync state from its newest jobs.
+///
+/// - `paused`: the connection is not `active` (`inactive`, or a status this
+///   code does not know): no schedule runs it, or it cannot be trusted to.
+/// - `syncing`: the newest job has not ended (`pending`, `running`,
+///   `incomplete`, or a status this code does not know). Every job type
+///   counts, a reset or clear too, because it also writes to the destination.
+///   Airbyte runs one job per connection at a time, so a job that has not
+///   ended but is older than a job that has ended is stale and is ignored.
+///   The caller passes the jobs newest first (the client checks this).
+/// - `succeeded_at`: the latest end time of a `sync` or `refresh` job that
+///   `succeeded`.
+/// - `failed_at`: the latest end time of a `sync` or `refresh` job that
+///   `failed` or was `cancelled`. A cancelled sync landed partial data or none, so it is not
+///   a success; counting it as a failure is the safe side.
+///
+/// The end time of a job is its `lastUpdatedAt`: Airbyte sets it when the job
+/// changes state, so for an ended job it is the time it ended. `startTime` is
+/// not an end, and `duration` would need a second clock-derived sum. A job
+/// that ended with no `lastUpdatedAt` gives no end time, so it can never
+/// count as the end of Rocky's sync (the wait fails closed). Only `sync`
+/// and `refresh` jobs set the two timestamps: both read the source and land
+/// data. A reset or clear job is never the sync Rocky asked for, so it leaves
+/// both unknown.
+///
+/// # Errors
+///
+/// A `lastUpdatedAt` that is not RFC 3339 is an error for the whole read.
+fn sync_state_of(
+    conn: &Connection,
+    jobs: &[Job],
+    observed_at: Option<DateTime<Utc>>,
+) -> Result<SourceSyncState, AirbyteError> {
+    let mut succeeded_at: Option<DateTime<Utc>> = None;
+    let mut failed_at: Option<DateTime<Utc>> = None;
+    for job in jobs
+        .iter()
+        .filter(|j| matches!(j.job_type.as_str(), "sync" | "refresh"))
+    {
+        let slot = match job.status.as_str() {
+            "succeeded" => &mut succeeded_at,
+            "failed" | "cancelled" => &mut failed_at,
+            _ => continue,
+        };
+        let Some(raw) = job.last_updated_at.as_deref() else {
+            continue;
+        };
+        let ended = parse_job_time(raw)?;
+        if slot.is_none_or(|t| ended > t) {
+            *slot = Some(ended);
+        }
+    }
+    Ok(SourceSyncState {
+        id: conn.connection_id.clone(),
+        schema: schema_of(conn),
+        source_type: "airbyte".to_string(),
+        syncing: jobs.first().is_some_and(job_is_running),
+        paused: conn.status != ConnectionStatus::Active,
+        succeeded_at,
+        failed_at,
+        observed_at,
+    })
+}
+
 /// Map an Airbyte [`Connection`] to a [`DiscoveredConnector`].
 fn map_connection(conn: Connection) -> DiscoveredConnector {
-    let schema = conn
-        .namespace_format
-        .clone()
-        .unwrap_or_else(|| conn.name.clone());
+    let schema = schema_of(&conn);
 
     let tables = match conn.configurations {
         Some(cfg) => cfg

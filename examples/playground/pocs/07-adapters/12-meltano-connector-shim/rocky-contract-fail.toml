@@ -1,0 +1,20 @@
+# The same connector as orders_tap in rocky.toml, plus a contract that the
+# batch cannot meet. run.sh runs it first: the load fails AFTER the shim
+# succeeded, so Rocky must not move the saved state.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.orders_tap]
+manifest     = "connector/connector.toml"
+keep_scratch = true
+output_uri   = "file://./.rocky/landing/orders_tap"
+target       = { catalog = "poc", schema = "main", table = "orders" }
+retries      = 0
+contract     = { required_columns = [{ name = "no_such_column", type = "BIGINT", nullable = false }] }
+
+[connector.orders_tap.options]
+project_dir = "../meltano_project"
+tap         = "tap-orders"
+stream      = "orders"

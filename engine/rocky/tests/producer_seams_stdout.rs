@@ -55,6 +55,7 @@ fn exec(name: &str, start: chrono::DateTime<Utc>, dur_ms: i64) -> ModelExecution
         upstream_freshness: None,
         bytes_scanned: Some(1024),
         bytes_written: Some(2048),
+        egress_bytes: None,
         tenant: None,
         recipe_hash: None,
         input_hash: None,
@@ -108,6 +109,7 @@ fn seed_state(state_path: &Path) {
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         })
         .unwrap();
 }

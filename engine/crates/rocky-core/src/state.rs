@@ -299,6 +299,41 @@ const CONNECTOR_STATE_SINCE_SCHEMA_VERSION: u32 = 34;
 /// stamped below [`CONNECTOR_STATE_SINCE_SCHEMA_VERSION`]. The reader maps it
 /// to "no saved state", which is the truth for such a store.
 const READ_ONLY_TOLERATED_ABSENT_BEFORE_V34: &[&str] = &["connector_state"];
+/// Recorded AI token usage (schema v35): one
+/// [`crate::ai_usage::AiUsageRecord`] per AI call that returned a response,
+/// keyed by the record's UUID, plus one reserved row at
+/// [`AI_USAGE_SINCE_KEY`] holding the RFC 3339 instant this store started
+/// recording. A month that starts before that instant has AI calls this store
+/// never saw, so `rocky cost` reports its AI part as `partial`.
+///
+/// **Local-only** (listed in [`LOCAL_ONLY_TABLE_NAMES`]): the figure is the
+/// AI spend recorded on this machine, and a remote restore keeps the local
+/// rows. Replicating it would let the start-of-run download replace rows a
+/// developer recorded locally with the remote copy, which never had them.
+/// The reserved row travels with the table, so the two stay consistent.
+const AI_USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_usage");
+/// The key `ai_usage_since` of the reserved row in [`AI_USAGE`] that holds
+/// when recording began. It lives in the local-only table, not in the
+/// replicating [`METADATA`] table: a download replaces `METADATA` with the
+/// remote copy, which would hand this machine another machine's instant and
+/// make a month this store never saw read as complete. Not a UUID, so it
+/// never collides with a record id.
+const AI_USAGE_SINCE_KEY: &str = "ai_usage_since";
+/// The key of the second reserved row in [`AI_USAGE`]: how many spooled
+/// records a drain dropped because their line did not parse. The drain
+/// truncates the spool, so without this count the loss would leave no trace.
+/// Local-only for the same reason as [`AI_USAGE_SINCE_KEY`].
+const AI_USAGE_DROPPED_KEY: &str = "ai_usage_dropped";
+/// Whether `key` is a reserved row of [`AI_USAGE`], not a record id.
+fn is_ai_usage_reserved_key(key: &str) -> bool {
+    key == AI_USAGE_SINCE_KEY || key == AI_USAGE_DROPPED_KEY
+}
+/// The schema version that added [`AI_USAGE`].
+const AI_USAGE_SINCE_SCHEMA_VERSION: u32 = 35;
+/// The table a read-only open tolerates being absent, and only in a store
+/// stamped below [`AI_USAGE_SINCE_SCHEMA_VERSION`]. The reader maps it to "no
+/// recorded AI usage, recording not started".
+const READ_ONLY_TOLERATED_ABSENT_BEFORE_V35: &[&str] = &["ai_usage"];
 /// The schema version that added [`ENVIRONMENTS`] and [`PUBLISH_HISTORY`].
 const ENVIRONMENT_TABLES_SINCE_SCHEMA_VERSION: u32 = 32;
 /// Tables a read-only open tolerates being absent, and only in a store
@@ -335,6 +370,7 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 /// - `product_approvals` — approval records point at snapshot bytes state
 ///   replication does not transport (see [`PRODUCT_APPROVALS`]; the v22
 ///   stanza records the revisit condition).
+/// - `ai_usage` — AI calls recorded on this machine (see [`AI_USAGE`]).
 pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &[
     "schema_cache",
     "jobs",
@@ -342,6 +378,7 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &[
     "schedule_claims",
     "fulfill_state",
     "product_approvals",
+    "ai_usage",
 ];
 
 /// [`LOCAL_ONLY_TABLE_NAMES`] without `schema_cache` — the set used when
@@ -361,6 +398,7 @@ pub const LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE: &[&str] = &[
     "schedule_claims",
     "fulfill_state",
     "product_approvals",
+    "ai_usage",
 ];
 
 /// The local-only table set for a given `[cache.schemas] replicate` posture.
@@ -450,6 +488,7 @@ const SNAPSHOT_TABLE_REGISTRY: &[(&str, TableShape)] = &[
     ("environments", TableShape::StrBytes),
     ("publish_history", TableShape::StrBytes),
     ("connector_state", TableShape::StrBytes),
+    ("ai_usage", TableShape::StrBytes),
     ("metadata", TableShape::StrStr),
 ];
 
@@ -1026,6 +1065,24 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   a v34 store. A v33 binary uses the `v33/` remote key and never sees the
 ///   connector state a v34 pod saved.
 ///
+/// - **v35** — adds the [`AI_USAGE`] table: one row per AI call that returned
+///   a response, plus the instant this store started recording. Pure additive
+///   table change (the v34 shape). The table is local-only. Guarded by
+///   `test_v34_opens_and_creates_ai_usage_table`.
+///
+///   **On upgrade.** A v34 store opened read-write is stamped v35 in place and
+///   gets the table, with recording starting at that open; every record is
+///   kept. A read-only open of a store stamped below v35 tolerates the table
+///   being absent and reads it as "no recorded usage, recording not started"
+///   ([`READ_ONLY_TOLERATED_ABSENT_BEFORE_V35`]); a store stamped v35 that
+///   lacks it is refused. Remote state carries forward from the `v34/` key
+///   ([`crate::state_sync`]); the first upload creates the `v35/` key. The
+///   table never travels: it is local-only.
+///
+///   **On rollback.** The version check runs at OPEN, so a v34 binary refuses
+///   a v35 store (or, under `on_schema_mismatch = "recreate"`, moves it aside
+///   and starts a fresh local store).
+///
 /// # Fields added without a bump
 ///
 /// A serde-additive field needs no bump when an older binary that ignores it
@@ -1094,7 +1151,7 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   `None`, which means "not recorded". Guarded by
 ///   `test_pre_delivery_timing_model_execution_forward_deserializes_to_none`
 ///   and `test_pre_queued_ms_run_record_forward_deserializes_to_none`.
-const CURRENT_SCHEMA_VERSION: u32 = 34;
+const CURRENT_SCHEMA_VERSION: u32 = 35;
 
 /// Errors from the embedded redb state store.
 #[derive(Error)]
@@ -1287,6 +1344,15 @@ pub enum StateError {
         size: usize,
         limit: usize,
     },
+
+    /// The AI usage spool next to the state file could not be read or
+    /// truncated. Nothing in it was lost: a failed drain leaves every line.
+    #[error("i/o error on the AI usage spool at {path}: {source}")]
+    AiUsageSpool {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -1446,6 +1512,12 @@ pub struct StateStore {
     // the as-opened state is exactly what the start-of-run download already
     // established remotely.
     write_epoch: AtomicU64,
+    // The AI usage spool next to the state file
+    // ([`crate::ai_usage::spool_path`]). Read by
+    // [`StateStore::ai_usage_including_spool`] and drained by
+    // [`StateStore::drain_ai_usage_spool`]. Set for every path-backed open,
+    // including the empty in-memory stand-in for a missing file.
+    ai_usage_spool: Option<std::path::PathBuf>,
 }
 
 /// The schema version this binary supports.
@@ -1687,6 +1759,7 @@ impl StateStore {
                     _lock: None,
                     recreated_for_forward_incompat: false,
                     write_epoch: AtomicU64::new(0),
+                    ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
                 })
             }
             Err(error) => Err(error),
@@ -1833,6 +1906,7 @@ impl StateStore {
                 _lock: lock,
                 recreated_for_forward_incompat: false,
                 write_epoch: AtomicU64::new(0),
+                ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
             }),
             InitOutcome::RecreateForwardIncompat { found } => {
                 // Forward-incompatible store under `SchemaMismatchPolicy::Recreate`.
@@ -1942,6 +2016,7 @@ impl StateStore {
                         _lock: lock,
                         recreated_for_forward_incompat: true,
                         write_epoch: AtomicU64::new(0),
+                        ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
                     }),
                     // A file we just created cannot carry a newer schema version.
                     InitOutcome::RecreateForwardIncompat { found } => {
@@ -2014,6 +2089,7 @@ impl StateStore {
             ENVIRONMENTS.name(),
             PUBLISH_HISTORY.name(),
             CONNECTOR_STATE.name(),
+            AI_USAGE.name(),
         ]
     }
 
@@ -2095,6 +2171,8 @@ impl StateStore {
         // The same rule for the v34 connector table.
         let tolerate_connector_table =
             found.is_some_and(|v| v < CONNECTOR_STATE_SINCE_SCHEMA_VERSION);
+        // And for the v35 AI usage table.
+        let tolerate_ai_usage_table = found.is_some_and(|v| v < AI_USAGE_SINCE_SCHEMA_VERSION);
         let missing: Vec<String> = Self::table_names()
             .into_iter()
             .filter(|name| !present.contains(*name))
@@ -2103,6 +2181,9 @@ impl StateStore {
             })
             .filter(|name| {
                 !(tolerate_connector_table && READ_ONLY_TOLERATED_ABSENT_BEFORE_V34.contains(name))
+            })
+            .filter(|name| {
+                !(tolerate_ai_usage_table && READ_ONLY_TOLERATED_ABSENT_BEFORE_V35.contains(name))
             })
             .map(str::to_string)
             .collect();
@@ -2224,6 +2305,13 @@ impl StateStore {
             let _table = txn.open_table(ENVIRONMENTS)?;
             let _table = txn.open_table(PUBLISH_HISTORY)?;
             let _table = txn.open_table(CONNECTOR_STATE)?;
+            // A store that has no "recording began" row (a new table, or one
+            // a remote restore emptied) starts recording now.
+            let mut ai_usage = txn.open_table(AI_USAGE)?;
+            if ai_usage.get(AI_USAGE_SINCE_KEY)?.is_none() {
+                let now = chrono::Utc::now().to_rfc3339();
+                ai_usage.insert(AI_USAGE_SINCE_KEY, now.as_bytes())?;
+            }
         }
         // Construction-time commit: this runs on the raw `db` handle before any
         // `StateStore` (and thus any `write_epoch`) exists, so it deliberately
@@ -3043,6 +3131,17 @@ pub struct ModelExecution {
     /// wired it yet. Reserved for adapters that produce a natural
     /// bytes-written figure via their statistics surface.
     pub bytes_written: Option<u64>,
+    /// Bytes this execution moved out of the warehouse's region, as the
+    /// adapter reported them. No adapter reports it yet, so it is `None`
+    /// everywhere today. `bytes_scanned` and `bytes_written` are not egress.
+    /// Read by `rocky cost --month --by product` as a build cost of the
+    /// version, priced by `[cost] cross_region_transfer_cost_per_gb`.
+    ///
+    /// Serde-additive with no schema bump: omitted when `None`, so a row
+    /// without it is byte-identical to an older row, and an older row reads
+    /// back `None` ("not reported").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_bytes: Option<u64>,
     /// Tenant this execution is attributed to, sourced from the
     /// discover-time schema-pattern `{tenant}` component (see
     /// [`crate::schema`]). Populated only for replication pipelines
@@ -3235,10 +3334,15 @@ pub struct ModelExecution {
     pub stored_bytes: Option<StoredBytes>,
 
     // --- Volume count (no schema bump) -------------------------------------
-    /// The output table's total rows (`SELECT COUNT(*)`), counted right
-    /// after a production build of a product output that declares
-    /// `[product.output.volume]`. Not [`Self::rows_affected`], which is the
-    /// rows this execution wrote.
+    /// The row count the product volume check judged, taken right after a
+    /// production build of a product output that declares
+    /// `[product.output.volume]`. Its basis follows the output's strategy:
+    /// the table's total rows for a full-refresh output, the rows the run
+    /// added for an incremental one, the rows its MERGE touched for a merge
+    /// one, and the rows in the partitions it wrote for a time-interval one
+    /// (recorded on the last partition's execution). Records written before
+    /// that change are always total rows. Not [`Self::rows_affected`], which
+    /// is the rows the adapter reported for a replication copy.
     ///
     /// `None` when nothing was counted: no volume declared, a shadow or
     /// branch run, a count that failed, or a record written before this
@@ -3892,6 +3996,86 @@ pub struct RunRecord {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_volumes: Vec<SourceVolumeRecord>,
+
+    /// The product output volume checks a production run made, one row per
+    /// judged load: one per model, or one per written partition for a
+    /// `time_interval` model. It keeps the basis the count was taken on and
+    /// the verdict, including `not_evaluated` with its reason, which the
+    /// per-execution [`ModelExecution::row_count`] cannot. Empty for a run
+    /// that judged none, for a shadow, branch or backfill run, and for
+    /// records written before this field existed (their counts, if any, are
+    /// total rows: only full-refresh outputs were counted then).
+    ///
+    /// Added without a schema bump, like [`Self::source_volumes`]. Omitted
+    /// when empty, so the `ledger_record_serialization_pinned` golden stays
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_volumes: Vec<OutputVolumeRecord>,
+}
+
+/// Read a [`crate::product::spec::VolumeBasis`] leniently: a name this build
+/// does not know reads as `None`.
+fn lenient_volume_basis<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::product::spec::VolumeBasis>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// One product output volume check a production run made: the count it
+/// judged, the basis it counted on and the verdict it reached.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutputVolumeRecord {
+    /// The product that declares the range.
+    pub product: String,
+    /// The product's output model.
+    pub model: String,
+    /// The partition key, for a `time_interval` model's partition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    /// What `row_count` counts. `None` when the strategy is not counted, or
+    /// when the record names a basis this build does not know (a record a
+    /// newer engine wrote): one unknown name must not make the whole run
+    /// record unreadable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_volume_basis"
+    )]
+    pub basis: Option<crate::product::spec::VolumeBasis>,
+    /// The count judged. `None` when no count was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    /// The declared `min_rows`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The declared severity.
+    pub severity: crate::product::spec::VolumeSeverity,
+    /// The verdict the run reached.
+    pub verdict: crate::product::spec::VolumeVerdict,
+    /// Why the verdict is `not_evaluated`, or what a breach did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The newest production build of one output model, with the volume rows
+/// that build recorded. Returned by [`StateStore::last_output_volume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestOutputVolume {
+    /// The run that built the model.
+    pub run_id: String,
+    /// When that run finished.
+    pub finished_at: chrono::DateTime<chrono::Utc>,
+    /// The build's volume rows. Empty when the build recorded no count and
+    /// no check: nothing declared then, or a record from before volume
+    /// checks stored a basis with no count.
+    pub rows: Vec<OutputVolumeRecord>,
 }
 
 /// One source row count a production run took when it started, judged
@@ -5328,6 +5512,9 @@ impl StateStore {
     /// Matches on [`ModelExecution::rocky_model_name`], the model name, not
     /// the table name.
     ///
+    /// A run where the model also has a non-success execution (for example
+    /// one partition that breached a volume range) is not a delivery.
+    ///
     /// `exclude_run_id` skips that run. A run persisted twice under one id
     /// (for example after a failed `verify_after`) must not be its own
     /// previous delivery.
@@ -5343,6 +5530,15 @@ impl StateStore {
     ) -> Result<Option<ModelExecution>, StateError> {
         let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
             if exclude_run_id == Some(run.run_id.as_str()) || !run.counts_as_production(unrecorded)
+            {
+                return None;
+            }
+            // A model with any failed execution in the run did not deliver,
+            // even where some of its partitions succeeded.
+            if run
+                .models_executed
+                .iter()
+                .any(|m| m.status != "success" && m.rocky_model_name() == model_name)
             {
                 return None;
             }
@@ -5413,6 +5609,73 @@ impl StateStore {
                 LatestSourceVolumes {
                     run_id: run.run_id,
                     started_at: run.started_at,
+                    rows,
+                },
+            ))
+        })?;
+        Ok(found.into_iter().next())
+    }
+
+    /// The newest production build of `model_name` and the volume rows it
+    /// recorded, whether or not it took a count.
+    ///
+    /// "Build" is a run that holds an execution of the model, any status. A
+    /// newer build that took no count hides an older build that did: the
+    /// caller must not read the older count as current. A record from
+    /// before [`RunRecord::output_volumes`] existed has its executions'
+    /// [`ModelExecution::row_count`] read as total-rows counts, the only
+    /// kind that was taken then.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn last_output_volume(
+        &self,
+        model_name: &str,
+        unrecorded: UnrecordedScope,
+    ) -> Result<Option<LatestOutputVolume>, StateError> {
+        let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
+            if !run.counts_as_production(unrecorded) {
+                return None;
+            }
+            let executions: Vec<&ModelExecution> = run
+                .models_executed
+                .iter()
+                .filter(|m| m.rocky_model_name() == model_name)
+                .collect();
+            if executions.is_empty() {
+                return None;
+            }
+            let mut rows: Vec<OutputVolumeRecord> = run
+                .output_volumes
+                .iter()
+                .filter(|row| row.model == model_name)
+                .cloned()
+                .collect();
+            if rows.is_empty() && run.output_volumes.is_empty() {
+                // Written before `output_volumes`: total rows, full refresh.
+                rows = executions
+                    .iter()
+                    .filter_map(|m| m.row_count)
+                    .map(|count| OutputVolumeRecord {
+                        product: String::new(),
+                        model: model_name.to_string(),
+                        partition: None,
+                        basis: Some(crate::product::spec::VolumeBasis::TotalRows),
+                        row_count: Some(count),
+                        min_rows: None,
+                        max_rows: None,
+                        severity: crate::product::spec::VolumeSeverity::Warning,
+                        verdict: crate::product::spec::VolumeVerdict::NotEvaluated,
+                        reason: None,
+                    })
+                    .collect();
+            }
+            Some((
+                1,
+                LatestOutputVolume {
+                    run_id: run.run_id.clone(),
+                    finished_at: run.finished_at,
                     rows,
                 },
             ))
@@ -6165,8 +6428,12 @@ impl StateStore {
             report.runs_deleted = deleted;
             report.runs_kept = kept;
             self.sweep_stale_run_started_markers(cutoff)?;
+            let (deleted, kept) = self.sweep_ai_usage(cutoff, false)?;
+            report.ai_usage_deleted = deleted;
+            report.ai_usage_kept = kept;
         } else {
             report.runs_kept = self.count_run_history()?;
+            report.ai_usage_kept = self.list_ai_usage()?.len() as u64;
         }
 
         if policy.applies_to_domain(StateRetentionDomain::Lineage) {
@@ -6208,8 +6475,12 @@ impl StateStore {
             let (deleted, kept) = self.count_run_history_sweep(cutoff, min_keep)?;
             report.runs_deleted = deleted;
             report.runs_kept = kept;
+            let (deleted, kept) = self.sweep_ai_usage(cutoff, true)?;
+            report.ai_usage_deleted = deleted;
+            report.ai_usage_kept = kept;
         } else {
             report.runs_kept = self.count_run_history()?;
+            report.ai_usage_kept = self.list_ai_usage()?.len() as u64;
         }
 
         if policy.applies_to_domain(StateRetentionDomain::Lineage) {
@@ -9977,6 +10248,268 @@ impl StateStore {
     }
 }
 
+// --- AI usage (schema v35) -------------------------------------------------
+
+/// What [`StateStore::drain_ai_usage_spool`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AiUsageDrain {
+    /// Spooled records the table did not hold yet, now inserted.
+    pub inserted: usize,
+    /// Spooled records the table already held (a drain that crashed after
+    /// its commit), skipped.
+    pub already_present: usize,
+    /// Lines that did not parse. Dropped with the truncate, and warned about.
+    pub malformed: usize,
+}
+
+impl StateStore {
+    /// When this store started recording AI usage, or `None` when it has not:
+    /// a store stamped below v35 opened read-only. Calls before this instant
+    /// are unknown to it.
+    pub fn ai_usage_since(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(AI_USAGE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StateError::Table(e)),
+        };
+        let Some(raw) = table.get(AI_USAGE_SINCE_KEY)? else {
+            return Ok(None);
+        };
+        // An unreadable stamp means "unknown since when": the conservative
+        // answer, which makes every month with usage partial.
+        Ok(std::str::from_utf8(raw.value())
+            .ok()
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+            .map(|at| at.with_timezone(&chrono::Utc)))
+    }
+
+    /// Overwrite the instant this store started recording AI usage. Opening a
+    /// store stamps it once, so only a tool that models a store that has
+    /// recorded for longer (a test, a restore) needs this.
+    pub fn stamp_ai_usage_since(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(AI_USAGE)?;
+            table.insert(AI_USAGE_SINCE_KEY, at.to_rfc3339().as_bytes())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
+    /// Insert `records`, skipping any whose id the table already holds.
+    /// Returns how many were inserted.
+    pub fn record_ai_usage(
+        &self,
+        records: &[crate::ai_usage::AiUsageRecord],
+    ) -> Result<usize, StateError> {
+        let txn = self.db.begin_write()?;
+        let inserted = insert_ai_usage_rows(&txn, records)?;
+        self.commit_write(txn)?;
+        Ok(inserted)
+    }
+
+    /// Every recorded AI call in the table, in id order. The spool is not
+    /// read; see [`Self::ai_usage_including_spool`].
+    pub fn list_ai_usage(&self) -> Result<Vec<crate::ai_usage::AiUsageRecord>, StateError> {
+        Ok(self.list_ai_usage_counting()?.0)
+    }
+
+    /// [`Self::list_ai_usage`], and how many rows were unreadable and skipped.
+    fn list_ai_usage_counting(
+        &self,
+    ) -> Result<(Vec<crate::ai_usage::AiUsageRecord>, usize), StateError> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(AI_USAGE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0)),
+            Err(e) => return Err(StateError::Table(e)),
+        };
+        let mut out = Vec::new();
+        let mut unreadable = 0;
+        for row in table.iter()? {
+            let (key, value) = row?;
+            if is_ai_usage_reserved_key(key.value()) {
+                continue;
+            }
+            match serde_json::from_slice(value.value()) {
+                Ok(record) => out.push(record),
+                Err(error) => {
+                    unreadable += 1;
+                    tracing::warn!(
+                        id = key.value(),
+                        %error,
+                        "skipped an unreadable AI usage row"
+                    );
+                }
+            }
+        }
+        Ok((out, unreadable))
+    }
+
+    /// The AI usage spool this store reads and drains: its state file's
+    /// [`crate::ai_usage::spool_path`]. `None` for a store with no path.
+    pub fn ai_usage_spool_path(&self) -> Option<&std::path::Path> {
+        self.ai_usage_spool.as_deref()
+    }
+
+    /// How many spooled AI usage records were dropped for good because their
+    /// line did not parse, over this store's life. Zero when none were.
+    pub fn ai_usage_dropped(&self) -> Result<u64, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(AI_USAGE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(StateError::Table(e)),
+        };
+        let Some(raw) = table.get(AI_USAGE_DROPPED_KEY)? else {
+            return Ok(0);
+        };
+        Ok(std::str::from_utf8(raw.value())
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Every recorded AI call: the spool's lines that have not been drained
+    /// yet, then the table, deduplicated by id. The spool is read FIRST, so
+    /// a drain that commits and truncates between the two reads cannot hide a
+    /// record: it is in the spool read or in the table read.
+    ///
+    /// `malformed` counts spool lines and table rows that did not parse and
+    /// are skipped. Lines a drain already dropped are in
+    /// [`Self::ai_usage_dropped`].
+    pub fn ai_usage_including_spool(&self) -> Result<crate::ai_usage::SpoolRead, StateError> {
+        let spooled = match &self.ai_usage_spool {
+            Some(path) => {
+                crate::ai_usage::read_spool(path).map_err(|source| StateError::AiUsageSpool {
+                    path: path.display().to_string(),
+                    source,
+                })?
+            }
+            None => crate::ai_usage::SpoolRead::default(),
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut records = Vec::new();
+        let (table_records, unreadable_rows) = self.list_ai_usage_counting()?;
+        for record in table_records.into_iter().chain(spooled.records) {
+            if seen.insert(record.id.clone()) {
+                records.push(record);
+            }
+        }
+        Ok(crate::ai_usage::SpoolRead {
+            records,
+            malformed: spooled.malformed + unreadable_rows,
+        })
+    }
+
+    /// Move every spooled record into the table, then empty the spool.
+    ///
+    /// Only a store opened for writing drains; a read-only store returns
+    /// `Ok(None)` and leaves the spool. The spool's lock is held from the
+    /// read through the truncate, and the truncate runs only after the insert
+    /// committed. A crash between the two leaves lines the next drain finds
+    /// already present.
+    pub fn drain_ai_usage_spool(&self) -> Result<Option<AiUsageDrain>, StateError> {
+        let (Some(path), Some(_)) = (&self.ai_usage_spool, &self._lock) else {
+            return Ok(None);
+        };
+        let mut report = AiUsageDrain::default();
+        let drained = crate::ai_usage::drain_spool(path, |read| {
+            let txn = self.db.begin_write()?;
+            let inserted = insert_ai_usage_rows(&txn, &read.records)?;
+            if read.malformed > 0 {
+                // The truncate that follows drops these lines for good.
+                // Count them in the same transaction, so the loss shows in
+                // `rocky cost`.
+                let mut table = txn.open_table(AI_USAGE)?;
+                let before = table
+                    .get(AI_USAGE_DROPPED_KEY)?
+                    .and_then(|raw| {
+                        std::str::from_utf8(raw.value())
+                            .ok()
+                            .and_then(|t| t.parse::<u64>().ok())
+                    })
+                    .unwrap_or(0);
+                let total = before.saturating_add(read.malformed as u64);
+                table.insert(AI_USAGE_DROPPED_KEY, total.to_string().as_bytes())?;
+            }
+            self.commit_write(txn)?;
+            report.inserted = inserted;
+            report.already_present = read.records.len() - inserted;
+            report.malformed = read.malformed;
+            Ok::<(), StateError>(())
+        });
+        match drained {
+            Ok(None) => Ok(None),
+            Ok(Some(_)) => Ok(Some(report)),
+            Err(crate::ai_usage::DrainError::Commit(error)) => Err(error),
+            Err(crate::ai_usage::DrainError::Io(source)) => Err(StateError::AiUsageSpool {
+                path: path.display().to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// Drop AI usage rows recorded before `cutoff`. Returns
+    /// `(deleted, kept)`. The "recording began" row is never dropped. Swept
+    /// with run history (`[state.retention]` domain `history`), by age only:
+    /// `rocky cost` already reports a month older than `max_age_days` as
+    /// partial.
+    fn sweep_ai_usage(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        dry_run: bool,
+    ) -> Result<(u64, u64), StateError> {
+        let records = self.list_ai_usage()?;
+        let stale: Vec<&str> = records
+            .iter()
+            .filter(|r| r.at < cutoff)
+            .map(|r| r.id.as_str())
+            .collect();
+        let deleted = stale.len() as u64;
+        if !dry_run && !stale.is_empty() {
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(AI_USAGE)?;
+                for id in &stale {
+                    table.remove(*id)?;
+                }
+            }
+            self.commit_write(txn)?;
+        }
+        Ok((deleted, records.len() as u64 - deleted))
+    }
+}
+
+/// Insert the records whose id `AI_USAGE` does not hold yet, in `txn`.
+fn insert_ai_usage_rows(
+    txn: &redb::WriteTransaction,
+    records: &[crate::ai_usage::AiUsageRecord],
+) -> Result<usize, StateError> {
+    let mut table = txn.open_table(AI_USAGE)?;
+    let mut inserted = 0;
+    for record in records {
+        if is_ai_usage_reserved_key(&record.id) {
+            tracing::warn!(
+                id = %record.id,
+                "dropped an AI usage record whose id is a reserved row key"
+            );
+            continue;
+        }
+        if table.get(record.id.as_str())?.is_some() {
+            continue;
+        }
+        let bytes = serde_json::to_vec(record)?;
+        table.insert(record.id.as_str(), bytes.as_slice())?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
 // --- Environments and publish history (RV1-P2, schema v32) -----------------
 
 /// Open an environment table in a read transaction, mapping "the table does
@@ -10534,6 +11067,7 @@ pub fn run_with_output_versions(
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -10569,6 +11103,7 @@ pub fn run_with_output_versions(
         run_scope: Some(RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),
+        output_volumes: Vec::new(),
     }
 }
 
@@ -11785,6 +12320,7 @@ mod tests {
             run_scope: Some(RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 
@@ -12186,6 +12722,61 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
         assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
         assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
+    }
+
+    /// A run record written before `output_volumes` existed, as the literal
+    /// JSON an older binary stored: it must read back with no output
+    /// volumes, and an `output_volumes` row that names a basis this binary
+    /// does not know must read with no basis instead of failing the record.
+    #[test]
+    fn a_pre_output_volumes_run_record_reads_and_an_unknown_basis_is_lenient() {
+        let literal = r#"{
+            "run_id": "run-old",
+            "started_at": "2026-05-01T05:00:00Z",
+            "finished_at": "2026-05-01T05:30:00Z",
+            "status": "Success",
+            "models_executed": [{
+                "model_name": "revenue_daily",
+                "started_at": "2026-05-01T05:00:00Z",
+                "finished_at": "2026-05-01T05:30:00Z",
+                "duration_ms": 1,
+                "rows_affected": null,
+                "status": "success",
+                "sql_hash": "h",
+                "bytes_scanned": null,
+                "bytes_written": null,
+                "row_count": 12
+            }],
+            "trigger": "Manual",
+            "config_hash": "config-hash",
+            "session_source": "cli",
+            "hostname": "test-host",
+            "rocky_version": "1.0.0"
+        }"#;
+        let old: RunRecord =
+            serde_json::from_str(literal).expect("a pre-output_volumes record must deserialize");
+        assert!(old.output_volumes.is_empty());
+        assert_eq!(old.models_executed[0].row_count, Some(12));
+
+        let mut value: serde_json::Value = serde_json::from_str(literal).unwrap();
+        value["output_volumes"] = serde_json::json!([
+            {
+                "product": "p", "model": "m", "basis": "partition_rows",
+                "row_count": 3, "severity": "error", "verdict": "in_range"
+            },
+            {
+                "product": "p", "model": "m", "basis": "a_basis_from_a_newer_engine",
+                "row_count": 4, "severity": "error", "verdict": "in_range"
+            }
+        ]);
+        let record: RunRecord = serde_json::from_value(value)
+            .expect("an unknown basis must not make the run record unreadable");
+        let bases: Vec<_> = record.output_volumes.iter().map(|v| v.basis).collect();
+        assert_eq!(
+            bases,
+            [Some(crate::product::spec::VolumeBasis::PartitionRows), None]
+        );
+        assert_eq!(record.output_volumes[1].row_count, Some(4));
     }
 
     #[test]
@@ -12735,6 +13326,7 @@ mod tests {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -12940,6 +13532,7 @@ mod tests {
                 upstream_freshness: None,
                 bytes_scanned: Some(1),
                 bytes_written: Some(1),
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -13244,6 +13837,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: None,
             input_hash: None,
@@ -13342,6 +13936,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    egress_bytes: None,
                     tenant: None,
                     recipe_hash: None,
                     input_hash: None,
@@ -13370,6 +13965,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    egress_bytes: None,
                     tenant: None,
                     recipe_hash: None,
                     input_hash: None,
@@ -13413,6 +14009,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    egress_bytes: None,
                     tenant: None,
                     recipe_hash: None,
                     input_hash: None,
@@ -13969,6 +14566,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some("rh".to_string()),
             input_hash: Some("ih".to_string()),
@@ -14031,6 +14629,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some("recipe-abc".to_string()),
             input_hash: Some("input-def".to_string()),
@@ -19412,7 +20011,7 @@ mod tests {
 
     /// Every `tracing` event emitted on this thread, as text.
     #[derive(Clone, Default)]
-    struct CapturedStateLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(super) struct CapturedStateLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl std::io::Write for CapturedStateLogs {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -19426,7 +20025,7 @@ mod tests {
 
     impl CapturedStateLogs {
         /// A thread-local subscriber that writes here.
-        fn install(&self) -> tracing::subscriber::DefaultGuard {
+        pub(super) fn install(&self) -> tracing::subscriber::DefaultGuard {
             let writer = self.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::TRACE)
@@ -19436,7 +20035,7 @@ mod tests {
             tracing::subscriber::set_default(subscriber)
         }
 
-        fn text(&self) -> String {
+        pub(super) fn text(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
     }
@@ -19863,7 +20462,10 @@ mod tests {
         // v34 adds the `connector_state` table (child connectors) — a new
         // table, so it IS in EXPECTED_TABLES below; guarded by
         // `test_v33_opens_and_creates_connector_state_table`. It replicates.
-        const EXPECTED_VERSION: u32 = 34;
+        // v35 adds the `ai_usage` table (recorded AI token usage) — a new
+        // table, so it IS in EXPECTED_TABLES below; guarded by
+        // `test_v34_opens_and_creates_ai_usage_table`. It is local-only.
+        const EXPECTED_VERSION: u32 = 35;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
@@ -19885,6 +20487,7 @@ mod tests {
         // `test_v30_run_progress_forward_deserializes_owed_check_targets_none`
         // and `test_store_with_owed_checks_is_refused_by_a_v30_binary`.
         const EXPECTED_TABLES: &[&str] = &[
+            "ai_usage",
             "branches",
             "check_history",
             "connector_state",
@@ -21207,5 +21810,413 @@ mod connector_state_tests {
         assert_eq!(record.commit_seq, 1);
         assert_eq!(record.envelope.value["cursor"], 7);
         assert!(!LOCAL_ONLY_TABLE_NAMES.contains(&"connector_state"));
+    }
+}
+
+#[cfg(test)]
+mod ai_usage_state_tests {
+    use super::tests::CapturedStateLogs;
+    use super::*;
+    use crate::ai_usage::{AiUsageRecord, append_to_spool, read_spool, spool_path};
+    use chrono::TimeZone;
+    use std::io::Write;
+
+    fn record(id: &str) -> AiUsageRecord {
+        AiUsageRecord {
+            id: id.to_string(),
+            at: chrono::Utc.with_ymd_and_hms(2026, 10, 3, 4, 5, 6).unwrap(),
+            command: "ai_explain".to_string(),
+            model: Some("orders".to_string()),
+            llm_model: "claude-sonnet-4-6".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+        }
+    }
+
+    /// Make the store at `path` look like one a v34 binary wrote: stamped
+    /// `34`, without the AI usage table.
+    fn force_pre_v35_store(path: &Path) {
+        force_schema_version(path, "34");
+        let db = Database::open(path).expect("reopen to drop the v35 table");
+        let txn = db.begin_write().expect("write txn");
+        txn.delete_table(AI_USAGE).expect("drop ai_usage");
+        txn.commit().expect("commit");
+    }
+
+    /// Mutation: drop the table creation or the stamp in `init` and the
+    /// upgraded store has no `ai_usage_since`.
+    #[test]
+    fn test_v34_opens_and_creates_ai_usage_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_loaded_file(
+                    "p",
+                    "f",
+                    &LoadedFileRecord {
+                        loaded_at: chrono::Utc::now(),
+                        rows_loaded: 1,
+                        bytes_read: 1,
+                        duration_ms: 0,
+                        file_hash: None,
+                    },
+                )
+                .unwrap();
+        }
+        force_pre_v35_store(&path);
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(34));
+
+        let before = chrono::Utc::now();
+        drop(StateStore::open(&path).unwrap());
+        let after = chrono::Utc::now();
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
+
+        let store = StateStore::open(&path).unwrap();
+        let since = store
+            .ai_usage_since()
+            .unwrap()
+            .expect("the upgrade stamps ai_usage_since");
+        assert!(
+            before - chrono::Duration::seconds(1) <= since
+                && since <= after + chrono::Duration::seconds(1),
+            "the stamp is the upgrade instant, not a fixed one: {since}"
+        );
+        assert!(store.list_ai_usage().unwrap().is_empty());
+        assert!(
+            store.get_loaded_file("p", "f").unwrap().is_some(),
+            "records kept"
+        );
+        assert_eq!(store.record_ai_usage(&[record("a")]).unwrap(), 1);
+        assert_eq!(store.list_ai_usage().unwrap().len(), 1);
+    }
+
+    /// The stamp is written once. A later open must not move it, or a month
+    /// the store did record would read as partial.
+    #[test]
+    fn the_ai_usage_stamp_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let early = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        {
+            let store = StateStore::open(&path).unwrap();
+            store.stamp_ai_usage_since(early).unwrap();
+        }
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.ai_usage_since().unwrap(), Some(early));
+        // The reserved row is not a call.
+        assert!(store.list_ai_usage().unwrap().is_empty());
+    }
+
+    /// Mutation: drop the tolerance and this open is refused.
+    #[test]
+    fn test_v34_store_read_only_open_tolerates_the_missing_ai_usage_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        force_pre_v35_store(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let store = StateStore::open_read_only(&path).expect("a v34 store opens read-only");
+        assert!(store.list_ai_usage().unwrap().is_empty());
+        assert_eq!(
+            store.ai_usage_since().unwrap(),
+            None,
+            "recording has not started"
+        );
+        drop(store);
+        assert!(before == std::fs::read(&path).unwrap(), "read-only wrote");
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(34));
+    }
+
+    /// The tolerance is keyed on the stamp: a v35 store without the table is
+    /// damaged and is refused read-only.
+    #[test]
+    fn test_v35_store_missing_ai_usage_table_read_only_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            assert!(txn.delete_table(AI_USAGE).unwrap());
+            txn.commit().unwrap();
+        }
+        match StateStore::open_read_only(&path).map(|_| ()) {
+            Err(StateError::ReadOnlyNeedsInit { missing, .. }) => {
+                assert_eq!(missing, vec!["ai_usage".to_string()]);
+            }
+            other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
+        }
+    }
+
+    /// Local-only: a snapshot that excludes the local-only tables carries
+    /// neither the calls nor the stamp.
+    #[test]
+    fn the_snapshot_does_not_carry_ai_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.record_ai_usage(&[record("a")]).unwrap();
+        assert!(LOCAL_ONLY_TABLE_NAMES.contains(&"ai_usage"));
+        assert!(LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE.contains(&"ai_usage"));
+        let dest = dir.path().join("snapshot.redb");
+        store
+            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
+            .unwrap();
+        let snapshot = StateStore::open(&dest).unwrap();
+        assert!(snapshot.list_ai_usage().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_dedupes_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        assert_eq!(
+            store
+                .record_ai_usage(&[record("a"), record("b"), record("a")])
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.record_ai_usage(&[record("b")]).unwrap(), 0);
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2);
+    }
+
+    /// The report reads the table and the spool and counts a record that is
+    /// in both once. Mutation: drop the dedupe and `shared` counts twice.
+    #[test]
+    fn the_report_reads_table_and_spool_and_dedupes_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        store
+            .record_ai_usage(&[record("table"), record("shared")])
+            .unwrap();
+        append_to_spool(&spool_path(&path), &[record("shared"), record("spool")]).unwrap();
+        let read = store.ai_usage_including_spool().unwrap();
+        let mut ids: Vec<&str> = read.records.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["shared", "spool", "table"]);
+    }
+
+    #[test]
+    fn a_drain_moves_the_spool_into_the_table_and_empties_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        append_to_spool(&spool_path(&path), &[record("a"), record("b")]).unwrap();
+        let drain = store.drain_ai_usage_spool().unwrap().unwrap();
+        assert_eq!(
+            drain,
+            AiUsageDrain {
+                inserted: 2,
+                already_present: 0,
+                malformed: 0
+            }
+        );
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2);
+        assert!(read_spool(&spool_path(&path)).unwrap().records.is_empty());
+        // Nothing to drain is not an error.
+        assert_eq!(
+            store.drain_ai_usage_spool().unwrap(),
+            Some(AiUsageDrain::default())
+        );
+    }
+
+    /// A crash between the commit and the truncate leaves the lines. The
+    /// next drain finds them in the table and skips them.
+    /// Mutation: insert without the id check and the second drain doubles
+    /// the rows; truncate before the commit and the failed drain loses them.
+    #[test]
+    fn a_drain_that_dies_before_truncating_loses_nothing_and_doubles_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        append_to_spool(&spool_path(&path), &[record("a"), record("b")]).unwrap();
+
+        crate::ai_usage::FAIL_TRUNCATE.with(|f| f.set(true));
+        let failed = store.drain_ai_usage_spool();
+        crate::ai_usage::FAIL_TRUNCATE.with(|f| f.set(false));
+        assert!(failed.is_err(), "the injected truncate failure surfaces");
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2, "committed");
+        assert_eq!(
+            read_spool(&spool_path(&path)).unwrap().records.len(),
+            2,
+            "the lines are still there"
+        );
+        // The report still counts each call once.
+        assert_eq!(store.ai_usage_including_spool().unwrap().records.len(), 2);
+
+        let drain = store.drain_ai_usage_spool().unwrap().unwrap();
+        assert_eq!(drain.inserted, 0);
+        assert_eq!(drain.already_present, 2);
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2);
+        assert!(read_spool(&spool_path(&path)).unwrap().records.is_empty());
+    }
+
+    /// Only the process that holds the writer drains. A read-only store
+    /// leaves the spool alone.
+    #[test]
+    fn a_read_only_store_does_not_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        append_to_spool(&spool_path(&path), &[record("a")]).unwrap();
+        let store = StateStore::open_read_only(&path).unwrap();
+        assert_eq!(store.drain_ai_usage_spool().unwrap(), None);
+        assert_eq!(read_spool(&spool_path(&path)).unwrap().records.len(), 1);
+        assert_eq!(store.ai_usage_including_spool().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_spool_line_is_counted_and_dropped_by_the_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        append_to_spool(&spool_path(&path), &[record("a")]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(spool_path(&path))
+            .unwrap()
+            .write_all(b"not json\n")
+            .unwrap();
+        assert_eq!(store.ai_usage_including_spool().unwrap().malformed, 1);
+        let drain = store.drain_ai_usage_spool().unwrap().unwrap();
+        assert_eq!((drain.inserted, drain.malformed), (1, 1));
+    }
+
+    /// A drain drops unparseable lines for good. The count is stored, so
+    /// `rocky cost` can say so long after the spool is empty. Mutation: drop
+    /// the counter write and `ai_usage_dropped` stays 0.
+    #[test]
+    fn a_drain_persists_how_many_lines_it_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.ai_usage_dropped().unwrap(), 0);
+        for _ in 0..2 {
+            append_to_spool(&spool_path(&path), &[record("a")]).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(spool_path(&path))
+                .unwrap()
+                .write_all(b"not json\n\xff\n")
+                .unwrap();
+            store.drain_ai_usage_spool().unwrap().unwrap();
+        }
+        assert_eq!(
+            store.ai_usage_dropped().unwrap(),
+            4,
+            "2 lines, drained twice"
+        );
+        assert!(read_spool(&spool_path(&path)).unwrap().records.is_empty());
+        // The counter is a reserved row, never a record.
+        assert_eq!(store.list_ai_usage().unwrap().len(), 1);
+        drop(store);
+        let reopened = StateStore::open_read_only(&path).unwrap();
+        assert_eq!(reopened.ai_usage_dropped().unwrap(), 4, "survives a reopen");
+    }
+
+    /// A table row that does not decode is skipped and counted in the report
+    /// read. Mutation: drop the count and `malformed` stays 0.
+    #[test]
+    fn an_unreadable_table_row_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        store.record_ai_usage(&[record("good")]).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(AI_USAGE).unwrap();
+                table.insert("bad", b"not json".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let read = store.ai_usage_including_spool().unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.malformed, 1);
+    }
+
+    /// A spool record whose id is a reserved row key is dropped with a
+    /// warning, and never overwrites the stamp or the counter. Mutation: drop
+    /// the guard and the record replaces the "recording began" row; drop the
+    /// warn and the loss is silent.
+    #[test]
+    fn a_record_with_a_reserved_id_is_dropped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        let stamp = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        store.stamp_ai_usage_since(stamp).unwrap();
+        let logs = CapturedStateLogs::default();
+        let _guard = logs.install();
+        let inserted = store
+            .record_ai_usage(&[record(AI_USAGE_SINCE_KEY), record(AI_USAGE_DROPPED_KEY)])
+            .unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(store.ai_usage_since().unwrap(), Some(stamp));
+        assert_eq!(store.ai_usage_dropped().unwrap(), 0);
+        let text = logs.text();
+        assert!(text.contains("reserved row key"), "{text}");
+        assert!(text.contains(AI_USAGE_SINCE_KEY), "{text}");
+    }
+
+    /// A store stamped below this binary's schema is not opened by an AI
+    /// command: the open would upgrade it in place and a pinned older binary
+    /// would then refuse it. The records spool instead. Mutation: drop the
+    /// peek and the store is upgraded to v35.
+    #[test]
+    fn recording_does_not_upgrade_an_older_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        force_pre_v35_store(&path);
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(34));
+        let mut call = record("a");
+        call.at = chrono::Utc::now() - chrono::Duration::days(1);
+        let outcome = crate::ai_usage::record_or_spool(&path, &[call.clone()]).unwrap();
+        assert_eq!(outcome, crate::ai_usage::RecordOutcome::Spooled);
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(34),
+            "the store is still v34"
+        );
+        assert_eq!(read_spool(&spool_path(&path)).unwrap().records.len(), 1);
+        // The owner of the store upgrades it and drains the spool; the
+        // "recording began" stamp is then later than the spooled call.
+        let store = StateStore::open(&path).unwrap();
+        store.drain_ai_usage_spool().unwrap();
+        assert_eq!(store.list_ai_usage().unwrap().len(), 1);
+        assert!(store.ai_usage_since().unwrap().unwrap() > call.at);
+    }
+
+    /// Retention sweeps old calls with history, by age, and keeps the stamp.
+    #[test]
+    fn the_sweep_removes_old_calls_and_keeps_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let mut old = record("old");
+        old.at = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let mut new = record("new");
+        new.at = chrono::Utc::now();
+        store.record_ai_usage(&[old, new]).unwrap();
+        let since = store.ai_usage_since().unwrap();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        assert_eq!(store.sweep_ai_usage(cutoff, true).unwrap(), (1, 1));
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2, "dry run");
+        assert_eq!(store.sweep_ai_usage(cutoff, false).unwrap(), (1, 1));
+        let ids: Vec<String> = store
+            .list_ai_usage()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["new"]);
+        assert_eq!(store.ai_usage_since().unwrap(), since);
     }
 }

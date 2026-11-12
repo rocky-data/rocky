@@ -8,7 +8,13 @@
 /**
  * A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.
  */
-export type CostUnit = "compute_ms" | "storage_byte_hours_data_files" | "storage_byte_hours_allocated_blocks";
+export type CostUnit =
+  | "compute_ms"
+  | "storage_byte_hours_data_files"
+  | "storage_byte_hours_allocated_blocks"
+  | "egress_bytes"
+  | "ai_input_tokens"
+  | "ai_output_tokens";
 /**
  * What a [`MoneyPart`] prices.
  */
@@ -37,7 +43,7 @@ export type ProductBudgetBreachAction = "warn";
 /**
  * `rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.
  *
- * For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.
+ * For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly, AI tokens included. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. An AI call about a model a product owns is charged to that product; every other call is `unallocated`. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.
  */
 export interface ProductMonthCostOutput {
   /**
@@ -80,7 +86,7 @@ export interface ProductMonthCostOutput {
    */
   products: ProductMonthCost[];
   /**
-   * Shadow and branch compute. Real spend, but not production.
+   * Shadow and branch compute, and egress where reported. Real spend, but not production.
    */
   shadow_branch: CostAmount[];
   /**
@@ -109,7 +115,7 @@ export interface ProductMonthCostOutput {
  */
 export interface CostAmount {
   /**
-   * Whole units. Milliseconds, or byte-hours rounded down per interval.
+   * Whole units: milliseconds, byte-hours rounded down per interval, bytes, or tokens.
    */
   amount: number;
   unit: CostUnit;
@@ -131,6 +137,18 @@ export interface MoneyPart {
  * Executions the monthly report could not measure. Counts, never amounts.
  */
 export interface CostNotMeasured {
+  /**
+   * AI calls this month whose response did not report both token counts. They add nothing to the AI amounts.
+   */
+  ai_calls_without_usage?: number;
+  /**
+   * AI usage records the state store could not read: spool lines that did not parse (dropped when the spool was drained, or skipped now) and table rows it could not decode. Their tokens are in no AI amount, so the AI figure is a floor when this is above zero.
+   */
+  ai_records_dropped?: number;
+  /**
+   * Production executions this month that reported no egress, counted only when at least one execution did report it (then the egress figure is a floor). Zero when none reported: egress is then not measured at all.
+   */
+  egress_unreported_executions?: number;
   /**
    * Production executions that failed and recorded no time; their compute is lost. One that wrote its table is still a version.
    */
@@ -178,7 +196,7 @@ export interface ProductMonthCost {
    */
   kept: CostAmount[];
   /**
-   * `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.
+   * `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute, storage, egress when an adapter reported it this month, and AI tokens when this state store recorded calls this month and recorded the whole month. A figure whose part is `not_measured` or (for AI tokens) `partial` is not in it.
    */
   money?: number | null;
   /**
@@ -264,7 +282,7 @@ export interface ProductBudgetCheck {
   limit: number;
   limit_type: ProductBudgetLimitType;
   /**
-   * Why the limit is `not_evaluated`.
+   * Why the limit is `not_evaluated`. On a `max_usd` limit that is `breached` from the priced figures alone (`actual` is then that floor), what the figure leaves out.
    */
   reason?: string | null;
   /**

@@ -1,0 +1,22 @@
+default_environment: dev
+project_id: rocky-poc-meltano-connector-shim
+environments:
+  - name: dev
+send_anonymous_usage_stats: false
+plugins:
+  extractors:
+    # The tap is defined here, not fetched from Meltano Hub, so setup needs
+    # only PyPI. `pip_url` installs the local tap-orders package.
+    - name: tap-orders
+      namespace: tap_orders
+      pip_url: ./tap-orders
+      executable: tap-orders
+      capabilities:
+        - catalog
+        - discover
+        - state
+      settings:
+        - name: data_dir
+      config:
+        # Relative to the project directory, where the shim runs the tap.
+        data_dir: data
