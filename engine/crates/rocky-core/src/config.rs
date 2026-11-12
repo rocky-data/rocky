@@ -5897,7 +5897,9 @@ pub enum AdapterKind {
 }
 
 /// One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"`
-/// adapter attaches to its connection under `alias`.
+/// adapter attaches to its connection under `alias`. `type` picks the kind.
+///
+/// An Iceberg REST catalog (`docs/adr/ADR-ICEBERG-DUCKDB.md`):
 ///
 /// ```toml
 /// [[adapter.lake.attach]]
@@ -5913,16 +5915,63 @@ pub enum AdapterKind {
 /// url_style = "path"
 /// use_ssl = false
 /// ```
+///
+/// A DuckLake catalog with DuckDB-file metadata (`docs/adr/ADR-DUCKLAKE.md`):
+///
+/// ```toml
+/// [[adapter.lake.attach]]
+/// alias = "dl"
+/// type = "ducklake"
+/// metadata_path = "lake/metadata.ducklake"
+/// data_path = "lake/data/"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DuckDbAttach {
+    /// An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
+    Iceberg(DuckDbIcebergAttach),
+    /// A DuckLake catalog, through DuckDB's `ducklake` extension.
+    #[serde(rename = "ducklake")]
+    DuckLake(DuckDbDuckLakeAttach),
+}
+
+impl DuckDbAttach {
+    /// The catalog name models use to target this attachment.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        match self {
+            Self::Iceberg(a) => &a.alias,
+            Self::DuckLake(a) => &a.alias,
+        }
+    }
+
+    /// The kind of catalog this entry attaches.
+    #[must_use]
+    pub const fn kind(&self) -> crate::traits::CatalogKind {
+        match self {
+            Self::Iceberg(_) => crate::traits::CatalogKind::IcebergRest,
+            Self::DuckLake(_) => crate::traits::CatalogKind::DuckLake,
+        }
+    }
+
+    /// The entry's S3 settings, if any.
+    #[must_use]
+    pub const fn s3(&self) -> Option<&DuckDbAttachS3> {
+        match self {
+            Self::Iceberg(a) => a.s3.as_ref(),
+            Self::DuckLake(a) => a.s3.as_ref(),
+        }
+    }
+}
+
+/// A `type = "iceberg"` attachment: an Iceberg REST catalog.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct DuckDbAttach {
+pub struct DuckDbIcebergAttach {
     /// The catalog name models use to target this attachment. A SQL
     /// identifier. It must not be `memory`, `main`, `temp`, `system`, the
     /// database file's own catalog name or another entry's alias.
     pub alias: String,
-    /// What the attachment is. Only `"iceberg"` (an Iceberg REST catalog).
-    #[serde(rename = "type")]
-    pub attach_type: DuckDbAttachType,
     /// The warehouse name the REST catalog knows.
     pub warehouse: EnvString,
     /// The REST catalog's base URL, for example `http://localhost:8181/catalog`.
@@ -5936,12 +5985,34 @@ pub struct DuckDbAttach {
     pub s3: Option<DuckDbAttachS3>,
 }
 
-/// The kind of catalog a [`DuckDbAttach`] entry attaches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum DuckDbAttachType {
-    /// An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
-    Iceberg,
+/// A `type = "ducklake"` attachment: a DuckLake catalog whose metadata is a
+/// DuckDB file. Data files go to `data_path`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DuckDbDuckLakeAttach {
+    /// The catalog name models use to target this attachment. The same rules
+    /// as an Iceberg alias, and it must not start with
+    /// `__ducklake_metadata_` (DuckLake's own metadata catalog).
+    pub alias: String,
+    /// The DuckDB file that holds the DuckLake metadata. A relative path is
+    /// made absolute against the working directory when Rocky connects, as
+    /// the adapter's own `path` is. It must not be the adapter's own `path`,
+    /// and it must not hold a `:` (v1 supports a local DuckDB file only).
+    pub metadata_path: EnvString,
+    /// Where DuckLake writes the Parquet data files: a local directory (an
+    /// `s3://` prefix is refused until it has a conformance case). A
+    /// relative path is made absolute when Rocky
+    /// connects, because DuckLake stores it verbatim and would resolve it
+    /// against each later process's working directory. When unset, DuckLake
+    /// uses the path it stored when the catalog was created
+    /// (`<metadata_path>.files/` for a new catalog).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_path: Option<EnvString>,
+    /// Object-store credentials for a future `s3://` `data_path`. Refused by
+    /// `rocky validate` today; the attach step would scope its secret to
+    /// `data_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<DuckDbAttachS3>,
 }
 
 /// How a [`DuckDbAttach`] entry authenticates to its catalog.
@@ -9625,6 +9696,32 @@ pub fn load_rocky_config_fingerprinted(path: &Path) -> Result<LoadedConfig, Conf
 /// adapter's connect step), because it depends on how DuckDB names a file.
 pub const DUCKDB_RESERVED_ATTACH_ALIASES: &[&str] = &["memory", "main", "temp", "system"];
 
+/// The catalog-name prefix DuckLake gives its hidden metadata catalog
+/// (`__ducklake_metadata_<alias>`). No alias may start with it.
+pub const DUCKLAKE_METADATA_CATALOG_PREFIX: &str = "__ducklake_metadata_";
+
+/// `C:\\…` or `C:/…`: a Windows drive path, whose colon is not a scheme.
+fn is_windows_drive(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// Whether two local paths name the same file, compared lexically after
+/// making both absolute against the working directory. A symlink is not
+/// followed: the adapter's connect step compares canonical paths again.
+fn same_local_path(a: &str, b: &str) -> bool {
+    let abs = |p: &str| {
+        let p = std::path::Path::new(p);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        }
+    };
+    let norm = |p: std::path::PathBuf| -> std::path::PathBuf { p.components().collect() };
+    norm(abs(a)) == norm(abs(b))
+}
+
 /// `[[adapter.<name>.attach]]` is a DuckDB setting: refuse it on any other
 /// adapter type, and refuse an alias that is not an identifier, is reserved,
 /// or repeats another alias of the same adapter (case-insensitively, as
@@ -9651,37 +9748,94 @@ pub fn validate_duckdb_attachments(config: &RockyConfig) -> Vec<ConfigError> {
         }
         let mut seen = std::collections::HashSet::new();
         for (index, entry) in adapter.attach.iter().enumerate() {
-            if let Err(e) = rocky_sql::validation::validate_identifier(&entry.alias) {
+            let alias = entry.alias();
+            if let Err(e) = rocky_sql::validation::validate_identifier(alias) {
                 invalid(format!("attach[{index}].alias: {e}"));
                 continue;
             }
-            let lower = entry.alias.to_ascii_lowercase();
+            let lower = alias.to_ascii_lowercase();
             if DUCKDB_RESERVED_ATTACH_ALIASES.contains(&lower.as_str()) {
                 invalid(format!(
-                    "attach[{index}].alias '{}' is a DuckDB built-in catalog name; choose another",
-                    entry.alias
+                    "attach[{index}].alias '{alias}' is a DuckDB built-in catalog name; choose another"
+                ));
+                continue;
+            }
+            if lower.starts_with(DUCKLAKE_METADATA_CATALOG_PREFIX) {
+                invalid(format!(
+                    "attach[{index}].alias '{alias}' starts with \
+                     '{DUCKLAKE_METADATA_CATALOG_PREFIX}', the prefix of DuckLake's own \
+                     metadata catalogs; choose another"
                 ));
                 continue;
             }
             if !seen.insert(lower) {
                 invalid(format!(
-                    "attach[{index}].alias '{}' is used by another attachment",
-                    entry.alias
+                    "attach[{index}].alias '{alias}' is used by another attachment"
                 ));
             }
-            if entry.warehouse.expose().is_empty() {
-                invalid(format!("attach[{index}].warehouse is empty"));
-            }
-            if entry.endpoint.expose().is_empty() {
-                invalid(format!("attach[{index}].endpoint is empty"));
+            match entry {
+                DuckDbAttach::Iceberg(a) => {
+                    if a.warehouse.expose().is_empty() {
+                        invalid(format!("attach[{index}].warehouse is empty"));
+                    }
+                    if a.endpoint.expose().is_empty() {
+                        invalid(format!("attach[{index}].endpoint is empty"));
+                    }
+                }
+                DuckDbAttach::DuckLake(a) => {
+                    let metadata = a.metadata_path.expose();
+                    if metadata.is_empty() {
+                        invalid(format!("attach[{index}].metadata_path is empty"));
+                    } else if metadata.contains(':') && !is_windows_drive(metadata) {
+                        invalid(format!(
+                            "attach[{index}].metadata_path '{metadata}' is not a local file; \
+                             v1 keeps DuckLake metadata in a local DuckDB file only (a ':' \
+                             would name another metadata kind, such as sqlite: or postgres:)"
+                        ));
+                    } else if adapter
+                        .path
+                        .as_ref()
+                        .is_some_and(|own| same_local_path(own.expose(), metadata))
+                    {
+                        invalid(format!(
+                            "attach[{index}].metadata_path is the adapter's own `path`; \
+                             DuckLake metadata needs a file of its own"
+                        ));
+                    }
+                    // v1 writes a local data directory only: an object-store data
+                    // path has no conformance case yet (ADR-DUCKLAKE D1).
+                    match a.data_path.as_ref().map(EnvString::expose) {
+                        Some("") => invalid(format!("attach[{index}].data_path is empty")),
+                        Some(data) if data.contains("://") => {
+                            invalid(format!(
+                                "attach[{index}].data_path '{data}': only a local directory is \
+                                 supported for a DuckLake catalog today"
+                            ));
+                        }
+                        _ => {}
+                    }
+                    if a.s3.is_some() {
+                        invalid(format!(
+                            "attach[{index}].s3: a DuckLake catalog takes a local data_path \
+                             only today, so it has no S3 secret"
+                        ));
+                    }
+                }
             }
         }
         // An unscoped S3 secret covers every `s3://` path. With two, DuckDB
-        // could read one catalog's files with the other's key.
-        let with_s3 = adapter.attach.iter().filter(|e| e.s3.is_some()).count();
+        // could read one catalog's files with the other's key. A DuckLake
+        // secret is scoped to its `data_path` by default, so it counts as
+        // scoped.
+        let with_s3 = adapter.attach.iter().filter(|e| e.s3().is_some()).count();
         if with_s3 > 1 {
             for (index, entry) in adapter.attach.iter().enumerate() {
-                if entry.s3.as_ref().is_some_and(|s3| s3.scope.is_none()) {
+                let unscoped = match entry {
+                    DuckDbAttach::Iceberg(a) => a.s3.as_ref().is_some_and(|s3| s3.scope.is_none()),
+                    // Its scope defaults to its data_path.
+                    DuckDbAttach::DuckLake(_) => false,
+                };
+                if unscoped {
                     invalid(format!(
                         "attach[{index}].s3 has no `scope`; with more than one attachment, \
                          each S3 secret needs one (for example scope = \"s3://<bucket>\")"
@@ -18326,7 +18480,9 @@ use_ssl = false
         let cfg = parse_rocky_config_str(ATTACH_BLOCK).expect("parses");
         let adapter = &cfg.adapters["default"];
         assert_eq!(adapter.attach.len(), 1);
-        let entry = &adapter.attach[0];
+        let DuckDbAttach::Iceberg(entry) = &adapter.attach[0] else {
+            panic!("an Iceberg entry");
+        };
         assert_eq!(entry.alias, "lk");
         assert_eq!(entry.authorization, DuckDbAttachAuthorization::None);
         let s3 = entry.s3.as_ref().expect("s3 block");
@@ -18402,6 +18558,99 @@ use_ssl = false
                      scope = \"s3://b\"\n"
                 ),
                 "attach[0].s3 has no `scope`",
+            ),
+        ];
+        for (toml_text, needle) in cases {
+            let cfg = parse_rocky_config_str(&toml_text).expect("parses");
+            let errors = validate_duckdb_attachments(&cfg);
+            assert!(
+                errors.iter().any(|e| e.to_string().contains(needle)),
+                "{needle}: {errors:?}"
+            );
+        }
+    }
+
+    const DUCKLAKE_BLOCK: &str = r#"
+[adapter]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[[adapter.attach]]
+alias = "dl"
+type = "ducklake"
+metadata_path = "lake/metadata.ducklake"
+data_path = "lake/data/"
+"#;
+
+    /// `type = "ducklake"` parses into its own variant, next to an Iceberg
+    /// entry whose TOML is unchanged.
+    #[test]
+    fn duckdb_attach_parses_a_ducklake_entry() {
+        let text = format!(
+            "{DUCKLAKE_BLOCK}\n[[adapter.attach]]\nalias = \"lk\"\ntype = \"iceberg\"\n\
+             warehouse = \"w\"\nendpoint = \"http://x\"\n"
+        );
+        let cfg = parse_rocky_config_str(&text).expect("parses");
+        let attach = &cfg.adapters["default"].attach;
+        let DuckDbAttach::DuckLake(dl) = &attach[0] else {
+            panic!("a DuckLake entry: {attach:?}");
+        };
+        assert_eq!(dl.alias, "dl");
+        assert_eq!(dl.metadata_path.expose(), "lake/metadata.ducklake");
+        assert_eq!(
+            dl.data_path.as_ref().map(EnvString::expose),
+            Some("lake/data/")
+        );
+        assert_eq!(attach[0].kind(), crate::traits::CatalogKind::DuckLake);
+        assert_eq!(attach[1].kind(), crate::traits::CatalogKind::IcebergRest);
+        assert!(validate_duckdb_attachments(&cfg).is_empty());
+        // Iceberg keys are refused on a DuckLake entry.
+        let bad = DUCKLAKE_BLOCK.replace(
+            "data_path = \"lake/data/\"",
+            "data_path = \"lake/data/\"\nwarehouse = \"w\"",
+        );
+        let err = parse_rocky_config_str(&bad).expect_err("must reject");
+        assert!(err.to_string().contains("warehouse"), "{err}");
+    }
+
+    #[test]
+    fn duckdb_attach_validation_refuses_bad_ducklake_entries() {
+        let cases = [
+            (
+                DUCKLAKE_BLOCK.replace("alias = \"dl\"", "alias = \"__ducklake_metadata_x\""),
+                "__ducklake_metadata_",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/metadata.ducklake", "warehouse.duckdb"),
+                "adapter's own `path`",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/metadata.ducklake", "./warehouse.duckdb"),
+                "adapter's own `path`",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/metadata.ducklake", "sqlite:meta.db"),
+                "not a local file",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/metadata.ducklake", "postgres:dbname=x"),
+                "not a local file",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/metadata.ducklake", ""),
+                "metadata_path is empty",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/data/", "gs://bucket/x"),
+                "only a local directory",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/data/", "s3://bucket/x/"),
+                "only a local directory",
+            ),
+            (
+                format!("{DUCKLAKE_BLOCK}\n[adapter.attach.s3]\nkey_id = \"k\"\n"),
+                "has no S3 secret",
             ),
         ];
         for (toml_text, needle) in cases {

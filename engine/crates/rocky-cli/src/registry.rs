@@ -252,8 +252,9 @@ static DUCKDB_DIALECT: rocky_duckdb::dialect::DuckDbSqlDialect =
     rocky_duckdb::dialect::DuckDbSqlDialect::plain();
 
 /// The dialect a `duckdb` adapter block renders with: it knows the block's
-/// `[[attach]]` Iceberg aliases, so `rocky plan` renders what `rocky run`
-/// executes without connecting (ADR-ICEBERG-DUCKDB D2). `None` for any other
+/// `[[attach]]` aliases and their kinds, so `rocky plan` renders what
+/// `rocky run` executes without connecting (ADR-ICEBERG-DUCKDB D2,
+/// ADR-DUCKLAKE D3). `None` for any other
 /// adapter type, and for a block with no attachment (the caller's default
 /// is the same dialect).
 #[cfg(feature = "duckdb")]
@@ -264,9 +265,7 @@ pub(crate) fn duckdb_dialect_for_config(
         return None;
     }
     Some(Box::new(
-        rocky_duckdb::dialect::DuckDbSqlDialect::with_iceberg_catalogs(
-            adapter_cfg.attach.iter().map(|a| &a.alias),
-        ),
+        rocky_duckdb::dialect::DuckDbSqlDialect::with_attachments(&adapter_cfg.attach),
     ))
 }
 
@@ -560,8 +559,9 @@ impl AdapterRegistry {
                         })?
                     };
 
-                    // `[[adapter.<name>.attach]]`: attach the Iceberg catalogs on
-                    // the same connection (ADR-ICEBERG-DUCKDB D1). The error
+                    // `[[adapter.<name>.attach]]`: attach the Iceberg and DuckLake
+                    // catalogs on the same connection (ADR-ICEBERG-DUCKDB D1,
+                    // ADR-DUCKLAKE D1). The error
                     // renders resolved `${VAR}` values as their names.
                     let warehouse_adapter = warehouse_adapter
                         .with_attachments(&adapter_cfg.attach, &extensions)

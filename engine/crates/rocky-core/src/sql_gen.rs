@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::incremental_filter;
 use crate::lakehouse::{self, LakehouseError};
-use crate::traits::{AdapterError, SqlDialect, TableReplace};
+use crate::traits::{AdapterError, CatalogKind, SqlDialect, TableReplace};
 use rocky_ir::{
     ArchivePlanIr, ColumnSelection, CompactPlanIr, MaterializationStrategy, ModelIr,
     ModelIrVariant, PartitionWindow,
@@ -576,7 +576,7 @@ pub fn generate_transformation_sql_with_warehouse(
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
-    refuse_on_in_place_catalog(model_ir, dialect)?;
+    refuse_on_catalog_kind(model_ir, dialect)?;
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
@@ -1051,23 +1051,64 @@ pub fn in_place_overwrite_statements(
     ]
 }
 
-/// Refuse, before any SQL runs, a model that writes to an in-place-overwrite
-/// catalog (an attached Iceberg catalog) with anything but `full_refresh` or
-/// an append `incremental` (ADR-ICEBERG-DUCKDB D4). The error names the
-/// strategy and the catalog.
+/// Refuse, before any SQL runs, a model whose strategy Rocky does not write
+/// to its target's kind of catalog ([`SqlDialect::catalog_kind`]). The error
+/// names the strategy and the catalog.
+///
+/// - An attached Iceberg catalog takes `full_refresh` and an append
+///   `incremental` only (ADR-ICEBERG-DUCKDB D4).
+/// - An attached DuckLake catalog takes every table strategy except
+///   `microbatch`, `snapshot` and `content_addressed`; it refuses views,
+///   materialized views, dynamic tables and a lakehouse `format`
+///   (ADR-DUCKLAKE D3).
+///
+/// A target catalog named like DuckLake's hidden metadata catalog
+/// (`__ducklake_metadata_<alias>`) is refused on every dialect: writing
+/// there would edit a lake's catalog tables.
 ///
 /// # Errors
 ///
 /// [`SqlGenError::InvalidRequest`] naming what is not supported.
-pub fn refuse_on_in_place_catalog(
+pub fn refuse_on_catalog_kind(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<(), SqlGenError> {
     let catalog = &model_ir.target.catalog;
-    if dialect.table_replace(catalog) != TableReplace::InPlaceOverwrite {
-        return Ok(());
+    let kind = dialect.catalog_kind(catalog);
+    let (refused, supported): (Option<&str>, &str) = match kind {
+        CatalogKind::Native => return Ok(()),
+        CatalogKind::DuckLakeMetadata => {
+            return Err(SqlGenError::InvalidRequest(format!(
+                "model '{}': catalog '{catalog}' is {}",
+                model_ir.name,
+                kind.describe()
+            )));
+        }
+        CatalogKind::IcebergRest => (
+            iceberg_refusal(&model_ir.materialization),
+            "full_refresh and append incremental only (ADR-ICEBERG-DUCKDB)",
+        ),
+        CatalogKind::DuckLake => (
+            ducklake_refusal(&model_ir.materialization),
+            "full_refresh, ephemeral, incremental, merge, delete_insert and time_interval \
+             only (ADR-DUCKLAKE)",
+        ),
+    };
+    let refused = refused.or_else(|| model_ir.format.is_some().then_some("a lakehouse `format`"));
+    match refused {
+        None => Ok(()),
+        Some(what) => Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': {what} is not supported on catalog '{catalog}', {}; Rocky writes it \
+             with {supported}",
+            model_ir.name,
+            kind.describe(),
+        ))),
     }
-    let refused: Option<&str> = match &model_ir.materialization {
+}
+
+/// What an attached Iceberg catalog does not take, or `None`.
+fn iceberg_refusal(materialization: &MaterializationStrategy) -> Option<&'static str> {
+    match materialization {
         MaterializationStrategy::FullRefresh | MaterializationStrategy::Ephemeral => None,
         MaterializationStrategy::Incremental {
             unique_key,
@@ -1091,16 +1132,27 @@ pub fn refuse_on_in_place_catalog(
         MaterializationStrategy::Microbatch { .. } => Some("microbatch"),
         MaterializationStrategy::ContentAddressed { .. } => Some("content_addressed"),
         MaterializationStrategy::Snapshot(_) => Some("snapshot"),
-    };
-    let refused = refused.or_else(|| model_ir.format.is_some().then_some("a lakehouse `format`"));
-    match refused {
-        None => Ok(()),
-        Some(what) => Err(SqlGenError::InvalidRequest(format!(
-            "model '{}': {what} is not supported on catalog '{catalog}', an attached Iceberg \
-             catalog; Rocky writes it with full_refresh and append incremental only \
-             (ADR-ICEBERG-DUCKDB)",
-            model_ir.name
-        ))),
+    }
+}
+
+/// What an attached DuckLake catalog does not take, or `None`.
+fn ducklake_refusal(materialization: &MaterializationStrategy) -> Option<&'static str> {
+    match materialization {
+        MaterializationStrategy::FullRefresh
+        | MaterializationStrategy::Ephemeral
+        | MaterializationStrategy::Incremental { .. }
+        | MaterializationStrategy::Merge { .. }
+        | MaterializationStrategy::DeleteInsert { .. }
+        | MaterializationStrategy::TimeInterval { .. } => None,
+        // A view stored in DuckLake binds its two-part names against the
+        // lake, not the main database, so it can read another table than the
+        // same SQL as a table model would (measured, ADR-DUCKLAKE D3).
+        MaterializationStrategy::View => Some("view"),
+        MaterializationStrategy::MaterializedView => Some("materialized_view"),
+        MaterializationStrategy::DynamicTable { .. } => Some("dynamic_table"),
+        MaterializationStrategy::Microbatch { .. } => Some("microbatch"),
+        MaterializationStrategy::ContentAddressed { .. } => Some("content_addressed"),
+        MaterializationStrategy::Snapshot(_) => Some("snapshot"),
     }
 }
 
@@ -4051,6 +4103,13 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 TableReplace::Atomic
             }
         }
+        fn catalog_kind(&self, catalog: &str) -> CatalogKind {
+            match catalog {
+                "lk" => CatalogKind::IcebergRest,
+                "dl" => CatalogKind::DuckLake,
+                _ => CatalogKind::reserved(catalog).unwrap_or(CatalogKind::Native),
+            }
+        }
         fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
             self.0.format_table_ref(c, s, t)
         }
@@ -4140,7 +4199,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         let d = InPlaceDialect(TestDialect);
         let stmts = generate_transformation_sql(&sample_transformation_ir(), &d).unwrap();
         assert_eq!(stmts.len(), 1);
-        assert!(refuse_on_in_place_catalog(&sample_transformation_ir(), &d).is_ok());
+        assert!(refuse_on_catalog_kind(&sample_transformation_ir(), &d).is_ok());
     }
 
     #[test]
@@ -4190,7 +4249,119 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             lookback: None,
             filter_column: None,
         });
-        assert!(refuse_on_in_place_catalog(&ir, &d).is_ok());
+        assert!(refuse_on_catalog_kind(&ir, &d).is_ok());
+    }
+
+    fn ducklake_ir(strategy: MaterializationStrategy) -> ModelIr {
+        let mut ir = lake_ir(strategy);
+        ir.target.catalog = "dl".into();
+        ir
+    }
+
+    #[test]
+    fn a_ducklake_catalog_takes_every_table_strategy() {
+        let d = InPlaceDialect(TestDialect);
+        let supported = [
+            MaterializationStrategy::FullRefresh,
+            MaterializationStrategy::Ephemeral,
+            MaterializationStrategy::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: rocky_ir::ColumnSelection::All,
+            },
+            MaterializationStrategy::DeleteInsert {
+                partition_by: vec!["id".into()],
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "ts".into(),
+                unique_key: vec!["id".into()],
+                lookback: None,
+                filter_column: None,
+            },
+        ];
+        for strategy in supported {
+            let ir = ducklake_ir(strategy);
+            assert!(refuse_on_catalog_kind(&ir, &d).is_ok(), "{ir:?}");
+        }
+        // A DuckLake full refresh is an atomic CREATE OR REPLACE, not the
+        // Iceberg transaction.
+        let stmts =
+            generate_transformation_sql(&ducklake_ir(MaterializationStrategy::FullRefresh), &d)
+                .unwrap();
+        assert_eq!(stmts.len(), 1, "{stmts:?}");
+        assert!(stmts[0].contains("dl.silver.dim_accounts"), "{stmts:?}");
+    }
+
+    #[test]
+    fn a_ducklake_catalog_refuses_what_it_cannot_hold() {
+        let d = InPlaceDialect(TestDialect);
+        let cases = [
+            (MaterializationStrategy::View, "view"),
+            (
+                MaterializationStrategy::MaterializedView,
+                "materialized_view",
+            ),
+            (
+                MaterializationStrategy::DynamicTable {
+                    target_lag: "1 hour".into(),
+                },
+                "dynamic_table",
+            ),
+            (
+                MaterializationStrategy::Microbatch {
+                    timestamp_column: "ts".into(),
+                    granularity: rocky_ir::TimeGrain::Hour,
+                },
+                "microbatch",
+            ),
+            (
+                MaterializationStrategy::ContentAddressed {
+                    storage_prefix: "s3://b/t".into(),
+                    partition_columns: vec![],
+                },
+                "content_addressed",
+            ),
+            (
+                MaterializationStrategy::Snapshot(Box::new(rocky_ir::snapshot::SnapshotSpec {
+                    unique_key: vec!["id".into()],
+                    change: rocky_ir::snapshot::SnapshotChangeStrategy::Check {
+                        check_cols: rocky_ir::snapshot::SnapshotCheckColumns::All,
+                        updated_at: None,
+                    },
+                    hard_deletes: rocky_ir::snapshot::SnapshotHardDeletes::NewRecord,
+                    meta_columns: rocky_ir::snapshot::SnapshotMetaColumns::default(),
+                    valid_to_current: None,
+                })),
+                "snapshot",
+            ),
+        ];
+        for (strategy, word) in cases {
+            let err = refuse_on_catalog_kind(&ducklake_ir(strategy), &d)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(word), "{err}");
+            assert!(err.contains("catalog 'dl'"), "{err}");
+            assert!(err.contains("DuckLake"), "{err}");
+        }
+        let mut ir = ducklake_ir(MaterializationStrategy::FullRefresh);
+        ir.format = Some(rocky_ir::LakehouseFormat::IcebergTable);
+        let err = refuse_on_catalog_kind(&ir, &d).unwrap_err().to_string();
+        assert!(err.contains("lakehouse `format`"), "{err}");
+    }
+
+    /// The hidden metadata catalog is refused as a target even on a native
+    /// catalog of a dialect that knows nothing of DuckLake.
+    #[test]
+    fn a_ducklake_metadata_catalog_is_never_a_target() {
+        let mut ir = sample_transformation_ir();
+        ir.target.catalog = "__DuckLake_Metadata_dl".into();
+        let err = refuse_on_catalog_kind(&ir, &TestDialect)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DuckLake metadata catalog"), "{err}");
+        assert_eq!(
+            TestDialect.catalog_kind("__ducklake_metadata_x"),
+            CatalogKind::DuckLakeMetadata
+        );
     }
 
     // -----------------------------------------------------------------------

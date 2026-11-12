@@ -849,6 +849,7 @@ fn order_planned_promotes(
     let mut targets = planned
         .into_iter()
         .map(|p| {
+            refuse_promote_to_attached(dialect, &p.prod.catalog)?;
             let (statement, production_upstreams) = if let Some(ir) = &p.model_ir {
                 anyhow::ensure!(
                     ir.target.catalog == p.prod.catalog
@@ -1156,6 +1157,11 @@ pub(crate) async fn run_promote_apply(
     // so the recorded names are what apply is entitled to trust in the first
     // place.
     reject_unquotable_promote_names(adapter.dialect(), targets)?;
+
+    // No step may target an attached catalog. Checked for every step first:
+    // the per-step checks below stop at the first bad step, after earlier
+    // steps passed, and the writes run in the same order.
+    refuse_attached_promote_targets(adapter.dialect(), targets)?;
 
     // Validate every destination and branch source before the first write.
     // The SELECT checks source readability without copying rows.
@@ -1516,10 +1522,42 @@ fn build_promote_sql(
 /// the branch copy. The swap builds that same `SELECT` under the stage name,
 /// so it is checked first: a recorded statement that is not exactly that
 /// replace is refused rather than reinterpreted.
+/// Refuse a promote into a catalog that is not the warehouse's own
+/// (ADR-ICEBERG-DUCKDB D4, ADR-DUCKLAKE D3). Called for every step when the
+/// plan is built and again for every step before apply's first write, so a
+/// plan with a native step and a lake step never half-applies.
+fn refuse_promote_to_attached(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    catalog: &str,
+) -> Result<()> {
+    let kind = dialect.catalog_kind(catalog);
+    match kind {
+        rocky_core::traits::CatalogKind::Native => Ok(()),
+        rocky_core::traits::CatalogKind::IcebergRest
+        | rocky_core::traits::CatalogKind::DuckLake
+        | rocky_core::traits::CatalogKind::DuckLakeMetadata => anyhow::bail!(
+            "promote is not supported on catalog '{catalog}': it is {}; nothing was promoted",
+            kind.describe()
+        ),
+    }
+}
+
+/// [`refuse_promote_to_attached`] for every step of a plan, before any
+/// statement runs.
+fn refuse_attached_promote_targets(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    targets: &[crate::output::PromoteTargetPlan],
+) -> Result<()> {
+    targets
+        .iter()
+        .try_for_each(|step| refuse_promote_to_attached(dialect, &step.target_catalog))
+}
+
 fn promote_swap(
     dialect: &dyn rocky_core::traits::SqlDialect,
     step: &crate::output::PromoteTargetPlan,
 ) -> Result<Option<rocky_core::replace::StagedSwap>> {
+    refuse_promote_to_attached(dialect, &step.target_catalog)?;
     if step.strategy != "full_refresh" {
         return Ok(None);
     }
@@ -5715,6 +5753,69 @@ adapter = "default"
                 .collect::<Vec<_>>(),
             vec!["DB.S.orders"],
             "the distinct `orders` is preflighted as a production upstream"
+        );
+    }
+
+    /// A plan whose first step is native and whose second targets an attached
+    /// DuckLake catalog is refused as a whole, before the first step runs.
+    /// The per-step check inside the write loop used to fire only at the lake
+    /// step, after the native one had been written.
+    #[test]
+    fn a_promote_with_a_lake_step_is_refused_before_any_step() {
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::with_catalogs([(
+            "dl",
+            rocky_core::traits::CatalogKind::DuckLake,
+        )]);
+        let step = |catalog: &str| crate::output::PromoteTargetPlan {
+            target: format!("{catalog}.demo.t"),
+            source: format!("{catalog}.br.t"),
+            target_catalog: catalog.to_string(),
+            target_schema: "demo".to_string(),
+            target_table: "t".to_string(),
+            source_catalog: catalog.to_string(),
+            source_schema: "br".to_string(),
+            source_table: "t".to_string(),
+            strategy: "full_refresh".to_string(),
+            statement: String::new(),
+            pre_drop_statement: None,
+            production_upstreams: Vec::new(),
+        };
+        let err = refuse_attached_promote_targets(&dialect, &[step("warehouse"), step("dl")])
+            .expect_err("the lake step refuses the plan");
+        assert!(err.to_string().contains("catalog 'dl'"), "{err}");
+        assert!(err.to_string().contains("DuckLake"), "{err}");
+        assert!(refuse_attached_promote_targets(&dialect, &[step("warehouse")]).is_ok());
+        // The hidden metadata catalog is refused on every dialect.
+        let plain = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
+        assert!(
+            refuse_attached_promote_targets(&plain, &[step("__ducklake_metadata_dl")]).is_err()
+        );
+    }
+
+    /// `rocky plan promote` refuses a lake target, so it never records a
+    /// plan that apply would refuse.
+    #[test]
+    fn promote_plan_refuses_a_ducklake_target() {
+        let tmp = TempDir::new().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_transformation_model(&models, "orders", "dl", "demo", "orders", "SELECT 1 AS id");
+        let loaded = crate::models_loader::load_project_models_matching(
+            &models,
+            &format!("{}/**", models.display()),
+            None,
+        )
+        .unwrap();
+        let planned = plan_transformation_from_models(loaded, &sample_record("fix"), None).unwrap();
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::with_catalogs([(
+            "dl",
+            rocky_core::traits::CatalogKind::DuckLake,
+        )]);
+        let err = order_planned_promotes(&dialect, planned).expect_err("refused at plan time");
+        assert!(
+            err.to_string()
+                .contains("promote is not supported on catalog 'dl'"),
+            "{err}"
         );
     }
 

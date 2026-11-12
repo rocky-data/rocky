@@ -1,0 +1,5 @@
+depends_on = ["orders"]
+
+[strategy]
+type = "delete_insert"
+partition_by = ["customer"]

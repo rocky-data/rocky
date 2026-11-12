@@ -50,7 +50,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`). Some `run.sh` scripts read JSON with `jq` or `python3`.
 
-**96 of 108 POCs run with no external credentials.** See each POC's README for prerequisites.
+**97 of 109 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -199,7 +199,7 @@ The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt impo
 | [21-emit-sql-exit-path](pocs/06-developer-experience/21-emit-sql-exit-path) | `rocky emit-sql --out-dir` renders the model DAG to plain `.sql`, then runs it through DuckDB with no Rocky — the tested no-lock-in exit path |
 | [22-edit-one-model-loop](pocs/06-developer-experience/22-edit-one-model-loop) | Edit one model, rebuild only it and its downstream: `[run] skip_unchanged`, `rocky run --watch --models`, `--defer` and `--defer-to-state`, steps 1-4 proved from the JSON `model_decisions`, steps 5-6 from `materializations` |
 
-### 07 — Adapters (12 POCs · mixed)
+### 07 — Adapters (13 POCs · mixed)
 
 One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, two starters for writing your own adapter, and a reference child connector for Postgres. Rocky ships more adapters than this section covers. Check the Credentials column before you run one.
 
@@ -216,6 +216,8 @@ One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, two start
 | [10-dlt-connector-shim](pocs/07-adapters/10-dlt-connector-shim) | Child connector shim over a dlt source: dlt's incremental state kept in Rocky state — three loads (5, 3, 0 rows), one stream per connector | none (installs dlt into a local venv) |
 | [11-airbyte-connector-shim](pocs/07-adapters/11-airbyte-connector-shim) | Child connector shim over the `airbyte/source-faker` image: the last Airbyte STATE kept in Rocky state, a second run resumes from it | none (Docker) |
 | [12-meltano-connector-shim](pocs/07-adapters/12-meltano-connector-shim) | Child connector shim over a Singer tap run by `meltano invoke`: the Singer bookmark kept in Rocky state — three loads (4, 3, 0 rows) | none (installs Meltano into a local venv) |
+| [09-duckdb-iceberg-rest](pocs/07-adapters/09-duckdb-iceberg-rest) | DuckDB writing Iceberg tables through a Lakekeeper REST catalog — `[[attach]]`, full refresh as one in-place transaction, append incremental | none (Docker) |
+| [13-duckdb-ducklake](pocs/07-adapters/13-duckdb-ducklake) | DuckDB writing DuckLake tables (local metadata file, Parquet data) — atomic full refresh, incremental, merge, delete_insert; a lake view refused | none |
 
 ## Benchmarks
 

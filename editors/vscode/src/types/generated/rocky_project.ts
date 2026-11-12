@@ -17,6 +17,62 @@ export type AdaptersFieldSchema =
     };
 export type RedactedString = string;
 /**
+ * One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"` adapter attaches to its connection under `alias`. `type` picks the kind.
+ *
+ * An Iceberg REST catalog (`docs/adr/ADR-ICEBERG-DUCKDB.md`):
+ *
+ * ```toml [[adapter.lake.attach]] alias = "lk" type = "iceberg" warehouse = "demo" endpoint = "${ICEBERG_ENDPOINT}"
+ *
+ * [adapter.lake.attach.s3] key_id = "${S3_KEY_ID}" secret = "${S3_SECRET}" endpoint = "localhost:8333" url_style = "path" use_ssl = false ```
+ *
+ * A DuckLake catalog with DuckDB-file metadata (`docs/adr/ADR-DUCKLAKE.md`):
+ *
+ * ```toml [[adapter.lake.attach]] alias = "dl" type = "ducklake" metadata_path = "lake/metadata.ducklake" data_path = "lake/data/" ```
+ */
+export type DuckDbAttach =
+  | {
+      /**
+       * The catalog name models use to target this attachment. A SQL identifier. It must not be `memory`, `main`, `temp`, `system`, the database file's own catalog name or another entry's alias.
+       */
+      alias: string;
+      /**
+       * How Rocky authenticates to the REST catalog. Only `"none"` today.
+       */
+      authorization?: DuckDbAttachAuthorization & string;
+      /**
+       * The REST catalog's base URL, for example `http://localhost:8181/catalog`.
+       */
+      endpoint: string;
+      /**
+       * Object-store credentials for the table files. Rocky turns them into a temporary DuckDB secret scoped to this attachment.
+       */
+      s3?: DuckDbAttachS3 | null;
+      type: "iceberg";
+      /**
+       * The warehouse name the REST catalog knows.
+       */
+      warehouse: string;
+    }
+  | {
+      /**
+       * The catalog name models use to target this attachment. The same rules as an Iceberg alias, and it must not start with `__ducklake_metadata_` (DuckLake's own metadata catalog).
+       */
+      alias: string;
+      /**
+       * Where DuckLake writes the Parquet data files: a local directory (an `s3://` prefix is refused until it has a conformance case). A relative path is made absolute when Rocky connects, because DuckLake stores it verbatim and would resolve it against each later process's working directory. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new catalog).
+       */
+      data_path?: string | null;
+      /**
+       * The DuckDB file that holds the DuckLake metadata. A relative path is made absolute against the working directory when Rocky connects, as the adapter's own `path` is. It must not be the adapter's own `path`, and it must not hold a `:` (v1 supports a local DuckDB file only).
+       */
+      metadata_path: string;
+      /**
+       * Object-store credentials for a future `s3://` `data_path`. Refused by `rocky validate` today; the attach step would scope its secret to `data_path`.
+       */
+      s3?: DuckDbAttachS3 | null;
+      type: "ducklake";
+    };
+/**
  * How a [`DuckDbAttach`] entry authenticates to its catalog.
  */
 export type DuckDbAttachAuthorization = "none";
@@ -24,10 +80,6 @@ export type DuckDbAttachAuthorization = "none";
  * S3 addressing style.
  */
 export type S3UrlStyle = "path" | "vhost";
-/**
- * The kind of catalog a [`DuckDbAttach`] entry attaches.
- */
-export type DuckDbAttachType = "iceberg";
 /**
  * Cache backend selector for [`FivetranCacheConfig`]. See the parent struct for the TOML shape and per-backend semantics.
  */
@@ -761,39 +813,6 @@ export interface AdapterConfig {
    * Snowflake warehouse to use for query execution.
    */
   warehouse?: string | null;
-}
-/**
- * One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"` adapter attaches to its connection under `alias`.
- *
- * ```toml [[adapter.lake.attach]] alias = "lk" type = "iceberg" warehouse = "demo" endpoint = "${ICEBERG_ENDPOINT}"
- *
- * [adapter.lake.attach.s3] key_id = "${S3_KEY_ID}" secret = "${S3_SECRET}" endpoint = "localhost:8333" url_style = "path" use_ssl = false ```
- */
-export interface DuckDbAttach {
-  /**
-   * The catalog name models use to target this attachment. A SQL identifier. It must not be `memory`, `main`, `temp`, `system`, the database file's own catalog name or another entry's alias.
-   */
-  alias: string;
-  /**
-   * How Rocky authenticates to the REST catalog. Only `"none"` today.
-   */
-  authorization?: DuckDbAttachAuthorization & string;
-  /**
-   * The REST catalog's base URL, for example `http://localhost:8181/catalog`.
-   */
-  endpoint: string;
-  /**
-   * Object-store credentials for the table files. Rocky turns them into a temporary DuckDB secret scoped to this attachment.
-   */
-  s3?: DuckDbAttachS3 | null;
-  /**
-   * What the attachment is. Only `"iceberg"` (an Iceberg REST catalog).
-   */
-  type: DuckDbAttachType;
-  /**
-   * The warehouse name the REST catalog knows.
-   */
-  warehouse: string;
 }
 /**
  * The S3 settings of a [`DuckDbAttach`] entry. Every field is optional; an unset one leaves DuckDB's default.

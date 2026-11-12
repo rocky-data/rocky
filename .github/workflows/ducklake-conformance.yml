@@ -1,0 +1,71 @@
+name: ducklake-conformance
+
+# Live conformance for DuckLake tables written through DuckDB
+# (docs/adr/ADR-DUCKLAKE.md). Runs the ignored tests behind the
+# `ducklake-conformance` feature against a local DuckDB-file lake, then the
+# 07-adapters/13-duckdb-ducklake POC. No Docker. Not a required check: it
+# downloads the `ducklake` extension from the DuckDB extension repository, so
+# it runs on the surfaces it covers and weekly.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/crates/rocky-duckdb/**'
+      - 'engine/crates/rocky-core/src/traits.rs'
+      - 'engine/crates/rocky-core/src/sql_gen.rs'
+      - 'engine/crates/rocky-core/src/config.rs'
+      - 'examples/playground/pocs/07-adapters/13-duckdb-ducklake/**'
+      - '.github/workflows/ducklake-conformance.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'engine/crates/rocky-duckdb/**'
+      - 'engine/crates/rocky-core/src/traits.rs'
+      - 'engine/crates/rocky-core/src/sql_gen.rs'
+      - 'engine/crates/rocky-core/src/config.rs'
+      - 'examples/playground/pocs/07-adapters/13-duckdb-ducklake/**'
+      - '.github/workflows/ducklake-conformance.yml'
+  schedule:
+    - cron: '43 5 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+
+jobs:
+  conformance:
+    name: Live DuckLake conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: engine
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Live conformance tests
+        working-directory: engine
+        run: >-
+          cargo test -p rocky-duckdb --features ducklake-conformance
+          --test ducklake_conformance -- --ignored --test-threads 1
+      - name: Run the POC
+        working-directory: examples/playground/pocs/07-adapters/13-duckdb-ducklake
+        run: |
+          cargo build --manifest-path "$GITHUB_WORKSPACE/engine/Cargo.toml" --bin rocky
+          PATH="$GITHUB_WORKSPACE/engine/target/debug:$PATH" ./run.sh

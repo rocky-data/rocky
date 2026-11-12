@@ -126,16 +126,19 @@ pub async fn run_load(
     // warehouse adapter's *shared* connector so the staging table the loader
     // writes is visible to `describe_table`/promote SQL (critical on DuckDB,
     // where a fresh in-memory loader would land staging in a separate DB).
-    // ADR-ICEBERG-DUCKDB D4: `rocky load` does not write to an attached
-    // Iceberg catalog in v1.
-    if adapter_cfg
-        .attach
-        .iter()
-        .any(|a| a.alias.eq_ignore_ascii_case(target_catalog))
-    {
+    // ADR-ICEBERG-DUCKDB D4, ADR-DUCKLAKE D3: `rocky load` does not write to
+    // an attached catalog in v1.
+    let kind = rocky_core::traits::CatalogKind::reserved(target_catalog).or_else(|| {
+        adapter_cfg
+            .attach
+            .iter()
+            .find(|a| a.alias().eq_ignore_ascii_case(target_catalog))
+            .map(rocky_core::config::DuckDbAttach::kind)
+    });
+    if let Some(kind) = kind {
         anyhow::bail!(
-            "rocky load is not supported on catalog '{target_catalog}', an attached Iceberg \
-             catalog; nothing was loaded"
+            "rocky load is not supported on catalog '{target_catalog}', {}; nothing was loaded",
+            kind.describe()
         );
     }
     let loader: Box<dyn LoaderAdapter> = build_loader(adapter_name, adapter_cfg, &registry)?;

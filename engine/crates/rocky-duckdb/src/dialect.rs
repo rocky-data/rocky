@@ -10,8 +10,8 @@
 use std::fmt::Write;
 
 use rocky_core::traits::{
-    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, TableReplace,
-    hold_back_predicate,
+    AdapterError, AdapterResult, CatalogKind, LiteralEscape, NullTimestamps, SqlDialect,
+    TableReplace, hold_back_predicate,
 };
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
@@ -53,22 +53,48 @@ fn watermark_literal(t: Option<&chrono::DateTime<chrono::Utc>>) -> String {
     format!("'{literal}+00:00'")
 }
 
-/// DuckDB's SQL dialect. `iceberg_catalogs` names the attached catalogs that are
-/// Iceberg REST catalogs (lower-cased); it is empty for a plain DuckDB file or
-/// in-memory database. It decides [`SqlDialect::table_replace`] and
-/// [`SqlDialect::create_schema_sql`] for those catalogs.
+/// DuckDB's SQL dialect. `attached` maps each attached catalog's alias
+/// (lower-cased) to its kind; it is empty for a plain DuckDB file or
+/// in-memory database. It decides [`SqlDialect::catalog_kind`],
+/// [`SqlDialect::table_replace`] and [`SqlDialect::create_schema_sql`] for
+/// those catalogs (ADR-ICEBERG-DUCKDB D2, ADR-DUCKLAKE D3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DuckDbSqlDialect {
-    iceberg_catalogs: std::collections::BTreeSet<String>,
+    attached: std::collections::BTreeMap<String, CatalogKind>,
 }
 
 impl DuckDbSqlDialect {
-    /// The dialect of a DuckDB database with no attached Iceberg catalog.
+    /// The dialect of a DuckDB database with no attached catalog.
     #[must_use]
     pub const fn plain() -> Self {
         Self {
-            iceberg_catalogs: std::collections::BTreeSet::new(),
+            attached: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The dialect of a DuckDB database with these catalogs attached, each
+    /// with its kind.
+    #[must_use]
+    pub fn with_catalogs<I, S>(catalogs: I) -> Self
+    where
+        I: IntoIterator<Item = (S, CatalogKind)>,
+        S: AsRef<str>,
+    {
+        Self {
+            attached: catalogs
+                .into_iter()
+                .filter(|(_, kind)| {
+                    matches!(kind, CatalogKind::IcebergRest | CatalogKind::DuckLake)
+                })
+                .map(|(c, kind)| (c.as_ref().to_ascii_lowercase(), kind))
+                .collect(),
+        }
+    }
+
+    /// The dialect of a DuckDB database with these `[[attach]]` entries.
+    #[must_use]
+    pub fn with_attachments(entries: &[rocky_core::config::DuckDbAttach]) -> Self {
+        Self::with_catalogs(entries.iter().map(|e| (e.alias(), e.kind())))
     }
 
     /// The dialect of a DuckDB database with these Iceberg catalogs attached.
@@ -78,21 +104,25 @@ impl DuckDbSqlDialect {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Self {
-            iceberg_catalogs: catalogs
-                .into_iter()
-                .map(|c| c.as_ref().to_ascii_lowercase())
-                .collect(),
-        }
+        Self::with_catalogs(catalogs.into_iter().map(|c| (c, CatalogKind::IcebergRest)))
+    }
+
+    /// Whether any catalog is attached.
+    #[must_use]
+    pub fn has_attachments(&self) -> bool {
+        !self.attached.is_empty()
+    }
+
+    /// Whether `catalog` is an attached catalog of any kind (case-insensitive).
+    #[must_use]
+    pub fn is_attached_catalog(&self, catalog: &str) -> bool {
+        self.catalog_kind(catalog) != CatalogKind::Native
     }
 
     /// Whether `catalog` is an attached Iceberg catalog (case-insensitive).
     #[must_use]
     pub fn is_iceberg_catalog(&self, catalog: &str) -> bool {
-        !self.iceberg_catalogs.is_empty()
-            && self
-                .iceberg_catalogs
-                .contains(&catalog.to_ascii_lowercase())
+        self.catalog_kind(catalog) == CatalogKind::IcebergRest
     }
 }
 
@@ -302,10 +332,11 @@ impl SqlDialect for DuckDbSqlDialect {
     }
 
     /// A plain DuckDB schema is created in the default catalog, as before.
-    /// A schema of an attached Iceberg catalog is named with its catalog,
-    /// because that catalog is never the default (ADR-ICEBERG-DUCKDB D1).
+    /// A schema of an attached catalog (Iceberg or DuckLake) is named with
+    /// its catalog, because that catalog is never the default
+    /// (ADR-ICEBERG-DUCKDB D1, ADR-DUCKLAKE D5).
     fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
-        if self.is_iceberg_catalog(catalog) {
+        if self.is_attached_catalog(catalog) {
             return Some(
                 validation::validate_identifier(catalog)
                     .and_then(|_| validation::validate_identifier(schema))
@@ -322,14 +353,28 @@ impl SqlDialect for DuckDbSqlDialect {
 
     /// DuckDB-Iceberg refuses `CREATE OR REPLACE TABLE` and a rename inside
     /// a write transaction, so an attached Iceberg catalog is overwritten in
-    /// place (ADR-ICEBERG-DUCKDB D3). Every other catalog replaces
-    /// atomically.
+    /// place (ADR-ICEBERG-DUCKDB D3). DuckLake's `CREATE OR REPLACE TABLE`
+    /// is one atomic snapshot (ADR-DUCKLAKE D2), like a native catalog's.
     fn table_replace(&self, catalog: &str) -> TableReplace {
-        if self.is_iceberg_catalog(catalog) {
-            TableReplace::InPlaceOverwrite
-        } else {
-            TableReplace::Atomic
+        match self.catalog_kind(catalog) {
+            CatalogKind::IcebergRest => TableReplace::InPlaceOverwrite,
+            CatalogKind::Native | CatalogKind::DuckLake | CatalogKind::DuckLakeMetadata => {
+                TableReplace::Atomic
+            }
         }
+    }
+
+    fn catalog_kind(&self, catalog: &str) -> CatalogKind {
+        if let Some(reserved) = CatalogKind::reserved(catalog) {
+            return reserved;
+        }
+        if self.attached.is_empty() {
+            return CatalogKind::Native;
+        }
+        self.attached
+            .get(&catalog.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(CatalogKind::Native)
     }
 
     fn tablesample_clause(&self, percent: u32) -> Option<String> {

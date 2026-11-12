@@ -1,0 +1,26 @@
+# DuckDB writing DuckLake tables.
+#
+# The DuckDB adapter attaches a DuckLake catalog as `dl`. Its metadata is a
+# local DuckDB file and its data is Parquet files under lake/data/. Models
+# whose target catalog is `dl` are written as DuckLake tables. No server, no
+# credentials.
+
+[adapter]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[[adapter.attach]]
+alias = "dl"
+type = "ducklake"
+metadata_path = "lake/metadata.ducklake"
+data_path = "lake/data/"
+
+[pipeline.demo]
+type = "transformation"
+models = "models/**"
+
+[pipeline.demo.target]
+adapter = "default"
+
+[pipeline.demo.target.governance]
+auto_create_schemas = true

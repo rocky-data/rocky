@@ -1187,6 +1187,47 @@ pub enum TableReplace {
     InPlaceOverwrite,
 }
 
+/// What kind of catalog a name refers to, as the dialect knows it from its
+/// configuration (never by probing the database). It decides which
+/// strategies Rocky writes there ([`crate::sql_gen::refuse_on_catalog_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogKind {
+    /// The warehouse's own catalog: every strategy the dialect supports.
+    Native,
+    /// An Iceberg REST catalog attached to DuckDB (ADR-ICEBERG-DUCKDB).
+    IcebergRest,
+    /// A DuckLake catalog attached to DuckDB (ADR-DUCKLAKE).
+    DuckLake,
+    /// A name with DuckLake's hidden metadata-catalog prefix
+    /// (`__ducklake_metadata_<alias>`). Rocky never writes there, on any
+    /// dialect: it would edit a lake's own catalog tables.
+    DuckLakeMetadata,
+}
+
+impl CatalogKind {
+    /// How the kind is named in an error message.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Native => "a native catalog",
+            Self::IcebergRest => "an attached Iceberg catalog",
+            Self::DuckLake => "an attached DuckLake catalog",
+            Self::DuckLakeMetadata => "a DuckLake metadata catalog, which Rocky never writes",
+        }
+    }
+
+    /// [`CatalogKind::DuckLakeMetadata`] when `catalog` has DuckLake's
+    /// metadata-catalog prefix (case-insensitive), else `None`. Every
+    /// [`SqlDialect::catalog_kind`] checks it first.
+    #[must_use]
+    pub fn reserved(catalog: &str) -> Option<Self> {
+        catalog
+            .to_ascii_lowercase()
+            .starts_with(crate::config::DUCKLAKE_METADATA_CATALOG_PREFIX)
+            .then_some(Self::DuckLakeMetadata)
+    }
+}
+
 /// Generates warehouse-specific SQL syntax.
 ///
 /// Each warehouse adapter provides a dialect implementation. rocky-core's
@@ -1257,6 +1298,13 @@ pub trait SqlDialect: Send + Sync {
     fn table_replace(&self, catalog: &str) -> TableReplace {
         let _ = catalog;
         TableReplace::Atomic
+    }
+
+    /// What kind of catalog `catalog` is. Every catalog of a warehouse is
+    /// [`CatalogKind::Native`] unless the dialect was configured with
+    /// attachments (the DuckDB `[[adapter.<name>.attach]]` list).
+    fn catalog_kind(&self, catalog: &str) -> CatalogKind {
+        CatalogKind::reserved(catalog).unwrap_or(CatalogKind::Native)
     }
 
     /// `ALTER TABLE <from> RENAME TO <to>`, both formatted table refs in the

@@ -13641,7 +13641,7 @@ async fn execute_models_phase(
         .filter(|m| model_name_filter.is_none_or(|name| m.config.name == name))
         .filter(|m| model_set.is_none_or(|set| set.contains(&m.config.name)))
         .filter_map(|m| {
-            rocky_core::sql_gen::refuse_on_in_place_catalog(&m.to_model_ir(), warehouse.dialect())
+            rocky_core::sql_gen::refuse_on_catalog_kind(&m.to_model_ir(), warehouse.dialect())
                 .err()
                 .map(|e| e.to_string())
         })
@@ -19818,7 +19818,7 @@ async fn process_table(
 
     // ADR-ICEBERG-DUCKDB D4: on an attached Iceberg catalog, only the
     // strategies v1 writes there pass, before any SQL runs.
-    sql_gen::refuse_on_in_place_catalog(&model_ir, dialect)?;
+    sql_gen::refuse_on_catalog_kind(&model_ir, dialect)?;
 
     let strategy_name;
     let sql = if use_full_refresh {

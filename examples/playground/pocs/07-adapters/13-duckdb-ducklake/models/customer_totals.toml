@@ -1,0 +1,6 @@
+depends_on = ["orders"]
+
+[strategy]
+type = "merge"
+unique_key = ["customer"]
+update_columns = ["orders", "total"]
