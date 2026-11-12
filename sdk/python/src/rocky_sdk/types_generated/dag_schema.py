@@ -152,7 +152,7 @@ class StrategyConfig13(BaseModel):
     type: Type
 
 
-class Type13(StrEnum):
+class Type15(StrEnum):
     incremental = "incremental"
 
 
@@ -179,14 +179,14 @@ class StrategyConfig14(BaseModel):
     """
     The watermark column: an output column of the model whose maximum in the target marks what is already loaded. `watermark` is accepted as an alias.
     """
-    type: Type13
+    type: Type15
     unique_key: list[str] | None = []
     """
     Upsert on these columns with `MERGE` instead of appending.
     """
 
 
-class Type14(StrEnum):
+class Type16(StrEnum):
     merge = "merge"
 
 
@@ -195,16 +195,16 @@ class StrategyConfig15(BaseModel):
     Materialization strategy for a model, defaulting to full refresh.
     """
 
-    type: Type14
+    type: Type16
     unique_key: list[str]
     update_columns: list[str] | None = None
 
 
-class Type15(StrEnum):
+class Type17(StrEnum):
     time_interval = "time_interval"
 
 
-class Type16(StrEnum):
+class Type18(StrEnum):
     ephemeral = "ephemeral"
 
 
@@ -213,10 +213,10 @@ class StrategyConfig17(BaseModel):
     Ephemeral model — never materialized. `rocky compile` inlines its SQL as a `__rocky_ephemeral__<name>` CTE into every model that reads it, and `rocky run` skips the node. Invalid uses are E038.
     """
 
-    type: Type16
+    type: Type18
 
 
-class Type17(StrEnum):
+class Type19(StrEnum):
     delete_insert = "delete_insert"
 
 
@@ -229,14 +229,14 @@ class StrategyConfig18(BaseModel):
     """
     Column(s) used to identify the partition to delete.
     """
-    type: Type17
+    type: Type19
 
 
-class Type18(StrEnum):
+class Type20(StrEnum):
     microbatch = "microbatch"
 
 
-class Type19(StrEnum):
+class Type21(StrEnum):
     view = "view"
 
 
@@ -245,10 +245,10 @@ class StrategyConfig20(BaseModel):
     SQL view — no physical storage. Every read against the target re-runs the model SELECT. Supported on every Rocky-targeted warehouse.
     """
 
-    type: Type19
+    type: Type21
 
 
-class Type20(StrEnum):
+class Type22(StrEnum):
     materialized_view = "materialized_view"
 
 
@@ -257,10 +257,10 @@ class StrategyConfig21(BaseModel):
     Materialized view — warehouse manages refresh. Supported on Databricks, Snowflake, and BigQuery. DuckDB / Trino surface a "not supported" error at SQL-gen time.
     """
 
-    type: Type20
+    type: Type22
 
 
-class Type21(StrEnum):
+class Type23(StrEnum):
     dynamic_table = "dynamic_table"
 
 
@@ -273,10 +273,10 @@ class StrategyConfig22(BaseModel):
     """
     Snowflake lag specifier — alphanumeric + space only. Examples: `"1 minute"`, `"5 hours"`, `"downstream"`.
     """
-    type: Type21
+    type: Type23
 
 
-class Type22(StrEnum):
+class Type24(StrEnum):
     content_addressed = "content_addressed"
 
 
@@ -293,10 +293,10 @@ class StrategyConfig23(BaseModel):
     """
     Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. Typically `s3://<bucket>/<path>/<table>` for AWS-backed deployments.
     """
-    type: Type22
+    type: Type24
 
 
-class Type23(StrEnum):
+class Type25(StrEnum):
     snapshot = "snapshot"
 
 
@@ -327,7 +327,7 @@ class StrategyConfig24(BaseModel):
     """
     `"timestamp"` or `"check"`.
     """
-    type: Type23
+    type: Type25
     unique_key: str | list[str] | None = None
     """
     Column, or list of columns, identifying a row of the output.
@@ -452,7 +452,7 @@ class StrategyConfig16(BaseModel):
     """
     Column on the model output that holds the partition value. Must be a non-nullable date or timestamp column. Validated by the compiler against the typed output schema.
     """
-    type: Type15
+    type: Type17
 
 
 class StrategyConfig19(BaseModel):
@@ -468,7 +468,7 @@ class StrategyConfig19(BaseModel):
     """
     Timestamp column for micro-batch boundaries.
     """
-    type: Type18
+    type: Type20
 
 
 class DagNodeOutput(BaseModel):

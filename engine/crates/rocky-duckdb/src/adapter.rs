@@ -292,8 +292,8 @@ impl DuckDbWarehouseAdapter {
     }
 
     /// Attach the `[[adapter.<name>.attach]]` catalogs to this adapter's
-    /// connection, and make its dialect treat them as Iceberg catalogs
-    /// (ADR-ICEBERG-DUCKDB). Call it once, right after opening.
+    /// connection, and make its dialect know each one's kind
+    /// (ADR-ICEBERG-DUCKDB, ADR-DUCKLAKE). Call it once, right after opening.
     ///
     /// # Errors
     ///
@@ -312,12 +312,12 @@ impl DuckDbWarehouseAdapter {
                 .connector
                 .lock()
                 .map_err(|e| crate::DuckDbError::AttachInvalid {
-                    alias: entries[0].alias.clone(),
+                    alias: entries[0].alias().to_string(),
                     detail: format!("connection mutex poisoned: {e}"),
                 })?;
             conn.attach_catalogs(entries, &own_catalog, opts)?;
         }
-        self.dialect = DuckDbSqlDialect::with_iceberg_catalogs(entries.iter().map(|e| &e.alias));
+        self.dialect = DuckDbSqlDialect::with_attachments(entries);
         Ok(self)
     }
 
@@ -814,14 +814,21 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
 
     async fn list_tables(&self, catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
         validation::validate_identifier(schema).map_err(AdapterError::new)?;
-        // An attached Iceberg catalog is never the default, so its tables
-        // are listed by catalog too (ADR-ICEBERG-DUCKDB D2). A plain DuckDB
-        // schema keeps the catalog-blind query.
-        let sql = if self.dialect.is_iceberg_catalog(catalog) {
+        // An attached catalog is never the default, so its tables are listed
+        // by catalog too (ADR-ICEBERG-DUCKDB D2, ADR-DUCKLAKE D5). With an
+        // attachment, the database's own schema is read from its own catalog
+        // only, so a same-named lake schema adds nothing. A plain DuckDB
+        // database keeps the catalog-blind query.
+        let sql = if self.dialect.is_attached_catalog(catalog) {
             validation::validate_identifier(catalog).map_err(AdapterError::new)?;
             format!(
                 "SELECT table_name FROM information_schema.tables \
                  WHERE lower(table_catalog) = lower('{catalog}') AND table_schema = '{schema}'"
+            )
+        } else if self.dialect.has_attachments() {
+            format!(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_catalog = current_database() AND table_schema = '{schema}'"
             )
         } else {
             format!(
@@ -868,6 +875,15 @@ pub fn classify_duckdb_failure(err: &AdapterError) -> FailureClass {
     // Match on the rendered message (uppercased) — DuckDB surfaces contention
     // as opaque `duckdb::Error` variants whose text is the reliable signal.
     let msg = err.to_string().to_uppercase();
+    // One transaction wrote two attached databases (DuckLake allows one).
+    // The same statements fail the same way on every attempt.
+    if msg.contains("IN A TRANSACTION THAT HAS ALREADY MODIFIED DATABASE") {
+        return FailureClass::Permanent;
+    }
+    // A DuckLake commit conflict (`Failed to commit DuckLake transaction.
+    // Transaction conflict - …`) is a `TransactionContext Error` and stays
+    // transient: the losing transaction wrote nothing, so a retry of an
+    // idempotent statement is safe (ADR-DUCKLAKE D2).
     let is_lock_contention = msg.contains("COULD NOT SET LOCK ON FILE")
         || msg.contains("CONFLICTING LOCK")
         || msg.contains("DATABASE IS LOCKED")
@@ -950,6 +966,10 @@ mod tests {
             "database is locked",
             "Conflicting lock is held",
             "TransactionContext Error: Write-write conflict on tuple",
+            // Measured on DuckDB 2.0 with ducklake 417a9117f5.
+            "TransactionContext Error: Failed to commit: Failed to commit DuckLake \
+             transaction.\nTransaction conflict - attempting to insert into table with \
+             index \"1\"",
         ] {
             let err = AdapterError::msg(phrase.to_string());
             assert_eq!(
@@ -969,6 +989,9 @@ mod tests {
             "Parser Error: syntax error at or near \"SELCT\"",
             "Conversion Error: Could not convert string 'x' to INT32",
             "Constraint Error: NOT NULL constraint failed",
+            // Measured: one transaction writing the lake and the main file.
+            "TransactionContext Error: Attempting to write to database \"dl\" in a \
+             transaction that has already modified database \"main_db\"",
         ] {
             let err = AdapterError::msg(phrase.to_string());
             let class = classify_duckdb_failure(&err);

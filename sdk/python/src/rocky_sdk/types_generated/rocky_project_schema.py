@@ -440,6 +440,14 @@ class Dialect(StrEnum):
     duckdb = "duckdb"
 
 
+class Type(StrEnum):
+    iceberg = "iceberg"
+
+
+class Type27(StrEnum):
+    ducklake = "ducklake"
+
+
 class DuckDbAttachAuthorization2(StrEnum):
     """
     No catalog authentication (`AUTHORIZATION_TYPE 'none'`).
@@ -452,21 +460,6 @@ class DuckDbAttachAuthorization(RootModel[DuckDbAttachAuthorization2]):
     root: DuckDbAttachAuthorization2
     """
     How a [`DuckDbAttach`] entry authenticates to its catalog.
-    """
-
-
-class DuckDbAttachType2(StrEnum):
-    """
-    An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
-    """
-
-    iceberg = "iceberg"
-
-
-class DuckDbAttachType(RootModel[DuckDbAttachType2]):
-    root: DuckDbAttachType2
-    """
-    The kind of catalog a [`DuckDbAttach`] entry attaches.
     """
 
 
@@ -785,7 +778,7 @@ class FivetranStampedeConfig(BaseModel):
     """
 
 
-class Type(StrEnum):
+class Type28(StrEnum):
     subprocess = "subprocess"
 
 
@@ -813,10 +806,10 @@ class FulfillDriverConfig1(BaseModel):
     """
     Wall-clock budget for one task; on elapse the group receives SIGTERM, then SIGKILL after the kill grace.
     """
-    type: Type
+    type: Type28
 
 
-class Type25(StrEnum):
+class Type29(StrEnum):
     replay = "replay"
 
 
@@ -832,7 +825,7 @@ class FulfillDriverConfig2(BaseModel):
     """
     The recorded session file, relative to the project root.
     """
-    type: Type25
+    type: Type29
 
 
 class GcConfig(BaseModel):
@@ -1122,23 +1115,23 @@ class OnSyncFailure2(StrEnum):
     warn = "warn"
 
 
-class Type26(StrEnum):
+class Type30(StrEnum):
     replication = "replication"
 
 
-class Type27(StrEnum):
+class Type31(StrEnum):
     transformation = "transformation"
 
 
-class Type28(StrEnum):
+class Type32(StrEnum):
     quality = "quality"
 
 
-class Type29(StrEnum):
+class Type33(StrEnum):
     snapshot = "snapshot"
 
 
-class Type30(StrEnum):
+class Type34(StrEnum):
     load = "load"
 
 
@@ -1449,55 +1442,55 @@ class ProductBudgetConfig(BaseModel):
     """
 
 
-class Type31(StrEnum):
+class Type35(StrEnum):
     not_null = "not_null"
 
 
-class Type32(StrEnum):
+class Type36(StrEnum):
     unique = "unique"
 
 
-class Type33(StrEnum):
+class Type37(StrEnum):
     accepted_values = "accepted_values"
 
 
-class Type34(StrEnum):
+class Type38(StrEnum):
     relationships = "relationships"
 
 
-class Type35(StrEnum):
+class Type39(StrEnum):
     expression = "expression"
 
 
-class Type36(StrEnum):
+class Type40(StrEnum):
     row_count_range = "row_count_range"
 
 
-class Type37(StrEnum):
+class Type41(StrEnum):
     in_range = "in_range"
 
 
-class Type38(StrEnum):
+class Type42(StrEnum):
     regex_match = "regex_match"
 
 
-class Type39(StrEnum):
+class Type43(StrEnum):
     aggregate = "aggregate"
 
 
-class Type40(StrEnum):
+class Type44(StrEnum):
     composite = "composite"
 
 
-class Type41(StrEnum):
+class Type45(StrEnum):
     unique_expr = "unique_expr"
 
 
-class Type42(StrEnum):
+class Type46(StrEnum):
     not_in_future = "not_in_future"
 
 
-class Type43(StrEnum):
+class Type47(StrEnum):
     older_than_n_days = "older_than_n_days"
 
 
@@ -2697,7 +2690,7 @@ class QualityAssertion1(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type31
+    type: Type35
 
 
 class QualityAssertion2(BaseModel):
@@ -2729,7 +2722,7 @@ class QualityAssertion2(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type32
+    type: Type36
 
 
 class QualityAssertion3(BaseModel):
@@ -2761,7 +2754,7 @@ class QualityAssertion3(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type33
+    type: Type37
     values: list[str]
     """
     The allowed values. Compared as string literals.
@@ -2805,7 +2798,7 @@ class QualityAssertion4(BaseModel):
     """
     Fully-qualified target table (`catalog.schema.table`).
     """
-    type: Type34
+    type: Type38
 
 
 class QualityAssertion5(BaseModel):
@@ -2841,7 +2834,7 @@ class QualityAssertion5(BaseModel):
     """
     A SQL boolean expression. Rows where `NOT (expression)` are failures.
     """
-    type: Type35
+    type: Type39
 
 
 class QualityAssertion6(BaseModel):
@@ -2881,7 +2874,7 @@ class QualityAssertion6(BaseModel):
     """
     Minimum row count (inclusive). `None` means no lower bound.
     """
-    type: Type36
+    type: Type40
 
 
 class QualityAssertion7(BaseModel):
@@ -2923,7 +2916,7 @@ class QualityAssertion7(BaseModel):
     """
     Minimum value (inclusive). `None` means no lower bound.
     """
-    type: Type37
+    type: Type41
 
 
 class QualityAssertion8(BaseModel):
@@ -2963,7 +2956,7 @@ class QualityAssertion8(BaseModel):
     """
     The regex pattern. Dialect-specific syntax — stick to the portable subset (character classes, anchors, quantifiers).
     """
-    type: Type38
+    type: Type42
 
 
 class QualityAssertion9(BaseModel):
@@ -3005,7 +2998,7 @@ class QualityAssertion9(BaseModel):
     """
     Aggregate operator.
     """
-    type: Type39
+    type: Type43
     value: str
     """
     Threshold to compare against. Parsed as `f64`.
@@ -3051,7 +3044,7 @@ class QualityAssertion10(BaseModel):
     """
     The kind of composite assertion. Currently `unique` only — kept as an enum to leave room for `not_null_any` / `not_null_all` in a later phase without another TestType.
     """
-    type: Type40
+    type: Type44
 
 
 class QualityAssertion11(BaseModel):
@@ -3091,7 +3084,7 @@ class QualityAssertion11(BaseModel):
     """
     SQL scalar expression whose value must be unique across rows.
     """
-    type: Type41
+    type: Type45
 
 
 class QualityAssertion12(BaseModel):
@@ -3123,7 +3116,7 @@ class QualityAssertion12(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type42
+    type: Type46
 
 
 class QualityAssertion13(BaseModel):
@@ -3159,7 +3152,7 @@ class QualityAssertion13(BaseModel):
     """
     N — days in the past. Must be > 0.
     """
-    type: Type43
+    type: Type47
 
 
 class QuarantineConfig(BaseModel):
@@ -3422,13 +3415,9 @@ class DiscoveryConfig(BaseModel):
     """
 
 
-class DuckDbAttach(BaseModel):
+class DuckDbAttach3(BaseModel):
     """
-    One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"` adapter attaches to its connection under `alias`.
-
-    ```toml [[adapter.lake.attach]] alias = "lk" type = "iceberg" warehouse = "demo" endpoint = "${ICEBERG_ENDPOINT}"
-
-    [adapter.lake.attach.s3] key_id = "${S3_KEY_ID}" secret = "${S3_SECRET}" endpoint = "localhost:8333" url_style = "path" use_ssl = false ```
+    An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
     """
 
     model_config = ConfigDict(
@@ -3452,14 +3441,38 @@ class DuckDbAttach(BaseModel):
     """
     Object-store credentials for the table files. Rocky turns them into a temporary DuckDB secret scoped to this attachment.
     """
-    type: DuckDbAttachType
-    """
-    What the attachment is. Only `"iceberg"` (an Iceberg REST catalog).
-    """
+    type: Type
     warehouse: str
     """
     The warehouse name the REST catalog knows.
     """
+
+
+class DuckDbAttach4(BaseModel):
+    """
+    A DuckLake catalog, through DuckDB's `ducklake` extension.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    alias: str
+    """
+    The catalog name models use to target this attachment. The same rules as an Iceberg alias, and it must not start with `__ducklake_metadata_` (DuckLake's own metadata catalog).
+    """
+    data_path: str | None = None
+    """
+    Where DuckLake writes the Parquet data files: a local directory or an `s3://` prefix. A relative local path is made absolute when Rocky connects, because DuckLake stores it verbatim and would resolve it against each later process's working directory. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new catalog).
+    """
+    metadata_path: str
+    """
+    The DuckDB file that holds the DuckLake metadata. A relative path is made absolute against the working directory when Rocky connects, as the adapter's own `path` is. It must not be the adapter's own `path`, and it must not hold a `:` (v1 supports a local DuckDB file only).
+    """
+    s3: DuckDbAttachS3 | None = None
+    """
+    Object-store credentials for an `s3://` `data_path`. Rocky turns them into a temporary DuckDB secret; its scope defaults to `data_path`.
+    """
+    type: Type27
 
 
 class GovernanceConfig(BaseModel):
@@ -4001,7 +4014,7 @@ class AdapterConfig(BaseModel):
     """
     api_key: str | None = None
     api_secret: str | None = None
-    attach: list[DuckDbAttach] | None = None
+    attach: list[DuckDbAttach3 | DuckDbAttach4] | None = None
     """
     Other catalogs this DuckDB connection attaches when `rocky run` connects. Each entry is an Iceberg REST catalog that models target by its `alias` (`[target] catalog = "<alias>"`). `rocky compile` and `rocky plan` never attach. Refused on every other adapter type; see [`validate_duckdb_attachments`] and `docs/adr/ADR-ICEBERG-DUCKDB.md`.
     """
@@ -4227,7 +4240,7 @@ class PipelineConfig1(ReplicationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type26 | None = None
+    type: Type30 | None = None
 
 
 class PipelineConfig3(QualityPipelineConfig):
@@ -4235,7 +4248,7 @@ class PipelineConfig3(QualityPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type28
+    type: Type32
 
 
 class PipelineConfig5(LoadPipelineConfig):
@@ -4243,7 +4256,7 @@ class PipelineConfig5(LoadPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type30
+    type: Type34
 
 
 class SnapshotPipelineConfig(BaseModel):
@@ -4393,7 +4406,7 @@ class PipelineConfig2(TransformationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type27
+    type: Type31
 
 
 class PipelineConfig4(SnapshotPipelineConfig):
@@ -4401,7 +4414,7 @@ class PipelineConfig4(SnapshotPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type29
+    type: Type33
 
 
 class RockyConfig(BaseModel):

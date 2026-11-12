@@ -25,6 +25,14 @@ class AdapterKind2(StrEnum):
     discovery = "discovery"
 
 
+class Type(StrEnum):
+    iceberg = "iceberg"
+
+
+class Type1(StrEnum):
+    ducklake = "ducklake"
+
+
 class DuckDbAttachAuthorization1(StrEnum):
     """
     No catalog authentication (`AUTHORIZATION_TYPE 'none'`).
@@ -37,21 +45,6 @@ class DuckDbAttachAuthorization(RootModel[DuckDbAttachAuthorization1]):
     root: DuckDbAttachAuthorization1
     """
     How a [`DuckDbAttach`] entry authenticates to its catalog.
-    """
-
-
-class DuckDbAttachType1(StrEnum):
-    """
-    An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
-    """
-
-    iceberg = "iceberg"
-
-
-class DuckDbAttachType(RootModel[DuckDbAttachType1]):
-    root: DuckDbAttachType1
-    """
-    The kind of catalog a [`DuckDbAttach`] entry attaches.
     """
 
 
@@ -444,13 +437,9 @@ class DuckDbAttachS3(BaseModel):
     """
 
 
-class DuckDbAttach(BaseModel):
+class DuckDbAttach1(BaseModel):
     """
-    One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"` adapter attaches to its connection under `alias`.
-
-    ```toml [[adapter.lake.attach]] alias = "lk" type = "iceberg" warehouse = "demo" endpoint = "${ICEBERG_ENDPOINT}"
-
-    [adapter.lake.attach.s3] key_id = "${S3_KEY_ID}" secret = "${S3_SECRET}" endpoint = "localhost:8333" url_style = "path" use_ssl = false ```
+    An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
     """
 
     model_config = ConfigDict(
@@ -474,14 +463,38 @@ class DuckDbAttach(BaseModel):
     """
     Object-store credentials for the table files. Rocky turns them into a temporary DuckDB secret scoped to this attachment.
     """
-    type: DuckDbAttachType
-    """
-    What the attachment is. Only `"iceberg"` (an Iceberg REST catalog).
-    """
+    type: Type
     warehouse: str
     """
     The warehouse name the REST catalog knows.
     """
+
+
+class DuckDbAttach2(BaseModel):
+    """
+    A DuckLake catalog, through DuckDB's `ducklake` extension.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    alias: str
+    """
+    The catalog name models use to target this attachment. The same rules as an Iceberg alias, and it must not start with `__ducklake_metadata_` (DuckLake's own metadata catalog).
+    """
+    data_path: str | None = None
+    """
+    Where DuckLake writes the Parquet data files: a local directory or an `s3://` prefix. A relative local path is made absolute when Rocky connects, because DuckLake stores it verbatim and would resolve it against each later process's working directory. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new catalog).
+    """
+    metadata_path: str
+    """
+    The DuckDB file that holds the DuckLake metadata. A relative path is made absolute against the working directory when Rocky connects, as the adapter's own `path` is. It must not be the adapter's own `path`, and it must not hold a `:` (v1 supports a local DuckDB file only).
+    """
+    s3: DuckDbAttachS3 | None = None
+    """
+    Object-store credentials for an `s3://` `data_path`. Rocky turns them into a temporary DuckDB secret; its scope defaults to `data_path`.
+    """
+    type: Type1
 
 
 class AdapterConfig(BaseModel):
@@ -508,7 +521,7 @@ class AdapterConfig(BaseModel):
     """
     api_key: str | None = None
     api_secret: str | None = None
-    attach: list[DuckDbAttach] | None = None
+    attach: list[DuckDbAttach1 | DuckDbAttach2] | None = None
     """
     Other catalogs this DuckDB connection attaches when `rocky run` connects. Each entry is an Iceberg REST catalog that models target by its `alias` (`[target] catalog = "<alias>"`). `rocky compile` and `rocky plan` never attach. Refused on every other adapter type; see [`validate_duckdb_attachments`] and `docs/adr/ADR-ICEBERG-DUCKDB.md`.
     """

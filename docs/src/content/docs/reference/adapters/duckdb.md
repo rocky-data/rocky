@@ -14,7 +14,7 @@ DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as 
 | `path` | string | No | (in-memory) | Path to a persistent DuckDB file. Required when using the same DuckDB adapter for both discovery and execution, so the discovery side sees rows written by the warehouse side. |
 | `extension_directory` | string | No | (DuckDB's default, under the home directory) | Directory DuckDB keeps its extensions in. Rocky sets DuckDB's `extension_directories` list to this one directory at connect. Every extension Rocky loads uses it. An empty string counts as unset. A relative path resolves against the working directory of the `rocky` process, not against `rocky.toml`. |
 | `offline` | bool | No | `false` | Rocky never runs `INSTALL` and turns DuckDB's auto-install off. See [Offline mode](#offline-mode). |
-| `attach` | list of tables | No | (none) | Iceberg REST catalogs to attach on connect. See [Iceberg catalogs](#iceberg-catalogs). |
+| `attach` | list of tables | No | (none) | Iceberg REST and DuckLake catalogs to attach on connect. See [Iceberg catalogs](#iceberg-catalogs) and [DuckLake catalogs](#ducklake-catalogs). |
 
 Pick one. Each example is a complete adapter declaration, not a complete `rocky.toml`.
 
@@ -120,6 +120,50 @@ What Rocky writes to an attached catalog:
 Everything else is refused before any model runs, with an error that names the strategy and the catalog: views, `merge`, `incremental` with a `unique_key` or a `lookback`, `delete_insert`, `time_interval`, `microbatch`, snapshots, quarantine, branch promote, seeds, `rocky load`, a lakehouse `format`, and a replication `full_refresh` of an existing table.
 
 The [`07-adapters/09-duckdb-iceberg-rest`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/09-duckdb-iceberg-rest) POC runs this against a local Lakekeeper and SeaweedFS in Docker, with no credentials.
+
+## DuckLake catalogs
+
+A DuckDB adapter can also write [DuckLake](https://ducklake.select/) tables. DuckLake keeps table data as Parquet files under a data path and its catalog in a database; Rocky supports a local DuckDB file as that database. Add a `type = "ducklake"` entry to the same `[[adapter.<name>.attach]]` list:
+
+```toml
+[adapter.lake]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[[adapter.lake.attach]]
+alias = "dl"
+type = "ducklake"
+metadata_path = "lake/metadata.ducklake"
+data_path = "lake/data/"
+```
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `alias` | string | Yes | The catalog name models target. The same rules as an Iceberg alias, and it must not start with `__ducklake_metadata_`. |
+| `type` | string | Yes | `"ducklake"`. |
+| `metadata_path` | string | Yes | The DuckDB file that holds the catalog. It is created on the first attach. It must not be the adapter's own `path`, and it must not hold a `:` (`sqlite:`, `postgres:` and `:memory:` are not supported). |
+| `data_path` | string | No | A local directory or an `s3://` prefix. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new one). |
+| `s3` | table | No | Only with an `s3://` `data_path`. The same keys as for Iceberg; `scope` defaults to `data_path`. |
+
+Rocky makes a relative `metadata_path` and `data_path` absolute against the working directory before it attaches. DuckLake stores the data path as written, and a relative one would resolve differently in each later process. For the same reason Rocky refuses a lake whose stored data path is relative. Rocky never overrides the stored data path, so a different `data_path` for an existing lake fails at attach.
+
+`rocky run` loads the `ducklake` extension (and `httpfs` for an `s3://` data path). With `offline = true`, they must already be in the extension directory.
+
+What Rocky writes to an attached DuckLake catalog:
+
+- **`full_refresh`** is `CREATE OR REPLACE TABLE … AS`, one atomic snapshot, as on a plain DuckDB file.
+- **`ephemeral`, `incremental`, `merge`, `delete_insert`, `time_interval`** and replication work as on a plain DuckDB file.
+
+Refused before any model runs, with an error that names the strategy and the catalog: `view` (a view stored in DuckLake looks up its table names in the lake, not the main database), `materialized_view`, `dynamic_table`, `microbatch`, `content_addressed`, snapshots, a lakehouse `format`, seeds, `rocky load`, quarantine and branch promote.
+
+Things to know:
+
+- A DuckDB-file catalog has one writer at a time. A second process fails at attach with `Could not set lock on file`.
+- A write of 10 rows or fewer stays in the metadata file, with no Parquet file.
+- DuckLake keeps old Parquet files until snapshots expire. Rocky expires nothing; run DuckLake's `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` yourself.
+- Discovery never reads an attached catalog: its schemas are not replication sources.
+
+The [`07-adapters/10-duckdb-ducklake`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-duckdb-ducklake) POC runs this with no server, no Docker and no credentials.
 
 ## Authentication
 

@@ -62,7 +62,17 @@ fn parse_profile(root: &Value) -> Option<RawScans> {
                 .and_then(|e| e.get("Table"))
                 .and_then(Value::as_str)
                 .filter(|t| !t.is_empty());
-            let rows = node.get("rows_scanned").and_then(Value::as_u64);
+            // A DuckLake scan reads Parquet files and inlined rows and
+            // reports `rows_scanned: 0` (measured on DuckDB 2.0, ducklake
+            // 417a9117f5). Its row count is not a scan count, so it is
+            // unattributed, never a zero (ADR-DUCKLAKE).
+            let is_ducklake_scan = node.get("extra_info").is_some_and(|e| {
+                e.get("Inlined Tables Read").is_some() || e.get("Total Files Read").is_some()
+            });
+            let rows = node
+                .get("rows_scanned")
+                .and_then(Value::as_u64)
+                .filter(|_| !is_ducklake_scan);
             match (table, rows) {
                 (Some(table), Some(rows_scanned)) => out.scans.push(RawScan {
                     table: table.to_string(),
@@ -393,6 +403,31 @@ mod tests {
         let raw = parse_profile(&root).unwrap();
         assert_eq!(raw.unattributed, 1);
         assert_eq!(raw.scans.len(), 1);
+    }
+
+    /// The measured shape of a DuckLake scan: `rows_scanned` is 0 although
+    /// 100 rows were read. It is unattributed, not a zero-row read.
+    #[test]
+    fn a_ducklake_scan_is_unattributed() {
+        let root = json!({
+            "operator": [{
+                "type": "RESULT_COLLECTOR",
+                "children": [{
+                    "type": "TABLE_SCAN",
+                    "rows_scanned": 0,
+                    "intermediate_rows": 100,
+                    "extra_info": {
+                        "Table": "dl.s.big",
+                        "Projections": "id",
+                        "Total Files Read": "1",
+                        "Inlined Tables Read": "1",
+                    },
+                }],
+            }],
+        });
+        let raw = parse_profile(&root).unwrap();
+        assert_eq!(raw.unattributed, 1);
+        assert!(raw.scans.is_empty());
     }
 
     #[test]

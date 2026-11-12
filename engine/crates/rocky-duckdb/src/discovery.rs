@@ -37,8 +37,11 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
             .lock()
             .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
 
-        // 1. Find schemas matching the prefix. The prefix is user text from
-        // `schema_pattern.prefix`, encoded by this dialect's own lexer rule.
+        // 1. Find schemas matching the prefix, in the database's own catalog
+        // only: an attached Iceberg or DuckLake catalog holds Rocky's
+        // targets, never its sources (ADR-DUCKLAKE). The prefix is user
+        // text from `schema_pattern.prefix`, encoded by this dialect's own
+        // lexer rule.
         //
         // `starts_with`, not `LIKE '<prefix>%'`: in a LIKE pattern `_` matches
         // any one character, so a prefix like `src__` also matched `srcab`
@@ -47,7 +50,7 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
         // `STARTS_WITH` for the same reason.
         let schema_sql = format!(
             "SELECT schema_name FROM information_schema.schemata \
-             WHERE starts_with(schema_name, {}) \
+             WHERE catalog_name = current_database() AND starts_with(schema_name, {}) \
              ORDER BY schema_name",
             string_literal(&DuckDbSqlDialect::plain(), schema_prefix)
         );
@@ -66,7 +69,8 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
             // same way.
             let table_sql = format!(
                 "SELECT table_name FROM information_schema.tables \
-                 WHERE table_schema = {} AND table_type = 'BASE TABLE' \
+                 WHERE table_catalog = current_database() AND table_schema = {} \
+                 AND table_type = 'BASE TABLE' \
                  ORDER BY table_name",
                 string_literal(&DuckDbSqlDialect::plain(), &schema)
             );
@@ -133,6 +137,38 @@ mod tests {
         let names: Vec<&str> = found.connectors.iter().map(|c| c.schema.as_str()).collect();
         assert_eq!(names, ["it's"]);
         assert_eq!(found.connectors[0].tables[0].name, "t");
+    }
+
+    /// An attached catalog (here a second in-memory database, standing in
+    /// for a DuckLake or Iceberg attachment) is never a source: its schemas
+    /// are not discovered, and a same-named schema does not add its tables.
+    #[tokio::test]
+    async fn discover_reads_only_the_own_catalog() {
+        let connector = Arc::new(Mutex::new(DuckDbConnector::in_memory().unwrap()));
+        {
+            let conn = connector.lock().unwrap();
+            for stmt in [
+                "ATTACH ':memory:' AS lake",
+                "CREATE SCHEMA src__own",
+                "CREATE TABLE src__own.a (id INTEGER)",
+                "CREATE SCHEMA lake.src__own",
+                "CREATE TABLE lake.src__own.b (id INTEGER)",
+                "CREATE SCHEMA lake.src__lake_only",
+                "CREATE TABLE lake.src__lake_only.c (id INTEGER)",
+            ] {
+                conn.execute_sql(stmt).unwrap();
+            }
+        }
+        let adapter = DuckDbDiscoveryAdapter::new(connector);
+        let found = adapter.discover("src__").await.unwrap();
+        let names: Vec<&str> = found.connectors.iter().map(|c| c.schema.as_str()).collect();
+        assert_eq!(names, ["src__own"]);
+        let tables: Vec<&str> = found.connectors[0]
+            .tables
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(tables, ["a"]);
     }
 
     #[tokio::test]

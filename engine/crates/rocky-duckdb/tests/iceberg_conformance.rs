@@ -16,7 +16,7 @@
 #![cfg(feature = "iceberg-conformance")]
 
 use rocky_core::config::{
-    DuckDbAttach, DuckDbAttachAuthorization, DuckDbAttachS3, DuckDbAttachType, S3UrlStyle,
+    DuckDbAttach, DuckDbAttachAuthorization, DuckDbAttachS3, DuckDbIcebergAttach, S3UrlStyle,
 };
 use rocky_core::env_string::EnvString;
 use rocky_core::redacted::RedactedString;
@@ -29,9 +29,8 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 fn attachment() -> DuckDbAttach {
-    DuckDbAttach {
+    DuckDbAttach::Iceberg(DuckDbIcebergAttach {
         alias: "lk".into(),
-        attach_type: DuckDbAttachType::Iceberg,
         warehouse: EnvString::from_resolved("demo"),
         endpoint: EnvString::from_resolved(env_or(
             "ICEBERG_ENDPOINT",
@@ -50,7 +49,7 @@ fn attachment() -> DuckDbAttach {
             region: Some(EnvString::from_resolved("us-east-1")),
             scope: Some(EnvString::from_resolved("s3://warehouse")),
         }),
-    }
+    })
 }
 
 fn adapter() -> DuckDbWarehouseAdapter {

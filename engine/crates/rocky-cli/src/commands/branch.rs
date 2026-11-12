@@ -1520,6 +1520,15 @@ fn promote_swap(
     dialect: &dyn rocky_core::traits::SqlDialect,
     step: &crate::output::PromoteTargetPlan,
 ) -> Result<Option<rocky_core::replace::StagedSwap>> {
+    // ADR-DUCKLAKE D3: promote does not write to an attached catalog in v1.
+    let kind = dialect.catalog_kind(&step.target_catalog);
+    if kind != rocky_core::traits::CatalogKind::Native {
+        anyhow::bail!(
+            "promote is not supported on catalog '{}': it is {}",
+            step.target_catalog,
+            kind.describe()
+        );
+    }
     if step.strategy != "full_refresh" {
         return Ok(None);
     }

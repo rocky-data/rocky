@@ -7,6 +7,7 @@
 //! - Unit testing SQL generation output
 
 pub mod adapter;
+pub mod attach;
 pub mod dialect;
 pub mod discovery;
 pub mod iceberg;
@@ -596,8 +597,8 @@ impl DuckDbConnector {
         Ok(QueryResult { columns, rows })
     }
 
-    /// Attach Iceberg catalogs to this connection; see
-    /// [`iceberg::attach_catalogs`]. `own_catalog` is the database's own
+    /// Attach the `[[attach]]` catalogs to this connection; see
+    /// [`attach::attach_catalogs`]. `own_catalog` is the database's own
     /// catalog name, which no alias may take.
     ///
     /// # Errors
@@ -609,7 +610,7 @@ impl DuckDbConnector {
         own_catalog: &str,
         opts: &ExtensionOptions,
     ) -> Result<(), DuckDbError> {
-        iceberg::attach_catalogs(
+        attach::attach_catalogs(
             &self.conn,
             entries,
             own_catalog,

@@ -82,15 +82,14 @@ pub async fn run_snapshot(
         "running snapshot"
     );
 
-    // ADR-ICEBERG-DUCKDB D4: snapshots are not written to an attached Iceberg
-    // catalog in v1.
-    if dialect.table_replace(&config.target.catalog)
-        == rocky_core::traits::TableReplace::InPlaceOverwrite
-    {
+    // ADR-ICEBERG-DUCKDB D4, ADR-DUCKLAKE D3: snapshots are not written to an
+    // attached catalog in v1.
+    let kind = dialect.catalog_kind(&config.target.catalog);
+    if kind != rocky_core::traits::CatalogKind::Native {
         anyhow::bail!(
-            "snapshot is not supported on catalog '{}', an attached Iceberg catalog; nothing \
-             was written",
-            config.target.catalog
+            "snapshot is not supported on catalog '{}', {}; nothing was written",
+            config.target.catalog,
+            kind.describe()
         );
     }
 

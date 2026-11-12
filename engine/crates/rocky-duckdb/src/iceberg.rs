@@ -1,15 +1,10 @@
 //! Iceberg REST catalogs attached to a DuckDB connection
-//! (`docs/adr/ADR-ICEBERG-DUCKDB.md`).
+//! (`docs/adr/ADR-ICEBERG-DUCKDB.md`): the in-place overwrite. The attach
+//! step lives in [`crate::attach`].
 //!
-//! Two parts:
-//!
-//! - **Attach.** [`attach_catalogs`] loads `httpfs` and `iceberg`, creates a
-//!   temporary S3 secret per attachment and runs `ATTACH … (TYPE iceberg)`.
-//!   The secret and attach statements carry credentials, so they never pass
-//!   through a logging path.
-//! - **In-place overwrite.** DuckDB-Iceberg refuses `CREATE OR REPLACE` and a
-//!   rename inside a write transaction. A full refresh of an existing table
-//!   is therefore one transaction ([`overwrite_in_place`]):
+//! DuckDB-Iceberg refuses `CREATE OR REPLACE` and a rename inside a write
+//! transaction. A full refresh of an existing table is therefore one
+//! transaction ([`overwrite_in_place`]):
 //!
 //! ```text
 //! BEGIN TRANSACTION
@@ -22,190 +17,12 @@
 //! COMMIT                 any error → ROLLBACK; the old table and rows stay
 //! ```
 
-use std::path::Path;
-
-use duckdb::Connection;
-use rocky_core::config::{
-    DuckDbAttach, DuckDbAttachAuthorization, DuckDbAttachS3, DuckDbAttachType, S3UrlStyle,
-};
-use rocky_sql::validation;
-
-use crate::{DuckDbConnector, DuckDbError, sql_literal};
-
-/// The extensions an Iceberg attachment needs, loaded in this order.
-const ICEBERG_EXTENSIONS: [&str; 2] = ["httpfs", "iceberg"];
+use crate::{DuckDbConnector, DuckDbError};
 
 /// How many times a full refresh runs its transaction when the catalog
 /// reports a commit conflict with another writer. A full refresh reads
 /// nothing it wrote, so running it again is safe.
 pub const COMMIT_CONFLICT_ATTEMPTS: u32 = 3;
-
-/// The name of the temporary secret Rocky creates for `alias`.
-#[must_use]
-pub fn secret_name(alias: &str) -> String {
-    format!("rocky_attach_{alias}")
-}
-
-/// The `CREATE OR REPLACE TEMPORARY SECRET` for an attachment's S3 settings.
-fn secret_sql(alias: &str, s3: &DuckDbAttachS3) -> String {
-    let mut parts = vec!["TYPE s3".to_string()];
-    if let Some(v) = &s3.key_id {
-        parts.push(format!("KEY_ID {}", sql_literal(v.expose())));
-    }
-    if let Some(v) = &s3.secret {
-        parts.push(format!("SECRET {}", sql_literal(v.expose())));
-    }
-    if let Some(v) = &s3.endpoint {
-        parts.push(format!("ENDPOINT {}", sql_literal(v.expose())));
-    }
-    if let Some(style) = s3.url_style {
-        let style = match style {
-            S3UrlStyle::Path => "path",
-            S3UrlStyle::Vhost => "vhost",
-        };
-        parts.push(format!("URL_STYLE '{style}'"));
-    }
-    if let Some(ssl) = s3.use_ssl {
-        parts.push(format!("USE_SSL {ssl}"));
-    }
-    if let Some(v) = &s3.region {
-        parts.push(format!("REGION {}", sql_literal(v.expose())));
-    }
-    if let Some(v) = &s3.scope {
-        parts.push(format!("SCOPE {}", sql_literal(v.expose())));
-    }
-    format!(
-        "CREATE OR REPLACE TEMPORARY SECRET {} ({})",
-        secret_name(alias),
-        parts.join(", ")
-    )
-}
-
-/// The `ATTACH` statement for one entry.
-fn attach_sql(entry: &DuckDbAttach) -> String {
-    let DuckDbAttachType::Iceberg = entry.attach_type;
-    let DuckDbAttachAuthorization::None = entry.authorization;
-    format!(
-        "ATTACH {} AS {} (TYPE iceberg, ENDPOINT {}, AUTHORIZATION_TYPE 'none', \
-         ACCESS_DELEGATION_MODE 'none')",
-        sql_literal(entry.warehouse.expose()),
-        entry.alias,
-        sql_literal(entry.endpoint.expose()),
-    )
-}
-
-/// A driver error with every credential of `entry` replaced by `***`.
-/// DuckDB does not echo secret values today; this keeps it so if it ever does.
-fn redacted_cause(entry: &DuckDbAttach, err: &duckdb::Error) -> String {
-    let mut cause = err.to_string();
-    if let Some(s3) = &entry.s3 {
-        for value in [
-            s3.secret
-                .as_ref()
-                .map(rocky_core::redacted::RedactedString::expose),
-            s3.key_id
-                .as_ref()
-                .map(rocky_core::env_string::EnvString::expose),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|v| !v.is_empty())
-        {
-            cause = cause.replace(value, "***");
-        }
-    }
-    cause
-}
-
-/// Check every alias before anything is attached: an identifier, not a
-/// built-in catalog, not the database file's own catalog (`own_catalog`) and
-/// not repeated. `rocky validate` checks the same rules except the file's
-/// catalog, which only the adapter knows.
-///
-/// # Errors
-///
-/// [`DuckDbError::AttachInvalid`] naming the alias.
-pub fn check_aliases(entries: &[DuckDbAttach], own_catalog: &str) -> Result<(), DuckDbError> {
-    let mut seen = std::collections::BTreeSet::new();
-    for entry in entries {
-        let invalid = |detail: String| DuckDbError::AttachInvalid {
-            alias: entry.alias.clone(),
-            detail,
-        };
-        validation::validate_identifier(&entry.alias).map_err(|e| invalid(e.to_string()))?;
-        let lower = entry.alias.to_ascii_lowercase();
-        if rocky_core::config::DUCKDB_RESERVED_ATTACH_ALIASES.contains(&lower.as_str()) {
-            return Err(invalid("it is a DuckDB built-in catalog name".into()));
-        }
-        if lower == own_catalog.to_ascii_lowercase() {
-            return Err(invalid(format!(
-                "it is the catalog name of the adapter's own database ('{own_catalog}')"
-            )));
-        }
-        if !seen.insert(lower) {
-            return Err(invalid("another attachment uses it".into()));
-        }
-    }
-    Ok(())
-}
-
-/// Load `httpfs` and `iceberg`, then create each entry's secret and attach
-/// it. With `offline`, an extension is only loaded, never installed, and a
-/// missing one is [`DuckDbError::OfflineExtensionMissing`].
-///
-/// The secret and attach statements run on `conn` directly, never through
-/// [`DuckDbConnector::execute_statement`], which logs its SQL.
-///
-/// # Errors
-///
-/// An invalid alias, a missing extension, or a failed secret or attach.
-pub(crate) fn attach_catalogs(
-    conn: &Connection,
-    entries: &[DuckDbAttach],
-    own_catalog: &str,
-    extension_directory: Option<&Path>,
-    offline: bool,
-) -> Result<(), DuckDbError> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    check_aliases(entries, own_catalog)?;
-    for extension in ICEBERG_EXTENSIONS {
-        if let Err(err) = conn.execute_batch(&format!("LOAD {extension}")) {
-            if offline {
-                return Err(crate::offline_extension_missing(
-                    conn,
-                    extension_directory,
-                    extension,
-                    &err,
-                ));
-            }
-            conn.execute_batch(&format!("INSTALL {extension}; LOAD {extension}"))
-                .map_err(|e| DuckDbError::AttachFailed {
-                    alias: entries[0].alias.clone(),
-                    step: "load extension",
-                    cause: format!("{extension}: {e}"),
-                })?;
-        }
-    }
-    for entry in entries {
-        if let Some(s3) = &entry.s3 {
-            conn.execute_batch(&secret_sql(&entry.alias, s3))
-                .map_err(|e| DuckDbError::AttachFailed {
-                    alias: entry.alias.clone(),
-                    step: "create the S3 secret",
-                    cause: redacted_cause(entry, &e),
-                })?;
-        }
-        conn.execute_batch(&attach_sql(entry))
-            .map_err(|e| DuckDbError::AttachFailed {
-                alias: entry.alias.clone(),
-                step: "attach the catalog",
-                cause: redacted_cause(entry, &e),
-            })?;
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Column reconcile
@@ -942,63 +759,5 @@ mod tests {
             target: "t".into(),
             detail: "CatalogCommitConflicts".into(),
         }));
-    }
-
-    #[test]
-    fn the_secret_statement_is_temporary_and_scoped() {
-        let s3 = DuckDbAttachS3 {
-            key_id: Some(rocky_core::env_string::EnvString::from_resolved("k")),
-            secret: Some(rocky_core::redacted::RedactedString::new(
-                "it's".to_string(),
-            )),
-            endpoint: Some(rocky_core::env_string::EnvString::from_resolved(
-                "localhost:8333",
-            )),
-            url_style: Some(S3UrlStyle::Path),
-            use_ssl: Some(false),
-            region: None,
-            scope: Some(rocky_core::env_string::EnvString::from_resolved(
-                "s3://warehouse",
-            )),
-        };
-        let sql = secret_sql("lk", &s3);
-        assert_eq!(
-            sql,
-            "CREATE OR REPLACE TEMPORARY SECRET rocky_attach_lk (TYPE s3, KEY_ID 'k', \
-             SECRET 'it''s', ENDPOINT 'localhost:8333', URL_STYLE 'path', USE_SSL false, \
-             SCOPE 's3://warehouse')"
-        );
-        assert!(!sql.contains("PERSISTENT"));
-    }
-
-    fn entry(alias: &str) -> DuckDbAttach {
-        DuckDbAttach {
-            alias: alias.to_string(),
-            attach_type: DuckDbAttachType::Iceberg,
-            warehouse: rocky_core::env_string::EnvString::from_resolved("demo"),
-            endpoint: rocky_core::env_string::EnvString::from_resolved(
-                "http://localhost:8181/catalog",
-            ),
-            authorization: DuckDbAttachAuthorization::None,
-            s3: None,
-        }
-    }
-
-    #[test]
-    fn attach_statement_names_the_alias() {
-        assert_eq!(
-            attach_sql(&entry("lk")),
-            "ATTACH 'demo' AS lk (TYPE iceberg, ENDPOINT 'http://localhost:8181/catalog', \
-             AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none')"
-        );
-    }
-
-    #[test]
-    fn aliases_are_checked_against_the_own_catalog_and_each_other() {
-        assert!(check_aliases(&[entry("lk")], "memory").is_ok());
-        assert!(check_aliases(&[entry("warehouse")], "warehouse").is_err());
-        assert!(check_aliases(&[entry("MEMORY")], "x").is_err());
-        assert!(check_aliases(&[entry("lk"), entry("LK")], "x").is_err());
-        assert!(check_aliases(&[entry("bad-name")], "x").is_err());
     }
 }

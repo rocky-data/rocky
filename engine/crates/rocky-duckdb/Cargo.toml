@@ -30,6 +30,11 @@ tokio = { workspace = true }
 # `.github/workflows/iceberg-conformance.yml`), and its tests are
 # `#[ignore]`, so `--all-features` runs stay network-free.
 iceberg-conformance = []
+# Gates the live DuckLake conformance test in `tests/ducklake_conformance.rs`.
+# It downloads the `ducklake` extension (see
+# `.github/workflows/ducklake-conformance.yml`), and its tests are
+# `#[ignore]`, so `--all-features` runs stay network-free.
+ducklake-conformance = []
 
 [dev-dependencies]
 # `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's

@@ -75,15 +75,13 @@ pub enum QuarantineError {
     )]
     TagNeedsSourceReplacement { dialect: &'static str },
 
-    /// Quarantine rebuilds tables by replace, which an in-place-overwrite
-    /// catalog does not offer (ADR-ICEBERG-DUCKDB D4).
-    #[error(
-        "quarantine is not supported on catalog '{catalog}' ({dialect}): it is an attached \
-         Iceberg catalog, which Rocky writes with full_refresh and append incremental only"
-    )]
+    /// Quarantine is not written to an attached catalog in v1
+    /// (ADR-ICEBERG-DUCKDB D4, ADR-DUCKLAKE D3).
+    #[error("quarantine is not supported on catalog '{catalog}' ({dialect}): it is {kind}")]
     NotSupportedOnCatalog {
         dialect: &'static str,
         catalog: String,
+        kind: &'static str,
     },
 
     /// The staged replace of the valid table could not be rendered.
@@ -415,10 +413,12 @@ fn compile_with_token(
     }
 
     let replace = dialect.table_replace(&table_ref.catalog);
-    if replace == TableReplace::InPlaceOverwrite {
+    let kind = dialect.catalog_kind(&table_ref.catalog);
+    if kind != crate::traits::CatalogKind::Native {
         return Err(QuarantineError::NotSupportedOnCatalog {
             dialect: dialect.name(),
             catalog: table_ref.catalog.clone(),
+            kind: kind.describe(),
         });
     }
     if matches!(config.mode, QuarantineMode::Tag) {
