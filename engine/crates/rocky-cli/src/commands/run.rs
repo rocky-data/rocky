@@ -56130,6 +56130,7 @@ mod staged_swap_wiring_tests {
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            product_volumes: None,
             record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
@@ -56333,6 +56334,7 @@ mod in_place_overwrite_wiring_tests {
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            product_volumes: None,
             record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
