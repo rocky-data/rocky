@@ -1,4 +1,4 @@
-# 09-dlt-connector-shim — dlt source as a Rocky child connector
+# 10-dlt-connector-shim — dlt source as a Rocky child connector
 
 > **Category:** 07-adapters
 > **Credentials:** none (installs dlt 1.32.0 into a POC-local `.venv` on the first run; needs a package registry once)
@@ -99,4 +99,4 @@ POC complete: 3 loads (5, 3, 0 rows), 8 rows total, dlt cursor carried in Rocky 
 
 - [Child connectors guide](../../../../../docs/src/content/docs/guides/child-connectors.md): the protocol, the checks and the guarantees
 - [`08-postgres-child-connector`](../08-postgres-child-connector/): the reference connector this shim copies
-- [`10-airbyte-connector-shim`](../10-airbyte-connector-shim/) and [`11-meltano-connector-shim`](../11-meltano-connector-shim/)
+- [`11-airbyte-connector-shim`](../11-airbyte-connector-shim/) and [`12-meltano-connector-shim`](../12-meltano-connector-shim/)

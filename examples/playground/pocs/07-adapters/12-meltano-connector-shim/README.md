@@ -1,4 +1,4 @@
-# 11-meltano-connector-shim — Singer tap run by Meltano as a Rocky child connector
+# 12-meltano-connector-shim — Singer tap run by Meltano as a Rocky child connector
 
 > **Category:** 07-adapters
 > **Credentials:** none (installs Meltano 4.4.1 and the POC tap into a local `.venv` on the first run; needs a package registry once)
@@ -101,4 +101,4 @@ POC complete: 3 loads (4, 3, 0 rows), 7 rows total, Singer bookmark carried in R
 
 - [Child connectors guide](../../../../../docs/src/content/docs/guides/child-connectors.md): the protocol, the checks and the guarantees
 - [`08-postgres-child-connector`](../08-postgres-child-connector/): the reference connector this shim copies
-- [`09-dlt-connector-shim`](../09-dlt-connector-shim/) and [`10-airbyte-connector-shim`](../10-airbyte-connector-shim/)
+- [`10-dlt-connector-shim`](../10-dlt-connector-shim/) and [`11-airbyte-connector-shim`](../11-airbyte-connector-shim/)

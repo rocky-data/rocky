@@ -1,4 +1,4 @@
-# 10-airbyte-connector-shim — Airbyte source image as a Rocky child connector
+# 11-airbyte-connector-shim — Airbyte source image as a Rocky child connector
 
 > **Category:** 07-adapters
 > **Credentials:** none (needs a Docker daemon and one pull of `airbyte/source-faker:6.2.21`)
@@ -107,4 +107,4 @@ POC complete: 3 loads (20, 0, 0 rows), Airbyte STREAM state carried in Rocky sta
 
 - [Child connectors guide](../../../../../docs/src/content/docs/guides/child-connectors.md): the protocol, the checks and the guarantees
 - [`08-postgres-child-connector`](../08-postgres-child-connector/): the reference connector this shim copies
-- [`09-dlt-connector-shim`](../09-dlt-connector-shim/) and [`11-meltano-connector-shim`](../11-meltano-connector-shim/)
+- [`10-dlt-connector-shim`](../10-dlt-connector-shim/) and [`12-meltano-connector-shim`](../12-meltano-connector-shim/)

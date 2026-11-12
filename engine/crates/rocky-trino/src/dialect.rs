@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use rocky_core::traits::{
-    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, hold_back_predicate,
+    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, TableReplace,
+    hold_back_predicate,
 };
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
@@ -55,12 +56,20 @@ impl SqlDialect for TrinoDialect {
         LiteralEscape::Standard
     }
 
-    /// Trino's portable `CREATE TABLE ... AS` has no `OR REPLACE` across
-    /// all connectors (Hive pre-414), so a second full refresh hits
-    /// "table already exists". The runtime issues a leading
-    /// `DROP TABLE IF EXISTS` to make full refresh idempotent.
-    fn full_refresh_needs_predrop(&self) -> bool {
-        true
+    /// Trino has no `CREATE OR REPLACE` on every connector (`memory` and
+    /// Hive refuse it) and no multi-statement transactions, so a full
+    /// refresh is a staged swap: build a stage, then rename it in
+    /// (ADR-REPLACE). A failed build leaves the old table untouched.
+    fn table_replace(&self, _catalog: &str) -> TableReplace {
+        TableReplace::StagedSwap
+    }
+
+    /// `ALTER TABLE [IF EXISTS] <from> RENAME TO <to>`. Both are three-part
+    /// refs; Trino refuses a rename onto an existing name, so a leftover
+    /// table is never overwritten.
+    fn rename_table_sql(&self, from: &str, to: &str, if_exists: bool) -> AdapterResult<String> {
+        let if_exists = if if_exists { "IF EXISTS " } else { "" };
+        Ok(format!("ALTER TABLE {if_exists}{from} RENAME TO {to}"))
     }
 
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
@@ -77,13 +86,9 @@ impl SqlDialect for TrinoDialect {
         // Trino's `CREATE OR REPLACE TABLE ... AS` lands behind connector
         // capability flags (Iceberg supports it; Hive does not pre-414),
         // so this emits the portable plain `CREATE TABLE ... AS` that every
-        // connector accepts. On its own that's NOT idempotent — a second
-        // full refresh hits "table already exists". Idempotency is provided
-        // by the runtime, which precedes the CTAS with a separate
-        // `DROP TABLE IF EXISTS` whenever `full_refresh_needs_predrop()` is
-        // true (Trino). Kept as a single statement here because Trino's
-        // REST `/v1/statement` runs one statement per request — the DROP is
-        // issued as its own statement, never `;`-joined onto the CTAS.
+        // connector accepts. It does not replace: a full refresh of an
+        // existing table goes through the staged swap (`table_replace`),
+        // which builds this CTAS under the stage name and renames it in.
         format!("CREATE TABLE {target} AS\n{select_sql}")
     }
 
@@ -370,7 +375,7 @@ mod tests {
         );
     }
     use rocky_core::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
-    use rocky_core::quarantine::{StatementRole, compile_quarantine_sql};
+    use rocky_core::quarantine::compile_quarantine_sql;
     use rocky_core::tests::{TestDecl, TestSeverity, TestType};
     use rocky_ir::TableRef;
 
@@ -402,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_drop_predrops_valid_table_before_ctas() {
+    fn quarantine_drop_builds_the_valid_table_under_a_stage_and_swaps_it_in() {
         let (assertions, table, config) = quarantine_case(QuarantineMode::Drop);
         let plan = compile_quarantine_sql(
             &assertions,
@@ -414,17 +419,25 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(plan.statements.len(), 2);
-        assert_eq!(plan.statements[0].role, StatementRole::PredropValid);
-        assert_eq!(plan.statements[1].role, StatementRole::Valid);
-        assert_eq!(
-            plan.statements[0].sql,
-            "DROP TABLE IF EXISTS \"iceberg\".\"raw\".\"orders__valid\""
+        assert!(
+            plan.statements.is_empty(),
+            "the valid table is written only by the swap: {:?}",
+            plan.statements
         );
+        let swap = plan
+            .valid_swap
+            .expect("drop mode on Trino carries a staged swap");
         assert_eq!(
-            plan.statements[1].sql,
-            "CREATE TABLE \"iceberg\".\"raw\".\"orders__valid\" AS\n\
-             SELECT * FROM \"iceberg\".\"raw\".\"orders\" WHERE customer_id IS NOT NULL"
+            swap.statements(),
+            [
+                "CREATE TABLE \"iceberg\".\"raw\".\"orders__valid__rocky_stage\" AS\n\
+                 SELECT * FROM \"iceberg\".\"raw\".\"orders\" WHERE customer_id IS NOT NULL",
+                "ALTER TABLE IF EXISTS \"iceberg\".\"raw\".\"orders__valid\" RENAME TO \
+                 \"iceberg\".\"raw\".\"orders__valid__rocky_old\"",
+                "ALTER TABLE \"iceberg\".\"raw\".\"orders__valid__rocky_stage\" RENAME TO \
+                 \"iceberg\".\"raw\".\"orders__valid\"",
+                "DROP TABLE IF EXISTS \"iceberg\".\"raw\".\"orders__valid__rocky_old\"",
+            ]
         );
     }
 
@@ -442,7 +455,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "quarantine mode = \"tag\" is not supported on trino: it rewrites its source table, and this dialect requires a pre-drop before CREATE TABLE AS; use mode = \"drop\""
+            "quarantine mode = \"tag\" is not supported on trino: it rewrites its source table in place, and this dialect has no atomic replace; use mode = \"drop\""
         );
     }
 
@@ -475,11 +488,19 @@ mod tests {
     }
 
     #[test]
-    fn full_refresh_needs_predrop_is_true() {
-        // Trino's portable CTAS has no `OR REPLACE`, so full refresh must be
-        // made idempotent by a leading DROP issued by the runtime.
+    fn full_refresh_is_a_staged_swap_with_renames() {
         let d = TrinoDialect::new();
-        assert!(d.full_refresh_needs_predrop());
+        assert_eq!(d.table_replace("iceberg"), TableReplace::StagedSwap);
+        assert_eq!(
+            d.rename_table_sql("\"c\".\"s\".\"a\"", "\"c\".\"s\".\"b\"", true)
+                .unwrap(),
+            "ALTER TABLE IF EXISTS \"c\".\"s\".\"a\" RENAME TO \"c\".\"s\".\"b\""
+        );
+        assert_eq!(
+            d.rename_table_sql("\"c\".\"s\".\"a\"", "\"c\".\"s\".\"b\"", false)
+                .unwrap(),
+            "ALTER TABLE \"c\".\"s\".\"a\" RENAME TO \"c\".\"s\".\"b\""
+        );
     }
 
     #[test]

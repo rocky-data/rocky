@@ -90,6 +90,8 @@ wall_time_secs = 1800
 
 A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
 
+`rocky validate` reads each manifest offline and reports **V067** for each connector. It is `ok` when the manifest reads and is valid, and the program in `command` exists. It is an error when the manifest is missing or invalid, or when the first entry of `command` is a path that does not exist. Validate does not check that the program can run, nor any later argument such as a script path. A bare program name is looked up on `PATH` at run time, so validate does not check it. The `[connector.<name>]` fields themselves, such as `output_uri` and `limits`, are checked when the config loads. Secrets are read only at load time. A project with connectors and no `[pipeline]` is valid: V020 ("No pipelines defined") does not warn.
+
 ## The request and the result
 
 Rocky writes one JSON document to the stdin of the program.
@@ -284,7 +286,9 @@ The limits of this design:
 - Delivery is at least once, as for every child connector.
 - Each run scans the whole source table.
 
-The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file.
+The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file. The weekly CI runs it as a gate: a failure turns the weekly job red.
+
+The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the same connector inside a full project, with a data product, a deadline, volume ranges, a monthly cost and a budget.
 
 ## Connector shims
 
@@ -292,9 +296,9 @@ Three POCs show how to run a third-party extraction tool as a child connector. E
 
 | Tool | POC | What the shim runs |
 |---|---|---|
-| dlt | [`07-adapters/09-dlt-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/09-dlt-connector-shim) | A dlt source, named by module and function, with the `filesystem` destination writing Parquet. |
-| Airbyte | [`07-adapters/10-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-airbyte-connector-shim) | An open-source Airbyte source image with `docker run`: `spec`, `discover`, then `read`. |
-| Meltano | [`07-adapters/11-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. |
+| dlt | [`07-adapters/10-dlt-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-dlt-connector-shim) | A dlt source, named by module and function, with the `filesystem` destination writing Parquet. |
+| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An open-source Airbyte source image with `docker run`: `spec`, `discover`, then `read`. |
+| Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. |
 
 All three follow the same rules.
 

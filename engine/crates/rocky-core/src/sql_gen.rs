@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::incremental_filter;
 use crate::lakehouse::{self, LakehouseError};
-use crate::traits::{AdapterError, SqlDialect};
+use crate::traits::{AdapterError, SqlDialect, TableReplace};
 use rocky_ir::{
     ArchivePlanIr, ColumnSelection, CompactPlanIr, MaterializationStrategy, ModelIr,
     ModelIrVariant, PartitionWindow,
@@ -55,6 +55,11 @@ pub enum SqlGenError {
     #[error("invalid SQL generation request: {0}")]
     InvalidRequest(String),
 
+    /// The staged replace of a full refresh could not be rendered
+    /// (ADR-REPLACE).
+    #[error(transparent)]
+    Replace(Box<crate::replace::ReplaceError>),
+
     /// A Delta-Lake maintenance operation (`OPTIMIZE` / `VACUUM`) was
     /// requested against a dialect that doesn't render it. Raised by
     /// `compact_from_ir` / `archive_from_ir` so `rocky compact` /
@@ -65,6 +70,12 @@ pub enum SqlGenError {
         operation: &'static str,
         dialect: String,
     },
+}
+
+impl From<crate::replace::ReplaceError> for SqlGenError {
+    fn from(e: crate::replace::ReplaceError) -> Self {
+        Self::Replace(Box::new(e))
+    }
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -565,11 +576,29 @@ pub fn generate_transformation_sql_with_warehouse(
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
+    refuse_on_in_place_catalog(model_ir, dialect)?;
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
         &model_ir.target.table,
     )?;
+
+    // An attached Iceberg catalog (ADR-ICEBERG-DUCKDB D3): a full refresh is
+    // one transaction that `WarehouseAdapter::overwrite_in_place` runs. The
+    // plan shows its fixed statements; the column reconcile between `BEGIN`
+    // and `DELETE` is decided at run time from the live table.
+    if dialect.table_replace(&model_ir.target.catalog) == TableReplace::InPlaceOverwrite
+        && matches!(
+            model_ir.materialization,
+            MaterializationStrategy::FullRefresh
+        )
+    {
+        return Ok(in_place_overwrite_statements(
+            dialect,
+            &target,
+            &model_ir.sql,
+        ));
+    }
 
     // Validate all source references
     for source in &model_ir.sources {
@@ -625,20 +654,25 @@ pub fn generate_transformation_sql_with_warehouse(
 
     match &model_ir.materialization {
         MaterializationStrategy::FullRefresh => {
-            // Dialects whose CTAS isn't an atomic `CREATE OR REPLACE` (Trino)
-            // need a leading `DROP TABLE IF EXISTS` so a re-run doesn't hit
-            // "table already exists". Emitted as a separate statement — the
-            // runtime executes each element of this Vec individually, and
-            // Trino's REST API runs one statement per request.
-            let mut stmts = Vec::with_capacity(2);
-            if dialect.full_refresh_needs_predrop() {
-                stmts.push(dialect.drop_table_sql(&target));
+            // A dialect with no atomic replace (Trino) gets the staged swap's
+            // statements (ADR-REPLACE): build a stage, rename the old table
+            // aside, rename the stage in, drop the old table. `rocky run`
+            // executes the same swap through `StagedSwap::execute`, which adds
+            // the probes and the rollback; each element here is one
+            // statement, because Trino's REST API runs one per request.
+            match full_refresh_swap(model_ir, dialect)? {
+                Some(swap) => Ok(swap.statements()),
+                None => Ok(vec![match ctas_with_table_options(
+                    model_ir,
+                    dialect,
+                    &target,
+                    &model_ir.sql,
+                    true,
+                )? {
+                    Some(stmt) => stmt,
+                    None => dialect.create_table_as(&target, &model_ir.sql),
+                }]),
             }
-            match ctas_with_table_options(model_ir, dialect, &target, &model_ir.sql, true)? {
-                Some(stmt) => stmts.push(stmt),
-                None => stmts.push(dialect.create_table_as(&target, &model_ir.sql)),
-            }
-            Ok(stmts)
         }
         MaterializationStrategy::Incremental { .. } => {
             // The incremental-run SQL: the model filtered to rows past the
@@ -992,6 +1026,136 @@ fn clickhouse_table_options(model_ir: &ModelIr) -> Option<&rocky_ir::ClickHouseT
 /// `[clickhouse]`) that shape its table's `CREATE TABLE … AS`.
 fn has_table_options(model_ir: &ModelIr) -> bool {
     redshift_table_options(model_ir).is_some() || clickhouse_table_options(model_ir).is_some()
+}
+
+/// The temporary table an in-place overwrite holds the model's rows in,
+/// so a model that reads its own target sees the old rows.
+pub const IN_PLACE_OVERWRITE_STAGE: &str = "temp.main.__rocky_overwrite";
+
+/// The statements `rocky plan` shows for an in-place overwrite of `target`
+/// (ADR-ICEBERG-DUCKDB D3), the same ones `rocky run` executes. `rocky run`
+/// adds the column reconcile, decided from the live table, before the
+/// `DELETE`. On a first build it runs `CREATE TABLE … AS` instead.
+#[must_use]
+pub fn in_place_overwrite_statements(
+    dialect: &dyn SqlDialect,
+    target: &str,
+    select_sql: &str,
+) -> Vec<String> {
+    vec![
+        "BEGIN TRANSACTION".to_string(),
+        format!("CREATE OR REPLACE TEMP TABLE {IN_PLACE_OVERWRITE_STAGE} AS\n{select_sql}\n"),
+        format!("DELETE FROM {target}"),
+        dialect.insert_into(target, &format!("SELECT * FROM {IN_PLACE_OVERWRITE_STAGE}")),
+        "COMMIT".to_string(),
+    ]
+}
+
+/// Refuse, before any SQL runs, a model that writes to an in-place-overwrite
+/// catalog (an attached Iceberg catalog) with anything but `full_refresh` or
+/// an append `incremental` (ADR-ICEBERG-DUCKDB D4). The error names the
+/// strategy and the catalog.
+///
+/// # Errors
+///
+/// [`SqlGenError::InvalidRequest`] naming what is not supported.
+pub fn refuse_on_in_place_catalog(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<(), SqlGenError> {
+    let catalog = &model_ir.target.catalog;
+    if dialect.table_replace(catalog) != TableReplace::InPlaceOverwrite {
+        return Ok(());
+    }
+    let refused: Option<&str> = match &model_ir.materialization {
+        MaterializationStrategy::FullRefresh | MaterializationStrategy::Ephemeral => None,
+        MaterializationStrategy::Incremental {
+            unique_key,
+            lookback,
+            ..
+        } => {
+            if !unique_key.is_empty() {
+                Some("incremental with a unique_key (a merge)")
+            } else if lookback.is_some() {
+                Some("incremental with a lookback")
+            } else {
+                None
+            }
+        }
+        MaterializationStrategy::Merge { .. } => Some("merge"),
+        MaterializationStrategy::View => Some("view"),
+        MaterializationStrategy::MaterializedView => Some("materialized_view"),
+        MaterializationStrategy::DynamicTable { .. } => Some("dynamic_table"),
+        MaterializationStrategy::TimeInterval { .. } => Some("time_interval"),
+        MaterializationStrategy::DeleteInsert { .. } => Some("delete_insert"),
+        MaterializationStrategy::Microbatch { .. } => Some("microbatch"),
+        MaterializationStrategy::ContentAddressed { .. } => Some("content_addressed"),
+        MaterializationStrategy::Snapshot(_) => Some("snapshot"),
+    };
+    let refused = refused.or_else(|| model_ir.format.is_some().then_some("a lakehouse `format`"));
+    match refused {
+        None => Ok(()),
+        Some(what) => Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': {what} is not supported on catalog '{catalog}', an attached Iceberg \
+             catalog; Rocky writes it with full_refresh and append incremental only \
+             (ADR-ICEBERG-DUCKDB)",
+            model_ir.name
+        ))),
+    }
+}
+
+/// The staged swap a `FullRefresh` model's run takes on a dialect with no
+/// atomic replace, or `None` when [`SqlDialect::table_replace`] is
+/// [`TableReplace::Atomic`] for the target's catalog (ADR-REPLACE).
+///
+/// The stage is built with the model's table attributes and the
+/// non-replacing CTAS form, so a leftover stage fails the build instead of
+/// being overwritten.
+///
+/// # Errors
+///
+/// The target's name ends in a reserved suffix, or the dialect cannot
+/// render the CTAS or a rename.
+pub fn full_refresh_swap(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<Option<crate::replace::StagedSwap>, SqlGenError> {
+    match dialect.table_replace(&model_ir.target.catalog) {
+        // An in-place overwrite is not a swap: the runner hands the model's
+        // query to `WarehouseAdapter::overwrite_in_place` instead.
+        TableReplace::Atomic | TableReplace::InPlaceOverwrite => return Ok(None),
+        TableReplace::StagedSwap => {}
+    }
+    let target = rocky_ir::TableRef {
+        catalog: model_ir.target.catalog.clone(),
+        schema: model_ir.target.schema.clone(),
+        table: model_ir.target.table.clone(),
+    };
+    // The swap builds a plain CTAS, so a lakehouse `format` would be lost.
+    // No staged-swap dialect renders lakehouse DDL today; refuse rather than
+    // drop the declared format if one ever does.
+    if model_ir.format.is_some() {
+        return Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': a lakehouse `format` cannot be replaced by a staged swap on {}",
+            model_ir.name,
+            dialect.name()
+        )));
+    }
+    let names = crate::replace::SwapNames::for_target(&target)?;
+    let ctas = |table: &rocky_ir::TableRef| -> Result<String, SqlGenError> {
+        let name = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
+        Ok(
+            match ctas_with_table_options(model_ir, dialect, &name, &model_ir.sql, false)? {
+                Some(stmt) => stmt,
+                None => dialect.create_table_as_new(&name, &model_ir.sql),
+            },
+        )
+    };
+    let build = ctas(&names.stage)?;
+    let create = ctas(&names.target)?;
+    Ok(Some(crate::replace::StagedSwap::new(
+        dialect, names, build, create,
+    )?))
 }
 
 /// The `CREATE TABLE … AS` carrying the model's warehouse table attributes,
@@ -1511,8 +1675,8 @@ pub fn archive_from_ir(
 ///
 /// // DuckDB's lexer reads no backslash escapes, so a quote is doubled and a
 /// // backslash stands for itself.
-/// assert_eq!(string_literal(&DuckDbSqlDialect, "it's"), "'it''s'");
-/// assert_eq!(string_literal(&DuckDbSqlDialect, r"C:\tmp"), r"'C:\tmp'");
+/// assert_eq!(string_literal(&DuckDbSqlDialect::plain(), "it's"), "'it''s'");
+/// assert_eq!(string_literal(&DuckDbSqlDialect::plain(), r"C:\tmp"), r"'C:\tmp'");
 /// ```
 #[must_use]
 pub fn string_literal(dialect: &dyn SqlDialect, value: &str) -> String {
@@ -3859,11 +4023,182 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     }
 
     // -----------------------------------------------------------------------
-    // Idempotent full-refresh pre-drop (D2 — Trino)
+    // In-place overwrite (ADR-ICEBERG-DUCKDB — Iceberg attached to DuckDB)
     // -----------------------------------------------------------------------
 
-    /// A dialect that advertises `full_refresh_needs_predrop` (stands in for
-    /// Trino, whose portable CTAS isn't `CREATE OR REPLACE`).
+    /// Catalog `lk` overwrites in place; every other catalog is atomic.
+    struct InPlaceDialect(TestDialect);
+
+    impl SqlDialect for InPlaceDialect {
+        fn watermark_hold_back(
+            &self,
+            ts: &str,
+            held_max: &chrono::DateTime<chrono::Utc>,
+            nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            self.0.watermark_hold_back(ts, held_max, nulls)
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+        fn name(&self) -> &'static str {
+            "inplace"
+        }
+        fn table_replace(&self, catalog: &str) -> TableReplace {
+            if catalog == "lk" {
+                TableReplace::InPlaceOverwrite
+            } else {
+                TableReplace::Atomic
+            }
+        }
+        fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
+            self.0.format_table_ref(c, s, t)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            self.0.create_table_as(target, select_sql)
+        }
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            self.0.insert_into(target, select_sql)
+        }
+        fn merge_into(
+            &self,
+            target: &str,
+            source_sql: &str,
+            keys: &[std::sync::Arc<str>],
+            update_cols: &rocky_ir::ColumnSelection,
+        ) -> AdapterResult<String> {
+            self.0.merge_into(target, source_sql, keys, update_cols)
+        }
+        fn select_clause(
+            &self,
+            columns: &rocky_ir::ColumnSelection,
+            metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            self.0.select_clause(columns, metadata)
+        }
+        fn watermark_where(
+            &self,
+            ts: &str,
+            wm: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            self.0.watermark_where(ts, wm)
+        }
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            self.0.describe_table_sql(table_ref)
+        }
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            self.0.drop_table_sql(table_ref)
+        }
+        fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+            self.0.create_catalog_sql(name)
+        }
+        fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+            self.0.create_schema_sql(catalog, schema)
+        }
+        fn tablesample_clause(&self, percent: u32) -> Option<String> {
+            self.0.tablesample_clause(percent)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            target: &str,
+            partition_filter: &str,
+            select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            self.0
+                .insert_overwrite_partition(target, partition_filter, select_sql)
+        }
+    }
+
+    fn lake_ir(materialization: MaterializationStrategy) -> ModelIr {
+        let mut ir = sample_transformation_ir();
+        ir.target.catalog = "lk".into();
+        ir.materialization = materialization;
+        ir
+    }
+
+    #[test]
+    fn full_refresh_on_an_in_place_catalog_renders_the_transaction() {
+        let d = InPlaceDialect(TestDialect);
+        let stmts = generate_transformation_sql(&lake_ir(MaterializationStrategy::FullRefresh), &d)
+            .unwrap();
+        assert_eq!(stmts.len(), 5);
+        assert_eq!(stmts[0], "BEGIN TRANSACTION");
+        assert!(stmts[1].contains("SELECT id, name, email"));
+        assert!(stmts[2].starts_with("DELETE FROM lk.silver.dim_accounts"));
+        assert!(stmts[3].contains(IN_PLACE_OVERWRITE_STAGE));
+        assert_eq!(stmts[4], "COMMIT");
+        // No swap: the runner hands the query to `overwrite_in_place`.
+        assert!(
+            full_refresh_swap(&lake_ir(MaterializationStrategy::FullRefresh), &d)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_atomic_catalog_of_the_same_dialect_is_unchanged() {
+        let d = InPlaceDialect(TestDialect);
+        let stmts = generate_transformation_sql(&sample_transformation_ir(), &d).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(refuse_on_in_place_catalog(&sample_transformation_ir(), &d).is_ok());
+    }
+
+    #[test]
+    fn unsupported_strategies_are_refused_naming_strategy_and_catalog() {
+        let d = InPlaceDialect(TestDialect);
+        let cases = [
+            (MaterializationStrategy::View, "view"),
+            (
+                MaterializationStrategy::Merge {
+                    unique_key: vec!["id".into()],
+                    update_columns: rocky_ir::ColumnSelection::All,
+                },
+                "merge",
+            ),
+            (
+                MaterializationStrategy::DeleteInsert {
+                    partition_by: vec!["id".into()],
+                },
+                "delete_insert",
+            ),
+            (
+                MaterializationStrategy::Incremental {
+                    timestamp_column: "ts".into(),
+                    unique_key: vec!["id".into()],
+                    lookback: None,
+                    filter_column: None,
+                },
+                "unique_key",
+            ),
+        ];
+        for (strategy, word) in cases {
+            let ir = lake_ir(strategy);
+            let err = generate_transformation_sql(&ir, &d)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(word), "{err}");
+            assert!(err.contains("catalog 'lk'"), "{err}");
+        }
+    }
+
+    #[test]
+    fn append_incremental_is_allowed_on_an_in_place_catalog() {
+        let d = InPlaceDialect(TestDialect);
+        let ir = lake_ir(MaterializationStrategy::Incremental {
+            timestamp_column: "ts".into(),
+            unique_key: vec![],
+            lookback: None,
+            filter_column: None,
+        });
+        assert!(refuse_on_in_place_catalog(&ir, &d).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Staged replace (ADR-REPLACE — Trino)
+    // -----------------------------------------------------------------------
+
+    /// A dialect with no atomic replace (stands in for Trino, whose portable
+    /// CTAS isn't `CREATE OR REPLACE`).
     struct PredropDialect(TestDialect);
 
     impl SqlDialect for PredropDialect {
@@ -3883,8 +4218,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         fn name(&self) -> &'static str {
             "predrop"
         }
-        fn full_refresh_needs_predrop(&self) -> bool {
-            true
+        fn table_replace(&self, _catalog: &str) -> TableReplace {
+            TableReplace::StagedSwap
+        }
+        fn rename_table_sql(&self, from: &str, to: &str, if_exists: bool) -> AdapterResult<String> {
+            let if_exists = if if_exists { "IF EXISTS " } else { "" };
+            Ok(format!("ALTER TABLE {if_exists}{from} RENAME TO {to}"))
         }
         fn format_table_ref(
             &self,
@@ -3975,24 +4314,38 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     }
 
     #[test]
-    fn full_refresh_prepends_drop_for_predrop_dialect() {
+    fn full_refresh_on_a_swap_dialect_builds_a_stage_and_never_drops_the_target_first() {
         let ir = full_refresh_transformation_ir();
         let stmts = generate_transformation_sql(&ir, &PredropDialect(TestDialect)).unwrap();
-        assert_eq!(stmts.len(), 2, "predrop dialect emits DROP + CTAS");
-        assert!(
-            stmts[0].starts_with("DROP TABLE IF EXISTS cat.silver.dim_accounts"),
-            "first statement must be the idempotent DROP, got: {}",
-            stmts[0]
+        assert_eq!(
+            stmts,
+            [
+                "CREATE TABLE cat.silver.dim_accounts__rocky_stage AS\nSELECT id FROM cat.sch.src",
+                "ALTER TABLE IF EXISTS cat.silver.dim_accounts RENAME TO \
+                 cat.silver.dim_accounts__rocky_old",
+                "ALTER TABLE cat.silver.dim_accounts__rocky_stage RENAME TO cat.silver.dim_accounts",
+                "DROP TABLE IF EXISTS cat.silver.dim_accounts__rocky_old",
+            ]
         );
+        // RD-009: no statement drops the target itself.
         assert!(
-            stmts[1].starts_with("CREATE TABLE cat.silver.dim_accounts AS"),
-            "second statement must be the CTAS, got: {}",
-            stmts[1]
+            !stmts.iter().any(
+                |s| s.starts_with("DROP TABLE IF EXISTS cat.silver.dim_accounts\n")
+                    || s == "DROP TABLE IF EXISTS cat.silver.dim_accounts"
+            ),
+            "{stmts:?}"
         );
-        // The DROP must be a SEPARATE statement, never `;`-joined onto the
-        // CTAS (Trino's REST API runs one statement per request).
-        assert!(!stmts[0].contains("CREATE TABLE"));
-        assert!(!stmts[1].contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn full_refresh_swap_refuses_a_reserved_target_name() {
+        let mut ir = full_refresh_transformation_ir();
+        ir.target.table = "dim__rocky_old".into();
+        let err = generate_transformation_sql(&ir, &PredropDialect(TestDialect)).unwrap_err();
+        assert!(matches!(
+            err,
+            SqlGenError::Replace(e) if matches!(*e, crate::replace::ReplaceError::ReservedName { .. })
+        ));
     }
 
     #[test]

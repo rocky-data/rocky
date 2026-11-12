@@ -130,8 +130,12 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         }
     }
 
-    // Validate pipelines
-    if cfg.pipelines.is_empty() {
+    // V067: each `[connector.<name>]` manifest, read offline.
+    validate_connectors(&cfg, config_path, &mut out);
+
+    // Validate pipelines. A project whose only work is child connectors
+    // (`rocky load --connector`) needs no pipeline, so V020 does not warn.
+    if cfg.pipelines.is_empty() && cfg.connectors.is_empty() {
         out.push(ValidateMessage {
             severity: "warn".into(),
             code: "V020".into(),
@@ -337,6 +341,75 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     validate_product_budgets(&cfg, config_path, &mut out);
 
     Ok(out)
+}
+
+/// **V067** — one message per `[connector.<name>]`: `ok` when its manifest
+/// reads and its program exists, and `error` when the manifest is missing
+/// or invalid, or when the first entry of its `command` is a path that
+/// does not exist. Later arguments and secrets are not checked. Offline: nothing is
+/// started. The block's own fields are checked when the config loads.
+fn validate_connectors(
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    out: &mut ValidateOutput,
+) {
+    let config_dir = match config_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    for (name, connector) in &cfg.connectors {
+        let manifest_path = config_dir.join(&connector.manifest);
+        let field = Some(format!("connector.{name}.manifest"));
+        let file = Some(config_path.display().to_string());
+        let manifest = match rocky_core::connector::ConnectorManifest::load(&manifest_path) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                out.push(ValidateMessage {
+                    severity: "error".into(),
+                    code: "V067".into(),
+                    message: format!(
+                        "connector.{name}: {e}. `rocky load --connector {name}` would fail"
+                    ),
+                    file,
+                    field,
+                });
+                continue;
+            }
+        };
+        let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
+        let program = manifest
+            .resolved_command(manifest_dir)
+            .into_iter()
+            .next()
+            .map(std::path::PathBuf::from);
+        // A bare name is looked up on PATH at run time, so only a program
+        // written as a path (relative ones are anchored to the manifest's
+        // directory) is checked.
+        if let Some(program) = program.filter(|p| p.components().count() > 1 && !p.exists()) {
+            out.push(ValidateMessage {
+                severity: "error".into(),
+                code: "V067".into(),
+                message: format!(
+                    "connector.{name}: the manifest's command names {}, which does not exist. \
+                     `rocky load --connector {name}` would fail",
+                    program.display()
+                ),
+                file,
+                field,
+            });
+            continue;
+        }
+        out.push(ValidateMessage {
+            severity: "ok".into(),
+            code: "V067".into(),
+            message: format!(
+                "connector.{name}: manifest `{}` ({}, protocol {})",
+                connector.manifest, manifest.name, manifest.protocol_version
+            ),
+            file: None,
+            field,
+        });
+    }
 }
 
 /// What W058 tells the user to do about a deprecated freshness block.
@@ -2331,6 +2404,8 @@ fn lint_config(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("");
+        // `name_declared` is empty when the sidecar omits `name`: then there
+        // is nothing to omit.
         if model.config.name == file_stem && model.config.name_declared == file_stem {
             out.push(ValidateMessage {
                 severity: "lint".into(),
@@ -2350,8 +2425,17 @@ fn lint_config(
         // author's declared template also matches, so
         // `table = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"` with
         // `name = "customer_facts"` no longer trips the lint.
+        // `target_table_declared` is empty when the sidecar omits
+        // `target.table`. A declared table is compared with the declared
+        // name, or with the filename stem the omitted name defaults to.
+        let name_written = if model.config.name_declared.is_empty() {
+            file_stem
+        } else {
+            model.config.name_declared.as_str()
+        };
         if model.config.target.table == model.config.name
-            && model.config.target_table_declared == model.config.name_declared
+            && !model.config.target_table_declared.is_empty()
+            && model.config.target_table_declared == name_written
         {
             out.push(ValidateMessage {
                 severity: "lint".into(),
@@ -5588,6 +5672,211 @@ target.adapter = "default"
             1,
             "L002 must still fire on literal redundant target.table: {:?}",
             out.messages
+        );
+    }
+
+    /// A connector-only project: `rocky.toml` with one `[connector.ev]`
+    /// whose manifest is `connector/connector.toml`. `manifest` is that
+    /// file's text (`None` writes none); `program` creates
+    /// `connector/main.py` when true.
+    fn connector_project(manifest: Option<&str>, program: bool) -> ValidateOutput {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rocky.toml"),
+            r#"
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.ev]
+manifest   = "connector/connector.toml"
+output_uri = "file://./landing"
+target     = { catalog = "poc", schema = "main", table = "events" }
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("connector")).unwrap();
+        if let Some(text) = manifest {
+            std::fs::write(dir.path().join("connector/connector.toml"), text).unwrap();
+        }
+        if program {
+            std::fs::write(dir.path().join("connector/main.py"), "").unwrap();
+        }
+        validate_inner(&dir.path().join("rocky.toml")).unwrap()
+    }
+
+    const GOOD_MANIFEST: &str = r#"
+protocol_version     = 0
+name                 = "events"
+command              = ["./main.py"]
+state_schema_version = 1
+egress_hosts         = []
+"#;
+
+    fn v067(out: &ValidateOutput) -> Vec<(&str, &str)> {
+        out.messages
+            .iter()
+            .filter(|m| m.code == "V067")
+            .map(|m| (m.severity.as_str(), m.message.as_str()))
+            .collect()
+    }
+
+    /// A good manifest and program: V067 is `ok`, the project is valid, and
+    /// V020 does not warn, since a connector-only project needs no pipeline.
+    #[test]
+    fn v067_ok_and_no_v020_for_a_connector_only_project() {
+        let out = connector_project(Some(GOOD_MANIFEST), true);
+        assert!(out.valid, "{:?}", out.messages);
+        let msgs = v067(&out);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].0, "ok");
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V020"),
+            "V020 must not warn when connectors are declared: {:?}",
+            out.messages
+        );
+    }
+
+    /// A manifest that is not there fails `rocky load`, so validate errors.
+    #[test]
+    fn v067_errors_on_a_missing_manifest() {
+        let out = connector_project(None, true);
+        assert!(!out.valid);
+        let msgs = v067(&out);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].0, "error");
+        assert!(
+            msgs[0].1.contains("cannot read the connector manifest"),
+            "{msgs:?}"
+        );
+    }
+
+    /// A manifest `rocky load` would refuse (an unknown key) is an error.
+    #[test]
+    fn v067_errors_on_an_invalid_manifest() {
+        let bad = format!("{GOOD_MANIFEST}\nsurprise = true\n");
+        let out = connector_project(Some(&bad), true);
+        assert!(!out.valid);
+        assert_eq!(v067(&out)[0].0, "error");
+    }
+
+    /// A relative program path that does not exist is an error; it names
+    /// the path.
+    #[test]
+    fn v067_errors_on_a_missing_program() {
+        let out = connector_project(Some(GOOD_MANIFEST), false);
+        assert!(!out.valid);
+        let msgs = v067(&out);
+        assert_eq!(msgs[0].0, "error");
+        assert!(msgs[0].1.contains("main.py"), "{msgs:?}");
+    }
+
+    /// A bare program name is looked up on PATH at run time, so validate
+    /// does not judge it.
+    #[test]
+    fn v067_does_not_judge_a_bare_program_name() {
+        let manifest = GOOD_MANIFEST.replace("[\"./main.py\"]", "[\"some-connector\"]");
+        let out = connector_project(Some(&manifest), false);
+        assert!(out.valid, "{:?}", out.messages);
+        assert_eq!(v067(&out)[0].0, "ok");
+    }
+
+    /// Without connectors, an empty project still warns V020.
+    #[test]
+    fn v020_still_warns_with_no_pipeline_and_no_connector() {
+        let out = validate_toml("[adapter]\ntype = \"duckdb\"\n");
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V020" && m.severity == "warn")
+        );
+    }
+
+    /// Lints one `customer_facts` model (file `customer_facts.sql`) whose
+    /// sidecar declared `name_declared` and `target_table_declared` (empty =
+    /// omitted). Returns the L001 and L002 codes that fired.
+    fn l001_l002_for(name_declared: &str, target_table_declared: &str) -> Vec<String> {
+        use rocky_core::models::{Model, ModelConfig, SourceConfig, StrategyConfig, TargetConfig};
+        let model = Model {
+            drop_existing_kind: None,
+            config: ModelConfig {
+                name: "customer_facts".into(),
+                depends_on: Vec::new(),
+                strategy: StrategyConfig::FullRefresh,
+                target: TargetConfig {
+                    catalog: "analytics".into(),
+                    schema: "marts".into(),
+                    table: "customer_facts".into(),
+                },
+                sources: Vec::<SourceConfig>::new(),
+                adapter: None,
+                intent: None,
+                freshness: None,
+                tests: Vec::new(),
+                format: None,
+                format_options: None,
+                classification: Default::default(),
+                tags: Default::default(),
+                governance: Default::default(),
+                retention: None,
+                budget: None,
+                skip: None,
+                name_declared: name_declared.into(),
+                target_table_declared: target_table_declared.into(),
+            },
+            sql: "SELECT 1".into(),
+            file_path: "/tmp/customer_facts.sql".into(),
+            contract_path: None,
+        };
+        let toml_str = r#"
+[adapter]
+type = "duckdb"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+target.adapter = "default"
+"#;
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = rocky_core::config::load_rocky_config(f.path()).unwrap();
+        let mut out = ValidateOutput::default();
+        lint_config(&cfg, None, std::slice::from_ref(&model), &mut out);
+        out.messages
+            .into_iter()
+            .map(|m| m.code)
+            .filter(|c| c == "L001" || c == "L002")
+            .collect()
+    }
+
+    /// A sidecar that omits both `name` and `target.table` gets neither
+    /// "you can omit it" lint: there is nothing to omit.
+    #[test]
+    fn test_l001_l002_skip_keys_the_sidecar_omits() {
+        assert!(l001_l002_for("", "").is_empty());
+    }
+
+    /// `name` omitted, `target.table` written as the filename stem: the
+    /// table is redundant (it defaults to the name, which defaults to the
+    /// stem), so L002 fires and L001 does not.
+    #[test]
+    fn test_l002_fires_on_a_written_table_when_name_is_omitted() {
+        assert_eq!(l001_l002_for("", "customer_facts"), vec!["L002"]);
+    }
+
+    /// `name` written as the stem, `target.table` omitted: only L001 fires.
+    /// Before, the omitted table read as the defaulted value and L002 fired.
+    #[test]
+    fn test_l001_fires_alone_when_only_the_name_is_written() {
+        assert_eq!(l001_l002_for("customer_facts", ""), vec!["L001"]);
+    }
+
+    /// Both written literally and redundant: both lints fire.
+    #[test]
+    fn test_l001_l002_fire_when_both_keys_are_written() {
+        assert_eq!(
+            l001_l002_for("customer_facts", "customer_facts"),
+            vec!["L001", "L002"]
         );
     }
 

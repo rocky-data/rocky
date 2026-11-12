@@ -1,0 +1,46 @@
+# A local Iceberg lakehouse: a Lakekeeper REST catalog (state in Postgres)
+# and a SeaweedFS S3 store for the data files. No credentials: the catalog
+# runs with authorization off and S3 accepts any key.
+#
+# Images are pinned by digest. The live conformance workflow
+# (.github/workflows/iceberg-conformance.yml) boots this same file.
+services:
+  pg:
+    image: postgres:16@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
+    environment:
+      POSTGRES_USER: lk
+      POSTGRES_PASSWORD: lk
+      POSTGRES_DB: lk
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lk"]
+      interval: 2s
+      retries: 30
+
+  migrate:
+    image: quay.io/lakekeeper/catalog@sha256:b02a882df48042020c473a79b980a643fcc883a6f9c21b74c5b7cc8eabeec9fe
+    command: ["migrate"]
+    environment: &lakekeeper-env
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lk:lk@pg:5432/lk
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lk:lk@pg:5432/lk
+      # Encrypts stored credentials. A fixed demo value: this stack holds none.
+      LAKEKEEPER__PG_ENCRYPTION_KEY: rocky-poc-not-a-secret-0000000000
+    depends_on:
+      pg:
+        condition: service_healthy
+    restart: "no"
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog@sha256:b02a882df48042020c473a79b980a643fcc883a6f9c21b74c5b7cc8eabeec9fe
+    command: ["serve"]
+    environment: *lakekeeper-env
+    ports:
+      - "8181:8181"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  s3:
+    image: chrislusf/seaweedfs@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0
+    command: ["server", "-s3", "-dir=/data"]
+    ports:
+      - "8333:8333"

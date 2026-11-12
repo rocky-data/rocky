@@ -25,6 +25,8 @@
 
 #![cfg(feature = "ui")]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -161,11 +163,8 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            let (status, _, _) = http_get(port, "/api/v1/health", "");
-            if status.contains("200") {
-                break;
-            }
+        if common::serve_health_ok(port) {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -1099,11 +1098,8 @@ fn open_hands_the_opener_the_printed_address_and_survives_an_opener_that_fails()
 fn wait_for_health(port: u16) {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            let (status, _, _) = http_get(port, "/api/v1/health", "");
-            if status.contains("200") {
-                return;
-            }
+        if common::serve_health_ok(port) {
+            return;
         }
         assert!(
             std::time::Instant::now() < deadline,

@@ -13,8 +13,9 @@
 //! from `ROCKY_PROBE_SMB_DIR` and prints the same entry points. The weekly job
 //! builds a loopback share for it; the setup is in `engine-weekly.yml`.
 //!
-//! Evidence only: nothing is asserted about the classification. The test fails
-//! only if `icacls` itself fails. Run by the weekly `windows-check` job:
+//! The first test is evidence only: it fails only if `icacls` itself fails.
+//! The SMB test asserts that the spool readers refuse the hidden spool
+//! instead of reading it as empty (#1903). Run by the weekly `windows-check` job:
 //!
 //! ```text
 //! cargo test -p rocky-core --test spool_probe_windows -- --ignored --nocapture
@@ -158,7 +159,7 @@ fn spool_probe_deny_list_directory() {
 ///
 /// `ROCKY_PROBE_SMB_DIR` is the spool directory itself, for example
 /// `\\localhost\share\.rocky\pending-demands`. Its parent is the `.rocky`
-/// directory the spool readers take. Evidence only: nothing is asserted.
+/// directory the spool readers take. Asserts that the readers refuse it.
 #[test]
 #[ignore = "evidence probe for #1903; needs ROCKY_PROBE_SMB_DIR on Windows"]
 fn spool_probe_smb_share() {
@@ -200,7 +201,15 @@ fn spool_probe_smb_share() {
         "classify_missing_spool(spool) = {}",
         describe(&classify_missing_spool(&spool))
     );
-    eprintln!("list_pending_files = {:?}", list_pending_files(rocky_dir));
-    eprintln!("count_corrupt = {:?}", count_corrupt(rocky_dir));
+    let pending = list_pending_files(rocky_dir);
+    let corrupt = count_corrupt(rocky_dir);
+    eprintln!("list_pending_files = {pending:?}");
+    eprintln!("count_corrupt = {corrupt:?}");
     eprintln!("entry_kind(sentinel) = {:?}", RealFs.entry_kind(&sentinel));
+    // The share hides the spool's entries, sentinel included, from this
+    // user. 2026-11-09 both read as an empty spool; they must now refuse.
+    assert!(
+        pending.is_err() && corrupt.is_err(),
+        "a spool the share hides must not read as empty: {pending:?} / {corrupt:?}"
+    );
 }

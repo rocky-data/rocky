@@ -1206,7 +1206,7 @@ impl WarehouseAdapter for BigQueryAdapter {
                     Some(ColumnInfo {
                         name: row[0].as_str().unwrap_or("").to_string(),
                         data_type: row[1].as_str().unwrap_or("").to_string(),
-                        nullable: row[2].as_str().unwrap_or("NO") == "YES",
+                        nullable: is_nullable_cell(&row[2]),
                     })
                 } else {
                     None
@@ -2231,9 +2231,32 @@ struct TableCell {
     v: Option<serde_json::Value>,
 }
 
+/// `INFORMATION_SCHEMA.COLUMNS.is_nullable` as a bool, failing safe.
+///
+/// Only an explicit `NO` means NOT NULL. A missing or non-string cell is read
+/// as nullable: `nullable = false` is a proof the contract checker (`E012`)
+/// relies on, so an unreadable cell must never become one.
+fn is_nullable_cell(cell: &serde_json::Value) -> bool {
+    cell.as_str()
+        .is_none_or(|v| !v.trim().eq_ignore_ascii_case("NO"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nullable_cell_fails_safe() {
+        assert!(!is_nullable_cell(&serde_json::json!("NO")));
+        assert!(is_nullable_cell(&serde_json::json!("YES")));
+        // An unreadable cell is nullable, never a NOT NULL proof.
+        assert!(is_nullable_cell(&serde_json::Value::Null));
+        assert!(is_nullable_cell(&serde_json::json!(0)));
+        // Only an explicit NO proves NOT NULL: any other text is nullable.
+        assert!(!is_nullable_cell(&serde_json::json!(" no ")));
+        assert!(is_nullable_cell(&serde_json::json!("")));
+        assert!(is_nullable_cell(&serde_json::json!("N")));
+    }
 
     #[test]
     fn error_debug_prints_a_resolved_value_as_its_name() {

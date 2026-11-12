@@ -50,7 +50,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`). Some `run.sh` scripts read JSON with `jq` or `python3`.
 
-**94 of 106 POCs run with no external credentials.** See each POC's README for prerequisites.
+**96 of 108 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -150,7 +150,7 @@ Who may read what, and who proved it. The Databricks POCs need credentials; the 
 | [10-recipe-provenance](pocs/04-governance/10-recipe-provenance) | Every materialization records a recipe-identity triple (`recipe_hash`, `input_hash`, `env_hash`); `rocky history --recipe <hash>` returns every execution of that exact program — the "what produced this?" audit one-liner, honest about `heuristic` vs `strong` input proof | none |
 | [11-agent-policy](pocs/04-governance/11-agent-policy) | The agent-policy plane as an incident guardrail: an agent's breaking drop of a PII-classified column under a cross-team contract is DENIED at the `rocky apply` seam with the deciding rule named, the same plan applied by a human goes through, and every decision lands in a ledger queryable via `rocky audit` | none |
 
-### 05 — Orchestration (12 POCs · DuckDB / docker)
+### 05 — Orchestration (13 POCs · DuckDB / docker)
 
 How a run starts, where its state lives, and what happens when it fails. Some POCs need Docker for a local backing service.
 
@@ -168,6 +168,7 @@ How a run starts, where its state lives, and what happens when it fails. Some PO
 | [10-state-retention-sweep](pocs/05-orchestration/10-state-retention-sweep) | `[state.retention]` + `rocky state retention sweep` — manual + end-of-run auto-sweep of run history / lineage / audit domains |
 | [11-state-namespacing](pocs/05-orchestration/11-state-namespacing) | `rocky --state-namespace <key>` routes each pipeline/client to its own `<models>/.rocky-state/<key>.redb` (own single-writer lock) — opt-in, byte-identical when off |
 | [12-webhook-ingress](pocs/05-orchestration/12-webhook-ingress) | `rocky serve --scheduler` exposes `POST /api/v1/hooks/trigger/{pipeline}`; an `X-Rocky-Signature` HMAC-SHA256 body signature queues a durable at-most-once run demand, and an `X-Rocky-Delivery` id deduplicates a redelivery |
+| [13-open-stack-acceptance](pocs/05-orchestration/13-open-stack-acceptance) | **Acceptance journey** — one scripted project: the S-2 Postgres child connector, a `deliver_by` deadline delivered on time then late, source and output volume ranges, `rocky cost --month --by product` with `[cost]` prices, a `[product_budget]` breach and its hook, and the `rocky serve` HTTP API, each step's JSON asserted (Docker) |
 
 ### 06 — Developer Experience (22 POCs · DuckDB)
 
@@ -198,7 +199,7 @@ The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt impo
 | [21-emit-sql-exit-path](pocs/06-developer-experience/21-emit-sql-exit-path) | `rocky emit-sql --out-dir` renders the model DAG to plain `.sql`, then runs it through DuckDB with no Rocky — the tested no-lock-in exit path |
 | [22-edit-one-model-loop](pocs/06-developer-experience/22-edit-one-model-loop) | Edit one model, rebuild only it and its downstream: `[run] skip_unchanged`, `rocky run --watch --models`, `--defer` and `--defer-to-state`, steps 1-4 proved from the JSON `model_decisions`, steps 5-6 from `materializations` |
 
-### 07 — Adapters (11 POCs · mixed)
+### 07 — Adapters (12 POCs · mixed)
 
 One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, two starters for writing your own adapter, and a reference child connector for Postgres. Rocky ships more adapters than this section covers. Check the Credentials column before you run one.
 
@@ -212,9 +213,9 @@ One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, two start
 | [06-rust-native-adapter-skeleton](pocs/07-adapters/06-rust-native-adapter-skeleton) | Out-of-tree warehouse adapter starter — `rocky-adapter-sdk` traits against an in-memory mock, ClickHouse-shaped (backtick quoting, no `MERGE`, partition replace) | none (Rust toolchain) |
 | [07-trino-docker](pocs/07-adapters/07-trino-docker) | `rocky-trino` v0 adapter against a single-node `trinodb/trino` container — full_refresh CTAS from `tpch.tiny.nation` into the `memory` catalog | none (Docker) |
 | [08-postgres-child-connector](pocs/07-adapters/08-postgres-child-connector) | Reference child connector: a stdlib Python program that `rocky load --connector` runs to pull new Postgres rows by timestamp cursor into Parquet — three loads, ties held back one run, no password in logs | none (Docker) |
-| [09-dlt-connector-shim](pocs/07-adapters/09-dlt-connector-shim) | Child connector shim over a dlt source: dlt's incremental state kept in Rocky state — three loads (5, 3, 0 rows), one stream per connector | none (installs dlt into a local venv) |
-| [10-airbyte-connector-shim](pocs/07-adapters/10-airbyte-connector-shim) | Child connector shim over the `airbyte/source-faker` image: the last Airbyte STATE kept in Rocky state, a second run resumes from it | none (Docker) |
-| [11-meltano-connector-shim](pocs/07-adapters/11-meltano-connector-shim) | Child connector shim over a Singer tap run by `meltano invoke`: the Singer bookmark kept in Rocky state — three loads (4, 3, 0 rows) | none (installs Meltano into a local venv) |
+| [10-dlt-connector-shim](pocs/07-adapters/10-dlt-connector-shim) | Child connector shim over a dlt source: dlt's incremental state kept in Rocky state — three loads (5, 3, 0 rows), one stream per connector | none (installs dlt into a local venv) |
+| [11-airbyte-connector-shim](pocs/07-adapters/11-airbyte-connector-shim) | Child connector shim over the `airbyte/source-faker` image: the last Airbyte STATE kept in Rocky state, a second run resumes from it | none (Docker) |
+| [12-meltano-connector-shim](pocs/07-adapters/12-meltano-connector-shim) | Child connector shim over a Singer tap run by `meltano invoke`: the Singer bookmark kept in Rocky state — three loads (4, 3, 0 rows) | none (installs Meltano into a local venv) |
 
 ## Benchmarks
 

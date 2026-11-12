@@ -36,6 +36,13 @@
               }
             ]
           },
+          "attach": {
+            "description": "Other catalogs this DuckDB connection attaches when `rocky run` connects. Each entry is an Iceberg REST catalog that models target by its `alias` (`[target] catalog = \"<alias>\"`). `rocky compile` and `rocky plan` never attach. Refused on every other adapter type; see [`validate_duckdb_attachments`] and `docs/adr/ADR-ICEBERG-DUCKDB.md`.",
+            "items": {
+              "$ref": "#/components/schemas/DuckDbAttach"
+            },
+            "type": "array"
+          },
           "cache": {
             "anyOf": [
               {
@@ -511,6 +518,13 @@
           },
           "unproven_non_null": {
             "description": "`nullable = false` claims the draft withheld, one message per column.\n\nThe column had no NULLs in the profiled table, but Rocky cannot prove it non-null from the model SQL and the source schemas it has, so `E012` would refuse the claim. The draft leaves `nullable` unset for it, which promises nothing, instead of writing `nullable = true`. Empty when every `nullable = false` in the draft was proven.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unresolved_sources": {
+            "description": "Leaf source tables Rocky could not describe in the warehouse, one message each (`schema.table: reason`).\n\n`rocky ai-contract` reads the column types of every table the project's models read and no model writes, so the drafted types and `nullable = false` claims are checked against the warehouse. A table listed here kept its schema-cache entry, or stayed untyped without one. Empty when every leaf source was described.",
             "items": {
               "type": "string"
             },
@@ -8066,6 +8080,147 @@
           "tables_drifted"
         ],
         "type": "object"
+      },
+      "DuckDbAttach": {
+        "additionalProperties": false,
+        "description": "One `[[adapter.<name>.attach]]` entry: a catalog a `type = \"duckdb\"` adapter attaches to its connection under `alias`.\n\n```toml [[adapter.lake.attach]] alias = \"lk\" type = \"iceberg\" warehouse = \"demo\" endpoint = \"${ICEBERG_ENDPOINT}\"\n\n[adapter.lake.attach.s3] key_id = \"${S3_KEY_ID}\" secret = \"${S3_SECRET}\" endpoint = \"localhost:8333\" url_style = \"path\" use_ssl = false ```",
+        "properties": {
+          "alias": {
+            "description": "The catalog name models use to target this attachment. A SQL identifier. It must not be `memory`, `main`, `temp`, `system`, the database file's own catalog name or another entry's alias.",
+            "type": "string"
+          },
+          "authorization": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DuckDbAttachAuthorization"
+              }
+            ],
+            "default": "none",
+            "description": "How Rocky authenticates to the REST catalog. Only `\"none\"` today."
+          },
+          "endpoint": {
+            "description": "The REST catalog's base URL, for example `http://localhost:8181/catalog`.",
+            "type": "string"
+          },
+          "s3": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DuckDbAttachS3"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Object-store credentials for the table files. Rocky turns them into a temporary DuckDB secret scoped to this attachment."
+          },
+          "type": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DuckDbAttachType"
+              }
+            ],
+            "description": "What the attachment is. Only `\"iceberg\"` (an Iceberg REST catalog)."
+          },
+          "warehouse": {
+            "description": "The warehouse name the REST catalog knows.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "endpoint",
+          "type",
+          "warehouse"
+        ],
+        "type": "object"
+      },
+      "DuckDbAttachAuthorization": {
+        "description": "How a [`DuckDbAttach`] entry authenticates to its catalog.",
+        "oneOf": [
+          {
+            "description": "No catalog authentication (`AUTHORIZATION_TYPE 'none'`).",
+            "enum": [
+              "none"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "DuckDbAttachS3": {
+        "additionalProperties": false,
+        "description": "The S3 settings of a [`DuckDbAttach`] entry. Every field is optional; an unset one leaves DuckDB's default.",
+        "properties": {
+          "endpoint": {
+            "description": "The S3 endpoint as `host[:port]`, for an S3-compatible store.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key_id": {
+            "description": "Access key id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "region": {
+            "description": "The bucket region.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "description": "The path prefix the secret applies to, for example `s3://warehouse`. When unset the secret applies to every `s3://` path of the connection.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RedactedString"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Secret access key."
+          },
+          "url_style": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/S3UrlStyle"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"path\"` or `\"vhost\"`."
+          },
+          "use_ssl": {
+            "description": "Whether to use HTTPS. DuckDB's default is `true`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DuckDbAttachType": {
+        "description": "The kind of catalog a [`DuckDbAttach`] entry attaches.",
+        "oneOf": [
+          {
+            "description": "An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.",
+            "enum": [
+              "iceberg"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "DurationEstimateStatus": {
         "description": "A p50/p90 duration estimate and the sample behind it.",
@@ -23523,6 +23678,25 @@
             "description": "The run was short-circuited because another caller held the idempotency key's in-flight claim. No work was done.",
             "enum": [
               "SkippedInFlight"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "S3UrlStyle": {
+        "description": "S3 addressing style.",
+        "oneOf": [
+          {
+            "description": "`https://host/bucket/key`.",
+            "enum": [
+              "path"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "`https://bucket.host/key`.",
+            "enum": [
+              "vhost"
             ],
             "type": "string"
           }

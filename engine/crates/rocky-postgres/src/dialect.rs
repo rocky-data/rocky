@@ -1063,7 +1063,10 @@ mod tests {
             sql,
             "DROP TABLE IF EXISTS m.t;\nCREATE TABLE m.t AS\nSELECT 1 AS a"
         );
-        assert!(!PostgresDialect::new().full_refresh_needs_predrop());
+        assert_eq!(
+            PostgresDialect::new().table_replace("any"),
+            rocky_core::traits::TableReplace::Atomic
+        );
         assert_eq!(
             RedshiftDialect::new().create_table_as("m.t", "SELECT 1"),
             "DROP TABLE IF EXISTS m.t;\nCREATE TABLE m.t AS\nSELECT 1"

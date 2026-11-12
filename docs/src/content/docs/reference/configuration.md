@@ -1351,7 +1351,7 @@ Control what `rocky gc` is allowed to delete. Eviction is recorded, not destruct
 
 ## `[policy]`
 
-State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one of three effects. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) — `rocky apply`, branch promote, the MCP write tools, and drift auto-apply in `rocky run` when [`auto_apply_additive_drift`](#resilience) is on — and records every decision in the audit ledger.
+State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one of three effects. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) — `rocky apply`, branch promote, the MCP write tools, and drift auto-apply in `rocky run` when [`auto_apply_additive_drift`](#resilience) is on — and records every decision in the audit ledger. A run started by the native scheduler is a plain `rocky run` and is governed exactly like one; there is no `run` capability.
 
 :::caution[An absent block does not gate agents]
 With no `[policy]` block, the gate returns `NotConfigured` and allows the action whoever the principal is. Two surfaces differ. `rocky policy check` *predicts* against the safe default posture: agents on mutating actions require review, and humans are never gated. With no block, its prediction is stricter than what enforcement actually does. Drift auto-apply with `auto_apply_additive_drift = true` also governs as `require_review` with no block, so it refuses every drift change.

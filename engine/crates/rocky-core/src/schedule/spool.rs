@@ -23,17 +23,26 @@
 //!
 //! The first [`accept`] writes [`SENTINEL_NAME`] into the spool directory,
 //! durably, before any demand is linked. It is a positive record that the
-//! spool was created. Every read site asks for it BY NAME when the directory
-//! itself reads as missing (see [`classify_missing_spool`]). A lookup by name
-//! needs no enumeration right, so a platform that masks a refused enumeration
-//! as `NotFound` (Windows ACLs, SMB access-based enumeration) still answers it,
-//! and a spool that exists but cannot be listed is refused instead of being
-//! read as empty (#1903).
+//! spool was created. Every read site asks for it in two cases:
+//!
+//! - The directory reads as missing. The sentinel is looked up BY NAME (see
+//!   [`classify_missing_spool`]). That needs no enumeration right, so a
+//!   platform that reports a refused listing as `NotFound` still answers it,
+//!   and a spool that exists but cannot be listed is refused.
+//! - The directory lists, but the listing does not show the sentinel. On an
+//!   SMB share with access-based enumeration, a process that may not read the
+//!   entries lists the spool as empty, and a stat of the sentinel by name is
+//!   hidden too. So the read site tries to create the sentinel: if it already
+//!   exists, the listing is hiding entries and is refused (see
+//!   `check_listing_shows_sentinel`), not read as an empty queue (#1903). A
+//!   listing that shows some entries but hides others is caught only when the
+//!   create answers that the sentinel exists.
 //!
 //! Spools created before the sentinel existed gain one on their next
-//! [`accept`], or on the next [`sweep_tombstones`] pass that can read the
-//! directory — the reconciler runs that sweep on every tick, so the migration
-//! completes on the first tick after an upgrade.
+//! [`accept`], or on the next read that lists them. The reconciler reads the
+//! spool on every tick, so the migration completes on the first tick after an
+//! upgrade. An empty legacy spool that no process may write refuses until one
+//! that may reads it once.
 //!
 //! # Dedup + disposal by [`WebhookKind`]
 //!
@@ -476,7 +485,6 @@ pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
         return Ok(out);
     };
     for entry in entries {
-        let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
@@ -610,7 +618,6 @@ pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
     };
     let mut n = 0;
     for entry in entries {
-        let entry = entry?;
         if entry.file_name().to_string_lossy().contains(CORRUPT_INFIX) {
             n += 1;
         }
@@ -659,18 +666,8 @@ pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
     let Some(entries) = read_spool_dir(&dir)? else {
         return Ok(TombstoneSweep::default());
     };
-    // The directory just listed, so it is readable: give a spool created before
-    // the sentinel existed its sentinel now (#1903). Best effort — a read-only
-    // spool must not stop the sweep — and loud, because until it lands this
-    // spool still reads as empty if its enumeration is later masked.
-    if let Err(e) = ensure_sentinel(&dir) {
-        tracing::warn!(
-            spool = %dir.display(),
-            error = %e,
-            "could not write the webhook spool sentinel; an unreadable spool on a \
-             platform that reports a refused listing as not-found will read as empty"
-        );
-    }
+    // `read_spool_dir` already gave a spool created before the sentinel existed
+    // its sentinel, when the listing did not show one (#1903).
     // `TOMBSTONE_TTL` is a 24-hour constant, so this conversion cannot fail;
     // falling back to an empty pass keeps the impossible branch panic-free.
     let Ok(ttl) = TOMBSTONE_TTL.to_std() else {
@@ -679,7 +676,6 @@ pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
     let wall_now = std::time::SystemTime::now();
     let mut sweep = TombstoneSweep::default();
     for entry in entries {
-        let entry = entry?;
         let name = entry.file_name();
         if !name.to_string_lossy().ends_with(DONE_SUFFIX) {
             continue;
@@ -721,7 +717,7 @@ pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
 /// # Errors
 ///
 /// Any failure to inspect, create, write or `fsync` it. [`accept`] propagates
-/// that (no `202` without the sentinel); the sweep only logs it.
+/// that (no `202` without the sentinel).
 fn ensure_sentinel(dir: &SpoolDir) -> io::Result<bool> {
     use std::io::Write as _;
 
@@ -740,8 +736,10 @@ fn ensure_sentinel(dir: &SpoolDir) -> io::Result<bool> {
             f.write_all(SENTINEL_BODY)?;
             f.sync_all()?;
         }
-        // A concurrent accept won the create. Its own dir-fsync makes it
-        // durable before that accept links anything.
+        // A concurrent accept, or a spool read probing for it
+        // (`create_sentinel`), won the create. The file exists either way. The
+        // directory `fsync` that `accept` runs after it links a demand also
+        // makes this entry durable, so no demand is durable without it.
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
     }
@@ -757,8 +755,160 @@ fn ensure_sentinel(dir: &SpoolDir) -> io::Result<bool> {
 /// [`count_corrupt`], [`sweep_tombstones`]) turn a `NotFound` into a verdict,
 /// so they cannot drift apart and the sentinel check is tested once for all
 /// of them (#1903).
-fn read_spool_dir(dir: &SpoolDir) -> io::Result<Option<std::fs::ReadDir>> {
-    read_spool_dir_with(dir, |path| std::fs::read_dir(path), &RealFs)
+fn read_spool_dir(dir: &SpoolDir) -> io::Result<Option<Vec<std::fs::DirEntry>>> {
+    let list = || -> io::Result<Option<Vec<std::fs::DirEntry>>> {
+        read_spool_dir_with(dir, |path| std::fs::read_dir(path), &RealFs)?
+            .map(Iterator::collect::<io::Result<Vec<_>>>)
+            .transpose()
+    };
+    let Some(first) = list()? else {
+        return Ok(None);
+    };
+    check_listing_shows_sentinel(
+        dir,
+        first,
+        |entry| entry.file_name() == std::ffi::OsStr::new(SENTINEL_NAME),
+        create_sentinel,
+        || list()?.ok_or_else(|| unreadable_spool(dir, "it disappeared while it was being read")),
+    )
+    .map(Some)
+}
+
+/// What creating [`SENTINEL_NAME`] by name answered, for a listing that did
+/// not show it.
+#[derive(Debug)]
+enum SentinelCreate {
+    /// This call created it, so it was not there: the listing was honest.
+    Created,
+    /// It is there, though the listing did not show it.
+    AlreadyExists,
+    /// Neither could be shown.
+    Failed(io::Error),
+}
+
+/// Create the sentinel with `create_new`, the one call whose answer proves
+/// whether the file is there without listing the directory or reading the
+/// file. A stat by name is not enough: with access-based enumeration on an
+/// SMB share, a stat of a hidden file answers `NotFound` (#1903).
+///
+/// Success is decided by the create alone. A failure to write, `fsync` it or
+/// `fsync` the directory after that is logged, not returned: the file exists,
+/// and only its presence is read. SMB directory `fsync` is not reliable.
+fn create_sentinel(dir: &SpoolDir) -> SentinelCreate {
+    use std::io::Write as _;
+
+    let path = dir.join(SENTINEL_NAME);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            let durable = f
+                .write_all(SENTINEL_BODY)
+                .and_then(|()| f.sync_all())
+                .and_then(|()| fsync_dir(dir.as_path()));
+            if let Err(e) = durable {
+                tracing::warn!(
+                    spool = %dir.display(),
+                    error = %e,
+                    "wrote the webhook spool sentinel but could not make it durable"
+                );
+            }
+            SentinelCreate::Created
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => SentinelCreate::AlreadyExists,
+        Err(e) => SentinelCreate::Failed(e),
+    }
+}
+
+/// Refuse a listing that is hiding entries, which a listing alone cannot show.
+///
+/// On an SMB share with access-based enumeration, a process that may not read
+/// the spool's entries lists it as `Ok` with no entries at all, and a stat of
+/// the sentinel by name answers `NotFound` too. That is a spool that reads as
+/// empty while demands wait in it (the weekly Windows probe, 2026-11-09).
+///
+/// A readable spool always lists its sentinel: [`accept`] writes it before it
+/// links any demand, and this check writes it for a spool made before the
+/// sentinel existed. So a listing without it is asked one more question, a
+/// `create_new` of the sentinel:
+///
+/// ```text
+///   listing shows the sentinel ................................ the listing
+///   no sentinel listed -> create_new(sentinel)
+///      Created ....................... it was not there; the listing stands
+///      AlreadyExists -> list again
+///          now shows the sentinel ...... a racing accept wrote it; 2nd listing
+///          still hidden ................ refuse: the listing is masked
+///      read-only filesystem, entries listed ... warn; the listing stands
+///      any other error ...................... refuse: completeness unproven
+/// ```
+///
+/// The cost: this writes from read sites (`rocky doctor`, `rocky tick`, the
+/// spool route), at most once per spool. A spool made before the sentinel
+/// existed, which this process may not write, now refuses until a process
+/// that may reads it once (on a read-only mount, only if it lists as empty).
+///
+/// What it does not close: a sentinel this check creates is created by the
+/// reader, so the reader can see it even where it cannot see the demands
+/// other users wrote. On a share with access-based enumeration, a reader
+/// that may create files but not read the writer's ones, and that reaches a
+/// legacy spool (or one whose `accept` stopped between creating the
+/// directory and writing the sentinel) first, reads it as empty from then
+/// on. Removing the probe file again would not help: an `accept` racing the
+/// probe could then link a demand with no sentinel at all.
+fn check_listing_shows_sentinel<E>(
+    dir: &SpoolDir,
+    first: Vec<E>,
+    is_sentinel: impl Fn(&E) -> bool,
+    create: impl FnOnce(&SpoolDir) -> SentinelCreate,
+    relist: impl FnOnce() -> io::Result<Vec<E>>,
+) -> io::Result<Vec<E>> {
+    if first.iter().any(&is_sentinel) {
+        return Ok(first);
+    }
+    match create(dir) {
+        SentinelCreate::Created => Ok(first),
+        SentinelCreate::AlreadyExists => {
+            let second = relist()?;
+            if second.iter().any(&is_sentinel) {
+                Ok(second)
+            } else {
+                Err(unreadable_spool(
+                    dir,
+                    &format!(
+                        "its sentinel '{SENTINEL_NAME}' exists, but listing the directory \
+                         does not show it — the platform is hiding entries from this process"
+                    ),
+                ))
+            }
+        }
+        // Only a read-only mount is let through, and only with entries
+        // listed: there no sentinel can be written, so a legacy spool could
+        // never be read. A permission error is what a share that hides the
+        // sentinel answers, so it refuses whatever the listing shows.
+        SentinelCreate::Failed(e)
+            if first.is_empty() || e.kind() != io::ErrorKind::ReadOnlyFilesystem =>
+        {
+            Err(unreadable_spool(
+                dir,
+                &format!(
+                    "it lists without its sentinel '{SENTINEL_NAME}', and the sentinel \
+                     could not be created to prove the listing is complete: {e}"
+                ),
+            ))
+        }
+        SentinelCreate::Failed(e) => {
+            tracing::warn!(
+                spool = %dir.display(),
+                error = %e,
+                "the webhook spool lists no sentinel and it could not be created; \
+                 reading the entries it does list"
+            );
+            Ok(first)
+        }
+    }
 }
 
 /// [`read_spool_dir`] with the listing call and the probe injected, so the
@@ -1118,6 +1268,144 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    /// The SMB access-based-enumeration shape from the weekly Windows probe
+    /// (2026-11-09): the listing is `Ok` with no entries, and the sentinel
+    /// exists but is hidden. Before #1903's second half this read as an empty
+    /// queue.
+    #[test]
+    fn an_empty_listing_hiding_an_existing_sentinel_is_refused() {
+        let dir = spool_dir(Path::new("/proj/.rocky"));
+        let refused = check_listing_shows_sentinel(
+            &dir,
+            Vec::<&str>::new(),
+            |name| *name == SENTINEL_NAME,
+            |_| SentinelCreate::AlreadyExists,
+            || Ok(Vec::new()),
+        )
+        .expect_err("a masked listing must not read as an empty spool");
+        let text = refused.to_string();
+        assert!(
+            text.contains("cannot be read") && text.contains("hiding entries"),
+            "got: {text}"
+        );
+    }
+
+    /// Under access-based enumeration the create of a hidden, existing file
+    /// may answer a permission error rather than `AlreadyExists`. An empty
+    /// listing is then unproven, and refused too.
+    #[test]
+    fn an_empty_listing_whose_sentinel_cannot_be_created_is_refused() {
+        let dir = spool_dir(Path::new("/proj/.rocky"));
+        let refused = check_listing_shows_sentinel(
+            &dir,
+            Vec::<&str>::new(),
+            |name| *name == SENTINEL_NAME,
+            |_| SentinelCreate::Failed(io::Error::from(io::ErrorKind::PermissionDenied)),
+            || panic!("only AlreadyExists lists again"),
+        )
+        .expect_err("an empty listing that cannot be proven complete must refuse");
+        assert!(
+            refused.to_string().contains("could not be created"),
+            "{refused}"
+        );
+    }
+
+    /// The controls: a listing that shows the sentinel never creates it, and
+    /// an honest empty legacy spool (the create succeeds) stays empty.
+    #[test]
+    fn a_listing_with_its_sentinel_or_an_honest_empty_one_stands() {
+        let dir = spool_dir(Path::new("/proj/.rocky"));
+        let shown = check_listing_shows_sentinel(
+            &dir,
+            vec![SENTINEL_NAME, "abc"],
+            |name| *name == SENTINEL_NAME,
+            |_| panic!("a listed sentinel needs no create"),
+            || panic!("a listed sentinel needs no second listing"),
+        )
+        .unwrap();
+        assert_eq!(shown, vec![SENTINEL_NAME, "abc"]);
+
+        let honest = check_listing_shows_sentinel(
+            &dir,
+            Vec::<&str>::new(),
+            |name| *name == SENTINEL_NAME,
+            |_| SentinelCreate::Created,
+            || panic!("a created sentinel needs no second listing"),
+        )
+        .unwrap();
+        assert!(honest.is_empty());
+    }
+
+    /// The race the create can lose honestly: the first listing ran before a
+    /// concurrent `accept` wrote the sentinel. The second listing shows it,
+    /// and is the one returned.
+    #[test]
+    fn a_sentinel_written_by_a_racing_accept_is_listed_again_not_refused() {
+        let dir = spool_dir(Path::new("/proj/.rocky"));
+        let listed = check_listing_shows_sentinel(
+            &dir,
+            Vec::<&str>::new(),
+            |name| *name == SENTINEL_NAME,
+            |_| SentinelCreate::AlreadyExists,
+            || Ok(vec![SENTINEL_NAME, "demand"]),
+        )
+        .unwrap();
+        assert_eq!(listed, vec![SENTINEL_NAME, "demand"]);
+    }
+
+    /// A listing that shows demands but hides the sentinel that exists is
+    /// partly masked, and refused, and so is one whose create answers a
+    /// permission error. Only a read-only mount (a legacy spool no process
+    /// can migrate) is read as listed.
+    #[test]
+    fn a_non_empty_listing_is_read_only_on_a_read_only_mount() {
+        let dir = spool_dir(Path::new("/proj/.rocky"));
+        check_listing_shows_sentinel(
+            &dir,
+            vec!["demand"],
+            |name| *name == SENTINEL_NAME,
+            |_| SentinelCreate::AlreadyExists,
+            || Ok(vec!["demand"]),
+        )
+        .expect_err("a sentinel that exists but is not listed proves masking");
+
+        check_listing_shows_sentinel(
+            &dir,
+            vec!["demand.done"],
+            |name| *name == SENTINEL_NAME,
+            |_| SentinelCreate::Failed(io::Error::from(io::ErrorKind::PermissionDenied)),
+            || panic!("only AlreadyExists lists again"),
+        )
+        .expect_err("a permission error is what a hiding share answers");
+
+        let read_only = check_listing_shows_sentinel(
+            &dir,
+            vec!["demand"],
+            |name| *name == SENTINEL_NAME,
+            |_| SentinelCreate::Failed(io::Error::from(io::ErrorKind::ReadOnlyFilesystem)),
+            || panic!("only AlreadyExists lists again"),
+        )
+        .unwrap();
+        assert_eq!(read_only, vec!["demand"]);
+    }
+
+    /// End to end on the real filesystem: an empty spool directory made
+    /// before the sentinel existed lists as empty, and the read writes its
+    /// sentinel, so the next read sees it in the listing.
+    #[test]
+    fn an_empty_legacy_spool_lists_empty_and_gains_its_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        let dir = spool_dir(&rocky_dir);
+        std::fs::create_dir_all(dir.as_path()).unwrap();
+        let sentinel = dir.join(SENTINEL_NAME);
+        assert!(!sentinel.exists());
+
+        assert!(list_pending_files(&rocky_dir).unwrap().is_empty());
+        assert!(sentinel.is_file(), "the read migrates the legacy spool");
+        assert_eq!(count_corrupt(&rocky_dir).unwrap(), 0);
     }
 
     /// The control: no sentinel either, so this is a spool that was never

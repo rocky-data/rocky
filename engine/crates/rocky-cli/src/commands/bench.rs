@@ -343,7 +343,7 @@ fn bench_dag(iterations: usize) -> Vec<BenchResult> {
 }
 
 fn bench_sql_gen(iterations: usize) -> Result<Vec<BenchResult>> {
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
     let mut results = Vec::new();
 
     let metadata_column = MetadataColumn::new("_loaded_by", "VARCHAR", "NULL")

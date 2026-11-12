@@ -123,7 +123,22 @@ pub fn contract_type_name(typed_col: &TypedColumn) -> String {
 ///
 /// Pure function: no LLM, no I/O. The output is the body of the user message
 /// the LLM sees, so the contract it proposes is grounded in observed data.
-pub fn render_profile_evidence(profile: &TableProfile) -> String {
+///
+/// Each column also carries what Rocky's typecheck proves about it, from
+/// `inferred_schema`, the schema the draft is verified against:
+///
+/// - `rocky_nullability`: `proven non-null` or `not proven non-null`. Only a
+///   proven column may take `nullable = false`; the verify loop withholds any
+///   other (see [`withhold_unproven_non_null`]). A profile with no NULL today
+///   is evidence about today's rows, not this proof, so the two are shown
+///   apart.
+/// - `unique_in_profile`: every profiled row has a distinct, non-NULL value
+///   (a candidate key). Shown only when it holds.
+///
+/// A column whose type Rocky could not work out shows `(Unknown)`; the prompt
+/// tells the LLM to leave its `type` unset, since no declared type could be
+/// checked against it.
+pub fn render_profile_evidence(profile: &TableProfile, inferred_schema: &[TypedColumn]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Model `{}` — observed profile of {} column(s):\n\n",
@@ -137,6 +152,18 @@ pub fn render_profile_evidence(profile: &TableProfile) -> String {
             "    rows={}, nulls={}, null_rate={:.4}, distinct={}\n",
             col.rows, col.nulls, col.null_rate, col.distinct
         ));
+        let proven = inferred_schema
+            .iter()
+            .find(|c| c.name == col.name)
+            .is_some_and(|c| !c.nullable);
+        out.push_str(if proven {
+            "    rocky_nullability=proven non-null\n"
+        } else {
+            "    rocky_nullability=not proven non-null\n"
+        });
+        if col.rows > 0 && col.nulls == 0 && col.distinct == col.rows {
+            out.push_str("    unique_in_profile=true\n");
+        }
         if let Some(min) = &col.min {
             out.push_str(&format!("    min={min}\n"));
         }
@@ -161,6 +188,12 @@ pub fn render_profile_evidence(profile: &TableProfile) -> String {
 /// so the LLM emits a file that round-trips through `toml::from_str`. The
 /// observed domain is offered as evidence but the format carries no
 /// `accepted_values` constraint, so the LLM is told not to invent fields.
+///
+/// The rules tie each claim to a fact the evidence states, so the draft
+/// promises only what Rocky can check: `type` copied from the profile (and
+/// left out when it is `Unknown`), `nullable = false` only for a column
+/// Rocky proves non-null, and `required` / `protected` for the key columns
+/// only.
 pub fn build_system_prompt() -> String {
     let mut p = String::new();
     p.push_str(
@@ -187,13 +220,23 @@ pub fn build_system_prompt() -> String {
          ```\n\n",
     );
     p.push_str("# Rules\n\n");
-    // The `nullable = false` rule below follows the data alone. A claim Rocky
-    // cannot prove is withheld by `withhold_unproven_non_null`, not retried.
     p.push_str(
-        "- Use ONLY the `type` names listed above; they must match the observed type for each column.\n\
-         - Set `nullable = false` for any column with an observed null_rate of exactly 0; otherwise leave it nullable.\n\
-         - Mark stable identity/key columns and never-null business-critical columns as `required` and `protected`.\n\
-         - Do NOT invent fields the schema does not list (there is no `accepted_values` or `min`/`max` field).\n\
+        "- Write one `[[columns]]` entry for every profiled column, and no other column.\n\
+         - `type`: copy the type shown in parentheses after the column name, exactly. When it \
+         is `Unknown`, leave `type` out: Rocky could not work out the column's type, so no \
+         declared type could be checked.\n\
+         - `nullable`: set `nullable = false` only when the column shows \
+         `rocky_nullability=proven non-null`. Every other column gets `nullable = true`, even \
+         when its profile shows no NULL today: zero NULLs in today's rows does not prove a \
+         future run cannot produce one.\n\
+         - `required` and `protected`: list the table's key columns in both, and nothing \
+         else. The key columns are its primary key (a column that is \
+         `unique_in_profile=true` and identifies the row, usually named `<entity>_id`) and \
+         its foreign keys (an `_id` column that names another table's key). Do NOT list \
+         measures, counts, dates, statuses, emails or other attributes, even when they are \
+         never NULL or happen to be unique.\n\
+         - Do NOT invent fields the schema does not list (there is no `accepted_values` or \
+         `min`/`max` field).\n\
          - Do NOT wrap the output in any block or add a header.\n",
     );
     p
@@ -342,13 +385,26 @@ fn withhold_unproven_non_null(
             "column '{}' had no NULLs in {} profiled row(s), but Rocky cannot prove it is \
              non-null from the model SQL and the source schemas it has, so the draft leaves \
              `nullable` unset. To make `nullable = false` checkable, COALESCE it in the model \
-             to a value that is never NULL: a literal default or a NOT NULL column. A NOT NULL source column also works, but only once Rocky's \
-             schema cache holds that table: a replication pipeline's `rocky run` or `rocky \
-             discover --with-schemas` can fill it; a transformation-only pipeline does not",
+             to a value that is never NULL: a literal default or a NOT NULL column. A column \
+             declared NOT NULL in the warehouse also works: `rocky ai-contract` reads the \
+             source tables' schemas from the warehouse it profiles",
             column.name, observed.rows
         ));
     }
     withheld
+}
+
+/// The retry message: the rejected draft and why it was rejected.
+///
+/// The client sends no conversation history, so without the draft the LLM
+/// rewrites the whole contract from the profile alone and can lose the
+/// columns that were right. Showing the draft lets it fix only what the
+/// diagnostics name.
+fn retry_context(rejected: &str, errors: &str) -> String {
+    format!(
+        "{errors}\n\nThe rejected contract was:\n\n{rejected}\n\nKeep every claim the errors do \
+         not name. Fix only what they name, following the rules."
+    )
 }
 
 /// Draft a data contract for a model from its observed profile.
@@ -366,7 +422,7 @@ pub async fn draft_contract(
     max_attempts: usize,
 ) -> Result<DraftedContract, AiError> {
     let system = build_system_prompt();
-    let evidence = render_profile_evidence(profile);
+    let evidence = render_profile_evidence(profile, inferred_schema);
     let mut error_context: Option<String> = None;
     let token_budget: u64 = u64::from(client.max_tokens());
     let mut consumed_output_tokens: u64 = 0;
@@ -417,7 +473,7 @@ pub async fn draft_contract(
                         errors = errors.as_str(),
                         "drafted contract failed validation, retrying"
                     );
-                    error_context = Some(errors);
+                    error_context = Some(retry_context(&toml_body, &errors));
                 } else {
                     return Err(AiError::CompileFailed {
                         attempts: max_attempts,
@@ -505,8 +561,16 @@ mod tests {
 
     #[test]
     fn evidence_includes_profile_facts() {
-        let evidence = render_profile_evidence(&sample_profile());
+        let schema = vec![
+            tc("id", RockyType::Int64, false),
+            tc("status", RockyType::String, true),
+        ];
+        let evidence = render_profile_evidence(&sample_profile(), &schema);
         assert!(evidence.contains("Model `orders`"));
+        // Rocky's proof is shown apart from the observed NULL count: both
+        // columns had no NULL, only `id` is proven.
+        assert!(evidence.contains("- id (Int64)\n    rows=1000, nulls=0, null_rate=0.0000, distinct=1000\n    rocky_nullability=proven non-null\n    unique_in_profile=true\n"), "{evidence}");
+        assert!(evidence.contains("- status (String)\n    rows=1000, nulls=0, null_rate=0.0000, distinct=3\n    rocky_nullability=not proven non-null\n    observed_domain"), "{evidence}");
         assert!(evidence.contains("id (Int64)"));
         assert!(evidence.contains("null_rate=0.0000"));
         assert!(evidence.contains("distinct=3"));
@@ -526,6 +590,26 @@ mod tests {
         assert!(p.contains("protected"));
         // The format has no accepted_values field; the prompt must say so.
         assert!(p.contains("accepted_values"));
+    }
+
+    /// Each claim the prompt asks for is tied to a fact the evidence states:
+    /// `nullable = false` to Rocky's proof (not the observed NULL count),
+    /// `type` to the profiled type (left out when `Unknown`), and
+    /// `required` / `protected` to key columns only.
+    #[test]
+    fn system_prompt_ties_each_claim_to_a_stated_fact() {
+        let p = build_system_prompt();
+        assert!(p.contains("only when the column shows `rocky_nullability=proven non-null`"));
+        assert!(p.contains("even when its profile shows no NULL today"));
+        assert!(p.contains("When it is `Unknown`, leave `type` out"));
+        assert!(p.contains("list the table's key columns in both, and nothing else"));
+    }
+
+    #[test]
+    fn retry_context_carries_the_rejected_draft_and_the_errors() {
+        let ctx = retry_context("[[columns]]\nname = \"id\"", "E011: type mismatch");
+        assert!(ctx.starts_with("E011: type mismatch"));
+        assert!(ctx.contains("The rejected contract was:\n\n[[columns]]\nname = \"id\""));
     }
 
     #[test]

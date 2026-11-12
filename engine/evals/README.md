@@ -123,6 +123,141 @@ about the tool surface). It also makes "no direct mutation" **structural**: the
 only warehouse-mutation path is `rocky apply` via a shell, and there is no MCP
 apply tool — so the safety property is *prevented*, not merely *observed*.
 
+## Contract quality (`--contract-quality`)
+
+A separate suite scores the `rocky ai-contract` drafter against an answer key.
+It needs only the `rocky` binary in its default mode.
+
+```bash
+cd engine/evals
+
+# Replay recorded responses (no key, no network). Pull-request CI runs this.
+uv run python run_evals.py --contract-quality
+
+# The real rerun: call the Anthropic API with your own key, record the responses.
+ANTHROPIC_API_KEY=... uv run python run_evals.py --contract-quality --contract-quality-mode live
+```
+
+What one run does:
+
+```
+fixtures/contract_quality ──copy──▶ temp project
+   data/seed.sql ──rocky shell──▶ cq.duckdb ──rocky run──▶ 4 materialized models
+   for each model in answer_key.toml:
+       rocky ai-contract <model> --output json
+           └─ ROCKY_AI_BASE_URL ──▶ local server ──replay──▶ recordings/<model>.json
+                                                 └─live────▶ api.anthropic.com (recorded)
+       drafted contract ──score──▶ results/contract_quality.{json,md}
+```
+
+The fixture is a DuckDB transformation pipeline over three raw tables with
+real `NOT NULL` constraints, plus columns that are nullable but hold no NULL
+today. The answer key (`fixtures/contract_quality/answer_key.toml`) holds 80
+items: 4 models, 5 columns each, and 4 attributes per column (`type`,
+`nullable`, `required`, `protected`).
+
+Each item gets one outcome:
+
+| outcome | meaning |
+|---|---|
+| `match` | the draft says what the key says; a type counts only when the compiler checked it |
+| `unverified` | the right type, but the compiler could not check it (`I003`) |
+| `unclaimed` | the draft says nothing (no `type`, no `nullable`, or no draft at all) |
+| `overclaim` | the draft promises more than the key: a wrong type, `nullable = false` on a nullable column, a non-key column in `required` / `protected` |
+| `underclaim` | the draft promises less: `nullable = true` on a NOT NULL column, a key column left out of `required` / `protected` |
+
+Every item of a returned draft passed the compiler, so an overclaim or an
+underclaim is a wrong item the compiler accepted. The pass line is in the
+answer key's `[pass_line]`: at least 64 of 80 matched, at most 4 overclaims,
+and no unverified type. A drafted column the key does not list counts as one
+more overclaim. Underclaims are reported but do not gate. Only a nullable
+underclaim is safe: the contract promises less than the data gives. A key
+column left out of `required` / `protected` is not safe: the contract no
+longer stops that column being dropped. (Splitting "wrong" by direction was
+an advisor ruling of 2026-11-11; Hugo to confirm.)
+
+The three modes:
+
+- **`replay`** (default) answers each request from `recordings/<model>.json`.
+  Each recorded exchange stores the SHA-256 of the request it answered. A
+  request that does not match fails the run, so a changed prompt never scores
+  against stale answers. The recordings in the repo were **written by hand**
+  to exercise every outcome (see `recordings/README.md`), so the replay score
+  is a regression check, not a quality measurement. Replay gates: every item's
+  outcome must equal `expected_replay.json`, or the run exits 1.
+- **`live`** forwards each request to the Anthropic API with
+  `ANTHROPIC_API_KEY` and overwrites the recordings with the real responses.
+  This is the quality measurement. It never gates on the score. Commit the
+  recordings with the scorecard they produced, then run a replay and
+  `--contract-quality-update-expected` so CI pins the real responses.
+- **`rehash`** keeps the recorded response texts and re-keys them to the
+  current requests. Use it only after an intentional prompt change, and say
+  so in the PR: the responses were not written for the new prompt.
+
+### Live rerun runbook
+
+The live rerun is the only real measure of draft quality. Results go on [#2577](https://github.com/rocky-data/rocky/issues/2577).
+
+**One command**, from the repo root on a fresh clone of `main`:
+
+```bash
+cd engine && cargo build -p rocky && cd evals && ANTHROPIC_API_KEY=<your key> python3 run_evals.py --contract-quality --contract-quality-mode live
+```
+
+**What it needs:**
+
+- A Rust toolchain (stable), to build `rocky`. The build compiles the bundled DuckDB from C++, so a C++ compiler is needed too, and the first build takes several minutes. To use a `rocky` binary you already have, set `ROCKY_BIN=/path/to/rocky` and skip `cargo build`.
+- Python 3.11 or newer. The harness uses only the standard library, so there is nothing to install; `uv run python` works too.
+- The `ANTHROPIC_API_KEY` environment variable. Nothing else: no Docker, no warehouse, no other credential.
+- Network access to `api.anthropic.com`.
+
+**What it reads and writes:**
+
+- It reads `fixtures/contract_quality/` (the project, its seed data and `answer_key.toml`).
+- It builds a DuckDB warehouse in a temporary directory and deletes it afterwards.
+- It sends four drafting requests, one per model, each retried at most twice. The prompt carries the model's schema and aggregate statistics, not raw rows.
+- It **overwrites** `fixtures/contract_quality/recordings/<model>.json` with the real responses.
+- It writes the scorecard to `results/contract_quality.md` and `results/contract_quality.json`. `results/` is git-ignored.
+
+**Reading the result.** The last block printed (also in `results/contract_quality.md`) starts with a line like this:
+
+```
+**PASS** — 75/80 matched (need >= 64), 1 overclaim(s) accepted (max 4), 0 unverified type(s) (max 0).
+```
+
+- `PASS` means all three conditions hold: at least 64 of 80 items matched, at most 4 overclaims, and no unverified type. An overclaim is a wrong item the compiler accepted that promises more than the data gives.
+- Underclaims are listed but do not gate.
+- `FAIL` is a finding, not a broken run. The exit code is 0 either way; a non-zero exit means the harness itself could not run.
+- The table under the summary gives the outcomes per model, and the list after it names every item that did not match.
+
+**Posting the result.** Comment on #2577 with:
+
+- the summary line;
+- the per-model table;
+- the list of items that did not match;
+- the commit SHA you ran.
+
+Do not paste the key, request bodies or raw responses. Write the comment in your own name, with no tool or agent attribution footer. To make CI pin the real responses, open a PR with:
+
+- the new recordings;
+- the scorecard;
+- a refreshed `expected_replay.json`: run `python3 run_evals.py --contract-quality`, then `python3 run_evals.py --contract-quality-update-expected`.
+
+The PR body gets no agent attribution either.
+
+**Can it run in a cloud agent session instead?** Yes, but only if the key owner chooses to. The session's network proxy can hold the key and add it to requests for `api.anthropic.com`:
+
+1. In the session, the agent asks for a credential for that host, sent in the `x-api-key` header.
+2. The key owner types the key into the secure form. The agent never sees it.
+3. The agent runs the command above with a dummy `ANTHROPIC_API_KEY`, which the proxy replaces.
+
+Two costs:
+
+- The key is saved on the cloud environment. The proxy then adds it to every session in that environment, other agents' sessions included, and to other people's sessions when the environment is shared.
+- It needs the owner present for the form.
+
+So only the key owner can start it. On a shared environment, a local run is simpler and keeps the key on one machine. Either way, the agent never handles the key.
+
 ## Determinism, flake, and reading a score
 
 Scenario scoring is deterministic **per attempt** — re-scoring a captured
@@ -179,9 +314,11 @@ engine/evals/
 │   ├── scorecard.py             scorecard model + JSON/Markdown render
 │   ├── selftest.py              creds-free plumbing check
 │   ├── error_contract.py        creds-free structured-error contract check (rocky binary only)
+│   ├── contract_quality.py      `rocky ai-contract` drafts vs an answer key (replay / live)
 │   └── version.py               HARNESS_VERSION
 ├── fixtures/orders_trap/        the pinned DuckDB fixture (the reconcile trap)
 ├── fixtures/orders_trap_governed/  the same fixture plus a [policy] deny on *_pii
+├── fixtures/contract_quality/   answer key, recordings and golden for --contract-quality
 ├── scorecards/                  committed scorecards (one so far, at 1.57.0)
 └── testdata/                    recorded transcript for --selftest
 ```

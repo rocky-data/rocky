@@ -131,7 +131,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/attribution_gate.sh scripts/tests/attribution-gate.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/soak-docker.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/attribution_gate.sh scripts/tests/attribution-gate.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).

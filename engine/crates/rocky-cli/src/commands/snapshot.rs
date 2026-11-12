@@ -82,6 +82,18 @@ pub async fn run_snapshot(
         "running snapshot"
     );
 
+    // ADR-ICEBERG-DUCKDB D4: snapshots are not written to an attached Iceberg
+    // catalog in v1.
+    if dialect.table_replace(&config.target.catalog)
+        == rocky_core::traits::TableReplace::InPlaceOverwrite
+    {
+        anyhow::bail!(
+            "snapshot is not supported on catalog '{}', an attached Iceberg catalog; nothing \
+             was written",
+            config.target.catalog
+        );
+    }
+
     let mut steps: Vec<SnapshotStepOutput> = Vec::new();
 
     if snapshot_cfg.target.governance.auto_create_schemas

@@ -228,6 +228,15 @@ async fn load_single_seed(
     catalog: &str,
     target_schema: &str,
 ) -> Result<(usize, Vec<ColumnDef>)> {
+    // ADR-ICEBERG-DUCKDB D4: seeds are not written to an attached Iceberg
+    // catalog in v1 (they drop and re-create their table).
+    if dialect.table_replace(catalog) == rocky_core::traits::TableReplace::InPlaceOverwrite {
+        anyhow::bail!(
+            "seed '{}': seeds are not supported on catalog '{catalog}', an attached Iceberg \
+             catalog; nothing was written",
+            seed.name
+        );
+    }
     // 0. Run pre-hooks BEFORE any warehouse write (including the destructive
     //    DROP TABLE). A failing pre-hook aborts the seed with nothing written —
     //    the canonical guard is "abort if the target already holds rows".

@@ -1995,7 +1995,7 @@ mod merge_strategy_e2e {
     #[test]
     fn test_duckdb_merge_idempotent_under_whole_table_resync() {
         let conn = DuckDbConnector::in_memory().expect("in-memory DuckDB");
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
 
         // Bootstrap an empty target table with the merge column schema.
         conn.execute_sql("CREATE TABLE main.dim_customers (id INTEGER, ts TIMESTAMP, val VARCHAR)")
@@ -2062,7 +2062,7 @@ mod merge_strategy_e2e {
     /// is caught here too.
     #[test]
     fn test_duckdb_merge_rejects_update_set_star_via_sql_gen() {
-        let dialect = DuckDbSqlDialect;
+        let dialect = DuckDbSqlDialect::plain();
         let ir = ModelIr::replication(
             TargetRef {
                 catalog: String::new(),

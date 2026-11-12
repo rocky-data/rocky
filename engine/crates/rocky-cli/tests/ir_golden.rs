@@ -68,7 +68,7 @@ fn snapshot_sql_uses_named_inserts_and_correlated_hard_deletes_for_every_dialect
         &SnowflakeSqlDialect,
         &BigQueryDialect,
         &TrinoDialect,
-        &DuckDbSqlDialect,
+        &DuckDbSqlDialect::plain(),
     ];
     for dialect in dialects {
         let columns = if dialect.name() == "snowflake" {
@@ -243,7 +243,7 @@ impl DialectKind {
 
     fn instance(self) -> Box<dyn SqlDialect> {
         match self {
-            DialectKind::DuckDb => Box::new(DuckDbSqlDialect),
+            DialectKind::DuckDb => Box::new(DuckDbSqlDialect::plain()),
             DialectKind::Databricks => Box::new(DatabricksSqlDialect),
             DialectKind::BigQuery => Box::new(BigQueryDialect),
             DialectKind::Snowflake => Box::new(SnowflakeSqlDialect),

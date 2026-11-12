@@ -7,6 +7,8 @@
 //! included. The in-process tests of `rocky-cli` cover the refusals that need no
 //! warehouse (the row cap, the consent gate, the permit).
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -148,11 +150,8 @@ fn real_server_answers_the_real_cli_sample_bytes() {
     let _keep_alive = &server;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            let (status, _, _) = http_get(port, "/api/v1/health");
-            if status.contains("200") {
-                break;
-            }
+        if common::serve_health_ok(port) {
+            break;
         }
         assert!(
             Instant::now() < deadline,
@@ -276,11 +275,8 @@ fn consent_header_reaches_the_gate_on_a_remote_adapter() {
     let _keep_alive = &server;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            let (status, _, _) = http_get(port, "/api/v1/health");
-            if status.contains("200") {
-                break;
-            }
+        if common::serve_health_ok(port) {
+            break;
         }
         assert!(
             Instant::now() < deadline,

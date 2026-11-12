@@ -53,7 +53,7 @@ fn round_trip(db: &DuckDbConnector, literal: &str) -> String {
 #[test]
 fn the_duckdb_dialect_literal_round_trips_byte_identical() {
     let db = DuckDbConnector::in_memory().expect("in-memory DuckDB");
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
 
     for value in HOSTILE_VALUES {
         let literal = string_literal(&dialect, value);
@@ -71,7 +71,7 @@ fn the_duckdb_dialect_literal_round_trips_byte_identical() {
 #[test]
 fn the_duckdb_dialect_literal_matches_the_same_value_stored_in_a_column() {
     let db = DuckDbConnector::in_memory().expect("in-memory DuckDB");
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
 
     db.execute_statement("CREATE TABLE probe (id INTEGER, v VARCHAR)")
         .expect("create probe");
@@ -110,7 +110,10 @@ fn the_duckdb_dialect_literal_matches_the_same_value_stored_in_a_column() {
 /// two-test failure (this one plus the executed round trip) rather than one.
 #[test]
 fn the_duckdb_dialect_states_the_standard_rule() {
-    assert_eq!(DuckDbSqlDialect.literal_escape(), LiteralEscape::Standard);
+    assert_eq!(
+        DuckDbSqlDialect::plain().literal_escape(),
+        LiteralEscape::Standard
+    );
 }
 
 /// The negative half: DuckDB's plain `'…'` does not read backslash escapes,

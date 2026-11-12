@@ -1,0 +1,9 @@
+{
+  "model": "customer_orders",
+  "exchanges": [
+    {
+      "request_sha256": "8b0eb4c6789ff7d7bec63292d338482c8d4133873f048751f850c24c2838a973",
+      "response_text": "```toml\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"country\"\ntype = \"String\"\nnullable = true\n\n[[columns]]\nname = \"order_count\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"total_amount\"\ntype = \"Float64\"\nnullable = true\n\n[[columns]]\nname = \"last_status\"\ntype = \"String\"\nnullable = true\n\n[rules]\nrequired = [\"customer_id\"]\nprotected = [\"customer_id\"]\n```"
+    }
+  ]
+}

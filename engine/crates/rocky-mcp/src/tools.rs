@@ -2450,7 +2450,67 @@ impl RockyMcpServer {
     /// then falls back to `Unknown` for source-leaf columns — the same
     /// behaviour as `rocky compile` without a warm cache).
     fn compile_full(&self) -> anyhow::Result<CompilerResult> {
-        let source_schemas = self.load_source_schemas()?;
+        self.compile_full_with_live(&std::collections::HashMap::new())
+    }
+
+    /// Type the leaf sources of `model_name` and its upstream chain from the
+    /// warehouse, and compile again with them (see
+    /// `rocky_cli::commands::live_describe_scope`). Returns the compile to
+    /// use and the leaf reads Rocky could not type live.
+    ///
+    /// When the warehouse adapter cannot be resolved, `compiled` is kept and
+    /// the reason is the one unresolved entry: the caller reports it rather
+    /// than drafting silently from the cache.
+    async fn compile_with_live_leaves(
+        &self,
+        compiled: CompilerResult,
+        model_name: &str,
+    ) -> anyhow::Result<(CompilerResult, Vec<String>)> {
+        let adapter = match self.warehouse_adapter() {
+            Ok(Some(adapter)) => adapter,
+            Ok(None) => {
+                return Ok((
+                    compiled,
+                    vec![
+                        "no warehouse adapter is configured; leaf sources keep the schema cache"
+                            .into(),
+                    ],
+                ));
+            }
+            Err(e) => {
+                return Ok((
+                    compiled,
+                    vec![format!(
+                        "could not resolve the warehouse adapter ({e:#}); leaf sources keep the schema cache"
+                    )],
+                ));
+            }
+        };
+        let scope = rocky_cli::commands::live_describe_scope(
+            &self.config_path,
+            &compiled.project,
+            model_name,
+        );
+        let live = rocky_cli::commands::describe_leaf_sources(
+            adapter.as_ref(),
+            &compiled.project.models,
+            &scope,
+        )
+        .await;
+        if live.schemas.is_empty() {
+            return Ok((compiled, live.unresolved));
+        }
+        Ok((self.compile_full_with_live(&live.schemas)?, live.unresolved))
+    }
+
+    /// [`Self::compile_full`], with `live` source schemas (read from the
+    /// warehouse by `describe_leaf_sources`) laid over the cached ones.
+    fn compile_full_with_live(
+        &self,
+        live: &std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    ) -> anyhow::Result<CompilerResult> {
+        let mut source_schemas = self.load_source_schemas()?;
+        rocky_cli::commands::overlay_live_schemas(&mut source_schemas, live);
         // Each model's warehouse, so a cast's column type matches `rocky
         // compile` (#2342). The schema load above refused an unreadable
         // `rocky.toml`.
@@ -3452,6 +3512,19 @@ impl RockyMcpServer {
         let compiled = self
             .compile_full()
             .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
+        if !compiled.type_check.typed_models.contains_key(&model_name) {
+            return Err(ToolError::model_not_found(&model_name));
+        }
+
+        // Type the leaf sources from the warehouse and compile again, for
+        // this tool only. A transformation-only project has an empty schema
+        // cache, so every leaf column is otherwise `Unknown`: the validator
+        // then checks no drafted type and proves no column non-null. The
+        // other tools keep the cache-only compile. Nothing is persisted.
+        let (compiled, unresolved_sources) = self
+            .compile_with_live_leaves(compiled, &model_name)
+            .await
+            .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
         let inferred_schema: Vec<rocky_compiler::types::TypedColumn> = compiled
             .type_check
             .typed_models
@@ -3486,6 +3559,7 @@ impl RockyMcpServer {
             unverified_types: drafted.unverified_types,
             unmatched_columns: drafted.unmatched_columns,
             unproven_non_null: drafted.unproven_non_null,
+            unresolved_sources,
         }))
     }
 
@@ -8650,6 +8724,42 @@ database = ":memory:"
         );
     }
 
+    /// When the warehouse adapter cannot be resolved, `ai_contract` keeps the
+    /// cache-only compile and reports why in `unresolved_sources`, instead of
+    /// dropping the error and drafting as if every leaf had been read live.
+    #[tokio::test]
+    async fn an_unresolvable_adapter_is_reported_for_the_live_leaves() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // No pipeline: the target adapter cannot be resolved.
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )
+        .expect("write config");
+        let models = root.join("models");
+        std::fs::create_dir(&models).expect("create models");
+        std::fs::write(models.join("m.sql"), "SELECT id FROM raw.orders").expect("write sql");
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .expect("write sidecar");
+
+        let server = RockyMcpServer::new(root.join("rocky.toml"));
+        let compiled = server.compile_full().expect("compile");
+        let (kept, unresolved) = server
+            .compile_with_live_leaves(compiled, "m")
+            .await
+            .expect("no hard failure");
+        assert!(kept.type_check.typed_models.contains_key("m"));
+        assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+        assert!(
+            unresolved[0].contains("could not resolve the warehouse adapter"),
+            "{unresolved:?}"
+        );
+    }
+
     /// A warehouse Rocky cannot reach must say so, not return an empty list.
     ///
     /// `inspect_schema` is the grounding tool. An agent reading empty `sources`
@@ -9678,7 +9788,7 @@ database = ":memory:"
         // Databricks) joins validated segments unquoted — Snowflake relies on
         // this to fold to its default uppercase casing rather than locking in
         // a case-sensitive quoted name.
-        let d = DuckDbSqlDialect;
+        let d = DuckDbSqlDialect::plain();
         // Three-part name (catalog.schema.table).
         assert_eq!(
             d.ground_table_ref(&["analytics", "raw", "orders"]).unwrap(),
@@ -9695,7 +9805,7 @@ database = ":memory:"
     fn ground_table_ref_default_rejects_bad_identifier_and_arity() {
         use rocky_core::traits::SqlDialect;
         use rocky_duckdb::dialect::DuckDbSqlDialect;
-        let d = DuckDbSqlDialect;
+        let d = DuckDbSqlDialect::plain();
         // Injection in any segment is rejected.
         assert!(
             d.ground_table_ref(&["raw", "orders; DROP TABLE x"])

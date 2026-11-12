@@ -157,8 +157,10 @@ pub struct RunOutcome {
     /// The child's exit code: 0 (success), 2 (partial), 1/other (failure). A
     /// child killed on timeout is reported as a failure exit code.
     pub exit_code: i32,
-    /// The child's PID, recorded on the claim for the recovery sweep. `None`
-    /// when the child could not be spawned.
+    /// The child's PID. `None` when the child could not be spawned. It is not
+    /// written to the claim today (`ClaimRecord::child_pid` stays `None`):
+    /// recovery relies on the state file's writer lock, which a live child
+    /// holds until its run record is written, plus the recovery grace.
     pub pid: Option<u32>,
     /// `true` only when the SPAWNER ended this attempt because of a shutdown
     /// drain: the pre-spawn drain gate refused to start it, or the drain
@@ -619,6 +621,73 @@ mod tests {
             "--state-path value must follow the flag: {args:?}"
         );
         assert!(pipe_pos > run_pos, "--pipeline must follow `run`: {args:?}");
+    }
+
+    /// Policy parity with a manual `rocky run` (#1416): the scheduler's child
+    /// is a bare `rocky run`, so it is governed exactly as one. Its argv is
+    /// pinned whole, and its environment changes only the trigger, the
+    /// submission id and the trace pair. It never sets or removes a
+    /// principal: `--principal` / `ROCKY_PRINCIPAL` would make the child
+    /// differ from the manual run the operator can reproduce by hand.
+    #[test]
+    fn the_child_is_a_bare_rocky_run_with_no_principal_of_its_own() {
+        let request = SpawnRequest {
+            pipeline: "raw".to_string(),
+            config_path: PathBuf::from("/proj/rocky.toml"),
+            state_path: PathBuf::from("/proj/state.redb"),
+            submission_id: "sub-1".to_string(),
+            trace_context: Some(TraceContext {
+                traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+                tracestate: None,
+            }),
+            timeout: None,
+            trigger: RunTriggerKind::Schedule,
+        };
+        let cmd = SubprocessSpawner::build_command_for_exe(&request, PathBuf::from("rocky"));
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "/proj/rocky.toml",
+                "--state-path",
+                "/proj/state.redb",
+                "run",
+                "--pipeline",
+                "raw",
+                "--output",
+                "json"
+            ],
+            "no --principal, no --principal-id, nothing a manual run lacks"
+        );
+        let allowed = [
+            "ROCKY_RUN_TRIGGER",
+            "ROCKY_SUBMISSION_ID",
+            "TRACEPARENT",
+            "TRACESTATE",
+        ];
+        for (key, value) in cmd.as_std().get_envs() {
+            let key = key.to_string_lossy();
+            assert!(
+                !key.starts_with("ROCKY_PRINCIPAL"),
+                "the child neither sets nor removes {key}"
+            );
+            if value.is_some() {
+                assert!(
+                    allowed.contains(&key.as_ref()),
+                    "unexpected child env {key}"
+                );
+            } else {
+                assert!(
+                    key == "TRACESTATE" || key.to_ascii_uppercase().starts_with("DAGSTER_PIPES_"),
+                    "the child removes only the Pipes env and a mispaired TRACESTATE, not {key}"
+                );
+            }
+        }
     }
 
     #[test]

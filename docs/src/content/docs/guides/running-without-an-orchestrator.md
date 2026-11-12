@@ -569,6 +569,14 @@ All of a reconciler's mutual exclusion is local to one machine. The `.rocky/tick
 
 If you need timers on several hosts, give each host its own project and state file. Or keep a single timer, and let the other hosts invoke `rocky run` directly.
 
+### Policy and freezes apply as they do to `rocky run`
+
+A scheduled run is a plain `rocky run --pipeline <name>` in a child process. The [`[policy]`](/reference/configuration/#policy) plane governs it exactly as it governs the same command typed by hand: the same freeze fence, the same drift auto-apply rules, the same cost `[budget]`. There is no separate `run` capability, so neither path evaluates one.
+
+The child sets only `ROCKY_RUN_TRIGGER`, `ROCKY_SUBMISSION_ID` and the trace context. It never passes `--principal`. `rocky run` reads no principal, so a `ROCKY_PRINCIPAL` the scheduler inherits changes nothing.
+
+A freeze that covers a scheduled pipeline does not skip the tick. The child starts, the freeze fence withholds its work, and the run records a failure. The usual retries, incident bundle and failure backoff follow, so the operator sees that a freeze blocked a scheduled run.
+
 ### Preview before you wire the timer
 
 `rocky tick --dry-run` evaluates demand and reports exactly what *would* run. It starts no pipeline and advances no scheduler cursor. It still opens the state store read-write. On a fresh project it can create the state file. On an older store it can stamp the current schema version. Use it to confirm a new schedule does what you expect:
@@ -609,7 +617,7 @@ The file holds the structured facts of that incident, with no narration:
 
 A fact the emitting path cannot know is `null`, never a guessed zero. The exit code of a run recovered from a crashed owner is one such fact.
 
-Two recovery paths write bundles as well: the stuck-claim resolver and the orphan sweep. Whichever one observes the failure writes the file. There is one deliberate exception. A child the spawner itself terminated for a shutdown drain gets no bundle, because a graceful shutdown is not an incident. A run that failed on its own while a drain happened to be in progress still records one.
+Two recovery paths write bundles as well: the stuck-claim resolver and the orphan sweep. The sweep also catches a cron occurrence whose child never recorded a run, for example after a power loss or a kill mid-run. It waits 5 minutes after it first sees such a claim, then records the occurrence as a lost failure and writes its bundle. The occurrence is not re-run. Whichever one observes the failure writes the file. There is one deliberate exception. A child the spawner itself terminated for a shutdown drain gets no bundle, because a graceful shutdown is not an incident. A run that failed on its own while a drain happened to be in progress still records one.
 
 Rocky keeps the newest 50 bundles. The sweep deletes only files the writer itself named, and it refuses to operate through a symlinked `incidents` directory.
 

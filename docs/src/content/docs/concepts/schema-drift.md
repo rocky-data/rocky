@@ -78,12 +78,14 @@ Rocky cannot see which connector backs a Trino table. On a non-Iceberg connector
 
 ### Unsafe Type Changes
 
-Any type change outside the safe allowlist costs a full refresh. Rocky drops the target and rebuilds it from the source:
+Any type change outside the safe allowlist costs a full refresh. Rocky rebuilds the target from the source and replaces it in one step:
 
 ```sql
-DROP TABLE IF EXISTS acme_warehouse.staging__us_west__shopify.orders
--- followed by full refresh from source
+CREATE OR REPLACE TABLE acme_warehouse.staging__us_west__shopify.orders AS
+SELECT ... FROM <source>
 ```
+
+The target is never dropped first, so a failed rebuild leaves the old table. On Trino the replace is a staged swap by rename (see [Full Refresh](/concepts/sql-generation/#full-refresh)). On BigQuery, `CREATE OR REPLACE` fails if the existing table's partitioning or clustering differs from the new one; the run then fails and the old table stays.
 
 Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP`.
 
