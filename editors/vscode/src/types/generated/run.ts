@@ -108,6 +108,12 @@ export type FailureKind =
   | "compile-error"
   | "unknown";
 /**
+ * What a `[product.output.volume]` check counts, set by the output model's strategy.
+ *
+ * ```text full_refresh                     total_rows      the whole table is this load incremental (no unique_key)      rows_added      the INSERT's reported rows incremental (unique_key), merge  rows_touched    the MERGE's reported row count time_interval                    partition_rows  COUNT(*) in each partition written ```
+ */
+export type VolumeBasis = "total_rows" | "rows_added" | "rows_touched" | "partition_rows";
+/**
  * What an out-of-range row count does to the run.
  */
 export type VolumeSeverity = "error" | "warning";
@@ -128,7 +134,13 @@ export type ProductBudgetLimitType = "max_compute_hours" | "max_storage_gb_month
 /**
  * A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.
  */
-export type CostUnit = "compute_ms" | "storage_byte_hours_data_files" | "storage_byte_hours_allocated_blocks";
+export type CostUnit =
+  | "compute_ms"
+  | "storage_byte_hours_data_files"
+  | "storage_byte_hours_allocated_blocks"
+  | "egress_bytes"
+  | "ai_input_tokens"
+  | "ai_output_tokens";
 /**
  * The verdict of a monthly product budget, or of one of its limits.
  */
@@ -566,6 +578,10 @@ export interface MaterializationOutput {
   cost_usd?: number | null;
   duration_ms: number;
   /**
+   * Bytes the statements moved out of the warehouse's region, summed over the statements that reported it. No adapter reports it yet, so it is absent today. `bytes_scanned` and `bytes_written` are not egress. Carried onto the run record for `rocky cost --month`.
+   */
+  egress_bytes?: number | null;
+  /**
    * Warehouse-side job identifiers for the SQL statements rocky issued to materialize this output. Populated for adapters whose REST API surfaces a job reference per statement (BigQuery today via `jobReference.jobId`).
    *
    * Useful for cross-checking rocky's reported figures against the warehouse's own statistics — e.g., feeding a job ID into `bq show -j <id>` and comparing `totalBytesBilled` to [`Self::bytes_scanned`]. Empty `Vec` for adapters that don't surface a job concept (DuckDB) or haven't wired it yet (Databricks, Snowflake).
@@ -596,7 +612,7 @@ export interface MaterializationOutput {
    */
   upstream_reads?: UpstreamReads | null;
   /**
-   * The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise.
+   * The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise. A `time_interval` model carries one on each partition this run wrote, judging that partition's rows.
    */
   volume?: VolumeCheckOutput | null;
   [k: string]: unknown;
@@ -713,9 +729,13 @@ export interface UpstreamRead {
 /**
  * The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.
  *
- * The count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.
+ * What is counted depends on the output model's strategy; `basis` says which (`total_rows`, `rows_added`, `rows_touched`, `partition_rows`).
  */
 export interface VolumeCheckOutput {
+  /**
+   * What `row_count` counts: `total_rows` (the whole table, for a full-refresh output), `rows_added` (the rows this run appended, for an incremental output), `rows_touched` (the rows this run's MERGE inserted or updated, matched rows included even when their values did not change, for a merge output or an incremental one with a `unique_key`), or `partition_rows` (the rows in this partition, for a time-interval output, which is judged one partition at a time). Absent when the strategy is not counted (`volume-strategy-unsupported`).
+   */
+  basis?: VolumeBasis | null;
   /**
    * The declared `max_rows` (inclusive), when set.
    */
@@ -737,7 +757,7 @@ export interface VolumeCheckOutput {
    */
   reason?: string | null;
   /**
-   * The table's total rows after the build. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
+   * The count judged, on `basis`. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
    */
   row_count?: number | null;
   /**
@@ -913,7 +933,7 @@ export interface ProductBudgetCheck {
   limit: number;
   limit_type: ProductBudgetLimitType;
   /**
-   * Why the limit is `not_evaluated`.
+   * Why the limit is `not_evaluated`. On a `max_usd` limit that is `breached` from the priced figures alone (`actual` is then that floor), what the figure leaves out.
    */
   reason?: string | null;
   /**

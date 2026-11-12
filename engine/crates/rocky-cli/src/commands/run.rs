@@ -17200,11 +17200,14 @@ async fn execute_one_plain_model(
     // tables already have. Skipped on a first-run bootstrap that already
     // loaded the data via CTAS (Incremental / DeleteInsert / Microbatch).
     //
-    // The rows the warehouse reports the strategy statements changed,
-    // summed; None once any statement does not report.
+    // The rows the warehouse reports the one strategy statement changed.
+    // A volume range reads this as the INSERT's or the MERGE's count, so it
+    // exists only when exactly one statement ran and that statement
+    // reported: summing several would count a statement that is not the
+    // write (a DROP, a CTAS, an ALTER).
     let mut rows_reported: Option<u64> = None;
+    let mut reported_per_statement: Vec<Option<u64>> = Vec::new();
     if !skip_strategy_exec {
-        rows_reported = Some(0);
         let mut atomic_create_done = false;
         if let Some((drop_sql, _, _)) = &pending_drop {
             if exec_stmts.len() != 1 {
@@ -17257,9 +17260,7 @@ async fn execute_one_plain_model(
                 Ok(stats) => {
                     bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                     bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
-                    rows_reported = rows_reported
-                        .zip(stats.rows_affected)
-                        .map(|(sum, rows)| sum.saturating_add(rows));
+                    reported_per_statement.push(stats.rows_affected);
                     egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                     if let Some(jid) = stats.job_id {
                         job_ids_acc.push(jid);
@@ -17279,6 +17280,7 @@ async fn execute_one_plain_model(
                 "Dropped {existing_name} {target_ref}: model '{model_name}' now requires a {expected_name} ({drop_sql})."
             );
         }
+        rows_reported = super::run_volume::single_statement_rows(&reported_per_statement);
     }
 
     // Report the watermark an `incremental` model now stands at, read back
@@ -44347,6 +44349,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         state.record_run(&failed).unwrap();
 
@@ -46773,6 +46776,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -46983,6 +46987,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         store.record_run(&base_run).unwrap();
         store
@@ -47269,6 +47274,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         store.record_run(&run).unwrap();
 
@@ -48267,6 +48273,7 @@ auto_create_schemas = true
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
+                output_volumes: Vec::new(),
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -48583,6 +48590,7 @@ auto_create_schemas = true
                     run_scope: Some(rocky_core::state::RunScope::Production),
                     queued_ms: None,
                     source_volumes: Vec::new(),
+                    output_volumes: Vec::new(),
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

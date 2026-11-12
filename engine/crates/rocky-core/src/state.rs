@@ -3983,6 +3983,67 @@ pub struct RunRecord {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_volumes: Vec<SourceVolumeRecord>,
+
+    /// The product output volume checks a production run made, one row per
+    /// judged load: one per model, or one per written partition for a
+    /// `time_interval` model. It keeps the basis the count was taken on and
+    /// the verdict, including `not_evaluated` with its reason, which the
+    /// per-execution [`ModelExecution::row_count`] cannot. Empty for a run
+    /// that judged none, for a shadow, branch or backfill run, and for
+    /// records written before this field existed (their counts, if any, are
+    /// total rows: only full-refresh outputs were counted then).
+    ///
+    /// Added without a schema bump, like [`Self::source_volumes`]. Omitted
+    /// when empty, so the `ledger_record_serialization_pinned` golden stays
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_volumes: Vec<OutputVolumeRecord>,
+}
+
+/// One product output volume check a production run made: the count it
+/// judged, the basis it counted on and the verdict it reached.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutputVolumeRecord {
+    /// The product that declares the range.
+    pub product: String,
+    /// The product's output model.
+    pub model: String,
+    /// The partition key, for a `time_interval` model's partition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    /// What `row_count` counts. `None` when the strategy is not counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<crate::product::spec::VolumeBasis>,
+    /// The count judged. `None` when no count was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    /// The declared `min_rows`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The declared severity.
+    pub severity: crate::product::spec::VolumeSeverity,
+    /// The verdict the run reached.
+    pub verdict: crate::product::spec::VolumeVerdict,
+    /// Why the verdict is `not_evaluated`, or what a breach did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The newest production build of one output model, with the volume rows
+/// that build recorded. Returned by [`StateStore::last_output_volume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestOutputVolume {
+    /// The run that built the model.
+    pub run_id: String,
+    /// When that run finished.
+    pub finished_at: chrono::DateTime<chrono::Utc>,
+    /// The build's volume rows. Empty when the build recorded no count and
+    /// no check: nothing declared then, or a record from before volume
+    /// checks stored a basis with no count.
+    pub rows: Vec<OutputVolumeRecord>,
 }
 
 /// One source row count a production run took when it started, judged
@@ -5504,6 +5565,73 @@ impl StateStore {
                 LatestSourceVolumes {
                     run_id: run.run_id,
                     started_at: run.started_at,
+                    rows,
+                },
+            ))
+        })?;
+        Ok(found.into_iter().next())
+    }
+
+    /// The newest production build of `model_name` and the volume rows it
+    /// recorded, whether or not it took a count.
+    ///
+    /// "Build" is a run that holds an execution of the model, any status. A
+    /// newer build that took no count hides an older build that did: the
+    /// caller must not read the older count as current. A record from
+    /// before [`RunRecord::output_volumes`] existed has its executions'
+    /// [`ModelExecution::row_count`] read as total-rows counts, the only
+    /// kind that was taken then.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn last_output_volume(
+        &self,
+        model_name: &str,
+        unrecorded: UnrecordedScope,
+    ) -> Result<Option<LatestOutputVolume>, StateError> {
+        let found = self.scan_runs_newest_first(1, usize::MAX, |run| {
+            if !run.counts_as_production(unrecorded) {
+                return None;
+            }
+            let executions: Vec<&ModelExecution> = run
+                .models_executed
+                .iter()
+                .filter(|m| m.rocky_model_name() == model_name)
+                .collect();
+            if executions.is_empty() {
+                return None;
+            }
+            let mut rows: Vec<OutputVolumeRecord> = run
+                .output_volumes
+                .iter()
+                .filter(|row| row.model == model_name)
+                .cloned()
+                .collect();
+            if rows.is_empty() && run.output_volumes.is_empty() {
+                // Written before `output_volumes`: total rows, full refresh.
+                rows = executions
+                    .iter()
+                    .filter_map(|m| m.row_count)
+                    .map(|count| OutputVolumeRecord {
+                        product: String::new(),
+                        model: model_name.to_string(),
+                        partition: None,
+                        basis: Some(crate::product::spec::VolumeBasis::TotalRows),
+                        row_count: Some(count),
+                        min_rows: None,
+                        max_rows: None,
+                        severity: crate::product::spec::VolumeSeverity::Warning,
+                        verdict: crate::product::spec::VolumeVerdict::NotEvaluated,
+                        reason: None,
+                    })
+                    .collect();
+            }
+            Some((
+                1,
+                LatestOutputVolume {
+                    run_id: run.run_id.clone(),
+                    finished_at: run.finished_at,
                     rows,
                 },
             ))
@@ -10854,6 +10982,7 @@ pub fn run_with_output_versions(
         run_scope: Some(RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),
+        output_volumes: Vec::new(),
     }
 }
 
@@ -12070,6 +12199,7 @@ mod tests {
             run_scope: Some(RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 

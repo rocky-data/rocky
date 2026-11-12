@@ -13,6 +13,14 @@ class CostNotMeasured(BaseModel):
     Executions the monthly report could not measure. Counts, never amounts.
     """
 
+    ai_calls_without_usage: conint(ge=0) | None = 0
+    """
+    AI calls this month whose response did not report both token counts. They add nothing to the AI amounts.
+    """
+    egress_unreported_executions: conint(ge=0) | None = 0
+    """
+    Production executions this month that reported no egress, counted only when at least one execution did report it (then the egress figure is a floor). Zero when none reported: egress is then not measured at all.
+    """
     failed_executions: conint(ge=0)
     """
     Production executions that failed and recorded no time; their compute is lost. One that wrote its table is still a version.
@@ -46,6 +54,9 @@ class CostUnit(StrEnum):
     compute_ms = "compute_ms"
     storage_byte_hours_data_files = "storage_byte_hours_data_files"
     storage_byte_hours_allocated_blocks = "storage_byte_hours_allocated_blocks"
+    egress_bytes = "egress_bytes"
+    ai_input_tokens = "ai_input_tokens"
+    ai_output_tokens = "ai_output_tokens"
 
 
 class MoneyFigure(StrEnum):
@@ -156,7 +167,7 @@ class CostAmount(BaseModel):
 
     amount: conint(ge=0)
     """
-    Whole units. Milliseconds, or byte-hours rounded down per interval.
+    Whole units: milliseconds, byte-hours rounded down per interval, bytes, or tokens.
     """
     unit: CostUnit
 
@@ -190,7 +201,7 @@ class ProductBudgetCheck(BaseModel):
     limit_type: ProductBudgetLimitType
     reason: str | None = None
     """
-    Why the limit is `not_evaluated`.
+    Why the limit is `not_evaluated`. On a `max_usd` limit that is `breached` from the priced figures alone (`actual` is then that floor), what the figure leaves out.
     """
     unit: CostUnit | None = None
     """
@@ -279,7 +290,7 @@ class ProductMonthCost(BaseModel):
     """
     money: float | None = None
     """
-    `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.
+    `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute, storage, egress when an adapter reported it this month, and AI tokens when this state store recorded calls this month and recorded the whole month. A figure whose part is `not_measured` or (for AI tokens) `partial` is not in it.
     """
     money_parts: list[MoneyPart]
     """
@@ -308,7 +319,7 @@ class ProductMonthCostOutput(BaseModel):
     """
     `rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.
 
-    For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.
+    For every unit, `sum(charged) + unallocated` equals `measured_total`, exactly, AI tokens included. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. An AI call about a model a product owns is charged to that product; every other call is `unallocated`. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.
     """
 
     as_of: str
@@ -352,7 +363,7 @@ class ProductMonthCostOutput(BaseModel):
     """
     shadow_branch: list[CostAmount]
     """
-    Shadow and branch compute. Real spend, but not production.
+    Shadow and branch compute, and egress where reported. Real spend, but not production.
     """
     timezone: str
     """

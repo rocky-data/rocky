@@ -723,7 +723,11 @@ mod tests {
         assert_eq!(db.execute_statement_counting_rows("BEGIN").unwrap(), None);
         assert_eq!(db.execute_statement_counting_rows("COMMIT").unwrap(), None);
         let rows = db.execute_sql("SELECT count(*) FROM t").unwrap().rows;
-        assert_eq!(rows[0][0], serde_json::json!(5), "every statement ran");
+        assert_eq!(
+            rocky_core::checks::cell_as_u64(rows[0].first()),
+            Some(5),
+            "every statement ran"
+        );
     }
 
     fn setting(db: &DuckDbConnector, name: &str) -> String {

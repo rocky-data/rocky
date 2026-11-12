@@ -1167,23 +1167,31 @@ pub struct ProductVolumeStatus {
     pub max_rows: Option<u64>,
     /// The declared severity: `warning` (the default) or `error`.
     pub severity: rocky_core::product::spec::VolumeSeverity,
-    /// The count the newest counted production build judged. Absent when
-    /// no build has been counted yet. It is on the basis that build's
-    /// strategy counted (`rocky run`'s `volume.basis`): the table's total
-    /// for a full-refresh output, that run's added, touched or partition
-    /// rows otherwise. The basis is not stored with the count.
+    /// The count the newest production build of the output judged. Absent
+    /// when that build took no count, or no build exists. An older build's
+    /// count is never shown in its place. When the newest build wrote
+    /// several partitions, this is the count of the partition that decides
+    /// the verdict: the first one out of range, otherwise the newest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count: Option<u64>,
+    /// What `row_count` counts, as stored with it (`rocky run`'s
+    /// `volume.basis`). Absent when there is no count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<rocky_core::product::spec::VolumeBasis>,
     /// When that build finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counted_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The run that took the count.
+    /// The newest production run that built the output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    /// That count judged against the range the spec declares now:
-    /// `in_range`, `below_min`, `above_max`, or `not_evaluated` when no
-    /// count exists.
+    /// The newest build's verdict: its count judged against the range the
+    /// spec declares now (`in_range`, `below_min`, `above_max`), or
+    /// `not_evaluated` when that build took no count, or counted on a
+    /// basis the output model no longer has.
     pub verdict: rocky_core::product::spec::VolumeVerdict,
+    /// Why the verdict is `not_evaluated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One product's row in `rocky product list`.
@@ -1350,6 +1358,7 @@ pub(crate) fn product_verify_outcome(
     }
     if let Err(reject) = check_product_collisions(root, &parsed, &spec_rel(product_name))
         .and_then(|()| check_volume_strategy(root, &parsed))
+        .and_then(|()| check_volume_merge_adapter(root, &config, &parsed).map(|_| ()))
     {
         let posture = PostureResult {
             status: VerifyStatus::Fail,
@@ -1359,6 +1368,12 @@ pub(crate) fn product_verify_outcome(
             apply_effect: posture.apply_effect,
         };
         return Ok((parsed, posture));
+    }
+    // An adapter that cannot be told is a loud warning on a pass, never a
+    // silent one: the range could be permanently inert.
+    let mut posture = posture;
+    if let Ok(Some(warning)) = check_volume_merge_adapter(root, &config, &parsed) {
+        posture.reason = format!("{} WARNING {warning}", posture.reason);
     }
     Ok((parsed, posture))
 }
@@ -1374,10 +1389,13 @@ pub(crate) enum OutputStrategy {
     Loaded(rocky_ir::MaterializationStrategy),
 }
 
-/// Resolve the output model's strategy. The spec does not name it, and the
-/// sidecar often omits it (it resolves from `_defaults.toml` or a config
-/// group), so this loads the model the way the compiler does.
-pub(crate) fn output_strategy(root: &Path, parsed: &ParsedSpec) -> OutputStrategy {
+/// Load the output model the way the compiler does. The spec does not name
+/// its strategy, and the sidecar often omits it (it resolves from
+/// `_defaults.toml` or a config group), so the model has to be loaded.
+fn load_output_model(
+    root: &Path,
+    parsed: &ParsedSpec,
+) -> Result<rocky_core::models::Model, OutputStrategy> {
     let model_name = parsed.output_model();
     // The model's source is a `.sql` file or a `.rocky` DSL file. The
     // compiler's directory loader reads both; `rocky_core`'s reads only
@@ -1385,7 +1403,7 @@ pub(crate) fn output_strategy(root: &Path, parsed: &ParsedSpec) -> OutputStrateg
     let sql = root.join(sql_rel(parsed));
     let has_source = sql.is_file() || sql.with_extension("rocky").is_file();
     if !has_source || !root.join(sidecar_rel(parsed)).is_file() {
-        return OutputStrategy::NotDrafted;
+        return Err(OutputStrategy::NotDrafted);
     }
     let models_dir = root.join("models");
     let only_this_model = format!(
@@ -1399,13 +1417,21 @@ pub(crate) fn output_strategy(root: &Path, parsed: &ParsedSpec) -> OutputStrateg
         None,
     ) {
         Ok(models) => models,
-        Err(err) => return OutputStrategy::DoesNotLoad(err.to_string()),
+        Err(err) => return Err(OutputStrategy::DoesNotLoad(err.to_string())),
     };
-    match models.iter().find(|model| model.config.name == model_name) {
-        Some(model) => OutputStrategy::Loaded(model.to_model_ir().materialization),
-        None => {
+    models
+        .into_iter()
+        .find(|model| model.config.name == model_name)
+        .ok_or_else(|| {
             OutputStrategy::DoesNotLoad(format!("no model named '{model_name}' loads from models/"))
-        }
+        })
+}
+
+/// Resolve the output model's strategy ([`load_output_model`]).
+pub(crate) fn output_strategy(root: &Path, parsed: &ParsedSpec) -> OutputStrategy {
+    match load_output_model(root, parsed) {
+        Ok(model) => OutputStrategy::Loaded(model.to_model_ir().materialization),
+        Err(state) => state,
     }
 }
 
@@ -1462,6 +1488,115 @@ pub(crate) fn check_volume_strategy(root: &Path, parsed: &ParsedSpec) -> SpecRes
             super::run::transformation_strategy_name(&strategy)
         ),
     ))
+}
+
+/// The adapter types whose `rocky run` reports no row count for a `MERGE`.
+/// On these a merge-basis volume range ([`VolumeBasis::RowsTouched`]) can
+/// never be evaluated. The type name is the `type` of the `[adapter.*]`
+/// block.
+const ADAPTERS_WITHOUT_MERGE_COUNT: [&str; 5] =
+    ["databricks", "snowflake", "bigquery", "trino", "redshift"];
+
+/// Refuse a merge-basis volume range at `error` on an adapter that cannot
+/// report MERGE row counts (`volume-merge-count-unavailable`).
+///
+/// A merge output, or an incremental one with a `unique_key`, is judged on
+/// the rows its MERGE inserted or updated, as the warehouse reports them.
+/// Databricks, Snowflake, BigQuery, Trino and Redshift report none, so every
+/// run is `not_evaluated` and an `error` guarantee would never fire. At
+/// `warning`, the range is only informational and passes.
+///
+/// The adapter is the model's own `adapter` override when it has one;
+/// otherwise the target adapter of the transformation pipeline whose
+/// `models` glob matches the model's file, or of every transformation
+/// pipeline when they all name the same one. When the adapter still cannot
+/// be told, this returns `Ok(Some(warning))`, and verify prints it: it does
+/// not guess either way. A model that is not drafted or does not load, or is
+/// not a merge-basis output, passes.
+pub(crate) fn check_volume_merge_adapter(
+    root: &Path,
+    config: &rocky_core::config::RockyConfig,
+    parsed: &ParsedSpec,
+) -> SpecResult<Option<String>> {
+    use rocky_core::product::spec::{VolumeBasis, VolumeSeverity};
+    let Some(volume) = &parsed.product().output.volume else {
+        return Ok(None);
+    };
+    if volume.severity() != VolumeSeverity::Error {
+        return Ok(None);
+    }
+    let Ok(model) = load_output_model(root, parsed) else {
+        return Ok(None);
+    };
+    if VolumeBasis::of(&model.to_model_ir().materialization) != Some(VolumeBasis::RowsTouched) {
+        return Ok(None);
+    }
+    let model_name = parsed.output_model();
+    let adapter_name = match &model.config.adapter {
+        Some(name) => Some(name.clone()),
+        None => {
+            let sql = sql_rel(parsed);
+            let pipelines: Vec<&rocky_core::config::TransformationPipelineConfig> = config
+                .pipelines
+                .values()
+                .filter_map(rocky_core::config::PipelineConfig::as_transformation)
+                .collect();
+            let matching: Vec<_> = pipelines
+                .iter()
+                .filter(|pipeline| {
+                    glob::Pattern::new(&pipeline.models).is_ok_and(|pattern| {
+                        let options = glob::MatchOptions {
+                            case_sensitive: true,
+                            require_literal_separator: true,
+                            require_literal_leading_dot: false,
+                        };
+                        pattern.matches_path_with(Path::new(&sql), options)
+                            || pattern.matches_path_with(&root.join(&sql), options)
+                    })
+                })
+                .collect();
+            let mut names: Vec<&str> = if matching.len() == 1 {
+                matching.iter().map(|p| p.target.adapter.as_str()).collect()
+            } else {
+                pipelines
+                    .iter()
+                    .map(|p| p.target.adapter.as_str())
+                    .collect()
+            };
+            names.sort_unstable();
+            names.dedup();
+            match names.as_slice() {
+                [only] => Some((*only).to_string()),
+                _ => None,
+            }
+        }
+    };
+    let Some(adapter_name) = adapter_name else {
+        return Ok(Some(format!(
+            "[volume-merge-count-unknown-adapter] model '{model_name}' is judged on the rows \
+             its MERGE touched, and verify could not tell which adapter it runs on. On \
+             Databricks, Snowflake, BigQuery, Trino or Redshift the warehouse reports no \
+             MERGE row count, so every run is not_evaluated and severity = \"error\" never \
+             fires. Set the model's `adapter`, or check the adapter yourself."
+        )));
+    };
+    let adapter_type = config
+        .adapters
+        .get(&adapter_name)
+        .map(|adapter| adapter.adapter_type.as_str());
+    match adapter_type {
+        Some(kind) if ADAPTERS_WITHOUT_MERGE_COUNT.contains(&kind) => Err(SpecRejected::new(
+            "volume-merge-count-unavailable",
+            format!(
+                "product.output.volume has severity = \"error\" on model '{model_name}', which \
+                 is judged on the rows its MERGE touched, but its adapter '{adapter_name}' \
+                 ({kind}) reports no MERGE row count. Every run would be not_evaluated and \
+                 the guarantee would never fire. Use severity = \"warning\", a full_refresh \
+                 or time_interval output, or an adapter that reports MERGE counts"
+            ),
+        )),
+        _ => Ok(None),
+    }
 }
 
 /// How Phase B lowers `[product.output.volume]` for the drafted output
@@ -2345,27 +2480,19 @@ pub(crate) fn product_status_at(
         && let Some(volume) = &parsed.product().output.volume
     {
         let latest = match &store {
-            Some(store) => store.last_volume_count(
+            Some(store) => store.last_output_volume(
                 parsed.output_model(),
                 rocky_core::state::UnrecordedScope::Exclude,
             )?,
             None => None,
         };
-        let row_count = latest
-            .as_ref()
-            .and_then(|(_, execution)| execution.row_count);
-        output.volume = Some(ProductVolumeStatus {
-            min_rows: volume.min_rows,
-            max_rows: volume.max_rows,
-            severity: volume.severity(),
-            row_count,
-            counted_at: latest.as_ref().map(|(_, execution)| execution.finished_at),
-            run_id: latest.map(|(run_id, _)| run_id),
-            verdict: row_count.map_or(
-                rocky_core::product::spec::VolumeVerdict::NotEvaluated,
-                |count| volume.judge(count),
-            ),
-        });
+        let current_basis = match output_strategy(root, parsed) {
+            OutputStrategy::Loaded(strategy) => {
+                Some(rocky_core::product::spec::VolumeBasis::of(&strategy))
+            }
+            OutputStrategy::NotDrafted | OutputStrategy::DoesNotLoad(_) => None,
+        };
+        output.volume = Some(volume_status(volume, latest, current_basis));
     }
     if let Some(parsed) = &parsed
         && !parsed.product().source.volume.is_empty()
@@ -2822,6 +2949,86 @@ fn print_source_volume(source: &ProductSourceVolumeStatus) {
     }
 }
 
+/// The volume status of the newest production build of the output.
+///
+/// The verdict is that build's own: a build that took no count is
+/// `not_evaluated`, however recent an older count is. A stored count is
+/// judged against the range the spec declares now only when it was counted
+/// on the basis the output model has now (`current_basis`, `None` when the
+/// model cannot be read, which accepts the stored basis); a count on another
+/// basis says nothing about this range. A build of several partitions is
+/// judged on each: the first partition out of range decides, then a
+/// partition with no count, then the newest.
+fn volume_status(
+    volume: &rocky_core::product::spec::VolumeSpec,
+    latest: Option<rocky_core::state::LatestOutputVolume>,
+    current_basis: Option<Option<rocky_core::product::spec::VolumeBasis>>,
+) -> ProductVolumeStatus {
+    use rocky_core::product::spec::VolumeVerdict;
+    let mut status = ProductVolumeStatus {
+        min_rows: volume.min_rows,
+        max_rows: volume.max_rows,
+        severity: volume.severity(),
+        row_count: None,
+        basis: None,
+        counted_at: None,
+        run_id: None,
+        verdict: VolumeVerdict::NotEvaluated,
+        reason: Some("no production build of the output is recorded".to_string()),
+    };
+    let Some(latest) = latest else {
+        return status;
+    };
+    status.counted_at = Some(latest.finished_at);
+    status.run_id = Some(latest.run_id);
+    status.reason = Some("the newest production build recorded no volume count".to_string());
+    // (verdict, row) per row, in the order the build recorded them.
+    let judged: Vec<(VolumeVerdict, &rocky_core::state::OutputVolumeRecord)> = latest
+        .rows
+        .iter()
+        .map(|row| {
+            let verdict = match (row.row_count, row.basis) {
+                (None, _) => VolumeVerdict::NotEvaluated,
+                (Some(_), basis) if current_basis.is_some_and(|current| current != basis) => {
+                    VolumeVerdict::NotEvaluated
+                }
+                (Some(count), _) => volume.judge(count),
+            };
+            (verdict, row)
+        })
+        .collect();
+    let decider = judged
+        .iter()
+        .find(|(verdict, _)| matches!(verdict, VolumeVerdict::BelowMin | VolumeVerdict::AboveMax))
+        .or_else(|| {
+            judged
+                .iter()
+                .find(|(verdict, _)| *verdict == VolumeVerdict::NotEvaluated)
+        })
+        .or_else(|| judged.last());
+    if let Some((verdict, row)) = decider {
+        status.verdict = *verdict;
+        if *verdict == VolumeVerdict::NotEvaluated {
+            status.reason = Some(match row.row_count {
+                None => row.reason.clone().unwrap_or_else(|| {
+                    "the newest production build recorded no volume count".to_string()
+                }),
+                Some(_) => "the newest build counted on a basis the output model no longer \
+                            has, so its count says nothing about this range"
+                    .to_string(),
+            });
+            if row.row_count.is_some() {
+                status.basis = row.basis;
+            }
+        } else {
+            status.row_count = row.row_count;
+            status.basis = row.basis;
+            status.reason = None;
+        }
+    }
+    status
+}
+
 /// The human-readable volume lines of `rocky product status`.
 fn print_volume(volume: &ProductVolumeStatus) {
     let bound = |value: Option<u64>| value.map_or_else(|| "-".to_string(), |v| v.to_string());
@@ -2832,12 +3039,23 @@ fn print_volume(volume: &ProductVolumeStatus) {
         volume.severity.as_str()
     );
     let verdict = volume_verdict_text(volume.verdict);
+    let basis = volume.basis.map_or_else(String::new, |basis| {
+        format!(" counted as {}", basis.as_str())
+    });
     match (volume.row_count, volume.counted_at) {
         (Some(count), Some(at)) => println!(
-            "    latest count: {count} row(s) at {} ({verdict})",
+            "    newest build: {count} row(s){basis} at {} ({verdict})",
             at.to_rfc3339()
         ),
-        _ => println!("    latest count: none yet ({verdict})"),
+        (None, Some(at)) => println!(
+            "    newest build at {}: no count ({verdict}){}",
+            at.to_rfc3339(),
+            volume
+                .reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(": {reason}"))
+        ),
+        _ => println!("    newest build: none yet ({verdict})"),
     }
 }
 
@@ -3714,6 +3932,145 @@ effect = "require_review"
         let error = check_product_collisions(&root, &parsed, "products/renamed.toml")
             .expect_err("renamed spec file collides");
         assert_eq!(error.code, "duplicate-product-name");
+    }
+
+    // ----- verify: a merge range at `error` needs an adapter that counts MERGE rows -----
+
+    /// The verify verb itself refuses the range, and passes on an adapter
+    /// that reports MERGE counts. The refusal is `fail`, with its code in
+    /// the reason.
+    #[test]
+    fn verify_fails_an_error_merge_volume_on_an_adapter_without_merge_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        write_file(
+            &root.join("products/vol_product.toml"),
+            b"[product]\nname = \"vol_product\"\nintent = \"x\"\n\n\
+              [product.source]\ntables = [\"c.s.t\"]\n\n\
+              [product.output]\nmodel = \"vol\"\ngrain = [\"x\"]\n\
+              columns = [{ name = \"x\", type = \"Int32\", nullable = false }]\n\n\
+              [product.output.volume]\nmin_rows = 1\nseverity = \"error\"\n\n\
+              [product.trust]\nagent = \"propose_only\"\n",
+        );
+        write_file(&root.join("models/vol.sql"), b"SELECT 1 AS x\n");
+        write_file(
+            &root.join("models/vol.toml"),
+            b"name = \"vol\"\n[strategy]\ntype = \"merge\"\nunique_key = [\"x\"]\n\n\
+              [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"vol\"\n",
+        );
+        let config = root.join("rocky.toml");
+        let write_config = |adapter: &str| {
+            write_file(
+                &config,
+                format!(
+                    "{adapter}\n[pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                     [pipeline.main.target.governance]\nauto_create_schemas = true\n\n{}",
+                    paste_block("vol")
+                )
+                .as_bytes(),
+            );
+        };
+        write_config(
+            "[adapter]\ntype = \"databricks\"\nhost = \"h.cloud.databricks.com\"\n\
+             http_path = \"/sql/1.0/warehouses/w\"\ntoken = \"t\"\n",
+        );
+        let (_, refused) = product_verify_outcome(&root, &config, "vol_product").expect("verifies");
+        assert_eq!(refused.status, VerifyStatus::Fail, "{}", refused.reason);
+        assert!(
+            refused.reason.contains("[volume-merge-count-unavailable]"),
+            "{}",
+            refused.reason
+        );
+
+        write_config("[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n");
+        let (_, passed) = product_verify_outcome(&root, &config, "vol_product").expect("verifies");
+        assert_eq!(passed.status, VerifyStatus::Pass, "{}", passed.reason);
+        assert!(!passed.reason.contains("WARNING"), "{}", passed.reason);
+    }
+
+    // ----- status: the newest build's volume verdict -----
+
+    fn volume_row(
+        partition: &str,
+        count: Option<u64>,
+        basis: rocky_core::product::spec::VolumeBasis,
+    ) -> rocky_core::state::OutputVolumeRecord {
+        rocky_core::state::OutputVolumeRecord {
+            product: "p".into(),
+            model: "m".into(),
+            partition: Some(partition.into()),
+            basis: Some(basis),
+            row_count: count,
+            min_rows: None,
+            max_rows: None,
+            severity: rocky_core::product::spec::VolumeSeverity::Warning,
+            verdict: rocky_core::product::spec::VolumeVerdict::NotEvaluated,
+            reason: count.is_none().then(|| "not counted".to_string()),
+        }
+    }
+
+    /// A build of several partitions is decided by the first partition out
+    /// of range, then a partition with no count, then the newest.
+    #[test]
+    fn volume_status_of_a_partitioned_build_follows_the_worst_partition() {
+        use rocky_core::product::spec::{VolumeBasis::PartitionRows, VolumeSpec, VolumeVerdict};
+        let spec = VolumeSpec {
+            min_rows: Some(2),
+            max_rows: Some(3),
+            severity: None,
+        };
+        let latest = |rows: Vec<rocky_core::state::OutputVolumeRecord>| {
+            Some(rocky_core::state::LatestOutputVolume {
+                run_id: "r".into(),
+                finished_at: chrono::Utc::now(),
+                rows,
+            })
+        };
+        let basis = Some(Some(PartitionRows));
+
+        let in_range = volume_status(
+            &spec,
+            latest(vec![
+                volume_row("a", Some(2), PartitionRows),
+                volume_row("b", Some(3), PartitionRows),
+            ]),
+            basis,
+        );
+        assert_eq!(in_range.verdict, VolumeVerdict::InRange);
+        assert_eq!(in_range.row_count, Some(3), "the newest decides");
+
+        let breach = volume_status(
+            &spec,
+            latest(vec![
+                volume_row("a", Some(2), PartitionRows),
+                volume_row("b", Some(9), PartitionRows),
+                volume_row("c", None, PartitionRows),
+            ]),
+            basis,
+        );
+        assert_eq!(breach.verdict, VolumeVerdict::AboveMax);
+        assert_eq!(breach.row_count, Some(9));
+
+        let uncounted = volume_status(
+            &spec,
+            latest(vec![
+                volume_row("a", Some(2), PartitionRows),
+                volume_row("b", None, PartitionRows),
+            ]),
+            basis,
+        );
+        assert_eq!(uncounted.verdict, VolumeVerdict::NotEvaluated);
+        assert_eq!(uncounted.row_count, None);
+        assert_eq!(uncounted.reason.as_deref(), Some("not counted"));
+
+        let none = volume_status(&spec, None, basis);
+        assert_eq!(none.verdict, VolumeVerdict::NotEvaluated);
+        assert!(none.run_id.is_none());
+
+        let empty = volume_status(&spec, latest(vec![]), basis);
+        assert_eq!(empty.verdict, VolumeVerdict::NotEvaluated);
+        assert_eq!(empty.run_id.as_deref(), Some("r"), "the build is known");
+        assert_eq!(empty.row_count, None);
     }
 
     // ----- the verbs end to end -----

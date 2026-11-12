@@ -1520,8 +1520,8 @@ pub struct MaterializationOutput {
     pub stored_bytes: Option<rocky_core::state::StoredBytes>,
     /// The product volume check on this output, when a product declares
     /// `[product.output.volume]` for the model and this was a production
-    /// build. Absent otherwise. A `time_interval` model carries it on the
-    /// last partition this run wrote; it judges all of them.
+    /// build. Absent otherwise. A `time_interval` model carries one on each
+    /// partition this run wrote, judging that partition's rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<VolumeCheckOutput>,
     /// State-internal facts about this build's write that the volume check
@@ -1559,8 +1559,9 @@ pub struct WriteEvidence {
     /// `SELECT COUNT(*)` on the table right before the write, taken only
     /// when a `rows_added` volume needs it. `Err` is why the count failed.
     pub rows_before: Option<Result<u64, String>>,
-    /// The rows the warehouse reported the strategy statements changed,
-    /// summed. `None` when no statement ran or any one did not report.
+    /// The rows the warehouse reported the build's one strategy statement
+    /// changed (the INSERT or the MERGE). `None` when no statement ran, more
+    /// than one did, or the one did not report.
     pub rows_reported: Option<u64>,
 }
 
@@ -1578,9 +1579,11 @@ pub struct VolumeCheckOutput {
     /// What `row_count` counts: `total_rows` (the whole table, for a
     /// full-refresh output), `rows_added` (the rows this run appended,
     /// for an incremental output), `rows_touched` (the rows this run's
-    /// MERGE inserted or updated, for a merge output or an incremental one
-    /// with a `unique_key`), or `partition_rows` (the rows in the
-    /// partitions this run wrote, for a time-interval output). Absent when
+    /// MERGE inserted or updated, matched rows included even when their
+    /// values did not change, for a merge output or an incremental one with
+    /// a `unique_key`), or `partition_rows` (the rows in this partition, for
+    /// a time-interval output, which is judged one partition at a time).
+    /// Absent when
     /// the strategy is not counted (`volume-strategy-unsupported`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis: Option<rocky_core::product::spec::VolumeBasis>,
@@ -1638,6 +1641,25 @@ pub struct SourceVolumeCheckOutput {
     /// output model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+impl VolumeCheckOutput {
+    /// The persisted twin of this check, for the run record. `partition` is
+    /// the key of the partition it judged, for a `time_interval` model.
+    pub fn to_record(&self, partition: Option<String>) -> rocky_core::state::OutputVolumeRecord {
+        rocky_core::state::OutputVolumeRecord {
+            product: self.product.clone(),
+            model: self.model.clone(),
+            partition,
+            basis: self.basis,
+            row_count: self.row_count,
+            min_rows: self.min_rows,
+            max_rows: self.max_rows,
+            severity: self.severity,
+            verdict: self.verdict,
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 impl SourceVolumeCheckOutput {
@@ -6822,16 +6844,25 @@ impl RunOutput {
             tracing::warn!("{summary}");
         }
 
-        // Models an `error` volume breach marks failed. A time-interval
-        // model records one execution per partition but carries the check
-        // on the last one, so every execution of the model is matched by
-        // its Rocky model name, not only the one that carries the check.
+        // Models an `error` volume breach marks failed. Each execution is
+        // failed by its own check, so a time-interval model fails only the
+        // partitions that breached; the model's `errors` entry is not
+        // recorded again for any of them (see below).
         let volume_failed: std::collections::BTreeSet<String> = self
             .materializations
             .iter()
             .filter_map(|mat| mat.volume.as_ref())
             .filter(|volume| volume.fails_the_model())
             .map(|volume| volume.model.clone())
+            .collect();
+        let output_volumes: Vec<rocky_core::state::OutputVolumeRecord> = self
+            .materializations
+            .iter()
+            .filter_map(|mat| {
+                mat.volume
+                    .as_ref()
+                    .map(|volume| volume.to_record(mat.partition.as_ref().map(|p| p.key.clone())))
+            })
             .collect();
 
         for mat in &self.materializations {
@@ -6860,10 +6891,6 @@ impl RunOutput {
                     .volume
                     .as_ref()
                     .is_some_and(VolumeCheckOutput::fails_the_model)
-                    || mat
-                        .output_target
-                        .as_ref()
-                        .is_some_and(|target| volume_failed.contains(&target.model))
                 {
                     "failed".to_string()
                 } else {
@@ -7055,6 +7082,7 @@ impl RunOutput {
                 .iter()
                 .map(SourceVolumeCheckOutput::to_record)
                 .collect(),
+            output_volumes,
         }
     }
 

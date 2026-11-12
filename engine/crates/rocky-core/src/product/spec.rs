@@ -563,9 +563,9 @@ impl VolumeSpec {
 ///
 /// ```text
 ///   full_refresh                     total_rows      the whole table is this load
-///   incremental (no unique_key)      rows_added      COUNT(*) after minus before
+///   incremental (no unique_key)      rows_added      the INSERT's reported rows
 ///   incremental (unique_key), merge  rows_touched    the MERGE's reported row count
-///   time_interval                    partition_rows  COUNT(*) in the partitions written
+///   time_interval                    partition_rows  COUNT(*) in each partition written
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -573,8 +573,10 @@ pub enum VolumeBasis {
     /// The table's total rows after the build. A full-refresh build replaces
     /// the whole table, so the total is this load.
     TotalRows,
-    /// The rows this run appended: the table's row count after the write
-    /// minus its count before. A run that created or rebuilt the table
+    /// The rows this run appended, as the adapter reported them for its
+    /// INSERT. When the adapter reports nothing, the table's row count after
+    /// the write minus its count before. When both exist and differ, nothing
+    /// is counted (`not_evaluated`). A run that created or rebuilt the table
     /// counts every row in it.
     RowsAdded,
     /// The rows this run's `MERGE` inserted or updated, as the warehouse
@@ -582,8 +584,9 @@ pub enum VolumeBasis {
     /// change. A run that created or rebuilt the table counts every row in
     /// it.
     RowsTouched,
-    /// The rows in the partitions this run wrote, counted after the write
-    /// with the same time window each partition's overwrite used.
+    /// The rows in one partition this run wrote, counted after the write
+    /// with the same time window that partition's overwrite used. Each
+    /// written partition is judged on its own.
     PartitionRows,
 }
 

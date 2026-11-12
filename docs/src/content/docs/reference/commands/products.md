@@ -53,13 +53,15 @@ What `rocky run` counts depends on the output model's strategy. The JSON output 
 | Strategy | `basis` | What is counted |
 |---|---|---|
 | `full_refresh` | `total_rows` | The table's rows after the build. The build replaces the whole table, so the total is the load. |
-| `incremental` | `rows_added` | The rows this run appended: the table's `COUNT(*)` after the write minus its `COUNT(*)` before. |
-| `merge`, or `incremental` with a `unique_key` | `rows_touched` | The rows this run's `MERGE` inserted or updated, as the warehouse reports them. A matched row counts even when its values did not change. |
-| `time_interval` | `partition_rows` | The rows in the partitions this run wrote, counted after the write with each partition's own time window. |
+| `incremental` | `rows_added` | The rows this run appended: the count the adapter reported for the `INSERT`. When it reports none, the table's `COUNT(*)` after the write minus its `COUNT(*)` before. |
+| `merge`, or `incremental` with a `unique_key` | `rows_touched` | The rows this run's `MERGE` inserted or updated, as the warehouse reports them. A matched row counts even when its values did not change. Only a run that sent exactly one statement has a count. |
+| `time_interval` | `partition_rows` | The rows in one partition this run wrote, counted after the write with that partition's own time window. Each partition is judged on its own. |
 
 A run that created the table (a first run) or rebuilt it (`rocky run --full-refresh`) counts every row in it, on any basis.
 
-A `COUNT(*)` cannot see an updated row, so `rows_touched` needs the warehouse's own count. DuckDB, PostgreSQL, SQL Server and Spark report it. Databricks, Snowflake, BigQuery, Trino and Redshift do not, so there a merge output is `not_evaluated`, with the reason in `reason`. `rows_added` assumes nothing else writes to the table during the run. If the table holds fewer rows after the write than before, the check is `not_evaluated`.
+A `COUNT(*)` cannot see an updated row, so `rows_touched` needs the warehouse's own count. DuckDB, PostgreSQL, SQL Server and Spark report it. Databricks, Snowflake, BigQuery, Trino and Redshift do not, so there a merge output is `not_evaluated`, with the reason in `reason`. For `rows_added`, Rocky takes the table's count before the write and after it, and checks the `INSERT`'s reported count against the growth. If the two differ, the check is `not_evaluated`: something else wrote to the table during the run. If the table holds fewer rows after the write than before, that is `not_evaluated` too. This check assumes the run is the table's only writer. A reported count needs no such assumption. Where the adapter reports no `INSERT` count, the growth is the count, and then the single-writer assumption matters. A `MERGE` that matches a row and changes nothing still counts that row.
+
+A merge output on one of those adapters can never be evaluated. `rocky product verify` refuses it at `error` severity (`volume-merge-count-unavailable`, below).
 
 A view, an ephemeral model, a materialized view and a dynamic table store no rows Rocky writes. A `delete_insert`, snapshot or content-addressed load has no one count that is its volume. These strategies are refused (`volume-strategy-unsupported`).
 
@@ -74,12 +76,13 @@ build ok ──▶ count ────▶ in range ──────────
                 │      ├─▶ out of range, warning ─▶ a `volume_warnings` line; delivery as usual
                 │      └─▶ out of range, error ───▶ the model is marked failed
                 └─ count failed, not reported,
-                   or cancelled ────────────────────▶ not_evaluated (never a failure)
+                   or cancelled ────────────────────▶ not_evaluated (never a failure;
+                                                      a `volume_warnings` line says why)
 ```
 
-At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. For a time-interval output, every partition this run wrote is marked failed, and none gets a `due_at`. The partitions keep their `computed` state, because their rows are in the table. An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
+At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A time-interval output is judged one partition at a time. If any partition breaches at `error`, the model fails. Only the breaching partitions are marked failed in the run record, and they get no `due_at`. The other partitions stay successes. Every partition keeps its `computed` state, because its rows are in the table. An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Every `not_evaluated` check adds a `volume_warnings` line with its reason, at either severity. It never fails the run. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
 
-The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `basis`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. A time-interval output carries it on the last partition the run wrote. The run records `row_count` in its history, and `rocky product status` reports it. The history does not store the basis, so after a strategy change `rocky product status` may show a count taken on the old basis until the next run. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
+The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `basis`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. A time-interval output carries one on each partition the run wrote. The run records each check in its history with its basis, and `rocky product status` reports the newest build's check. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
 
 ### Source volume ranges
 
@@ -145,6 +148,7 @@ Four checks run in order, fail-closed:
 2. **Classification tags.** Every tag in `output.classifications` must resolve to a `[mask]` strategy, a `[mask.<env>]` override, or `[classifications].allow_unmasked`. This is an error here; plain `rocky compile` only warns (W004). Resolution only: whether masking is applied is warehouse-dependent.
 3. **Identity collisions.** The product name must not be claimed by another spec file, and the output model must not be claimed by another product.
 4. **Volume strategy.** When the spec declares `[product.output.volume]` and the model exists (`models/<model>.sql` or `models/<model>.rocky`, plus `models/<model>.toml`), the model must be a `full_refresh`, `incremental`, `merge` or `time_interval` model (`volume-strategy-unsupported`). The strategy is read the way the compiler reads it, including `_defaults.toml`. Before the model is drafted, verify cannot judge the strategy, so this check passes; the Phase-B compile runs it again. If a model with another strategy still reaches `rocky run`, the run does not count it: the verdict is `not_evaluated` with reason `volume-strategy-unsupported`, never a failure.
+5. **Volume on a merge.** A `merge` output, or an `incremental` one with a `unique_key`, is counted from the rows its `MERGE` reports. When the range has `severity = "error"` and the model's adapter is Databricks, Snowflake, BigQuery, Trino or Redshift, verify refuses it (`volume-merge-count-unavailable`): those adapters report no `MERGE` count, so every run would be `not_evaluated` and the guarantee would never fire. Use `severity = "warning"`, another strategy, or another adapter. The adapter is the model's own `adapter` when it sets one. Otherwise it is the target adapter of the transformation pipeline whose `models` glob matches the model file, or of all transformation pipelines when they share one. When verify cannot tell which adapter the model runs on, it passes and adds a `WARNING [volume-merge-count-unknown-adapter]` to its reason instead of guessing.
 
 Exit codes: `0` pass · `1` needs input (a paste-ready `[policy]` block is printed) · `2` fail.
 
@@ -247,8 +251,10 @@ When the spec declares `[product.output.volume]`, status also reports `volume`:
 | Field | Meaning |
 |---|---|
 | `min_rows`, `max_rows`, `severity` | The declared range and severity. |
-| `row_count`, `counted_at`, `run_id` | The newest production build that recorded a count, whatever its status. A build an `error` breach marked failed still shows its count. Absent until a build is counted. |
-| `verdict` | That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when there is no count. |
+| `run_id`, `counted_at` | The newest production run that built the output, whatever its status, and when it finished. An older run's count never stands in for a newer build that took none. |
+| `row_count`, `basis` | That build's count and what it counted (`total_rows`, `rows_added`, `rows_touched`, `partition_rows`). Absent when the build took no count. A build that wrote several partitions shows the partition that decides the verdict: the first one out of range, otherwise the newest. |
+| `verdict` | That build's count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`. It is `not_evaluated` when the build took no count, or counted on a basis the output model no longer has. |
+| `reason` | Why the verdict is `not_evaluated`. |
 
 When the spec declares `[[product.source.volume]]`, status also reports `source_volumes`, one row per declared range:
 

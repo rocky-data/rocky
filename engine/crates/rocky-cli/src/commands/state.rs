@@ -1000,6 +1000,7 @@ mod retention_sweep_config_tests {
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 
