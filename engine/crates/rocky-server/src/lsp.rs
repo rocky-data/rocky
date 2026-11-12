@@ -7918,6 +7918,66 @@ mod tests {
         }
     }
 
+    /// The LSP records AI usage through the spool and never opens the state
+    /// store: the store file is byte-identical afterwards, and a store that
+    /// does not exist is not created.
+    #[tokio::test]
+    async fn the_lsp_records_ai_usage_in_the_spool_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let (service, _socket) = LspService::new(test_lsp);
+        let lsp = service.inner();
+        // Before `initialize` there is no models directory: no recorder.
+        assert!(
+            lsp.ai_usage_recorder("lsp_ai_dsl_fix", None)
+                .await
+                .is_none()
+        );
+        *lsp.models_dir.write().await = Some(models.display().to_string());
+
+        let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+        let spool = rocky_core::ai_usage::spool_path(&state_path);
+        let call = |tokens| rocky_ai::client::LlmUsage {
+            llm_model: "claude-sonnet-4-6".to_string(),
+            input_tokens: Some(tokens),
+            output_tokens: Some(2 * tokens),
+        };
+
+        // No store yet: the call lands in the spool and creates no store.
+        let recorder = lsp
+            .ai_usage_recorder("lsp_ai_contract_fix", Some("orders"))
+            .await
+            .unwrap();
+        (recorder.sink())(&call(10));
+        assert!(!state_path.exists(), "the LSP must not create the store");
+        let spooled = rocky_core::ai_usage::read_spool(&spool).unwrap().records;
+        assert_eq!(spooled.len(), 1);
+        assert_eq!(spooled[0].command, "lsp_ai_contract_fix");
+        assert_eq!(spooled[0].model.as_deref(), Some("orders"));
+        assert_eq!(spooled[0].input_tokens, Some(10));
+
+        // A store that exists is left byte-identical.
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let before = std::fs::read(&state_path).unwrap();
+        let recorder = lsp.ai_usage_recorder("lsp_ai_dsl_fix", None).await.unwrap();
+        (recorder.sink())(&call(20));
+        assert!(
+            before == std::fs::read(&state_path).unwrap(),
+            "the store was written"
+        );
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        assert!(store.list_ai_usage().unwrap().is_empty(), "table untouched");
+        assert_eq!(
+            rocky_core::ai_usage::read_spool(&spool)
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+    }
+
     /// The V062 lookup of the AI code actions: a broken `rocky.toml` stops
     /// the arms that carry warehouse data (no fallback that would judge the
     /// data against an empty config and let it through), and an EU model is

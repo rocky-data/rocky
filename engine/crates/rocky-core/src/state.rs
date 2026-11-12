@@ -312,9 +312,13 @@ const READ_ONLY_TOLERATED_ABSENT_BEFORE_V34: &[&str] = &["connector_state"];
 /// developer recorded locally with the remote copy, which never had them.
 /// The reserved row travels with the table, so the two stay consistent.
 const AI_USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_usage");
-/// The key of the reserved row in [`AI_USAGE`] that holds when recording
-/// began. Not a UUID, so it never collides with a record id.
-const AI_USAGE_SINCE_KEY: &str = "~since";
+/// The key `ai_usage_since` of the reserved row in [`AI_USAGE`] that holds
+/// when recording began. It lives in the local-only table, not in the
+/// replicating [`METADATA`] table: a download replaces `METADATA` with the
+/// remote copy, which would hand this machine another machine's instant and
+/// make a month this store never saw read as complete. Not a UUID, so it
+/// never collides with a record id.
+const AI_USAGE_SINCE_KEY: &str = "ai_usage_since";
 /// The schema version that added [`AI_USAGE`].
 const AI_USAGE_SINCE_SCHEMA_VERSION: u32 = 35;
 /// The table a read-only open tolerates being absent, and only in a store
@@ -10238,6 +10242,22 @@ impl StateStore {
             .ok()
             .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
             .map(|at| at.with_timezone(&chrono::Utc)))
+    }
+
+    /// Overwrite the instant this store started recording AI usage. Opening a
+    /// store stamps it once, so only a tool that models a store that has
+    /// recorded for longer (a test, a restore) needs this.
+    pub fn stamp_ai_usage_since(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(AI_USAGE)?;
+            table.insert(AI_USAGE_SINCE_KEY, at.to_rfc3339().as_bytes())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
     }
 
     /// Insert `records`, skipping any whose id the table already holds.
@@ -21634,5 +21654,306 @@ mod connector_state_tests {
         assert_eq!(record.commit_seq, 1);
         assert_eq!(record.envelope.value["cursor"], 7);
         assert!(!LOCAL_ONLY_TABLE_NAMES.contains(&"connector_state"));
+    }
+}
+
+#[cfg(test)]
+mod ai_usage_state_tests {
+    use super::*;
+    use crate::ai_usage::{AiUsageRecord, append_to_spool, read_spool, spool_path};
+    use chrono::TimeZone;
+    use std::io::Write;
+
+    fn record(id: &str) -> AiUsageRecord {
+        AiUsageRecord {
+            id: id.to_string(),
+            at: chrono::Utc.with_ymd_and_hms(2026, 10, 3, 4, 5, 6).unwrap(),
+            command: "ai_explain".to_string(),
+            model: Some("orders".to_string()),
+            llm_model: "claude-sonnet-4-6".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+        }
+    }
+
+    /// Make the store at `path` look like one a v34 binary wrote: stamped
+    /// `34`, without the AI usage table.
+    fn force_pre_v35_store(path: &Path) {
+        force_schema_version(path, "34");
+        let db = Database::open(path).expect("reopen to drop the v35 table");
+        let txn = db.begin_write().expect("write txn");
+        txn.delete_table(AI_USAGE).expect("drop ai_usage");
+        txn.commit().expect("commit");
+    }
+
+    /// Mutation: drop the table creation or the stamp in `init` and the
+    /// upgraded store has no `ai_usage_since`.
+    #[test]
+    fn test_v34_opens_and_creates_ai_usage_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_loaded_file(
+                    "p",
+                    "f",
+                    &LoadedFileRecord {
+                        loaded_at: chrono::Utc::now(),
+                        rows_loaded: 1,
+                        bytes_read: 1,
+                        duration_ms: 0,
+                        file_hash: None,
+                    },
+                )
+                .unwrap();
+        }
+        force_pre_v35_store(&path);
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(34));
+
+        let before = chrono::Utc::now();
+        drop(StateStore::open(&path).unwrap());
+        let after = chrono::Utc::now();
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
+
+        let store = StateStore::open(&path).unwrap();
+        let since = store
+            .ai_usage_since()
+            .unwrap()
+            .expect("the upgrade stamps ai_usage_since");
+        assert!(
+            before - chrono::Duration::seconds(1) <= since
+                && since <= after + chrono::Duration::seconds(1),
+            "the stamp is the upgrade instant, not a fixed one: {since}"
+        );
+        assert!(store.list_ai_usage().unwrap().is_empty());
+        assert!(
+            store.get_loaded_file("p", "f").unwrap().is_some(),
+            "records kept"
+        );
+        assert_eq!(store.record_ai_usage(&[record("a")]).unwrap(), 1);
+        assert_eq!(store.list_ai_usage().unwrap().len(), 1);
+    }
+
+    /// The stamp is written once. A later open must not move it, or a month
+    /// the store did record would read as partial.
+    #[test]
+    fn the_ai_usage_stamp_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let early = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        {
+            let store = StateStore::open(&path).unwrap();
+            store.stamp_ai_usage_since(early).unwrap();
+        }
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.ai_usage_since().unwrap(), Some(early));
+        // The reserved row is not a call.
+        assert!(store.list_ai_usage().unwrap().is_empty());
+    }
+
+    /// Mutation: drop the tolerance and this open is refused.
+    #[test]
+    fn test_v34_store_read_only_open_tolerates_the_missing_ai_usage_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        force_pre_v35_store(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let store = StateStore::open_read_only(&path).expect("a v34 store opens read-only");
+        assert!(store.list_ai_usage().unwrap().is_empty());
+        assert_eq!(
+            store.ai_usage_since().unwrap(),
+            None,
+            "recording has not started"
+        );
+        drop(store);
+        assert!(before == std::fs::read(&path).unwrap(), "read-only wrote");
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(34));
+    }
+
+    /// The tolerance is keyed on the stamp: a v35 store without the table is
+    /// damaged and is refused read-only.
+    #[test]
+    fn test_v35_store_missing_ai_usage_table_read_only_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            assert!(txn.delete_table(AI_USAGE).unwrap());
+            txn.commit().unwrap();
+        }
+        match StateStore::open_read_only(&path).map(|_| ()) {
+            Err(StateError::ReadOnlyNeedsInit { missing, .. }) => {
+                assert_eq!(missing, vec!["ai_usage".to_string()]);
+            }
+            other => panic!("expected ReadOnlyNeedsInit, got {other:?}"),
+        }
+    }
+
+    /// Local-only: a snapshot that excludes the local-only tables carries
+    /// neither the calls nor the stamp.
+    #[test]
+    fn the_snapshot_does_not_carry_ai_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.record_ai_usage(&[record("a")]).unwrap();
+        assert!(LOCAL_ONLY_TABLE_NAMES.contains(&"ai_usage"));
+        assert!(LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE.contains(&"ai_usage"));
+        let dest = dir.path().join("snapshot.redb");
+        store
+            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
+            .unwrap();
+        let snapshot = StateStore::open(&dest).unwrap();
+        assert!(snapshot.list_ai_usage().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_dedupes_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        assert_eq!(
+            store
+                .record_ai_usage(&[record("a"), record("b"), record("a")])
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.record_ai_usage(&[record("b")]).unwrap(), 0);
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2);
+    }
+
+    /// The report reads the table and the spool and counts a record that is
+    /// in both once. Mutation: drop the dedupe and `shared` counts twice.
+    #[test]
+    fn the_report_reads_table_and_spool_and_dedupes_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        store
+            .record_ai_usage(&[record("table"), record("shared")])
+            .unwrap();
+        append_to_spool(&spool_path(&path), &[record("shared"), record("spool")]).unwrap();
+        let read = store.ai_usage_including_spool().unwrap();
+        let mut ids: Vec<&str> = read.records.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["shared", "spool", "table"]);
+    }
+
+    #[test]
+    fn a_drain_moves_the_spool_into_the_table_and_empties_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        append_to_spool(&spool_path(&path), &[record("a"), record("b")]).unwrap();
+        let drain = store.drain_ai_usage_spool().unwrap().unwrap();
+        assert_eq!(
+            drain,
+            AiUsageDrain {
+                inserted: 2,
+                already_present: 0,
+                malformed: 0
+            }
+        );
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2);
+        assert!(read_spool(&spool_path(&path)).unwrap().records.is_empty());
+        // Nothing to drain is not an error.
+        assert_eq!(
+            store.drain_ai_usage_spool().unwrap(),
+            Some(AiUsageDrain::default())
+        );
+    }
+
+    /// A crash between the commit and the truncate leaves the lines. The
+    /// next drain finds them in the table and skips them.
+    /// Mutation: insert without the id check and the second drain doubles
+    /// the rows; truncate before the commit and the failed drain loses them.
+    #[test]
+    fn a_drain_that_dies_before_truncating_loses_nothing_and_doubles_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        append_to_spool(&spool_path(&path), &[record("a"), record("b")]).unwrap();
+
+        crate::ai_usage::FAIL_TRUNCATE.with(|f| f.set(true));
+        let failed = store.drain_ai_usage_spool();
+        crate::ai_usage::FAIL_TRUNCATE.with(|f| f.set(false));
+        assert!(failed.is_err(), "the injected truncate failure surfaces");
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2, "committed");
+        assert_eq!(
+            read_spool(&spool_path(&path)).unwrap().records.len(),
+            2,
+            "the lines are still there"
+        );
+        // The report still counts each call once.
+        assert_eq!(store.ai_usage_including_spool().unwrap().records.len(), 2);
+
+        let drain = store.drain_ai_usage_spool().unwrap().unwrap();
+        assert_eq!(drain.inserted, 0);
+        assert_eq!(drain.already_present, 2);
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2);
+        assert!(read_spool(&spool_path(&path)).unwrap().records.is_empty());
+    }
+
+    /// Only the process that holds the writer drains. A read-only store
+    /// leaves the spool alone.
+    #[test]
+    fn a_read_only_store_does_not_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        append_to_spool(&spool_path(&path), &[record("a")]).unwrap();
+        let store = StateStore::open_read_only(&path).unwrap();
+        assert_eq!(store.drain_ai_usage_spool().unwrap(), None);
+        assert_eq!(read_spool(&spool_path(&path)).unwrap().records.len(), 1);
+        assert_eq!(store.ai_usage_including_spool().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_spool_line_is_counted_and_dropped_by_the_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        append_to_spool(&spool_path(&path), &[record("a")]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(spool_path(&path))
+            .unwrap()
+            .write_all(b"not json\n")
+            .unwrap();
+        assert_eq!(store.ai_usage_including_spool().unwrap().malformed, 1);
+        let drain = store.drain_ai_usage_spool().unwrap().unwrap();
+        assert_eq!((drain.inserted, drain.malformed), (1, 1));
+    }
+
+    /// Retention sweeps old calls with history, by age, and keeps the stamp.
+    #[test]
+    fn the_sweep_removes_old_calls_and_keeps_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let mut old = record("old");
+        old.at = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let mut new = record("new");
+        new.at = chrono::Utc::now();
+        store.record_ai_usage(&[old, new]).unwrap();
+        let since = store.ai_usage_since().unwrap();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        assert_eq!(store.sweep_ai_usage(cutoff, true).unwrap(), (1, 1));
+        assert_eq!(store.list_ai_usage().unwrap().len(), 2, "dry run");
+        assert_eq!(store.sweep_ai_usage(cutoff, false).unwrap(), (1, 1));
+        let ids: Vec<String> = store
+            .list_ai_usage()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["new"]);
+        assert_eq!(store.ai_usage_since().unwrap(), since);
     }
 }

@@ -234,6 +234,10 @@ class MaterializationInfo(BaseModel):
     bytes_scanned: int | None = None
     #: Adapter-reported bytes-written figure. ``None`` on every adapter today.
     bytes_written: int | None = None
+    #: Adapter-reported bytes moved out of the warehouse's region. ``None`` on
+    #: every adapter today. ``rocky cost --month`` prices it with
+    #: ``cross_region_transfer_cost_per_gb``. Omitted on the wire when ``None``.
+    egress_bytes: int | None = None
     #: Tenant this materialization is attributed to (from the discover-time
     #: ``{tenant}`` schema-pattern component). ``None`` for non-tenant patterns.
     tenant: str | None = None
@@ -1072,6 +1076,7 @@ class ModelExecution(BaseModel):
     sql_hash: str
     bytes_scanned: int | None = None
     bytes_written: int | None = None
+    egress_bytes: int | None = None
 
 
 class RunRecord(BaseModel):

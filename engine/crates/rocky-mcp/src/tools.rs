@@ -11453,6 +11453,48 @@ database = ":memory:"
         );
     }
 
+    /// The MCP server records AI usage through the spool and never opens the
+    /// state store: an existing store file is byte-identical afterwards, and
+    /// a missing one is not created.
+    #[test]
+    fn the_mcp_server_records_ai_usage_in_the_spool_only() {
+        let (_tmp, server) = write_mcp_project(None);
+        let state_path = server.state_path();
+        let spool = rocky_core::ai_usage::spool_path(&state_path);
+        let usage = |tokens| rocky_ai::client::LlmUsage {
+            llm_model: "claude-sonnet-4-6".to_string(),
+            input_tokens: Some(tokens),
+            output_tokens: None,
+        };
+
+        let sink = server.ai_usage_sink("mcp_explain_model", "m");
+        sink(&usage(5));
+        assert!(!state_path.exists(), "the server must not create the store");
+        let spooled = rocky_core::ai_usage::read_spool(&spool).unwrap().records;
+        assert_eq!(spooled.len(), 1);
+        assert_eq!(spooled[0].command, "mcp_explain_model");
+        assert_eq!(spooled[0].model.as_deref(), Some("m"));
+        assert_eq!(spooled[0].output_tokens, None, "no usage is kept as none");
+
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let before = std::fs::read(&state_path).unwrap();
+        server.ai_usage_sink("mcp_ai_test", "m")(&usage(6));
+        assert!(
+            before == std::fs::read(&state_path).unwrap(),
+            "the store was written"
+        );
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        assert!(store.list_ai_usage().unwrap().is_empty(), "table untouched");
+        assert_eq!(
+            rocky_core::ai_usage::read_spool(&spool)
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+    }
+
     /// V062 on the MCP generator tools: with EU data and a US `[ai]`
     /// endpoint, both the model-schema client (`ai_test`, `explain_model`)
     /// and the statistics client (`ai_contract`) are refused when built,

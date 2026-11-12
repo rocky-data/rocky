@@ -359,6 +359,105 @@ mod tests {
         assert_eq!(read.malformed, 1);
     }
 
+    /// Run `work` on another thread and report whether it finished within a
+    /// short wait. Used to show that a lock holder blocks it.
+    fn finishes_within(
+        work: impl FnOnce() + Send + 'static,
+        wait: std::time::Duration,
+    ) -> (bool, std::thread::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            work();
+            let _ = tx.send(());
+        });
+        (rx.recv_timeout(wait).is_ok(), handle)
+    }
+
+    /// An appender takes the exclusive lock. Mutation: drop the `lock` call
+    /// and the append finishes while the lock is held.
+    #[test]
+    fn an_append_waits_for_the_spool_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        append_to_spool(&path, &[record("a")]).unwrap();
+        let holder = std::fs::File::open(&path).unwrap();
+        FileExt::lock(&holder).unwrap();
+        let target = path.clone();
+        let (done, handle) = finishes_within(
+            move || append_to_spool(&target, &[record("b")]).unwrap(),
+            std::time::Duration::from_millis(300),
+        );
+        assert!(!done, "the append must wait for the lock");
+        FileExt::unlock(&holder).unwrap();
+        handle.join().unwrap();
+        assert_eq!(read_spool(&path).unwrap().records.len(), 2);
+    }
+
+    /// A drain takes the same lock, so an appender cannot slip a line in
+    /// between the drain's read and its truncate. Mutation: drop the `lock`
+    /// call in `drain_spool` and the drain finishes while the lock is held.
+    #[test]
+    fn a_drain_waits_for_the_spool_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        append_to_spool(&path, &[record("a")]).unwrap();
+        let holder = std::fs::File::open(&path).unwrap();
+        FileExt::lock(&holder).unwrap();
+        let target = path.clone();
+        let (done, handle) = finishes_within(
+            move || {
+                let read = drain_spool(&target, |_| Ok::<(), ()>(())).unwrap().unwrap();
+                assert_eq!(read.records.len(), 1);
+            },
+            std::time::Duration::from_millis(300),
+        );
+        assert!(!done, "the drain must wait for the lock");
+        FileExt::unlock(&holder).unwrap();
+        handle.join().unwrap();
+        assert!(read_spool(&path).unwrap().records.is_empty());
+    }
+
+    /// Many appenders at once lose no line and tear none.
+    #[test]
+    fn concurrent_appenders_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..20 {
+                        append_to_spool(
+                            &path,
+                            &[record(&format!("{t}-{n}-a")), record(&format!("{t}-{n}-b"))],
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let read = read_spool(&path).unwrap();
+        assert_eq!(read.malformed, 0);
+        let ids: std::collections::BTreeSet<&str> =
+            read.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(read.records.len(), 8 * 20 * 2);
+        assert_eq!(ids.len(), 8 * 20 * 2, "no duplicates, none lost");
+    }
+
+    /// A failed commit leaves every line in the spool.
+    #[test]
+    fn a_failed_commit_keeps_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        append_to_spool(&path, &[record("a")]).unwrap();
+        let result = drain_spool(&path, |_| Err::<(), &str>("no"));
+        assert!(matches!(result, Err(DrainError::Commit("no"))));
+        assert_eq!(read_spool(&path).unwrap().records.len(), 1);
+    }
+
     #[test]
     fn record_or_spool_never_creates_a_store() {
         let dir = tempfile::tempdir().unwrap();

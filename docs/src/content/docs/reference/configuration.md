@@ -965,15 +965,15 @@ A Valkey-backed runtime cache exists in the codebase but `rocky.toml` does not r
 
 ## `[cost]`
 
-Tell Rocky what your warehouse costs. `rocky optimize` and run cost estimates use these prices, and fall back to Rocky's defaults for an unset storage or DBU price. The monthly product view, `rocky cost --month <YYYY-MM> --by product`, uses only the prices you set: a figure with no price shows no money.
+Tell Rocky what your warehouse costs. `rocky optimize` and run cost estimates use these prices, and fall back to Rocky's defaults for an unset storage or DBU price. The monthly product view, `rocky cost --month <YYYY-MM> --by product`, uses only the prices you set: a figure with no price shows no money. A price of `0` is valid and means the figure is free.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `storage_cost_per_gb_month` | float | unset | Storage price in USD per GB-month. Must be a finite number, 0 or more. When unset, `rocky optimize` estimates with `0.023`. The monthly product view (`rocky cost --month`) uses only a price you set. |
 | `compute_cost_per_dbu` | float | unset | Compute price in USD per DBU-hour (Databricks, Snowflake). Must be a finite number, 0 or more. When unset, run cost estimates (`rocky cost <run>`, `rocky optimize`, run summaries) use `0.40`. |
 | `compute_cost_per_machine_hour` | float | unset | Compute price in USD per machine-hour, for engines that bill by machine time. Must be a finite number, 0 or more. Prices model time in `rocky cost --month <YYYY-MM> --by product`. |
-| `cross_region_transfer_cost_per_gb` | float | unset | Price in USD to move 1 GB across regions. Must be a finite number, 0 or more. Read by no cost command yet. |
-| `ai_cost_per_million_tokens` | float | unset | AI price in USD per 1,000,000 tokens. Must be a finite number, 0 or more. Read by no cost command yet. |
+| `cross_region_transfer_cost_per_gb` | float | unset | Price in USD to move 1 GB (2^30 bytes) across regions. Must be a finite number, 0 or more. `rocky cost --month <YYYY-MM> --by product` prices the egress that adapters reported. No adapter reports egress yet, so it prices nothing today. Reported egress with no price gives no money total. `0` is a valid explicit price. |
+| `ai_cost_per_million_tokens` | float | unset | AI price in USD per 1,000,000 tokens. One blended price: input and output tokens cost the same. Must be a finite number, 0 or more. `rocky cost --month <YYYY-MM> --by product` prices the AI calls recorded in this state store with it. That figure is developer spend, and it covers this store only. A month with recorded calls and no price here has no money total. `0` is a valid explicit price. |
 | `warehouse_size` | string | `"Medium"` | Warehouse size for cost estimation (e.g., `"Small"`, `"Medium"`, `"Large"`). |
 | `min_history_runs` | integer | `5` | Runs Rocky needs in history before it makes a cost recommendation. |
 
