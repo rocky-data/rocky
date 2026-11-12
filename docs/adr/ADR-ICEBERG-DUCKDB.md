@@ -27,7 +27,9 @@
 | A failed `INSERT` inside the transaction, then `COMMIT` | The transaction rolls back; the old rows stay |
 | A transaction that mixes `RENAME` or `DROP` with writes, or creates two tables | Refused |
 | `information_schema.tables` | Lists the Iceberg tables as `BASE TABLE`; `duckdb_databases()` reports type `iceberg` |
-| Type round-trip | `UTINYINT` comes back `INTEGER`, `HUGEINT` comes back `DECIMAL(38,0)`. A `LIST` column is missing from `DESCRIBE` |
+| Type round-trip | `TINYINT`, `SMALLINT`, `UTINYINT` and `USMALLINT` come back `INTEGER`; `UINTEGER` comes back `BIGINT`; `HUGEINT` comes back `DECIMAL(38,0)`. `UBIGINT`, `INTERVAL`, `JSON` and fixed-size arrays are refused. A `LIST` column is in `DESCRIBE` (re-measured during implementation; the first spike reported it missing) |
+| `ALTER COLUMN … TYPE` | Allowed: `INTEGER` → `BIGINT`, `FLOAT` → `DOUBLE`, `DECIMAL(p,s)` → `DECIMAL(p',s)`. Refused: `INTEGER` → `DOUBLE`, `DATE` → `TIMESTAMP` (Iceberg v3), every narrowing |
+| `DROP COLUMN` of a partition column | Refused by DuckDB-Iceberg inside the transaction ("referenced by the current partition spec") |
 
 ## Decision
 
@@ -54,9 +56,9 @@ region = "us-east-1"
 ```
 
 - No new adapter type: it would duplicate the factory, discovery and loader wiring for the same connection.
-- `alias` and `type` are plain literals, not `${VAR}` strings. They decide the rendered SQL, so plan and run would otherwise diverge.
+- `alias` and `type` decide the rendered SQL. `type` is an enum. `alias` is validated as an identifier; a `${VAR}` in it is expanded before parsing like every other value, so it cannot be told apart from a literal. Plan and run read the same expanded config, so they agree.
 - `alias` must be a valid identifier. It must not equal the file's own catalog name, `memory`, or another alias. It is never the default catalog: a model with an empty catalog renders a two-part name and is not an Iceberg write.
-- The S3 secret is scoped to its attachment. Secret values are `RedactedString`. Rocky never creates a `PERSISTENT` secret, and runs the secret and attach statements on a path that does not log SQL.
+- The S3 secret is a `TEMPORARY` secret named `rocky_attach_<alias>`. It is scoped by `s3.scope` (for example `s3://warehouse`); Rocky cannot learn the bucket from the catalog without probing, so with no `scope` the secret covers every `s3://` path of the connection. Secret values are `RedactedString`. Rocky never creates a `PERSISTENT` secret, and runs the secret and attach statements on a path that does not log SQL.
 - `offline = true` refuses to connect when `httpfs` or `iceberg` is missing from the extension directory, as it does for `icu`.
 - `compile`, `plan` and other paths that do not connect never attach.
 - OAuth2 and vended credentials are refused in v1. They come later, with a Lakekeeper conformance case.
@@ -81,7 +83,7 @@ COMMIT                               any error → ROLLBACK; the old table is ke
 ```
 
 - Column types are compared after normalising Iceberg's round-trip (above). A re-run with no change emits no `ALTER`.
-- Refused, with the old table kept: dropping a partition or identifier column, changing a nested type, a type change that is not a widening.
+- Refused, with the old table kept: changing a nested type and a type change that is not a widening (Rocky checks both before any write). Dropping a partition or identifier column is refused by DuckDB-Iceberg inside the transaction, which then rolls back; Rocky does not read the partition spec itself.
 - A first build is the non-replacing `CREATE TABLE … AS`.
 - `rocky plan` shows the fixed skeleton (`BEGIN`, `DELETE`, `INSERT BY NAME`, `COMMIT`) with a note that column changes are decided at run time, the way the staged swap's statements stand in for its probes.
 - A commit conflict with another writer retries the whole transaction. That is safe for a full refresh, which reads nothing it wrote.
@@ -92,14 +94,14 @@ COMMIT                               any error → ROLLBACK; the old table is ke
 
 Supported on an Iceberg alias: `full_refresh` (D3) and append `incremental`.
 
-Refused before any SQL runs, with an error that names the strategy and the catalog: views, `merge`, `delete_insert`, `time_interval`, `snapshot`, quarantine (both modes), branch and promote, `rocky load`, seeds, and `drop_existing_kind`. `UPDATE` and `MERGE` work in the spike; each comes later with its own conformance case.
+Refused before any SQL runs, with an error that names the strategy and the catalog: views, `merge` (also `incremental` with a `unique_key`), `incremental` with a `lookback`, `delete_insert`, `time_interval`, `microbatch`, `snapshot`, quarantine (both modes), branch and promote, `rocky load`, seeds, a lakehouse `format`, and `drop_existing_kind`. A replication full refresh of an existing table is refused too (its rebuild SQL is a CTAS, not a bare query); a replication first copy and incremental work. `UPDATE` and `MERGE` work in the spike; each comes later with its own conformance case.
 
 An append and its watermark write are not one transaction. A crash between them repeats the append on the next run, as on every other warehouse.
 
 ### D5 — Tests and CI
 
 - The renderer, the reconcile logic and every failure point of the executor are tested in the required `engine-ci`, against a scripted adapter, with no network.
-- A live conformance test runs against Lakekeeper and SeaweedFS in Docker. It is behind a cargo feature and `#[ignore]`, and runs in its own path-filtered, non-required workflow plus a weekly schedule. Extensions are downloaded there, cached by DuckDB version. Images are pinned by digest.
+- A live conformance test runs against Lakekeeper and SeaweedFS in Docker (`rocky-duckdb/tests/iceberg_conformance.rs`, feature `iceberg-conformance`, `#[ignore]`). It runs in `.github/workflows/iceberg-conformance.yml`, path-filtered and non-required, plus a weekly schedule. Images are pinned by digest. Extensions are downloaded on each run: no cache action is pinned in this repository, and adding one is a separate supply-chain decision.
 - A credential-free POC sits in `examples/playground/pocs/07-adapters/`.
 
 ## Consequences

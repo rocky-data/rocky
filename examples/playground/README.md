@@ -50,7 +50,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`). Some `run.sh` scripts read JSON with `jq` or `python3`.
 
-**92 of 104 POCs run with no external credentials.** See each POC's README for prerequisites.
+**93 of 105 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -199,7 +199,7 @@ The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt impo
 | [21-emit-sql-exit-path](pocs/06-developer-experience/21-emit-sql-exit-path) | `rocky emit-sql --out-dir` renders the model DAG to plain `.sql`, then runs it through DuckDB with no Rocky — the tested no-lock-in exit path |
 | [22-edit-one-model-loop](pocs/06-developer-experience/22-edit-one-model-loop) | Edit one model, rebuild only it and its downstream: `[run] skip_unchanged`, `rocky run --watch --models`, `--defer` and `--defer-to-state`, steps 1-4 proved from the JSON `model_decisions`, steps 5-6 from `materializations` |
 
-### 07 — Adapters (8 POCs · mixed)
+### 07 — Adapters (9 POCs · mixed)
 
 One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, two starters for writing your own adapter, and a reference child connector for Postgres. Rocky ships more adapters than this section covers. Check the Credentials column before you run one.
 

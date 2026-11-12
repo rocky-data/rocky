@@ -1,0 +1,78 @@
+name: iceberg-conformance
+
+# Live conformance for Iceberg tables written through DuckDB and a REST
+# catalog (docs/adr/ADR-ICEBERG-DUCKDB.md). Boots the credential-free
+# Lakekeeper + SeaweedFS stack of the 07-adapters/09-duckdb-iceberg-rest POC,
+# runs the ignored tests behind the `iceberg-conformance` feature, then the
+# POC itself. Not a required check: it depends on images and the DuckDB
+# extension repository, so it runs on the surfaces it covers and weekly.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/crates/rocky-duckdb/**'
+      - 'engine/crates/rocky-core/src/traits.rs'
+      - 'engine/crates/rocky-core/src/sql_gen.rs'
+      - 'examples/playground/pocs/07-adapters/09-duckdb-iceberg-rest/**'
+      - '.github/workflows/iceberg-conformance.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'engine/crates/rocky-duckdb/**'
+      - 'engine/crates/rocky-core/src/traits.rs'
+      - 'engine/crates/rocky-core/src/sql_gen.rs'
+      - 'examples/playground/pocs/07-adapters/09-duckdb-iceberg-rest/**'
+      - '.github/workflows/iceberg-conformance.yml'
+  schedule:
+    - cron: '17 5 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+
+jobs:
+  conformance:
+    name: Live Iceberg conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: engine
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Boot Lakekeeper, Postgres and SeaweedFS
+        working-directory: examples/playground/pocs/07-adapters/09-duckdb-iceberg-rest
+        run: |
+          docker compose up -d
+          ./setup.sh
+      - name: Live conformance tests
+        working-directory: engine
+        run: >-
+          cargo test -p rocky-duckdb --features iceberg-conformance
+          --test iceberg_conformance -- --ignored --test-threads 1
+      - name: Run the POC against the same stack
+        working-directory: examples/playground/pocs/07-adapters/09-duckdb-iceberg-rest
+        run: |
+          cargo build --manifest-path "$GITHUB_WORKSPACE/engine/Cargo.toml" --bin rocky
+          PATH="$GITHUB_WORKSPACE/engine/target/debug:$PATH" ./run.sh
+      - name: Catalog logs on failure
+        if: failure()
+        working-directory: examples/playground/pocs/07-adapters/09-duckdb-iceberg-rest
+        run: docker compose logs --no-color --tail 200
