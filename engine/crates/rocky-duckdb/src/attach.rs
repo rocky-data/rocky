@@ -478,10 +478,16 @@ mod tests {
     #[test]
     fn a_ducklake_secret_is_scoped_to_its_data_path_by_default() {
         let sql = secret_sql("dl", &s3(None), Some("s3://lake/data/"));
-        assert!(sql.ends_with("SCOPE 's3://lake/data/')"), "{sql}");
+        assert!(
+            sql.ends_with("SCOPE 's3://lake/data/')"),
+            "the scope is not defaulted to data_path"
+        );
         // An explicit scope wins.
         let sql = secret_sql("dl", &s3(Some("s3://lake")), Some("s3://lake/data/"));
-        assert!(sql.ends_with("SCOPE 's3://lake')"), "{sql}");
+        assert!(
+            sql.ends_with("SCOPE 's3://lake')"),
+            "an explicit scope does not win"
+        );
     }
 
     fn entry(alias: &str) -> DuckDbAttach {
