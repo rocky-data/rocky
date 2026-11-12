@@ -6973,6 +6973,20 @@ const LAST_RETENTION_SWEEP_AT_KEY: &str = "last_retention_sweep_at";
 /// [`StateStore::get_last_brief_at`]).
 const LAST_BRIEF_AT_KEY: &str = "last_brief_at";
 
+/// [`METADATA`] key holding the RFC 3339 time the schedule-claim GC last ran.
+const LAST_SCHEDULE_CLAIM_GC_AT_KEY: &str = "last_schedule_claim_gc_at";
+
+/// What one [`StateStore::gc_schedule_claims`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScheduleClaimGc {
+    /// Claims removed.
+    pub removed: usize,
+    /// Old terminal claims the caller's `is_protected` kept.
+    pub protected: usize,
+    /// Rows that did not parse and were left alone.
+    pub skipped_corrupt: usize,
+}
+
 /// Metadata key prefix for a [`RunStartedMarker`] (#1884). Every key under it
 /// is `run_started:{run_id}`.
 const RUN_STARTED_KEY_PREFIX: &str = "run_started:";
@@ -7735,24 +7749,42 @@ impl StateStore {
         Ok(best)
     }
 
-    /// Garbage-collect terminal (`completed`) claims whose last transition is
-    /// older than `cutoff`. Returns the number removed. `cutoff` is injected;
-    /// this method never reads the clock.
+    /// Garbage-collect terminal schedule claims: `completed` and `released`
+    /// claims whose last transition is older than `cutoff`. `submitted`
+    /// claims are never removed here. `cutoff` is injected; this method never
+    /// reads the clock.
+    ///
+    /// `is_protected(key, claim)` vetoes a removal (the tick uses it to keep a
+    /// webhook claim whose spool file still exists). A row that does not parse
+    /// is skipped with a warning and never deleted: GC must not destroy what
+    /// it cannot read. A claim with no readable `last_transition_at` is kept.
     pub fn gc_schedule_claims(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> Result<usize, StateError> {
-        use crate::schedule::claim::ClaimRecord;
+        is_protected: &dyn Fn(&str, &crate::schedule::claim::ClaimRecord) -> bool,
+    ) -> Result<ScheduleClaimGc, StateError> {
+        use crate::schedule::claim::{ClaimRecord, ClaimState};
 
         let txn = self.db.begin_write()?;
-        let mut removed = 0usize;
+        let mut gc = ScheduleClaimGc::default();
         {
             let mut table = txn.open_table(SCHEDULE_CLAIMS)?;
             let mut stale_keys: Vec<String> = Vec::new();
             for entry in table.iter()? {
                 let (key, value) = entry?;
-                let claim: ClaimRecord = serde_json::from_slice(value.value())?;
-                if !claim.is_completed() {
+                let claim: ClaimRecord = match serde_json::from_slice(value.value()) {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        tracing::warn!(
+                            key = key.value(),
+                            error = %error,
+                            "schedule claim GC skipping an unreadable claim row"
+                        );
+                        gc.skipped_corrupt += 1;
+                        continue;
+                    }
+                };
+                if matches!(claim.state, ClaimState::Submitted) {
                     continue;
                 }
                 let old = claim
@@ -7760,20 +7792,37 @@ impl StateStore {
                     .as_deref()
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .is_some_and(|dt| dt.with_timezone(&chrono::Utc) < cutoff);
-                if old {
-                    stale_keys.push(key.value().to_string());
+                if !old {
+                    continue;
                 }
+                if is_protected(key.value(), &claim) {
+                    gc.protected += 1;
+                    continue;
+                }
+                stale_keys.push(key.value().to_string());
             }
             for key in stale_keys {
                 table.remove(key.as_str())?;
-                removed += 1;
+                gc.removed += 1;
             }
         }
         self.commit_write(txn)?;
-        Ok(removed)
+        Ok(gc)
     }
 
-    /// Every schedule claim as `(key, record)` pairs, read-only.
+    /// Every schedule claim as `(key, record)` pairs, read-only. A row that
+    /// does not parse is skipped with a warning, so one corrupt row cannot
+    /// fault every caller.
+    ///
+    /// Reads and deserializes the whole table; the per-tick sweep uses
+    /// [`Self::list_submitted_schedule_claims`] instead.
+    pub fn list_schedule_claims(
+        &self,
+    ) -> Result<Vec<(String, crate::schedule::claim::ClaimRecord)>, StateError> {
+        self.scan_schedule_claims(|_| true)
+    }
+
+    /// The `submitted` schedule claims as `(key, record)` pairs, read-only.
     ///
     /// Backs the tick's stuck-claim sweep: a `submitted` claim that outlived the
     /// tick that created it is one whose terminal transaction never committed —
@@ -7782,20 +7831,124 @@ impl StateStore {
     /// these and resolves each by the run-record join, independent of whether
     /// the demand is due again (a cron occurrence advances its anchor on
     /// submission, so its claim would otherwise never be re-evaluated).
-    pub fn list_schedule_claims(
+    ///
+    /// The filter runs inside the table iteration, so terminal claims are
+    /// never collected. Unparseable rows are skipped with a warning.
+    pub fn list_submitted_schedule_claims(
         &self,
     ) -> Result<Vec<(String, crate::schedule::claim::ClaimRecord)>, StateError> {
+        self.scan_schedule_claims(|claim| {
+            matches!(claim.state, crate::schedule::claim::ClaimState::Submitted)
+        })
+    }
+
+    /// The claim whose current attempt carries `submission_id`, stopping at the
+    /// first match. `None` when no claim matches. Unparseable rows are skipped
+    /// with a warning.
+    pub fn find_schedule_claim_by_submission_id(
+        &self,
+        submission_id: &str,
+    ) -> Result<Option<(String, crate::schedule::claim::ClaimRecord)>, StateError> {
+        let mut found = None;
+        self.visit_schedule_claims(|key, claim| {
+            if claim.submission_id == submission_id {
+                found = Some((key.to_string(), claim));
+                false
+            } else {
+                true
+            }
+        })?;
+        Ok(found)
+    }
+
+    fn scan_schedule_claims(
+        &self,
+        keep: impl Fn(&crate::schedule::claim::ClaimRecord) -> bool,
+    ) -> Result<Vec<(String, crate::schedule::claim::ClaimRecord)>, StateError> {
+        let mut out = Vec::new();
+        self.visit_schedule_claims(|key, claim| {
+            if keep(&claim) {
+                out.push((key.to_string(), claim));
+            }
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// Visit each parseable claim in key order; `visit` returns `false` to
+    /// stop. Unparseable rows are skipped with a warning.
+    fn visit_schedule_claims(
+        &self,
+        mut visit: impl FnMut(&str, crate::schedule::claim::ClaimRecord) -> bool,
+    ) -> Result<(), StateError> {
         use crate::schedule::claim::ClaimRecord;
 
         let txn = self.db.begin_read()?;
         let table = txn.open_table(SCHEDULE_CLAIMS)?;
-        let mut out = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
-            let claim: ClaimRecord = serde_json::from_slice(value.value())?;
-            out.push((key.value().to_string(), claim));
+            match serde_json::from_slice::<ClaimRecord>(value.value()) {
+                Ok(claim) => {
+                    if !visit(key.value(), claim) {
+                        break;
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    key = key.value(),
+                    error = %error,
+                    "skipping an unreadable schedule claim row"
+                ),
+            }
         }
-        Ok(out)
+        Ok(())
+    }
+
+    /// When the schedule-claim GC last ran, or `None` if it never has.
+    ///
+    /// Stored in the existing [`METADATA`] table, so it adds no table and moves
+    /// no schema version. `METADATA` replicates with remote state; a downloaded
+    /// stamp only delays or advances the next GC, and the GC is idempotent.
+    pub fn get_last_schedule_claim_gc_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(METADATA)?;
+        let Some(value) = table.get(LAST_SCHEDULE_CLAIM_GC_AT_KEY)? else {
+            return Ok(None);
+        };
+        let parsed = chrono::DateTime::parse_from_rfc3339(value.value())
+            .map_err(|e| StateError::VersionParse(format!("last_schedule_claim_gc_at: {e}")))?
+            .with_timezone(&chrono::Utc);
+        Ok(Some(parsed))
+    }
+
+    /// Stamp the schedule-claim GC time. See
+    /// [`Self::get_last_schedule_claim_gc_at`].
+    pub fn set_last_schedule_claim_gc_at(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StateError> {
+        let formatted = at.to_rfc3339();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(METADATA)?;
+            table.insert(LAST_SCHEDULE_CLAIM_GC_AT_KEY, formatted.as_str())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
+
+    /// Test-only: write a byte blob under a `schedule_claims` key that is not
+    /// valid claim JSON, to prove scans skip a corrupt row.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_corrupt_schedule_claim_row(&self, key: &str) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEDULE_CLAIMS)?;
+            table.insert(key, b"{not valid claim json".as_slice())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
     }
 
     /// Test-only: write a byte blob under a `run_history` key that is not valid

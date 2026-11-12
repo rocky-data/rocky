@@ -50,9 +50,8 @@ use crate::config::RockyConfig;
 use crate::state::{StateError, StateStore};
 
 use super::claim::{
-    ClaimCas, ClaimRecord, ClaimState, DemandKind, PostAttempt, PreSpawn, Resolved,
-    TerminalOutcome, decide_post_attempt, decide_pre_spawn, decide_resolver, parse_claim_key,
-    sweep_terminal_claim,
+    ClaimCas, ClaimRecord, DemandKind, PostAttempt, PreSpawn, Resolved, TerminalOutcome,
+    decide_post_attempt, decide_pre_spawn, decide_resolver, parse_claim_key, sweep_terminal_claim,
 };
 use super::demand::{
     CursorError, Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView,
@@ -69,6 +68,21 @@ use super::spool::{self, WebhookKind};
 /// claim and writing a record). `now` is injected, so the grace is deterministic
 /// under test and a crash never stalls a standing demand indefinitely.
 const RECOVERY_GRACE: Duration = Duration::minutes(5);
+
+/// A `completed` or `released` claim is removed once its last transition is
+/// this old. A `submitted` claim is never removed by the GC.
+///
+/// Removal is safe because claim presence is not what stops a spent demand
+/// from running again. A cron occurrence is deduplicated by the monotonic fire
+/// anchor ([`ScheduleStateRecord::advance_fire_anchor`]), which moves on
+/// submission. A standing `after`/`freshness` demand is due only while the
+/// pipeline's own run history lacks a newer success. A webhook claim is kept
+/// while its spool file exists (see [`gc_schedule_claims_if_due`]).
+const CLAIM_RETENTION: Duration = Duration::days(7);
+
+/// The claim GC runs in a tick at most this often, per the persisted
+/// `last_schedule_claim_gc_at` stamp.
+const CLAIM_GC_INTERVAL: Duration = Duration::hours(24);
 
 /// A held tick lock whose heartbeat is older than this is a wedged owner: a
 /// later tick proceeds via the wedge override rather than skipping forever.
@@ -603,6 +617,10 @@ pub async fn tick_once(
     //    store still open.
     if !opts.dry_run {
         sweep_orphan_claims(&schedules, phase.store(), &opts.rocky_dir, now)?;
+        // Age out terminal claims. Under the tick's lock and open store, after
+        // the sweep so nothing it still needs is removed. A failure warns; the
+        // tick's outcome is already decided.
+        gc_schedule_claims_if_due(phase.store(), &opts.rocky_dir, now);
         // Bound the id-dedup window: drop `.done` tombstones past their TTL.
         // `sweep_tombstones` resolves the spool itself, so it takes the `.rocky`
         // dir — the same argument `list_pending_files` takes above. Passing
@@ -1463,6 +1481,97 @@ fn record_incident(
     }
 }
 
+/// Remove aged terminal claims, at most once per [`CLAIM_GC_INTERVAL`].
+///
+/// Removes `completed` and `released` claims whose last transition is older
+/// than [`CLAIM_RETENTION`]. A `submitted` claim is never removed. A webhook
+/// claim is kept while its spool file still exists, because a spool file that
+/// outlived its claim would run again. If the spool cannot be listed or read,
+/// every webhook claim is kept this pass. A claim key this code cannot
+/// interpret is kept.
+///
+/// `now` is injected. The last-run stamp is written only after a successful
+/// pass, so a failed pass is retried next tick. Every failure warns and
+/// returns: the GC never fails the tick, like [`record_incident`].
+///
+/// Known gap: a `submitted` claim stuck for a pipeline that was removed from
+/// config is not force-finalized here (follow-up).
+fn gc_schedule_claims_if_due(store: &StateStore, rocky_dir: &Path, now: DateTime<Utc>) {
+    match store.get_last_schedule_claim_gc_at() {
+        Ok(Some(last)) if last <= now && now - last < CLAIM_GC_INTERVAL => return,
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "schedule claim GC stamp unreadable; treating it as never run"
+        ),
+    }
+
+    let spooled = live_webhook_demands(rocky_dir);
+    let is_protected = |key: &str, _claim: &ClaimRecord| -> bool {
+        let Some((_, source, _)) = parse_claim_key(key) else {
+            return true;
+        };
+        if source != DemandKind::Webhook {
+            return false;
+        }
+        match (&spooled, key.split('\u{1f}').nth(2)) {
+            (Some(live), Some(uid)) => live.contains(&(key_pipeline(key), uid.to_string())),
+            _ => true,
+        }
+    };
+
+    let cutoff = now - CLAIM_RETENTION;
+    match store.gc_schedule_claims(cutoff, &is_protected) {
+        Ok(gc) => {
+            if gc.removed > 0 || gc.protected > 0 || gc.skipped_corrupt > 0 {
+                tracing::info!(
+                    removed = gc.removed,
+                    kept_for_spool = gc.protected,
+                    skipped_corrupt = gc.skipped_corrupt,
+                    "schedule claim GC"
+                );
+            }
+            if let Err(e) = store.set_last_schedule_claim_gc_at(now) {
+                tracing::warn!(error = %e, "schedule claim GC could not record its run time");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "schedule claim GC failed"),
+    }
+}
+
+fn key_pipeline(key: &str) -> String {
+    key.split('\u{1f}').next().unwrap_or_default().to_string()
+}
+
+/// The `(pipeline, demand_uid)` of every pending webhook spool file, or `None`
+/// when the spool cannot be listed or a file cannot be read.
+fn live_webhook_demands(rocky_dir: &Path) -> Option<BTreeSet<(String, String)>> {
+    let files = match spool::list_pending_files(rocky_dir) {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::warn!(error = %e, "schedule claim GC could not list the webhook spool");
+            return None;
+        }
+    };
+    let mut live = BTreeSet::new();
+    for path in files {
+        match spool::read_pending(&path) {
+            Ok(d) => {
+                live.insert((d.pipeline, d.demand_uid));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    file = %path.display(),
+                    "schedule claim GC could not read a webhook spool file"
+                );
+                return None;
+            }
+        }
+    }
+    Some(live)
+}
+
 /// Resolve orphaned `submitted` claims independent of whether their demand is
 /// due again.
 ///
@@ -1472,8 +1581,8 @@ fn record_incident(
 /// resolves a stuck claim when it re-evaluates that key, but a cron occurrence
 /// advances its anchor on submission (so its key never recurs) and a satisfied
 /// `after`/`freshness` demand goes not-due; either way the loop never revisits
-/// the orphan, so its `submitted` claim would leak (no claim GC runs; #2567) and, for
-/// a standing demand, keep the key un-re-claimable. The sweep record-joins each
+/// the orphan, so its `submitted` claim would leak (the claim GC never removes a
+/// `submitted` claim) and, for a standing demand, keep the key un-re-claimable. The sweep record-joins each
 /// such claim and drives its CLAIM to a terminal state.
 ///
 /// **Claim-lifecycle only — no per-pipeline scalars.** The sweep deliberately
@@ -1502,10 +1611,7 @@ fn sweep_orphan_claims(
     rocky_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<(), TickError> {
-    for (key, claim) in store.list_schedule_claims()? {
-        if !matches!(claim.state, ClaimState::Submitted) {
-            continue;
-        }
+    for (key, claim) in store.list_submitted_schedule_claims()? {
         // The discriminator is deliberately ignored here: it is a timestamp for
         // cron/after/freshness but a `demand_uid` for a webhook, and the sweep
         // needs neither.
@@ -4608,6 +4714,277 @@ adapter = "db"
                 .unwrap()
                 .is_empty(),
             "the affix-shaped demand was consumed"
+        );
+    }
+
+    // --- claim GC (#2567) ------------------------------------------------------
+
+    /// Seed a claim in `state`, last transitioned at `at`.
+    fn seed_claim_in_state(
+        store: &StateStore,
+        key: &str,
+        pipeline: &str,
+        state: ClaimState,
+        submission_id: &str,
+        at: DateTime<Utc>,
+    ) {
+        let mut claim = ClaimRecord::new_submitted(submission_id.to_string(), at);
+        claim.state = state;
+        let cas = store
+            .schedule_claim_cas(key, None, &claim, pipeline, &ScheduleStateMutation::None)
+            .unwrap();
+        assert!(matches!(cas, ClaimCas::Won));
+    }
+
+    fn done() -> ClaimState {
+        ClaimState::Completed {
+            outcome: TerminalOutcome::Success,
+        }
+    }
+
+    fn claim_key_for(source: DemandKind, ts: DateTime<Utc>) -> String {
+        claim_key(&Demand {
+            pipeline: "raw".to_string(),
+            source,
+            logical_ts: ts,
+            claim_discriminator: None,
+        })
+    }
+
+    #[test]
+    fn gc_removes_old_terminal_claims_and_keeps_submitted_and_recent_ones() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(8);
+        let recent = now - Duration::days(2);
+        let k_old_done = claim_key_for(DemandKind::Cron, at(2026, 5, 1, 3, 0));
+        let k_old_released = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        let k_old_submitted = claim_key_for(DemandKind::Freshness, at(2026, 5, 1, 5, 0));
+        let k_recent_done = claim_key_for(DemandKind::Cron, at(2026, 5, 18, 3, 0));
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &k_old_done, "raw", done(), "a", old);
+            seed_claim_in_state(
+                store,
+                &k_old_released,
+                "raw",
+                ClaimState::Released,
+                "b",
+                old,
+            );
+            seed_claim_in_state(
+                store,
+                &k_old_submitted,
+                "raw",
+                ClaimState::Submitted,
+                "c",
+                old,
+            );
+            seed_claim_in_state(store, &k_recent_done, "raw", done(), "d", recent);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now);
+            assert!(store.get_schedule_claim(&k_old_done).unwrap().is_none());
+            assert!(store.get_schedule_claim(&k_old_released).unwrap().is_none());
+            assert!(
+                store
+                    .get_schedule_claim(&k_old_submitted)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(store.get_schedule_claim(&k_recent_done).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn gc_runs_in_the_tick_after_the_sweep() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let now = at(2026, 5, 20, 12, 0);
+        let k = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &k, "raw", done(), "a", now - Duration::days(9));
+        });
+        sweep_tick(&config, &state_path, &opts, now);
+        with_store(&state_path, |store| {
+            assert!(store.get_schedule_claim(&k).unwrap().is_none());
+            assert!(store.get_last_schedule_claim_gc_at().unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn gc_keeps_a_webhook_claim_whose_spool_file_exists() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(9);
+        let spool::AcceptOutcome::Created(live_uid) = spool::accept(
+            &opts.rocky_dir,
+            "raw",
+            WebhookKind::Id,
+            "evt-1",
+            "hash",
+            old,
+        )
+        .unwrap() else {
+            panic!("expected a created spool file");
+        };
+        let webhook_key = |uid: &str| {
+            claim_key(&Demand {
+                pipeline: "raw".to_string(),
+                source: DemandKind::Webhook,
+                logical_ts: old,
+                claim_discriminator: Some(uid.to_string()),
+            })
+        };
+        let live_key = webhook_key(&live_uid);
+        let gone_key = webhook_key("no-spool-file");
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &live_key, "raw", done(), "a", old);
+            seed_claim_in_state(store, &gone_key, "raw", done(), "b", old);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now);
+            assert!(
+                store.get_schedule_claim(&live_key).unwrap().is_some(),
+                "a live spool file keeps its claim"
+            );
+            assert!(store.get_schedule_claim(&gone_key).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn gc_keeps_every_webhook_claim_when_the_spool_cannot_be_read() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(9);
+        let key = claim_key(&Demand {
+            pipeline: "raw".to_string(),
+            source: DemandKind::Webhook,
+            logical_ts: old,
+            claim_discriminator: Some("uid".to_string()),
+        });
+        let spool::AcceptOutcome::Created(_) = spool::accept(
+            &opts.rocky_dir,
+            "raw",
+            WebhookKind::Id,
+            "evt-2",
+            "hash",
+            old,
+        )
+        .unwrap() else {
+            panic!("expected a created spool file");
+        };
+        for entry in std::fs::read_dir(spool::spool_dir(&opts.rocky_dir)).unwrap() {
+            std::fs::write(entry.unwrap().path(), b"{not json").unwrap();
+        }
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &key, "raw", done(), "a", old);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now);
+            assert!(store.get_schedule_claim(&key).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn gc_runs_at_most_once_per_24_hours() {
+        let (state_path, _dir, opts) = temp_env();
+        let t0 = at(2026, 5, 20, 12, 0);
+        let k = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, t0);
+            seed_claim_in_state(store, &k, "raw", done(), "a", t0 - Duration::days(9));
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, t0 + Duration::hours(1));
+            assert!(
+                store.get_schedule_claim(&k).unwrap().is_some(),
+                "inside the 24h cadence"
+            );
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, t0 + Duration::hours(25));
+            assert!(store.get_schedule_claim(&k).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn a_corrupt_claim_row_is_skipped_by_the_sweep_and_the_gc_and_survives() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let now = at(2026, 5, 20, 12, 0);
+        let k = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            store.insert_corrupt_schedule_claim_row("junk").unwrap();
+            seed_claim_in_state(store, &k, "raw", done(), "a", now - Duration::days(9));
+        });
+        // The tick (sweep + GC) completes despite the bad row. The GC returns
+        // `()`, so it has no way to fail the tick.
+        sweep_tick(&config, &state_path, &opts, now);
+        with_store(&state_path, |store| {
+            assert!(store.get_schedule_claim(&k).unwrap().is_none());
+            let gc = store
+                .gc_schedule_claims(now + Duration::days(30), &|_, _| false)
+                .unwrap();
+            assert_eq!(gc.skipped_corrupt, 1, "the bad row is still there");
+            assert!(store.list_schedule_claims().unwrap().is_empty());
+            assert!(store.list_submitted_schedule_claims().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn submitted_listing_is_filtered_and_lookup_by_submission_id_finds_one() {
+        let (state_path, _dir, _opts) = temp_env();
+        let t = at(2026, 5, 20, 12, 0);
+        let ks = claim_key_for(DemandKind::Cron, at(2026, 5, 1, 3, 0));
+        let kd = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &ks, "raw", ClaimState::Submitted, "sub-1", t);
+            seed_claim_in_state(store, &kd, "raw", done(), "sub-2", t);
+            let submitted = store.list_submitted_schedule_claims().unwrap();
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0].0, ks);
+            assert_eq!(store.list_schedule_claims().unwrap().len(), 2);
+            let found = store
+                .find_schedule_claim_by_submission_id("sub-2")
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.0, kd);
+            assert!(
+                store
+                    .find_schedule_claim_by_submission_id("nope")
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn a_gcd_completed_cron_claim_does_not_refire_its_occurrence() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        let fired_at = at(2026, 5, 2, 4, 0);
+        rt().block_on(tick_once(&config, &state_path, fired_at, &spawner, &opts))
+            .unwrap();
+        assert_eq!(spawner.run_count(), 1);
+        let key = claim_key_for(DemandKind::Cron, at(2026, 5, 2, 3, 0));
+        with_store(&state_path, |store| {
+            assert!(
+                store.get_schedule_claim(&key).unwrap().is_some(),
+                "the fired occurrence holds a completed claim"
+            );
+            let gc = store
+                .gc_schedule_claims(fired_at + Duration::days(30), &|_, _| false)
+                .unwrap();
+            assert_eq!(gc.removed, 1);
+            assert!(store.get_schedule_claim(&key).unwrap().is_none());
+        });
+        // Same instant again: the claim is gone, but the monotonic anchor
+        // still says the 03:00 occurrence fired.
+        rt().block_on(tick_once(&config, &state_path, fired_at, &spawner, &opts))
+            .unwrap();
+        assert_eq!(
+            spawner.run_count(),
+            1,
+            "the anchor, not the claim, dedupes a cron occurrence"
         );
     }
 }
