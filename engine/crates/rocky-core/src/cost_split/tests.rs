@@ -1203,9 +1203,6 @@ fn independent_egress_total(runs: &[RunRecord], window: MonthWindow) -> u128 {
         .filter(|r| r.counts_as_production(UnrecordedScope::Count))
         .flat_map(|r| &r.models_executed)
         .filter(|e| window.contains(e.started_at))
-        // A failed execution with no time and no target is not a version and
-        // carries no egress into the split.
-        .filter(|e| !(is_unmeasured_failure(e) && e.output_target.is_none()))
         .filter_map(|e| e.egress_bytes)
         .map(u128::from)
         .sum()
@@ -2049,4 +2046,57 @@ fn shadow_egress_is_outside_the_production_total() {
     let split = split_month(&input(&runs, &[], &o, &c, after_october()));
     assert_eq!(amount(&split.shadow_branch, Unit::EgressBytes), 77);
     assert!(!split.measured_total.contains_key(&Unit::EgressBytes));
+}
+
+/// Mutation: set the flag from the sums and a reported zero reads as not
+/// measured.
+#[test]
+fn a_reported_zero_of_egress_is_measured() {
+    let runs = vec![run(
+        "r",
+        oct(5, 0, 0),
+        production(),
+        vec![egress(exec("fct_orders", oct(5, 0, 0), 10), 0)],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert!(split.egress_reported);
+    assert!(!split.measured_total.contains_key(&Unit::EgressBytes));
+    let none = split_month(&input(&[], &[], &o, &c, after_october()));
+    assert!(!none.egress_reported);
+}
+
+/// Mutation: set the flag from the sums and a call with zero tokens reads as
+/// not measured.
+#[test]
+fn an_ai_call_with_zero_tokens_is_measured() {
+    let (o, c) = (owners(), BTreeMap::new());
+    let calls = [call("1", oct(3, 0, 0), Some("fct_orders"), Some((0, 0)))];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, after_october())
+    });
+    assert!(split.ai_measured);
+    let calls = [call("2", oct(3, 0, 0), Some("fct_orders"), None)];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, after_october())
+    });
+    assert!(!split.ai_measured, "a call with no counts measured nothing");
+}
+
+/// Mutation: `continue` before the egress is added and a failed execution
+/// with no target loses the egress it reported.
+#[test]
+fn egress_of_a_failed_execution_with_no_target_is_unallocated() {
+    let mut f = failed("fct_orders", oct(5, 0, 0));
+    f.egress_bytes = Some(900);
+    let runs = vec![run("r", oct(5, 0, 0), production(), vec![f])];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(amount(&split.unallocated, Unit::EgressBytes), 900);
+    assert_eq!(amount(&split.measured_total, Unit::EgressBytes), 900);
+    assert!(split.egress_reported);
+    assert_eq!(split.not_measured.egress_unreported_executions, 0);
+    assert!(split.invariant_violations().is_empty());
 }

@@ -82,12 +82,15 @@ impl AiUsageRecord {
     }
 }
 
-/// The spool next to a state file: `<state file>.ai-usage.jsonl`, the
-/// extension of the state file replaced (`.rocky-state.redb` becomes
-/// `.rocky-state.ai-usage.jsonl`), as `rocky ai-sync` names its snapshot.
+/// The spool next to a state file: the state file's full name with
+/// `.ai-usage.jsonl` appended (`.rocky-state.redb` becomes
+/// `.rocky-state.redb.ai-usage.jsonl`). Appending, not replacing the
+/// extension, keeps `a.redb` and `a.db` from sharing one spool.
 #[must_use]
 pub fn spool_path(state_path: &Path) -> PathBuf {
-    state_path.with_extension("ai-usage.jsonl")
+    let mut name = state_path.as_os_str().to_owned();
+    name.push(".ai-usage.jsonl");
+    PathBuf::from(name)
 }
 
 /// What reading the spool found.
@@ -99,13 +102,17 @@ pub struct SpoolRead {
     pub malformed: usize,
 }
 
-fn parse_spool(text: &str) -> SpoolRead {
+/// Parse spool bytes line by line. A line that is not valid UTF-8 or JSON
+/// spoils only itself: bytes are split on newlines first, so one bad byte
+/// never hides the other records.
+fn parse_spool(bytes: &[u8]) -> SpoolRead {
     let mut out = SpoolRead::default();
-    for line in text.lines() {
+    for raw in bytes.split(|b| *b == b'\n') {
+        let line = String::from_utf8_lossy(raw);
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<AiUsageRecord>(line) {
+        match serde_json::from_str::<AiUsageRecord>(&line) {
             Ok(record) => out.records.push(record),
             Err(error) => {
                 out.malformed += 1;
@@ -178,11 +185,11 @@ pub fn read_spool(path: &Path) -> std::io::Result<SpoolRead> {
         Err(error) => return Err(error),
     };
     FileExt::lock_shared(&file)?;
-    let mut text = String::new();
-    let result = file.read_to_string(&mut text);
+    let mut bytes = Vec::new();
+    let result = file.read_to_end(&mut bytes);
     let unlocked = FileExt::unlock(&file);
     result.and(unlocked)?;
-    Ok(parse_spool(&text))
+    Ok(parse_spool(&bytes))
 }
 
 /// Read every spooled record under an exclusive lock, hand them to `commit`,
@@ -205,9 +212,9 @@ pub(crate) fn drain_spool<E>(
     };
     FileExt::lock(&file).map_err(DrainError::Io)?;
     let result = (|| {
-        let mut text = String::new();
-        file.read_to_string(&mut text).map_err(DrainError::Io)?;
-        let read = parse_spool(&text);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(DrainError::Io)?;
+        let read = parse_spool(&bytes);
         commit(&read).map_err(DrainError::Commit)?;
         #[cfg(test)]
         if FAIL_TRUNCATE.with(std::cell::Cell::get) {
@@ -268,7 +275,23 @@ pub fn record_or_spool(
     }
     // The store is created by the commands that own it, never by an AI
     // command; a false answer only routes the records to the spool.
-    if state_path.is_file() {
+    //
+    // A store stamped below this binary's schema is not opened either: the
+    // open would upgrade it in place, and a pinned older binary would then
+    // refuse it. Such a store is upgraded by the command that owns it
+    // (`rocky run`), which also drains the spool. Calls spooled before that
+    // predate the "recording began" stamp, so `rocky cost` reads the month as
+    // partial: the conservative answer.
+    let writable_now = state_path.is_file()
+        && match crate::state::StateStore::peek_schema_version(state_path) {
+            Ok(Some(version)) => version == crate::state::current_schema_version(),
+            Ok(None) => false,
+            Err(error) => {
+                tracing::debug!(error = %error, "state schema not readable; spooling AI usage");
+                false
+            }
+        };
+    if writable_now {
         match crate::state::StateStore::open(state_path) {
             Ok(store) => match store.record_ai_usage(records) {
                 Ok(_) => {
@@ -311,11 +334,56 @@ mod tests {
     }
 
     #[test]
-    fn spool_path_replaces_the_state_extension() {
+    fn spool_path_appends_to_the_state_file_name() {
         assert_eq!(
             spool_path(Path::new("models/.rocky-state.redb")),
-            PathBuf::from("models/.rocky-state.ai-usage.jsonl")
+            PathBuf::from("models/.rocky-state.redb.ai-usage.jsonl")
         );
+    }
+
+    /// Mutation: `with_extension` and `a.redb` and `a.db` share one spool.
+    #[test]
+    fn state_files_that_differ_only_in_extension_get_their_own_spool() {
+        assert_ne!(
+            spool_path(Path::new("a.redb")),
+            spool_path(Path::new("a.db"))
+        );
+    }
+
+    /// The spool holds AI usage metadata: owner-only, as the state file is.
+    /// Mutation: open it with plain `OpenOptions` and it is `0644`.
+    #[cfg(unix)]
+    #[test]
+    fn the_spool_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("s.ai-usage.jsonl");
+        append_to_spool(&path, &[record("a")]).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    /// Mutation: read the spool with `read_to_string` and one non-UTF-8 byte
+    /// fails every report.
+    #[test]
+    fn a_non_utf8_byte_spoils_only_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        append_to_spool(&path, &[record("a")]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"id\":\"\xff\xfe\"}\n")
+            .unwrap();
+        append_to_spool(&path, &[record("b")]).unwrap();
+        let read = read_spool(&path).unwrap();
+        let ids: Vec<&str> = read.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(read.malformed, 1);
+        let drained = drain_spool(&path, |_| Ok::<(), ()>(())).unwrap().unwrap();
+        assert_eq!((drained.records.len(), drained.malformed), (2, 1));
     }
 
     #[test]

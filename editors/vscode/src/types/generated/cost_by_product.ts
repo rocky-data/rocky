@@ -142,6 +142,10 @@ export interface CostNotMeasured {
    */
   ai_calls_without_usage?: number;
   /**
+   * AI usage records the state store could not read: spool lines that did not parse (dropped when the spool was drained, or skipped now) and table rows it could not decode. Their tokens are in no AI amount, so the AI figure is a floor when this is above zero.
+   */
+  ai_records_dropped?: number;
+  /**
    * Production executions this month that reported no egress, counted only when at least one execution did report it (then the egress figure is a floor). Zero when none reported: egress is then not measured at all.
    */
   egress_unreported_executions?: number;

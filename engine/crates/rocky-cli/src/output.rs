@@ -13123,6 +13123,12 @@ pub struct CostNotMeasured {
     /// counts. They add nothing to the AI amounts.
     #[serde(default)]
     pub ai_calls_without_usage: u64,
+    /// AI usage records the state store could not read: spool lines that did
+    /// not parse (dropped when the spool was drained, or skipped now) and
+    /// table rows it could not decode. Their tokens are in no AI amount, so
+    /// the AI figure is a floor when this is above zero.
+    #[serde(default)]
+    pub ai_records_dropped: u64,
 }
 
 /// `rocky cost --month YYYY-MM --by product`: one month of production cost,

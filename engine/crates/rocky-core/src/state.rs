@@ -319,6 +319,15 @@ const AI_USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_usage");
 /// make a month this store never saw read as complete. Not a UUID, so it
 /// never collides with a record id.
 const AI_USAGE_SINCE_KEY: &str = "ai_usage_since";
+/// The key of the second reserved row in [`AI_USAGE`]: how many spooled
+/// records a drain dropped because their line did not parse. The drain
+/// truncates the spool, so without this count the loss would leave no trace.
+/// Local-only for the same reason as [`AI_USAGE_SINCE_KEY`].
+const AI_USAGE_DROPPED_KEY: &str = "ai_usage_dropped";
+/// Whether `key` is a reserved row of [`AI_USAGE`], not a record id.
+fn is_ai_usage_reserved_key(key: &str) -> bool {
+    key == AI_USAGE_SINCE_KEY || key == AI_USAGE_DROPPED_KEY
+}
 /// The schema version that added [`AI_USAGE`].
 const AI_USAGE_SINCE_SCHEMA_VERSION: u32 = 35;
 /// The table a read-only open tolerates being absent, and only in a store
@@ -10306,28 +10315,63 @@ impl StateStore {
     /// Every recorded AI call in the table, in id order. The spool is not
     /// read; see [`Self::ai_usage_including_spool`].
     pub fn list_ai_usage(&self) -> Result<Vec<crate::ai_usage::AiUsageRecord>, StateError> {
+        Ok(self.list_ai_usage_counting()?.0)
+    }
+
+    /// [`Self::list_ai_usage`], and how many rows were unreadable and skipped.
+    fn list_ai_usage_counting(
+        &self,
+    ) -> Result<(Vec<crate::ai_usage::AiUsageRecord>, usize), StateError> {
         let txn = self.db.begin_read()?;
         let table = match txn.open_table(AI_USAGE) {
             Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0)),
             Err(e) => return Err(StateError::Table(e)),
         };
         let mut out = Vec::new();
+        let mut unreadable = 0;
         for row in table.iter()? {
             let (key, value) = row?;
-            if key.value() == AI_USAGE_SINCE_KEY {
+            if is_ai_usage_reserved_key(key.value()) {
                 continue;
             }
             match serde_json::from_slice(value.value()) {
                 Ok(record) => out.push(record),
-                Err(error) => tracing::warn!(
-                    id = key.value(),
-                    %error,
-                    "skipped an unreadable AI usage row"
-                ),
+                Err(error) => {
+                    unreadable += 1;
+                    tracing::warn!(
+                        id = key.value(),
+                        %error,
+                        "skipped an unreadable AI usage row"
+                    );
+                }
             }
         }
-        Ok(out)
+        Ok((out, unreadable))
+    }
+
+    /// The AI usage spool this store reads and drains: its state file's
+    /// [`crate::ai_usage::spool_path`]. `None` for a store with no path.
+    pub fn ai_usage_spool_path(&self) -> Option<&std::path::Path> {
+        self.ai_usage_spool.as_deref()
+    }
+
+    /// How many spooled AI usage records were dropped for good because their
+    /// line did not parse, over this store's life. Zero when none were.
+    pub fn ai_usage_dropped(&self) -> Result<u64, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(AI_USAGE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(StateError::Table(e)),
+        };
+        let Some(raw) = table.get(AI_USAGE_DROPPED_KEY)? else {
+            return Ok(0);
+        };
+        Ok(std::str::from_utf8(raw.value())
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or(0))
     }
 
     /// Every recorded AI call: the spool's lines that have not been drained
@@ -10335,7 +10379,9 @@ impl StateStore {
     /// a drain that commits and truncates between the two reads cannot hide a
     /// record: it is in the spool read or in the table read.
     ///
-    /// `malformed` counts spool lines that did not parse.
+    /// `malformed` counts spool lines and table rows that did not parse and
+    /// are skipped. Lines a drain already dropped are in
+    /// [`Self::ai_usage_dropped`].
     pub fn ai_usage_including_spool(&self) -> Result<crate::ai_usage::SpoolRead, StateError> {
         let spooled = match &self.ai_usage_spool {
             Some(path) => {
@@ -10348,14 +10394,15 @@ impl StateStore {
         };
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut records = Vec::new();
-        for record in self.list_ai_usage()?.into_iter().chain(spooled.records) {
+        let (table_records, unreadable_rows) = self.list_ai_usage_counting()?;
+        for record in table_records.into_iter().chain(spooled.records) {
             if seen.insert(record.id.clone()) {
                 records.push(record);
             }
         }
         Ok(crate::ai_usage::SpoolRead {
             records,
-            malformed: spooled.malformed,
+            malformed: spooled.malformed + unreadable_rows,
         })
     }
 
@@ -10374,6 +10421,22 @@ impl StateStore {
         let drained = crate::ai_usage::drain_spool(path, |read| {
             let txn = self.db.begin_write()?;
             let inserted = insert_ai_usage_rows(&txn, &read.records)?;
+            if read.malformed > 0 {
+                // The truncate that follows drops these lines for good.
+                // Count them in the same transaction, so the loss shows in
+                // `rocky cost`.
+                let mut table = txn.open_table(AI_USAGE)?;
+                let before = table
+                    .get(AI_USAGE_DROPPED_KEY)?
+                    .and_then(|raw| {
+                        std::str::from_utf8(raw.value())
+                            .ok()
+                            .and_then(|t| t.parse::<u64>().ok())
+                    })
+                    .unwrap_or(0);
+                let total = before.saturating_add(read.malformed as u64);
+                table.insert(AI_USAGE_DROPPED_KEY, total.to_string().as_bytes())?;
+            }
             self.commit_write(txn)?;
             report.inserted = inserted;
             report.already_present = read.records.len() - inserted;
@@ -10430,7 +10493,14 @@ fn insert_ai_usage_rows(
     let mut table = txn.open_table(AI_USAGE)?;
     let mut inserted = 0;
     for record in records {
-        if record.id == AI_USAGE_SINCE_KEY || table.get(record.id.as_str())?.is_some() {
+        if is_ai_usage_reserved_key(&record.id) {
+            tracing::warn!(
+                id = %record.id,
+                "dropped an AI usage record whose id is a reserved row key"
+            );
+            continue;
+        }
+        if table.get(record.id.as_str())?.is_some() {
             continue;
         }
         let bytes = serde_json::to_vec(record)?;
@@ -19941,7 +20011,7 @@ mod tests {
 
     /// Every `tracing` event emitted on this thread, as text.
     #[derive(Clone, Default)]
-    struct CapturedStateLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(super) struct CapturedStateLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl std::io::Write for CapturedStateLogs {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -19955,7 +20025,7 @@ mod tests {
 
     impl CapturedStateLogs {
         /// A thread-local subscriber that writes here.
-        fn install(&self) -> tracing::subscriber::DefaultGuard {
+        pub(super) fn install(&self) -> tracing::subscriber::DefaultGuard {
             let writer = self.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::TRACE)
@@ -19965,7 +20035,7 @@ mod tests {
             tracing::subscriber::set_default(subscriber)
         }
 
-        fn text(&self) -> String {
+        pub(super) fn text(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
     }
@@ -21745,6 +21815,7 @@ mod connector_state_tests {
 
 #[cfg(test)]
 mod ai_usage_state_tests {
+    use super::tests::CapturedStateLogs;
     use super::*;
     use crate::ai_usage::{AiUsageRecord, append_to_spool, read_spool, spool_path};
     use chrono::TimeZone;
@@ -22016,6 +22087,112 @@ mod ai_usage_state_tests {
         assert_eq!(store.ai_usage_including_spool().unwrap().malformed, 1);
         let drain = store.drain_ai_usage_spool().unwrap().unwrap();
         assert_eq!((drain.inserted, drain.malformed), (1, 1));
+    }
+
+    /// A drain drops unparseable lines for good. The count is stored, so
+    /// `rocky cost` can say so long after the spool is empty. Mutation: drop
+    /// the counter write and `ai_usage_dropped` stays 0.
+    #[test]
+    fn a_drain_persists_how_many_lines_it_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.ai_usage_dropped().unwrap(), 0);
+        for _ in 0..2 {
+            append_to_spool(&spool_path(&path), &[record("a")]).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(spool_path(&path))
+                .unwrap()
+                .write_all(b"not json\n\xff\n")
+                .unwrap();
+            store.drain_ai_usage_spool().unwrap().unwrap();
+        }
+        assert_eq!(
+            store.ai_usage_dropped().unwrap(),
+            4,
+            "2 lines, drained twice"
+        );
+        assert!(read_spool(&spool_path(&path)).unwrap().records.is_empty());
+        // The counter is a reserved row, never a record.
+        assert_eq!(store.list_ai_usage().unwrap().len(), 1);
+        drop(store);
+        let reopened = StateStore::open_read_only(&path).unwrap();
+        assert_eq!(reopened.ai_usage_dropped().unwrap(), 4, "survives a reopen");
+    }
+
+    /// A table row that does not decode is skipped and counted in the report
+    /// read. Mutation: drop the count and `malformed` stays 0.
+    #[test]
+    fn an_unreadable_table_row_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        store.record_ai_usage(&[record("good")]).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(AI_USAGE).unwrap();
+                table.insert("bad", b"not json".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let read = store.ai_usage_including_spool().unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.malformed, 1);
+    }
+
+    /// A spool record whose id is a reserved row key is dropped with a
+    /// warning, and never overwrites the stamp or the counter. Mutation: drop
+    /// the guard and the record replaces the "recording began" row; drop the
+    /// warn and the loss is silent.
+    #[test]
+    fn a_record_with_a_reserved_id_is_dropped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        let stamp = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        store.stamp_ai_usage_since(stamp).unwrap();
+        let logs = CapturedStateLogs::default();
+        let _guard = logs.install();
+        let inserted = store
+            .record_ai_usage(&[record(AI_USAGE_SINCE_KEY), record(AI_USAGE_DROPPED_KEY)])
+            .unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(store.ai_usage_since().unwrap(), Some(stamp));
+        assert_eq!(store.ai_usage_dropped().unwrap(), 0);
+        let text = logs.text();
+        assert!(text.contains("reserved row key"), "{text}");
+        assert!(text.contains(AI_USAGE_SINCE_KEY), "{text}");
+    }
+
+    /// A store stamped below this binary's schema is not opened by an AI
+    /// command: the open would upgrade it in place and a pinned older binary
+    /// would then refuse it. The records spool instead. Mutation: drop the
+    /// peek and the store is upgraded to v35.
+    #[test]
+    fn recording_does_not_upgrade_an_older_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        force_pre_v35_store(&path);
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), Some(34));
+        let mut call = record("a");
+        call.at = chrono::Utc::now() - chrono::Duration::days(1);
+        let outcome = crate::ai_usage::record_or_spool(&path, &[call.clone()]).unwrap();
+        assert_eq!(outcome, crate::ai_usage::RecordOutcome::Spooled);
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(34),
+            "the store is still v34"
+        );
+        assert_eq!(read_spool(&spool_path(&path)).unwrap().records.len(), 1);
+        // The owner of the store upgrades it and drains the spool; the
+        // "recording began" stamp is then later than the spooled call.
+        let store = StateStore::open(&path).unwrap();
+        store.drain_ai_usage_spool().unwrap();
+        assert_eq!(store.list_ai_usage().unwrap().len(), 1);
+        assert!(store.ai_usage_since().unwrap().unwrap() > call.at);
     }
 
     /// Retention sweeps old calls with history, by age, and keeps the stamp.

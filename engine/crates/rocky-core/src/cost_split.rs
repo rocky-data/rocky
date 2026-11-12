@@ -49,6 +49,8 @@
 //! Egress is a build cost of a version, split exactly like model time. Only
 //! reported values are summed: an execution that reported no egress adds
 //! nothing and is counted in [`NotMeasured::egress_unreported_executions`].
+//! Egress a failed execution reported with no target (it wrote no table) is
+//! charged to no one: it goes to `unallocated` and the measured total.
 //! No adapter reports egress yet.
 //!
 //! # AI tokens
@@ -552,6 +554,12 @@ pub struct MonthSplit {
     pub measured_total: Amounts,
     /// What could not be measured. Outside the invariant.
     pub not_measured: NotMeasured,
+    /// Whether any production execution this month reported egress, even
+    /// zero bytes. A reported zero is a measured $0, not a missing figure.
+    pub egress_reported: bool,
+    /// Whether any AI call this month reported both token counts, even
+    /// zero. A reported zero is measured, not missing.
+    pub ai_measured: bool,
 }
 
 impl MonthSplit {
@@ -663,8 +671,14 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
                     if !is_synthetic_name(model) {
                         out.not_measured.failed_executions += 1;
                     }
-                    // With no target it wrote no table: not a version.
+                    // With no target it wrote no table: not a version. Egress
+                    // it reported was still spent, so it is charged to no
+                    // one: unallocated and in the measured total.
                     if exec.output_target.is_none() {
+                        if let Some(bytes) = egress {
+                            add(&mut out.unallocated, Unit::EgressBytes, bytes);
+                            add(&mut out.measured_total, Unit::EgressBytes, bytes);
+                        }
                         continue;
                     }
                 }
@@ -733,6 +747,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
         }
     }
     if egress_reported {
+        out.egress_reported = true;
         out.not_measured.egress_unreported_executions = egress_unreported;
     }
     for exec in input.carry_in {
@@ -1065,6 +1080,7 @@ pub fn split_month(input: &SplitInput<'_>) -> MonthSplit {
             out.not_measured.ai_calls_without_usage += 1;
             continue;
         };
+        out.ai_measured = true;
         let owner = call.model.as_deref().and_then(|m| input.owners.get(m));
         for (unit, value) in [
             (Unit::AiInputTokens, u128::from(tokens_in)),
