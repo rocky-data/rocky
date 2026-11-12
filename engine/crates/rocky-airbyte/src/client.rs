@@ -1,6 +1,6 @@
 //! Async Airbyte REST API client.
 //!
-//! Wraps the Airbyte Configuration API v1 to list and inspect connections.
+//! Wraps the Airbyte public API (`/v1`) to list and inspect connections.
 //! Connections are Airbyte's unit of replication (source + destination + streams).
 
 use std::time::Duration;
@@ -128,6 +128,11 @@ pub enum ConnectionStatus {
     Active,
     Inactive,
     Deprecated,
+    /// A status this code does not know. Discovery leaves it out and a sync
+    /// state read reports it as paused, so a wait names it and never reads
+    /// its jobs.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Wrapper around the stream configurations for a connection.
@@ -256,7 +261,7 @@ pub const JOBS_PAGE_LIMIT: u32 = 25;
 
 /// Async Airbyte REST client with optional Bearer auth and configurable retry.
 ///
-/// Targets the Airbyte Configuration API v1:
+/// Targets the Airbyte public API (`/v1`):
 /// - `GET /v1/connections` -- list all connections
 /// - `GET /v1/connections/{connectionId}` -- get a single connection
 /// - `GET /v1/jobs?connectionId=...` -- the newest jobs of one connection
@@ -356,6 +361,15 @@ impl AirbyteClient {
             encode_path_segment(connection_id)
         );
         let (resp, date): (JobsListResponse, _) = self.get_dated(&url).await?;
+        // The sync state trusts the first job to be the newest. Job ids rise
+        // with creation, so a page that is not strictly descending by id is
+        // not the order that was asked for: refuse it.
+        if !resp.data.windows(2).all(|w| w[0].job_id > w[1].job_id) {
+            return Err(AirbyteError::UnexpectedResponse(format!(
+                "jobs of connection {connection_id} are not newest first (job ids {:?})",
+                resp.data.iter().map(|j| j.job_id).collect::<Vec<_>>()
+            )));
+        }
         Ok((resp.data, date))
     }
 
@@ -370,10 +384,12 @@ impl AirbyteClient {
     /// - A timeout, a 5xx or a connection lost mid-request may mean the job
     ///   started, so those do not retry. They return
     ///   [`SyncRequestError::Unknown`].
+    /// - A connect timeout never reached Airbyte, so it is `Failed`.
     /// - A 403 returns [`SyncRequestError::Forbidden`].
     /// - A 409 returns [`SyncRequestError::Conflict`]: a sync already runs.
     ///
-    /// `Ok` carries the `Date` header of the accepting answer.
+    /// A 2xx whose body is not a job of type `sync` is `Failed`. `Ok` carries
+    /// the `Date` header of the accepting answer.
     pub async fn post_sync_job(
         &self,
         connection_id: &str,
@@ -399,17 +415,17 @@ impl AirbyteClient {
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
+                // A connect error means the request never went out, a connect
+                // timeout included. Any other send error (a timeout, a
+                // connection lost mid-request) may have reached Airbyte.
+                Err(e) if e.is_connect() => {
+                    return Err(SyncRequestError::Failed(AirbyteError::from(e).to_string()));
+                }
                 Err(e) if e.is_timeout() => {
                     return Err(SyncRequestError::Unknown(format!(
                         "no answer to the sync request: {}",
                         AirbyteError::from(e)
                     )));
-                }
-                // A connect error means the request never went out. Any other
-                // send error (a connection lost mid-request) may have reached
-                // Airbyte.
-                Err(e) if e.is_connect() => {
-                    return Err(SyncRequestError::Failed(AirbyteError::from(e).to_string()));
                 }
                 Err(e) => {
                     return Err(SyncRequestError::Unknown(format!(
@@ -458,13 +474,28 @@ impl AirbyteClient {
                     error_body(&text)
                 )));
             }
+            // A 2xx is not enough: a redirected POST becomes a GET, and a proxy
+            // can answer 200 to anything. Only the job Airbyte created, of
+            // type `sync`, shows that a sync was requested.
             match serde_json::from_str::<Job>(&text) {
-                Ok(job) => debug!(
+                Ok(job) if job.job_type == "sync" => debug!(
                     connection_id,
                     job_id = job.job_id,
                     "Airbyte started a sync job"
                 ),
-                Err(e) => debug!(connection_id, error = %e, "sync job accepted; body not parsed"),
+                Ok(job) => {
+                    return Err(SyncRequestError::Failed(format!(
+                        "HTTP {status} to the sync request, but the answer is a `{}` job, not a \
+                         `sync` job",
+                        error_body(&job.job_type)
+                    )));
+                }
+                Err(e) => {
+                    return Err(SyncRequestError::Failed(format!(
+                        "HTTP {status} to the sync request, but the answer is not a job ({e}): {}",
+                        error_body(&text)
+                    )));
+                }
             }
             return Ok(server_date);
         }

@@ -247,7 +247,11 @@ async fn sync_states_map_the_newest_jobs_of_each_connection() {
 
     let paused = by_id(&states, "c_paused");
     assert!(paused.paused, "inactive is paused");
-    assert_eq!(paused.succeeded_at, ts(OLD));
+    assert_eq!(
+        (paused.syncing, paused.succeeded_at, paused.failed_at),
+        (false, None, None),
+        "a paused connection has no jobs read"
+    );
 
     let new = by_id(&states, "c_new");
     assert!(!new.syncing && !new.paused);
@@ -261,7 +265,11 @@ async fn sync_states_map_the_newest_jobs_of_each_connection() {
         .into_iter()
         .filter(|r| r.url.path() == "/v1/jobs")
         .collect();
-    assert_eq!(job_reads.len(), 6);
+    assert_eq!(
+        job_reads.len(),
+        5,
+        "no jobs read for the inactive connection"
+    );
     let query: Vec<(String, String)> = job_reads[0]
         .url
         .query_pairs()
@@ -392,6 +400,298 @@ async fn the_connection_id_is_encoded_into_the_jobs_query() {
     assert_eq!(ids, ["a&limit=1#x"], "one connectionId, the whole raw id");
     let limits = read.url.query_pairs().filter(|(k, _)| k == "limit").count();
     assert_eq!(limits, 1, "the id cannot add a query parameter");
+}
+
+/// A refresh job reads the source and lands data like a sync, so it ends a
+/// sync. A reset or clear job never does.
+#[tokio::test]
+async fn a_refresh_job_ends_a_sync_but_reset_and_clear_do_not() {
+    let server = MockServer::start().await;
+    serve_connections(
+        &server,
+        vec![
+            connection("c_refresh", "src__r", "active"),
+            connection("c_clear", "src__c", "active"),
+        ],
+    )
+    .await;
+    serve_jobs(
+        &server,
+        "c_refresh",
+        vec![jobs_page(vec![
+            job(2, "refresh", "succeeded", Some("2026-10-21T09:50:00Z")),
+            job(1, "refresh", "failed", Some("2026-10-21T09:40:00Z")),
+        ])],
+    )
+    .await;
+    serve_jobs(
+        &server,
+        "c_clear",
+        vec![jobs_page(vec![
+            job(4, "clear", "succeeded", Some("2026-10-21T09:50:00Z")),
+            job(3, "clear", "failed", Some("2026-10-21T09:40:00Z")),
+            job(
+                2,
+                "reset_connection",
+                "succeeded",
+                Some("2026-10-21T09:30:00Z"),
+            ),
+        ])],
+    )
+    .await;
+    let states = adapter(&server, false)
+        .source_sync_states("src__")
+        .await
+        .unwrap()
+        .unwrap();
+    let refresh = by_id(&states, "c_refresh");
+    assert_eq!(refresh.succeeded_at, ts("2026-10-21T09:50:00Z"));
+    assert_eq!(refresh.failed_at, ts("2026-10-21T09:40:00Z"));
+    let clear = by_id(&states, "c_clear");
+    assert_eq!((clear.succeeded_at, clear.failed_at), (None, None));
+    assert!(!clear.syncing);
+}
+
+/// Airbyte runs one job per connection. A job that never ended but is older
+/// than one that did is stale and must not hold the wait forever.
+#[tokio::test]
+async fn a_stale_unended_job_behind_a_newer_ended_job_is_not_syncing() {
+    let server = MockServer::start().await;
+    serve_connections(&server, vec![connection("conn_1", "src__a", "active")]).await;
+    serve_jobs(
+        &server,
+        "conn_1",
+        vec![jobs_page(vec![
+            job(3, "sync", "succeeded", Some("2026-10-21T09:50:00Z")),
+            job(2, "sync", "incomplete", None),
+            job(1, "sync", "queued_somewhere_new", None),
+        ])],
+    )
+    .await;
+    let states = adapter(&server, false)
+        .source_sync_states("src__")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!states[0].syncing);
+}
+
+/// The first job is taken as the newest, so a page in another order is an
+/// error, not a guess.
+#[tokio::test]
+async fn a_jobs_page_that_is_not_newest_first_fails_the_read() {
+    let server = MockServer::start().await;
+    serve_connections(&server, vec![connection("conn_1", "src__a", "active")]).await;
+    serve_jobs(
+        &server,
+        "conn_1",
+        vec![jobs_page(vec![
+            job(1, "sync", "succeeded", Some(OLD)),
+            job(2, "sync", "running", None),
+        ])],
+    )
+    .await;
+    let err = adapter(&server, false)
+        .source_sync_states("src__")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not newest first"), "{err}");
+}
+
+/// One failed jobs read fails the whole poll (fail closed).
+#[tokio::test]
+async fn one_failed_jobs_read_fails_the_whole_poll() {
+    let server = MockServer::start().await;
+    serve_connections(
+        &server,
+        vec![
+            connection("c_ok", "src__a", "active"),
+            connection("c_denied", "src__b", "active"),
+        ],
+    )
+    .await;
+    serve_jobs(&server, "c_ok", vec![jobs_page(vec![])]).await;
+    serve_jobs(
+        &server,
+        "c_denied",
+        vec![ResponseTemplate::new(403).set_body_string("no jobs for you")],
+    )
+    .await;
+    let err = adapter(&server, false)
+        .source_sync_states("src__")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
+}
+
+/// The jobs reads of one poll overlap. Each answer takes 300 ms; ten reads
+/// one after another would take 3 s.
+#[tokio::test]
+async fn the_jobs_reads_of_one_poll_run_concurrently() {
+    let server = MockServer::start().await;
+    let ids: Vec<String> = (0..10).map(|i| format!("c_{i}")).collect();
+    serve_connections(
+        &server,
+        ids.iter()
+            .map(|id| connection(id, &format!("src__{id}"), "active"))
+            .collect(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/jobs"))
+        .respond_with(jobs_page(vec![]).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    let states = adapter(&server, false)
+        .source_sync_states("src__")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    let got: Vec<&str> = states.iter().map(|s| s.id.as_str()).collect();
+    let want: Vec<&str> = ids.iter().map(String::as_str).collect();
+    assert_eq!(got, want, "the order of the connection list is kept");
+}
+
+/// A paused connection with a job still running is not waited for (the shared
+/// wait skips paused connections), and its jobs are never read. A status this
+/// code does not know is treated the same way, and does not fail the read.
+#[tokio::test]
+async fn inactive_and_unknown_status_connections_are_paused_without_a_jobs_read() {
+    let server = MockServer::start().await;
+    serve_connections(
+        &server,
+        vec![
+            connection("c_inactive", "src__a", "inactive"),
+            connection("c_new_status", "src__b", "archived"),
+        ],
+    )
+    .await;
+    serve_jobs(
+        &server,
+        "c_inactive",
+        vec![jobs_page(vec![job(1, "sync", "running", None)])],
+    )
+    .await;
+    serve_jobs(
+        &server,
+        "c_new_status",
+        vec![jobs_page(vec![job(1, "sync", "running", None)])],
+    )
+    .await;
+    let adapter = adapter(&server, true);
+    let states = adapter.source_sync_states("src__").await.unwrap().unwrap();
+    assert_eq!(states.len(), 2);
+    assert!(states.iter().all(|s| s.paused && !s.syncing));
+
+    let report = wait_for_source_syncs(&adapter, "src__", &all, opts(1000), std::future::pending())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(report.syncs.is_empty(), "nothing to wait for");
+    let job_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == "/v1/jobs")
+        .count();
+    assert_eq!(job_reads, 0);
+    assert!(posts(&server).await.is_empty());
+    let found = adapter.discover("src__").await.unwrap();
+    assert!(found.connectors.is_empty(), "discovery returns active only");
+}
+
+/// A connection that is deprecated while Rocky waits is left out of the next
+/// poll, so the wait ends it as unknown.
+#[tokio::test]
+async fn a_connection_deprecated_mid_wait_ends_unknown() {
+    let server = MockServer::start().await;
+    for (status, once) in [("active", true), ("deprecated", false)] {
+        let mock = Mock::given(method("GET"))
+            .and(path("/v1/connections"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Date", SERVER_DATE)
+                    .set_body_json(json!({ "data": [connection("conn_1", "src__a", status)] })),
+            );
+        if once {
+            mock.up_to_n_times(1).mount(&server).await;
+        } else {
+            mock.mount(&server).await;
+        }
+    }
+    serve_jobs(
+        &server,
+        "conn_1",
+        vec![jobs_page(vec![job(2, "sync", "running", None)])],
+    )
+    .await;
+    let report = wait_for_source_syncs(
+        &adapter(&server, false),
+        "src__",
+        &all,
+        opts(5000),
+        std::future::pending(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.syncs[0].outcome, SourceSyncOutcome::Unknown);
+}
+
+/// A 2xx that is not a created `sync` job is not an accepted request: a
+/// proxy page, an empty answer, a list or a job of another type.
+#[tokio::test]
+async fn a_2xx_that_is_not_a_sync_job_is_failed() {
+    let bodies: Vec<(&str, ResponseTemplate)> = vec![
+        (
+            "html",
+            ResponseTemplate::new(200).set_body_string("<html>ok</html>"),
+        ),
+        ("empty", ResponseTemplate::new(200)),
+        (
+            "list",
+            ResponseTemplate::new(200).set_body_json(json!({ "data": [] })),
+        ),
+        (
+            "reset job",
+            ResponseTemplate::new(200).set_body_json(job(99, "reset", "pending", None)),
+        ),
+        ("204", ResponseTemplate::new(204)),
+    ];
+    for (label, answer) in bodies {
+        let server = MockServer::start().await;
+        serve_post(&server, answer).await;
+        let err = adapter(&server, true)
+            .trigger_source_sync("conn_1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SourceSyncTriggerError::Failed(_)),
+            "{label}: {err:?}"
+        );
+        assert_eq!(posts(&server).await.len(), 1, "{label}: never retried");
+    }
+}
+
+/// A 302 on the POST is followed as a GET by the HTTP client; what answers
+/// there is not a job, so the trigger fails.
+#[tokio::test]
+async fn a_redirected_post_is_failed() {
+    let server = MockServer::start().await;
+    serve_connections(&server, vec![connection("conn_1", "src__a", "active")]).await;
+    serve_post(
+        &server,
+        ResponseTemplate::new(302).insert_header("Location", "/v1/connections"),
+    )
+    .await;
+    let err = adapter(&server, true)
+        .trigger_source_sync("conn_1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SourceSyncTriggerError::Failed(_)), "{err:?}");
 }
 
 // ---------------------------------------------------------------------------

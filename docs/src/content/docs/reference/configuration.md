@@ -378,7 +378,7 @@ Waits for a running source sync to finish before the run starts. With `wait` alo
 | `wait_timeout_secs` | integer | No | `3600` | Longest wait for the whole phase. A sync still running at the limit counts as a failure. `rocky validate` requires at most half of `[state.idempotency] in_flight_ttl_hours`. |
 | `poll_interval_secs` | integer | No | `30` | Seconds between polls. At least 10. |
 | `on_sync_failure` | `"fail"` \| `"warn"` | No | `"fail"` | `fail` stops the run before any warehouse write. `warn` logs the failure and runs on the data already landed. |
-| `trigger` | bool | No | `false` | Start a sync on each selected connector, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. `rocky run --no-sync-trigger` turns it off for one run. See [Start a sync](/reference/adapters/fivetran/#start-a-sync). |
+| `trigger` | bool | No | `false` | Start a sync on each selected connector, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. `rocky run --no-sync-trigger` turns it off for one run. See [Start a sync](/reference/adapters/fivetran/#start-a-sync) for Fivetran and [Start a sync](/reference/adapters/airbyte/#start-a-sync) for Airbyte. |
 
 ### `[pipeline.NAME.source.schema_pattern]`
 

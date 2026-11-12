@@ -4082,6 +4082,7 @@ version = "1.92.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "percent-encoding",
  "reqwest",
  "rocky-core",

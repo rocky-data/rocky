@@ -38,14 +38,16 @@ adapter = "airbyte"
 
 `[pipeline.NAME.source.discovery.sync] wait = true` works on Airbyte the same way it works on Fivetran. The keys, the outcomes and the run JSON are the same. See [Wait for a running sync](/reference/adapters/fivetran/#wait-for-a-running-sync) on the Fivetran page. This section covers only what is different on Airbyte.
 
-With `wait = true` alone, Rocky only reads. Each poll sends one `GET /v1/connections`, then one `GET /v1/jobs` for each connection the prefix selects. The jobs read asks for the 25 newest jobs, newest first (`orderBy=createdAt|DESC`). Rocky builds each connection's state from them:
+With `wait = true` alone, Rocky only reads. Each poll sends one `GET /v1/connections`, then one `GET /v1/jobs` for each active connection the prefix selects, up to 10 at a time. An inactive connection gets no jobs read. The jobs read asks for the 25 newest jobs, newest first (`orderBy=createdAt|DESC`). If the jobs are not in that order (job ids not falling), the read fails. Rocky builds each connection's state from them. One failed jobs read fails the whole poll. The pipeline's `include` filter is applied after the poll, so a connection it leaves out is still read.
 
 | State | Where it comes from |
 |-------|---------------------|
-| syncing | Any of those jobs has not ended: `pending`, `running`, `incomplete`, or a status Rocky does not know. Every job type counts, a reset too, because a reset also writes to the destination. |
-| paused | The connection is `inactive`. Rocky never starts a sync on it. |
-| `succeeded_at` | The latest `lastUpdatedAt` of a `sync` job that `succeeded`. |
-| `failed_at` | The latest `lastUpdatedAt` of a `sync` job that `failed` or was `cancelled`. A cancelled sync is not a success, so Rocky counts it as a failure. |
+| syncing | The newest job has not ended: `pending`, `running`, `incomplete`, or a status Rocky does not know. Every job type counts, a reset or clear too, because it also writes to the destination. Airbyte runs one job per connection. A job that has not ended but is older than one that has is stale, and Rocky ignores it. |
+| paused | The connection is `inactive`, or has a status Rocky does not know. Rocky never starts a sync on it and does not read its jobs. |
+| `succeeded_at` | The latest `lastUpdatedAt` of a `sync` or `refresh` job that `succeeded`. |
+| `failed_at` | The latest `lastUpdatedAt` of a `sync` or `refresh` job that `failed` or was `cancelled`. A cancelled sync is not a success, so Rocky counts it as a failure. |
+
+A `reset` or `clear` job never sets `succeeded_at` or `failed_at`. It is not the sync Rocky asked for. A connection that has only had such jobs ends a triggered sync as `unknown`.
 
 A `deprecated` connection is deleted in Airbyte. Rocky leaves it out: discovery never returns it, so the run never reads it.
 
@@ -76,10 +78,11 @@ How Rocky reads each answer:
 
 | Answer | Meaning |
 |--------|---------|
-| `200` | The sync started. Its `Date` header is the lower bound for the end of the sync (`T_pre`). |
+| `2xx` with a `sync` job in the body | The sync started. Its `Date` header is the lower bound for the end of the sync (`T_pre`). |
+| `2xx` with any other body (not a job, or a job that is not a `sync`) | Rocky does not trust it. The connection ends as `trigger_failed`. A redirected `POST` ends up here. |
 | `403` | The token cannot start syncs. The message says: use a token whose role can run syncs on this workspace, or set `trigger = false`. No more requests go out. |
-| `409` | A sync already runs. Rocky waits for it to end, does not count it, and asks once more. |
-| `400`, `404`, a `429` after the retries, a connect error | The request was refused. The connection ends as `trigger_failed`. |
+| `409` | A sync already runs. Rocky waits for it to end, does not count it, and asks once more. This follows Airbyte's API description. It has not been checked against a live Airbyte yet. |
+| `400`, `404`, a `429` after the retries, a connect error (a connect timeout too) | The request was refused. The connection ends as `trigger_failed`. |
 | A timeout, a `5xx`, a connection lost mid-request | The answer is unknown. Rocky treats the request as sent and never sends it again. |
 
 Airbyte answers a sync request with a job id. Rocky logs it but does not use it. It decides which sync is its own from the timestamps, with the same two tests as on Fivetran: the timestamp moved past its value at the idle read, and it is later than `T_pre` plus 5 seconds.

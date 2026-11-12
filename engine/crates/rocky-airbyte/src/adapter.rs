@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt};
 use tracing::{debug, warn};
 
 use rocky_core::source::{DiscoveredConnector, DiscoveredTable, DiscoveryResult};
@@ -27,10 +28,13 @@ use crate::client::{
     job_is_running, parse_job_time,
 };
 
+/// How many jobs reads one sync state poll runs at once.
+const JOBS_READ_CONCURRENCY: usize = 10;
+
 /// Airbyte source discovery adapter.
 ///
 /// Discovers connections and their configured streams from Airbyte
-/// by calling the Airbyte Configuration API v1. Connections are filtered
+/// by calling the Airbyte public API (`/v1`). Connections are filtered
 /// to active-only and optionally by a namespace prefix (analogous to
 /// Fivetran's schema prefix filtering).
 ///
@@ -90,14 +94,16 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
         Ok(DiscoveryResult::ok(connectors))
     }
 
-    /// One connection list read, then one jobs read per selected connection
-    /// (`GET /v1/jobs?connectionId=<id>&limit=25&orderBy=createdAt|DESC`).
+    /// One connection list read, then one jobs read per selected active
+    /// connection (`GET /v1/jobs?connectionId=<id>&limit=25&orderBy=createdAt|DESC`),
+    /// up to 10 at a time.
     ///
     /// The connections are the ones [`Self::discover`] would return for the
     /// prefix (same [`matches_prefix`]), plus inactive ones, reported as
-    /// paused so the wait names them. A deprecated connection is left out:
-    /// Airbyte has deleted it, it cannot sync, and discovery never returns
-    /// it, so the run never reads it.
+    /// paused so the wait names them. A paused connection has no jobs read.
+    /// A connection with a status this code does not know is treated the same
+    /// way. A deprecated connection is left out: Airbyte has deleted it, it
+    /// cannot sync, and discovery never returns it, so the run never reads it.
     ///
     /// Each state is built from the connection's newest jobs; see
     /// [`sync_state_of`]. `observed_at` is the `Date` header of that
@@ -111,19 +117,31 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
             .list_connections()
             .await
             .map_err(AdapterError::new)?;
-        let mut states = Vec::new();
-        for conn in connections
+        let selected: Vec<Connection> = connections
             .into_iter()
             .filter(|c| c.status != ConnectionStatus::Deprecated)
             .filter(|c| matches_prefix(c, schema_prefix))
-        {
-            let (jobs, observed_at) = self
-                .client
-                .list_connection_jobs(&conn.connection_id)
-                .await
-                .map_err(AdapterError::new)?;
-            states.push(sync_state_of(&conn, &jobs, observed_at).map_err(AdapterError::new)?);
-        }
+            .collect();
+        // Only an active connection has its jobs read. An inactive or unknown
+        // one is paused, and the wait skips paused connections, so its jobs
+        // could not change the outcome. Reads run concurrently, at most
+        // `JOBS_READ_CONCURRENCY` at a time, in the order of the list. The
+        // first failed read fails the whole poll.
+        let states: Vec<SourceSyncState> = futures::stream::iter(selected)
+            .map(|conn| async move {
+                if conn.status != ConnectionStatus::Active {
+                    return sync_state_of(&conn, &[], None).map_err(AdapterError::new);
+                }
+                let (jobs, observed_at) = self
+                    .client
+                    .list_connection_jobs(&conn.connection_id)
+                    .await
+                    .map_err(AdapterError::new)?;
+                sync_state_of(&conn, &jobs, observed_at).map_err(AdapterError::new)
+            })
+            .buffered(JOBS_READ_CONCURRENCY)
+            .try_collect()
+            .await?;
         Ok(Some(states))
     }
 
@@ -203,21 +221,28 @@ fn schema_of(conn: &Connection) -> String {
 
 /// Build one connection's sync state from its newest jobs.
 ///
-/// - `paused`: the connection is `inactive` (no schedule runs it).
-/// - `syncing`: any job on the page has not ended (`pending`, `running`,
+/// - `paused`: the connection is not `active` (`inactive`, or a status this
+///   code does not know): no schedule runs it, or it cannot be trusted to.
+/// - `syncing`: the newest job has not ended (`pending`, `running`,
 ///   `incomplete`, or a status this code does not know). Every job type
-///   counts, a reset too, because it also writes to the destination.
-/// - `succeeded_at`: the latest end time of a `sync` job that `succeeded`.
-/// - `failed_at`: the latest end time of a `sync` job that `failed` or was
-///   `cancelled`. A cancelled sync landed partial data or none, so it is not
+///   counts, a reset or clear too, because it also writes to the destination.
+///   Airbyte runs one job per connection at a time, so a job that has not
+///   ended but is older than a job that has ended is stale and is ignored.
+///   The caller passes the jobs newest first (the client checks this).
+/// - `succeeded_at`: the latest end time of a `sync` or `refresh` job that
+///   `succeeded`.
+/// - `failed_at`: the latest end time of a `sync` or `refresh` job that
+///   `failed` or was `cancelled`. A cancelled sync landed partial data or none, so it is not
 ///   a success; counting it as a failure is the safe side.
 ///
 /// The end time of a job is its `lastUpdatedAt`: Airbyte sets it when the job
 /// changes state, so for an ended job it is the time it ended. `startTime` is
 /// not an end, and `duration` would need a second clock-derived sum. A job
 /// that ended with no `lastUpdatedAt` gives no end time, so it can never
-/// count as the end of Rocky's sync (the wait fails closed). Only `sync` jobs
-/// set the two timestamps: a reset is never the sync Rocky asked for.
+/// count as the end of Rocky's sync (the wait fails closed). Only `sync`
+/// and `refresh` jobs set the two timestamps: both read the source and land
+/// data. A reset or clear job is never the sync Rocky asked for, so it leaves
+/// both unknown.
 ///
 /// # Errors
 ///
@@ -229,7 +254,10 @@ fn sync_state_of(
 ) -> Result<SourceSyncState, AirbyteError> {
     let mut succeeded_at: Option<DateTime<Utc>> = None;
     let mut failed_at: Option<DateTime<Utc>> = None;
-    for job in jobs.iter().filter(|j| j.job_type == "sync") {
+    for job in jobs
+        .iter()
+        .filter(|j| matches!(j.job_type.as_str(), "sync" | "refresh"))
+    {
         let slot = match job.status.as_str() {
             "succeeded" => &mut succeeded_at,
             "failed" | "cancelled" => &mut failed_at,
@@ -247,8 +275,8 @@ fn sync_state_of(
         id: conn.connection_id.clone(),
         schema: schema_of(conn),
         source_type: "airbyte".to_string(),
-        syncing: jobs.iter().any(job_is_running),
-        paused: conn.status == ConnectionStatus::Inactive,
+        syncing: jobs.first().is_some_and(job_is_running),
+        paused: conn.status != ConnectionStatus::Active,
         succeeded_at,
         failed_at,
         observed_at,
