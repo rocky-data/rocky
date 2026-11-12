@@ -8,7 +8,9 @@ services:
   s3:
     # chrislusf/seaweedfs:4.01
     image: chrislusf/seaweedfs@sha256:d91cdf769018b143f1c944085b36d29893d9af199e656b2537367c35744fc221
-    command: server -s3 -dir=/data
+    # A small volume size keeps SeaweedFS from reserving gigabytes of disk
+    # for a demo that stores one small state file.
+    command: server -s3 -dir=/data -master.volumeSizeLimitMB=64
     ports:
       - "8333:8333"
     volumes:
