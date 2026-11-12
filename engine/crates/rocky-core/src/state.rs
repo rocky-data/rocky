@@ -10123,6 +10123,25 @@ pub fn resolve_state_path_ns(
     }
 }
 
+/// Where a long-lived server (`rocky mcp`, `rocky lsp`) finds the state
+/// store, resolved the way the CLI resolves it (#2587).
+///
+/// Precedence, as in the CLI: an explicit `--state-path` wins and disables
+/// namespacing; then an explicit `--state-namespace`; then the namespace the
+/// project's `[state] namespacing` asks for
+/// ([`crate::config::RockyConfig::state_namespace`]); else the global file.
+/// `config` is the loaded project config, `None` when it is absent or does
+/// not load, which falls back to the global file as the CLI does.
+pub fn resolve_server_state_path(
+    explicit: Option<&Path>,
+    namespace: Option<&str>,
+    config: Option<&crate::config::RockyConfig>,
+    models_dir: &Path,
+) -> ResolvedStatePath {
+    let namespace = namespace.or_else(|| config.and_then(|c| c.state_namespace()));
+    resolve_state_path_ns(explicit, models_dir, namespace)
+}
+
 /// Validate a state namespace as a SQL identifier (`^[a-zA-Z0-9_]+$`).
 ///
 /// This is the path-traversal guard for `--state-namespace` /

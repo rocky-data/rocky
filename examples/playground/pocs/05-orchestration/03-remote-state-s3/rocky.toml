@@ -15,6 +15,9 @@ components = ["source"]
 catalog_template = "poc"
 schema_template = "staging__{source}"
 
+[pipeline.poc.target.governance]
+auto_create_schemas = true
+
 [state]
 backend = "s3"
 s3_bucket = "rocky-state"

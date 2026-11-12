@@ -800,6 +800,12 @@ pub struct RockyMcpServer {
     /// `rocky --state-path <p> fulfill` recorded its decisions in the default
     /// store while the loop read `<p>` (#2278).
     state_path_override: Option<PathBuf>,
+    /// An explicit `--state-namespace`, validated by the CLI (#2587).
+    state_namespace: Option<String>,
+    /// The store [`Self::state_path`] resolved, once per session, so a
+    /// `rocky.toml` edited mid-session cannot move the server to another
+    /// store halfway through (#2587).
+    resolved_state_path: std::sync::OnceLock<PathBuf>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -2294,6 +2300,8 @@ impl RockyMcpServer {
             instructions,
             actor: profile.default_actor(),
             state_path_override: None,
+            state_namespace: None,
+            resolved_state_path: std::sync::OnceLock::new(),
             tool_router,
             prompt_router,
         })
@@ -2316,12 +2324,43 @@ impl RockyMcpServer {
     #[must_use]
     pub fn with_state_path(mut self, path: Option<PathBuf>) -> Self {
         self.state_path_override = path;
+        self.resolved_state_path = std::sync::OnceLock::new();
         self
     }
 
+    /// Route the server to a `--state-namespace` store, as the CLI does.
+    pub fn with_state_namespace(mut self, namespace: Option<String>) -> Self {
+        self.state_namespace = namespace;
+        self.resolved_state_path = std::sync::OnceLock::new();
+        self
+    }
+
+    /// The state store this server reads and spools AI usage next to,
+    /// resolved as the CLI resolves it: `--state-path`, then
+    /// `--state-namespace`, then the project's `[state] namespacing`
+    /// (#2587). Before, it ignored any namespace, so its AI calls landed in
+    /// a spool `rocky cost` did not read. Resolved at the first call and
+    /// kept for the session, as the CLI resolves it once per command.
     fn state_path(&self) -> PathBuf {
-        rocky_core::state::resolve_state_path(self.state_path_override.as_deref(), &self.models_dir)
-            .path
+        self.resolved_state_path
+            .get_or_init(|| self.resolve_state_path())
+            .clone()
+    }
+
+    fn resolve_state_path(&self) -> PathBuf {
+        // The config is read only when no flag decides the store.
+        let config = if self.state_path_override.is_none() && self.state_namespace.is_none() {
+            rocky_core::config::load_rocky_config(&self.config_path).ok()
+        } else {
+            None
+        };
+        rocky_core::state::resolve_server_state_path(
+            self.state_path_override.as_deref(),
+            self.state_namespace.as_deref(),
+            config.as_ref(),
+            &self.models_dir,
+        )
+        .path
     }
 
     /// Whether this server serves the `review_queue` APPROVE action — writing
@@ -6327,9 +6366,8 @@ impl RockyMcpServer {
                 .map_err(|e| anyhow::anyhow!("invalid table reference '{target}': {e}"))?
         } else {
             // Bare name — resolve the model's target coordinates by compiling
-            // the models dir. Emit `catalog.schema.table` when the target
-            // carries a catalog (Snowflake/BigQuery/Databricks); DuckDB has no
-            // catalog level so it stays a two-part `schema.table` name.
+            // the models dir, and address the table the way `rocky run`
+            // wrote it (see `model_target_ref`).
             let result = self.compile_full()?;
             let model = result
                 .project
@@ -6337,19 +6375,27 @@ impl RockyMcpServer {
                 .iter()
                 .find(|m| m.config.name == target)
                 .ok_or_else(|| anyhow::anyhow!("model '{target}' not found in project"))?;
-            let t = &model.config.target;
-            let parts: Vec<&str> = if t.catalog.is_empty() {
-                vec![&t.schema, &t.table]
-            } else {
-                vec![&t.catalog, &t.schema, &t.table]
-            };
-            dialect
-                .ground_table_ref(&parts)
-                .map_err(|e| anyhow::anyhow!("invalid model target reference: {e}"))?
+            model_target_ref(dialect, &model.config.target)?
         };
 
         Ok(Prepared { adapter, table_ref })
     }
+}
+
+/// The SQL reference for a model's target table, built with the dialect's
+/// `format_table_ref`: the same ref `rocky run` writes the table with, and
+/// the one `rocky profile` / `rocky ai-contract` use. On Snowflake it quotes
+/// every segment, so a lowercase target is found as the case-sensitive
+/// object `rocky run` created rather than folded to uppercase (#2582). A
+/// dotted source ref keeps `ground_table_ref`: Rocky did not create that
+/// table, so it resolves the way the model's own SQL names it.
+fn model_target_ref(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    t: &rocky_core::models::TargetConfig,
+) -> anyhow::Result<String> {
+    dialect
+        .format_table_ref(&t.catalog, &t.schema, &t.table)
+        .map_err(|e| anyhow::anyhow!("invalid model target reference: {e}"))
 }
 
 // `prompt_router`'s `router` arg takes a string ident (unlike `tool_router`);
@@ -9728,6 +9774,38 @@ database = ":memory:"
         );
     }
 
+    /// A model name addresses the table the way `rocky run` wrote it: on
+    /// Snowflake every segment is double-quoted, so a lowercase target is
+    /// not folded to uppercase and missed (#2582). DuckDB keeps a two-part
+    /// name when the target has no catalog. A hostile segment is refused.
+    #[test]
+    fn model_target_ref_matches_what_rocky_run_writes() {
+        use rocky_core::models::TargetConfig;
+        use rocky_core::traits::SqlDialect;
+        let target = |catalog: &str, schema: &str, table: &str| TargetConfig {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table: table.into(),
+        };
+        let sf = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let t = target("analytics", "staging", "orders");
+        assert_eq!(
+            model_target_ref(&sf, &t).unwrap(),
+            sf.format_table_ref("analytics", "staging", "orders")
+                .unwrap()
+        );
+        assert_eq!(
+            model_target_ref(&sf, &t).unwrap(),
+            "\"analytics\".\"staging\".\"orders\""
+        );
+        let duck = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
+        assert_eq!(
+            model_target_ref(&duck, &target("", "staging", "orders")).unwrap(),
+            "staging.orders"
+        );
+        assert!(model_target_ref(&sf, &target("a", "s", "t; DROP TABLE x")).is_err());
+    }
+
     #[test]
     fn ground_table_ref_default_rejects_bad_identifier_and_arity() {
         use rocky_core::traits::SqlDialect;
@@ -11530,6 +11608,50 @@ database = ":memory:"
                 .len(),
             2
         );
+    }
+
+    /// Under `[state] namespacing = "pipeline"` the server reads, and spools
+    /// AI usage next to, the namespaced store the CLI reads, so `rocky cost`
+    /// counts its calls (#2587). An explicit `--state-namespace` or
+    /// `--state-path` wins, in that order reversed, as in the CLI.
+    #[test]
+    fn the_mcp_server_follows_the_clis_state_namespace() {
+        let (tmp, server) = write_mcp_project(Some(
+            "[state]\nnamespacing = \"pipeline\"\n\n\
+             [adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [pipeline.xf]\ntype = \"transformation\"\n\n\
+             [pipeline.xf.target]\nadapter = \"default\"\n",
+        ));
+        let models = tmp.path().join("models");
+        let cli_state = rocky_core::state::resolve_state_path_ns(None, &models, Some("xf")).path;
+        assert_eq!(server.state_path(), cli_state);
+        // A `rocky.toml` broken mid-session does not move the server to
+        // another store: the store is resolved once.
+        std::fs::write(tmp.path().join("rocky.toml"), "not toml [").unwrap();
+        assert_eq!(server.state_path(), cli_state);
+        server.ai_usage_sink("mcp_explain_model", "m")(&rocky_ai::client::LlmUsage {
+            llm_model: "claude-sonnet-4-6".to_string(),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+        });
+        let spool = rocky_core::ai_usage::spool_path(&cli_state);
+        assert_eq!(
+            rocky_core::ai_usage::read_spool(&spool)
+                .unwrap()
+                .records
+                .len(),
+            1,
+            "the call is in the spool the CLI reads"
+        );
+
+        let server = server.with_state_namespace(Some("other".into()));
+        assert_eq!(
+            server.state_path(),
+            rocky_core::state::resolve_state_path_ns(None, &models, Some("other")).path
+        );
+        let pinned = tmp.path().join("pinned.redb");
+        let server = server.with_state_path(Some(pinned.clone()));
+        assert_eq!(server.state_path(), pinned);
     }
 
     /// V062 on the MCP generator tools: with EU data and a US `[ai]`

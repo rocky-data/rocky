@@ -5540,6 +5540,23 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
 }
 
 impl RockyConfig {
+    /// The state namespace `[state] namespacing = "pipeline"` asks for: the
+    /// name of the project's only pipeline, when it is a valid namespace.
+    /// `None` when namespacing is off, when there is not exactly one
+    /// pipeline, or when the name cannot be a file segment. Then the global
+    /// state file is used.
+    ///
+    /// The CLI, `rocky mcp` and `rocky lsp` all derive the config-driven
+    /// namespace here, so an AI call recorded by a server lands in the spool
+    /// of the store the CLI reads (#2587).
+    pub fn state_namespace(&self) -> Option<&str> {
+        if self.state.namespacing != StateNamespacing::Pipeline || self.pipelines.len() != 1 {
+            return None;
+        }
+        let name = self.pipelines.keys().next()?.as_str();
+        crate::state::validate_namespace(name).ok()
+    }
+
     /// Resolve `[mask]` + `[mask.<env>]` into a flat `classification → strategy`
     /// map for the active environment.
     ///

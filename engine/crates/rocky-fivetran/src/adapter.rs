@@ -139,9 +139,14 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
     /// One group-list read (`GET /v1/groups/{id}/connectors`, paged). Covers
     /// every connected connector under the prefix, so a poll costs the page
     /// count whatever the connector count.
+    ///
+    /// `include` is ignored: the one list read already carries every
+    /// connector's state, so filtering first would save nothing. The shared
+    /// wait applies the pipeline's filter to the answer.
     async fn source_sync_states(
         &self,
         schema_prefix: &str,
+        _include: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
     ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
         let (connectors, observed_at) = ft_connector::discover_connectors_dated(
             &self.client,

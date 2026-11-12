@@ -5,9 +5,9 @@ cd "$HERE"
 mkdir -p expected
 rm -f poc.duckdb .rocky-state.redb
 
-# --- Helper: list objects in the MinIO bucket via aws CLI ---
+# --- Helper: list objects in the S3 bucket via aws CLI ---
 s3_ls() {
-    aws --endpoint-url http://localhost:9000 s3 ls s3://rocky-state/ --recursive 2>/dev/null || true
+    aws --endpoint-url http://localhost:8333 s3 ls s3://rocky-state/ --recursive 2>/dev/null || true
 }
 
 HAVE_DOCKER=false
@@ -16,9 +16,17 @@ if command -v docker >/dev/null; then
 fi
 
 if $HAVE_DOCKER; then
-    echo "=== Starting MinIO ==="
-    docker compose up -d --wait 2>&1 || true
-    sleep 2
+    echo "=== Starting SeaweedFS (S3 API on :8333) ==="
+    docker compose up -d 2>&1 || true
+    # The `bucket` service exits once it has created the bucket.
+    for _ in $(seq 1 90); do
+        [ "$(docker compose ps -a --format '{{.State}}' bucket 2>/dev/null)" = "exited" ] && break
+        sleep 1
+    done
+    if [ "$(docker compose ps -a --format '{{.ExitCode}}' bucket 2>/dev/null)" != "0" ]; then
+        echo "the S3 bucket was not created; see: docker compose logs bucket" >&2
+        exit 1
+    fi
 else
     echo "docker not installed; showing config-only demo."
 fi
@@ -27,20 +35,23 @@ fi
 duckdb poc.duckdb < data/seed.sql
 echo "=== Source after seed: $(duckdb poc.duckdb 'SELECT COUNT(*) FROM raw__orders.orders' -noheader -list) rows ==="
 
-# These envs configure rocky's S3 state sync (state_sync.rs uses the aws CLI)
+# These envs configure rocky's S3 state sync. SeaweedFS runs with anonymous
+# access, so any key works.
 export AWS_ACCESS_KEY_ID="rocky"
 export AWS_SECRET_ACCESS_KEY="rocky-secret"
-export AWS_ENDPOINT_URL="http://localhost:9000"
+export AWS_ENDPOINT_URL="http://localhost:8333"
 export AWS_REGION="us-east-1"
+# The local store speaks plain HTTP; Rocky's S3 client refuses it otherwise.
+export AWS_ALLOW_HTTP="true"
 
 rocky validate
 echo
 
-# --- state_rw probe: confirm the MinIO bucket is writable before any pipeline
+# --- state_rw probe: confirm the S3 bucket is writable before any pipeline
 #     work (fails fast at cold start on IAM / reachability issues instead of
 #     at end-of-run upload). Local backend = no-op; tiered probes both legs.
 if $HAVE_DOCKER; then
-    echo "=== rocky doctor --check state_rw (live round-trip probe vs MinIO) ==="
+    echo "=== rocky doctor --check state_rw (live round-trip probe vs SeaweedFS) ==="
     rocky -c rocky.toml -o json doctor --check state_rw > expected/doctor_state_rw.json 2>&1 || true
     head -20 expected/doctor_state_rw.json
     echo
@@ -57,7 +68,7 @@ rocky state 2>&1 | tail -5
 
 if $HAVE_DOCKER; then
     echo
-    echo "=== S3 state after run 1 (MinIO bucket) ==="
+    echo "=== S3 state after run 1 (SeaweedFS bucket) ==="
     s3_ls
 fi
 
@@ -99,7 +110,7 @@ if $HAVE_DOCKER; then
 fi
 
 echo
-echo "POC complete: S3 state sync (upload + download) via MinIO."
+echo "POC complete: S3 state sync (upload + download) via SeaweedFS."
 if $HAVE_DOCKER; then
     echo "To clean up: docker compose down -v"
 fi

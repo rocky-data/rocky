@@ -2860,32 +2860,66 @@ fn infer_aggregation_type(
             // `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`), so it is a
             // decimal whose precision Rocky does not claim (#2356). The scale
             // `s` is kept only where every target warehouse keeps it (#2398).
-            let ty = if input_type.is_integer() {
-                RockyType::Int64
-            } else if *input_type == RockyType::Float32 {
-                sum_of_float_type(target)
-            } else if input_type.is_decimal() {
-                RockyType::DecimalUnsized {
-                    scale: input_type
-                        .decimal_scale()
-                        .filter(|_| sum_keeps_decimal_scale(target)),
+            //
+            // Only a numeric input is typed. `SUM` over a `BOOLEAN` is
+            // `HUGEINT` on DuckDB and an error elsewhere, so a non-numeric
+            // input is `Unknown`, never its own type (#2578). The match is
+            // exhaustive so a new `RockyType` variant must be ruled here.
+            let ty = match input_type {
+                RockyType::Int32 | RockyType::Int64 => RockyType::Int64,
+                RockyType::Float32 => sum_of_float_type(target),
+                RockyType::Float64 => RockyType::Float64,
+                RockyType::Decimal { .. } | RockyType::DecimalUnsized { .. } => {
+                    RockyType::DecimalUnsized {
+                        scale: input_type
+                            .decimal_scale()
+                            .filter(|_| sum_keeps_decimal_scale(target)),
+                    }
                 }
-            } else {
-                input_type.clone()
+                RockyType::Boolean
+                | RockyType::String
+                | RockyType::Date
+                | RockyType::Timestamp
+                | RockyType::TimestampNtz
+                | RockyType::Binary
+                | RockyType::Array(_)
+                | RockyType::Map(_, _)
+                | RockyType::Struct(_)
+                | RockyType::Variant
+                | RockyType::Unknown => RockyType::Unknown,
             };
             (ty, true)
         }
         "AVG" => {
             // `AVG` of an exact-numeric input is dialect-dependent and this layer
             // has no adapter context: DuckDB returns DOUBLE, Databricks returns
-            // DECIMAL(p + 4, s + 4), BigQuery preserves NUMERIC/BIGNUMERIC. Only
-            // `Decimal` degrades to `Unknown` (#1238) — every other input keeps
-            // `Float64`, so an argument Rocky simply failed to resolve does not
-            // silently drop out of contract validation.
-            let ty = if input_type.is_decimal() {
-                RockyType::Unknown
-            } else {
-                RockyType::Float64
+            // DECIMAL(p + 4, s + 4), BigQuery preserves NUMERIC/BIGNUMERIC, so
+            // `Decimal` degrades to `Unknown` (#1238). An integer or float
+            // input, and an argument Rocky failed to resolve, keep `Float64`,
+            // so an unresolved argument does not silently drop out of contract
+            // validation. A known non-numeric input is `Unknown`: DuckDB
+            // averages a `DATE` or `TIMESTAMP` to a `TIMESTAMP`, not a
+            // `DOUBLE` (#2578). `AVG` over an unresolved argument is never
+            // exact ([`has_exact_type`]), so this guess does not override a
+            // type read from the SQL.
+            let ty = match input_type {
+                RockyType::Int32
+                | RockyType::Int64
+                | RockyType::Float32
+                | RockyType::Float64
+                | RockyType::Unknown => RockyType::Float64,
+                RockyType::Decimal { .. }
+                | RockyType::DecimalUnsized { .. }
+                | RockyType::Boolean
+                | RockyType::String
+                | RockyType::Date
+                | RockyType::Timestamp
+                | RockyType::TimestampNtz
+                | RockyType::Binary
+                | RockyType::Array(_)
+                | RockyType::Map(_, _)
+                | RockyType::Struct(_)
+                | RockyType::Variant => RockyType::Unknown,
             };
             (ty, true)
         }
@@ -4319,11 +4353,25 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
                 }
                 _ => false,
             },
-            "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
+            "SUM" | "MIN" | "MAX" => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
                     Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
                         if has_exact_type(arg, scope)
+                ),
+                _ => false,
+            },
+            // `AVG` over an argument of unknown type is typed `Float64` only
+            // so a contract on it is still checked; that is a guess, not a
+            // type read from the SQL. A cast to a type Rocky does not model
+            // (`AVG(CAST(x AS INTERVAL))`) is exact but `Unknown`, so `AVG`
+            // is exact only over an argument whose type is known (#2578).
+            "AVG" => match &func.args {
+                ast::FunctionArguments::List(list) => matches!(
+                    list.args.first(),
+                    Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
+                        if has_exact_type(arg, scope)
+                            && infer_expr_type(arg, scope).0 != RockyType::Unknown
                 ),
                 _ => false,
             },
@@ -11721,6 +11769,51 @@ mod tests {
         for (target, expected) in cases {
             let r = compile_typed_on(&[("m", sql)], division_sources(), target.clone());
             assert_eq!(column(&r, "m", "v").data_type, expected, "{target:?}");
+        }
+    }
+
+    /// `AVG` over a `DATE` or `TIMESTAMP` and `SUM` over a `BOOLEAN` are not
+    /// the numeric types Rocky used to claim: DuckDB returns `TIMESTAMP`,
+    /// `TIMESTAMP` and `HUGEINT` (#2578). They are `Unknown`, so a contract
+    /// on them is reported as not checked instead of wrongly passing or
+    /// failing. A numeric input keeps its type.
+    #[test]
+    fn avg_and_sum_over_non_numeric_input_are_unknown() {
+        let sources = HashMap::from([(
+            "raw.t".to_string(),
+            source_schema(&[
+                ("ts", RockyType::Timestamp, false),
+                ("tsn", RockyType::TimestampNtz, false),
+                ("d", RockyType::Date, false),
+                ("b", RockyType::Boolean, false),
+                ("s", RockyType::String, false),
+                ("n", RockyType::Int64, false),
+                ("f", RockyType::Float64, false),
+            ]),
+        )]);
+        let sql = "SELECT AVG(ts) AS avg_ts, AVG(tsn) AS avg_tsn, AVG(d) AS avg_d, \
+                   AVG(b) AS avg_b, SUM(b) AS sum_b, SUM(s) AS sum_s, SUM(d) AS sum_d, \
+                   AVG(n) AS avg_n, SUM(n) AS sum_n, SUM(f) AS sum_f, \
+                   AVG(CAST(n AS INTERVAL)) AS avg_iv FROM raw.t";
+        for target in [duckdb_target(), OperandTarget::Unconfigured] {
+            let r = compile_typed_on(&[("m", sql)], sources.clone(), target.clone());
+            for name in [
+                "avg_ts", "avg_tsn", "avg_d", "avg_b", "sum_b", "sum_s", "sum_d",
+            ] {
+                assert_eq!(
+                    column(&r, "m", name).data_type,
+                    RockyType::Unknown,
+                    "{name} on {target:?}"
+                );
+            }
+            assert_eq!(column(&r, "m", "avg_n").data_type, RockyType::Float64);
+            assert_eq!(
+                column(&r, "m", "avg_iv").data_type,
+                RockyType::Unknown,
+                "AVG over a cast to an unmodelled type on {target:?}"
+            );
+            assert_eq!(column(&r, "m", "sum_n").data_type, RockyType::Int64);
+            assert_eq!(column(&r, "m", "sum_f").data_type, RockyType::Float64);
         }
     }
 

@@ -4019,20 +4019,11 @@ fn resolve_state_namespace(cli: &Cli) -> Result<Option<String>> {
     let Ok(cfg) = rocky_core::config::load_rocky_config(&cli.config) else {
         return Ok(None);
     };
-    if cfg.state.namespacing != rocky_core::config::StateNamespacing::Pipeline {
-        return Ok(None);
-    }
-    match rocky_cli::registry::resolve_pipeline(&cfg, None) {
-        Ok((name, _)) => match rocky_core::state::validate_namespace(name) {
-            Ok(_) => Ok(Some(name.to_string())),
-            // A pipeline name that isn't a valid identifier (unusual) can't be a
-            // file segment; fall back to the global file rather than erroring.
-            Err(_) => Ok(None),
-        },
-        // Ambiguous (multiple pipelines, no selector) or empty: fall back to
-        // the global file. The user should pass `--state-namespace` to fan out.
-        Err(_) => Ok(None),
-    }
+    // Ambiguous (multiple pipelines), empty, or a pipeline name that is not a
+    // valid file segment: fall back to the global file. The user should pass
+    // `--state-namespace` to fan out. `rocky mcp` and `rocky lsp` derive the
+    // same namespace through the same helper (#2587).
+    Ok(cfg.state_namespace().map(str::to_string))
 }
 
 async fn run_async(cli: Cli, json: bool) -> Result<()> {
@@ -5518,7 +5509,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             )
             .await
         }
-        Command::Lsp { stdio: _ } => rocky_cli::commands::run_lsp().await,
+        Command::Lsp { stdio: _ } => {
+            rocky_cli::commands::run_lsp(cli.state_path.clone(), cli.state_namespace.clone()).await
+        }
         #[cfg(feature = "duckdb")]
         Command::Test {
             models,
@@ -6245,7 +6238,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 resolve_cli_principal_id(cli.principal_id.as_deref(), Some(profile.name()))?;
             // An explicit `--state-path` reaches the server, so its decision
             // rows land in the store the caller chose (#2278).
-            rocky_mcp::serve_stdio(config, profile, actor, cli.state_path.clone()).await
+            rocky_mcp::serve_stdio(
+                config,
+                profile,
+                actor,
+                cli.state_path.clone(),
+                cli.state_namespace.clone(),
+            )
+            .await
         }
     };
 

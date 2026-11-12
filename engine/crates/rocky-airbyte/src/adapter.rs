@@ -105,12 +105,18 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
     /// way. A deprecated connection is left out: Airbyte has deleted it, it
     /// cannot sync, and discovery never returns it, so the run never reads it.
     ///
+    /// `include` is applied to each connection before its jobs read, on a
+    /// state built without jobs (the filter reads only `id`, `schema` and
+    /// `source_type`). A connection it rejects costs no jobs read and cannot
+    /// fail the poll; it is left out of the answer.
+    ///
     /// Each state is built from the connection's newest jobs; see
     /// [`sync_state_of`]. `observed_at` is the `Date` header of that
     /// connection's jobs read, the server time at which it was seen.
     async fn source_sync_states(
         &self,
         schema_prefix: &str,
+        include: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
     ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
         let connections = self
             .client
@@ -121,7 +127,16 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
             .into_iter()
             .filter(|c| c.status != ConnectionStatus::Deprecated)
             .filter(|c| matches_prefix(c, schema_prefix))
-            .collect();
+            .filter_map(|c| {
+                // A state without jobs: enough for the filter.
+                let bare = match sync_state_of(&c, &[], None) {
+                    Ok(bare) => bare,
+                    Err(e) => return Some(Err(AdapterError::new(e))),
+                };
+                let keep = include(&bare);
+                keep.then_some(Ok(c))
+            })
+            .collect::<Result<Vec<_>, AdapterError>>()?;
         // Only an active connection has its jobs read. An inactive or unknown
         // one is paused, and the wait skips paused connections, so its jobs
         // could not change the outcome. Reads run concurrently, at most
