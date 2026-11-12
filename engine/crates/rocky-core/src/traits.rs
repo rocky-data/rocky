@@ -247,7 +247,7 @@ pub trait DiscoveryAdapter: Send + Sync {
     async fn source_sync_states(
         &self,
         _schema_prefix: &str,
-        _include: &(dyn Fn(&crate::source_sync::SourceSyncState) -> bool + Sync),
+        _include: &(dyn for<'s> Fn(&'s crate::source_sync::SourceSyncState) -> bool + Sync),
     ) -> AdapterResult<Option<Vec<crate::source_sync::SourceSyncState>>> {
         Ok(None)
     }

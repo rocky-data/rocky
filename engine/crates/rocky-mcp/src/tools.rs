@@ -11618,7 +11618,10 @@ database = ":memory:"
         });
         let spool = rocky_core::ai_usage::spool_path(&cli_state);
         assert_eq!(
-            rocky_core::ai_usage::read_spool(&spool).unwrap().records.len(),
+            rocky_core::ai_usage::read_spool(&spool)
+                .unwrap()
+                .records
+                .len(),
             1,
             "the call is in the spool the CLI reads"
         );

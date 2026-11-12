@@ -116,7 +116,7 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
     async fn source_sync_states(
         &self,
         schema_prefix: &str,
-        include: &(dyn Fn(&SourceSyncState) -> bool + Sync),
+        include: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
     ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
         let connections = self
             .client
@@ -127,15 +127,16 @@ impl DiscoveryAdapter for AirbyteDiscoveryAdapter {
             .into_iter()
             .filter(|c| c.status != ConnectionStatus::Deprecated)
             .filter(|c| matches_prefix(c, schema_prefix))
-            .map(|c| {
+            .filter_map(|c| {
                 // A state without jobs: enough for the filter.
-                let bare = sync_state_of(&c, &[], None).map_err(AdapterError::new)?;
-                Ok::<_, AdapterError>((include(&bare)).then_some(c))
+                let bare = match sync_state_of(&c, &[], None) {
+                    Ok(bare) => bare,
+                    Err(e) => return Some(Err(AdapterError::new(e))),
+                };
+                let keep = include(&bare);
+                keep.then_some(Ok(c))
             })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+            .collect::<Result<Vec<_>, AdapterError>>()?;
         // Only an active connection has its jobs read. An inactive or unknown
         // one is paused, and the wait skips paused connections, so its jobs
         // could not change the outcome. Reads run concurrently, at most

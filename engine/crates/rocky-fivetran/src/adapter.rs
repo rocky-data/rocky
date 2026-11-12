@@ -146,7 +146,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
     async fn source_sync_states(
         &self,
         schema_prefix: &str,
-        _include: &(dyn Fn(&SourceSyncState) -> bool + Sync),
+        _include: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
     ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
         let (connectors, observed_at) = ft_connector::discover_connectors_dated(
             &self.client,

@@ -5736,7 +5736,10 @@ pub fn set_state_location(location: StateLocation) {
 /// under a namespace its AI calls landed in a spool `rocky cost` did not
 /// read. A `rocky.toml` that does not load falls back to the global file,
 /// as the CLI does.
-fn ai_usage_state_path(models_dir: &std::path::Path, location: &StateLocation) -> std::path::PathBuf {
+fn ai_usage_state_path(
+    models_dir: &std::path::Path,
+    location: &StateLocation,
+) -> std::path::PathBuf {
     let config = if location.explicit.is_none() && location.namespace.is_none() {
         RockyLsp::project_config_path(models_dir)
             .filter(|p| p.is_file())
@@ -7993,7 +7996,8 @@ adapter = "db"
         )
         .unwrap();
         // What `rocky cost` reads: the CLI's store for this project.
-        let cli_state = rocky_core::state::resolve_state_path_ns(None, &models, Some("silver")).path;
+        let cli_state =
+            rocky_core::state::resolve_state_path_ns(None, &models, Some("silver")).path;
         assert_ne!(
             cli_state,
             rocky_core::state::resolve_state_path(None, &models).path,
@@ -8012,13 +8016,16 @@ adapter = "db"
             input_tokens: Some(10),
             output_tokens: Some(20),
         });
-        let spooled = rocky_core::ai_usage::read_spool(&rocky_core::ai_usage::spool_path(&cli_state))
-            .unwrap()
-            .records;
+        let spooled =
+            rocky_core::ai_usage::read_spool(&rocky_core::ai_usage::spool_path(&cli_state))
+                .unwrap()
+                .records;
         assert_eq!(spooled.len(), 1, "the call is in the spool the CLI reads");
         assert!(
-            !rocky_core::ai_usage::spool_path(&rocky_core::state::resolve_state_path(None, &models).path)
-                .exists(),
+            !rocky_core::ai_usage::spool_path(
+                &rocky_core::state::resolve_state_path(None, &models).path
+            )
+            .exists(),
             "nothing lands in the global spool"
         );
 

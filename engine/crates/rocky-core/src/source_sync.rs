@@ -337,7 +337,7 @@ fn moved(now: Option<DateTime<Utc>>, base: Option<DateTime<Utc>>) -> bool {
 pub async fn wait_for_source_syncs(
     adapter: &dyn DiscoveryAdapter,
     schema_prefix: &str,
-    include: &(dyn Fn(&SourceSyncState) -> bool + Sync),
+    include: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
     opts: SourceSyncWaitOptions,
     cancel: impl Future<Output = ()>,
 ) -> AdapterResult<Option<SourceSyncReport>> {
@@ -585,7 +585,7 @@ async fn read_after_unknown(
 pub async fn trigger_and_wait_for_source_syncs(
     adapter: &dyn DiscoveryAdapter,
     schema_prefix: &str,
-    include: &(dyn Fn(&SourceSyncState) -> bool + Sync),
+    include: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
     opts: SourceSyncWaitOptions,
     on_trigger: &(dyn Fn(&SourceSyncTriggered) + Sync),
     cancel: impl Future<Output = ()>,
@@ -968,7 +968,7 @@ mod tests {
         async fn source_sync_states(
             &self,
             _p: &str,
-            _i: &(dyn Fn(&SourceSyncState) -> bool + Sync),
+            _i: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
         ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
             *self.calls.lock().unwrap() += 1;
             let mut q = self.polls.lock().unwrap();
@@ -1203,7 +1203,7 @@ mod tests {
             async fn source_sync_states(
                 &self,
                 _p: &str,
-                _i: &(dyn Fn(&SourceSyncState) -> bool + Sync),
+                _i: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
             ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
                 let mut n = self.0.lock().unwrap();
                 *n += 1;
@@ -1295,7 +1295,7 @@ mod tests {
         async fn source_sync_states(
             &self,
             _p: &str,
-            _i: &(dyn Fn(&SourceSyncState) -> bool + Sync),
+            _i: &(dyn for<'s> Fn(&'s SourceSyncState) -> bool + Sync),
         ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
             self.log.lock().unwrap().push("poll".into());
             let mut q = self.polls.lock().unwrap();
