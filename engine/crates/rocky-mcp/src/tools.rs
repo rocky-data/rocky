@@ -3783,20 +3783,27 @@ impl RockyMcpServer {
     /// Profile each column of a model's target table into a
     /// [`TableProfile`](rocky_ai::contract::TableProfile) for `ai_contract`.
     ///
-    /// Reuses the grounding path (`prepare_table_query` + `query_grounding`), so
-    /// it works on any configured warehouse, not just DuckDB.
+    /// Resolves the table through the grounding path (`prepare_table_query`),
+    /// so it works on any configured warehouse, then profiles each column with
+    /// the same `profile_column` the `rocky ai-contract` CLI uses, in its
+    /// statistics-only mode.
     ///
     /// # Egress
     ///
     /// Issues **aggregate statistics only** — `COUNT(*)`, `COUNT(col)`,
     /// `COUNT(DISTINCT col)` — and never selects `MIN`/`MAX` or a domain sample.
     /// No raw cell value leaves the machine; the prompt the LLM sees carries
-    /// counts, not data. This mirrors the default of the `rocky ai-contract`
-    /// generator this tool wraps (whose `--with-data` opt-in, which would send
-    /// observed min/max and low-cardinality samples, is intentionally NOT
-    /// exposed over MCP). `null_rate` + `distinct` are enough to draft the
-    /// nullable / required / protected constraints; `min`/`max`/`observed_values`
-    /// are left empty. SQL is built only from validated identifiers.
+    /// counts, not data. This is the CLI's default (`CellValues::Withheld`); its
+    /// `--with-data` opt-in, which would send observed min/max and
+    /// low-cardinality samples, is intentionally NOT exposed over MCP.
+    /// `null_rate` + `distinct` are enough to draft the nullable / required /
+    /// protected constraints; `min`/`max`/`observed_values` are left empty.
+    /// SQL is built only from validated identifiers.
+    ///
+    /// # Cost
+    ///
+    /// Each column query scans the whole table. On a metered warehouse that
+    /// costs money on a large table.
     async fn profile_table_columns(
         &self,
         model_name: &str,
@@ -3806,43 +3813,16 @@ impl RockyMcpServer {
 
         let mut columns = Vec::with_capacity(schema.len());
         for typed_col in schema {
-            let col = rocky_sql::validation::validate_identifier(&typed_col.name)
-                .map_err(|e| anyhow::anyhow!("invalid column identifier: {e}"))?;
-            // Statistics only — counts, never raw cell values. No MIN/MAX, no
-            // domain query, so nothing observable from the table's contents
-            // reaches the LLM prompt.
-            let agg_sql = column_stats_sql(&prepared.table_ref, col);
-            let qr = query_grounding(prepared.adapter.as_ref(), &agg_sql)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("profile query failed for column '{}': {e}", typed_col.name)
-                })?;
-            let row = qr.rows.first().ok_or_else(|| {
-                anyhow::anyhow!("profile query returned no rows for '{}'", typed_col.name)
-            })?;
-
-            let total = row.first().map(json_as_u64).unwrap_or(0);
-            let non_null = row.get(1).map(json_as_u64).unwrap_or(0);
-            let distinct = row.get(2).map(json_as_u64).unwrap_or(0);
-            let nulls = total.saturating_sub(non_null);
-            let null_rate = if total == 0 {
-                0.0
-            } else {
-                nulls as f64 / total as f64
-            };
-
-            columns.push(rocky_ai::contract::ColumnProfile {
-                name: typed_col.name.clone(),
-                type_name: rocky_ai::contract::contract_type_name(typed_col),
-                rows: total,
-                nulls,
-                null_rate,
-                distinct,
-                // Raw cell values are never sent over MCP (see # Egress).
-                observed_values: Vec::new(),
-                min: None,
-                max: None,
-            });
+            // Statistics only: counts, never raw cell values, so nothing
+            // observable from the table's contents reaches the LLM prompt.
+            let profile = rocky_cli::commands::profile_column(
+                prepared.adapter.as_ref(),
+                &prepared.table_ref,
+                typed_col,
+                rocky_cli::commands::CellValues::Withheld,
+            )
+            .await?;
+            columns.push(profile);
         }
 
         Ok(rocky_ai::contract::TableProfile {
@@ -7098,20 +7078,6 @@ fn commands_adapter_registry(
     rocky_cli::registry::AdapterRegistry::from_config(cfg)
 }
 
-/// Build the per-column **statistics** query for `ai_contract`'s profiler.
-///
-/// Aggregate counts only — `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`.
-/// Deliberately selects no `MIN`/`MAX` and issues no domain query, so no raw
-/// cell value can reach the LLM prompt (the egress contract the MCP
-/// `ai_contract` tool upholds — see `profile_table_columns`). `table_ref`
-/// and `col` are already validated by the caller.
-fn column_stats_sql(table_ref: &str, col: &str) -> String {
-    format!(
-        "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n \
-         FROM {table_ref}"
-    )
-}
-
 /// Parse a qualified `schema.table` / `catalog.schema.table` reference into a
 /// [`TableRef`](rocky_ir::TableRef) for `drift_preview`'s `describe_table`
 /// calls.
@@ -7146,16 +7112,6 @@ fn drift_action_wire_name(action: &rocky_ir::DriftAction) -> &'static str {
         rocky_ir::DriftAction::DropAndRecreate => "drop_and_recreate",
         rocky_ir::DriftAction::AlterColumnTypes => "alter_column_types",
         rocky_ir::DriftAction::Ignore => "ignore",
-    }
-}
-
-/// Read a `serde_json::Value` grounding cell as a `u64`, tolerating the
-/// string-encoded integers some adapters return.
-fn json_as_u64(v: &serde_json::Value) -> u64 {
-    match v {
-        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
-        serde_json::Value::String(s) => s.parse().unwrap_or(0),
-        _ => 0,
     }
 }
 
@@ -8632,35 +8588,6 @@ database = ":memory:"
             "hint should list the accepted values: {:?}",
             err.0
         );
-    }
-
-    /// Egress contract: the `ai_contract` profiler issues STATISTICS only —
-    /// it must never select raw cell values (`MIN`/`MAX`) nor a domain sample,
-    /// matching the default of the `rocky ai-contract` generator it wraps.
-    #[test]
-    fn column_stats_sql_sends_no_raw_cell_values() {
-        let sql = column_stats_sql("out.orders", "status");
-        assert!(
-            sql.contains("COUNT(DISTINCT status)"),
-            "distinct COUNT is a statistic and is expected: {sql}"
-        );
-        let upper = sql.to_uppercase();
-        assert!(
-            !upper.contains("MIN(") && !upper.contains("MAX("),
-            "statistics-only query must not select MIN/MAX: {sql}"
-        );
-        assert!(
-            !upper.contains("DISTINCT CAST"),
-            "statistics-only query must not issue the domain-values query: {sql}"
-        );
-    }
-
-    #[test]
-    fn json_as_u64_handles_null_number_and_string() {
-        assert_eq!(json_as_u64(&serde_json::json!(42)), 42);
-        assert_eq!(json_as_u64(&serde_json::json!("17")), 17);
-        assert_eq!(json_as_u64(&serde_json::json!(null)), 0);
-        assert_eq!(json_as_u64(&serde_json::json!("nope")), 0);
     }
 
     #[test]

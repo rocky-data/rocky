@@ -1798,7 +1798,7 @@ enum Command {
         models: String,
     },
 
-    /// AI-draft a data contract from a model's observed data (DuckDB only)
+    /// AI-draft a data contract from a model's observed data
     AiContract {
         /// Model whose target table to profile and draft a contract for
         model: String,
@@ -1819,7 +1819,7 @@ enum Command {
     },
 
     /// Profile a model's target table per column — row/null/distinct/min/max
-    /// (DuckDB only)
+    /// (a full table scan)
     Profile {
         /// Model whose target table to profile
         model: String,

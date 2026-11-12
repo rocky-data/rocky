@@ -1978,10 +1978,12 @@ class RockyClient:
         return _parse_rocky_json(self.run_cli(args), AiTestResult, command="ai-test")
 
     def profile(self, model: str, *, column: str | None = None, sample: int = 0) -> ProfileOutput:
-        """Profile a model's target table per column (DuckDB only).
+        """Profile a model's target table per column (a full table scan).
 
         ``sample > 0`` adds up to that many random distinct non-null values per
         column (``sample_values``, at most 100). Needs engine 1.77.0 or later.
+        ``sample`` is DuckDB only: on another warehouse the profile comes back
+        with ``unavailable`` set.
         """
         args: list[str] = ["profile", model, "--models", self.models_dir]
         if column is not None:
@@ -1991,7 +1993,7 @@ class RockyClient:
         return _parse_rocky_json(self.run_cli(args), ProfileOutput, command="profile")
 
     def ai_contract(self, model: str, *, save: bool = False) -> AiContractOutput:
-        """AI-draft a data contract from a model's observed data (DuckDB only)."""
+        """AI-draft a data contract from a model's observed data."""
         args: list[str] = ["ai-contract", model, "--models", self.models_dir]
         if save:
             args.append("--save")
