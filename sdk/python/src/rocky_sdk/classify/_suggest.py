@@ -216,8 +216,8 @@ def suggest(
     """Suggest tags for ``model``'s columns. Writes nothing.
 
     Runs ``rocky profile <model> --sample <sample>`` (DuckDB targets only for
-    now; other targets return no suggestions because the profile is
-    unavailable). Columns already in the sidecar's ``[classification]`` block
+    now: ``--sample`` is DuckDB only, so other targets return no suggestions
+    because the profile is unavailable). Columns already in the sidecar's ``[classification]`` block
     are skipped when ``sidecar`` is given.
 
     ``use_model=True`` runs the Laya model on every column the rules left

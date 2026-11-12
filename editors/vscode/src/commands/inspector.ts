@@ -262,8 +262,8 @@ async function loadPreview(model: string): Promise<InspectorPreviewData> {
 }
 
 /**
- * Profile `model`'s target table per column via `rocky profile` (DuckDB-only;
- * a single aggregate query per column, no LLM). Invoked lazily (Profile tab).
+ * Profile `model`'s target table per column via `rocky profile` (any
+ * warehouse; a single aggregate query per column, no LLM). Invoked lazily (Profile tab).
  */
 async function loadProfile(model: string): Promise<ProfileOutput> {
   try {

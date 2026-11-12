@@ -1,6 +1,6 @@
 //! `rocky ai-contract <model>` — AI-drafted data contracts from observed data.
 //!
-//! Profiles a model's target table per column (DuckDB only this release), then
+//! Profiles a model's target table per column on the configured warehouse, then
 //! asks the LLM to propose a `.contract.toml` grounded in that profile. The
 //! proposal is compile-verified against the model before it's accepted, so the
 //! reported contract is one `rocky compile` will accept.
@@ -340,23 +340,27 @@ pub fn overlay_live_schemas(
     }
 }
 
-/// A validated, DuckDB-runnable table reference plus the adapter to run it on.
-/// Ported from the rocky-mcp grounding helper: identifiers are validated via
-/// `rocky_sql::validation` before composing the ref so SQL is never built from
-/// raw input.
+/// A validated table reference plus the adapter to run it on.
+///
+/// `table_ref` is SQL the profiler interpolates into `FROM`: the adapter's
+/// dialect builds it from `table` and validates every segment first, so SQL
+/// is never built from raw input and each warehouse gets its own quoting.
 pub(crate) struct PreparedTable {
     pub(crate) adapter: std::sync::Arc<dyn WarehouseAdapter>,
+    /// The structured coordinates of the profiled table.
+    pub(crate) table: rocky_ir::TableRef,
+    /// The dialect-built SQL reference for `table`.
     pub(crate) table_ref: String,
     /// Set when the model's declared target wasn't materialized and we fell
     /// back to a source table (only when `FallbackPolicy::SourceFallback` is
-    /// requested). Carries the declared-target FQN that was missing so the
+    /// requested). Carries the declared-target name that was missing so the
     /// caller can surface "this is a source preview, not the model output" in
     /// its output. `None` means we profiled the declared target directly.
     pub(crate) fell_back_from: Option<String>,
 }
 
-/// Either a runnable table query or the reason a non-DuckDB adapter blocks
-/// profiling this release.
+/// Either a runnable table query or the reason profiling cannot run (for
+/// example, the model's target is not materialized).
 pub(crate) enum PreparedKind {
     Ready(PreparedTable),
     Unavailable(String),
@@ -376,7 +380,7 @@ pub(crate) enum FallbackPolicy {
     SourceFallback,
 }
 
-/// The target adapter resolved from config, plus whether it's DuckDB.
+/// The target adapter resolved from config.
 struct ResolvedTarget {
     registry: crate::registry::AdapterRegistry,
     target_adapter: String,
@@ -384,7 +388,7 @@ struct ResolvedTarget {
 }
 
 /// Resolve the pipeline's target adapter and its type from config. Pure of any
-/// model lookup so the DuckDB-only gate is unit-testable without a compile.
+/// model lookup so it is unit-testable without a compile.
 fn resolve_target(config_path: &Path) -> Result<ResolvedTarget> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
     let registry = crate::registry::AdapterRegistry::from_config(&cfg)?;
@@ -401,22 +405,57 @@ fn resolve_target(config_path: &Path) -> Result<ResolvedTarget> {
     })
 }
 
-/// The DuckDB-only refusal message for a given target adapter type. Returns
-/// `None` when the adapter is DuckDB (no refusal).
-fn duckdb_only_refusal(adapter_type: &str) -> Option<String> {
-    if adapter_type == "duckdb" {
-        None
+/// The dotted display name of a table: `catalog.schema.table`, or
+/// `schema.table` when there is no catalog. Unquoted, for humans and JSON
+/// output — never interpolated into SQL.
+pub(crate) fn display_table_name(t: &rocky_ir::TableRef) -> String {
+    if t.catalog.is_empty() {
+        format!("{}.{}", t.schema, t.table)
     } else {
-        Some(format!(
-            "`rocky ai-contract` is DuckDB-only in this release; the target adapter is '{adapter_type}'. \
-             Warehouse support is deferred."
-        ))
+        format!("{}.{}.{}", t.catalog, t.schema, t.table)
     }
 }
 
+/// The SQL reference for `t`, built by the adapter's dialect — the same
+/// `format_table_ref` `rocky run` writes the table with. The dialect
+/// validates every segment, so a hostile name is refused here.
+fn dialect_table_ref(adapter: &dyn WarehouseAdapter, t: &rocky_ir::TableRef) -> Result<String> {
+    adapter
+        .dialect()
+        .format_table_ref(&t.catalog, &t.schema, &t.table)
+        .map_err(|e| anyhow::anyhow!("invalid table reference '{}': {e}", display_table_name(t)))
+}
+
+/// Whether `sql_ref` resolves on the warehouse, by a zero-row query through
+/// the exact ref the profile will use. `describe_table` is not enough: an
+/// adapter may build its own differently-quoted ref for it (Snowflake's
+/// describe quotes, while a source's grounding ref does not), so a describe
+/// can pass for a ref that then fails to query, or fail for one that works.
+/// Zero rows, so it reads no data.
+async fn ref_resolves(adapter: &dyn WarehouseAdapter, sql_ref: &str) -> bool {
+    let sql = adapter
+        .dialect()
+        .select_limited("1 AS probe", &format!("FROM {sql_ref}"), 0);
+    adapter.execute_query(&sql).await.is_ok()
+}
+
+/// The dialect's grounding ref for a table Rocky did not create (a source):
+/// see [`first_existing_source`] for why it differs from [`dialect_table_ref`].
+fn grounding_table_ref(adapter: &dyn WarehouseAdapter, t: &rocky_ir::TableRef) -> Result<String> {
+    let parts: Vec<&str> = if t.catalog.is_empty() {
+        vec![&t.schema, &t.table]
+    } else {
+        vec![&t.catalog, &t.schema, &t.table]
+    };
+    adapter
+        .dialect()
+        .ground_table_ref(&parts)
+        .map_err(|e| anyhow::anyhow!("invalid table reference '{}': {e}", display_table_name(t)))
+}
+
 /// Resolve a model's target table into a validated table ref + warehouse
-/// adapter — but only on DuckDB. Other adapters return the typed "unavailable"
-/// reason so the command refuses cleanly with a clear message.
+/// adapter, on any configured warehouse. The ref comes from the adapter's
+/// dialect, so quoting and catalog handling match what `rocky run` writes.
 ///
 /// When `policy` is [`FallbackPolicy::SourceFallback`] and the model's declared
 /// target isn't materialized, this probes the model's declared sources (or
@@ -430,9 +469,6 @@ pub(crate) async fn prepare_table_query(
     policy: FallbackPolicy,
 ) -> Result<PreparedKind> {
     let resolved = resolve_target(config_path)?;
-    if let Some(reason) = duckdb_only_refusal(&resolved.adapter_type) {
-        return Ok(PreparedKind::Unavailable(reason));
-    }
     let registry = resolved.registry;
     let target_adapter = resolved.target_adapter;
 
@@ -443,31 +479,34 @@ pub(crate) async fn prepare_table_query(
         .find(|m| m.config.name == model_name)
         .ok_or_else(|| anyhow::anyhow!("model '{model_name}' not found in project"))?;
     let t = &model.config.target;
-
-    // DuckDB has no catalog level — emit a two-part `schema.table` name built
-    // from validated identifiers only.
-    let schema = rocky_sql::validation::validate_identifier(&t.schema)
-        .map_err(|e| anyhow::anyhow!("invalid schema identifier: {e}"))?;
-    let table = rocky_sql::validation::validate_identifier(&t.table)
-        .map_err(|e| anyhow::anyhow!("invalid table identifier: {e}"))?;
-    if !t.catalog.is_empty() {
-        rocky_sql::validation::validate_identifier(&t.catalog)
-            .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
-    }
-    let adapter = registry.warehouse_adapter(&target_adapter)?;
-    let target_ref = profile_ref(adapter.dialect(), &t.catalog, schema, table);
-
-    // Probe the model's declared target. We use `describe_table` rather than
-    // information_schema so the existence check goes through the adapter trait
-    // (works for any future warehouse), and is cheap even on cold tables.
-    let target_table_ref = rocky_ir::TableRef {
+    let target = rocky_ir::TableRef {
         catalog: t.catalog.clone(),
         schema: t.schema.clone(),
         table: t.table.clone(),
     };
-    if adapter.describe_table(&target_table_ref).await.is_ok() {
+
+    let adapter = registry.warehouse_adapter(&target_adapter)?;
+    let target_name = display_table_name(&target);
+    // Validates every segment through the dialect before any query runs. A
+    // name this dialect cannot address (an empty BigQuery project, a catalog
+    // on ClickHouse) makes the profile unavailable, not an error.
+    let target_ref = match dialect_table_ref(adapter.as_ref(), &target) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(PreparedKind::Unavailable(format!(
+                "model '{model_name}' target '{target_name}' cannot be profiled on the \
+                 '{}' adapter: {e:#}",
+                resolved.adapter_type
+            )));
+        }
+    };
+
+    // Probe the model's declared target with the ref the profile will query,
+    // so "exists" means "the profile query resolves".
+    if ref_resolves(adapter.as_ref(), &target_ref).await {
         return Ok(PreparedKind::Ready(PreparedTable {
             adapter,
+            table: target,
             table_ref: target_ref,
             fell_back_from: None,
         }));
@@ -477,19 +516,21 @@ pub(crate) async fn prepare_table_query(
     // drafting a contract from source data would be semantically wrong.
     match policy {
         FallbackPolicy::Strict => Ok(PreparedKind::Unavailable(format!(
-            "model '{model_name}' target '{target_ref}' is not materialized. \
-             Run `rocky run` to materialize the model first."
+            "model '{model_name}' target '{target_name}' is not materialized \
+             on the '{}' adapter. Run `rocky run` to materialize the model first.",
+            resolved.adapter_type
         ))),
         FallbackPolicy::SourceFallback => {
             match first_existing_source(adapter.as_ref(), model).await {
-                Some(source_ref) => Ok(PreparedKind::Ready(PreparedTable {
+                Some((table, table_ref)) => Ok(PreparedKind::Ready(PreparedTable {
                     adapter,
-                    table_ref: source_ref,
-                    fell_back_from: Some(target_ref),
+                    table,
+                    table_ref,
+                    fell_back_from: Some(target_name),
                 })),
                 None => Ok(PreparedKind::Unavailable(format!(
                     "model '{model_name}' has no profile-able table: target \
-                     '{target_ref}' is not materialized and no source table \
+                     '{target_name}' is not materialized and no source table \
                      could be resolved. Run `rocky run` to materialize the \
                      model first."
                 ))),
@@ -498,47 +539,34 @@ pub(crate) async fn prepare_table_query(
     }
 }
 
-/// The name a profile query reads: DuckDB's two-part `schema.table`, or
-/// `catalog.schema.table` for a catalog the dialect knows is attached
-/// (an Iceberg or DuckLake alias is never the default catalog, so the
-/// two-part name would read another table or none).
-fn profile_ref(
-    dialect: &dyn rocky_core::traits::SqlDialect,
-    catalog: &str,
-    schema: &str,
-    table: &str,
-) -> String {
-    match dialect.catalog_kind(catalog) {
-        rocky_core::traits::CatalogKind::Native
-        | rocky_core::traits::CatalogKind::DuckLakeMetadata => format!("{schema}.{table}"),
-        rocky_core::traits::CatalogKind::IcebergRest
-        | rocky_core::traits::CatalogKind::DuckLake => format!("{catalog}.{schema}.{table}"),
-    }
-}
-
 /// Find the first source table for `model` that actually exists in the
-/// warehouse. Tries explicit `[[sources]]` sidecar declarations first, then
-/// falls back to FROM clauses parsed out of the model's SQL — useful when the
-/// sidecar doesn't list sources (the common shape in the playground POCs).
-/// Returns the DuckDB-style two-part `schema.table` ref, since this release
-/// is DuckDB-only.
+/// warehouse, with its SQL reference. Tries explicit `[[sources]]` sidecar
+/// declarations first, then falls back to FROM clauses parsed out of the
+/// model's SQL — useful when the sidecar doesn't list sources (the common
+/// shape in the playground POCs).
+///
+/// A source gets the dialect's `ground_table_ref`, not the `format_table_ref`
+/// the target gets. Rocky did not create a source table, so its ref must
+/// resolve the way the model's own SQL names it: `ground_table_ref` leaves it
+/// unquoted on the dialects that fold case (Snowflake), where a quoted
+/// lowercase name would miss an uppercase table. The SQL parser also
+/// lowercases the names it returns. A candidate whose name the dialect
+/// refuses is skipped.
 async fn first_existing_source(
     adapter: &dyn WarehouseAdapter,
     model: &rocky_core::models::Model,
-) -> Option<String> {
+) -> Option<(rocky_ir::TableRef, String)> {
     for src in &model.config.sources {
         let r = rocky_ir::TableRef {
             catalog: src.catalog.clone(),
             schema: src.schema.clone(),
             table: src.table.clone(),
         };
-        if adapter.describe_table(&r).await.is_ok() {
-            return Some(profile_ref(
-                adapter.dialect(),
-                &src.catalog,
-                &src.schema,
-                &src.table,
-            ));
+        let Ok(sql_ref) = grounding_table_ref(adapter, &r) else {
+            continue;
+        };
+        if ref_resolves(adapter, &sql_ref).await {
+            return Some((r, sql_ref));
         }
     }
     // SQL-extracted fallback. `referenced_tables` returns lowercased
@@ -560,25 +588,59 @@ async fn first_existing_source(
             },
             _ => continue,
         };
-        if adapter.describe_table(&table_ref).await.is_ok() {
-            return Some(profile_ref(
-                adapter.dialect(),
-                &table_ref.catalog,
-                &table_ref.schema,
-                &table_ref.table,
-            ));
+        let Ok(sql_ref) = grounding_table_ref(adapter, &table_ref) else {
+            continue;
+        };
+        if ref_resolves(adapter, &sql_ref).await {
+            return Some((table_ref, sql_ref));
         }
     }
     None
 }
 
-/// Read a `serde_json::Value` cell as a `u64`, tolerating string-encoded ints.
-fn as_u64(v: &serde_json::Value) -> u64 {
+/// Read a count cell as a `u64`, tolerating string-encoded and integral
+/// float values (`"17"`, `17.0`, `"17.0"`), which some warehouses return.
+///
+/// Anything else is an error, never 0: a row count read as 0 would show an
+/// empty table, and a null count that comes out 0 would back a draft
+/// `nullable = false` the data does not support.
+fn as_u64(v: &serde_json::Value) -> Option<u64> {
+    let integral = |f: f64| (f.is_finite() && f >= 0.0 && f.fract() == 0.0).then_some(f as u64);
     match v {
-        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
-        serde_json::Value::String(s) => s.parse().unwrap_or(0),
-        _ => 0,
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| n.as_f64().and_then(integral)),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            s.parse()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().and_then(integral))
+        }
+        _ => None,
     }
+}
+
+/// Read count cell `i` of a profile row, or say which one did not parse.
+fn count_cell(row: &[serde_json::Value], i: usize, what: &str, column: &str) -> Result<u64> {
+    let cell = row.get(i);
+    cell.and_then(as_u64).ok_or_else(|| {
+        anyhow::anyhow!(
+            "profile query for column '{column}' returned an unreadable {what}: {}",
+            cell.map_or_else(|| "nothing".to_string(), ToString::to_string)
+        )
+    })
+}
+
+/// Whether a profile may read raw cell values.
+///
+/// An enum, not a `bool`, so every caller names its egress choice: a stray
+/// `true` would send real values to the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellValues {
+    /// Aggregate counts only. No raw cell value is read. The MCP
+    /// `ai_contract` tool and `rocky ai-contract` without `--with-data`.
+    Withheld,
+    /// Also read `MIN`/`MAX` and a low-cardinality column's value list.
+    /// `rocky profile` and `rocky ai-contract --with-data`.
+    Included,
 }
 
 /// Read a `serde_json::Value` cell as a display string, mapping SQL NULL to
@@ -593,20 +655,28 @@ pub(crate) fn str_cell(v: Option<&serde_json::Value>) -> Option<String> {
 
 /// Profile one column.
 ///
-/// By default this issues only aggregate **statistics** queries
-/// (count / non-null / distinct count) — no raw cell values leave the machine.
-/// When `with_data` is `true` the caller has opted into sending observed cell
-/// values to the LLM, so it additionally captures `MIN`/`MAX` and (for
+/// With [`CellValues::Withheld`] this issues only aggregate **statistics**
+/// queries (count / non-null / distinct count) — no raw cell values leave the
+/// machine. With [`CellValues::Included`] the caller has opted into reading
+/// observed cell values, so it additionally captures `MIN`/`MAX` and (for
 /// low-cardinality columns) the observed domain values.
 ///
 /// SQL is built from the already-validated `table_ref` and a freshly-validated
-/// column identifier — never from raw input.
-pub(crate) async fn profile_column(
+/// column identifier — never from raw input. `table_ref` must be a reference
+/// the adapter's dialect built (`format_table_ref` or `ground_table_ref`).
+///
+/// # Cost
+///
+/// Each query scans the whole column: no sampling, because a sampled null
+/// count of 0 would not justify `nullable = false`. On a metered warehouse
+/// (Snowflake, BigQuery, Databricks) a profile of a large table costs money.
+pub async fn profile_column(
     adapter: &dyn WarehouseAdapter,
     table_ref: &str,
     typed_col: &TypedColumn,
-    with_data: bool,
+    values: CellValues,
 ) -> Result<ColumnProfile> {
+    let with_data = values == CellValues::Included;
     let col = rocky_sql::validation::validate_identifier(&typed_col.name)
         .map_err(|e| anyhow::anyhow!("invalid column identifier: {e}"))?;
 
@@ -635,9 +705,9 @@ pub(crate) async fn profile_column(
         anyhow::anyhow!("profile query returned no rows for '{}'", typed_col.name)
     })?;
 
-    let total = row.first().map(as_u64).unwrap_or(0);
-    let non_null = row.get(1).map(as_u64).unwrap_or(0);
-    let distinct = row.get(2).map(as_u64).unwrap_or(0);
+    let total = count_cell(row, 0, "row count", &typed_col.name)?;
+    let non_null = count_cell(row, 1, "non-null count", &typed_col.name)?;
+    let distinct = count_cell(row, 2, "distinct count", &typed_col.name)?;
     let nulls = total.saturating_sub(non_null);
     let null_rate = if total == 0 {
         0.0
@@ -708,10 +778,10 @@ pub async fn run_ai_contract(
         );
     }
 
-    // Resolve the target table — refuses non-DuckDB adapters with a clear
-    // message before any LLM tokens are spent. `Strict` policy: refuse if the
-    // model isn't materialized rather than drafting a contract from source
-    // data (which would be semantically wrong for non-passthrough models).
+    // Resolve the target table before any LLM tokens are spent. `Strict`
+    // policy: refuse if the model isn't materialized rather than drafting a
+    // contract from source data (which would be semantically wrong for
+    // non-passthrough models).
     let prepared = match prepare_table_query(
         config_path,
         &compile_result,
@@ -797,7 +867,11 @@ pub async fn run_ai_contract(
             prepared.adapter.as_ref(),
             &prepared.table_ref,
             col,
-            with_data,
+            if with_data {
+                CellValues::Included
+            } else {
+                CellValues::Withheld
+            },
         )
         .await?;
         profiles.push(p);
@@ -912,19 +986,6 @@ pub async fn run_ai_contract(
 
 #[cfg(test)]
 mod tests {
-
-    /// A table in an attached catalog keeps its catalog, so a profile reads
-    /// the lake table and not a same-named one in the default catalog.
-    #[test]
-    fn a_profile_of_an_attached_catalog_keeps_the_catalog() {
-        let d = rocky_duckdb::dialect::DuckDbSqlDialect::with_catalogs([(
-            "dl",
-            rocky_core::traits::CatalogKind::DuckLake,
-        )]);
-        assert_eq!(profile_ref(&d, "dl", "demo", "agg"), "dl.demo.agg");
-        assert_eq!(profile_ref(&d, "warehouse", "demo", "agg"), "demo.agg");
-    }
-
     use super::*;
 
     /// The `rocky ai-contract` / MCP `ai_contract` profile: its statistics
@@ -967,10 +1028,23 @@ mod tests {
 
     #[test]
     fn as_u64_handles_number_and_string() {
-        assert_eq!(as_u64(&serde_json::json!(42)), 42);
-        assert_eq!(as_u64(&serde_json::json!("17")), 17);
-        assert_eq!(as_u64(&serde_json::json!(null)), 0);
-        assert_eq!(as_u64(&serde_json::json!("not-a-number")), 0);
+        assert_eq!(as_u64(&serde_json::json!(42)), Some(42));
+        assert_eq!(as_u64(&serde_json::json!("17")), Some(17));
+        assert_eq!(as_u64(&serde_json::json!(17.0)), Some(17));
+        assert_eq!(as_u64(&serde_json::json!(" 17.0 ")), Some(17));
+        // Never a silent 0: an unreadable count is an error upstream.
+        assert_eq!(as_u64(&serde_json::json!(null)), None);
+        assert_eq!(as_u64(&serde_json::json!("not-a-number")), None);
+        assert_eq!(as_u64(&serde_json::json!(1.5)), None);
+        assert_eq!(as_u64(&serde_json::json!(-3)), None);
+        let row = vec![serde_json::json!(10), serde_json::json!("x")];
+        assert_eq!(count_cell(&row, 0, "row count", "c").unwrap(), 10);
+        let err = count_cell(&row, 1, "non-null count", "c").unwrap_err();
+        assert!(
+            err.to_string().contains("unreadable non-null count"),
+            "{err}"
+        );
+        assert!(count_cell(&row, 2, "distinct count", "c").is_err());
     }
 
     #[test]
@@ -984,32 +1058,122 @@ mod tests {
         assert_eq!(str_cell(Some(&serde_json::json!(3))), Some("3".to_string()));
     }
 
-    /// The DuckDB-only gate must refuse any non-DuckDB target with a clear,
-    /// adapter-naming message — and a DuckDB target must NOT be refused.
-    #[test]
-    fn duckdb_only_gate_refuses_non_duckdb_adapter() {
-        let snowflake = duckdb_only_refusal("snowflake").expect("snowflake must be refused");
-        assert!(
-            snowflake.contains("DuckDB-only"),
-            "expected DuckDB-only refusal, got: {snowflake}"
-        );
-        assert!(
-            snowflake.contains("snowflake"),
-            "refusal should name the adapter: {snowflake}"
-        );
+    /// A stub warehouse on the Trino dialect, which double-quotes every
+    /// segment in `format_table_ref` and leaves `ground_table_ref` unquoted.
+    /// Only a query naming a table in `existing` by its unquoted ref works.
+    struct QuotingWarehouse {
+        dialect: rocky_trino::TrinoDialect,
+        existing: Vec<(String, String, String)>,
+    }
 
-        assert!(
-            duckdb_only_refusal("databricks").is_some(),
-            "databricks must be refused"
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for QuotingWarehouse {
+        fn dialect(&self) -> &dyn SqlDialect {
+            &self.dialect
+        }
+        async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+            unimplemented!("not used")
+        }
+        /// Answers the zero-row probe only when it names an existing table
+        /// by its unquoted ref, the way a case-folding warehouse resolves a
+        /// source; a quoted ref never resolves here.
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            let hit = self
+                .existing
+                .iter()
+                .any(|(c, s, t)| sql.contains(&format!("FROM {c}.{s}.{t} ")));
+            if hit {
+                Ok(QueryResult {
+                    columns: vec!["probe".into()],
+                    rows: Vec::new(),
+                })
+            } else {
+                Err(AdapterError::msg("no such table"))
+            }
+        }
+        async fn describe_table(&self, _t: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            // Succeeds for everything: the probe must not trust it.
+            Ok(Vec::new())
+        }
+    }
+
+    fn quoting_warehouse(existing: &[(&str, &str, &str)]) -> QuotingWarehouse {
+        QuotingWarehouse {
+            dialect: rocky_trino::TrinoDialect,
+            existing: existing
+                .iter()
+                .map(|(c, s, t)| (c.to_string(), s.to_string(), t.to_string()))
+                .collect(),
+        }
+    }
+
+    fn table(catalog: &str, schema: &str, name: &str) -> TableRef {
+        TableRef {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: name.to_string(),
+        }
+    }
+
+    /// The profiled table's SQL ref comes from the adapter's dialect, not a
+    /// hardcoded two-part `schema.table`: a quoting dialect quotes it, the
+    /// catalog is kept, and a hostile segment is refused before any SQL.
+    #[test]
+    fn table_ref_is_built_by_the_dialect() {
+        let wh = quoting_warehouse(&[]);
+        let t = table("lake", "staging", "orders");
+        assert_eq!(
+            dialect_table_ref(&wh, &t).unwrap(),
+            r#""lake"."staging"."orders""#
         );
+        assert_eq!(display_table_name(&t), "lake.staging.orders");
+        assert_eq!(
+            display_table_name(&table("", "staging", "orders")),
+            "staging.orders"
+        );
+        let hostile = table("lake", "staging", "orders; DROP TABLE x");
+        assert!(dialect_table_ref(&wh, &hostile).is_err());
+    }
+
+    /// The source fallback gives a declared `[[sources]]` entry and a name
+    /// parsed from the SQL the dialect's unquoted grounding ref, not the
+    /// quoted target ref. Tables that do not exist are skipped.
+    #[tokio::test]
+    async fn source_fallback_refs_go_through_the_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = dir.path().join("m.sql");
+        let toml = dir.path().join("m.toml");
+        std::fs::write(&sql, "SELECT id FROM lake.raw.orders").unwrap();
+        std::fs::write(
+            &toml,
+            "[target]\ncatalog = \"lake\"\nschema = \"staging\"\n\n\
+             [[sources]]\ncatalog = \"lake\"\nschema = \"raw\"\ntable = \"declared\"\n",
+        )
+        .unwrap();
+        let model = rocky_core::models::load_model_pair(&sql, &toml, None).unwrap();
+
+        // The declared source exists: it wins, with the unquoted grounding ref.
+        let wh = quoting_warehouse(&[("lake", "raw", "declared"), ("lake", "raw", "orders")]);
+        let (t, sql_ref) = first_existing_source(&wh, &model).await.unwrap();
+        assert_eq!(t, table("lake", "raw", "declared"));
+        assert_eq!(sql_ref, "lake.raw.declared");
+
+        // Only the SQL-referenced table exists: `ground_table_ref`, unquoted.
+        let wh = quoting_warehouse(&[("lake", "raw", "orders")]);
+        let (t, sql_ref) = first_existing_source(&wh, &model).await.unwrap();
+        assert_eq!(t, table("lake", "raw", "orders"));
+        assert_eq!(sql_ref, "lake.raw.orders");
+
+        // Nothing exists.
         assert!(
-            duckdb_only_refusal("duckdb").is_none(),
-            "duckdb must not be refused"
+            first_existing_source(&quoting_warehouse(&[]), &model)
+                .await
+                .is_none()
         );
     }
 
-    /// `resolve_target` reads the pipeline's target adapter type so the gate
-    /// can fire before any compile or LLM call.
+    /// `resolve_target` reads the pipeline's target adapter and its type from
+    /// config, before any compile or LLM call.
     #[test]
     fn resolve_target_reports_duckdb_type() {
         let dir = tempfile::tempdir().unwrap();
@@ -1032,7 +1196,6 @@ adapter = "warehouse"
         let resolved = resolve_target(&config_path).expect("config should resolve");
         assert_eq!(resolved.adapter_type, "duckdb");
         assert_eq!(resolved.target_adapter, "warehouse");
-        assert!(duckdb_only_refusal(&resolved.adapter_type).is_none());
     }
 
     // ── Egress safety: no raw cell values without --with-data (H2) ────────
@@ -1105,9 +1268,14 @@ adapter = "warehouse"
     #[tokio::test]
     async fn profile_column_without_data_sends_no_values() {
         let adapter = RecordingAdapter::new();
-        let profile = profile_column(&adapter, "main.orders", &col("status"), false)
-            .await
-            .expect("profile should succeed");
+        let profile = profile_column(
+            &adapter,
+            "main.orders",
+            &col("status"),
+            CellValues::Withheld,
+        )
+        .await
+        .expect("profile should succeed");
 
         let queries = adapter.recorded();
         assert_eq!(queries.len(), 1, "exactly one statistics query expected");
@@ -1203,9 +1371,14 @@ adapter = "warehouse"
         let adapter = WithDataAdapter {
             queries: Mutex::new(Vec::new()),
         };
-        let profile = profile_column(&adapter, "main.orders", &col("status"), true)
-            .await
-            .expect("profile should succeed");
+        let profile = profile_column(
+            &adapter,
+            "main.orders",
+            &col("status"),
+            CellValues::Included,
+        )
+        .await
+        .expect("profile should succeed");
 
         assert_eq!(profile.min.as_deref(), Some("active"));
         assert_eq!(profile.max.as_deref(), Some("inactive"));

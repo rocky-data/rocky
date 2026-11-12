@@ -148,4 +148,4 @@ Reviewer: Fable 5.2, a fresh read-only agent that did not author the change, wit
 | 6 | A hard link to the adapter's file passes the same-file check. | Fixed: compared by device and inode on Unix, with a test. |
 | 7 | An `if let` over `DuckDbAttach` in the two-secrets rule. | Fixed: an exhaustive `match`. |
 | 8 | A lake is pinned to its creation directory; DuckDB's hint names an option Rocky lacks. | Fixed: a Rocky error message, and recorded in D1 and Consequences. |
-| 9 | `rocky profile` drops the catalog of a lake model. | Fixed: `profile_ref` keeps the catalog of an attached table, with a test. |
+| 9 | `rocky profile` drops the catalog of a lake model. | Fixed on main by #2583, which builds the profile's table reference with the dialect's `format_table_ref` (three-part for an attached catalog). |
