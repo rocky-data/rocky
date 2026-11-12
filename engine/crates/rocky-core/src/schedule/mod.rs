@@ -9,6 +9,7 @@
 //! testable without built binaries, and every "do not run" outcome is an
 //! explicit, recorded reason.
 
+pub mod child_marker;
 pub mod claim;
 pub mod demand;
 pub mod incidents;

@@ -41,6 +41,7 @@ lasso = { version = "0.7", features = ["multi-threaded"] }
 memmap2 = "0.9"
 rayon = "1"
 blake3 = { workspace = true }
+hostname = { workspace = true }
 # Unix SIGTERM delivery for the schedule spawner's graceful-then-forced child
 # termination. Usage is `#[cfg(unix)]`-gated; the crate is a no-op shim elsewhere.
 libc = { workspace = true }

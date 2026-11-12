@@ -49,6 +49,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::config::RockyConfig;
 use crate::state::{StateError, StateStore};
 
+use super::child_marker;
 use super::claim::{
     ClaimCas, ClaimRecord, DemandKind, PostAttempt, PreSpawn, Resolved, TerminalOutcome,
     decide_post_attempt, decide_pre_spawn, decide_resolver, parse_claim_key, sweep_terminal_claim,
@@ -1260,6 +1261,7 @@ async fn execute_claimed(
             trace_context: opts.trace_context.clone(),
             timeout: schedule.timeout.map(to_std_timeout),
             trigger: RunTriggerKind::for_source(demand.source),
+            rocky_dir: opts.rocky_dir.clone(),
         };
         // Release the store — both locks — for the child's whole window: the
         // child `rocky run` opens the SAME state file, and the redb + advisory
@@ -1285,6 +1287,8 @@ async fn execute_claimed(
                 }
             }
         };
+        // The child has exited, so its identity sidecar is no longer needed.
+        child_marker::remove(&opts.rocky_dir, &submission_id);
         // Take the store back to observe and decide. Contention here means a
         // third `rocky` process slipped in between the child's release and our
         // reopen: defer — the claim stays `submitted{submission_id}` and the
@@ -1537,6 +1541,7 @@ fn gc_schedule_claims_if_due(store: &StateStore, rocky_dir: &Path, now: DateTime
         }
         Err(e) => tracing::warn!(error = %e, "schedule claim GC failed"),
     }
+    child_marker::sweep_stale(rocky_dir);
 }
 
 fn key_pipeline(key: &str) -> String {
@@ -1646,6 +1651,7 @@ fn sweep_orphan_claims(
         // the per-pipeline scalars (see the note above). A lost CAS is a no-op
         // (nothing else mutates claims while this tick holds the lock).
         let terminal = sweep_terminal_claim(&claim, source, outcome, now);
+        child_marker::remove(rocky_dir, &claim.submission_id);
         let cas = store.schedule_claim_cas(
             &key,
             Some(&claim),
@@ -1674,6 +1680,40 @@ fn sweep_orphan_claims(
         }
     }
     Ok(())
+}
+
+/// Copy the spawner's child sidecar into `claim` (first sweep only), so the
+/// identity survives the sidecar's removal. Leaves the claim alone when the
+/// claim already has an identity or there is no sidecar.
+fn copy_child_identity(rocky_dir: &Path, claim: &mut ClaimRecord) {
+    if claim.child_pid.is_some() {
+        return;
+    }
+    if let Some(marker) = child_marker::read(rocky_dir, &claim.submission_id) {
+        claim.child_pid = Some(marker.pid);
+        claim.child_start_time = Some(marker.start_time);
+        claim.child_host = Some(marker.host);
+    }
+}
+
+/// Whether the child of a stuck claim may still be running, so the grace must
+/// not resolve it. Never true without a positively recorded identity.
+fn child_still_running(rocky_dir: &Path, claim: &ClaimRecord, now: DateTime<Utc>) -> bool {
+    let identity = child_marker::identity_for(rocky_dir, claim);
+    let alive = child_marker::child_may_be_alive(
+        identity.as_ref(),
+        claim,
+        &child_marker::host_identity(),
+        now,
+        crate::process::process_liveness,
+    );
+    if alive {
+        tracing::info!(
+            submission_id = %claim.submission_id,
+            "scheduler: a stuck claim's child is still running; grace not applied"
+        );
+    }
+    alive
 }
 
 /// Resolve a record-less `submitted` cron claim: stamp the grace on first
@@ -1708,6 +1748,7 @@ fn sweep_lost_cron_claim(
         None => {
             let mut stamped = claim.clone();
             stamped.first_swept_at = Some(now.to_rfc3339());
+            copy_child_identity(rocky_dir, &mut stamped);
             store.schedule_claim_cas(
                 key,
                 Some(claim),
@@ -1717,6 +1758,9 @@ fn sweep_lost_cron_claim(
             )?;
         }
         Some(swept_at) if now - swept_at >= RECOVERY_GRACE => {
+            if child_still_running(rocky_dir, claim, now) {
+                return Ok(());
+            }
             let terminal =
                 sweep_terminal_claim(claim, DemandKind::Cron, TerminalOutcome::Failure, now);
             let cas = store.schedule_claim_cas(
@@ -1727,6 +1771,7 @@ fn sweep_lost_cron_claim(
                 &ScheduleStateMutation::None,
             )?;
             if matches!(cas, ClaimCas::Won) {
+                child_marker::remove(rocky_dir, &claim.submission_id);
                 tracing::warn!(
                     pipeline,
                     submission_id = %claim.submission_id,
@@ -1833,6 +1878,7 @@ fn resolve_missing_record(
         None => {
             let mut updated = current.clone();
             updated.first_swept_at = Some(now.to_rfc3339());
+            copy_child_identity(rocky_dir, &mut updated);
             // Either outcome of this CAS means "skip this tick": on win the grace
             // has begun; on loss another reconciler owns the resolution.
             store.schedule_claim_cas(
@@ -1845,6 +1891,9 @@ fn resolve_missing_record(
             Ok(StuckResolution::InFlight)
         }
         Some(swept_at) if now - swept_at >= RECOVERY_GRACE => {
+            if child_still_running(rocky_dir, current, now) {
+                return Ok(StuckResolution::InFlight);
+            }
             let resolved = decide_resolver(
                 current,
                 TerminalOutcome::Failure,
@@ -1853,6 +1902,7 @@ fn resolve_missing_record(
                 now,
             );
             let resolution = commit_resolution(key, &demand.pipeline, current, resolved, store)?;
+            child_marker::remove(rocky_dir, &current.submission_id);
             // A lost attempt (crash before any run record) that just
             // exhausted its budget is a failure nobody else will surface.
             if matches!(resolution, StuckResolution::Finished) {
@@ -3563,6 +3613,101 @@ freshness = true
         // A later sweep is a no-op: no second incident.
         sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 30));
         assert_eq!(incident_count(&opts), 1, "a second sweep adds nothing");
+    }
+
+    /// This test process as a "child": its real pid and start time.
+    fn live_marker() -> Option<child_marker::ChildMarker> {
+        let pid = std::process::id();
+        let start_time = crate::process::process_liveness(pid).ok().flatten()?;
+        Some(child_marker::ChildMarker {
+            pid,
+            start_time,
+            host: child_marker::host_identity(),
+        })
+    }
+
+    #[test]
+    fn first_sweep_copies_the_child_sidecar_into_the_claim() {
+        let Some(marker) = live_marker() else { return };
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert_eq!(claim.child_pid, Some(marker.pid));
+            assert_eq!(claim.child_start_time, Some(marker.start_time));
+            assert_eq!(claim.child_host.as_deref(), Some(marker.host.as_str()));
+        });
+    }
+
+    #[test]
+    fn a_live_child_holds_a_lost_cron_claim_past_the_grace() {
+        let Some(marker) = live_marker() else { return };
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 6, 0));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(claim.state, ClaimState::Submitted));
+        });
+        assert_eq!(incident_count(&opts), 0, "a live child is not a lost run");
+    }
+
+    #[test]
+    fn a_reused_pid_does_not_hold_a_lost_cron_claim() {
+        let Some(mut marker) = live_marker() else {
+            return;
+        };
+        marker.start_time += 1;
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 5));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(
+                claim.state,
+                ClaimState::Completed {
+                    outcome: TerminalOutcome::Failure
+                }
+            ));
+        });
+        assert_eq!(incident_count(&opts), 1);
+        assert_eq!(child_marker::read(&opts.rocky_dir, "lost-1"), None);
+    }
+
+    #[test]
+    fn a_child_on_another_host_does_not_hold_a_lost_cron_claim() {
+        let Some(mut marker) = live_marker() else {
+            return;
+        };
+        marker.host = "some-other-host".to_string();
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 5));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(claim.state, ClaimState::Completed { .. }));
+        });
+    }
+
+    #[test]
+    fn the_gc_pass_removes_stale_child_sidecars_only() {
+        let (_state_path, _dir, opts) = temp_env();
+        child_marker::write(
+            &opts.rocky_dir,
+            "fresh",
+            &child_marker::ChildMarker {
+                pid: 1,
+                start_time: 1,
+                host: "h".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(child_marker::sweep_stale(&opts.rocky_dir), 0);
+        assert!(child_marker::read(&opts.rocky_dir, "fresh").is_some());
     }
 
     #[test]

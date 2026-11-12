@@ -101,6 +101,10 @@ pub struct SpawnRequest {
     /// `"schedule"` for a cron/`after`/freshness demand, `"webhook"` for a
     /// webhook-ingress demand.
     pub trigger: RunTriggerKind,
+    /// The Rocky state directory. The spawner records the child's identity
+    /// under it ([`super::child_marker`]) so a later sweep can tell a live
+    /// child from a dead one.
+    pub rocky_dir: PathBuf,
 }
 
 /// The W3C trace context handed to a spawned child.
@@ -295,6 +299,9 @@ impl Spawner for SubprocessSpawner {
             }
         };
         let pid = child.id();
+        if let Some(pid) = pid {
+            record_child_identity(&request.rocky_dir, &request.submission_id, pid);
+        }
         // When the child started, so a drain landing late in the child's own
         // scheduler timeout doesn't reset that budget to the (usually longer)
         // drain grace (see the `Interrupt::Drain` arm).
@@ -356,6 +363,25 @@ impl Spawner for SubprocessSpawner {
             pid,
             drain_interrupted,
         }
+    }
+}
+
+/// Write the child's identity sidecar. The tick has closed the state store, so
+/// the claim cannot carry it yet; the first sweep of a stuck claim copies it.
+/// Written only when the probe returns a start time: without one the pid could
+/// not be told apart from a reused pid. A failure only costs the liveness
+/// check, so it warns and goes on.
+fn record_child_identity(rocky_dir: &std::path::Path, submission_id: &str, pid: u32) {
+    let Ok(Some(start_time)) = crate::process::process_liveness(pid) else {
+        return;
+    };
+    let marker = super::child_marker::ChildMarker {
+        pid,
+        start_time,
+        host: super::child_marker::host_identity(),
+    };
+    if let Err(e) = super::child_marker::write(rocky_dir, submission_id, &marker) {
+        tracing::warn!(error = %e, "could not record the scheduler child's identity");
     }
 }
 
@@ -541,6 +567,7 @@ mod tests {
             trace_context: None,
             timeout: None,
             trigger: RunTriggerKind::Schedule,
+            rocky_dir: std::env::temp_dir().join("rocky-spawn-test"),
         };
         let mut command = SubprocessSpawner::build_command_for_exe(&request, probe);
         // Production discards scheduler stdout. Capture the same child for this probe.
@@ -568,6 +595,7 @@ mod tests {
             trace_context: None,
             timeout: None,
             trigger: RunTriggerKind::Schedule,
+            rocky_dir: std::env::temp_dir().join("rocky-spawn-test"),
         };
 
         let outcome = spawner.run(&request).await;
@@ -593,6 +621,7 @@ mod tests {
             trace_context: None,
             timeout: None,
             trigger: RunTriggerKind::Schedule,
+            rocky_dir: std::env::temp_dir().join("rocky-spawn-test"),
         };
         let cmd = SubprocessSpawner::build_command(&request);
         let args: Vec<String> = cmd
@@ -642,6 +671,7 @@ mod tests {
             }),
             timeout: None,
             trigger: RunTriggerKind::Schedule,
+            rocky_dir: std::env::temp_dir().join("rocky-spawn-test"),
         };
         let cmd = SubprocessSpawner::build_command_for_exe(&request, PathBuf::from("rocky"));
         let args: Vec<String> = cmd
@@ -704,6 +734,7 @@ mod tests {
                 trace_context: None,
                 timeout: None,
                 trigger: kind,
+                rocky_dir: std::env::temp_dir().join("rocky-spawn-test"),
             };
             let cmd = SubprocessSpawner::build_command(&request);
             let trigger = cmd
@@ -744,6 +775,7 @@ mod tests {
             trace_context: None,
             timeout: None,
             trigger: RunTriggerKind::Schedule,
+            rocky_dir: std::env::temp_dir().join("rocky-spawn-test"),
         };
 
         // 1. Our context carries no vendor state ⇒ an inherited one is removed.
