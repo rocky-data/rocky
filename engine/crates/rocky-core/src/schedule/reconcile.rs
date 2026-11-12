@@ -1770,7 +1770,7 @@ fn copy_child_identity(rocky_dir: &Path, claim: &mut ClaimRecord) {
 fn child_still_running(rocky_dir: &Path, claim: &ClaimRecord, now: DateTime<Utc>) -> bool {
     let identity = child_marker::identity_for(rocky_dir, claim);
     let alive = child_marker::child_may_be_alive(
-        identity.as_ref(),
+        &identity,
         claim,
         &child_marker::host_identity(),
         now,
@@ -1794,7 +1794,8 @@ fn child_still_running(rocky_dir: &Path, claim: &ClaimRecord, now: DateTime<Utc>
 /// or record a false failure. Past the timeout, measured from the claim's
 /// submission (`last_transition_at`), this writes ONE `"overrun"` warning
 /// incident and stamps `overrun_warned_at` on the claim, so later ticks do not
-/// repeat it. With no `timeout` configured there is no bound to overrun.
+/// repeat it. With no `timeout` configured the bound is
+/// [`child_marker::PROBE_ERROR_CAP`] (24 hours).
 #[allow(clippy::too_many_arguments)]
 fn hold_for_live_child(
     key: &str,
@@ -1815,10 +1816,10 @@ fn hold_for_live_child(
         .as_deref()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
-    let overrun = match (timeout, submitted_at) {
-        (Some(timeout), Some(at)) => now - at > timeout,
-        _ => false,
-    };
+    // With no `timeout_minutes`, a day is the bound, so a hung child that
+    // holds a standing demand is still surfaced once.
+    let bound = timeout.unwrap_or(child_marker::PROBE_ERROR_CAP);
+    let overrun = submitted_at.is_some_and(|at| now - at > bound);
     if !overrun || claim.overrun_warned_at.is_some() {
         return Ok(true);
     }
@@ -1867,6 +1868,7 @@ fn hold_for_live_child(
 /// Claim-lifecycle only, like the rest of the sweep: no retry (the occurrence
 /// is past, and a cron's retries run inside the tick that claimed it) and no
 /// per-pipeline scalars (`ScheduleStateMutation::None`). A lost CAS is a no-op.
+#[allow(clippy::too_many_arguments)]
 fn sweep_lost_cron_claim(
     key: &str,
     pipeline: &str,
@@ -3773,10 +3775,19 @@ freshness = true
         assert_eq!(incident_count(&opts), 1, "a second sweep adds nothing");
     }
 
-    /// This test process as a "child": its real pid and start time.
+    /// This test process as a "child": its real pid and start time. `None`
+    /// only where no probe exists; on Linux and macOS a failed probe panics,
+    /// so the tests that use this can never pass by returning early.
     fn live_marker() -> Option<child_marker::ChildMarker> {
         let pid = std::process::id();
-        let start_time = crate::process::process_liveness(pid).ok().flatten()?;
+        let probed = crate::process::running_process_start_time(pid);
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(
+                matches!(probed, Ok(Some(_))),
+                "the liveness probe must see this process: {probed:?}"
+            );
+        }
+        let start_time = probed.ok().flatten()?;
         Some(child_marker::ChildMarker {
             pid,
             start_time,
@@ -3861,10 +3872,7 @@ freshness = true
         };
         child_marker::write(&opts.rocky_dir, "fresh", &marker).unwrap();
         child_marker::write(&opts.rocky_dir, "old", &marker).unwrap();
-        let old_path = opts
-            .rocky_dir
-            .join("schedule-children")
-            .join("old.json");
+        let old_path = opts.rocky_dir.join("schedule-children").join("old.json");
         let eight_days_ago =
             std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
         std::fs::File::options()
@@ -4035,8 +4043,12 @@ cron = "0 3 * * *"
             .unwrap();
         assert_eq!(spawner.run_count(), 1, "the other pipeline still ran");
         assert!(report.executed.iter().all(|e| e.pipeline == "other"));
-        assert!(report.skipped.iter().any(|s| s.pipeline == "raw"
-            && s.reason == TickSkipReason::HistoryUnavailable));
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.pipeline == "raw" && s.reason == TickSkipReason::HistoryUnavailable)
+        );
         with_store(&state_path, |store| {
             assert!(
                 matches!(
@@ -5387,6 +5399,30 @@ adapter = "db"
                 DateTime::<Utc>::MAX_UTC,
             );
             assert!(store.get_schedule_claim(&k).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn gc_keeps_an_old_released_claim_whose_retry_cycle_is_open() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(9);
+        let k_open = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        let k_closed = claim_key_for(DemandKind::Freshness, at(2026, 5, 1, 5, 0));
+        with_store(&state_path, |store| {
+            let mut open = ClaimRecord::new_submitted("open".to_string(), old);
+            open.state = ClaimState::Released;
+            open.budget_open = true;
+            store
+                .schedule_claim_cas(&k_open, None, &open, "raw", &ScheduleStateMutation::None)
+                .unwrap();
+            seed_claim_in_state(store, &k_closed, "raw", ClaimState::Released, "closed", old);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now, DateTime::<Utc>::MAX_UTC);
+            assert!(
+                store.get_schedule_claim(&k_open).unwrap().is_some(),
+                "an open cycle keeps its budget"
+            );
+            assert!(store.get_schedule_claim(&k_closed).unwrap().is_none());
         });
     }
 

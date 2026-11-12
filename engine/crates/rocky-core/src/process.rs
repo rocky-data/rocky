@@ -61,6 +61,10 @@ pub fn running_process_start_time(pid: u32) -> Result<Option<u64>, String> {
 
 /// What one probe of a pid found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", test)),
+    allow(dead_code)
+)]
 struct ProbedProcess {
     start_time: u64,
     /// The process has exited and is not yet reaped (`Z`, or Linux's `X`).

@@ -7751,7 +7751,8 @@ impl StateStore {
 
     /// Garbage-collect terminal schedule claims: `completed` and `released`
     /// claims whose last transition is older than `cutoff`. `submitted`
-    /// claims are never removed here. `cutoff` is injected; this method never
+    /// claims, and `released` claims whose retry cycle is still open
+    /// (`budget_open`), are never removed here. `cutoff` is injected; this method never
     /// reads the clock.
     ///
     /// `is_protected(key, claim)` vetoes a removal (the tick uses it to keep a
@@ -7784,7 +7785,12 @@ impl StateStore {
                         continue;
                     }
                 };
-                if matches!(claim.state, ClaimState::Submitted) {
+                // A `released` claim with `budget_open` is mid retry cycle: the
+                // next re-claim continues its budget. Removing it would reset
+                // the cycle and grant extra attempts, so it is kept.
+                if matches!(claim.state, ClaimState::Submitted)
+                    || (matches!(claim.state, ClaimState::Released) && claim.budget_open)
+                {
                     continue;
                 }
                 let old = claim

@@ -24,9 +24,12 @@
 //! 4. The probe confirms the same start time: alive, with no age bound. The
 //!    process is positively identified, and the scheduler timeout bounds a
 //!    real run.
-//! 5. The probe errors: alive, but only while the claim is younger than
-//!    [`PROBE_ERROR_CAP`]. Past the cap the grace applies, so a wedged probe
-//!    cannot hold a claim forever.
+//! 5. The probe errors, or a sidecar exists but cannot be read: alive, but
+//!    only while the claim is younger than [`PROBE_ERROR_CAP`]. Past the cap
+//!    the grace applies, so a wedged probe cannot hold a claim forever.
+//!
+//! A zombie (exited, not yet reaped) is gone: the probe is
+//! [`crate::process::running_process_start_time`].
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -55,13 +58,56 @@ pub struct ChildMarker {
     pub host: String,
 }
 
-/// This machine's identity for [`ChildMarker::host`].
+/// This machine's identity for [`ChildMarker::host`]: the hostname, and on
+/// Linux also the kernel's boot id. A pid and start time only name a process
+/// within one boot of one kernel, so a reboot, or another node that shares the
+/// hostname, reads as another host. A renamed host also reads as another host:
+/// the claim then gets the grace-only behaviour it had before #2568.
 pub fn host_identity() -> String {
-    hostname::get()
+    let name = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
         .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    match boot_id() {
+        Some(boot) => format!("{name}/{boot}"),
+        None => name,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn boot_id() -> Option<String> {
+    None
+}
+
+/// What a sidecar read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerRead {
+    /// No sidecar for this submission.
+    Absent,
+    /// A readable sidecar.
+    Present(ChildMarker),
+    /// A sidecar exists but could not be read or parsed. Not proof of death.
+    Unreadable(String),
+}
+
+/// The child identity a liveness decision rests on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildIdentity {
+    /// Nothing recorded: the grace-only behaviour applies.
+    Unknown,
+    /// A recorded pid, start time and host.
+    Known(ChildMarker),
+    /// A sidecar exists but could not be read. Treated like a probe error.
+    Unreadable(String),
 }
 
 fn dir(rocky_dir: &Path) -> PathBuf {
@@ -98,10 +144,27 @@ pub fn write(rocky_dir: &Path, submission_id: &str, marker: &ChildMarker) -> io:
     std::fs::rename(&tmp, &path)
 }
 
-/// Read the marker for `submission_id`. A missing or unreadable file is `None`.
+/// Read the marker for `submission_id`. A missing or unreadable file is `None`;
+/// [`read_marker`] tells the two apart.
 pub fn read(rocky_dir: &Path, submission_id: &str) -> Option<ChildMarker> {
-    let bytes = std::fs::read(marker_path(rocky_dir, submission_id)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    match read_marker(rocky_dir, submission_id) {
+        MarkerRead::Present(marker) => Some(marker),
+        MarkerRead::Absent | MarkerRead::Unreadable(_) => None,
+    }
+}
+
+/// Read the marker for `submission_id`, telling a missing file from one that
+/// exists but cannot be read or parsed.
+pub fn read_marker(rocky_dir: &Path, submission_id: &str) -> MarkerRead {
+    let bytes = match std::fs::read(marker_path(rocky_dir, submission_id)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return MarkerRead::Absent,
+        Err(e) => return MarkerRead::Unreadable(e.to_string()),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(marker) => MarkerRead::Present(marker),
+        Err(e) => MarkerRead::Unreadable(e.to_string()),
+    }
 }
 
 /// Remove the marker for `submission_id`. Missing is fine.
@@ -136,34 +199,59 @@ pub fn sweep_stale(rocky_dir: &Path) -> usize {
 }
 
 /// The child identity to use for `claim`: the claim's own fields, else the
-/// sidecar. `None` when neither holds a complete identity.
-pub fn identity_for(rocky_dir: &Path, claim: &ClaimRecord) -> Option<ChildMarker> {
+/// sidecar.
+pub fn identity_for(rocky_dir: &Path, claim: &ClaimRecord) -> ChildIdentity {
     if let (Some(pid), Some(start_time), Some(host)) = (
         claim.child_pid,
         claim.child_start_time,
         claim.child_host.clone(),
     ) {
-        return Some(ChildMarker {
+        return ChildIdentity::Known(ChildMarker {
             pid,
             start_time,
             host,
         });
     }
-    read(rocky_dir, &claim.submission_id)
+    match read_marker(rocky_dir, &claim.submission_id) {
+        MarkerRead::Absent => ChildIdentity::Unknown,
+        MarkerRead::Present(marker) => ChildIdentity::Known(marker),
+        MarkerRead::Unreadable(e) => ChildIdentity::Unreadable(e),
+    }
+}
+
+/// Whether `claim` is still young enough for doubt to hold it: its last
+/// transition is less than [`PROBE_ERROR_CAP`] before `now`.
+fn within_doubt_cap(claim: &ClaimRecord, now: DateTime<Utc>) -> bool {
+    claim
+        .last_transition_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .is_some_and(|t| now - t.with_timezone(&Utc) < PROBE_ERROR_CAP)
 }
 
 /// Whether the child recorded for `claim` may still be running. See the module
 /// docs for the rules. `probe` is [`crate::process::running_process_start_time`] in
 /// production; `this_host` is [`host_identity`].
 pub fn child_may_be_alive(
-    identity: Option<&ChildMarker>,
+    identity: &ChildIdentity,
     claim: &ClaimRecord,
     this_host: &str,
     now: DateTime<Utc>,
     probe: impl Fn(u32) -> Result<Option<u64>, String>,
 ) -> bool {
-    let Some(child) = identity else {
-        return false;
+    let child = match identity {
+        ChildIdentity::Unknown => return false,
+        ChildIdentity::Known(child) => child,
+        ChildIdentity::Unreadable(e) => {
+            let within_cap = within_doubt_cap(claim, now);
+            tracing::warn!(
+                submission_id = %claim.submission_id,
+                error = %e,
+                within_cap,
+                "scheduler child sidecar unreadable"
+            );
+            return within_cap;
+        }
     };
     if child.host != this_host {
         return false;
@@ -172,11 +260,7 @@ pub fn child_may_be_alive(
         Ok(None) => false,
         Ok(Some(start)) => start == child.start_time,
         Err(e) => {
-            let within_cap = claim
-                .last_transition_at
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .is_some_and(|t| now - t.with_timezone(&Utc) < PROBE_ERROR_CAP);
+            let within_cap = within_doubt_cap(claim, now);
             tracing::warn!(
                 pid = child.pid,
                 error = %e,
@@ -213,7 +297,7 @@ mod tests {
     fn same_start_time_is_alive_even_for_an_old_claim() {
         let c = claim_at(now() - Duration::days(3));
         assert!(child_may_be_alive(
-            Some(&marker()),
+            &ChildIdentity::Known(marker()),
             &c,
             "h1",
             now(),
@@ -225,7 +309,7 @@ mod tests {
     fn gone_pid_is_not_alive() {
         let c = claim_at(now());
         assert!(!child_may_be_alive(
-            Some(&marker()),
+            &ChildIdentity::Known(marker()),
             &c,
             "h1",
             now(),
@@ -237,7 +321,7 @@ mod tests {
     fn mismatched_start_time_means_pid_reuse() {
         let c = claim_at(now());
         assert!(!child_may_be_alive(
-            Some(&marker()),
+            &ChildIdentity::Known(marker()),
             &c,
             "h1",
             now(),
@@ -250,22 +334,68 @@ mod tests {
         let err = |_: u32| Err("boom".to_string());
         let fresh = claim_at(now() - Duration::hours(1));
         assert!(child_may_be_alive(
-            Some(&marker()),
+            &ChildIdentity::Known(marker()),
             &fresh,
             "h1",
             now(),
             err
         ));
         let old = claim_at(now() - Duration::hours(25));
-        assert!(!child_may_be_alive(Some(&marker()), &old, "h1", now(), err));
+        assert!(!child_may_be_alive(
+            &ChildIdentity::Known(marker()),
+            &old,
+            "h1",
+            now(),
+            err
+        ));
     }
 
     #[test]
     fn other_host_or_no_identity_keeps_the_grace_behaviour() {
         let c = claim_at(now());
         let alive = |_: u32| Ok(Some(100));
-        assert!(!child_may_be_alive(Some(&marker()), &c, "h2", now(), alive));
-        assert!(!child_may_be_alive(None, &c, "h1", now(), alive));
+        assert!(!child_may_be_alive(
+            &ChildIdentity::Known(marker()),
+            &c,
+            "h2",
+            now(),
+            alive
+        ));
+        assert!(!child_may_be_alive(
+            &ChildIdentity::Unknown,
+            &c,
+            "h1",
+            now(),
+            alive
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_sidecar_is_doubt_not_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path(), "sub-1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{truncated").unwrap();
+        let fresh = claim_at(now() - Duration::hours(1));
+        let identity = identity_for(dir.path(), &fresh);
+        assert!(matches!(identity, ChildIdentity::Unreadable(_)));
+        let never_called = |_: u32| -> Result<Option<u64>, String> { panic!("no probe") };
+        assert!(child_may_be_alive(
+            &identity,
+            &fresh,
+            "h1",
+            now(),
+            never_called
+        ));
+        let old = claim_at(now() - Duration::hours(25));
+        assert!(!child_may_be_alive(
+            &identity,
+            &old,
+            "h1",
+            now(),
+            never_called
+        ));
+        assert_eq!(read_marker(dir.path(), "nope"), MarkerRead::Absent);
     }
 
     #[test]
