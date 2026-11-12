@@ -576,11 +576,29 @@ pub fn generate_transformation_sql_with_warehouse(
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
+    refuse_on_in_place_catalog(model_ir, dialect)?;
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
         &model_ir.target.table,
     )?;
+
+    // An attached Iceberg catalog (ADR-ICEBERG-DUCKDB D3): a full refresh is
+    // one transaction that `WarehouseAdapter::overwrite_in_place` runs. The
+    // plan shows its fixed statements; the column reconcile between `BEGIN`
+    // and `DELETE` is decided at run time from the live table.
+    if dialect.table_replace(&model_ir.target.catalog) == TableReplace::InPlaceOverwrite
+        && matches!(
+            model_ir.materialization,
+            MaterializationStrategy::FullRefresh
+        )
+    {
+        return Ok(in_place_overwrite_statements(
+            dialect,
+            &target,
+            &model_ir.sql,
+        ));
+    }
 
     // Validate all source references
     for source in &model_ir.sources {
@@ -1032,6 +1050,77 @@ fn has_table_options(model_ir: &ModelIr) -> bool {
     redshift_table_options(model_ir).is_some() || clickhouse_table_options(model_ir).is_some()
 }
 
+/// The statements `rocky plan` shows for an in-place overwrite of `target`
+/// (ADR-ICEBERG-DUCKDB D3). `rocky run` adds the column reconcile, decided
+/// from the live table, between `BEGIN` and `DELETE`. On a first build it
+/// runs `CREATE TABLE … AS` instead.
+#[must_use]
+pub fn in_place_overwrite_statements(
+    dialect: &dyn SqlDialect,
+    target: &str,
+    select_sql: &str,
+) -> Vec<String> {
+    vec![
+        "BEGIN TRANSACTION".to_string(),
+        format!("DELETE FROM {target}"),
+        dialect.insert_into(target, select_sql),
+        "COMMIT".to_string(),
+    ]
+}
+
+/// Refuse, before any SQL runs, a model that writes to an in-place-overwrite
+/// catalog (an attached Iceberg catalog) with anything but `full_refresh` or
+/// an append `incremental` (ADR-ICEBERG-DUCKDB D4). The error names the
+/// strategy and the catalog.
+///
+/// # Errors
+///
+/// [`SqlGenError::InvalidRequest`] naming what is not supported.
+pub fn refuse_on_in_place_catalog(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<(), SqlGenError> {
+    let catalog = &model_ir.target.catalog;
+    if dialect.table_replace(catalog) != TableReplace::InPlaceOverwrite {
+        return Ok(());
+    }
+    let refused: Option<&str> = match &model_ir.materialization {
+        MaterializationStrategy::FullRefresh | MaterializationStrategy::Ephemeral => None,
+        MaterializationStrategy::Incremental {
+            unique_key,
+            lookback,
+            ..
+        } => {
+            if !unique_key.is_empty() {
+                Some("incremental with a unique_key (a merge)")
+            } else if lookback.is_some() {
+                Some("incremental with a lookback")
+            } else {
+                None
+            }
+        }
+        MaterializationStrategy::Merge { .. } => Some("merge"),
+        MaterializationStrategy::View => Some("view"),
+        MaterializationStrategy::MaterializedView => Some("materialized_view"),
+        MaterializationStrategy::DynamicTable { .. } => Some("dynamic_table"),
+        MaterializationStrategy::TimeInterval { .. } => Some("time_interval"),
+        MaterializationStrategy::DeleteInsert { .. } => Some("delete_insert"),
+        MaterializationStrategy::Microbatch { .. } => Some("microbatch"),
+        MaterializationStrategy::ContentAddressed { .. } => Some("content_addressed"),
+        MaterializationStrategy::Snapshot(_) => Some("snapshot"),
+    };
+    let refused = refused.or_else(|| model_ir.format.is_some().then_some("a lakehouse `format`"));
+    match refused {
+        None => Ok(()),
+        Some(what) => Err(SqlGenError::InvalidRequest(format!(
+            "model '{}': {what} is not supported on catalog '{catalog}', an attached Iceberg \
+             catalog; Rocky writes it with full_refresh and append incremental only \
+             (ADR-ICEBERG-DUCKDB)",
+            model_ir.name
+        ))),
+    }
+}
+
 /// The staged swap a `FullRefresh` model's run takes on a dialect with no
 /// atomic replace, or `None` when [`SqlDialect::table_replace`] is
 /// [`TableReplace::Atomic`] for the target's catalog (ADR-REPLACE).
@@ -1049,7 +1138,9 @@ pub fn full_refresh_swap(
     dialect: &dyn SqlDialect,
 ) -> Result<Option<crate::replace::StagedSwap>, SqlGenError> {
     match dialect.table_replace(&model_ir.target.catalog) {
-        TableReplace::Atomic => return Ok(None),
+        // An in-place overwrite is not a swap: the runner hands the model's
+        // query to `WarehouseAdapter::overwrite_in_place` instead.
+        TableReplace::Atomic | TableReplace::InPlaceOverwrite => return Ok(None),
         TableReplace::StagedSwap => {}
     }
     let target = rocky_ir::TableRef {
@@ -3909,6 +4000,176 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             .expect("maintenance dialect emits archive SQL");
         assert!(archive[0].1.contains("DELETE FROM"));
         assert!(archive[1].1.contains("VACUUM"));
+    }
+
+    // -----------------------------------------------------------------------
+    // In-place overwrite (ADR-ICEBERG-DUCKDB — Iceberg attached to DuckDB)
+    // -----------------------------------------------------------------------
+
+    /// Catalog `lk` overwrites in place; every other catalog is atomic.
+    struct InPlaceDialect(TestDialect);
+
+    impl SqlDialect for InPlaceDialect {
+        fn watermark_hold_back(
+            &self,
+            ts: &str,
+            held_max: &chrono::DateTime<chrono::Utc>,
+            nulls: crate::traits::NullTimestamps,
+        ) -> AdapterResult<String> {
+            self.0.watermark_hold_back(ts, held_max, nulls)
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+        fn name(&self) -> &'static str {
+            "inplace"
+        }
+        fn table_replace(&self, catalog: &str) -> TableReplace {
+            if catalog == "lk" {
+                TableReplace::InPlaceOverwrite
+            } else {
+                TableReplace::Atomic
+            }
+        }
+        fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
+            self.0.format_table_ref(c, s, t)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            self.0.create_table_as(target, select_sql)
+        }
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            self.0.insert_into(target, select_sql)
+        }
+        fn merge_into(
+            &self,
+            target: &str,
+            source_sql: &str,
+            keys: &[std::sync::Arc<str>],
+            update_cols: &rocky_ir::ColumnSelection,
+        ) -> AdapterResult<String> {
+            self.0.merge_into(target, source_sql, keys, update_cols)
+        }
+        fn select_clause(
+            &self,
+            columns: &rocky_ir::ColumnSelection,
+            metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            self.0.select_clause(columns, metadata)
+        }
+        fn watermark_where(
+            &self,
+            ts: &str,
+            wm: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            self.0.watermark_where(ts, wm)
+        }
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            self.0.describe_table_sql(table_ref)
+        }
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            self.0.drop_table_sql(table_ref)
+        }
+        fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+            self.0.create_catalog_sql(name)
+        }
+        fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+            self.0.create_schema_sql(catalog, schema)
+        }
+        fn tablesample_clause(&self, percent: u32) -> Option<String> {
+            self.0.tablesample_clause(percent)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            target: &str,
+            partition_filter: &str,
+            select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            self.0
+                .insert_overwrite_partition(target, partition_filter, select_sql)
+        }
+    }
+
+    fn lake_ir(materialization: MaterializationStrategy) -> ModelIr {
+        let mut ir = sample_transformation_ir();
+        ir.target.catalog = "lk".into();
+        ir.materialization = materialization;
+        ir
+    }
+
+    #[test]
+    fn full_refresh_on_an_in_place_catalog_renders_the_transaction() {
+        let d = InPlaceDialect(TestDialect);
+        let stmts = generate_transformation_sql(&lake_ir(MaterializationStrategy::FullRefresh), &d)
+            .unwrap();
+        assert_eq!(stmts.len(), 4);
+        assert_eq!(stmts[0], "BEGIN TRANSACTION");
+        assert!(stmts[1].starts_with("DELETE FROM lk.silver.dim_accounts"));
+        assert!(stmts[2].contains("SELECT id, name, email"));
+        assert_eq!(stmts[3], "COMMIT");
+        // No swap: the runner hands the query to `overwrite_in_place`.
+        assert!(
+            full_refresh_swap(&lake_ir(MaterializationStrategy::FullRefresh), &d)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_atomic_catalog_of_the_same_dialect_is_unchanged() {
+        let d = InPlaceDialect(TestDialect);
+        let stmts = generate_transformation_sql(&sample_transformation_ir(), &d).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(refuse_on_in_place_catalog(&sample_transformation_ir(), &d).is_ok());
+    }
+
+    #[test]
+    fn unsupported_strategies_are_refused_naming_strategy_and_catalog() {
+        let d = InPlaceDialect(TestDialect);
+        let cases = [
+            (MaterializationStrategy::View, "view"),
+            (
+                MaterializationStrategy::Merge {
+                    unique_key: vec!["id".into()],
+                    update_columns: rocky_ir::ColumnSelection::All,
+                },
+                "merge",
+            ),
+            (
+                MaterializationStrategy::DeleteInsert {
+                    partition_by: vec!["id".into()],
+                },
+                "delete_insert",
+            ),
+            (
+                MaterializationStrategy::Incremental {
+                    timestamp_column: "ts".into(),
+                    unique_key: vec!["id".into()],
+                    lookback: None,
+                    filter_column: None,
+                },
+                "unique_key",
+            ),
+        ];
+        for (strategy, word) in cases {
+            let ir = lake_ir(strategy);
+            let err = generate_transformation_sql(&ir, &d)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(word), "{err}");
+            assert!(err.contains("catalog 'lk'"), "{err}");
+        }
+    }
+
+    #[test]
+    fn append_incremental_is_allowed_on_an_in_place_catalog() {
+        let d = InPlaceDialect(TestDialect);
+        let ir = lake_ir(MaterializationStrategy::Incremental {
+            timestamp_column: "ts".into(),
+            unique_key: vec![],
+            lookback: None,
+            filter_column: None,
+        });
+        assert!(refuse_on_in_place_catalog(&ir, &d).is_ok());
     }
 
     // -----------------------------------------------------------------------

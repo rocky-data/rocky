@@ -13617,6 +13617,25 @@ async fn execute_models_phase(
         !defer_opts.consumers_logged_by_caller,
     );
 
+    // ADR-ICEBERG-DUCKDB D4: a model this run builds into an attached Iceberg
+    // catalog with a strategy v1 does not write there is refused before any
+    // model runs, so a run never stops halfway through a layer for it.
+    let iceberg_refusals: Vec<String> = compile_result
+        .project
+        .models
+        .iter()
+        .filter(|m| model_name_filter.is_none_or(|name| m.config.name == name))
+        .filter(|m| model_set.is_none_or(|set| set.contains(&m.config.name)))
+        .filter_map(|m| {
+            rocky_core::sql_gen::refuse_on_in_place_catalog(&m.to_model_ir(), warehouse.dialect())
+                .err()
+                .map(|e| e.to_string())
+        })
+        .collect();
+    if !iceberg_refusals.is_empty() {
+        anyhow::bail!("nothing was run: {}", iceberg_refusals.join("; "));
+    }
+
     // `--model <function>` selects a user-defined function (`functions/`):
     // create it and the functions it calls, and build no model.
     if let Some(name) = model_name_filter
@@ -17120,6 +17139,74 @@ async fn execute_one_plain_model(
     // staged swap through its executor, which adds the probes and the
     // rollback that the plain statement list cannot (ADR-REPLACE). The swap
     // is built by the same function that produced `exec_stmts`.
+    // An attached Iceberg catalog (ADR-ICEBERG-DUCKDB D3): a full refresh of
+    // an existing table is one transaction in the adapter, which reconciles
+    // the columns and rewrites the rows; a first build is a plain CREATE.
+    if !skip_strategy_exec
+        && matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::FullRefresh
+        )
+        && dialect.table_replace(&model_ir.target.catalog)
+            == rocky_core::traits::TableReplace::InPlaceOverwrite
+    {
+        if pending_drop.is_some() {
+            return Err(anyhow::anyhow!(
+                "model '{model_name}': {target_ref} is another kind of object; Rocky does not \
+                 drop objects in catalog '{}', an attached Iceberg catalog. Nothing was changed",
+                model_ir.target.catalog
+            ));
+        }
+        let target_struct = rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        };
+        let target_absent = match warehouse.describe_table(&target_struct).await {
+            Ok(_) => false,
+            Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "target existence probe for model '{model_name}' failed with a \
+                     retryable error; refusing to assume '{target_ref}' is absent"
+                )));
+            }
+            Err(_) => true,
+        };
+        if target_absent {
+            let create = dialect.create_table_as_new(&target_ref, &model_ir.sql);
+            let stats =
+                super::run_upstream_reads::run_model_statement(warehouse, &create, &mut reads_acc)
+                    .await
+                    .map_err(|e| {
+                        anyhow::Error::from(e).context(format!(
+                            "first build of '{target_ref}' for model '{model_name}' failed"
+                        ))
+                    })?;
+            bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+            bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+        } else {
+            match warehouse
+                .overwrite_in_place(&target_ref, &model_ir.sql)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(anyhow::anyhow!(
+                        "model '{model_name}': this adapter cannot overwrite {target_ref} in \
+                         place; nothing was changed"
+                    ));
+                }
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context(format!("model '{model_name}' failed"))
+                    );
+                }
+            }
+            // The transaction ran outside the measured call.
+            reads_acc.mark_unmeasured();
+        }
+        skip_strategy_exec = true;
+    }
     let full_refresh_swap = match (&model_ir.materialization, &pending_drop) {
         (rocky_ir::MaterializationStrategy::FullRefresh, None) if !skip_strategy_exec => {
             rocky_core::sql_gen::full_refresh_swap(&model_ir, dialect)?
@@ -19794,6 +19881,15 @@ async fn process_table(
     let swap = if target_exists && strategy_name == "full_refresh" {
         match dialect.table_replace(&target_table.catalog) {
             rocky_core::traits::TableReplace::Atomic => None,
+            // ADR-ICEBERG-DUCKDB D4: a replication full refresh of an existing
+            // Iceberg table is not in v1. The first copy (a plain CREATE) and
+            // incremental appends are.
+            rocky_core::traits::TableReplace::InPlaceOverwrite => anyhow::bail!(
+                "table {}: a replication full_refresh of an existing table is not supported on \
+                 catalog '{}' (an attached Iceberg catalog); use strategy = \"incremental\"",
+                target_table.full_name(),
+                target_table.catalog
+            ),
             rocky_core::traits::TableReplace::StagedSwap => {
                 let names = rocky_core::replace::SwapNames::for_target(&target_table)
                     .map_err(anyhow::Error::from)?;

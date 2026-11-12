@@ -10,7 +10,8 @@
 use std::fmt::Write;
 
 use rocky_core::traits::{
-    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, hold_back_predicate,
+    AdapterError, AdapterResult, LiteralEscape, NullTimestamps, SqlDialect, TableReplace,
+    hold_back_predicate,
 };
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
@@ -54,7 +55,8 @@ fn watermark_literal(t: Option<&chrono::DateTime<chrono::Utc>>) -> String {
 
 /// DuckDB's SQL dialect. `iceberg_catalogs` names the attached catalogs that are
 /// Iceberg REST catalogs (lower-cased); it is empty for a plain DuckDB file or
-/// in-memory database. Nothing reads it yet.
+/// in-memory database. It decides [`SqlDialect::table_replace`] and
+/// [`SqlDialect::create_schema_sql`] for those catalogs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DuckDbSqlDialect {
     iceberg_catalogs: std::collections::BTreeSet<String>,
@@ -299,12 +301,35 @@ impl SqlDialect for DuckDbSqlDialect {
         None
     }
 
-    fn create_schema_sql(&self, _catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+    /// A plain DuckDB schema is created in the default catalog, as before.
+    /// A schema of an attached Iceberg catalog is named with its catalog,
+    /// because that catalog is never the default (ADR-ICEBERG-DUCKDB D1).
+    fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+        if self.is_iceberg_catalog(catalog) {
+            return Some(
+                validation::validate_identifier(catalog)
+                    .and_then(|_| validation::validate_identifier(schema))
+                    .map(|_| format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"))
+                    .map_err(AdapterError::new),
+            );
+        }
         Some(
             validation::validate_identifier(schema)
                 .map(|_| format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
                 .map_err(AdapterError::new),
         )
+    }
+
+    /// DuckDB-Iceberg refuses `CREATE OR REPLACE TABLE` and a rename inside
+    /// a write transaction, so an attached Iceberg catalog is overwritten in
+    /// place (ADR-ICEBERG-DUCKDB D3). Every other catalog replaces
+    /// atomically.
+    fn table_replace(&self, catalog: &str) -> TableReplace {
+        if self.is_iceberg_catalog(catalog) {
+            TableReplace::InPlaceOverwrite
+        } else {
+            TableReplace::Atomic
+        }
     }
 
     fn tablesample_clause(&self, percent: u32) -> Option<String> {

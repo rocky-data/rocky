@@ -228,6 +228,9 @@ pub enum ConfigError {
     #[error("adapter '{name}' (type 'manual'): {detail}")]
     ManualAdapterInvalidSchema { name: EnvString, detail: EnvString },
 
+    #[error("adapter '{name}': attach: {detail}")]
+    DuckDbAttachInvalid { name: EnvString, detail: EnvString },
+
     #[error(
         "adapter '{name}' (type '{adapter_type}') sets `schemas`, which only a type = \"manual\" \
          discovery adapter reads; remove the [[adapter.{name}.schemas]] blocks"
@@ -5871,6 +5874,117 @@ pub enum AdapterKind {
     Discovery,
 }
 
+/// One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"`
+/// adapter attaches to its connection under `alias`.
+///
+/// ```toml
+/// [[adapter.lake.attach]]
+/// alias = "lk"
+/// type = "iceberg"
+/// warehouse = "demo"
+/// endpoint = "${ICEBERG_ENDPOINT}"
+///
+/// [adapter.lake.attach.s3]
+/// key_id = "${S3_KEY_ID}"
+/// secret = "${S3_SECRET}"
+/// endpoint = "localhost:8333"
+/// url_style = "path"
+/// use_ssl = false
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DuckDbAttach {
+    /// The catalog name models use to target this attachment. A SQL
+    /// identifier. It must not be `memory`, `main`, `temp`, `system`, the
+    /// database file's own catalog name or another entry's alias.
+    pub alias: String,
+    /// What the attachment is. Only `"iceberg"` (an Iceberg REST catalog).
+    #[serde(rename = "type")]
+    pub attach_type: DuckDbAttachType,
+    /// The warehouse name the REST catalog knows.
+    pub warehouse: EnvString,
+    /// The REST catalog's base URL, for example `http://localhost:8181/catalog`.
+    pub endpoint: EnvString,
+    /// How Rocky authenticates to the REST catalog. Only `"none"` today.
+    #[serde(default)]
+    pub authorization: DuckDbAttachAuthorization,
+    /// Object-store credentials for the table files. Rocky turns them into
+    /// a temporary DuckDB secret scoped to this attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<DuckDbAttachS3>,
+}
+
+/// The kind of catalog a [`DuckDbAttach`] entry attaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DuckDbAttachType {
+    /// An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
+    Iceberg,
+}
+
+/// How a [`DuckDbAttach`] entry authenticates to its catalog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DuckDbAttachAuthorization {
+    /// No catalog authentication (`AUTHORIZATION_TYPE 'none'`).
+    #[default]
+    None,
+}
+
+/// The S3 settings of a [`DuckDbAttach`] entry. Every field is optional;
+/// an unset one leaves DuckDB's default.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DuckDbAttachS3 {
+    /// Access key id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<EnvString>,
+    /// Secret access key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<RedactedString>,
+    /// The S3 endpoint as `host[:port]`, for an S3-compatible store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<EnvString>,
+    /// `"path"` or `"vhost"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_style: Option<S3UrlStyle>,
+    /// Whether to use HTTPS. DuckDB's default is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_ssl: Option<bool>,
+    /// The bucket region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<EnvString>,
+    /// The path prefix the secret applies to, for example `s3://warehouse`.
+    /// When unset the secret applies to every `s3://` path of the
+    /// connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<EnvString>,
+}
+
+impl std::fmt::Debug for DuckDbAttachS3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuckDbAttachS3")
+            .field("key_id", &self.key_id)
+            .field("secret", &self.secret.as_ref().map(|_| "***"))
+            .field("endpoint", &self.endpoint)
+            .field("url_style", &self.url_style)
+            .field("use_ssl", &self.use_ssl)
+            .field("region", &self.region)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// S3 addressing style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum S3UrlStyle {
+    /// `https://host/bucket/key`.
+    Path,
+    /// `https://bucket.host/key`.
+    Vhost,
+}
+
 /// Configuration for a named adapter instance.
 ///
 /// The `type` field determines which adapter crate handles this config.
@@ -5961,6 +6075,15 @@ pub struct AdapterConfig {
     /// `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub offline: bool,
+    /// Other catalogs this DuckDB connection attaches when `rocky run`
+    /// connects. Each entry is an Iceberg REST catalog that models target by
+    /// its `alias` (`[target] catalog = "<alias>"`). `rocky compile` and
+    /// `rocky plan` never attach. Refused on every other adapter type; see
+    /// [`validate_duckdb_attachments`] and `docs/adr/ADR-ICEBERG-DUCKDB.md`.
+    // Skipped when empty, so the config digest a plan records stays the same
+    // for a project that does not use it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attach: Vec<DuckDbAttach>,
 
     // -- Fivetran sync trigger --
     /// The credential owner's opt-in to let Rocky start a Fivetran sync with
@@ -6104,6 +6227,7 @@ impl std::fmt::Debug for AdapterConfig {
             .field("path", &self.path)
             .field("extension_directory", &self.extension_directory)
             .field("offline", &self.offline)
+            .field("attach", &self.attach)
             .field("schemas", &self.schemas)
             .field("retry", &self.retry)
             .field("cache", &self.cache)
@@ -9342,6 +9466,7 @@ type ConfigValidator = fn(&RockyConfig) -> Vec<ConfigError>;
 const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_adapter_kinds,
     validate_manual_adapters,
+    validate_duckdb_attachments,
     validate_replication_strategies,
     validate_schema_pattern_reserved_components,
     validate_separators,
@@ -9470,6 +9595,67 @@ pub fn load_rocky_config_fingerprinted(path: &Path) -> Result<LoadedConfig, Conf
 ///
 /// Part of [`CONFIG_VALIDATORS`], so `rocky validate` and every command that
 /// loads the config (`plan`, `run`, `discover`) agree.
+/// Catalog names a `[[adapter.<name>.attach]]` alias may never take: the
+/// in-memory database's name and DuckDB's built-in catalogs. The database
+/// file's own catalog name is checked where the path is known (the DuckDB
+/// adapter's connect step), because it depends on how DuckDB names a file.
+pub const DUCKDB_RESERVED_ATTACH_ALIASES: &[&str] = &["memory", "main", "temp", "system"];
+
+/// `[[adapter.<name>.attach]]` is a DuckDB setting: refuse it on any other
+/// adapter type, and refuse an alias that is not an identifier, is reserved,
+/// or repeats another alias of the same adapter (case-insensitively, as
+/// DuckDB compares catalog names).
+pub fn validate_duckdb_attachments(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (name, adapter) in &config.adapters {
+        if adapter.attach.is_empty() {
+            continue;
+        }
+        let mut invalid = |detail: String| {
+            errors.push(ConfigError::DuckDbAttachInvalid {
+                name: name.clone().into(),
+                detail: detail.into(),
+            });
+        };
+        if adapter.adapter_type != "duckdb" {
+            invalid(format!(
+                "only a type = \"duckdb\" adapter attaches catalogs, not type '{}'; \
+                 remove the [[adapter.{name}.attach]] blocks",
+                adapter.adapter_type
+            ));
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (index, entry) in adapter.attach.iter().enumerate() {
+            if let Err(e) = rocky_sql::validation::validate_identifier(&entry.alias) {
+                invalid(format!("attach[{index}].alias: {e}"));
+                continue;
+            }
+            let lower = entry.alias.to_ascii_lowercase();
+            if DUCKDB_RESERVED_ATTACH_ALIASES.contains(&lower.as_str()) {
+                invalid(format!(
+                    "attach[{index}].alias '{}' is a DuckDB built-in catalog name; choose another",
+                    entry.alias
+                ));
+                continue;
+            }
+            if !seen.insert(lower) {
+                invalid(format!(
+                    "attach[{index}].alias '{}' is used by another attachment",
+                    entry.alias
+                ));
+            }
+            if entry.warehouse.expose().is_empty() {
+                invalid(format!("attach[{index}].warehouse is empty"));
+            }
+            if entry.endpoint.expose().is_empty() {
+                invalid(format!("attach[{index}].endpoint is empty"));
+            }
+        }
+    }
+    errors
+}
+
 pub fn validate_manual_adapters(config: &RockyConfig) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     for (name, adapter) in &config.adapters {
@@ -14801,6 +14987,7 @@ table = "customers_history"
             location: None,
             path: None,
             extension_directory: None,
+            attach: Vec::new(),
             offline: false,
             allow_sync_trigger: false,
             schemas: Vec::new(),
@@ -17999,6 +18186,110 @@ adapter = "default"
             Some("/opt/duckdb-ext")
         );
         assert!(set.offline);
+    }
+
+    const ATTACH_BLOCK: &str = r#"
+[adapter]
+type = "duckdb"
+
+[[adapter.attach]]
+alias = "lk"
+type = "iceberg"
+warehouse = "demo"
+endpoint = "http://localhost:8181/catalog"
+
+[adapter.attach.s3]
+key_id = "KEY-ID-ATTACH"
+secret = "SECRET-ATTACH-123"
+url_style = "path"
+use_ssl = false
+"#;
+
+    /// `[[attach]]` parses, defaults `authorization` to `none`, and never
+    /// prints the S3 secret.
+    #[test]
+    fn duckdb_attach_parses_and_redacts_the_secret() {
+        let cfg = parse_rocky_config_str(ATTACH_BLOCK).expect("parses");
+        let adapter = &cfg.adapters["default"];
+        assert_eq!(adapter.attach.len(), 1);
+        let entry = &adapter.attach[0];
+        assert_eq!(entry.alias, "lk");
+        assert_eq!(entry.authorization, DuckDbAttachAuthorization::None);
+        let s3 = entry.s3.as_ref().expect("s3 block");
+        assert_eq!(s3.url_style, Some(S3UrlStyle::Path));
+        assert_eq!(s3.use_ssl, Some(false));
+        assert!(!format!("{adapter:?}").contains("SECRET-ATTACH-123"));
+        assert!(
+            !serde_json::to_string(adapter)
+                .unwrap()
+                .contains("SECRET-ATTACH-123")
+        );
+        assert!(validate_duckdb_attachments(&cfg).is_empty());
+    }
+
+    /// No attachment: the key is absent from the serialized adapter, so a
+    /// recorded config digest is unchanged.
+    #[test]
+    fn duckdb_attach_is_skipped_when_empty() {
+        let plain = adapter_from_toml("type = \"duckdb\"\n");
+        assert!(!serde_json::to_string(&plain).unwrap().contains("attach"));
+    }
+
+    #[test]
+    fn duckdb_attach_refuses_unknown_keys_and_authorizations() {
+        for (bad, needle) in [
+            (
+                ATTACH_BLOCK.replace("warehouse = \"demo\"", "warehouse = \"demo\"\nwarehous = 1"),
+                "warehous",
+            ),
+            (
+                ATTACH_BLOCK.replace("type = \"iceberg\"", "type = \"delta\""),
+                "delta",
+            ),
+            (
+                ATTACH_BLOCK.replace(
+                    "warehouse = \"demo\"",
+                    "warehouse = \"demo\"\nauthorization = \"oauth2\"",
+                ),
+                "oauth2",
+            ),
+        ] {
+            let err = parse_rocky_config_str(&bad).expect_err("must reject");
+            assert!(format!("{err}").contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn duckdb_attach_validation_refuses_bad_aliases_and_other_types() {
+        let cases = [
+            (
+                ATTACH_BLOCK.replace("alias = \"lk\"", "alias = \"memory\""),
+                "built-in",
+            ),
+            (
+                ATTACH_BLOCK.replace("alias = \"lk\"", "alias = \"lk-1\""),
+                "attach[0].alias",
+            ),
+            (
+                ATTACH_BLOCK.replace("type = \"duckdb\"", "type = \"databricks\""),
+                "only a type = \"duckdb\"",
+            ),
+            (
+                format!(
+                    "{ATTACH_BLOCK}\n[[adapter.attach]]\nalias = \"LK\"\ntype = \"iceberg\"\n\
+                     warehouse = \"w\"\nendpoint = \"http://x\"\n"
+                ),
+                "used by another",
+            ),
+        ];
+        for (toml_text, needle) in cases {
+            let cfg = parse_rocky_config_str(&toml_text).expect("parses");
+            let errors = validate_duckdb_attachments(&cfg);
+            assert!(
+                errors.iter().any(|e| e.to_string().contains(needle)),
+                "{needle}: {errors:?}"
+            );
+        }
     }
 
     /// Every credential and principal field an adapter block can carry,

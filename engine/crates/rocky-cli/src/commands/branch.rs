@@ -1526,6 +1526,11 @@ fn promote_swap(
     match dialect.table_replace(&step.target_catalog) {
         rocky_core::traits::TableReplace::Atomic => return Ok(None),
         rocky_core::traits::TableReplace::StagedSwap => {}
+        rocky_core::traits::TableReplace::InPlaceOverwrite => anyhow::bail!(
+            "promote is not supported on catalog '{}': it is an attached Iceberg catalog, \
+             which Rocky writes with full_refresh and append incremental only",
+            step.target_catalog
+        ),
     }
     let prod = TargetRef {
         catalog: step.target_catalog.clone(),

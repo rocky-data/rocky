@@ -535,7 +535,9 @@ pub async fn recover_interrupted_swap(
 ) -> Result<Option<String>, ReplaceError> {
     let dialect = warehouse.dialect();
     match dialect.table_replace(&target.catalog) {
-        TableReplace::Atomic => return Ok(None),
+        // An in-place overwrite runs in one transaction and keeps no
+        // backup, so there is nothing to recover.
+        TableReplace::Atomic | TableReplace::InPlaceOverwrite => return Ok(None),
         TableReplace::StagedSwap => {}
     }
     // A target with a reserved name never had a swap, so it has no backup.

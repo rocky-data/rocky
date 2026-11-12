@@ -251,6 +251,33 @@ pub(crate) fn sqlserver_dialect_for_config(
 static DUCKDB_DIALECT: rocky_duckdb::dialect::DuckDbSqlDialect =
     rocky_duckdb::dialect::DuckDbSqlDialect::plain();
 
+/// The dialect a `duckdb` adapter block renders with: it knows the block's
+/// `[[attach]]` Iceberg aliases, so `rocky plan` renders what `rocky run`
+/// executes without connecting (ADR-ICEBERG-DUCKDB D2). `None` for any other
+/// adapter type, and for a block with no attachment (the caller's default
+/// is the same dialect).
+#[cfg(feature = "duckdb")]
+pub(crate) fn duckdb_dialect_for_config(
+    adapter_cfg: &AdapterConfig,
+) -> Option<Box<dyn rocky_core::traits::SqlDialect>> {
+    if adapter_cfg.adapter_type != "duckdb" || adapter_cfg.attach.is_empty() {
+        return None;
+    }
+    Some(Box::new(
+        rocky_duckdb::dialect::DuckDbSqlDialect::with_iceberg_catalogs(
+            adapter_cfg.attach.iter().map(|a| &a.alias),
+        ),
+    ))
+}
+
+/// Without the `duckdb` feature there is no DuckDB dialect to configure.
+#[cfg(not(feature = "duckdb"))]
+pub(crate) fn duckdb_dialect_for_config(
+    _adapter_cfg: &AdapterConfig,
+) -> Option<Box<dyn rocky_core::traits::SqlDialect>> {
+    None
+}
+
 static POSTGRES_DIALECT: rocky_postgres::PostgresDialect =
     rocky_postgres::PostgresDialect::const_default();
 static REDSHIFT_DIALECT: rocky_postgres::RedshiftDialect =
@@ -533,6 +560,17 @@ impl AdapterRegistry {
                         })?
                     };
 
+                    // `[[adapter.<name>.attach]]`: attach the Iceberg catalogs on
+                    // the same connection (ADR-ICEBERG-DUCKDB D1). The error
+                    // renders resolved `${VAR}` values as their names.
+                    let warehouse_adapter = warehouse_adapter
+                        .with_attachments(&adapter_cfg.attach, &extensions)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "adapters.{name}: {}",
+                                rocky_core::secret_registry::render_placeholders(&e.to_string())
+                            )
+                        })?;
                     let shared = warehouse_adapter.shared_connector();
                     let warehouse_arc = Arc::new(warehouse_adapter);
                     warehouse.insert(name.clone(), warehouse_arc as Arc<dyn WarehouseAdapter>);
