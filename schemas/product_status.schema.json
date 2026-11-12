@@ -717,6 +717,77 @@
       ],
       "type": "object"
     },
+    "ProductVolumeBreachStatus": {
+      "description": "An open volume breach: the output model stays failed in every run until it is rebuilt or the breach is cleared (#2581).",
+      "properties": {
+        "max_rows": {
+          "description": "The declared `max_rows` at the newest breach.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_rows": {
+          "description": "The declared `min_rows` at the newest breach.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The output model held failed.",
+          "type": "string"
+        },
+        "opened_at": {
+          "description": "When the breach was first recorded.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "partitions": {
+          "default": [],
+          "description": "For a `time_interval` output, the partition keys still breached. Empty means the whole output.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "product": {
+          "description": "The product that declares the range.",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "description": "The newest breach, in words.",
+          "type": "string"
+        },
+        "rows": {
+          "description": "The row count of the newest breach, when it was counted.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "The run that recorded it, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model",
+        "opened_at",
+        "product"
+      ],
+      "type": "object"
+    },
     "ProductVolumeStatus": {
       "description": "The declared volume range and the latest production count.",
       "properties": {
@@ -1001,6 +1072,13 @@
       "format": "uint64",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "open_volume_breaches": {
+      "description": "The volume breaches still open for this product: an `error` range breached and not yet rebuilt or cleared. Each holds its output model failed in every run. Empty (and omitted) when none is open.",
+      "items": {
+        "$ref": "#/definitions/ProductVolumeBreachStatus"
+      },
+      "type": "array"
     },
     "output_model": {
       "description": "The resolved output model, when the spec parses.",

@@ -1047,6 +1047,70 @@ pub struct ProductApproveOutput {
     pub already_approved: bool,
 }
 
+/// JSON output of `rocky product clear-breach`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductClearBreachOutput {
+    pub version: String,
+    pub command: String,
+    /// The product name.
+    pub product: String,
+    /// The output model whose breach marker was cleared.
+    pub model: String,
+    /// True when a marker was open and was deleted. False when none was
+    /// open, so a second call changes nothing.
+    pub was_open: bool,
+    /// The marker that was deleted, when one was open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared: Option<ProductVolumeBreachStatus>,
+}
+
+/// An open volume breach: the output model stays failed in every run until
+/// it is rebuilt or the breach is cleared (#2581).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductVolumeBreachStatus {
+    /// The product that declares the range.
+    pub product: String,
+    /// The output model held failed.
+    pub model: String,
+    /// When the breach was first recorded.
+    pub opened_at: chrono::DateTime<chrono::Utc>,
+    /// The run that recorded it, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// For a `time_interval` output, the partition keys still breached.
+    /// Empty means the whole output.
+    #[serde(default)]
+    pub partitions: Vec<String>,
+    /// The row count of the newest breach, when it was counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// The declared `min_rows` at the newest breach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    /// The declared `max_rows` at the newest breach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+    /// The newest breach, in words.
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl From<rocky_core::product::breach::VolumeBreachMarker> for ProductVolumeBreachStatus {
+    fn from(marker: rocky_core::product::breach::VolumeBreachMarker) -> Self {
+        Self {
+            product: marker.product,
+            model: marker.model,
+            opened_at: marker.opened_at,
+            run_id: marker.run_id,
+            partitions: marker.partitions,
+            rows: marker.rows,
+            min_rows: marker.min_rows,
+            max_rows: marker.max_rows,
+            reason: marker.reason,
+        }
+    }
+}
+
 /// JSON output of `rocky product status`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ProductStatusOutput {
@@ -1113,6 +1177,11 @@ pub struct ProductStatusOutput {
     /// omitted) when the spec declares no source range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_volumes: Vec<ProductSourceVolumeStatus>,
+    /// The volume breaches still open for this product: an `error` range
+    /// breached and not yet rebuilt or cleared. Each holds its output model
+    /// failed in every run. Empty (and omitted) when none is open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_volume_breaches: Vec<ProductVolumeBreachStatus>,
     /// The product's cost for the current month (in the project's
     /// `[schedule].timezone`), with its `[product_budget.<name>]` verdict and
     /// breach events when it has a budget: its row from `rocky cost --month
@@ -2309,6 +2378,59 @@ fn product_approve_with(
     }
 }
 
+/// Delete the open volume breach marker of `model` of product `product_name`.
+///
+/// Idempotent: a model with no open marker reports `was_open = false`. Opens
+/// the store read-write, so a store that does not exist yet is created empty.
+pub(crate) fn product_clear_breach(
+    state_path: &Path,
+    product_name: &str,
+    model: &str,
+) -> Result<ProductClearBreachOutput> {
+    let store = open_state_store(state_path)?;
+    let existing = store.volume_breach_get(product_name, model)?;
+    let was_open = match &existing {
+        Some(_) => store.volume_breach_delete(product_name, model)?,
+        None => false,
+    };
+    Ok(ProductClearBreachOutput {
+        version: VERSION.to_string(),
+        command: "product_clear_breach".to_string(),
+        product: product_name.to_string(),
+        model: model.to_string(),
+        was_open,
+        cleared: existing
+            .filter(|_| was_open)
+            .map(ProductVolumeBreachStatus::from),
+    })
+}
+
+/// Execute `rocky product clear-breach <name> --model <model>`.
+pub fn run_product_clear_breach(
+    product_name: &str,
+    model: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
+    rocky_sql::validation::validate_identifier(model)
+        .map_err(|e| anyhow::anyhow!("invalid --model '{model}': {e}"))?;
+    let output = product_clear_breach(state_path, product_name, model)?;
+    if output_json {
+        print_json(&output)?;
+    } else if output.was_open {
+        println!(
+            "cleared the open volume breach of model {} (product {}); the next run judges it as usual",
+            output.model, output.product
+        );
+    } else {
+        println!(
+            "no open volume breach for model {} of product {}; nothing changed",
+            output.model, output.product
+        );
+    }
+    Ok(())
+}
+
 /// Execute `rocky product approve <name>`.
 pub fn run_product_approve(
     config_path: &Path,
@@ -2410,6 +2532,7 @@ pub(crate) fn product_status_at(
         delivery: None,
         volume: None,
         source_volumes: Vec::new(),
+        open_volume_breaches: Vec::new(),
         cost_month: None,
         cost_month_error: None,
     };
@@ -2508,6 +2631,11 @@ pub(crate) fn product_status_at(
             source_volume_statuses(&parsed.product().source.volume, latest.as_ref());
     }
     if let Some(store) = store {
+        output.open_volume_breaches = store
+            .volume_breach_list_for_product(product_name)?
+            .into_iter()
+            .map(ProductVolumeBreachStatus::from)
+            .collect();
         if let Some(record) = store.product_approval_get(product_name)? {
             // `snapshot_intact: false` is an accusation — it says the bytes a
             // human approved no longer match. Only a snapshot that was READ
@@ -2832,6 +2960,9 @@ pub fn run_product_status(
         if let Some(volume) = &output.volume {
             print_volume(volume);
         }
+        for breach in &output.open_volume_breaches {
+            print_volume_breach(breach);
+        }
         for source in &output.source_volumes {
             print_source_volume(source);
         }
@@ -3030,6 +3161,26 @@ fn volume_status(
 }
 
 /// The human-readable volume lines of `rocky product status`.
+fn print_volume_breach(breach: &ProductVolumeBreachStatus) {
+    let what = if breach.partitions.is_empty() {
+        "the whole output".to_string()
+    } else {
+        format!("partition(s) {}", breach.partitions.join(", "))
+    };
+    println!(
+        "  OPEN VOLUME BREACH: model '{}' is held failed since {} ({what})",
+        breach.model,
+        breach.opened_at.to_rfc3339()
+    );
+    if !breach.reason.is_empty() {
+        println!("    {}", breach.reason);
+    }
+    println!(
+        "    clear it by rebuilding the output, or run: rocky product clear-breach {} --model {}",
+        breach.product, breach.model
+    );
+}
+
 fn print_volume(volume: &ProductVolumeStatus) {
     let bound = |value: Option<u64>| value.map_or_else(|| "-".to_string(), |v| v.to_string());
     println!(

@@ -35,22 +35,38 @@
 //! only the breaching partitions are marked failed in the run record. A
 //! partition run that itself failed still judges the partitions it wrote.
 //!
-//! What an `error` breach does and does not do:
+//! What an `error` breach does:
 //!
-//! 1. It fails the model for the run that wrote the rows and withholds
-//!    downstream for that run only. The rows are not rolled back.
-//! 2. Time-interval: the breaching partition is recorded `Failed` in the
-//!    partition state. `--missing`, `--partition` or `--from`/`--to` rewrite
-//!    it and judge it again. A default run (latest) does not revisit it, so
-//!    downstream can build over the breached rows until it is rewritten.
-//! 3. Incremental and merge: each load is judged alone. The next in-range
-//!    load passes. The remedy is `--full-refresh`, which judges the whole
-//!    table.
-//! 4. `rocky product status` shows the newest build's verdict. An earlier
-//!    breach is not shown.
+//! 1. It fails the model for the run that wrote the rows. The rows are not
+//!    rolled back.
+//! 2. It opens a breach marker for the model in the replicated state store
+//!    ([`rocky_core::product::breach::VolumeBreachMarker`]), written right
+//!    after the judgment. A time-interval marker lists the breached
+//!    partition keys.
+//! 3. While a marker is open, every run that builds the model fails it,
+//!    even when that run's load is in range, so downstream stays withheld.
+//!    The load still writes its rows. Only the verdict is failed.
+//! 4. A rebuild clears the marker, once it is judged in range. For
+//!    incremental, merge and full-refresh outputs that is a build that
+//!    created or replaced the whole table (a first run, `--full-refresh`, a
+//!    drift rebuild). For a time-interval output it is a rewrite of each
+//!    breached partition (`--missing`, `--partition`, `--from`/`--to`). The
+//!    marker goes when its last partition is clear.
+//! 5. `rocky product clear-breach` deletes the marker by hand.
+//! 6. `rocky product status` lists the open breaches.
 //!
-//! Keeping a breached output failed until it is rebuilt is planned work
-//! (#2581).
+//! ```text
+//!   error breach ──▶ marker opened, model fails
+//!   marker open, in-range append ──▶ rows written, model still fails
+//!   marker open, rebuild in range ──▶ marker deleted, model passes
+//! ```
+//!
+//! A marker is written per model, right after its judgment, so a crash
+//! cannot lose a breach. A failed write of a new marker fails the model
+//! (closed). A failed delete only warns: the marker stays and the model
+//! stays failed. A run with no state store, and a non-production run,
+//! neither reads nor writes markers. A model a run does not build is not
+//! held by this check.
 //!
 //! Counting assumes this run is the table's only writer. A reported count
 //! needs no such assumption, but the cross-check against the table's own
@@ -62,6 +78,7 @@
 
 use std::path::Path;
 
+use rocky_core::product::breach::VolumeBreachMarker;
 use rocky_core::product::spec::{VolumeBasis, VolumeSeverity, VolumeVerdict};
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
 use rocky_ir::MaterializationStrategy;
@@ -88,6 +105,219 @@ impl ProductVolumes {
     /// True when a product declares a range for `model`.
     pub(crate) fn declares(&self, model: &str) -> bool {
         self.for_model(model).is_some()
+    }
+}
+
+/// The state store the volume check keeps breach markers in, and the run
+/// that writes them. With no store a run reads and writes no marker.
+#[derive(Clone, Copy)]
+pub(crate) struct BreachLedger<'a> {
+    pub(crate) store: Option<&'a rocky_core::state::StateStore>,
+    pub(crate) run_id: &'a str,
+}
+
+/// What the marker ledger says about one model after this run's judgment.
+#[derive(Debug, PartialEq, Eq)]
+enum Standing {
+    /// No marker holds the model.
+    Clear,
+    /// An open marker holds the model failed; the sentence says why.
+    Held(String),
+    /// A marker could not be read or written; the sentence says what. The
+    /// model fails.
+    StoreFailed(String),
+}
+
+fn held_message(marker: &VolumeBreachMarker, partitions: &[String]) -> String {
+    let (product, model) = (&marker.product, &marker.model);
+    let clear = format!("`rocky product clear-breach {product} --model {model}` clears it by hand");
+    let how = if partitions.is_empty() {
+        format!("Rebuild the whole output with `rocky run --full-refresh`, or {clear}.")
+    } else {
+        format!(
+            "Still breached: partition(s) {}. Rewrite them with `rocky run --missing` or \
+             `rocky run --partition <key>`, or {clear}.",
+            partitions.join(", ")
+        )
+    };
+    let was = if marker.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", marker.reason)
+    };
+    format!(
+        "model '{model}' is held failed by an open volume breach of product '{product}', \
+         opened {}{was}. {how}",
+        marker.opened_at.to_rfc3339()
+    )
+}
+
+impl BreachLedger<'_> {
+    fn read(&self, product: &str, model: &str) -> Result<Option<VolumeBreachMarker>, Standing> {
+        let Some(store) = self.store else {
+            return Ok(None);
+        };
+        store.volume_breach_get(product, model).map_err(|e| {
+            Standing::StoreFailed(format!(
+                "model '{model}' could not be checked for an open volume breach: the state \
+                 store read failed ({e}); failing closed"
+            ))
+        })
+    }
+
+    fn newest(
+        &self,
+        range: &ProductVolume,
+        model: &str,
+        existing: Option<&VolumeBreachMarker>,
+        check: &VolumeCheckOutput,
+        reason: &str,
+        partitions: Vec<String>,
+    ) -> VolumeBreachMarker {
+        VolumeBreachMarker {
+            product: range.product.clone(),
+            model: model.to_string(),
+            opened_at: existing.map_or_else(chrono::Utc::now, |m| m.opened_at),
+            run_id: existing
+                .and_then(|m| m.run_id.clone())
+                .or_else(|| Some(self.run_id.to_string())),
+            partitions,
+            rows: check.row_count,
+            min_rows: check.min_rows,
+            max_rows: check.max_rows,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn open(&self, marker: &VolumeBreachMarker) -> Standing {
+        let Some(store) = self.store else {
+            return Standing::Clear;
+        };
+        match store.volume_breach_put(marker) {
+            Ok(()) => Standing::Clear,
+            Err(e) => Standing::StoreFailed(format!(
+                "the breach could not be recorded in the state store ({e}), so the next run \
+                 will not hold model '{}' failed",
+                marker.model
+            )),
+        }
+    }
+
+    /// Settle the marker of a model that is judged as a whole: full refresh,
+    /// incremental or merge. `breach` is the sentence of an `error` breach
+    /// this load made. `rebuilt_in_range` is true when this build created or
+    /// replaced the whole table and the count is in range.
+    fn settle_whole(
+        &self,
+        range: &ProductVolume,
+        model: &str,
+        check: &VolumeCheckOutput,
+        breach: Option<&str>,
+        rebuilt_in_range: bool,
+    ) -> Standing {
+        let existing = match self.read(&range.product, model) {
+            Ok(existing) => existing,
+            Err(failed) => return failed,
+        };
+        if let Some(line) = breach {
+            return self.open(&self.newest(range, model, existing.as_ref(), check, line, vec![]));
+        }
+        let Some(existing) = existing else {
+            return Standing::Clear;
+        };
+        if rebuilt_in_range && let Some(store) = self.store {
+            return match store.volume_breach_delete(&range.product, model) {
+                Ok(_) => Standing::Clear,
+                Err(e) => {
+                    warn!(model, error = %e, "could not clear the volume breach marker");
+                    Standing::Held(format!(
+                        "{} The rebuild was in range, but the marker could not be cleared \
+                         ({e}): it stays open and the model stays failed.",
+                        held_message(&existing, &existing.partitions)
+                    ))
+                }
+            };
+        }
+        Standing::Held(held_message(&existing, &existing.partitions))
+    }
+
+    /// Settle the marker of a `time_interval` model after its partitions were
+    /// judged. `breaching` holds each partition key an `error` breach covered
+    /// (with the newest breach's check and sentence), `in_range` each key
+    /// this run rewrote and judged in range.
+    fn settle_partitions(
+        &self,
+        range: &ProductVolume,
+        model: &str,
+        breaching: &[String],
+        newest: Option<(&VolumeCheckOutput, &str)>,
+        in_range: &[String],
+    ) -> Standing {
+        let existing = match self.read(&range.product, model) {
+            Ok(existing) => existing,
+            Err(failed) => return failed,
+        };
+        if let Some((check, line)) = newest {
+            let mut partitions = existing
+                .as_ref()
+                .filter(|m| !m.is_whole_output())
+                .map(|m| m.partitions.clone())
+                .unwrap_or_default();
+            if existing.as_ref().is_none_or(|m| !m.is_whole_output()) {
+                partitions.retain(|key| !in_range.contains(key));
+                partitions.extend(breaching.iter().cloned());
+                partitions.sort();
+                partitions.dedup();
+            }
+            return self.open(&self.newest(
+                range,
+                model,
+                existing.as_ref(),
+                check,
+                line,
+                partitions,
+            ));
+        }
+        let Some(existing) = existing else {
+            return Standing::Clear;
+        };
+        let Some(store) = self.store else {
+            return Standing::Clear;
+        };
+        if existing.is_whole_output() {
+            return Standing::Held(held_message(&existing, &[]));
+        }
+        let remaining: Vec<String> = existing
+            .partitions
+            .iter()
+            .filter(|key| !in_range.contains(key))
+            .cloned()
+            .collect();
+        if remaining.len() == existing.partitions.len() {
+            return Standing::Held(held_message(&existing, &remaining));
+        }
+        let saved = if remaining.is_empty() {
+            store
+                .volume_breach_delete(&range.product, model)
+                .map(|_| ())
+        } else {
+            store.volume_breach_put(&VolumeBreachMarker {
+                partitions: remaining.clone(),
+                ..existing.clone()
+            })
+        };
+        match saved {
+            Ok(()) if remaining.is_empty() => Standing::Clear,
+            Ok(()) => Standing::Held(held_message(&existing, &remaining)),
+            Err(e) => {
+                warn!(model, error = %e, "could not update the volume breach marker");
+                Standing::Held(format!(
+                    "{} The rewrite was in range, but the marker could not be updated ({e}): \
+                     it stays as it was and the model stays failed.",
+                    held_message(&existing, &existing.partitions)
+                ))
+            }
+        }
     }
 }
 
@@ -133,7 +363,8 @@ fn unsupported_reason() -> String {
         .to_string()
 }
 
-/// Count and judge `model`'s output when a product declares a volume for it.
+/// Count and judge `model`'s output when a product declares a volume for it,
+/// then settle its breach marker.
 ///
 /// For a model built by the plain transformation path: full refresh,
 /// incremental, merge (`time_interval` goes through
@@ -142,8 +373,10 @@ fn unsupported_reason() -> String {
 /// `output.volume_warnings`. Returns the error the caller must treat as
 /// this model's failure for an `error` breach, and `None` otherwise. A
 /// count that cannot be taken is `not_evaluated`, never an error.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn check_volume(
     volumes: &ProductVolumes,
+    ledger: &BreachLedger<'_>,
     warehouse: &dyn WarehouseAdapter,
     model: &str,
     strategy: &MaterializationStrategy,
@@ -158,7 +391,20 @@ pub(crate) async fn check_volume(
         Some(_) if cancel.is_cancelled() => Err("the run was cancelled before the count".into()),
         Some(basis) => count_load(warehouse, basis, materialization).await,
     };
-    let judged = judge(range, model, basis, None, counted);
+    let mut judged = judge(range, model, basis, None, counted);
+    let rebuilt = materialization
+        .write_evidence
+        .as_ref()
+        .is_some_and(|e| e.created_or_replaced);
+    let breach = judged.failure.as_ref().map(|e| format!("{e:#}"));
+    let standing = ledger.settle_whole(
+        range,
+        model,
+        &judged.check,
+        breach.as_deref(),
+        rebuilt && judged.check.verdict == VolumeVerdict::InRange,
+    );
+    judged.apply_standing(standing);
     materialization.volume = Some(judged.check.clone());
     judged.settle(output)
 }
@@ -176,8 +422,10 @@ pub(crate) async fn check_volume(
 /// breaching partitions are marked failed in the run record
 /// ([`crate::output::RunOutput::to_run_record`]) and, through
 /// [`mark_breaching_partitions_failed`], in the partition state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn check_partition_volume(
     volumes: &ProductVolumes,
+    ledger: &BreachLedger<'_>,
     warehouse: &dyn WarehouseAdapter,
     dialect: &dyn SqlDialect,
     model: &rocky_core::models::Model,
@@ -190,6 +438,11 @@ pub(crate) async fn check_partition_volume(
     let strategy = model.to_model_ir().materialization;
     let basis = VolumeBasis::of(&strategy);
     let mut failures: Vec<String> = Vec::new();
+    // The keys an `error` breach covered, the keys judged in range, and the
+    // newest breach, for the marker.
+    let mut breaching: Vec<String> = Vec::new();
+    let mut in_range: Vec<String> = Vec::new();
+    let mut newest: Option<(VolumeCheckOutput, String)> = None;
     for index in first..output.materializations.len() {
         let (asset_key, partition) = {
             let mat = &output.materializations[index];
@@ -226,13 +479,57 @@ pub(crate) async fn check_partition_volume(
         };
         let key = partition.as_ref().map(|partition| partition.key.as_str());
         let judged = judge(range, model_name, basis, key, counted);
+        let covered = partition.iter().flat_map(|partition| {
+            std::iter::once(partition.key.clone()).chain(partition.batched_with.iter().cloned())
+        });
+        if judged.check.fails_the_model() {
+            breaching.extend(covered);
+            let line = judged.failure.as_ref().map(|e| format!("{e:#}"));
+            newest = line.map(|line| (judged.check.clone(), line));
+        } else if judged.check.verdict == VolumeVerdict::InRange {
+            in_range.extend(covered);
+        }
         output.materializations[index].volume = Some(judged.check.clone());
         if let Some(failure) = judged.settle(output) {
             failures.push(format!("{failure:#}"));
         }
     }
+    let standing = ledger.settle_partitions(
+        range,
+        model_name,
+        &breaching,
+        newest.as_ref().map(|(check, line)| (check, line.as_str())),
+        &in_range,
+    );
+    let held_text = match &standing {
+        Standing::Held(text) => {
+            for mat in &mut output.materializations[first..] {
+                if let Some(volume) = mat.volume.as_mut()
+                    && !volume.fails_the_model()
+                {
+                    volume.held_by_open_breach = true;
+                    volume.reason = Some(text.clone());
+                }
+            }
+            Some(text.clone())
+        }
+        Standing::StoreFailed(text) if failures.is_empty() => {
+            for mat in &mut output.materializations[first..] {
+                if let Some(volume) = mat.volume.as_mut() {
+                    volume.held_by_open_breach = true;
+                    volume.reason = Some(text.clone());
+                }
+            }
+            Some(text.clone())
+        }
+        Standing::StoreFailed(text) => {
+            failures.push(text.clone());
+            None
+        }
+        Standing::Clear => None,
+    };
     match failures.len() {
-        0 => None,
+        0 => held_text.map(|text| anyhow::anyhow!("{text}")),
         1 => failures.pop().map(|line| anyhow::anyhow!("{line}")),
         n => Some(anyhow::anyhow!(
             "{n} partitions of model '{model_name}' breach the volume range: {}",
@@ -395,6 +692,25 @@ struct Judged {
 }
 
 impl Judged {
+    /// Fold the marker ledger's standing into the judgment. A model held by
+    /// an open marker fails even when this load was in range. A model that
+    /// already failed on its own breach keeps that failure and gains the
+    /// ledger's note.
+    fn apply_standing(&mut self, standing: Standing) {
+        let text = match standing {
+            Standing::Clear => return,
+            Standing::Held(text) | Standing::StoreFailed(text) => text,
+        };
+        match self.failure.take() {
+            Some(own) => self.failure = Some(anyhow::anyhow!("{own:#}; {text}")),
+            None => {
+                self.check.held_by_open_breach = true;
+                self.check.reason = Some(text.clone());
+                self.failure = Some(anyhow::anyhow!("{text}"));
+            }
+        }
+    }
+
     /// Record the warning, if any, and hand back the failure.
     fn settle(self, output: &mut RunOutput) -> Option<anyhow::Error> {
         if let Some(line) = self.warning {
@@ -433,6 +749,7 @@ fn judge(
         severity,
         verdict,
         reason,
+        held_by_open_breach: false,
     };
     let (warning, failure) = match (
         describe_breach(&check, partition),
@@ -563,6 +880,7 @@ mod tests {
             severity,
             verdict,
             reason: None,
+            held_by_open_breach: false,
         }
     }
 
@@ -1387,6 +1705,16 @@ mod tests {
             shadow: Option<&rocky_core::shadow::ShadowConfig>,
             partitions: &PartitionRunOptions,
         ) -> (anyhow::Result<()>, RunRecord, serde_json::Value) {
+            run_in_with(dir, shadow, partitions, &SkipRunOptions::default()).await
+        }
+
+        /// [`run_in`] with the run's skip options, for `--full-refresh`.
+        async fn run_in_with(
+            dir: &std::path::Path,
+            shadow: Option<&rocky_core::shadow::ShadowConfig>,
+            partitions: &PartitionRunOptions,
+            skip: &SkipRunOptions,
+        ) -> (anyhow::Result<()>, RunRecord, serde_json::Value) {
             let config_path = dir.join("rocky.toml");
             let state_path = dir.join("state.redb");
             let run_id = format!("volume-{}", uuid::Uuid::new_v4());
@@ -1412,7 +1740,7 @@ mod tests {
                 None,
                 None,
                 &DeferOptions::default(),
-                &SkipRunOptions::default(),
+                skip,
                 &rocky_core::run_vars::RunVars::new(),
                 Some(&run_id),
                 None,
@@ -2780,6 +3108,383 @@ mod tests {
                 executions.iter().all(|e| e.status == "failed"),
                 "{executions:?}"
             );
+        }
+
+        // ----- the open breach marker (#2581) -----
+
+        const ERROR_MAX_4: &str = "max_rows = 4\nseverity = \"error\"";
+
+        fn markers(root: &std::path::Path) -> Vec<rocky_core::product::breach::VolumeBreachMarker> {
+            StateStore::open(&root.join("state.redb"))
+                .unwrap()
+                .volume_breach_list()
+                .unwrap()
+        }
+
+        fn executions_of<'a>(record: &'a RunRecord, model: &str) -> Vec<&'a ModelExecution> {
+            record
+                .models_executed
+                .iter()
+                .filter(|e| e.rocky_model_name() == model)
+                .collect()
+        }
+
+        /// Every error text of a run's JSON output, joined.
+        fn error_text(output: &serde_json::Value) -> String {
+            output["errors"]
+                .as_array()
+                .map(|errors| {
+                    errors
+                        .iter()
+                        .filter_map(|e| e["error"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default()
+        }
+
+        fn volume_of(output: &serde_json::Value, table: &str) -> serde_json::Value {
+            output["materializations"]
+                .as_array()
+                .expect("materializations")
+                .iter()
+                .rfind(|m| m["asset_key"].as_array().and_then(|k| k.last()) == Some(&table.into()))
+                .map(|m| m["volume"].clone())
+                .unwrap_or(serde_json::Value::Null)
+        }
+
+        /// The incremental project again with `rows` source rows and the
+        /// given range, optionally as `--full-refresh`.
+        async fn incremental_again(
+            root: &std::path::Path,
+            rows: u32,
+            volume: &str,
+            full_refresh: bool,
+        ) -> (anyhow::Result<()>, RunRecord, serde_json::Value) {
+            write_project(
+                root,
+                &spec(volume),
+                &borrowed(&incremental_models(&src_rows(rows))),
+                "",
+            );
+            run_in_with(
+                root,
+                None,
+                &PartitionRunOptions::default(),
+                &SkipRunOptions {
+                    full_refresh,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+
+        /// A breach opens the marker. The next in-range append writes its
+        /// rows but the model stays failed and downstream stays withheld. A
+        /// `--full-refresh` that is in range clears the marker and passes.
+        /// Mutation: skip the marker read in `settle_whole` and the second
+        /// run passes.
+        #[tokio::test]
+        async fn an_open_breach_keeps_an_incremental_output_failed_until_a_full_refresh() {
+            let (ran, _) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                ERROR_MAX_4,
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            assert!(ran.result.is_err(), "5 added rows breach max 4");
+            let root = ran._tmp.path();
+            let open = markers(root);
+            assert_eq!(open.len(), 1, "{open:?}");
+            assert_eq!(
+                (open[0].product.as_str(), open[0].model.as_str()),
+                ("vol_product", "vol")
+            );
+            assert!(open[0].partitions.is_empty(), "the whole output");
+            assert_eq!(open[0].rows, Some(5));
+            assert_eq!(open[0].max_rows, Some(4));
+            let opened_at = open[0].opened_at;
+
+            // 3 more rows: in range, written, still failed.
+            let (result, record, output) = incremental_again(root, 103, ERROR_MAX_4, false).await;
+            assert!(result.is_err(), "an open breach keeps the model failed");
+            let err = error_text(&output);
+            assert!(err.contains("open volume breach"), "{err}");
+            assert!(err.contains("rocky run --full-refresh"), "{err}");
+            assert!(
+                err.contains("rocky product clear-breach vol_product --model vol"),
+                "{err}"
+            );
+            assert_eq!(
+                table_total(&ran, "vol"),
+                103,
+                "the load still writes its rows"
+            );
+            let volume = volume_of(&output, "vol");
+            assert_eq!(volume["verdict"], "in_range", "{volume}");
+            assert_eq!(volume["row_count"], 3, "{volume}");
+            assert_eq!(volume["held_by_open_breach"], true, "{volume}");
+            let executions = executions_of(&record, "vol");
+            assert_eq!(executions.len(), 1, "{executions:?}");
+            assert_eq!(executions[0].status, "failed");
+            assert_eq!(executions[0].due_at, None, "no delivery over a breach");
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .all(|e| e.status != "success"),
+                "downstream is withheld: {:?}",
+                record.models_executed
+            );
+            let still = markers(root);
+            assert_eq!(still.len(), 1);
+            assert_eq!(
+                still[0].opened_at, opened_at,
+                "the marker keeps its first date"
+            );
+
+            // A full refresh that is in range clears it.
+            let (result, record, output) =
+                incremental_again(root, 103, "max_rows = 200\nseverity = \"error\"", true).await;
+            result.expect("an in-range rebuild clears the breach");
+            assert!(markers(root).is_empty());
+            assert!(
+                volume_of(&output, "vol")
+                    .get("held_by_open_breach")
+                    .is_none()
+            );
+            let executions = executions_of(&record, "vol");
+            assert_eq!(executions[0].status, "success");
+            assert!(executions[0].due_at.is_some());
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .any(|e| e.status == "success"),
+                "downstream builds again"
+            );
+        }
+
+        /// A full refresh that is itself out of range keeps the marker.
+        #[tokio::test]
+        async fn a_rebuild_that_is_still_out_of_range_keeps_the_breach_open() {
+            let (ran, _) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                ERROR_MAX_4,
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            let root = ran._tmp.path();
+            let (result, _, _) = incremental_again(root, 103, ERROR_MAX_4, true).await;
+            assert!(result.is_err(), "103 rows breach max 4");
+            assert_eq!(markers(root).len(), 1);
+        }
+
+        /// A `warning` breach never opens a marker.
+        #[tokio::test]
+        async fn a_warning_breach_opens_no_marker() {
+            let (ran, _) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                "max_rows = 4",
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            ran.result.as_ref().expect("a warning never fails the run");
+            assert_eq!(ran.volume("vol")["verdict"], "above_max");
+            assert!(markers(ran._tmp.path()).is_empty());
+        }
+
+        /// A shadow run neither reads nor writes markers: it is not held by
+        /// the open breach and does not change it.
+        #[tokio::test]
+        async fn a_non_production_run_touches_no_marker() {
+            let ran = run_with(
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &one_model(),
+                None,
+            )
+            .await;
+            assert!(ran.result.is_err(), "3 rows breach max 2");
+            let root = ran._tmp.path();
+            let before = markers(root);
+            assert_eq!(before.len(), 1);
+            let shadow = rocky_core::shadow::ShadowConfig::default();
+            let (result, _, _) = run_in(root, Some(&shadow), &PartitionRunOptions::default()).await;
+            result.expect("a shadow run is not held by a production breach");
+            assert_eq!(markers(root), before);
+        }
+
+        /// `rocky product clear-breach` deletes the marker and says so; a
+        /// second call changes nothing. `rocky product status` lists the
+        /// open breach until then.
+        #[tokio::test]
+        async fn clear_breach_deletes_the_marker_and_status_lists_it() {
+            let (ran, _) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                ERROR_MAX_4,
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            let root = ran._tmp.path();
+            let state_path = root.join("state.redb");
+            let status = super::super::super::product::product_status_in(
+                root,
+                Some(&state_path),
+                "vol_product",
+            )
+            .expect("status");
+            assert_eq!(status.open_volume_breaches.len(), 1, "{status:?}");
+            let breach = &status.open_volume_breaches[0];
+            assert_eq!(breach.model, "vol");
+            assert_eq!(breach.rows, Some(5));
+            assert_eq!(breach.max_rows, Some(4));
+            assert!(
+                breach.reason.contains("added 5 row(s)"),
+                "{}",
+                breach.reason
+            );
+
+            let cleared = super::super::super::product::product_clear_breach(
+                &state_path,
+                "vol_product",
+                "vol",
+            )
+            .expect("clear");
+            assert!(cleared.was_open);
+            assert_eq!(
+                cleared.cleared.as_ref().map(|c| c.model.as_str()),
+                Some("vol")
+            );
+            assert!(markers(root).is_empty());
+            let again = super::super::super::product::product_clear_breach(
+                &state_path,
+                "vol_product",
+                "vol",
+            )
+            .expect("clear again");
+            assert!(!again.was_open, "idempotent");
+            assert!(again.cleared.is_none());
+            let status = super::super::super::product::product_status_in(
+                root,
+                Some(&state_path),
+                "vol_product",
+            )
+            .expect("status");
+            assert!(status.open_volume_breaches.is_empty());
+
+            // With the marker cleared, the next in-range load passes.
+            let (result, _, _) = incremental_again(root, 103, ERROR_MAX_4, false).await;
+            result.expect("a cleared breach no longer holds the model");
+        }
+
+        /// Time interval: the breaching partition opens the marker. A run of
+        /// another, in-range partition keeps the model failed. Rewriting the
+        /// breaching partition in range clears it.
+        /// Mutation: skip the marker read in `settle_partitions` and the
+        /// second run passes.
+        #[tokio::test]
+        async fn an_open_breach_keeps_a_time_interval_output_failed_until_the_partition_is_rewritten()
+         {
+            let ran = two_partition_runs("max_rows = 2\nseverity = \"error\"").await;
+            assert!(ran.result.is_err());
+            let root = ran._tmp.path();
+            let open = markers(root);
+            assert_eq!(open.len(), 1, "{open:?}");
+            assert_eq!(open[0].partitions, ["2024-01-02"]);
+
+            // Another partition, in range: written, but the model fails.
+            let other = PartitionRunOptions {
+                partition: Some("2024-01-01".into()),
+                parallel: 1,
+                ..Default::default()
+            };
+            let (result, record, output) = run_in(root, None, &other).await;
+            assert!(result.is_err(), "the open breach holds the model");
+            let err = error_text(&output);
+            assert!(err.contains("open volume breach"), "{err}");
+            assert!(err.contains("2024-01-02"), "{err}");
+            assert!(err.contains("rocky run --missing"), "{err}");
+            assert_eq!(volume_of(&output, "vol")["verdict"], "in_range");
+            assert_eq!(volume_of(&output, "vol")["held_by_open_breach"], true);
+            assert!(
+                executions_of(&record, "vol")
+                    .iter()
+                    .all(|e| e.status == "failed"),
+                "{:?}",
+                record.models_executed
+            );
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .all(|e| e.status != "success"),
+                "downstream is withheld"
+            );
+            assert_eq!(markers(root)[0].partitions, ["2024-01-02"]);
+
+            // The range admits the breaching partition; rewriting it clears.
+            write_project(
+                root,
+                &spec("max_rows = 3\nseverity = \"error\""),
+                &borrowed(&partitioned_models(0)),
+                "",
+            );
+            let breaching = PartitionRunOptions {
+                partition: Some("2024-01-02".into()),
+                parallel: 1,
+                ..Default::default()
+            };
+            let (result, record, _) = run_in(root, None, &breaching).await;
+            result.expect("the rewrite is in range and clears the breach");
+            assert!(markers(root).is_empty());
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .any(|e| e.status == "success"),
+                "downstream builds again"
+            );
+        }
+
+        /// A rewrite of one of two breached partitions clears only that one.
+        #[tokio::test]
+        async fn a_partial_rewrite_narrows_the_breach_to_the_partitions_left() {
+            let ran = two_partition_runs("max_rows = 1\nseverity = \"error\"").await;
+            assert!(ran.result.is_err());
+            let root = ran._tmp.path();
+            assert_eq!(markers(root)[0].partitions, ["2024-01-01", "2024-01-02"]);
+            // Day 1 has 2 rows: in range of max 2. Day 2 has 3.
+            write_project(
+                root,
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &borrowed(&partitioned_models(0)),
+                "",
+            );
+            let first = PartitionRunOptions {
+                partition: Some("2024-01-01".into()),
+                parallel: 1,
+                ..Default::default()
+            };
+            let (result, _, output) = run_in(root, None, &first).await;
+            assert!(result.is_err(), "one partition is still breached");
+            let err = error_text(&output);
+            assert!(
+                err.contains("Still breached: partition(s) 2024-01-02."),
+                "{err}"
+            );
+            assert_eq!(markers(root)[0].partitions, ["2024-01-02"]);
+        }
+
+        /// A time-interval `warning` breach opens no marker.
+        #[tokio::test]
+        async fn a_time_interval_warning_breach_opens_no_marker() {
+            let ran = two_partition_runs("min_rows = 3").await;
+            ran.result.as_ref().expect("a warning never fails the run");
+            assert!(markers(ran._tmp.path()).is_empty());
         }
     }
 }

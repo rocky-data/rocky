@@ -81,8 +81,8 @@ Captured on 2026-11-12 against SeaweedFS 4.01. Timestamps and sizes vary.
     -rw------- 1 user user 5.3M ... .rocky-state.redb
 
 === S3 state after run 1 (SeaweedFS bucket) ===
-    [DATE]  4.2M playground/v35/state.redb
-    [DATE]   361 playground/v35/state.redb.cas-required
+    [DATE]  4.2M playground/v36/state.redb
+    [DATE]   361 playground/v36/state.redb.cas-required
 
 === Append delta (25 new rows, later timestamps) ===
     source rows: 125
@@ -102,7 +102,7 @@ POC complete: S3 state sync (upload + download) via SeaweedFS.
 
 The bucket listing needs the `aws` CLI; without it that section is empty.
 
-The object key includes the state schema version (`v35` since the state schema bump after engine 1.92.0). `state.redb.cas-required` is the marker that keeps every later upload a conditional write.
+The object key includes the state schema version (`v36` since the state schema bump after engine 1.92.0). `state.redb.cas-required` is the marker that keeps every later upload a conditional write.
 
 Each run copies one row fewer than the source holds. That is by design: an incremental copy holds back the newest timestamp until the next run, so a late row with the same timestamp is not skipped. So run 1 copies 99 of 100 rows, and run 2 reaches 124 of 125.
 
