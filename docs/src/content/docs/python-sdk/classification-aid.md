@@ -7,7 +7,7 @@ sidebar:
 
 `rocky_sdk.classify` suggests [`[classification]`](/guides/governance/#tag-columns-in-the-model-sidecar) tags for the columns of a model. It never writes a tag by itself. A person reads each suggestion, then accepts or rejects it. Only accepted suggestions reach the model sidecar.
 
-The aid needs a DuckDB target today, because `rocky profile` is DuckDB only.
+The aid needs a DuckDB target today. It reads sample values with `rocky profile --sample`, which is DuckDB only.
 
 ## How the aid makes a suggestion
 

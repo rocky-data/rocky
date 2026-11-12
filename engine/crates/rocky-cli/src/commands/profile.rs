@@ -1,9 +1,13 @@
 //! `rocky profile <model> [--column <col>]` — observed per-column data profile.
 //!
 //! Runs one aggregate query per column (row / null / distinct counts, min / max,
-//! and a bounded low-cardinality domain) against the model's target table.
-//! DuckDB only this release — the same profiling primitive `rocky ai-contract`
+//! and a bounded low-cardinality domain) against the model's target table, on
+//! the configured warehouse — the same profiling primitive `rocky ai-contract`
 //! uses to ground its drafts, exposed without the LLM round-trip.
+//!
+//! A profile scans the whole table, once per column. On a metered warehouse
+//! (Snowflake, BigQuery, Databricks) that costs money on a large table.
+//! `--sample` is DuckDB-only: it orders by DuckDB's `hash()`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,10 +37,11 @@ pub const MAX_SAMPLE_VALUES: u32 = 100;
 /// `DISTINCT`, so it is not repeatable on large tables). New rows only change
 /// the sample when one of them hashes lower.
 ///
-/// DuckDB syntax: `rocky profile` is DuckDB-only this release (see
-/// `duckdb_only_refusal`). The `DISTINCT` scans the whole column. SQL is built
-/// from the already-validated `table_ref` and a freshly-validated column
-/// identifier.
+/// DuckDB only: the order uses DuckDB's `hash()`, which other warehouses
+/// spell differently or lack. [`build_profile_output`] refuses `--sample` on
+/// any other dialect before running a query. The `DISTINCT` scans the whole
+/// column. SQL is built from the dialect-built `table_ref` and a
+/// freshly-validated column identifier.
 async fn sample_column_values(
     adapter: &dyn WarehouseAdapter,
     table_ref: &str,
@@ -49,9 +54,15 @@ async fn sample_column_values(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let sql = format!(
-        "SELECT v FROM (SELECT DISTINCT CAST({col} AS VARCHAR) AS v FROM {table_ref} \
-         WHERE {col} IS NOT NULL) AS s ORDER BY hash(v), v LIMIT {n}"
+    let dialect = adapter.dialect();
+    let text = dialect.string_type_name();
+    let sql = dialect.select_limited(
+        "v",
+        &format!(
+            "FROM (SELECT DISTINCT CAST({col} AS {text}) AS v FROM {table_ref} \
+             WHERE {col} IS NOT NULL) AS s ORDER BY hash(v), v"
+        ),
+        u64::from(n),
     );
     let qr = adapter
         .execute_query(&sql)
@@ -62,8 +73,21 @@ async fn sample_column_values(
     Ok(values)
 }
 
-/// Observed warehouse types for a `schema.table` (or `catalog.schema.table`)
-/// ref, keyed by lowercased column name. Profile reports these instead of the
+/// Why `--sample` cannot run on this dialect, or `None` when it can. The
+/// sample orders by DuckDB's `hash()` (see [`sample_column_values`]), so any
+/// other dialect reports the profile `unavailable` before any query runs.
+/// An `unavailable` profile, not an error, so the SDK's tag-suggestion aid
+/// keeps returning no suggestions on such a target.
+fn sample_unavailable(dialect_name: &str, sample: u32) -> Option<String> {
+    (sample > 0 && dialect_name != "duckdb").then(|| {
+        format!(
+            "`--sample` is only available on DuckDB: it orders values by DuckDB's \
+             hash(). The target dialect is '{dialect_name}'. Run without `--sample`."
+        )
+    })
+}
+
+/// Observed warehouse types for a table, keyed by lowercased column name. Profile reports these instead of the
 /// compiler's inferred types, which come back `Unknown` for raw-SQL models
 /// whose source schemas weren't resolved at compile time — the warehouse is
 /// the authoritative source for a *profile* of what's actually there. Returns
@@ -71,23 +95,9 @@ async fn sample_column_values(
 /// type), so a describe failure never aborts the profile.
 async fn observed_column_types(
     adapter: &dyn WarehouseAdapter,
-    table_ref: &str,
+    table: &rocky_ir::TableRef,
 ) -> HashMap<String, String> {
-    let parts: Vec<&str> = table_ref.split('.').collect();
-    let tref = match parts.as_slice() {
-        [schema, table] => rocky_ir::TableRef {
-            catalog: String::new(),
-            schema: (*schema).to_string(),
-            table: (*table).to_string(),
-        },
-        [catalog, schema, table] => rocky_ir::TableRef {
-            catalog: (*catalog).to_string(),
-            schema: (*schema).to_string(),
-            table: (*table).to_string(),
-        },
-        _ => return HashMap::new(),
-    };
-    match adapter.describe_table(&tref).await {
+    match adapter.describe_table(table).await {
         Ok(cols) => cols
             .into_iter()
             .map(|c| (c.name.to_lowercase(), c.data_type))
@@ -98,9 +108,10 @@ async fn observed_column_types(
 
 /// Build the profile payload for `model_name`, optionally narrowed to one
 /// column. Returns a [`ProfileOutput`] carrying either the per-column stats or
-/// an `unavailable` reason (a non-DuckDB target this release). `sample > 0`
-/// adds up to that many random distinct values per column
-/// (`sample_values`), capped at [`MAX_SAMPLE_VALUES`].
+/// an `unavailable` reason (for example, no materialized table to profile).
+/// `sample > 0` adds up to that many random distinct values per column
+/// (`sample_values`), capped at [`MAX_SAMPLE_VALUES`]; on a non-DuckDB target
+/// it makes the whole profile `unavailable`, before any profile query runs.
 pub async fn build_profile_output(
     config_path: &Path,
     state_path: &Path,
@@ -151,6 +162,18 @@ pub async fn build_profile_output(
         }
     };
 
+    if let Some(reason) = sample_unavailable(prepared.adapter.dialect().name(), sample) {
+        return Ok(ProfileOutput {
+            version: VERSION.to_string(),
+            command: "profile".to_string(),
+            model: model_name.to_string(),
+            profiled_table: None,
+            fell_back_from: None,
+            columns: Vec::new(),
+            unavailable: Some(reason),
+        });
+    }
+
     let targets: Vec<_> = match column {
         Some(name) => inferred_schema.iter().filter(|c| c.name == name).collect(),
         None => inferred_schema.iter().collect(),
@@ -164,8 +187,7 @@ pub async fn build_profile_output(
     // Observed warehouse types for the table actually profiled — preferred
     // over the compiler's inferred types (which are `Unknown` for raw-SQL
     // models on a cold source-schema cache).
-    let observed_types =
-        observed_column_types(prepared.adapter.as_ref(), &prepared.table_ref).await;
+    let observed_types = observed_column_types(prepared.adapter.as_ref(), &prepared.table).await;
 
     let fell_back = prepared.fell_back_from.is_some();
     let mut columns = Vec::with_capacity(targets.len());
@@ -222,7 +244,7 @@ pub async fn build_profile_output(
         version: VERSION.to_string(),
         command: "profile".to_string(),
         model: model_name.to_string(),
-        profiled_table: Some(prepared.table_ref),
+        profiled_table: Some(super::ai_contract::display_table_name(&prepared.table)),
         fell_back_from: prepared.fell_back_from,
         columns,
         unavailable: None,
@@ -413,7 +435,11 @@ mod tests {
         .await
         .expect("profile should succeed via source fallback");
         assert_eq!(output.profiled_table.as_deref(), Some("raw__orders.orders"));
-        assert_eq!(output.fell_back_from.as_deref(), Some("staging.raw_orders"));
+        // The declared target's full name, catalog included.
+        assert_eq!(
+            output.fell_back_from.as_deref(),
+            Some("wh.staging.raw_orders")
+        );
         assert_eq!(output.unavailable, None);
         // Both source columns exist on the model → both should profile.
         let order_id = output
@@ -560,8 +586,28 @@ mod tests {
         )
         .await
         .expect("profile should succeed against the materialized target");
-        assert_eq!(output.profiled_table.as_deref(), Some("staging.raw_orders"));
+        // The ref `rocky run` writes to: the DuckDB dialect keeps the catalog.
+        assert_eq!(
+            output.profiled_table.as_deref(),
+            Some("wh.staging.raw_orders")
+        );
         assert_eq!(output.fell_back_from, None);
         assert_eq!(output.columns[0].rows, 3);
+    }
+}
+
+#[cfg(test)]
+mod sample_gate_tests {
+    use super::sample_unavailable;
+
+    /// `--sample` relies on DuckDB's `hash()`: any other dialect gets a plain
+    /// reason naming it, and no sample is always allowed.
+    #[test]
+    fn sample_is_unavailable_off_duckdb() {
+        assert_eq!(sample_unavailable("duckdb", 5), None);
+        assert_eq!(sample_unavailable("snowflake", 0), None);
+        let reason = sample_unavailable("snowflake", 5).expect("refused");
+        assert!(reason.contains("only available on DuckDB"), "{reason}");
+        assert!(reason.contains("snowflake"), "{reason}");
     }
 }

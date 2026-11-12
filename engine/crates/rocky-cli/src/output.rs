@@ -3971,8 +3971,10 @@ pub struct AiContractColumnProfile {
 ///
 /// A per-column data profile (row / null / distinct counts, min / max, and the
 /// low-cardinality domain) for a model's target table, computed by a single
-/// aggregate query per column. DuckDB-only this release; a non-DuckDB target
-/// reports `unavailable` with an empty `columns` list rather than erroring.
+/// aggregate query per column, on any configured warehouse. Each query scans
+/// the whole table, which costs money on a metered warehouse. When profiling
+/// cannot run (no materialized table to read), it reports `unavailable` with
+/// an empty `columns` list rather than erroring.
 ///
 /// When the model's declared target isn't materialized (the agentic authoring
 /// loop pre-`rocky run`, or a replication-pipeline POC that doesn't run the
@@ -3985,8 +3987,8 @@ pub struct ProfileOutput {
     pub version: String,
     pub command: String,
     pub model: String,
-    /// Fully-qualified table actually profiled (e.g. `staging.raw_orders` or
-    /// `raw__orders.orders`). When `fell_back_from` is set, this differs from
+    /// Fully-qualified table actually profiled, unquoted (e.g.
+    /// `warehouse.staging.raw_orders` or `raw__orders.orders`). When `fell_back_from` is set, this differs from
     /// the model's declared target. Omitted when `unavailable` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profiled_table: Option<String>,
@@ -3997,7 +3999,8 @@ pub struct ProfileOutput {
     pub fell_back_from: Option<String>,
     /// One entry per profiled column.
     pub columns: Vec<ProfileColumnStats>,
-    /// Set when profiling could not run (e.g. a non-DuckDB target this release).
+    /// Set when profiling could not run (e.g. the target is not materialized
+    /// and no source table could be resolved).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<String>,
 }

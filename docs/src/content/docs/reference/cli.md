@@ -84,7 +84,7 @@ The groups and their order match `rocky --help`. The core commands come first.
 | [`cost`](/reference/commands/administration/#rocky-cost) | Allocate cost per model for a recorded run. |
 | [`metrics`](/reference/commands/administration/#rocky-metrics) | Show quality metrics for a model. |
 | [`optimize`](/reference/commands/administration/#rocky-optimize) | Recommend `table` or `view` from run history and cost. |
-| [`profile`](#rocky-profile) | Report row, null and distinct counts per column. DuckDB only. |
+| [`profile`](#rocky-profile) | Report row, null and distinct counts per column. |
 | [`profile-storage`](/reference/commands/administration/#rocky-profile-storage) | Recommend column encodings for a table. |
 | [`compact`](/reference/commands/administration/#rocky-compact) | Write a plan of `OPTIMIZE` and `VACUUM` SQL. |
 | [`archive`](/reference/commands/administration/#rocky-archive) | Write a plan that deletes old rows. |
@@ -107,7 +107,7 @@ The groups and their order match `rocky --help`. The core commands come first.
 | [`ai-sync`](/reference/commands/ai/#rocky-ai-sync) | Propose model updates after a source schema changes. |
 | [`ai-explain`](/reference/commands/ai/#rocky-ai-explain) | Describe what a model does, in plain English. |
 | [`ai-test`](/reference/commands/ai/#rocky-ai-test) | Draft test assertions from a model's intent. |
-| <span id="rocky-ai-contract"></span>[`ai-contract`](/reference/commands/ai/#rocky-ai-contract) | Draft a data contract from a model's observed data. DuckDB only. |
+| <span id="rocky-ai-contract"></span>[`ai-contract`](/reference/commands/ai/#rocky-ai-contract) | Draft a data contract from a model's observed data. |
 | [`mcp`](/reference/commands/ai/#rocky-mcp) | Serve Rocky's tools to an AI agent over MCP. |
 
 ### Integrations and tooling
@@ -407,7 +407,7 @@ Rocky finds changed rows in one of two ways. The **timestamp** strategy compares
 
 ### `rocky profile`
 
-Report what is in a model's data, column by column: row count, null count and distinct count. Run it before you write a contract or a test, so the assertion matches the data. DuckDB only.
+Report what is in a model's data, column by column: row count, null count and distinct count. Run it before you write a contract or a test, so the assertion matches the data. It works on any configured warehouse.
 
 ```bash
 rocky profile <model> [flags]
@@ -417,16 +417,17 @@ rocky profile <model> [flags]
 |------|---------|-------------|
 | `model` | required | Model to profile. |
 | `--column <NAME>` | (every column) | Profile only this column. |
-| `--sample <N>` | `0` (off) | Also return up to N distinct non-null values per column as `sample_values`. N is at most 100. |
+| `--sample <N>` | `0` (off) | Also return up to N distinct non-null values per column as `sample_values`. N is at most 100. DuckDB only. |
 | `--models <PATH>` | `models` | Models directory. Rocky compiles it to get the model's inferred schema. |
 
 ```bash
 rocky profile fct_orders --column amount --sample 5
 ```
 
+- **Cost.** Rocky reads the whole table, once per column. It does not sample, so the counts are exact. On a warehouse that bills by data scanned or compute time (Snowflake, BigQuery, Databricks), profiling a large table costs money.
 - **The table Rocky reads.** Rocky profiles the model's target table when it exists. Otherwise it profiles the first source table it can resolve, and skips any column that table does not have. The JSON names the table read under `profiled_table` and the missing target under `fell_back_from`. The text output prints neither.
 - **Minimum and maximum.** `--output json` carries `min` and `max` for every column. The text output prints only the counts.
-- **Cell values.** Without `--sample`, the only cell values are `min`, `max` and `observed_values` (the value list of a column with 25 or fewer distinct values). `--sample` reads every distinct value of each column, so it costs more on a large table. Rocky picks the sample by a hash of each value, so a re-run on unchanged data returns the same values. The [tag-suggestion aid](/python-sdk/classification-aid/) uses it.
+- **Cell values.** Without `--sample`, the only cell values are `min`, `max` and `observed_values` (the value list of a column with 25 or fewer distinct values). `--sample` reads every distinct value of each column, so it costs more on a large table. Rocky picks the sample by a hash of each value, so a re-run on unchanged data returns the same values. The [tag-suggestion aid](/python-sdk/classification-aid/) uses it. `--sample` orders values by DuckDB's `hash()`, so on any other warehouse the profile reports `unavailable` instead.
 
 ---
 

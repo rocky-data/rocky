@@ -362,7 +362,7 @@ rocky ai-test fct_revenue --models src/transformations --save
 
 ## `rocky ai-contract`
 
-Draft a data contract from a model's observed data, instead of writing the column list by hand. Rocky profiles the target table, sends the shape to Anthropic, and prints the draft. DuckDB only.
+Draft a data contract from a model's observed data, instead of writing the column list by hand. Rocky profiles the target table, sends the shape to Anthropic, and prints the draft. It works on any configured warehouse. The profile reads the whole table, once per column, which costs money on a metered warehouse such as Snowflake, BigQuery or Databricks.
 
 ```bash
 rocky ai-contract <model> [flags]

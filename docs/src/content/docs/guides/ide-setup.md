@@ -253,7 +253,7 @@ Each tab covers one concern and runs one Rocky CLI command. A tab whose data is 
 - **Lineage** -- the interactive lineage canvas (below)
 - **Tests** -- declarative `[[tests]]` assertions plus the model-execution check (`rocky test`)
 - **Preview** -- a sample of the model's output rows (`rocky preview rows`); DuckDB runs locally, other warehouses require `rocky.preview.allowWarehouse`
-- **Profile** -- per-column profiling of the materialized table (`rocky profile`, DuckDB-only)
+- **Profile** -- per-column profiling of the materialized table (`rocky profile`)
 
 ### Lineage canvas
 

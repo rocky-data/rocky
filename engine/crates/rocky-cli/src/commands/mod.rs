@@ -117,7 +117,7 @@ pub use ai::{
 };
 pub use ai_contract::{
     LiveLeafSchemas, describe_leaf_sources, leaf_source_reads, live_describe_scope,
-    overlay_live_schemas, profile_data_regions, run_ai_contract,
+    overlay_live_schemas, profile_column, profile_data_regions, run_ai_contract,
 };
 pub use apply::{
     EmptyTouched, PolicyGate, evaluate_apply_policy, evaluate_apply_policy_durable,
