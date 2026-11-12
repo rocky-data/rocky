@@ -82,14 +82,36 @@ build ok ──▶ count ────▶ in range ──────────
 
 At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A time-interval output is judged one partition at a time. If any partition breaches at `error`, the model fails. Only the breaching partitions are marked failed in the run record. The model delivers nothing in that run, so no partition of it gets a `due_at`. The other partitions stay successes in the record. Partitions written before another partition failed to run are judged too.
 
-What an `error` breach does and does not do:
+What an `error` breach does:
 
-1. It fails the model for the run that wrote the rows. It withholds downstream for that run only. The rows are not rolled back.
-2. Time-interval: the breaching partition is recorded `failed` in the partition state. `--missing`, `--partition` and `--from`/`--to` rewrite it and judge it again. A default run (latest) does not revisit it. Downstream can build over the breached rows until the partition is rewritten.
-3. Incremental and merge: each load is judged alone. The next in-range load passes, and the breached rows stay. The remedy is `--full-refresh`, which judges the whole table.
-4. `rocky product status` shows the newest build's verdict. An earlier breach is not shown.
+1. It fails the model for the run that wrote the rows. The rows are not rolled back.
+2. It opens a breach marker for the model. A time-interval marker lists the breached partitions.
+3. While a marker is open, every run that builds the model fails it, even when that run's load is in range. Downstream stays withheld. The load still writes its rows. Only the verdict is failed. The error says when the breach opened, which partitions are still breached, and how to clear it.
+4. A rebuild clears the marker, once it is judged in range.
+5. `rocky product clear-breach` deletes the marker by hand.
 
-Keeping a breached output failed until it is rebuilt is planned work (#2581).
+```
+error breach ──────────────────────▶ marker opened, model fails
+marker open, in-range append ──────▶ rows written, model still fails
+marker open, rebuild in range ─────▶ marker deleted, model passes
+```
+
+What counts as a rebuild:
+
+- **Full-refresh, incremental, merge:** a build that created or replaced the whole table. That is a first run, `rocky run --full-refresh`, or a drift rebuild. The rebuild is judged on the whole table, and it must be in range. A rebuild that is still out of range keeps the marker.
+- **Time interval:** a rewrite of the breached partition, judged in range. Use `rocky run --missing`, `--partition <key>` or `--from`/`--to`. A breached partition is also recorded `failed` in the partition state, so `--missing` plans it again. Each partition leaves the marker as it is rewritten in range. The marker is deleted when its last partition is clear. A default run (latest) of another partition does not clear it, and the model stays failed.
+
+The marker lives in the replicated state table `product_volume_breaches` (state schema 36), so every machine that shares the state sees it. Rocky writes it right after the model's check, not at the end of the run, so a crash cannot lose a breach. If the state store cannot record a new breach, the model fails. If it cannot delete a marker, Rocky warns, the marker stays and the model stays failed.
+
+A `warning` breach opens no marker, and neither does a count that was not evaluated. A marker that is already open still holds the model when a later run is `not_evaluated`. A shadow or branch run neither reads nor writes markers. A model that a run does not build is not held by this check, so a run that leaves out the output model can still build models that read it.
+
+### `rocky product clear-breach`
+
+```bash
+rocky product clear-breach <name> --model <model>
+```
+
+Deletes the open volume breach of the product's output model, without a rebuild. Use it when you have judged the breached rows acceptable. The next run judges the model as usual. It reports whether a marker was open. With none open it changes nothing and exits 0, so it is safe to repeat. `--output json` returns `product`, `model`, `was_open` and the `cleared` marker.
 
 An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Every `not_evaluated` check adds a `volume_warnings` line with its reason, at either severity. It never fails the run. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
 
@@ -266,6 +288,8 @@ When the spec declares `[product.output.volume]`, status also reports `volume`:
 | `row_count`, `basis` | That build's count and what it counted (`total_rows`, `rows_added`, `rows_touched`, `partition_rows`). Absent when the build took no count. A build that wrote several partitions shows the partition that decides the verdict: the first one out of range, otherwise the newest. |
 | `verdict` | That build's count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`. It is `not_evaluated` when the build took no count, or counted on a basis the output model no longer has. |
 | `reason` | Why the verdict is `not_evaluated`. |
+
+Status also lists `open_volume_breaches`, one row for each breach still open for the product (empty and omitted when there is none): `product`, `model`, `opened_at`, `run_id`, `partitions` (empty means the whole output), `rows`, `min_rows`, `max_rows` and `reason`. The text view prints each as `OPEN VOLUME BREACH` with the command that clears it.
 
 When the spec declares `[[product.source.volume]]`, status also reports `source_volumes`, one row per declared range:
 

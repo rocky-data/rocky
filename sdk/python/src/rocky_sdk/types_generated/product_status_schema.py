@@ -138,6 +138,49 @@ class ProductBudgetVerdict(StrEnum):
     not_evaluated = "not_evaluated"
 
 
+class ProductVolumeBreachStatus(BaseModel):
+    """
+    An open volume breach: the output model stays failed in every run until it is rebuilt or the breach is cleared (#2581).
+    """
+
+    max_rows: conint(ge=0) | None = None
+    """
+    The declared `max_rows` at the newest breach.
+    """
+    min_rows: conint(ge=0) | None = None
+    """
+    The declared `min_rows` at the newest breach.
+    """
+    model: str
+    """
+    The output model held failed.
+    """
+    opened_at: AwareDatetime
+    """
+    When the breach was first recorded.
+    """
+    partitions: list[str] | None = []
+    """
+    For a `time_interval` output, the partition keys still breached. Empty means the whole output.
+    """
+    product: str
+    """
+    The product that declares the range.
+    """
+    reason: str | None = ""
+    """
+    The newest breach, in words.
+    """
+    rows: conint(ge=0) | None = None
+    """
+    The row count of the newest breach, when it was counted.
+    """
+    run_id: str | None = None
+    """
+    The run that recorded it, when known.
+    """
+
+
 class SharedNotChargedCost(BaseModel):
     """
     A share of an owned table's cost that a reader did not pay.
@@ -661,6 +704,10 @@ class ProductStatusOutput(BaseModel):
     journal_rows: conint(ge=0)
     """
     Number of fulfillment journal rows recorded for this product.
+    """
+    open_volume_breaches: list[ProductVolumeBreachStatus] | None = None
+    """
+    The volume breaches still open for this product: an `error` range breached and not yet rebuilt or cleared. Each holds its output model failed in every run. Empty (and omitted) when none is open.
     """
     output_model: str | None = None
     """
