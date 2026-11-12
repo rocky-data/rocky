@@ -738,6 +738,7 @@ impl rocky_core::traits::DiscoveryAdapter for ScriptedSyncSource {
     async fn source_sync_states(
         &self,
         _schema_prefix: &str,
+        _include: &(dyn Fn(&rocky_core::source_sync::SourceSyncState) -> bool + Sync),
     ) -> AdapterResult<Option<Vec<rocky_core::source_sync::SourceSyncState>>> {
         let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n >= self.fail_after.load(std::sync::atomic::Ordering::SeqCst) {

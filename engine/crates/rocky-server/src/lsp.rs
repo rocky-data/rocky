@@ -907,7 +907,8 @@ impl RockyLsp {
     /// prompt carries warehouse data call this; the `.rocky` syntax fix does
     /// not, so this read never stops it.
     /// A recorder that spools each AI call of a code action for
-    /// `rocky cost`, next to the project's state file. `None` before
+    /// `rocky cost`, next to the project's state file (see
+    /// [`ai_usage_state_path`]). `None` before
     /// `initialize` sets the models directory.
     async fn ai_usage_recorder(
         &self,
@@ -915,8 +916,10 @@ impl RockyLsp {
         model: Option<&str>,
     ) -> Option<rocky_ai::usage::UsageRecorder> {
         let models_dir = self.models_dir.read().await.clone()?;
-        let state_path =
-            rocky_core::state::resolve_state_path(None, std::path::Path::new(&models_dir)).path;
+        let state_path = ai_usage_state_path(
+            std::path::Path::new(&models_dir),
+            STATE_LOCATION.get_or_init(StateLocation::default),
+        );
         let recorder = rocky_ai::usage::UsageRecorder::spool(command, &state_path);
         recorder.set_model(model);
         Some(recorder)
@@ -5707,6 +5710,49 @@ pub fn compile_incremental(
 // ── Server entry point ──────────────────────────────────────────────────────
 
 /// Start the LSP server on stdin/stdout.
+/// The state store a `rocky lsp` process was told to use, by the global
+/// `--state-path` and `--state-namespace` flags. Empty for the standalone
+/// `rocky-lsp` binary, which takes no flags.
+#[derive(Debug, Clone, Default)]
+pub struct StateLocation {
+    /// An explicit `--state-path`. Wins over any namespace.
+    pub explicit: Option<std::path::PathBuf>,
+    /// An explicit `--state-namespace`, validated by the CLI.
+    pub namespace: Option<String>,
+}
+
+static STATE_LOCATION: std::sync::OnceLock<StateLocation> = std::sync::OnceLock::new();
+
+/// Record the state location for this process before [`run_lsp`]. Only the
+/// first call counts.
+pub fn set_state_location(location: StateLocation) {
+    let _ = STATE_LOCATION.set(location);
+}
+
+/// The state file whose AI usage spool an LSP code action writes to,
+/// resolved as the CLI resolves its store: `--state-path`, then
+/// `--state-namespace`, then the project's `[state] namespacing`, else the
+/// global file (#2587). Before, the LSP always used the global file, so
+/// under a namespace its AI calls landed in a spool `rocky cost` did not
+/// read. A `rocky.toml` that does not load falls back to the global file,
+/// as the CLI does.
+fn ai_usage_state_path(models_dir: &std::path::Path, location: &StateLocation) -> std::path::PathBuf {
+    let config = if location.explicit.is_none() && location.namespace.is_none() {
+        RockyLsp::project_config_path(models_dir)
+            .filter(|p| p.is_file())
+            .and_then(|p| rocky_core::config::load_rocky_config(&p).ok())
+    } else {
+        None
+    };
+    rocky_core::state::resolve_server_state_path(
+        location.explicit.as_deref(),
+        location.namespace.as_deref(),
+        config.as_ref(),
+        models_dir,
+    )
+    .path
+}
+
 pub async fn run_lsp() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -7916,6 +7962,81 @@ mod tests {
             cast_targets: Arc::default(),
             watch_registration: Arc::default(),
         }
+    }
+
+    /// Under `[state] namespacing = "pipeline"` the CLI reads, and `rocky
+    /// cost` counts, the namespaced store. An LSP code action spools its AI
+    /// call next to that store, not the global one (#2587). An explicit
+    /// `--state-path` or `--state-namespace` wins, as in the CLI.
+    #[tokio::test]
+    async fn the_lsp_spools_ai_usage_next_to_the_clis_namespaced_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            tmp.path().join("rocky.toml"),
+            r#"
+[state]
+namespacing = "pipeline"
+
+[adapter.db]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "db"
+"#,
+        )
+        .unwrap();
+        // What `rocky cost` reads: the CLI's store for this project.
+        let cli_state = rocky_core::state::resolve_state_path_ns(None, &models, Some("silver")).path;
+        assert_ne!(
+            cli_state,
+            rocky_core::state::resolve_state_path(None, &models).path,
+            "the namespace selects its own store"
+        );
+
+        let (service, _socket) = LspService::new(test_lsp);
+        let lsp = service.inner();
+        *lsp.models_dir.write().await = Some(models.display().to_string());
+        let recorder = lsp
+            .ai_usage_recorder("lsp_ai_contract_fix", Some("orders"))
+            .await
+            .unwrap();
+        (recorder.sink())(&rocky_ai::client::LlmUsage {
+            llm_model: "claude-sonnet-4-6".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+        });
+        let spooled = rocky_core::ai_usage::read_spool(&rocky_core::ai_usage::spool_path(&cli_state))
+            .unwrap()
+            .records;
+        assert_eq!(spooled.len(), 1, "the call is in the spool the CLI reads");
+        assert!(
+            !rocky_core::ai_usage::spool_path(&rocky_core::state::resolve_state_path(None, &models).path)
+                .exists(),
+            "nothing lands in the global spool"
+        );
+
+        // The flags win over the config, as they do in the CLI.
+        let explicit = tmp.path().join("pinned.redb");
+        let flagged = StateLocation {
+            explicit: Some(explicit.clone()),
+            namespace: Some("other".into()),
+        };
+        assert_eq!(ai_usage_state_path(&models, &flagged), explicit);
+        let ns_flag = StateLocation {
+            explicit: None,
+            namespace: Some("other".into()),
+        };
+        assert_eq!(
+            ai_usage_state_path(&models, &ns_flag),
+            rocky_core::state::resolve_state_path_ns(None, &models, Some("other")).path
+        );
     }
 
     /// The LSP records AI usage through the spool and never opens the state

@@ -1,20 +1,24 @@
-# 03-remote-state-s3 — Remote state via MinIO (no real AWS)
+# 03-remote-state-s3 — Remote state via an S3-compatible store (no real AWS)
 
 > **Category:** 05-orchestration
-> **Credentials:** none (MinIO via docker-compose)
-> **Runtime:** < 30s (first run pulls MinIO image)
+> **Credentials:** none (SeaweedFS via docker-compose)
+> **Runtime:** < 30s (first run pulls the SeaweedFS image)
 > **Rocky features:** `[state] backend = "s3"`, `[state.retry]`, `on_upload_failure`, `rocky doctor --check state_rw`, watermark upload/download, incremental persistence
 
 ## What it shows
 
 Stores Rocky's `.rocky-state.redb` in S3, except instead of real AWS
-this POC runs MinIO via docker-compose so you can verify the upload/download
-flow without an account.
+this POC runs [SeaweedFS](https://github.com/seaweedfs/seaweedfs)'s S3 API
+via docker-compose so you can verify the upload/download flow without an
+account. It used MinIO until the `minio/minio` image stopped pulling from
+Docker Hub. SeaweedFS 4.01 answers the S3 conditional writes Rocky's remote
+state relies on (`If-None-Match: *` and `If-Match`, `412` on a conflict), so
+nothing in the demo is skipped.
 
 The demo runs:
 
-0. **`state_rw` probe** — `rocky doctor --check state_rw` round-trips a marker object against MinIO *before* any pipeline work so IAM / reachability problems surface at cold start instead of end-of-run upload.
-1. **Initial load** — 100 rows replicated, state uploaded to MinIO (under the retry + circuit-breaker policy configured in `[state.retry]`).
+0. **`state_rw` probe** — `rocky doctor --check state_rw` round-trips a marker object against the S3 store *before* any pipeline work so IAM / reachability problems surface at cold start instead of end-of-run upload.
+1. **Initial load** — 100 rows replicated, state uploaded to S3 (under the retry + circuit-breaker policy configured in `[state.retry]`).
 2. **Incremental run** — 25 delta rows appended, only new rows replicated (watermark persisted via S3).
 3. **Round-trip restore** — local state file deleted, re-downloaded from S3 on next run, proving zero duplicate rows.
 
@@ -25,13 +29,13 @@ The demo runs:
 - **Cold-start connectivity check** — `rocky doctor --check state_rw` proves write permission + reachability before the first pipeline run. No more silent IAM drift.
 - **Pick your failure posture** — default `on_upload_failure = "skip"` keeps runs live and lets the next run re-derive state; switch to `"fail"` for strict environments where state durability trumps liveness.
 - The same `[state]` block works against AWS S3 by changing `endpoint`.
-- All credential-free thanks to MinIO.
+- All credential-free: SeaweedFS runs with anonymous access, so any key works.
 
 ## Layout
 
 ```
 rocky.toml              # [state] backend = "s3" + [state.retry] block
-docker-compose.yml      # MinIO server + init container (creates bucket)
+docker-compose.yml      # SeaweedFS S3 API (:8333) + a curl step that creates the bucket
 data/seed.sql           # Initial 100-row source table
 data/seed_delta.sql     # 25 delta rows for incremental run
 run.sh                  # End-to-end demo: state_rw probe + 3 runs + S3 round-trip
@@ -41,14 +45,14 @@ expected/               # Captured JSON output (gitignored)
 ## Prerequisites
 
 - `rocky` and the `duckdb` CLI on `PATH`
-- `docker` + `docker compose` for MinIO
+- `docker` + `docker compose` for SeaweedFS
 - The `aws` CLI, only to list the bucket contents in the output (optional)
 
 ## Run
 
 ```bash
-./run.sh                # starts MinIO, runs pipeline 3 times
-docker compose down -v  # cleanup (removes MinIO volume)
+./run.sh                # starts SeaweedFS, runs pipeline 3 times
+docker compose down -v  # cleanup (removes the S3 volume)
 ```
 
 Without Docker, the script shows config validation only.

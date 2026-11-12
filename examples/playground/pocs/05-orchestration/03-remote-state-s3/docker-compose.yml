@@ -1,31 +1,29 @@
+# S3-compatible store for the remote-state demo. SeaweedFS rather than
+# MinIO: the `minio/minio` and `minio/mc` images no longer pull from Docker
+# Hub (#2571). SeaweedFS 4.01 honours the S3 conditional writes Rocky's
+# remote state relies on (`If-None-Match: *` and `If-Match`, answering 412
+# on a conflict). Anonymous access, so any key works. Images are pinned by
+# digest so a future upstream change cannot break the POC silently.
 services:
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: rocky
-      MINIO_ROOT_PASSWORD: rocky-secret
+  s3:
+    # chrislusf/seaweedfs:4.01
+    image: chrislusf/seaweedfs@sha256:d91cdf769018b143f1c944085b36d29893d9af199e656b2537367c35744fc221
+    command: server -s3 -dir=/data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "8333:8333"
     volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 2s
-      timeout: 5s
-      retries: 5
+      - s3-data:/data
 
-  minio-init:
-    image: minio/mc:latest
+  bucket:
+    # curlimages/curl:8.17.0
+    image: curlimages/curl@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
     depends_on:
-      minio:
-        condition: service_healthy
+      - s3
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 rocky rocky-secret &&
-      mc mb -p local/rocky-state || true
+      until curl -fsS -X PUT http://s3:8333/rocky-state; do echo 'waiting for s3'; sleep 1; done;
+      echo 'rocky-state bucket ready'
       "
 
 volumes:
-  minio-data:
+  s3-data:

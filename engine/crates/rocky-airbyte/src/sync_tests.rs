@@ -210,7 +210,7 @@ async fn sync_states_map_the_newest_jobs_of_each_connection() {
     serve_jobs(&server, "c_new", vec![jobs_page(vec![])]).await;
 
     let states = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap()
         .unwrap();
@@ -293,7 +293,7 @@ async fn pending_incomplete_and_unknown_statuses_are_syncing() {
         )
         .await;
         let states = adapter(&server, false)
-            .source_sync_states("src__")
+            .source_sync_states("src__", &all)
             .await
             .unwrap()
             .unwrap();
@@ -318,7 +318,7 @@ async fn a_reset_job_counts_as_syncing_but_never_as_a_sync_end() {
     )
     .await;
     let states = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap()
         .unwrap();
@@ -341,7 +341,7 @@ async fn the_latest_end_wins_and_a_job_without_an_end_time_gives_none() {
     )
     .await;
     let states = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap()
         .unwrap();
@@ -364,7 +364,7 @@ async fn a_job_time_that_is_not_rfc3339_fails_the_read() {
     )
     .await;
     let err = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not RFC 3339"), "{err}");
@@ -380,7 +380,7 @@ async fn the_connection_id_is_encoded_into_the_jobs_query() {
         .mount(&server)
         .await;
     adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap()
         .unwrap();
@@ -440,7 +440,7 @@ async fn a_refresh_job_ends_a_sync_but_reset_and_clear_do_not() {
     )
     .await;
     let states = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap()
         .unwrap();
@@ -469,7 +469,7 @@ async fn a_stale_unended_job_behind_a_newer_ended_job_is_not_syncing() {
     )
     .await;
     let states = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap()
         .unwrap();
@@ -492,7 +492,7 @@ async fn a_jobs_page_that_is_not_newest_first_fails_the_read() {
     )
     .await;
     let err = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not newest first"), "{err}");
@@ -518,7 +518,7 @@ async fn one_failed_jobs_read_fails_the_whole_poll() {
     )
     .await;
     let err = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("403"), "{err}");
@@ -544,7 +544,7 @@ async fn the_jobs_reads_of_one_poll_run_concurrently() {
         .await;
     let started = std::time::Instant::now();
     let states = adapter(&server, false)
-        .source_sync_states("src__")
+        .source_sync_states("src__", &all)
         .await
         .unwrap()
         .unwrap();
@@ -581,7 +581,11 @@ async fn inactive_and_unknown_status_connections_are_paused_without_a_jobs_read(
     )
     .await;
     let adapter = adapter(&server, true);
-    let states = adapter.source_sync_states("src__").await.unwrap().unwrap();
+    let states = adapter
+        .source_sync_states("src__", &all)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(states.len(), 2);
     assert!(states.iter().all(|s| s.paused && !s.syncing));
 
@@ -601,6 +605,68 @@ async fn inactive_and_unknown_status_connections_are_paused_without_a_jobs_read(
     assert!(posts(&server).await.is_empty());
     let found = adapter.discover("src__").await.unwrap();
     assert!(found.connectors.is_empty(), "discovery returns active only");
+}
+
+/// The pipeline's include filter runs before the jobs fan-out (#2586): an
+/// excluded connection gets no jobs read, and a failing jobs read for it does
+/// not fail the poll. The wait over the selected connection still works.
+#[tokio::test]
+async fn excluded_connection_gets_no_jobs_read_and_cannot_fail_the_poll() {
+    let server = MockServer::start().await;
+    serve_connections(
+        &server,
+        vec![
+            connection("c_in", "src__a", "active"),
+            connection("c_out", "src__b", "active"),
+        ],
+    )
+    .await;
+    serve_jobs(
+        &server,
+        "c_in",
+        vec![jobs_page(vec![job(1, "sync", "succeeded", Some(OLD))])],
+    )
+    .await;
+    serve_jobs(&server, "c_out", vec![ResponseTemplate::new(500)]).await;
+
+    let only_in = |s: &SourceSyncState| s.id == "c_in";
+    let adapter = adapter(&server, false);
+    let states = adapter
+        .source_sync_states("src__", &only_in)
+        .await
+        .expect("the excluded connection's failing jobs read must not fail the poll")
+        .unwrap();
+    let ids: Vec<&str> = states.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["c_in"]);
+
+    let report = wait_for_source_syncs(
+        &adapter,
+        "src__",
+        &only_in,
+        opts(1000),
+        std::future::pending(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(report.syncs.is_empty());
+
+    let excluded_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.url.path() == "/v1/jobs"
+                && r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "connectionId" && v == "c_out")
+        })
+        .count();
+    assert_eq!(
+        excluded_reads, 0,
+        "no jobs read for the excluded connection"
+    );
 }
 
 /// A connection that is deprecated while Rocky waits is left out of the next

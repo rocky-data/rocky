@@ -341,7 +341,7 @@ pub async fn wait_for_source_syncs(
     opts: SourceSyncWaitOptions,
     cancel: impl Future<Output = ()>,
 ) -> AdapterResult<Option<SourceSyncReport>> {
-    let Some(first) = adapter.source_sync_states(schema_prefix).await? else {
+    let Some(first) = adapter.source_sync_states(schema_prefix, include).await? else {
         return Ok(None);
     };
     let started = Instant::now();
@@ -390,7 +390,7 @@ pub async fn wait_for_source_syncs(
             () = tokio::time::sleep(pause) => {}
         }
 
-        let states = match adapter.source_sync_states(schema_prefix).await {
+        let states = match adapter.source_sync_states(schema_prefix, include).await {
             Ok(Some(states)) => {
                 errors_in_a_row = 0;
                 states
@@ -548,7 +548,8 @@ async fn read_after_unknown(
     schema_prefix: &str,
     id: &str,
 ) -> Option<SourceSyncState> {
-    let Ok(Some(states)) = adapter.source_sync_states(schema_prefix).await else {
+    let only_this = |s: &SourceSyncState| s.id == id;
+    let Ok(Some(states)) = adapter.source_sync_states(schema_prefix, &only_this).await else {
         return None;
     };
     states.into_iter().find(|s| s.id == id)
@@ -589,7 +590,7 @@ pub async fn trigger_and_wait_for_source_syncs(
     on_trigger: &(dyn Fn(&SourceSyncTriggered) + Sync),
     cancel: impl Future<Output = ()>,
 ) -> AdapterResult<Option<SourceSyncReport>> {
-    let Some(first) = adapter.source_sync_states(schema_prefix).await? else {
+    let Some(first) = adapter.source_sync_states(schema_prefix, include).await? else {
         return Ok(None);
     };
     let started = Instant::now();
@@ -794,7 +795,7 @@ pub async fn trigger_and_wait_for_source_syncs(
             () = tokio::time::sleep(pause) => {}
         }
 
-        let states = match adapter.source_sync_states(schema_prefix).await {
+        let states = match adapter.source_sync_states(schema_prefix, include).await {
             Ok(Some(states)) => {
                 errors_in_a_row = 0;
                 states
@@ -967,6 +968,7 @@ mod tests {
         async fn source_sync_states(
             &self,
             _p: &str,
+            _i: &(dyn Fn(&SourceSyncState) -> bool + Sync),
         ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
             *self.calls.lock().unwrap() += 1;
             let mut q = self.polls.lock().unwrap();
@@ -1201,6 +1203,7 @@ mod tests {
             async fn source_sync_states(
                 &self,
                 _p: &str,
+                _i: &(dyn Fn(&SourceSyncState) -> bool + Sync),
             ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
                 let mut n = self.0.lock().unwrap();
                 *n += 1;
@@ -1292,6 +1295,7 @@ mod tests {
         async fn source_sync_states(
             &self,
             _p: &str,
+            _i: &(dyn Fn(&SourceSyncState) -> bool + Sync),
         ) -> AdapterResult<Option<Vec<SourceSyncState>>> {
             self.log.lock().unwrap().push("poll".into());
             let mut q = self.polls.lock().unwrap();

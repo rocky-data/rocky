@@ -231,7 +231,14 @@ pub trait DiscoveryAdapter: Send + Sync {
     }
 
     /// Current sync state of every connector whose schema starts with the
-    /// prefix: one status read, no side effect on the source.
+    /// prefix and that `include` accepts: one status read, no side effect on
+    /// the source.
+    ///
+    /// `include` is the pipeline's filter. It reads only `id`, `schema` and
+    /// `source_type`, so an adapter can apply it before any per-connector
+    /// read and skip the cost (and the failure risk) of connectors the run
+    /// will not read. Ignoring it is allowed: the shared wait applies it
+    /// again to the answer.
     ///
     /// Default: `Ok(None)`, meaning this adapter does not report sync state.
     /// `rocky run` uses it for `[...discovery.sync] wait = true`. It warns and
@@ -240,6 +247,7 @@ pub trait DiscoveryAdapter: Send + Sync {
     async fn source_sync_states(
         &self,
         _schema_prefix: &str,
+        _include: &(dyn Fn(&crate::source_sync::SourceSyncState) -> bool + Sync),
     ) -> AdapterResult<Option<Vec<crate::source_sync::SourceSyncState>>> {
         Ok(None)
     }

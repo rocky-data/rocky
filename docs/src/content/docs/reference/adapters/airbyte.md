@@ -38,7 +38,7 @@ adapter = "airbyte"
 
 `[pipeline.NAME.source.discovery.sync] wait = true` works on Airbyte the same way it works on Fivetran. The keys, the outcomes and the run JSON are the same. See [Wait for a running sync](/reference/adapters/fivetran/#wait-for-a-running-sync) on the Fivetran page. This section covers only what is different on Airbyte.
 
-With `wait = true` alone, Rocky only reads. Each poll sends one `GET /v1/connections`, then one `GET /v1/jobs` for each active connection the prefix selects, up to 10 at a time. An inactive connection gets no jobs read. The jobs read asks for the 25 newest jobs, newest first (`orderBy=createdAt|DESC`). If the jobs are not in that order (job ids not falling), the read fails. Rocky builds each connection's state from them. One failed jobs read fails the whole poll. The pipeline's `include` filter is applied after the poll, so a connection it leaves out is still read.
+With `wait = true` alone, Rocky only reads. Each poll sends one `GET /v1/connections`, then one `GET /v1/jobs` for each active connection the prefix selects, up to 10 at a time. An inactive connection gets no jobs read. The jobs read asks for the 25 newest jobs, newest first (`orderBy=createdAt|DESC`). If the jobs are not in that order (job ids not falling), the read fails. Rocky builds each connection's state from them. One failed jobs read fails the whole poll. The pipeline's `include` filter is applied before the jobs reads, so a connection it leaves out costs no jobs read and cannot fail the poll.
 
 | State | Where it comes from |
 |-------|---------------------|
