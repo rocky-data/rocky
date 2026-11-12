@@ -6475,6 +6475,88 @@ mod tests {
         assert_eq!(jobs[0].job_id, "job-local-1");
     }
 
+    /// Seed `path` with one AI usage record, a dropped-lines counter, and a
+    /// "recording began" stamp long ago.
+    fn seed_ai_usage(path: &Path) -> chrono::DateTime<chrono::Utc> {
+        let since = chrono::Utc::now() - chrono::Duration::days(400);
+        let store = StateStore::open(path).expect("open local seed store");
+        store.stamp_ai_usage_since(since).unwrap();
+        store
+            .record_ai_usage(&[crate::ai_usage::AiUsageRecord::new(
+                chrono::Utc::now(),
+                "ai_explain",
+                Some("orders".to_string()),
+                "claude".to_string(),
+                Some(1),
+                Some(2),
+            )])
+            .unwrap();
+        // One dropped line, as a drain leaves it.
+        let spool = crate::ai_usage::spool_path(path);
+        std::fs::write(&spool, b"not json\n").unwrap();
+        store.drain_ai_usage_spool().unwrap().unwrap();
+        drop(store);
+        since
+    }
+
+    fn assert_ai_usage_survived(path: &Path, since: chrono::DateTime<chrono::Utc>) {
+        let store = StateStore::open(path).unwrap();
+        assert_eq!(
+            store.list_ai_usage().unwrap().len(),
+            1,
+            "local-only ai_usage rows must survive the merge"
+        );
+        assert_eq!(
+            store.ai_usage_since().unwrap(),
+            Some(since),
+            "the recording-began row must stay this machine's, not the remote's or a fresh one"
+        );
+        assert_eq!(store.ai_usage_dropped().unwrap(), 1);
+    }
+
+    /// A restored download keeps the local AI usage rows and the "recording
+    /// began" row. Mutation: drop `ai_usage` from the local-only list and the
+    /// rows and the stamp reset.
+    #[tokio::test]
+    async fn download_restored_keeps_ai_usage_rows_and_the_since_row() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_local_with_local_only(&local, "local.stale", "job-local-1");
+        let since = seed_ai_usage(&local);
+        let remote_bytes = build_remote_object_bytes(dir.path(), "remote.fresh");
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let _ = download_state(&config, &local, false).await.unwrap();
+        test_support::clear();
+        assert_ai_usage_survived(&local, since);
+    }
+
+    /// An absent remote keeps them too.
+    #[tokio::test]
+    async fn download_absent_keeps_ai_usage_rows_and_the_since_row() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_local_with_local_only(&local, "local.stale", "job-local-1");
+        let since = seed_ai_usage(&local);
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let _ = download_state(&config, &local, false).await.unwrap();
+        test_support::clear();
+        assert_ai_usage_survived(&local, since);
+    }
+
     /// The copy primitive itself: it replaces ONLY the named (local-only) tables
     /// in `dst`, leaves every replicated table in `dst` untouched, drags NO
     /// replicated table across from `src`, and drops a stale `dst` row.

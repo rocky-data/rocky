@@ -749,6 +749,7 @@ mod tests {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -787,6 +788,7 @@ mod tests {
             }),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 
@@ -924,6 +926,7 @@ mod tests {
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 
@@ -994,6 +997,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: None,
             input_hash: None,

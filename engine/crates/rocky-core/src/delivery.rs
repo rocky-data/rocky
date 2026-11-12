@@ -353,11 +353,23 @@ pub fn stamp_delivery_timing(
     // model records one execution per partition.
     let mut previous_by_model: std::collections::BTreeMap<String, Option<LastDelivery>> =
         std::collections::BTreeMap::new();
+    // A model with any failed execution in this record did not deliver, even
+    // where some of its partitions succeeded (for example a volume breach
+    // on one partition).
+    let failed_models: std::collections::BTreeSet<String> = record
+        .models_executed
+        .iter()
+        .filter(|m| m.status != "success")
+        .map(|m| m.rocky_model_name().to_string())
+        .collect();
     for execution in &mut record.models_executed {
         if execution.status != "success" {
             continue;
         }
         let model = execution.rocky_model_name().to_string();
+        if failed_models.contains(&model) {
+            continue;
+        }
         let Some(deadline) = deadlines.iter().find(|d| d.output_model == model) else {
             continue;
         };
@@ -1265,6 +1277,55 @@ mod tests {
             "a second stamp must not re-cover the next deadline"
         );
         assert!(day2.models_executed[0].finished_at > due);
+    }
+
+    /// A run where one partition of the model breached its volume range and
+    /// another passed: the passing partition's execution is a success, but
+    /// the model did not deliver.
+    fn partial_partition_run(id: &str, started: DateTime<Utc>) -> RunRecord {
+        let mut record = delivery_run(
+            id,
+            started,
+            30,
+            "success",
+            crate::state::RunScope::Production,
+        );
+        let mut failed = record.models_executed[0].clone();
+        failed.status = "failed".to_string();
+        record.models_executed.push(failed);
+        record
+    }
+
+    #[test]
+    fn a_model_with_a_failed_partition_is_not_stamped_as_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let deadlines = [ProductDeadline {
+            product: "revenue".to_string(),
+            output_model: "revenue_daily".to_string(),
+            deliver_by: six_am(),
+        }];
+        let mut run = partial_partition_run("partial", utc(2026, 5, 1, 5, 0));
+        stamp_delivery_timing(&mut run, &store, &deadlines).unwrap();
+        assert!(
+            run.models_executed.iter().all(|m| m.due_at.is_none()),
+            "no execution of a model with a failed partition serves a deadline"
+        );
+    }
+
+    #[test]
+    fn a_run_with_a_failed_partition_is_not_the_last_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .record_run(&partial_partition_run("partial", utc(2026, 5, 1, 5, 0)))
+            .unwrap();
+        assert!(
+            store
+                .last_delivery("revenue_daily", UnrecordedScope::Exclude, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ----- the latest start -----

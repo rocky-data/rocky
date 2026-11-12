@@ -1,0 +1,102 @@
+# Airbyte connector shim: an Airbyte source image -> Parquet -> DuckDB.
+#
+# `rocky load --connector faker_users` runs connector/main.py once. The shim
+# runs the airbyte/source-faker image with docker, loads the records of the
+# `users` stream, and keeps the last Airbyte STATE message as Rocky state.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[connector.faker_users]
+manifest     = "connector/connector.toml"
+# Keep each run's scratch directory, so run.sh can inspect it.
+keep_scratch = true
+output_uri   = "file://./.rocky/landing/faker_users"
+# This POC needs no credential. A real source reads its token or password
+# from the environment: declare the variable name here, and map it into the
+# source config with `config_env` below. Rocky hands exactly the variables
+# listed here to the shim. The docker CLI uses the default socket; to reach
+# another daemon, add "DOCKER_HOST" to this list.
+#   secrets = ["SOURCE_API_TOKEN"]
+# Never put a credential under options: options.json is on disk in clear.
+secrets      = []
+target       = { catalog = "poc", schema = "main", table = "users" }
+retries      = 0
+
+# Settings for the shim. Rocky writes this table as JSON to options.json.
+[connector.faker_users.options]
+# Required. A pinned tag or digest. The shim never pulls: run.sh pulls it.
+image          = "airbyte/source-faker:6.2.21"
+# Required. The ONE stream to load. The source also has `products` and
+# `purchases`; the shim ignores them. A name the source lacks fails the run.
+stream         = "users"
+# Optional. "auto" (default) is incremental when the stream supports it,
+# else full_refresh. "full_refresh" forces a full read on every run
+# (a full refresh with an append target loads duplicates).
+sync_mode      = "auto"
+# Optional. Passed to `docker run --network`. "none" makes the container
+# offline: the faker source needs no network. Omit it for a real source.
+docker_network = "none"
+
+# The source's connection config, as the source's spec defines it.
+# No secrets here. `always_updated = false` makes faker honor its state
+# (by default it ignores the state and regenerates every record).
+[connector.faker_users.options.config]
+count             = 20
+seed              = 7
+records_per_slice = 10
+parallelism       = 1
+always_updated    = false
+
+# Optional. Config key -> NAME of an environment variable. The name must be
+# in `secrets` above. The value is written to a 0600 config file that the
+# shim deletes when the run ends. Example:
+# [connector.faker_users.options.config_env]
+# api_token = "SOURCE_API_TOKEN"
+
+# Control: the same source with no saved state. run.sh loads it once to show
+# that load 2 of faker_users read 0 rows because of the saved state.
+[connector.faker_users_fresh]
+manifest     = "connector/connector.toml"
+output_uri   = "file://./.rocky/landing/faker_users_fresh"
+target       = { catalog = "poc", schema = "main", table = "users_fresh" }
+retries      = 0
+
+[connector.faker_users_fresh.options]
+image          = "airbyte/source-faker:6.2.21"
+stream         = "users"
+docker_network = "none"
+
+[connector.faker_users_fresh.options.config]
+count             = 20
+seed              = 7
+records_per_slice = 10
+parallelism       = 1
+always_updated    = false
+
+# Failure cases. run.sh runs each once and expects a clear failure.
+[connector.faker_bad_stream]
+manifest     = "connector/connector.toml"
+output_uri   = "file://./.rocky/landing/faker_bad_stream"
+target       = { catalog = "poc", schema = "main", table = "bad_stream" }
+retries      = 0
+
+[connector.faker_bad_stream.options]
+image          = "airbyte/source-faker:6.2.21"
+stream         = "orders"
+docker_network = "none"
+
+[connector.faker_bad_config]
+manifest     = "connector/connector.toml"
+output_uri   = "file://./.rocky/landing/faker_bad_config"
+target       = { catalog = "poc", schema = "main", table = "bad_config" }
+retries      = 0
+
+[connector.faker_bad_config.options]
+image          = "airbyte/source-faker:6.2.21"
+stream         = "users"
+docker_network = "none"
+
+[connector.faker_bad_config.options.config]
+count = "not a number"

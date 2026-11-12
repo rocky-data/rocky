@@ -3,7 +3,7 @@ name: ducklake-conformance
 # Live conformance for DuckLake tables written through DuckDB
 # (docs/adr/ADR-DUCKLAKE.md). Runs the ignored tests behind the
 # `ducklake-conformance` feature against a local DuckDB-file lake, then the
-# 07-adapters/10-duckdb-ducklake POC. No Docker. Not a required check: it
+# 07-adapters/13-duckdb-ducklake POC. No Docker. Not a required check: it
 # downloads the `ducklake` extension from the DuckDB extension repository, so
 # it runs on the surfaces it covers and weekly.
 
@@ -15,7 +15,7 @@ on:
       - 'engine/crates/rocky-core/src/traits.rs'
       - 'engine/crates/rocky-core/src/sql_gen.rs'
       - 'engine/crates/rocky-core/src/config.rs'
-      - 'examples/playground/pocs/07-adapters/10-duckdb-ducklake/**'
+      - 'examples/playground/pocs/07-adapters/13-duckdb-ducklake/**'
       - '.github/workflows/ducklake-conformance.yml'
   pull_request:
     branches: [main]
@@ -24,7 +24,7 @@ on:
       - 'engine/crates/rocky-core/src/traits.rs'
       - 'engine/crates/rocky-core/src/sql_gen.rs'
       - 'engine/crates/rocky-core/src/config.rs'
-      - 'examples/playground/pocs/07-adapters/10-duckdb-ducklake/**'
+      - 'examples/playground/pocs/07-adapters/13-duckdb-ducklake/**'
       - '.github/workflows/ducklake-conformance.yml'
   schedule:
     - cron: '43 5 * * 2'
@@ -65,7 +65,7 @@ jobs:
           cargo test -p rocky-duckdb --features ducklake-conformance
           --test ducklake_conformance -- --ignored --test-threads 1
       - name: Run the POC
-        working-directory: examples/playground/pocs/07-adapters/10-duckdb-ducklake
+        working-directory: examples/playground/pocs/07-adapters/13-duckdb-ducklake
         run: |
           cargo build --manifest-path "$GITHUB_WORKSPACE/engine/Cargo.toml" --bin rocky
           PATH="$GITHUB_WORKSPACE/engine/target/debug:$PATH" ./run.sh

@@ -12,7 +12,13 @@ export type CostSplitBasis = "bytes" | "estimated_bytes" | "rows_scanned_unweigh
 /**
  * A unit a monthly cost figure is counted in. Units are never added to each other, and the two storage bases are never added together.
  */
-export type CostUnit = "compute_ms" | "storage_byte_hours_data_files" | "storage_byte_hours_allocated_blocks";
+export type CostUnit =
+  | "compute_ms"
+  | "storage_byte_hours_data_files"
+  | "storage_byte_hours_allocated_blocks"
+  | "egress_bytes"
+  | "ai_input_tokens"
+  | "ai_output_tokens";
 /**
  * Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
  */
@@ -49,6 +55,12 @@ export type VolumeSeverity = "error" | "warning";
  * The outcome of one volume check.
  */
 export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evaluated";
+/**
+ * What a `[product.output.volume]` check counts, set by the output model's strategy.
+ *
+ * ```text full_refresh                     total_rows      the whole table is this load incremental (no unique_key)      rows_added      the INSERT's reported rows incremental (unique_key), merge  rows_touched    the MERGE's reported row count time_interval                    partition_rows  COUNT(*) in each partition written ```
+ */
+export type VolumeBasis = "total_rows" | "rows_added" | "rows_touched" | "partition_rows";
 
 /**
  * JSON output of `rocky product status`.
@@ -219,7 +231,7 @@ export interface ProductMonthCost {
    */
   kept: CostAmount[];
   /**
-   * `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.
+   * `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute, storage, egress when an adapter reported it this month, and AI tokens when this state store recorded calls this month and recorded the whole month. A figure whose part is `not_measured` or (for AI tokens) `partial` is not in it.
    */
   money?: number | null;
   /**
@@ -305,7 +317,7 @@ export interface ProductBudgetCheck {
   limit: number;
   limit_type: ProductBudgetLimitType;
   /**
-   * Why the limit is `not_evaluated`.
+   * Why the limit is `not_evaluated`. On a `max_usd` limit that is `breached` from the priced figures alone (`actual` is then that floor), what the figure leaves out.
    */
   reason?: string | null;
   /**
@@ -345,7 +357,7 @@ export interface ProductBudgetStatus {
  */
 export interface CostAmount {
   /**
-   * Whole units. Milliseconds, or byte-hours rounded down per interval.
+   * Whole units: milliseconds, byte-hours rounded down per interval, bytes, or tokens.
    */
   amount: number;
   unit: CostUnit;
@@ -512,6 +524,10 @@ export interface ProductSourceVolumeStatus {
  */
 export interface ProductVolumeStatus {
   /**
+   * What `row_count` counts, as stored with it (`rocky run`'s `volume.basis`). Absent when there is no count.
+   */
+  basis?: VolumeBasis | null;
+  /**
    * When that build finished.
    */
   counted_at?: string | null;
@@ -524,11 +540,15 @@ export interface ProductVolumeStatus {
    */
   min_rows?: number | null;
   /**
-   * The newest production build that recorded a count. Absent when no build has been counted yet.
+   * Why the verdict is `not_evaluated`.
+   */
+  reason?: string | null;
+  /**
+   * The count the newest production build of the output judged. Absent when that build took no count, or no build exists. An older build's count is never shown in its place. When the newest build wrote several partitions, this is the count of the partition that decides the verdict: the first one out of range, otherwise the newest.
    */
   row_count?: number | null;
   /**
-   * The run that took the count.
+   * The newest production run that built the output.
    */
   run_id?: string | null;
   /**
@@ -536,7 +556,7 @@ export interface ProductVolumeStatus {
    */
   severity: VolumeSeverity;
   /**
-   * That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists.
+   * The newest build's verdict: its count judged against the range the spec declares now (`in_range`, `below_min`, `above_max`), or `not_evaluated` when that build took no count, or counted on a basis the output model no longer has.
    */
   verdict: VolumeVerdict;
   [k: string]: unknown;

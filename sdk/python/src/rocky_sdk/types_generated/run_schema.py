@@ -134,6 +134,9 @@ class CostUnit(StrEnum):
     compute_ms = "compute_ms"
     storage_byte_hours_data_files = "storage_byte_hours_data_files"
     storage_byte_hours_allocated_blocks = "storage_byte_hours_allocated_blocks"
+    egress_bytes = "egress_bytes"
+    ai_input_tokens = "ai_input_tokens"
+    ai_output_tokens = "ai_output_tokens"
 
 
 class DriftActionOutput(BaseModel):
@@ -819,6 +822,38 @@ class UpstreamReads(BaseModel):
     """
 
 
+class VolumeBasis(StrEnum):
+    """
+    The table's total rows after the build. A full-refresh build replaces the whole table, so the total is this load.
+    """
+
+    total_rows = "total_rows"
+
+
+class VolumeBasis7(StrEnum):
+    """
+    The rows this run appended, as the adapter reported them for its INSERT. When the adapter reports nothing, the table's row count after the write minus its count before. When both exist and differ, nothing is counted (`not_evaluated`). A run that created or rebuilt the table counts every row in it.
+    """
+
+    rows_added = "rows_added"
+
+
+class VolumeBasis8(StrEnum):
+    """
+    The rows this run's `MERGE` inserted or updated, as the warehouse reports them. A matched row counts even when its values did not change. A run that created or rebuilt the table counts every row in it.
+    """
+
+    rows_touched = "rows_touched"
+
+
+class VolumeBasis9(StrEnum):
+    """
+    The rows in one partition this run wrote, counted after the write with the same time window that partition's overwrite used. Each written partition is judged on its own.
+    """
+
+    partition_rows = "partition_rows"
+
+
 class VolumeSeverity5(StrEnum):
     """
     The model is marked failed after its build, and the run is partial.
@@ -1121,7 +1156,7 @@ class ProductBudgetCheck(BaseModel):
     limit_type: ProductBudgetLimitType
     reason: str | None = None
     """
-    Why the limit is `not_evaluated`.
+    Why the limit is `not_evaluated`. On a `max_usd` limit that is `breached` from the priced figures alone (`actual` is then that floor), what the figure leaves out.
     """
     unit: CostUnit | None = None
     """
@@ -1218,9 +1253,13 @@ class VolumeCheckOutput(BaseModel):
     """
     The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.
 
-    The count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.
+    What is counted depends on the output model's strategy; `basis` says which (`total_rows`, `rows_added`, `rows_touched`, `partition_rows`).
     """
 
+    basis: VolumeBasis | VolumeBasis7 | VolumeBasis8 | VolumeBasis9 | None = None
+    """
+    What `row_count` counts: `total_rows` (the whole table, for a full-refresh output), `rows_added` (the rows this run appended, for an incremental output), `rows_touched` (the rows this run's MERGE inserted or updated, matched rows included even when their values did not change, for a merge output or an incremental one with a `unique_key`), or `partition_rows` (the rows in this partition, for a time-interval output, which is judged one partition at a time). Absent when the strategy is not counted (`volume-strategy-unsupported`).
+    """
     max_rows: conint(ge=0) | None = None
     """
     The declared `max_rows` (inclusive), when set.
@@ -1243,7 +1282,7 @@ class VolumeCheckOutput(BaseModel):
     """
     row_count: conint(ge=0) | None = None
     """
-    The table's total rows after the build. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
+    The count judged, on `basis`. Absent when no count was taken or it could not be read (`verdict = "not_evaluated"`).
     """
     severity: VolumeSeverity5 | VolumeSeverity6
     """
@@ -1276,6 +1315,10 @@ class MaterializationOutput(BaseModel):
     Observed dollar cost of this materialization, computed post-hoc from the adapter-appropriate formula (duration × DBU rate for Databricks/Snowflake, bytes × $/TB for BigQuery, zero for DuckDB). `None` when the warehouse type isn't billed or the adapter didn't report the inputs the formula needs. Populated by the run finalizer via `rocky_core::cost::compute_observed_cost_usd`.
     """
     duration_ms: conint(ge=0)
+    egress_bytes: conint(ge=0) | None = None
+    """
+    Bytes the statements moved out of the warehouse's region, summed over the statements that reported it. No adapter reports it yet, so it is absent today. `bytes_scanned` and `bytes_written` are not egress. Carried onto the run record for `rocky cost --month`.
+    """
     job_ids: list[str] | None = None
     """
     Warehouse-side job identifiers for the SQL statements rocky issued to materialize this output. Populated for adapters whose REST API surfaces a job reference per statement (BigQuery today via `jobReference.jobId`).
@@ -1308,7 +1351,7 @@ class MaterializationOutput(BaseModel):
     """
     volume: VolumeCheckOutput | None = None
     """
-    The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise.
+    The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise. A `time_interval` model carries one on each partition this run wrote, judging that partition's rows. That includes partitions written in a run where another partition failed to run.
     """
 
 

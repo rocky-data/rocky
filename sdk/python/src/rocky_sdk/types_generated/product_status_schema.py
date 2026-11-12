@@ -27,6 +27,9 @@ class CostUnit(StrEnum):
     compute_ms = "compute_ms"
     storage_byte_hours_data_files = "storage_byte_hours_data_files"
     storage_byte_hours_allocated_blocks = "storage_byte_hours_allocated_blocks"
+    egress_bytes = "egress_bytes"
+    ai_input_tokens = "ai_input_tokens"
+    ai_output_tokens = "ai_output_tokens"
 
 
 class EstimateBasis1(StrEnum):
@@ -156,6 +159,38 @@ class SharedNotChargedCost(BaseModel):
     unit: CostUnit
 
 
+class VolumeBasis1(StrEnum):
+    """
+    The table's total rows after the build. A full-refresh build replaces the whole table, so the total is this load.
+    """
+
+    total_rows = "total_rows"
+
+
+class VolumeBasis2(StrEnum):
+    """
+    The rows this run appended, as the adapter reported them for its INSERT. When the adapter reports nothing, the table's row count after the write minus its count before. When both exist and differ, nothing is counted (`not_evaluated`). A run that created or rebuilt the table counts every row in it.
+    """
+
+    rows_added = "rows_added"
+
+
+class VolumeBasis3(StrEnum):
+    """
+    The rows this run's `MERGE` inserted or updated, as the warehouse reports them. A matched row counts even when its values did not change. A run that created or rebuilt the table counts every row in it.
+    """
+
+    rows_touched = "rows_touched"
+
+
+class VolumeBasis4(StrEnum):
+    """
+    The rows in one partition this run wrote, counted after the write with the same time window that partition's overwrite used. Each written partition is judged on its own.
+    """
+
+    partition_rows = "partition_rows"
+
+
 class VolumeSeverity1(StrEnum):
     """
     The model is marked failed after its build, and the run is partial.
@@ -240,7 +275,7 @@ class CostAmount(BaseModel):
 
     amount: conint(ge=0)
     """
-    Whole units. Milliseconds, or byte-hours rounded down per interval.
+    Whole units: milliseconds, byte-hours rounded down per interval, bytes, or tokens.
     """
     unit: CostUnit
 
@@ -309,7 +344,7 @@ class ProductBudgetCheck(BaseModel):
     limit_type: ProductBudgetLimitType
     reason: str | None = None
     """
-    Why the limit is `not_evaluated`.
+    Why the limit is `not_evaluated`. On a `max_usd` limit that is `breached` from the priced figures alone (`actual` is then that floor), what the figure leaves out.
     """
     unit: CostUnit | None = None
     """
@@ -388,6 +423,10 @@ class ProductVolumeStatus(BaseModel):
     The declared volume range and the latest production count.
     """
 
+    basis: VolumeBasis1 | VolumeBasis2 | VolumeBasis3 | VolumeBasis4 | None = None
+    """
+    What `row_count` counts, as stored with it (`rocky run`'s `volume.basis`). Absent when there is no count.
+    """
     counted_at: AwareDatetime | None = None
     """
     When that build finished.
@@ -400,13 +439,17 @@ class ProductVolumeStatus(BaseModel):
     """
     The declared `min_rows` (inclusive), when set.
     """
+    reason: str | None = None
+    """
+    Why the verdict is `not_evaluated`.
+    """
     row_count: conint(ge=0) | None = None
     """
-    The newest production build that recorded a count. Absent when no build has been counted yet.
+    The count the newest production build of the output judged. Absent when that build took no count, or no build exists. An older build's count is never shown in its place. When the newest build wrote several partitions, this is the count of the partition that decides the verdict: the first one out of range, otherwise the newest.
     """
     run_id: str | None = None
     """
-    The run that took the count.
+    The newest production run that built the output.
     """
     severity: VolumeSeverity1 | VolumeSeverity2
     """
@@ -414,7 +457,7 @@ class ProductVolumeStatus(BaseModel):
     """
     verdict: VolumeVerdict1 | VolumeVerdict2 | VolumeVerdict3 | VolumeVerdict4
     """
-    That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists.
+    The newest build's verdict: its count judged against the range the spec declares now (`in_range`, `below_min`, `above_max`), or `not_evaluated` when that build took no count, or counted on a basis the output model no longer has.
     """
 
 
@@ -525,7 +568,7 @@ class ProductMonthCost(BaseModel):
     """
     money: float | None = None
     """
-    `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.
+    `charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute, storage, egress when an adapter reported it this month, and AI tokens when this state store recorded calls this month and recorded the whole month. A figure whose part is `not_measured` or (for AI tokens) `partial` is not in it.
     """
     money_parts: list[MoneyPart]
     """

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 rocky-core = { path = "../rocky-core" }
 async-trait = { workspace = true }
+futures = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -18,6 +19,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 percent-encoding = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

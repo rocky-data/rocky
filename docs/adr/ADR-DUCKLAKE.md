@@ -97,7 +97,7 @@ Reads change too, because an attached catalog shares the connection:
 
 - Required CI, no network and no `INSTALL ducklake` (a 55 MB download): config parsing and validation, attach rendering, path absolutising, the stored-path and same-file checks (a plain in-memory database named like the metadata catalog stands in for a lake), kind → `Atomic`, the refusal matrix, the seed, quarantine and promote gates, `list_tables` and discovery with an attachment, profile parsing, the failure classifier on the measured messages, and the offline-missing error.
 - A live conformance test, `rocky-duckdb/tests/ducklake_conformance.rs` (feature `ducklake-conformance`, `#[ignore]`), runs the SQL Rocky's DuckDB dialect renders against a real lake: a full refresh with a self-read and a failed replace, a merge, a partition overwrite, drift widenings and a refused narrowing, a cross-database transaction, relative and stored paths, and discovery. It needs no Docker.
-- A credential-free POC, `examples/playground/pocs/07-adapters/10-duckdb-ducklake`, runs `rocky run` twice on `full_refresh`, append `incremental`, `merge` and `delete_insert`, checks the Parquet files, and checks that a view model is refused.
+- A credential-free POC, `examples/playground/pocs/07-adapters/13-duckdb-ducklake`, runs `rocky run` twice on `full_refresh`, append `incremental`, `merge` and `delete_insert`, checks the Parquet files, and checks that a view model is refused.
 - `.github/workflows/ducklake-conformance.yml` runs both, path-filtered and non-required, plus a weekly schedule. Models write more than 10 rows, so Parquet files are written.
 
 ## Consequences

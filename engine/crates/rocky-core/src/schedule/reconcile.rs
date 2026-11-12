@@ -2016,6 +2016,7 @@ cron = "also invalid"
             run_scope: Some(crate::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 

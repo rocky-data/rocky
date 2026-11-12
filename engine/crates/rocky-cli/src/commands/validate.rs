@@ -2694,6 +2694,52 @@ schema_template = "{name}__{{source}}"
         );
     }
 
+    /// The same pipeline on an Airbyte discovery adapter named `ab`.
+    fn airbyte_trigger_toml(opt_in: &str, sync: &str) -> String {
+        trigger_toml("", sync, "")
+            .replace(
+                "[adapter.ft]\ntype = \"fivetran\"\nkind = \"discovery\"\ndestination_id = \"d\"\n\
+                 api_key = \"k\"\napi_secret = \"s\"\n",
+                &format!(
+                    "[adapter.ab]\ntype = \"airbyte\"\nkind = \"discovery\"\n\
+                     host = \"https://api.airbyte.com\"\ntoken = \"t\"\n{opt_in}\n"
+                ),
+            )
+            .replace("adapter = \"ft\"", "adapter = \"ab\"")
+    }
+
+    #[test]
+    fn airbyte_wait_and_trigger_with_the_opt_in_are_valid() {
+        let toml = airbyte_trigger_toml(
+            "allow_sync_trigger = true",
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+        );
+        assert!(toml.contains("type = \"airbyte\"") && !toml.contains("fivetran"));
+        let out = validate_toml(&toml);
+        assert!(out.valid, "{:?}", out.messages);
+        let wait_only = validate_toml(&airbyte_trigger_toml(
+            "",
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        ));
+        assert!(wait_only.valid, "{:?}", wait_only.messages);
+    }
+
+    #[test]
+    fn an_airbyte_trigger_without_the_adapter_opt_in_is_invalid() {
+        let out = validate_toml(&airbyte_trigger_toml(
+            "",
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+        ));
+        assert!(!out.valid, "{:?}", out.messages);
+        assert!(
+            out.messages.iter().any(|m| m
+                .message
+                .contains("allow_sync_trigger = true on [adapter.ab]")),
+            "{:?}",
+            out.messages
+        );
+    }
+
     /// #1919: `rocky validate --output json` prints a resolved pipeline
     /// template as `${NAME}`: in the pipeline status and in the V020 message.
     #[test]

@@ -161,6 +161,13 @@ pub struct ExecutionStats {
     /// Reserved so a future wave can populate it without a schema
     /// break.
     pub bytes_written: Option<u64>,
+    /// Bytes the statement moved out of the warehouse's region (cross-region
+    /// transfer). No adapter reports it yet: every adapter returns `None`.
+    /// `bytes_scanned` and `bytes_written` are not egress. Threaded into
+    /// [`crate::state::ModelExecution::egress_bytes`], where the monthly
+    /// cost report prices it with `[cost] cross_region_transfer_cost_per_gb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_bytes: Option<u64>,
     /// Rows affected by the statement (inserts + updates + deletes).
     /// Not populated yet — reserved so a follow-up wave can thread
     /// per-adapter row counts through without another trait-method
@@ -242,7 +249,7 @@ pub trait DiscoveryAdapter: Send + Sync {
     ///
     /// Default: [`SourceSyncTriggerError::Unsupported`]. An adapter that
     /// implements it must also refuse unless its owner opted in (the Fivetran
-    /// adapter checks `allow_sync_trigger`), because `rocky validate` is only
+    /// and Airbyte adapters check `allow_sync_trigger`), because `rocky validate` is only
     /// one funnel into this call. `rocky run` calls it for
     /// `[...discovery.sync] trigger = true`.
     ///

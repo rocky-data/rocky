@@ -1,0 +1,13 @@
+# Manifest for the dlt connector shim.
+# The tool's credentials would be declared in rocky.toml (`secrets`), not here:
+# the manifest refuses unknown keys.
+protocol_version     = 0
+name                 = "dlt-shim"
+command              = ["./launch.sh"]
+state_schema_version = 1
+# The shim itself calls no host (dlt telemetry is switched off). Your dlt
+# source may: list its API hosts here, as a statement of intent.
+egress_hosts         = []
+
+[limits]
+wall_time_secs = 300

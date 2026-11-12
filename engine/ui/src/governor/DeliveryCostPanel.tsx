@@ -94,6 +94,9 @@ export function unitState(unit: CostUnit): FigureState {
   switch (unit) {
     case "compute_ms":
     case "storage_byte_hours_data_files":
+    case "egress_bytes":
+    case "ai_input_tokens":
+    case "ai_output_tokens":
       return "measured";
     case "storage_byte_hours_allocated_blocks":
       return "estimated";
@@ -188,6 +191,12 @@ export function formatAmount(unit: CostUnit, amount: number): string {
       return `${formatNumber(amount / BYTES_PER_GIB)} GiB-hours (data files)`;
     case "storage_byte_hours_allocated_blocks":
       return `${formatNumber(amount / BYTES_PER_GIB)} GiB-hours (allocated blocks)`;
+    case "egress_bytes":
+      return `${formatNumber(amount / BYTES_PER_GIB)} GiB egress`;
+    case "ai_input_tokens":
+      return `${amount} AI input tokens`;
+    case "ai_output_tokens":
+      return `${amount} AI output tokens`;
     default:
       return `${amount} ${String(unit)}`;
   }
@@ -441,6 +450,12 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
     counts.unattributed_read_tables > 0
       ? `${plural(counts.unattributed_read_tables, "table")} read with no recorded build, so the cost of those reads is not split`
       : null,
+    (counts.egress_unreported_executions ?? 0) > 0
+      ? `${plural(counts.egress_unreported_executions ?? 0, "production execution")} reported no egress, so the egress figure is a floor`
+      : null,
+    (counts.ai_calls_without_usage ?? 0) > 0
+      ? `${plural(counts.ai_calls_without_usage ?? 0, "AI call")} reported no token counts, so they are not counted`
+      : null,
   ].filter((line): line is string => line !== null);
   const caveats = [...(report.warnings ?? []), ...unmeasured];
   return (
@@ -469,7 +484,7 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
           label="charged, in USD"
           value={<MoneyFigureText cost={cost} />}
           tone={cost.money_status === "priced" ? "muted" : "warn"}
-          sub="Compute and storage only. Egress and AI tokens are not measured."
+          sub="Only figures the month measured and priced. AI tokens cover calls recorded in this state store. See the money by figure below."
         />
         <StatusCard
           label="charged"

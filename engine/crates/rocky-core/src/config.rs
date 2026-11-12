@@ -2544,12 +2544,18 @@ pub struct CostSection {
     /// monthly product view (`rocky cost --month`) prices model time with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_cost_per_machine_hour: Option<f64>,
-    /// Price of moving one GB of data across regions, in USD per GB. Unset
-    /// by default. Config only for now: no cost path reads it yet.
+    /// Price of moving one GB (2^30 bytes) of data across regions, in USD
+    /// per GB. Unset by default. The monthly product view
+    /// (`rocky cost --month`) prices reported egress with it. No adapter
+    /// reports egress yet, so it prices nothing today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_region_transfer_cost_per_gb: Option<f64>,
-    /// Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by
-    /// default. Config only for now: no cost path reads it yet.
+    /// Price of one million AI tokens, in USD per 1,000,000 tokens. One
+    /// blended price: input and output tokens are priced alike. Unset by
+    /// default. The monthly product view (`rocky cost --month`) prices the
+    /// AI calls this state store recorded with it; a month with recorded
+    /// calls and no price here has no money total. `0` is a valid explicit
+    /// price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_cost_per_million_tokens: Option<f64>,
 }
@@ -4968,14 +4974,28 @@ pub fn validate_product_budget_limits(config: &RockyConfig) -> Vec<ConfigError> 
     errors
 }
 
+/// Discovery adapter types that report sync state and can start a sync:
+/// `[...discovery.sync] wait = true` and `trigger = true` work only on these.
+pub const SYNC_STATE_ADAPTER_TYPES: &[&str] = &["fivetran", "airbyte"];
+
+/// Product name for an adapter type in a validation message.
+fn sync_vendor_name(adapter_type: &str) -> &str {
+    match adapter_type {
+        "fivetran" => "Fivetran",
+        "airbyte" => "Airbyte",
+        other => other,
+    }
+}
+
 /// Validate every `[pipeline.<name>.source.discovery.sync]` table.
 ///
 /// - `poll_interval_secs` is at least [`MIN_SYNC_POLL_INTERVAL_SECS`].
 /// - `wait_timeout_secs` is above zero and at most half of
 ///   `[state.idempotency] in_flight_ttl_hours`. Past that, another run's
 ///   sweep could reap this run's idempotency claim while it still waits.
-/// - `wait = true` needs a Fivetran discovery adapter. No other known adapter
-///   reports sync state, so the key would do nothing.
+/// - `wait = true` needs a Fivetran or Airbyte discovery adapter
+///   ([`SYNC_STATE_ADAPTER_TYPES`]). No other known adapter reports sync
+///   state, so the key would do nothing.
 ///
 /// - `trigger = true` needs `wait = true` (Rocky starts a sync only to wait
 ///   for it) and `allow_sync_trigger = true` on the discovery adapter (the
@@ -5010,13 +5030,14 @@ pub fn validate_source_sync(config: &RockyConfig) -> Vec<ConfigError> {
                 );
             }
             if let Some(adapter) = config.adapters.get(&disc.adapter)
-                && adapter.adapter_type == "fivetran"
+                && SYNC_STATE_ADAPTER_TYPES.contains(&adapter.adapter_type.as_str())
                 && !adapter.allow_sync_trigger
             {
                 refuse(format!(
                     "trigger = true needs allow_sync_trigger = true on [adapter.{}]: the owner \
-                     of the Fivetran key has to allow Rocky to start syncs",
-                    disc.adapter
+                     of the {} key has to allow Rocky to start syncs",
+                    disc.adapter,
+                    sync_vendor_name(&adapter.adapter_type)
                 ));
             }
         }
@@ -5045,15 +5066,16 @@ pub fn validate_source_sync(config: &RockyConfig) -> Vec<ConfigError> {
                 ttl_secs / 2
             ));
         }
-        // A known adapter type other than fivetran never reports sync state, so
-        // the key would do nothing. An unknown type is left to
+        // A known adapter type outside SYNC_STATE_ADAPTER_TYPES never reports
+        // sync state, so the key would do nothing. An unknown type is left to
         // `validate_adapter_kinds` and the registry, which refuse it already.
         if let Some(adapter) = config.adapters.get(&disc.adapter)
-            && adapter.adapter_type != "fivetran"
+            && !SYNC_STATE_ADAPTER_TYPES.contains(&adapter.adapter_type.as_str())
             && crate::adapter_capability::capability_for(&adapter.adapter_type).is_some()
         {
             refuse(format!(
-                "wait = true needs a fivetran discovery adapter, but adapter '{}' is type '{}'",
+                "wait = true needs a fivetran or airbyte discovery adapter, but adapter '{}' \
+                 is type '{}'",
                 disc.adapter, adapter.adapter_type
             ));
         }
@@ -6156,12 +6178,13 @@ pub struct AdapterConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attach: Vec<DuckDbAttach>,
 
-    // -- Fivetran sync trigger --
-    /// The credential owner's opt-in to let Rocky start a Fivetran sync with
-    /// this adapter's key (`POST /v1/connections/{id}/sync`, never `force`).
-    /// A pipeline also has to ask for it with
-    /// `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this
-    /// key the adapter sends no `POST`, and `rocky validate` refuses a
+    // -- Sync trigger (fivetran, airbyte) --
+    /// The credential owner's opt-in to let Rocky start a sync with this
+    /// adapter's key. On Fivetran that is `POST /v1/connections/{id}/sync`,
+    /// never `force`. On Airbyte it is `POST /v1/jobs` with
+    /// `jobType = "sync"`, never a reset. A pipeline also has to ask for it
+    /// with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without
+    /// this key the adapter sends no `POST`, and `rocky validate` refuses a
     /// pipeline that sets `trigger = true`. Ignored on every other adapter
     /// type. Default `false`.
     // Skipped when false, so the config digest a plan records stays the same
@@ -8528,7 +8551,8 @@ pub struct DiscoverySyncConfig {
 
     /// Start a sync on each selected connector before the run, then wait for
     /// it. Needs `wait = true` and `allow_sync_trigger = true` on the
-    /// discovery adapter. One `POST` per connector, never `force`. A paused
+    /// discovery adapter (fivetran or airbyte). One `POST` per connector:
+    /// never a Fivetran `force`, never an Airbyte reset. A paused
     /// connector is not started. `rocky run --no-sync-trigger` turns this off
     /// for one run. Default `false`.
     // Skipped when false, so the config digest stays the same for a project
@@ -17412,15 +17436,20 @@ schema_template = "raw__{source}"
         sync: &str,
         allow_sync_trigger: bool,
     ) -> RockyConfig {
-        let adapter = if adapter_type == "fivetran" {
-            if allow_sync_trigger {
-                "api_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\nkind = \"discovery\"\n\
-                 allow_sync_trigger = true\n"
-            } else {
-                "api_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\nkind = \"discovery\"\n"
-            }
+        let opt_in = if allow_sync_trigger {
+            "allow_sync_trigger = true\n"
         } else {
-            "path = \"x.db\"\n"
+            ""
+        };
+        let adapter = match adapter_type {
+            "fivetran" => format!(
+                "api_key = \"k\"\napi_secret = \"s\"\ndestination_id = \"d\"\nkind = \"discovery\"\n\
+                 {opt_in}"
+            ),
+            "airbyte" => format!(
+                "host = \"https://api.airbyte.com\"\ntoken = \"t\"\nkind = \"discovery\"\n{opt_in}"
+            ),
+            _ => "path = \"x.db\"\n".to_string(),
         };
         let toml_str = format!(
             r#"
@@ -17663,6 +17692,78 @@ schema_template = "raw__{{source}}"
         let errors = validate_source_sync(&config);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].to_string().contains("needs a fivetran"));
+    }
+
+    #[test]
+    fn airbyte_reports_sync_state_so_wait_and_trigger_are_valid() {
+        let wait = sync_config(
+            "airbyte",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        );
+        assert!(validate_source_sync(&wait).is_empty());
+        let trigger = sync_config_with(
+            "airbyte",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+            true,
+        );
+        assert!(config_has_airbyte_opt_in(&trigger));
+        assert!(validate_source_sync(&trigger).is_empty());
+    }
+
+    fn config_has_airbyte_opt_in(config: &RockyConfig) -> bool {
+        config.adapters["src"].adapter_type == "airbyte"
+            && config.adapters["src"].allow_sync_trigger
+    }
+
+    /// Opt-in check, config leg, on Airbyte: the same gate as Fivetran.
+    #[test]
+    fn validate_refuses_an_airbyte_trigger_without_the_adapter_opt_in() {
+        let config = sync_config(
+            "airbyte",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true\ntrigger = true",
+        );
+        let errors = validate_source_sync(&config);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let text = errors[0].to_string();
+        assert!(
+            text.contains("allow_sync_trigger = true on [adapter.src]"),
+            "{text}"
+        );
+        assert!(text.contains("Airbyte key"), "{text}");
+    }
+
+    #[test]
+    fn validate_refuses_an_airbyte_trigger_without_wait() {
+        let config = sync_config_with(
+            "airbyte",
+            24,
+            "[pipeline.raw.source.discovery.sync]\ntrigger = true",
+            true,
+        );
+        let errors = validate_source_sync(&config);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].to_string().contains("needs wait = true"));
+    }
+
+    #[test]
+    fn validate_refuses_wait_on_iceberg_discovery() {
+        let config = sync_config(
+            "iceberg",
+            24,
+            "[pipeline.raw.source.discovery.sync]\nwait = true",
+        );
+        let errors = validate_source_sync(&config);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("needs a fivetran or airbyte discovery adapter"),
+            "{}",
+            errors[0]
+        );
     }
 
     #[test]

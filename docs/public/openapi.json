@@ -13,7 +13,7 @@
             ]
           },
           "allow_sync_trigger": {
-            "description": "The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.",
+            "description": "The credential owner's opt-in to let Rocky start a sync with this adapter's key. On Fivetran that is `POST /v1/connections/{id}/sync`, never `force`. On Airbyte it is `POST /v1/jobs` with `jobType = \"sync\"`, never a reset. A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.",
             "type": "boolean"
           },
           "api_key": {
@@ -6313,7 +6313,7 @@
         "description": "A whole-number amount in one [`CostUnit`].",
         "properties": {
           "amount": {
-            "description": "Whole units. Milliseconds, or byte-hours rounded down per interval.",
+            "description": "Whole units: milliseconds, byte-hours rounded down per interval, bytes, or tokens.",
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
@@ -6448,6 +6448,27 @@
       "CostNotMeasured": {
         "description": "Executions the monthly report could not measure. Counts, never amounts.",
         "properties": {
+          "ai_calls_without_usage": {
+            "default": 0,
+            "description": "AI calls this month whose response did not report both token counts. They add nothing to the AI amounts.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "ai_records_dropped": {
+            "default": 0,
+            "description": "AI usage records the state store could not read: spool lines that did not parse (dropped when the spool was drained, or skipped now) and table rows it could not decode. Their tokens are in no AI amount, so the AI figure is a floor when this is above zero.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "egress_unreported_executions": {
+            "default": 0,
+            "description": "Production executions this month that reported no egress, counted only when at least one execution did report it (then the egress figure is a floor). Zero when none reported: egress is then not measured at all.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "failed_executions": {
             "description": "Production executions that failed and recorded no time; their compute is lost. One that wrote its table is still a version.",
             "format": "uint64",
@@ -6587,7 +6608,7 @@
         "description": "Cost estimation configuration.\n\nControls pricing assumptions used by [`crate::optimize::recommend_strategy`] when analyzing materialization costs and generating recommendations.",
         "properties": {
           "ai_cost_per_million_tokens": {
-            "description": "Price of one million AI tokens, in USD per 1,000,000 tokens. Unset by default. Config only for now: no cost path reads it yet.",
+            "description": "Price of one million AI tokens, in USD per 1,000,000 tokens. One blended price: input and output tokens are priced alike. Unset by default. The monthly product view (`rocky cost --month`) prices the AI calls this state store recorded with it; a month with recorded calls and no price here has no money total. `0` is a valid explicit price.",
             "format": "double",
             "type": [
               "number",
@@ -6611,7 +6632,7 @@
             ]
           },
           "cross_region_transfer_cost_per_gb": {
-            "description": "Price of moving one GB of data across regions, in USD per GB. Unset by default. Config only for now: no cost path reads it yet.",
+            "description": "Price of moving one GB (2^30 bytes) of data across regions, in USD per GB. Unset by default. The monthly product view (`rocky cost --month`) prices reported egress with it. No adapter reports egress yet, so it prices nothing today.",
             "format": "double",
             "type": [
               "number",
@@ -6656,7 +6677,10 @@
         "enum": [
           "compute_ms",
           "storage_byte_hours_data_files",
-          "storage_byte_hours_allocated_blocks"
+          "storage_byte_hours_allocated_blocks",
+          "egress_bytes",
+          "ai_input_tokens",
+          "ai_output_tokens"
         ],
         "type": "string"
       },
@@ -7891,7 +7915,7 @@
             "type": "integer"
           },
           "trigger": {
-            "description": "Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. One `POST` per connector, never `force`. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.",
+            "description": "Start a sync on each selected connector before the run, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter (fivetran or airbyte). One `POST` per connector: never a Fivetran `force`, never an Airbyte reset. A paused connector is not started. `rocky run --no-sync-trigger` turns this off for one run. Default `false`.",
             "type": "boolean"
           },
           "wait": {
@@ -13321,6 +13345,15 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "egress_bytes": {
+            "description": "Bytes the statements moved out of the warehouse's region, summed over the statements that reported it. No adapter reports it yet, so it is absent today. `bytes_scanned` and `bytes_written` are not egress. Carried onto the run record for `rocky cost --month`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "job_ids": {
             "description": "Warehouse-side job identifiers for the SQL statements rocky issued to materialize this output. Populated for adapters whose REST API surfaces a job reference per statement (BigQuery today via `jobReference.jobId`).\n\nUseful for cross-checking rocky's reported figures against the warehouse's own statistics — e.g., feeding a job ID into `bq show -j <id>` and comparing `totalBytesBilled` to [`Self::bytes_scanned`]. Empty `Vec` for adapters that don't surface a job concept (DuckDB) or haven't wired it yet (Databricks, Snowflake).",
             "items": {
@@ -13389,7 +13422,7 @@
                 "type": "null"
               }
             ],
-            "description": "The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise."
+            "description": "The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise. A `time_interval` model carries one on each partition this run wrote, judging that partition's rows. That includes partitions written in a run where another partition failed to run."
           }
         },
         "required": [
@@ -18338,7 +18371,7 @@
             "$ref": "#/components/schemas/ProductBudgetLimitType"
           },
           "reason": {
-            "description": "Why the limit is `not_evaluated`.",
+            "description": "Why the limit is `not_evaluated`. On a `max_usd` limit that is `breached` from the priced figures alone (`actual` is then that floor), what the figure leaves out.",
             "type": [
               "string",
               "null"
@@ -18865,7 +18898,7 @@
             "type": "array"
           },
           "money": {
-            "description": "`charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute and storage; egress and AI tokens are not measured and are not in it.",
+            "description": "`charged` in USD, priced only from prices set in `[cost]`. Present only when `money_status` is `priced`. It covers compute, storage, egress when an adapter reported it this month, and AI tokens when this state store recorded calls this month and recorded the whole month. A figure whose part is `not_measured` or (for AI tokens) `partial` is not in it.",
             "format": "double",
             "type": [
               "number",
@@ -18924,7 +18957,7 @@
         "type": "object"
       },
       "ProductMonthCostOutput": {
-        "description": "`rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.\n\nFor every unit, `sum(charged) + unallocated` equals `measured_total`, exactly. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.",
+        "description": "`rocky cost --month YYYY-MM --by product`: one month of production cost, split across data products, in physical units, with money in USD where `[cost]` sets a price.\n\nFor every unit, `sum(charged) + unallocated` equals `measured_total`, exactly, AI tokens included. Shadow and branch spend (`shadow_branch`) and `not_measured` sit outside that equation. An AI call about a model a product owns is charged to that product; every other call is `unallocated`. Money is priced from each figure on its own, so the money figures are floating point and are not claimed to add up to the cent.",
         "properties": {
           "as_of": {
             "description": "The instant the report was computed. Storage accrues to the earlier of this and `month_end`.",
@@ -18985,7 +19018,7 @@
             "type": "array"
           },
           "shadow_branch": {
-            "description": "Shadow and branch compute. Real spend, but not production.",
+            "description": "Shadow and branch compute, and egress where reported. Real spend, but not production.",
             "items": {
               "$ref": "#/components/schemas/CostAmount"
             },
@@ -19428,6 +19461,17 @@
       "ProductVolumeStatus": {
         "description": "The declared volume range and the latest production count.",
         "properties": {
+          "basis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VolumeBasis"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What `row_count` counts, as stored with it (`rocky run`'s `volume.basis`). Absent when there is no count."
+          },
           "counted_at": {
             "description": "When that build finished.",
             "format": "date-time",
@@ -19454,8 +19498,15 @@
               "null"
             ]
           },
+          "reason": {
+            "description": "Why the verdict is `not_evaluated`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "row_count": {
-            "description": "The newest production build that recorded a count. Absent when no build has been counted yet.",
+            "description": "The count the newest production build of the output judged. Absent when that build took no count, or no build exists. An older build's count is never shown in its place. When the newest build wrote several partitions, this is the count of the partition that decides the verdict: the first one out of range, otherwise the newest.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -19464,7 +19515,7 @@
             ]
           },
           "run_id": {
-            "description": "The run that took the count.",
+            "description": "The newest production run that built the output.",
             "type": [
               "string",
               "null"
@@ -19484,7 +19535,7 @@
                 "$ref": "#/components/schemas/VolumeVerdict"
               }
             ],
-            "description": "That count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`, or `not_evaluated` when no count exists."
+            "description": "The newest build's verdict: its count judged against the range the spec declares now (`in_range`, `below_min`, `above_max`), or `not_evaluated` when that build took no count, or counted on a basis the output model no longer has."
           }
         },
         "required": [
@@ -26034,7 +26085,7 @@
         "description": "Domain identifier for the state-store retention sweep.\n\nThe wire format is a lowercase string in `applies_to` — the [`Display`] impl produces the canonical spelling, and the `from_str` impl accepts only that spelling (no aliases).\n\n[`Display`]: std::fmt::Display",
         "oneOf": [
           {
-            "description": "Pipeline run records (`run_history` table). Each row carries `started_at`/`finished_at` and the governance audit trail.",
+            "description": "Pipeline run records (`run_history` table). Each row carries `started_at`/`finished_at` and the governance audit trail. Also sweeps recorded AI calls (`ai_usage`) older than `max_age_days`.",
             "enum": [
               "history"
             ],
@@ -27998,9 +28049,53 @@
           }
         ]
       },
+      "VolumeBasis": {
+        "description": "What a `[product.output.volume]` check counts, set by the output model's strategy.\n\n```text full_refresh                     total_rows      the whole table is this load incremental (no unique_key)      rows_added      the INSERT's reported rows incremental (unique_key), merge  rows_touched    the MERGE's reported row count time_interval                    partition_rows  COUNT(*) in each partition written ```",
+        "oneOf": [
+          {
+            "description": "The table's total rows after the build. A full-refresh build replaces the whole table, so the total is this load.",
+            "enum": [
+              "total_rows"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The rows this run appended, as the adapter reported them for its INSERT. When the adapter reports nothing, the table's row count after the write minus its count before. When both exist and differ, nothing is counted (`not_evaluated`). A run that created or rebuilt the table counts every row in it.",
+            "enum": [
+              "rows_added"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The rows this run's `MERGE` inserted or updated, as the warehouse reports them. A matched row counts even when its values did not change. A run that created or rebuilt the table counts every row in it.",
+            "enum": [
+              "rows_touched"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The rows in one partition this run wrote, counted after the write with the same time window that partition's overwrite used. Each written partition is judged on its own.",
+            "enum": [
+              "partition_rows"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "VolumeCheckOutput": {
-        "description": "The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.\n\nThe count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.",
+        "description": "The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.\n\nWhat is counted depends on the output model's strategy; `basis` says which (`total_rows`, `rows_added`, `rows_touched`, `partition_rows`).",
         "properties": {
+          "basis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VolumeBasis"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What `row_count` counts: `total_rows` (the whole table, for a full-refresh output), `rows_added` (the rows this run appended, for an incremental output), `rows_touched` (the rows this run's MERGE inserted or updated, matched rows included even when their values did not change, for a merge output or an incremental one with a `unique_key`), or `partition_rows` (the rows in this partition, for a time-interval output, which is judged one partition at a time). Absent when the strategy is not counted (`volume-strategy-unsupported`)."
+          },
           "max_rows": {
             "description": "The declared `max_rows` (inclusive), when set.",
             "format": "uint64",
@@ -28035,7 +28130,7 @@
             ]
           },
           "row_count": {
-            "description": "The table's total rows after the build. Absent when no count was taken or it could not be read (`verdict = \"not_evaluated\"`).",
+            "description": "The count judged, on `basis`. Absent when no count was taken or it could not be read (`verdict = \"not_evaluated\"`).",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -28089,7 +28184,7 @@
       },
       "VolumeSpec": {
         "additionalProperties": false,
-        "description": "The declared row-count range: the output table's total rows after a load, checked by `rocky run` on a full-refresh output.\n\nAt least one bound is present. `min_rows = 0` alone counts as one.",
+        "description": "The declared row-count range one load of the output must hold, checked by `rocky run` after a production build. What is counted depends on the output model's strategy: see [`VolumeBasis`].\n\nAt least one bound is present. `min_rows = 0` alone counts as one.",
         "properties": {
           "max_rows": {
             "description": "Most rows allowed (inclusive).",

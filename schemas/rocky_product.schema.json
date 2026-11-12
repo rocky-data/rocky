@@ -321,7 +321,7 @@
     },
     "VolumeSpec": {
       "additionalProperties": false,
-      "description": "The declared row-count range: the output table's total rows after a load, checked by `rocky run` on a full-refresh output.\n\nAt least one bound is present. `min_rows = 0` alone counts as one.",
+      "description": "The declared row-count range one load of the output must hold, checked by `rocky run` after a production build. What is counted depends on the output model's strategy: see [`VolumeBasis`].\n\nAt least one bound is present. `min_rows = 0` alone counts as one.",
       "properties": {
         "max_rows": {
           "description": "Most rows allowed (inclusive).",

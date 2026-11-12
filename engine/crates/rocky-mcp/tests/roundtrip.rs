@@ -5655,6 +5655,7 @@ fn seed_run_history(models_dir: &Path) {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: Some(1024),
+            egress_bytes: None,
             tenant: None,
             recipe_hash: None,
             input_hash: None,
@@ -5689,6 +5690,7 @@ fn seed_run_history(models_dir: &Path) {
         run_scope: Some(rocky_core::state::RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),
+        output_volumes: Vec::new(),
     };
     store.record_run(&run).expect("record run");
 

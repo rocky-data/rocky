@@ -520,8 +520,9 @@ impl VolumeSeverity {
     }
 }
 
-/// The declared row-count range: the output table's total rows after a
-/// load, checked by `rocky run` on a full-refresh output.
+/// The declared row-count range one load of the output must hold, checked
+/// by `rocky run` after a production build. What is counted depends on the
+/// output model's strategy: see [`VolumeBasis`].
 ///
 /// At least one bound is present. `min_rows = 0` alone counts as one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -554,6 +555,79 @@ impl VolumeSpec {
             return VolumeVerdict::AboveMax;
         }
         VolumeVerdict::InRange
+    }
+}
+
+/// What a `[product.output.volume]` check counts, set by the output
+/// model's strategy.
+///
+/// ```text
+///   full_refresh                     total_rows      the whole table is this load
+///   incremental (no unique_key)      rows_added      the INSERT's reported rows
+///   incremental (unique_key), merge  rows_touched    the MERGE's reported row count
+///   time_interval                    partition_rows  COUNT(*) in each partition written
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeBasis {
+    /// The table's total rows after the build. A full-refresh build replaces
+    /// the whole table, so the total is this load.
+    TotalRows,
+    /// The rows this run appended, as the adapter reported them for its
+    /// INSERT. When the adapter reports nothing, the table's row count after
+    /// the write minus its count before. When both exist and differ, nothing
+    /// is counted (`not_evaluated`). A run that created or rebuilt the table
+    /// counts every row in it.
+    RowsAdded,
+    /// The rows this run's `MERGE` inserted or updated, as the warehouse
+    /// reports them. A matched row counts even when its values did not
+    /// change. A run that created or rebuilt the table counts every row in
+    /// it.
+    RowsTouched,
+    /// The rows in one partition this run wrote, counted after the write
+    /// with the same time window that partition's overwrite used. Each
+    /// written partition is judged on its own.
+    PartitionRows,
+}
+
+impl VolumeBasis {
+    /// What a volume check counts for an output of `strategy`, or `None`
+    /// when no count on one build is that build's volume.
+    ///
+    /// Exhaustive on purpose (no `_ =>`): a new strategy fails to compile
+    /// here until someone decides what its load's volume is.
+    pub fn of(strategy: &rocky_ir::MaterializationStrategy) -> Option<Self> {
+        use rocky_ir::MaterializationStrategy as S;
+        match strategy {
+            S::FullRefresh => Some(Self::TotalRows),
+            // With a `unique_key`, an incremental model loads through a
+            // MERGE, which updates rows a count cannot see.
+            S::Incremental { unique_key, .. } if unique_key.is_empty() => Some(Self::RowsAdded),
+            S::Incremental { .. } | S::Merge { .. } => Some(Self::RowsTouched),
+            S::TimeInterval { .. } => Some(Self::PartitionRows),
+            // No stored table, or a warehouse-managed one Rocky does not
+            // write.
+            S::View | S::Ephemeral | S::MaterializedView | S::DynamicTable { .. } => None,
+            // A transformation `microbatch` runs as `time_interval` before it
+            // reaches the IR. `delete_insert` replaces the keys it reloads and
+            // a snapshot closes and opens versions: one count does not say
+            // what such a load wrote. A content-addressed write has no count
+            // wired.
+            S::Microbatch { .. }
+            | S::DeleteInsert { .. }
+            | S::Snapshot(_)
+            | S::ContentAddressed { .. } => None,
+        }
+    }
+
+    /// The `snake_case` spelling the JSON output uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TotalRows => "total_rows",
+            Self::RowsAdded => "rows_added",
+            Self::RowsTouched => "rows_touched",
+            Self::PartitionRows => "partition_rows",
+        }
     }
 }
 
@@ -2070,6 +2144,65 @@ include = ["stripe.*"]"#,
         };
         assert_eq!(floor_only.judge(0), VolumeVerdict::InRange);
         assert_eq!(floor_only.judge(u64::MAX), VolumeVerdict::InRange);
+    }
+
+    /// Each counted strategy maps to the basis its load is judged on; the
+    /// rest are not counted.
+    #[test]
+    fn each_strategy_has_the_volume_basis_its_load_is_judged_on() {
+        use rocky_ir::{ColumnSelection, MaterializationStrategy as S, TimeGrain};
+        let incremental = |unique_key: Vec<std::sync::Arc<str>>| S::Incremental {
+            timestamp_column: "ts".into(),
+            unique_key,
+            lookback: None,
+            filter_column: None,
+        };
+        assert_eq!(
+            VolumeBasis::of(&S::FullRefresh),
+            Some(VolumeBasis::TotalRows)
+        );
+        assert_eq!(
+            VolumeBasis::of(&incremental(Vec::new())),
+            Some(VolumeBasis::RowsAdded)
+        );
+        assert_eq!(
+            VolumeBasis::of(&incremental(vec!["id".into()])),
+            Some(VolumeBasis::RowsTouched),
+            "an incremental model with a unique_key MERGEs"
+        );
+        assert_eq!(
+            VolumeBasis::of(&S::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: ColumnSelection::All,
+            }),
+            Some(VolumeBasis::RowsTouched)
+        );
+        assert_eq!(
+            VolumeBasis::of(&S::TimeInterval {
+                time_column: "d".into(),
+                granularity: TimeGrain::Day,
+                window: None,
+            }),
+            Some(VolumeBasis::PartitionRows)
+        );
+        for unsupported in [
+            S::View,
+            S::Ephemeral,
+            S::MaterializedView,
+            S::DeleteInsert {
+                partition_by: vec!["d".into()],
+            },
+            S::Microbatch {
+                timestamp_column: "ts".into(),
+                granularity: TimeGrain::Hour,
+            },
+        ] {
+            assert_eq!(VolumeBasis::of(&unsupported), None, "{unsupported:?}");
+        }
+        assert_eq!(
+            serde_json::to_value(VolumeBasis::PartitionRows).unwrap(),
+            serde_json::json!(VolumeBasis::PartitionRows.as_str())
+        );
     }
 
     /// A spec with a volume serializes it back and parses to the same value.

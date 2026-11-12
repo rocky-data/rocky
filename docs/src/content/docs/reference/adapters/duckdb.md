@@ -164,7 +164,7 @@ Things to know:
 - DuckLake keeps old Parquet files until snapshots expire. Rocky expires nothing; run DuckLake's `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` yourself.
 - Discovery never reads an attached catalog: its schemas are not replication sources.
 
-The [`07-adapters/10-duckdb-ducklake`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-duckdb-ducklake) POC runs this with no server, no Docker and no credentials.
+The [`07-adapters/13-duckdb-ducklake`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/13-duckdb-ducklake) POC runs this with no server, no Docker and no credentials.
 
 ## Authentication
 

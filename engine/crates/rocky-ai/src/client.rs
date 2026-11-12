@@ -220,11 +220,29 @@ pub struct LlmResponse {
     pub output_tokens: Option<u64>,
 }
 
+/// The token usage of one AI call, handed to a [`UsageSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmUsage {
+    /// The provider's model id that answered (the response's `model`, else
+    /// the configured one).
+    pub llm_model: String,
+    /// Input tokens the response reported.
+    pub input_tokens: Option<u64>,
+    /// Output tokens the response reported.
+    pub output_tokens: Option<u64>,
+}
+
+/// Called once per HTTP call that returned a response which parsed, with
+/// that call's usage. Each compile-loop retry is its own call. A failed call
+/// (an HTTP error, an unparsable body) is not reported.
+pub type UsageSink = std::sync::Arc<dyn Fn(&LlmUsage) + Send + Sync>;
+
 /// LLM client for generating model code.
 pub struct LlmClient {
     config: AiConfig,
     messages_url: String,
     http: reqwest::Client,
+    usage_sink: Option<UsageSink>,
 }
 
 impl LlmClient {
@@ -265,7 +283,15 @@ impl LlmClient {
             config,
             messages_url,
             http,
+            usage_sink: None,
         })
+    }
+
+    /// Report every call's token usage to `sink`, after the response parsed.
+    #[must_use]
+    pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
+        self.usage_sink = Some(sink);
+        self
     }
 
     /// `max_tokens` configured for this client. Used as the per-request cap
@@ -282,12 +308,27 @@ impl LlmClient {
         user: &str,
         error_context: Option<&str>,
     ) -> Result<LlmResponse, AiError> {
-        match self.config.provider.as_str() {
-            "anthropic" => self.call_anthropic(system, user, error_context).await,
-            other => Err(AiError::Api {
-                message: format!("unsupported provider: {other}"),
-            }),
+        let response = match self.config.provider.as_str() {
+            "anthropic" => self.call_anthropic(system, user, error_context).await?,
+            other => {
+                return Err(AiError::Api {
+                    message: format!("unsupported provider: {other}"),
+                });
+            }
+        };
+        if let Some(sink) = &self.usage_sink {
+            let llm_model = if response.model.is_empty() {
+                self.config.model.clone()
+            } else {
+                response.model.clone()
+            };
+            sink(&LlmUsage {
+                llm_model,
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
+            });
         }
+        Ok(response)
     }
 
     async fn call_anthropic(

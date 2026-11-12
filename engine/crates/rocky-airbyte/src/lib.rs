@@ -5,7 +5,10 @@
 //! `rocky-airbyte` is a **source-side** integration: it talks to the Airbyte
 //! Configuration API to enumerate connections and their configured streams.
 //! The only adapter trait it implements is
-//! [`rocky_core::traits::DiscoveryAdapter`].
+//! [`rocky_core::traits::DiscoveryAdapter`]. Besides discovery, that covers
+//! the sync state read (`GET /v1/jobs`) and, with the owner's
+//! `allow_sync_trigger` opt-in, starting one sync (`POST /v1/jobs`,
+//! `jobType = "sync"`) for `[...discovery.sync] wait` / `trigger`.
 //!
 //! # Relationship to `WarehouseAdapter::fetch_arrow_batch`
 //!
@@ -23,3 +26,6 @@
 
 pub mod adapter;
 pub mod client;
+
+#[cfg(test)]
+mod sync_tests;

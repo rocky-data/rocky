@@ -740,6 +740,34 @@ const BYTES_PER_GB: f64 = 1_073_741_824.0;
 /// Milliseconds in one machine-hour, for `compute_cost_per_machine_hour`.
 const MS_PER_MACHINE_HOUR: f64 = 3_600_000.0;
 
+/// Tokens in one million, for `ai_cost_per_million_tokens`.
+const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+
+/// The `[cost]` key that prices a money figure.
+fn price_key(figure: MoneyFigure) -> &'static str {
+    match figure {
+        MoneyFigure::Compute => "compute_cost_per_machine_hour",
+        MoneyFigure::StorageDataFiles | MoneyFigure::StorageAllocatedBlocks => {
+            "storage_cost_per_gb_month"
+        }
+        MoneyFigure::Egress => "cross_region_transfer_cost_per_gb",
+        MoneyFigure::AiTokens => "ai_cost_per_million_tokens",
+    }
+}
+
+/// The `[cost]` keys a `no_price` total is missing, deduplicated, in figure
+/// order.
+fn missing_price_keys(parts: &[MoneyPart]) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = Vec::new();
+    for part in parts.iter().filter(|p| p.status == MoneyStatus::NoPrice) {
+        let key = price_key(part.figure);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 /// The prices the monthly report may use: only those the user set in
 /// `[cost]`. It reads the raw fields, never the estimate accessors that fall
 /// back to Rocky's shipped defaults, and never the per-run cost formula.
@@ -758,6 +786,20 @@ struct MonthPricing {
     /// month never measured is left out of every money total.
     data_files_measured: bool,
     allocated_blocks_measured: bool,
+    /// USD per GB (2^30 bytes) of cross-region transfer.
+    egress_per_gb: Option<f64>,
+    /// USD per million AI tokens, input and output alike.
+    ai_per_million_tokens: Option<f64>,
+    /// Whether any production execution this month reported egress. When
+    /// none did, egress is `not_measured` everywhere.
+    egress_measured: bool,
+    /// Whether this month has a recorded AI call with token counts. When it
+    /// has none, AI tokens are `not_measured` everywhere.
+    ai_measured: bool,
+    /// Whether the state store started recording AI calls after the month
+    /// began (or never did). Then the AI part is `partial` and stays out of
+    /// every total.
+    ai_partial: bool,
 }
 
 impl MonthPricing {
@@ -766,6 +808,9 @@ impl MonthPricing {
         window: &cost_split::MonthWindow,
         history_complete: bool,
         measured_total: &[CostAmount],
+        egress_reported: bool,
+        ai_measured: bool,
+        ai_usage_since: Option<DateTime<Utc>>,
     ) -> Self {
         let measured = |unit: CostUnit| measured_total.iter().any(|a| a.unit == unit);
         Self {
@@ -775,6 +820,13 @@ impl MonthPricing {
             history_complete,
             data_files_measured: measured(CostUnit::StorageByteHoursDataFiles),
             allocated_blocks_measured: measured(CostUnit::StorageByteHoursAllocatedBlocks),
+            egress_per_gb: cost.and_then(|c| c.cross_region_transfer_cost_per_gb),
+            ai_per_million_tokens: cost.and_then(|c| c.ai_cost_per_million_tokens),
+            // Taken from the split, not inferred from the sums: a reported
+            // zero adds nothing to a sum but is still measured.
+            egress_measured: egress_reported,
+            ai_measured,
+            ai_partial: ai_usage_since.is_none_or(|since| since > window.start),
         }
     }
 
@@ -801,9 +853,14 @@ impl MonthPricing {
 
     /// Price a set of amounts. Returns the total, its status and the parts.
     ///
-    /// The total exists only when every measured part is priced. A partial
-    /// month has no total. Egress and AI tokens are listed as not measured
-    /// and are not part of the total.
+    /// The total exists only when every part in it is priced. A partial
+    /// month has no total. Egress is in the total when the month measured
+    /// it, and `not_measured` (outside the total) otherwise. AI tokens are
+    /// in the total when the month has recorded calls and the store recorded
+    /// the whole month. When the store started recording after the month
+    /// began (or never did), the AI part is `partial` and outside the total,
+    /// with or without recorded calls. With the whole month recorded and no
+    /// calls it is `not_measured`.
     fn price(&self, amounts: &[CostAmount]) -> (Option<f64>, MoneyStatus, Vec<MoneyPart>) {
         let amount_of = |unit: CostUnit| {
             amounts
@@ -839,7 +896,29 @@ impl MonthPricing {
                 ));
             }
         }
-        let (usd, status) = if !self.history_complete {
+        if self.egress_measured {
+            parts.push(self.part(
+                MoneyFigure::Egress,
+                amount_of(CostUnit::EgressBytes),
+                self.egress_per_gb,
+                BYTES_PER_GB,
+            ));
+        }
+        if self.ai_measured && !self.ai_partial {
+            let tokens = amount_of(CostUnit::AiInputTokens)
+                .saturating_add(amount_of(CostUnit::AiOutputTokens));
+            parts.push(self.part(
+                MoneyFigure::AiTokens,
+                tokens,
+                self.ai_per_million_tokens,
+                TOKENS_PER_MILLION,
+            ));
+        }
+        // A partial AI part holds the whole total back when the month has
+        // recorded calls: a total that leaves out spend the store never saw
+        // would understate. With no recorded calls the AI part is only
+        // listed, and the rest of the month is priced.
+        let (usd, status) = if !self.history_complete || (self.ai_measured && self.ai_partial) {
             (None, MoneyStatus::Partial)
         } else if parts.iter().all(|p| p.status == MoneyStatus::Priced) {
             (
@@ -849,14 +928,39 @@ impl MonthPricing {
         } else {
             (None, MoneyStatus::NoPrice)
         };
-        for figure in [MoneyFigure::Egress, MoneyFigure::AiTokens] {
+        if !self.egress_measured {
             parts.push(MoneyPart {
-                figure,
+                figure: MoneyFigure::Egress,
+                status: MoneyStatus::NotMeasured,
+                usd: None,
+            });
+        }
+        // A month that began before this store started recording has AI
+        // calls the store never saw, with or without calls recorded since.
+        if self.ai_partial {
+            parts.push(MoneyPart {
+                figure: MoneyFigure::AiTokens,
+                status: MoneyStatus::Partial,
+                usd: None,
+            });
+        } else if !self.ai_measured {
+            parts.push(MoneyPart {
+                figure: MoneyFigure::AiTokens,
                 status: MoneyStatus::NotMeasured,
                 usd: None,
             });
         }
         (usd, status, parts)
+    }
+
+    /// A floor on the money of `parts`: the sum of the priced parts. Costs
+    /// are never negative, so the real figure is at least this.
+    fn priced_floor(parts: &[MoneyPart]) -> f64 {
+        parts
+            .iter()
+            .filter(|p| p.status == MoneyStatus::Priced)
+            .filter_map(|p| p.usd)
+            .sum()
     }
 }
 
@@ -925,7 +1029,52 @@ struct MonthInputs {
     /// (`finished_at`, then `run_id`).
     runs: Vec<RunRecord>,
     carry_in: Vec<ModelExecution>,
+    /// Every AI call this state store recorded: its table and its undrained
+    /// spool, deduplicated. The split keeps those inside the month.
+    ai_usage: Vec<rocky_core::ai_usage::AiUsageRecord>,
+    /// When the store started recording AI calls. `None` when it never did.
+    ai_usage_since: Option<DateTime<Utc>>,
+    /// AI usage records the store could not read: spool lines and table rows
+    /// that did not parse, plus those a drain dropped earlier.
+    ai_records_dropped: u64,
     warnings: Vec<String>,
+}
+
+/// A warning when the default state file's AI usage spool holds calls this
+/// report does not read.
+///
+/// `rocky lsp` and the MCP server spool next to the default state file
+/// (`<models>/.rocky-state.redb`). They take no `--state-path` or
+/// `--state-namespace`, so when this report reads another store those calls
+/// land where it never looks. Their count is unknown here, so the report says
+/// so and is not silent.
+fn stray_default_spool_warning(store: &StateStore, config_path: &Path) -> Option<String> {
+    let used = store.ai_usage_spool_path()?;
+    let models_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("models");
+    let default = rocky_core::ai_usage::spool_path(
+        &rocky_core::state::resolve_state_path(None, &models_dir).path,
+    );
+    let non_empty = std::fs::metadata(&default).is_ok_and(|m| m.len() > 0);
+    if !non_empty {
+        return None;
+    }
+    let same = match (std::fs::canonicalize(used), std::fs::canonicalize(&default)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => used == default,
+    };
+    if same {
+        return None;
+    }
+    Some(format!(
+        "AI calls from `rocky lsp` or the MCP server are spooled at {}, but this report reads \
+         {}; those calls are not counted. `rocky lsp` and MCP always use the default state \
+         file, not --state-path or --state-namespace",
+        default.display(),
+        used.display()
+    ))
 }
 
 fn load_month_inputs(
@@ -992,6 +1141,22 @@ fn load_month_inputs(
     })?;
     let carry_in: Vec<ModelExecution> = carry_in.into_values().collect();
 
+    // AI calls recorded in this state store only: a call on another machine
+    // wrote to that machine's store.
+    let ai = store.ai_usage_including_spool()?;
+    if let Some(warning) = stray_default_spool_warning(store, config_path) {
+        warnings.push(warning);
+    }
+    let ai_records_dropped = store
+        .ai_usage_dropped()?
+        .saturating_add(ai.malformed as u64);
+    if ai_records_dropped > 0 {
+        warnings.push(format!(
+            "{ai_records_dropped} AI usage record(s) did not parse and are not counted"
+        ));
+    }
+    let ai_usage_since = store.ai_usage_since()?;
+
     Ok(MonthInputs {
         cfg,
         label: format!("{year:04}-{month_number:02}"),
@@ -1002,6 +1167,9 @@ fn load_month_inputs(
         children,
         runs,
         carry_in,
+        ai_usage: ai.records,
+        ai_usage_since,
+        ai_records_dropped,
         warnings,
     })
 }
@@ -1020,6 +1188,7 @@ impl MonthInputs {
             owners: &self.owners,
             declared_children: &self.children,
             default_catalog: None,
+            ai_usage: &self.ai_usage,
         });
         let broken = split.invariant_violations();
         anyhow::ensure!(
@@ -1035,12 +1204,19 @@ impl MonthInputs {
         Ok(split)
     }
 
-    fn pricing(&self, measured_total: &[CostAmount]) -> MonthPricing {
+    fn pricing(
+        &self,
+        split: &cost_split::MonthSplit,
+        measured_total: &[CostAmount],
+    ) -> MonthPricing {
         MonthPricing::new(
             self.cfg.as_ref().map(|c| &c.cost),
             &self.window,
             self.history_complete,
             measured_total,
+            split.egress_reported,
+            split.ai_measured,
+            self.ai_usage_since,
         )
     }
 
@@ -1178,22 +1354,7 @@ fn evaluate_budget(
         }
     }
     if let Some(limit) = budget.max_usd {
-        let (usd, status, _) = pricing.price(charged);
-        let unknown = match status {
-            MoneyStatus::Priced => None,
-            MoneyStatus::NoPrice => Some(
-                "a charged figure has no price in [cost] (compute_cost_per_machine_hour, \
-                 storage_cost_per_gb_month)",
-            ),
-            MoneyStatus::Partial | MoneyStatus::NotMeasured => Some(HISTORY_INCOMPLETE),
-        };
-        checks.push(budget_check(
-            ProductBudgetLimitType::MaxUsd,
-            None,
-            limit,
-            usd,
-            unknown,
-        ));
+        checks.push(max_usd_check(limit, charged, pricing));
     }
     let mut reasons = Vec::new();
     let verdict = if let Some(reason) = history {
@@ -1223,6 +1384,74 @@ fn evaluate_budget(
     }
 }
 
+/// Check a `max_usd` limit against `charged`.
+///
+/// With every figure priced, the total is tested. Otherwise the priced
+/// parts alone are a floor (costs are never negative): a floor over the
+/// limit is already a breach, and `actual` is that floor. Anything else is
+/// `not_evaluated`, naming what is missing. A `not_measured` part is outside
+/// the total either way, as it is in the report.
+fn max_usd_check(limit: f64, charged: &[CostAmount], pricing: &MonthPricing) -> ProductBudgetCheck {
+    let (usd, status, parts) = pricing.price(charged);
+    // A budget is held back by partial AI only when the month recorded AI
+    // calls. A month that began before recording but has none is reported
+    // partial, and its budget is judged on what the store recorded: the
+    // alternative, no verdict for every month a store is first upgraded in,
+    // would silence every `max_usd` budget.
+    let ai_partial = pricing.ai_measured && pricing.ai_partial;
+    let missing = match status {
+        MoneyStatus::Priced => {
+            return budget_check(ProductBudgetLimitType::MaxUsd, None, limit, usd, None);
+        }
+        MoneyStatus::Partial | MoneyStatus::NotMeasured if !pricing.history_complete => {
+            return budget_check(
+                ProductBudgetLimitType::MaxUsd,
+                None,
+                limit,
+                None,
+                Some(HISTORY_INCOMPLETE),
+            );
+        }
+        MoneyStatus::Partial | MoneyStatus::NotMeasured | MoneyStatus::NoPrice => {
+            let mut missing: Vec<String> = Vec::new();
+            let keys = missing_price_keys(&parts);
+            if !keys.is_empty() {
+                missing.push(format!(
+                    "a charged figure has no price in [cost] ({})",
+                    keys.join(", ")
+                ));
+            }
+            if ai_partial {
+                missing.push(AI_RECORDING_STARTED_LATE.to_string());
+            }
+            missing.join("; ")
+        }
+    };
+    let floor = MonthPricing::priced_floor(&parts);
+    if floor > limit {
+        return ProductBudgetCheck {
+            limit_type: ProductBudgetLimitType::MaxUsd,
+            unit: None,
+            limit,
+            actual: Some(floor),
+            verdict: ProductBudgetVerdict::Breached,
+            reason: Some(format!(
+                "the priced figures alone exceed the limit; the full figure is higher: {missing}"
+            )),
+        };
+    }
+    budget_check(
+        ProductBudgetLimitType::MaxUsd,
+        None,
+        limit,
+        None,
+        Some(&missing),
+    )
+}
+
+const AI_RECORDING_STARTED_LATE: &str = "this state store started recording AI calls after the \
+     month began, so the month's AI spend is partial";
+
 /// The charged amounts of one product row, as the report prints them.
 fn charged_amounts(row: &cost_split::ProductSplit) -> Vec<CostAmount> {
     let charged: cost_split::Amounts = cost_split::Unit::ALL
@@ -1240,7 +1469,7 @@ fn evaluate_budgets(
     production_ran: bool,
 ) -> std::collections::BTreeMap<String, ProductBudgetStatus> {
     let measured_total = amounts_out(&split.measured_total);
-    let pricing = inputs.pricing(&measured_total);
+    let pricing = inputs.pricing(split, &measured_total);
     budgets
         .iter()
         .filter_map(|(product, budget)| {
@@ -1452,7 +1681,7 @@ fn compute_month_cost_in(
     let split = inputs.split(&inputs.runs, now)?;
     let measured_total = amounts_out(&split.measured_total);
     let unallocated = amounts_out(&split.unallocated);
-    let pricing = inputs.pricing(&measured_total);
+    let pricing = inputs.pricing(&split, &measured_total);
     let (measured_total_money, measured_total_money_status, measured_total_money_parts) =
         pricing.price(&measured_total);
     let (unallocated_money, unallocated_money_status, unallocated_money_parts) =
@@ -1536,6 +1765,9 @@ fn compute_month_cost_in(
             failed_executions: split.not_measured.failed_executions,
             storage_unknown_tables: split.not_measured.storage_unknown_tables,
             unattributed_read_tables: split.not_measured.unattributed_read_tables,
+            egress_unreported_executions: split.not_measured.egress_unreported_executions,
+            ai_calls_without_usage: split.not_measured.ai_calls_without_usage,
+            ai_records_dropped: inputs.ai_records_dropped,
         },
         warnings: inputs.warnings,
     })
@@ -1809,8 +2041,67 @@ fn print_month_table(output: &ProductMonthCostOutput) {
             amount_cell(&output.measured_total, unit)
         );
     }
+    for (unit, label) in [
+        (
+            CostUnit::EgressBytes,
+            "egress, bytes (as adapters reported it)",
+        ),
+        (
+            CostUnit::AiInputTokens,
+            "AI input tokens (calls recorded in this state store)",
+        ),
+        (
+            CostUnit::AiOutputTokens,
+            "AI output tokens (calls recorded in this state store)",
+        ),
+    ] {
+        if !output.measured_total.iter().any(|a| a.unit == unit) {
+            continue;
+        }
+        println!();
+        println!("{label}");
+        println!("  {:<24}  {:>16}", "product", "charged");
+        for p in &output.products {
+            println!("  {:<24}  {:>16}", p.product, amount_cell(&p.charged, unit));
+        }
+        println!(
+            "  {:<24}  {:>16}",
+            "<unallocated>",
+            amount_cell(&output.unallocated, unit)
+        );
+        println!(
+            "  {:<24}  {:>16}",
+            "measured total",
+            amount_cell(&output.measured_total, unit)
+        );
+    }
+    let part_status = |figure: MoneyFigure| {
+        output
+            .measured_total_money_parts
+            .iter()
+            .find(|p| p.figure == figure)
+            .map_or(MoneyStatus::NotMeasured, |p| p.status)
+    };
+    let mut outside = Vec::new();
+    if part_status(MoneyFigure::Egress) == MoneyStatus::NotMeasured {
+        outside.push("egress is not measured");
+    }
+    match part_status(MoneyFigure::AiTokens) {
+        MoneyStatus::NotMeasured => outside.push("no AI call was recorded"),
+        MoneyStatus::Partial if output.history_complete => {
+            outside.push("AI tokens are partial: recording began after the month began");
+        }
+        MoneyStatus::Priced | MoneyStatus::NoPrice | MoneyStatus::Partial => {}
+    }
     println!();
-    println!("money, USD (only from prices set in [cost]; egress and AI tokens are not measured)");
+    if outside.is_empty() {
+        println!("money, USD (only from prices set in [cost])");
+    } else {
+        println!(
+            "money, USD (only from prices set in [cost]; {}, and not in the total)",
+            outside.join("; ")
+        );
+    }
     println!("  {:<24}  {:>14}  {:<12}", "product", "charged", "status");
     for p in &output.products {
         println!(
@@ -1834,7 +2125,8 @@ fn print_month_table(output: &ProductMonthCostOutput) {
     );
     if output.measured_total_money_status == MoneyStatus::NoPrice {
         println!(
-            "  to price this view, set [cost] compute_cost_per_machine_hour and storage_cost_per_gb_month; compute_cost_per_dbu does not price it"
+            "  to price this view, set [cost] {}; compute_cost_per_dbu does not price it, and 0 is a valid price",
+            missing_price_keys(&output.measured_total_money_parts).join(", ")
         );
     }
     println!();
@@ -1846,6 +2138,24 @@ fn print_month_table(output: &ProductMonthCostOutput) {
         "{} tables were read that name no model with a recorded build; their cost is not split",
         output.not_measured.unattributed_read_tables
     );
+    if output.not_measured.egress_unreported_executions > 0 {
+        println!(
+            "{} production executions reported no egress; the egress figure is a floor",
+            output.not_measured.egress_unreported_executions
+        );
+    }
+    if output.not_measured.ai_calls_without_usage > 0 {
+        println!(
+            "{} AI calls reported no token counts and are not counted",
+            output.not_measured.ai_calls_without_usage
+        );
+    }
+    if output.not_measured.ai_records_dropped > 0 {
+        println!(
+            "{} AI usage records could not be read and are not counted; the AI figure is a floor",
+            output.not_measured.ai_records_dropped
+        );
+    }
     if output
         .products
         .iter()
@@ -1954,6 +2264,7 @@ pub(crate) mod tests {
             upstream_freshness: None,
             bytes_scanned,
             bytes_written,
+            egress_bytes: None,
             tenant: tenant.map(str::to_string),
             recipe_hash: None,
             input_hash: None,
@@ -2009,6 +2320,7 @@ pub(crate) mod tests {
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 
@@ -2964,7 +3276,7 @@ pub(crate) mod tests {
         };
 
         let both = cost("compute_cost_per_machine_hour = 2.0\nstorage_cost_per_gb_month = 0.5\n");
-        let pricing = MonthPricing::new(Some(&both), &window, true, &measured);
+        let pricing = MonthPricing::new(Some(&both), &window, true, &measured, false, false, None);
         let (usd, status, parts) = pricing.price(&measured);
         assert_eq!(status, MoneyStatus::Priced);
         let usd_of = |figure| part(&parts, figure).usd.unwrap();
@@ -2975,7 +3287,15 @@ pub(crate) mod tests {
 
         // Storage priced, compute not: no total.
         let storage_only = cost("storage_cost_per_gb_month = 0.5\n");
-        let pricing = MonthPricing::new(Some(&storage_only), &window, true, &measured);
+        let pricing = MonthPricing::new(
+            Some(&storage_only),
+            &window,
+            true,
+            &measured,
+            false,
+            false,
+            None,
+        );
         let (usd, status, parts) = pricing.price(&measured);
         assert_eq!(status, MoneyStatus::NoPrice);
         assert_eq!(usd, None);
@@ -2991,7 +3311,15 @@ pub(crate) mod tests {
         // No prices at all, and nothing charged: $0, priced. With no config
         // the same holds.
         for section in [Some(cost("")), None] {
-            let pricing = MonthPricing::new(section.as_ref(), &window, true, &measured);
+            let pricing = MonthPricing::new(
+                section.as_ref(),
+                &window,
+                true,
+                &measured,
+                false,
+                false,
+                None,
+            );
             let (usd, status, parts) = pricing.price(&[]);
             assert_eq!(status, MoneyStatus::Priced);
             assert_eq!(usd, Some(0.0));
@@ -3028,6 +3356,9 @@ pub(crate) mod tests {
             "\n[cost]\ncompute_cost_per_machine_hour = 3.6\nstorage_cost_per_gb_month = 1.0\n\
              cross_region_transfer_cost_per_gb = 0.02\nai_cost_per_million_tokens = 3.0\n",
         );
+        // A store that recorded the whole month, with no AI call and no
+        // egress reported: both are not measured.
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
         let out = month(&config, &state);
         for parts in [
             &out.products[0].money_parts,
@@ -3053,6 +3384,486 @@ pub(crate) mod tests {
             .clone();
         assert_eq!(egress["status"], "not_measured");
         assert!(egress["usd"].is_null());
+    }
+
+    // ----- AI tokens and egress in the monthly report -----
+
+    use rocky_core::ai_usage::AiUsageRecord;
+
+    const ALL_PRICES: &str = "\n[cost]\ncompute_cost_per_machine_hour = 3.6\n\
+         storage_cost_per_gb_month = 7.44\ncross_region_transfer_cost_per_gb = 0.5\n\
+         ai_cost_per_million_tokens = 2.0\n";
+
+    fn stamp_ai_since(state_path: &Path, since: DateTime<Utc>) {
+        StateStore::open(state_path)
+            .unwrap()
+            .stamp_ai_usage_since(since)
+            .unwrap();
+    }
+
+    fn ai_call(
+        id: &str,
+        when: DateTime<Utc>,
+        model: Option<&str>,
+        tokens: Option<(u64, u64)>,
+    ) -> AiUsageRecord {
+        AiUsageRecord {
+            id: id.to_string(),
+            at: when,
+            command: "ai_explain".to_string(),
+            model: model.map(str::to_string),
+            llm_model: "claude-sonnet-4-6".to_string(),
+            input_tokens: tokens.map(|t| t.0),
+            output_tokens: tokens.map(|t| t.1),
+        }
+    }
+
+    fn record_ai(state_path: &Path, calls: &[AiUsageRecord]) {
+        StateStore::open(state_path)
+            .unwrap()
+            .record_ai_usage(calls)
+            .unwrap();
+    }
+
+    /// Calls in October: two about the owned model `revenue_daily`, one of
+    /// them with no usage; one about unowned `raw`; one about no model. One
+    /// call in September and one in November are outside the month.
+    fn october_ai_calls() -> Vec<AiUsageRecord> {
+        let oct = |d| at(2026, 10, d, 9, 0);
+        vec![
+            ai_call("owned", oct(3), Some("revenue_daily"), Some((100, 50))),
+            ai_call("owned-no-usage", oct(4), Some("revenue_daily"), None),
+            ai_call("unowned", oct(5), Some("raw"), Some((1_000, 500))),
+            ai_call("no-model", oct(6), None, Some((10, 5))),
+            ai_call(
+                "sept",
+                at(2026, 9, 30, 23, 0),
+                Some("revenue_daily"),
+                Some((7, 7)),
+            ),
+            ai_call(
+                "nov",
+                at(2026, 11, 1, 1, 0),
+                Some("revenue_daily"),
+                Some((9, 9)),
+            ),
+        ]
+    }
+
+    fn amounts_of(parts: &[CostAmount]) -> (u64, u64) {
+        (
+            amount(parts, CostUnit::AiInputTokens),
+            amount(parts, CostUnit::AiOutputTokens),
+        )
+    }
+
+    /// An owned model's calls go to its product, every other call to
+    /// unallocated, a call without usage is only counted, and the money is
+    /// the blended price over both token units.
+    #[test]
+    fn ai_tokens_are_charged_to_the_owning_product_else_unallocated() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
+        record_ai(&state, &october_ai_calls());
+        let out = month(&config, &state);
+
+        let product = budget_of(&out, "revenue_daily");
+        assert_eq!(amounts_of(&product.charged), (100, 50));
+        assert_eq!(amounts_of(&out.unallocated), (1_010, 505));
+        assert_eq!(amounts_of(&out.measured_total), (1_110, 555));
+        assert_eq!(out.not_measured.ai_calls_without_usage, 1);
+
+        let money = |parts: &[MoneyPart]| {
+            let part = part(parts, MoneyFigure::AiTokens);
+            assert_eq!(part.status, MoneyStatus::Priced);
+            part.usd.unwrap()
+        };
+        assert!((money(&product.money_parts) - 150.0 / 1e6 * 2.0).abs() < 1e-12);
+        assert!((money(&out.unallocated_money_parts) - 1_515.0 / 1e6 * 2.0).abs() < 1e-12);
+        assert!((money(&out.measured_total_money_parts) - 1_665.0 / 1e6 * 2.0).abs() < 1e-12);
+        // The AI money is inside the total.
+        assert_eq!(out.measured_total_money_status, MoneyStatus::Priced);
+        let parts_sum: f64 = out
+            .measured_total_money_parts
+            .iter()
+            .filter(|p| p.status == MoneyStatus::Priced)
+            .filter_map(|p| p.usd)
+            .sum();
+        assert!((out.measured_total_money.unwrap() - parts_sum).abs() < 1e-12);
+
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["not_measured"]["ai_calls_without_usage"], 1);
+        let units: Vec<&str> = json["measured_total"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["unit"].as_str().unwrap())
+            .collect();
+        assert!(units.contains(&"ai_input_tokens"), "{units:?}");
+        assert!(units.contains(&"ai_output_tokens"), "{units:?}");
+    }
+
+    /// The report reads the spool next to the state file as well as the
+    /// table, and a call in both counts once.
+    #[test]
+    fn the_report_reads_the_spool_and_counts_a_call_once() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
+        let calls = october_ai_calls();
+        record_ai(&state, &calls[..1]);
+        // `owned` is in both; `unowned` only in the spool.
+        rocky_core::ai_usage::append_to_spool(
+            &rocky_core::ai_usage::spool_path(&state),
+            &[calls[0].clone(), calls[2].clone()],
+        )
+        .unwrap();
+        let out = month(&config, &state);
+        assert_eq!(
+            amounts_of(&budget_of(&out, "revenue_daily").charged),
+            (100, 50)
+        );
+        assert_eq!(amounts_of(&out.unallocated), (1_000, 500));
+    }
+
+    /// Recorded AI usage with no price is `no_price`, and the figure that
+    /// holds the total back is named by its `[cost]` key. A price of 0 is a
+    /// valid explicit price.
+    #[test]
+    fn recorded_ai_usage_with_no_price_gives_no_price_and_zero_is_a_price() {
+        let priced_but_ai = "\n[cost]\ncompute_cost_per_machine_hour = 3.6\n\
+             storage_cost_per_gb_month = 7.44\n";
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), priced_but_ai);
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
+        record_ai(&state, &october_ai_calls());
+        let out = month(&config, &state);
+        let product = budget_of(&out, "revenue_daily");
+        assert_eq!(product.money_status, MoneyStatus::NoPrice);
+        assert_eq!(product.money, None, "a total without AI would understate");
+        assert_eq!(
+            part(&product.money_parts, MoneyFigure::AiTokens).status,
+            MoneyStatus::NoPrice
+        );
+        assert_eq!(out.measured_total_money_status, MoneyStatus::NoPrice);
+        assert_eq!(
+            missing_price_keys(&out.measured_total_money_parts),
+            ["ai_cost_per_million_tokens"]
+        );
+        // The other figures are still priced.
+        assert_eq!(
+            part(&product.money_parts, MoneyFigure::Compute).status,
+            MoneyStatus::Priced
+        );
+
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(
+            dir.path(),
+            &format!("{priced_but_ai}ai_cost_per_million_tokens = 0\n"),
+        );
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
+        record_ai(&state, &october_ai_calls());
+        let out = month(&config, &state);
+        let product = budget_of(&out, "revenue_daily");
+        assert_eq!(product.money_status, MoneyStatus::Priced);
+        let ai = part(&product.money_parts, MoneyFigure::AiTokens);
+        assert_eq!((ai.status, ai.usd), (MoneyStatus::Priced, Some(0.0)));
+    }
+
+    /// A month that began before the store started recording AI calls has
+    /// calls the store never saw: its AI part is partial, outside the total,
+    /// with or without recorded calls. Beginning exactly with the month is
+    /// complete.
+    #[test]
+    fn a_month_before_ai_recording_began_reports_ai_as_partial() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        // The store was created just now: October is before the stamp.
+        let out = month(&config, &state);
+        for parts in [
+            &out.products[0].money_parts,
+            &out.measured_total_money_parts,
+            &out.unallocated_money_parts,
+        ] {
+            let ai = part(parts, MoneyFigure::AiTokens);
+            assert_eq!(ai.status, MoneyStatus::Partial, "no calls recorded");
+            assert_eq!(ai.usd, None);
+        }
+        // Partial AI stays outside the total: the rest still prices.
+        assert_eq!(out.products[0].money_status, MoneyStatus::Priced);
+
+        // With calls recorded in the month the amounts show, the money does
+        // not.
+        record_ai(&state, &october_ai_calls());
+        let out = month(&config, &state);
+        let product = budget_of(&out, "revenue_daily");
+        assert_eq!(amounts_of(&product.charged), (100, 50));
+        let ai = part(&product.money_parts, MoneyFigure::AiTokens);
+        assert_eq!((ai.status, ai.usd), (MoneyStatus::Partial, None));
+        // Recorded calls with a partial AI part: no total, on every row. A
+        // total that left the unseen spend out would understate it, and the
+        // `max_usd` check already refuses to judge on it.
+        assert_eq!(product.money_status, MoneyStatus::Partial);
+        assert_eq!(product.money, None);
+        assert_eq!(out.measured_total_money_status, MoneyStatus::Partial);
+        assert_eq!(out.measured_total_money, None);
+        assert_eq!(out.unallocated_money_status, MoneyStatus::Partial);
+        assert_eq!(out.unallocated_money, None);
+        // The priced parts are still listed.
+        assert_eq!(
+            part(&product.money_parts, MoneyFigure::Compute).status,
+            MoneyStatus::Priced
+        );
+
+        // Recording began exactly at the start of the month: complete.
+        stamp_ai_since(&state, at(2026, 10, 1, 0, 0));
+        let out = month(&config, &state);
+        assert_eq!(
+            part(&out.products[0].money_parts, MoneyFigure::AiTokens).status,
+            MoneyStatus::Priced
+        );
+        assert_eq!(out.products[0].money_status, MoneyStatus::Priced);
+        // One second later: partial.
+        stamp_ai_since(&state, at(2026, 10, 1, 0, 0) + chrono::Duration::seconds(1));
+        let out = month(&config, &state);
+        assert_eq!(
+            part(&out.products[0].money_parts, MoneyFigure::AiTokens).status,
+            MoneyStatus::Partial
+        );
+    }
+
+    /// Run 2 adds an execution that reports 2 GiB of egress. The other three
+    /// production executions report none.
+    fn add_egress_run(state_path: &Path) {
+        let start = at(2026, 10, 20, 0, 0);
+        let mut raw = exec_at("raw", start, 1_000);
+        raw.egress_bytes = Some(2 * (1 << 30));
+        record(
+            state_path,
+            &[sample_run_at(
+                "run-2",
+                start,
+                vec![
+                    raw,
+                    reading(
+                        exec_at("revenue_daily", start + chrono::Duration::minutes(1), 400),
+                        "raw",
+                        10,
+                    ),
+                ],
+            )],
+        );
+    }
+
+    /// Some executions report egress and some do not: the reported sum is
+    /// priced, and the rest are counted.
+    #[test]
+    fn partially_reported_egress_prices_the_reported_sum_and_counts_the_rest() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        add_egress_run(&state);
+        let out = month(&config, &state);
+        assert_eq!(amount(&out.measured_total, CostUnit::EgressBytes), 2 << 30);
+        assert_eq!(out.not_measured.egress_unreported_executions, 3);
+        let egress = part(&out.measured_total_money_parts, MoneyFigure::Egress);
+        assert_eq!(egress.status, MoneyStatus::Priced);
+        assert!((egress.usd.unwrap() - 1.0).abs() < 1e-12, "2 GiB * 0.5");
+        // The egress money is inside the total.
+        let parts_sum: f64 = out
+            .measured_total_money_parts
+            .iter()
+            .filter_map(|p| p.usd)
+            .sum();
+        assert!((out.measured_total_money.unwrap() - parts_sum).abs() < 1e-12);
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["not_measured"]["egress_unreported_executions"], 3);
+        // Every byte reported is somewhere: on a product or unallocated.
+        let on_products: u64 = out
+            .products
+            .iter()
+            .map(|p| amount(&p.charged, CostUnit::EgressBytes))
+            .sum();
+        assert_eq!(
+            on_products + amount(&out.unallocated, CostUnit::EgressBytes),
+            2 << 30
+        );
+    }
+
+    /// Reported egress with no price is `no_price` and names the key; 0 is a
+    /// valid price. Nothing reported is `not_measured` with nothing counted.
+    #[test]
+    fn egress_with_no_price_gives_no_price_and_zero_is_a_price() {
+        let no_egress_price = "\n[cost]\ncompute_cost_per_machine_hour = 3.6\n\
+             storage_cost_per_gb_month = 7.44\nai_cost_per_million_tokens = 2.0\n";
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), no_egress_price);
+        add_egress_run(&state);
+        let out = month(&config, &state);
+        assert_eq!(out.measured_total_money_status, MoneyStatus::NoPrice);
+        assert_eq!(out.measured_total_money, None);
+        assert_eq!(
+            missing_price_keys(&out.measured_total_money_parts),
+            ["cross_region_transfer_cost_per_gb"]
+        );
+
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(
+            dir.path(),
+            &format!("{no_egress_price}cross_region_transfer_cost_per_gb = 0\n"),
+        );
+        add_egress_run(&state);
+        let out = month(&config, &state);
+        assert_eq!(out.measured_total_money_status, MoneyStatus::Priced);
+        let egress = part(&out.measured_total_money_parts, MoneyFigure::Egress);
+        assert_eq!(
+            (egress.status, egress.usd),
+            (MoneyStatus::Priced, Some(0.0))
+        );
+
+        // No execution reports egress: not measured, and no execution is
+        // counted as unreported.
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        let out = month(&config, &state);
+        assert_eq!(out.not_measured.egress_unreported_executions, 0);
+        assert_eq!(
+            part(&out.measured_total_money_parts, MoneyFigure::Egress).status,
+            MoneyStatus::NotMeasured
+        );
+    }
+
+    /// A reported zero is measured: priced at $0, not `not_measured`.
+    /// Mutation: infer the flags from the sums and both read `not_measured`.
+    #[test]
+    fn a_reported_zero_of_egress_or_ai_tokens_is_priced_at_zero() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
+        let start = at(2026, 10, 20, 0, 0);
+        let mut raw = exec_at("raw", start, 1_000);
+        raw.egress_bytes = Some(0);
+        record(&state, &[sample_run_at("run-2", start, vec![raw])]);
+        record_ai(
+            &state,
+            &[ai_call("zero", at(2026, 10, 3, 9, 0), None, Some((0, 0)))],
+        );
+        let out = month(&config, &state);
+        for figure in [MoneyFigure::Egress, MoneyFigure::AiTokens] {
+            let p = part(&out.measured_total_money_parts, figure);
+            assert_eq!(
+                (p.status, p.usd),
+                (MoneyStatus::Priced, Some(0.0)),
+                "{figure:?}"
+            );
+        }
+    }
+
+    /// With recorded calls and a partial AI part the `max_usd` check and the
+    /// reported total agree: neither judges on the incomplete figure.
+    #[test]
+    fn the_total_and_the_max_usd_check_agree_on_partial_ai() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        record_ai(&state, &october_ai_calls());
+        let out = month(&config, &state);
+        assert_eq!(out.measured_total_money_status, MoneyStatus::Partial);
+        let inputs = load_month_inputs(
+            &StateStore::open_read_only(&state).unwrap(),
+            &config,
+            "2026-10",
+            at(2026, 11, 2, 0, 0),
+        )
+        .unwrap();
+        let split = inputs.split(&inputs.runs, at(2026, 11, 2, 0, 0)).unwrap();
+        let measured = amounts_out(&split.measured_total);
+        let pricing = inputs.pricing(&split, &measured);
+        let check = max_usd_check(1e9, &measured, &pricing);
+        assert_eq!(check.verdict, ProductBudgetVerdict::NotEvaluated);
+        assert!(
+            check
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("started recording AI calls")),
+            "{check:?}"
+        );
+    }
+
+    /// Spooled records that no parse can read are counted in `not_measured`
+    /// and warned about; the persisted count survives the spool being
+    /// emptied. Mutation: drop the field and the loss is silent.
+    #[test]
+    fn unreadable_ai_records_are_counted_in_not_measured() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
+        let spool = rocky_core::ai_usage::spool_path(&state);
+        rocky_core::ai_usage::append_to_spool(&spool, &october_ai_calls()[..1]).unwrap();
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&spool)
+                .unwrap(),
+            b"not json\n\xff\n",
+        )
+        .unwrap();
+        // Not yet drained: counted from the spool read.
+        let out = month(&config, &state);
+        assert_eq!(out.not_measured.ai_records_dropped, 2);
+        assert!(out.warnings.iter().any(|w| w.contains("did not parse")));
+        // A drain drops them for good; the persisted count keeps them.
+        StateStore::open(&state)
+            .unwrap()
+            .drain_ai_usage_spool()
+            .unwrap();
+        let out = month(&config, &state);
+        assert_eq!(out.not_measured.ai_records_dropped, 2);
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["not_measured"]["ai_records_dropped"], 2);
+    }
+
+    /// `rocky lsp` and MCP spool next to the default state file. A report on
+    /// another store says so. Mutation: drop the check and no warning.
+    #[test]
+    fn a_report_on_another_store_warns_about_the_default_spool() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        let models = config.parent().unwrap().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let default_state = models.join(".rocky-state.redb");
+        let spool = rocky_core::ai_usage::spool_path(&default_state);
+        rocky_core::ai_usage::append_to_spool(&spool, &october_ai_calls()[..1]).unwrap();
+        let out = month(&config, &state);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("rocky lsp") && w.contains("not counted")),
+            "{:?}",
+            out.warnings
+        );
+        // Reading the default store itself reads that spool: no warning.
+        drop(StateStore::open(&default_state).unwrap());
+        let out = month(&config, &default_state);
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("rocky lsp")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// The month table prints the new figures and the counters.
+    #[test]
+    fn the_month_table_prints_ai_tokens_egress_and_the_counters() {
+        let dir = TempDir::new().unwrap();
+        let (config, state) = money_project(dir.path(), ALL_PRICES);
+        stamp_ai_since(&state, at(2026, 9, 1, 0, 0));
+        add_egress_run(&state);
+        record_ai(&state, &october_ai_calls());
+        let out = month(&config, &state);
+        // Prints without panicking; the content is the output fields above.
+        print_month_table(&out);
+        assert!(out.not_measured.ai_calls_without_usage > 0);
+        assert!(out.not_measured.egress_unreported_executions > 0);
     }
 
     #[test]

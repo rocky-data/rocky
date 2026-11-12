@@ -1,4 +1,4 @@
-# 10-duckdb-ducklake — DuckLake tables through DuckDB
+# 13-duckdb-ducklake — DuckLake tables through DuckDB
 
 > **Category:** 07-adapters
 > **Credentials:** none (the live run downloads DuckDB's `ducklake` extension once)

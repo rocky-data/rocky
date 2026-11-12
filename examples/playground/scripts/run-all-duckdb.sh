@@ -138,9 +138,20 @@ for run in pocs/*/*/run.sh; do
         continue
     fi
 
-    # Skip POCs that need docker.
-    if grep -qiE 'docker[ -]compose' "$readme" 2>/dev/null; then
+    # Skip POCs that need docker: a compose file in the README, or a run.sh
+    # that checks for the docker CLI.
+    if grep -qiE 'docker[ -]compose' "$readme" 2>/dev/null \
+        || grep -qE 'command -v docker' "$run" 2>/dev/null; then
         echo "--- SKIP $poc_dir (docker required)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    # Skip POCs that install a third-party tool into a local venv (the
+    # connector shims for dlt and Meltano). A cold install from PyPI can take
+    # longer than the 60s smoke timeout.
+    if grep -qE '(uv|-m) pip install' "$run" 2>/dev/null; then
+        echo "--- SKIP $poc_dir (installs a third-party tool; slower than the smoke timeout)"
         skipped=$((skipped + 1))
         continue
     fi

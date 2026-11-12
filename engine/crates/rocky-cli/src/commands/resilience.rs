@@ -415,6 +415,7 @@ mod tests {
     fn sample_mat() -> MaterializationOutput {
         MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: vec!["main".into(), "orders".into()],
             notes: vec![],
             rows_copied: None,
@@ -432,6 +433,7 @@ mod tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: vec![],
             attempts: Vec::new(),

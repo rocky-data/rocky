@@ -485,6 +485,7 @@ fn test_run_history_flow() {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -513,6 +514,7 @@ fn test_run_history_flow() {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -548,6 +550,7 @@ fn test_run_history_flow() {
         run_scope: Some(rocky_core::state::RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),
+        output_volumes: Vec::new(),
     };
 
     store.record_run(&run).unwrap();
@@ -2177,6 +2180,7 @@ mod delivery_timing_e2e {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -2216,6 +2220,7 @@ mod delivery_timing_e2e {
             run_scope: Some(scope),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         }
     }
 

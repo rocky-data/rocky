@@ -1022,7 +1022,7 @@ status: success   adapter: databricks   total: $0.101
 
 ### One month, split by product
 
-`rocky cost --month 2026-10 --by product` answers one question: which data product paid for how much of last month. It reads run history only. It reports physical units: model time in milliseconds, and stored data in byte-hours. It adds money in USD only where you set a price in `[cost]`. Rocky's shipped default prices are never used here. See [Money](#money).
+`rocky cost --month 2026-10 --by product` answers one question: which data product paid for how much of last month. It reads run history and the AI calls recorded in the state store. It reports physical units: model time in milliseconds, stored data in byte-hours, bytes of egress where an adapter reported them, and AI tokens. It adds money in USD only where you set a price in `[cost]`. Rocky's shipped default prices are never used here. See [Money](#money).
 
 ```bash
 rocky cost --month 2026-10 --by product
@@ -1071,17 +1071,19 @@ Each product, `measured_total` and `unallocated` get money fields: `money` (USD,
 | `compute` | `compute_ms` | `compute_cost_per_machine_hour`: milliseconds / 3,600,000 x price |
 | `storage_data_files` | `storage_byte_hours_data_files` | `storage_cost_per_gb_month`: byte-hours / (2^30 x hours in the month) x price |
 | `storage_allocated_blocks` | `storage_byte_hours_allocated_blocks` | `storage_cost_per_gb_month`, the same way |
-| `egress` | not measured | none |
-| `ai_tokens` | not measured | none |
+| `egress` | `egress_bytes` | `cross_region_transfer_cost_per_gb`: bytes / 2^30 x price |
+| `ai_tokens` | `ai_input_tokens` plus `ai_output_tokens` | `ai_cost_per_million_tokens`: tokens / 1,000,000 x price. One blended price: input and output tokens cost the same. |
 
 `compute_cost_per_dbu` does not price this view. Model time is machine time, not DBUs, so set `compute_cost_per_machine_hour`. A storage figure appears only when the month measured that basis. Each table's storage is measured on one basis, so the money total adds both storage figures.
 
 `money_status` is one of:
 
 - `priced`: every measured figure has a price. `money` is their sum. A figure whose amount is `0` costs `$0`, with or without a price.
-- `no_price`: a measured figure has no price. `money` is `null`, because a total without that figure would read low. The parts still show the figures that have a price.
-- `not_measured`: used only on the `egress` and `ai_tokens` parts. Rocky does not measure them, so their `usd` is `null`, never `0`. They are not in `money`.
-- `partial`: `history_complete` is `false`. The amounts are partial, so no money total is shown, and no part that has a price shows money.
+- `no_price`: a measured figure has no price. `money` is `null`, because a total without that figure would read low. The parts still show the figures that have a price. The table view names the missing `[cost]` keys. This holds for egress and AI tokens too: recorded usage with no price is `no_price`.
+- `not_measured`: used only on the `egress` and `ai_tokens` parts. Nothing was measured for the month, so their `usd` is `null`, never `0`. They are not in `money`.
+- `partial`: `history_complete` is `false`. The amounts are partial, so no money total is shown, and no part that has a price shows money. The `ai_tokens` part is also `partial` when the state store began recording AI calls after the month began. That part has no money. With recorded calls in the month, `money` is `null` and `money_status` is `partial`, because a total without the unseen spend would read low. With none, the part is only listed and the rest of the month is priced.
+
+Set a price of `0` to say a figure is free. `0` is a valid explicit price. An unset price is not `0`: with no price, a measured figure is `no_price`.
 
 For the current month, money is month-to-date: storage counts up to now, at the price of a whole GB-month spread over every hour of the month. The table view prints USD to six decimal places; the JSON carries the full value.
 
@@ -1091,7 +1093,7 @@ Rocky prices each figure on its own, in floating point. The money of the product
 
 A product with a [`[product_budget.NAME]`](/reference/configuration/#product_budgetname) gets two more fields. Both are left out for a product with no budget.
 
-- `budget`: the budget checked against `charged`, as of the report. `verdict` is `in_budget`, `breached` or `not_evaluated`. `checks` has one entry per limit set, with `limit_type`, `limit`, `actual` and its own `verdict`. A `max_storage_gb_month` check names its storage basis in `unit`, one check per basis the month measured. A check that is `not_evaluated` says why in `reason`. `max_usd` tests `money`, so it is `not_evaluated` whenever `money_status` is not `priced`.
+- `budget`: the budget checked against `charged`, as of the report. `verdict` is `in_budget`, `breached` or `not_evaluated`. `checks` has one entry per limit set, with `limit_type`, `limit`, `actual` and its own `verdict`. A `max_storage_gb_month` check names its storage basis in `unit`, one check per basis the month measured. A check that is `not_evaluated` says why in `reason`. `max_usd` tests `money` when `money_status` is `priced`. When it is not, the check is `not_evaluated`, with one exception: if the priced figures alone already exceed the limit, it is `breached`, because a missing price only raises the total. An incomplete history (`partial` from `history_complete`) is always `not_evaluated`. A month with recorded AI calls and a store that began recording after the month began has `money_status` `partial` and no `money`, because the AI part is `partial`. It is `not_evaluated` unless the priced figures alone exceed the limit.
 - `breach_events`: each time this month the product went from not over to over, in run order. Each event has the `run_id` of the production run after which it was over, the time that run finished (`at`), and the exceeded checks. An event is never withdrawn. The current `verdict` can read `in_budget` beside an earlier event.
 
 ```json
@@ -1116,7 +1118,8 @@ Rocky finds the events by splitting the month again after each production run, o
 
 - `history_complete: false` means state retention may have swept runs the month needs. The few rows that remain look like a quiet month. Every figure is then partial. Raise `[state.retention] max_age_days` to cover the month.
 - The command scans runs that started up to one day before the month. A run that started earlier, with executions inside the month, is missed.
-- Egress and AI tokens are not measured. They have no units, and their money parts are `not_measured`.
+- Egress is plumbing only. Rocky can carry `egress_bytes` from an adapter to the report and split it like model time, but no adapter reports it yet. Until one does, egress is `not_measured`. When some executions report egress and others do not, Rocky prices the sum that was reported, and counts the rest in `not_measured.egress_unreported_executions`. The egress figure is then a floor.
+- AI tokens cover the calls recorded in this state store only. A `rocky ai` command run on a laptop writes to the laptop's store, and this store never sees it. The figure is developer spend: AI calls have no production scope, and no run records them. Rocky charges a call to the product that owns the model it names. Any other call goes to `unallocated`. A call whose response gave no token counts adds nothing and is counted in `not_measured.ai_calls_without_usage`. The `rocky ai` commands, the LSP code actions and the MCP tools record calls. The LSP and MCP servers never write the state store. They append to a file next to it, the state file name plus `.ai-usage.jsonl`, and the next `rocky run`, or `rocky ai` command on a store already at the current schema, moves the lines into the store. `rocky ai` does not upgrade an older store in place: it spools, and a month holding those calls reads `partial`. `rocky cost` reads both, and counts a call once. Nothing caps the spool while no process drains it. A call is attributed to a product by who owns its model when you run the report, so a change of owner moves its past calls. The LSP and MCP servers always use the default state file, not `--state-path` or `--state-namespace`. If you report on another store, `rocky cost` warns when the default store's spool holds calls it does not read. A recorded call that cannot be read is counted in `not_measured.ai_records_dropped`, and the AI figure is then a floor. A figure that was reported as zero is measured and priced at $0; it is `not_measured` only when nothing reported it.
 - A reader that ran on an adapter that records no reads (anything but DuckDB) is invisible. The cost of its tables goes to the owner, or to `unallocated`.
 - Storage is the size measured right after each build. A table that Rocky did not build this month still counts, from its last measured build before the month, but only when that build is still in the state store and the table is known: an owned model, a model the scan ran, or a model named in the model graph. A table that is read but links to no recorded build (a source, a name that matches two models, or a build older than the history or than the reader) is counted in `not_measured.unattributed_read_tables`, once per name as written (`c.s.t` and `s.t` count twice), and its cost is not split. A model built before the month and never read still adds its storage to `measured_total`, and to `unallocated` when no product owns it. Retention can remove an old build, and `history_complete` does not flag that case. Before the first build of a table, with enough history, its storage is zero.
 - The several executions of one model in one run (for example, partitions) count as one version. A model that changes its target during the month still resolves under both names. Shadow and branch runs never decide where a model's table is.

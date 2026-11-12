@@ -627,6 +627,31 @@ impl DuckDbConnector {
         Ok(())
     }
 
+    /// Executes `sql` like [`Self::execute_statement`] and returns the rows
+    /// it changed, when DuckDB counts them.
+    ///
+    /// DuckDB counts the rows of one `INSERT`, `UPDATE`, `DELETE` or
+    /// `MERGE` statement; a `MERGE` counts every row it inserted, updated or
+    /// deleted. Anything else (DDL, a transaction statement, a batch of
+    /// several statements) runs as before and returns `None`: unknown, never
+    /// a guessed zero.
+    pub fn execute_statement_counting_rows(&self, sql: &str) -> Result<Option<u64>, DuckDbError> {
+        debug!(sql = sql, "executing DuckDB statement");
+        self.ensure_profiling_off();
+        self.run_counting_rows(sql)
+    }
+
+    /// The statement part of [`Self::execute_statement_counting_rows`], with
+    /// no profiling reset, so a profiled caller can use it too.
+    pub(crate) fn run_counting_rows(&self, sql: &str) -> Result<Option<u64>, DuckDbError> {
+        if !counts_changed_rows(sql) {
+            self.conn.execute_batch(sql)?;
+            return Ok(None);
+        }
+        let changed = self.conn.prepare(sql)?.execute([])?;
+        Ok(u64::try_from(changed).ok())
+    }
+
     /// Keep both DDL statements on the same connection and roll back either
     /// failure before another adapter call can acquire the connection lock.
     pub fn atomic_drop_and_create(
@@ -708,9 +733,72 @@ impl DuckDbConnector {
     }
 }
 
+/// True for SQL DuckDB returns a changed-row count for: one statement whose
+/// first word is `INSERT`, `UPDATE`, `DELETE` or `MERGE`. A `;` anywhere but
+/// at the end (even inside a literal) reads as a batch, which is not
+/// counted.
+fn counts_changed_rows(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';');
+    if trimmed.contains(';') {
+        return false;
+    }
+    let first = trimmed
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or_default();
+    ["INSERT", "UPDATE", "DELETE", "MERGE"]
+        .iter()
+        .any(|keyword| first.eq_ignore_ascii_case(keyword))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DuckDB counts the rows a DML statement changed, including both arms
+    /// of a MERGE. Other statements report no count rather than zero.
+    #[test]
+    fn a_dml_statement_reports_the_rows_it_changed() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        assert_eq!(
+            db.execute_statement_counting_rows("CREATE TABLE t (id INTEGER, v INTEGER)")
+                .unwrap(),
+            None,
+            "DDL has no count"
+        );
+        assert_eq!(
+            db.execute_statement_counting_rows("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+                .unwrap(),
+            Some(3)
+        );
+        // Two keys match (updated) and one is new (inserted): three touched.
+        let merge = "MERGE INTO t USING (SELECT * FROM (VALUES (2, 21), (3, 31), (4, 40)) \
+                     AS s(id, v)) AS s ON t.id = s.id \
+                     WHEN MATCHED THEN UPDATE SET v = s.v \
+                     WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)";
+        assert_eq!(db.execute_statement_counting_rows(merge).unwrap(), Some(3));
+        assert_eq!(
+            db.execute_statement_counting_rows("delete from t where id = 1;")
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.execute_statement_counting_rows(
+                "INSERT INTO t VALUES (9, 9); INSERT INTO t VALUES (8, 8)"
+            )
+            .unwrap(),
+            None,
+            "a batch is not counted"
+        );
+        assert_eq!(db.execute_statement_counting_rows("BEGIN").unwrap(), None);
+        assert_eq!(db.execute_statement_counting_rows("COMMIT").unwrap(), None);
+        let rows = db.execute_sql("SELECT count(*) FROM t").unwrap().rows;
+        assert_eq!(
+            rocky_core::checks::cell_as_u64(rows[0].first()),
+            Some(5),
+            "every statement ran"
+        );
+    }
 
     fn setting(db: &DuckDbConnector, name: &str) -> String {
         let sql = format!("SELECT current_setting('{name}')::VARCHAR");

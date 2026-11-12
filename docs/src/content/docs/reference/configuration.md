@@ -225,13 +225,13 @@ The connection fields, authentication, and examples for each adapter type live o
 - [ClickHouse](/reference/adapters/clickhouse/) (Beta) — HTTP interface with user/password and TLS, plus table engine and sort keys
 - [Spark](/reference/adapters/spark/) (Beta) — Spark Connect with an optional bearer token, on Delta Lake or Iceberg tables
 - [Fivetran](/reference/adapters/fivetran/) — metadata-only source discovery
+- [Airbyte](/reference/adapters/airbyte/) — metadata-only source discovery
 
-Three types have no page yet. They read these top-level fields:
+Two types have no page yet. They read these top-level fields:
 
 | `type` | Role | Fields |
 |--------|------|--------|
 | `"trino"` | Warehouse | `host` (coordinator URL, required). `token` for JWT bearer auth, else `username` + `password` for Basic auth. `username` also names the Trino user. `database` sets the default catalog. `timeout_secs` defaults to `300`. |
-| `"airbyte"` | Discovery | `host` (Airbyte API URL, required). `token` (optional bearer token). |
 | `"iceberg"` | Discovery | `host` (REST catalog URL, required). `token` (optional bearer token). |
 
 
@@ -364,13 +364,13 @@ Use a different adapter to list schemas and tables than the one that reads the r
 | `adapter` | string | Yes | — | Adapter name to use for discovery. |
 | `report_new_sources` | bool | No | `false` | Diff the discovered source inventory against the prior persisted snapshot and report first-seen schemas in the discover output's `new_sources`. The first discover of a pipeline records the baseline and reports nothing. Off by default — the diff and its state write only happen when opted in. |
 | `on_collision` | `"off"` \| `"warn"` \| `"error"` | No | `"off"` | Cross-source collision detection. When the same external object (e.g. an ad account) is onboarded under two schemas, its data lands in two target tables and silently doubles any downstream `UNION ALL`. `warn` reports the pairs in the discover output's `collision_candidates` and emits a `source_collision_detected` event; `error` additionally fails the discover so a colliding onboard can't silently create a catalog. `off` (default) skips detection entirely. Only adapters that resolve external object ids (e.g. Fivetran) participate; others contribute nothing. |
-| `sync` | table | No | absent | `[pipeline.NAME.source.discovery.sync]`. Wait for a running source sync before `rocky run` reads the source, and optionally start one. Fivetran only. See the keys below. |
+| `sync` | table | No | absent | `[pipeline.NAME.source.discovery.sync]`. Wait for a running source sync before `rocky run` reads the source, and optionally start one. Fivetran and Airbyte only. See the keys below. |
 
 See [Cross-source duplicate detection](#cross-source-duplicate-detection) for the counterpart that runs during replication rather than at discovery.
 
 #### `[pipeline.NAME.source.discovery.sync]`
 
-Waits for a running source sync to finish before the run starts. With `wait` alone Rocky sends `GET` requests only. With `trigger` as well, and `allow_sync_trigger = true` on the adapter, it starts one sync per connector first. See [Fivetran adapter](/reference/adapters/fivetran/#wait-for-a-running-sync) for the full behaviour.
+Waits for a running source sync to finish before the run starts. With `wait` alone Rocky sends `GET` requests only. With `trigger` as well, and `allow_sync_trigger = true` on the adapter, it starts one sync per connector first. It works on a `fivetran` or `airbyte` discovery adapter. `rocky validate` refuses `wait = true` on any other known type. See [Fivetran adapter](/reference/adapters/fivetran/#wait-for-a-running-sync) for the full behaviour, and [Airbyte adapter](/reference/adapters/airbyte/#wait-for-a-running-sync) for what differs on Airbyte.
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
@@ -378,7 +378,7 @@ Waits for a running source sync to finish before the run starts. With `wait` alo
 | `wait_timeout_secs` | integer | No | `3600` | Longest wait for the whole phase. A sync still running at the limit counts as a failure. `rocky validate` requires at most half of `[state.idempotency] in_flight_ttl_hours`. |
 | `poll_interval_secs` | integer | No | `30` | Seconds between polls. At least 10. |
 | `on_sync_failure` | `"fail"` \| `"warn"` | No | `"fail"` | `fail` stops the run before any warehouse write. `warn` logs the failure and runs on the data already landed. |
-| `trigger` | bool | No | `false` | Start a sync on each selected connector, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. `rocky run --no-sync-trigger` turns it off for one run. See [Start a sync](/reference/adapters/fivetran/#start-a-sync). |
+| `trigger` | bool | No | `false` | Start a sync on each selected connector, then wait for it. Needs `wait = true` and `allow_sync_trigger = true` on the discovery adapter. `rocky run --no-sync-trigger` turns it off for one run. See [Start a sync](/reference/adapters/fivetran/#start-a-sync) for Fivetran and [Start a sync](/reference/adapters/airbyte/#start-a-sync) for Airbyte. |
 
 ### `[pipeline.NAME.source.schema_pattern]`
 
@@ -965,15 +965,15 @@ A Valkey-backed runtime cache exists in the codebase but `rocky.toml` does not r
 
 ## `[cost]`
 
-Tell Rocky what your warehouse costs. `rocky optimize` and run cost estimates use these prices, and fall back to Rocky's defaults for an unset storage or DBU price. The monthly product view, `rocky cost --month <YYYY-MM> --by product`, uses only the prices you set: a figure with no price shows no money.
+Tell Rocky what your warehouse costs. `rocky optimize` and run cost estimates use these prices, and fall back to Rocky's defaults for an unset storage or DBU price. The monthly product view, `rocky cost --month <YYYY-MM> --by product`, uses only the prices you set: a figure with no price shows no money. A price of `0` is valid and means the figure is free.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `storage_cost_per_gb_month` | float | unset | Storage price in USD per GB-month. Must be a finite number, 0 or more. When unset, `rocky optimize` estimates with `0.023`. The monthly product view (`rocky cost --month`) uses only a price you set. |
 | `compute_cost_per_dbu` | float | unset | Compute price in USD per DBU-hour (Databricks, Snowflake). Must be a finite number, 0 or more. When unset, run cost estimates (`rocky cost <run>`, `rocky optimize`, run summaries) use `0.40`. |
 | `compute_cost_per_machine_hour` | float | unset | Compute price in USD per machine-hour, for engines that bill by machine time. Must be a finite number, 0 or more. Prices model time in `rocky cost --month <YYYY-MM> --by product`. |
-| `cross_region_transfer_cost_per_gb` | float | unset | Price in USD to move 1 GB across regions. Must be a finite number, 0 or more. Read by no cost command yet. |
-| `ai_cost_per_million_tokens` | float | unset | AI price in USD per 1,000,000 tokens. Must be a finite number, 0 or more. Read by no cost command yet. |
+| `cross_region_transfer_cost_per_gb` | float | unset | Price in USD to move 1 GB (2^30 bytes) across regions. Must be a finite number, 0 or more. `rocky cost --month <YYYY-MM> --by product` prices the egress that adapters reported. No adapter reports egress yet, so it prices nothing today. Reported egress with no price gives no money total. `0` is a valid explicit price. |
+| `ai_cost_per_million_tokens` | float | unset | AI price in USD per 1,000,000 tokens. One blended price: input and output tokens cost the same. Must be a finite number, 0 or more. `rocky cost --month <YYYY-MM> --by product` prices the AI calls recorded in this state store with it. That figure is developer spend, and it covers this store only. A month with recorded calls and no price here has no money total. `0` is a valid explicit price. |
 | `warehouse_size` | string | `"Medium"` | Warehouse size for cost estimation (e.g., `"Small"`, `"Medium"`, `"Large"`). |
 | `min_history_runs` | integer | `5` | Runs Rocky needs in history before it makes a cost recommendation. |
 

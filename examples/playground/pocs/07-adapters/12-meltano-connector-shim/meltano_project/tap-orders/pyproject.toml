@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tap-orders"
+version = "0.0.1"
+description = "A tiny offline Singer tap for the Rocky POC. Reads local JSONL files."
+requires-python = ">=3.9"
+dependencies = ["singer-sdk==0.54.9"]
+
+[project.scripts]
+tap-orders = "tap_orders.tap:TapOrders.cli"
+
+[tool.setuptools]
+packages = ["tap_orders"]

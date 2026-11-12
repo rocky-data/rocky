@@ -8,6 +8,7 @@ use rocky_ai::client::{AiConfig, DEFAULT_MAX_TOKENS, LlmClient};
 use rocky_ai::generate;
 use rocky_ai::residency::AiResidency;
 use rocky_ai::sidecar::{SidecarMaterialization, SidecarTarget, write_model_files};
+use rocky_ai::usage::UsageRecorder;
 use rocky_compiler::compile::{CompileResult, CompilerConfig, compile};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::redacted::RedactedString;
@@ -276,6 +277,11 @@ pub async fn run_ai(
         let tables: Vec<&str> = source_tables.iter().map(|(n, _)| n.as_str()).collect();
         setup.client(&models, &tables)?
     };
+    // Every call is recorded for `rocky cost`, even when generation fails.
+    // The model is named once generation knows it.
+    let recorder = UsageRecorder::collect("ai");
+    let _persist = recorder.persist_on_drop(state_path);
+    let client = client.with_usage_sink(recorder.sink());
 
     // Missing (not implemented): validation gets empty `source_schemas`
     // until `rocky-ai`'s generate callpath is audited. The
@@ -315,6 +321,7 @@ pub async fn run_ai(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    recorder.label_unlabelled(&result.name);
 
     // Literally the value verification used, not a second derivation of it.
     let resolved_target = result.target.clone();
@@ -435,6 +442,9 @@ async fn run_ai_sync_with(
     // Each prompt carries the model's upstream schemas. Built before the
     // baseline below is written, so a V062 refusal leaves nothing on disk.
     let client = setup.client_for_models(&result, &models_with_intent, true)?;
+    let recorder = UsageRecorder::collect("ai_sync");
+    let _persist = recorder.persist_on_drop(state_path);
+    let client = client.with_usage_sink(recorder.sink());
 
     // Diff each model's upstream schemas against the baseline stored next to
     // the state store. A model with no baseline (first sync) proceeds on
@@ -460,6 +470,7 @@ async fn run_ai_sync_with(
     let mut proposals = Vec::new();
 
     for (model, diff) in models_with_intent.iter().zip(&diffs) {
+        recorder.set_model(Some(&model.config.name));
         let proposal = rocky_ai::sync::sync_model(model, &diff.changes, &client, &result)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -746,9 +757,13 @@ pub async fn run_ai_explain(
 
     // Each prompt carries the model's schema and its upstream schemas.
     let client = setup.client_for_models(&result, &models_to_explain, true)?;
+    let recorder = UsageRecorder::collect("ai_explain");
+    let _persist = recorder.persist_on_drop(state_path);
+    let client = client.with_usage_sink(recorder.sink());
     let mut explanations: Vec<AiExplanation> = Vec::new();
 
     for model in &models_to_explain {
+        recorder.set_model(Some(&model.config.name));
         let intent = rocky_ai::explain::explain_model(model, &result, &client)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -818,9 +833,13 @@ pub async fn run_ai_test(
 
     // Each prompt carries the model's own schema.
     let client = setup.client_for_models(&result, &models_to_test, false)?;
+    let recorder = UsageRecorder::collect("ai_test");
+    let _persist = recorder.persist_on_drop(state_path);
+    let client = client.with_usage_sink(recorder.sink());
     let mut all_results: Vec<AiTestModelResult> = Vec::new();
 
     for model in &models_to_test {
+        recorder.set_model(Some(&model.config.name));
         let assertions = rocky_ai::testgen::generate_tests(model, &result, &client)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -1804,6 +1804,10 @@ pub(crate) struct ExecutionContext<'a> {
     /// a production run, false on a shadow, branch or backfill run. See
     /// [`super::run_upstream_reads`].
     pub record_upstream_reads: bool,
+    /// The `[product.output.volume]` ranges this run checks. A model whose
+    /// range counts the rows a run adds takes a row count before its write.
+    /// `None` (tests, and paths that check no range) takes none.
+    pub product_volumes: Option<&'a super::run_volume::ProductVolumes>,
 }
 
 /// The first-run fills a governed plan recorded; see
@@ -1917,12 +1921,22 @@ pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 /// Only warns: a failure to evaluate is logged, and no verdict changes the
 /// run's exit code. Does nothing without a store or a config path (the
 /// record was not written, or there is no `rocky.toml` to read budgets from).
+///
+/// First, a store held for writing drains the AI usage spool that `rocky ai*`,
+/// the LSP and MCP append to while the writer is held (see
+/// [`rocky_core::ai_usage`]). A failed drain only warns: the spool keeps its
+/// lines, and `rocky cost` reads them anyway.
 pub(crate) fn record_product_budgets(
     state_store: Option<&StateStore>,
     config_path: Option<&Path>,
     run_id: &str,
     output: &mut RunOutput,
 ) {
+    if let Some(store) = state_store
+        && let Err(error) = store.drain_ai_usage_spool()
+    {
+        warn!(error = %error, run_id, "the AI usage spool could not be drained");
+    }
     let (Some(store), Some(config_path)) = (state_store, config_path) else {
         return;
     };
@@ -14321,6 +14335,7 @@ async fn execute_models_phase(
             shadow_config,
             model_set,
         ),
+        product_volumes: Some(&product_volumes),
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -15230,6 +15245,7 @@ async fn execute_models_phase(
                         );
                         output.materializations.push(MaterializationOutput {
                             volume: None,
+                            write_evidence: None,
                             upstream_reads: None,
                             asset_key,
                             notes: vec![],
@@ -15251,6 +15267,7 @@ async fn execute_models_phase(
                             cost_usd: None,
                             bytes_scanned: None,
                             bytes_written: Some(summary.size_bytes),
+                            egress_bytes: None,
                             // Transformation models carry no tenant
                             // dimension (no source-schema `{tenant}`).
                             tenant: None,
@@ -15501,6 +15518,9 @@ async fn execute_models_phase(
                 model.config.strategy,
                 rocky_core::models::StrategyConfig::TimeInterval { .. }
             ) {
+                // The partitions this run writes are pushed from here on; the
+                // volume check below counts exactly those.
+                let first_partition = output.materializations.len();
                 let time_interval_res = execute_time_interval_model(
                     model,
                     warehouse,
@@ -15526,6 +15546,32 @@ async fn execute_models_phase(
                         ))
                         .await;
                 }
+                // The product volume check over the partitions this run wrote,
+                // made even when another partition failed: the written
+                // partitions hold rows, and each is judged on its own. A
+                // cancelled run is `not_evaluated`. An `error` breach marks
+                // that partition `Failed` in the partition state, so
+                // `--missing` rewrites and judges it again.
+                let volume_failure = super::run_volume::check_partition_volume(
+                    &product_volumes,
+                    warehouse,
+                    dialect,
+                    model,
+                    output,
+                    first_partition,
+                    cancel,
+                )
+                .await;
+                if volume_failure.is_some()
+                    && let Some(store) = state_store
+                {
+                    super::run_volume::mark_breaching_partitions_failed(
+                        store,
+                        model_name,
+                        output,
+                        first_partition,
+                    );
+                }
                 // Containment: a partitioned model whose run reported any failed
                 // partition has already materialized its healthy partitions (and
                 // marked only the failed one `Failed` in per-partition state).
@@ -15544,6 +15590,32 @@ async fn execute_models_phase(
                         record_contained_cause(output, &mut containment, model_name, &e);
                         continue;
                     }
+                    output.fail_fast_model = Some(model_name.to_string());
+                    return Err(e);
+                }
+                // An `error` breach fails the model after its writes, as on
+                // the plain path: `model_error` fires, the success hook does
+                // not, and downstream is withheld (contained) or the run
+                // stops. The rows stay in the table. Only the breaching
+                // partitions were marked `Failed` above.
+                if let Some(e) = volume_failure {
+                    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                        let _ = reg
+                            .fire(&HookContext::model_error(
+                                run_id,
+                                pipe,
+                                model_name,
+                                &format!("{e:#}"),
+                            ))
+                            .await;
+                    }
+                    models_executed += 1;
+                    if resilience.contain_failures {
+                        record_contained_cause(output, &mut containment, model_name, &e);
+                        continue;
+                    }
+                    // The failed partition materializations are this model's
+                    // records (#2470).
                     output.fail_fast_model = Some(model_name.to_string());
                     return Err(e);
                 }
@@ -16423,7 +16495,7 @@ fn resolve_read_set_content_upstreams(
 /// Map a `MaterializationStrategy` (post-`to_plan()`) onto the string used
 /// in `MaterializationMetadata.strategy`. Mirrors the names used elsewhere
 /// in `run.rs` (replication path lines ~4024-4076).
-fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static str {
+pub(crate) fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static str {
     match strategy {
         MaterializationStrategy::FullRefresh => "full_refresh",
         MaterializationStrategy::Incremental { .. } => "incremental",
@@ -16970,6 +17042,7 @@ async fn execute_one_plain_model(
     let model_started_at = Utc::now();
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
+    let mut egress_acc: Option<u64> = None;
     let mut job_ids_acc: Vec<String> = Vec::new();
     // What this build reads from each upstream table: recorded on a
     // production run, on an adapter that can profile, for a strategy that
@@ -17019,6 +17092,9 @@ async fn execute_one_plain_model(
         rocky_ir::MaterializationStrategy::Merge { .. }
     );
     let mut skip_strategy_exec = false;
+    // This build created the target (first-run bootstrap): every row in it
+    // is this build's, which the volume check reads.
+    let mut bootstrapped = false;
     if strategy_mutates_existing_target {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
@@ -17070,6 +17146,7 @@ async fn execute_one_plain_model(
                                 accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                             bytes_written_acc =
                                 accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                            egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                             if let Some(jid) = stats.job_id {
                                 job_ids_acc.push(jid);
                             }
@@ -17105,8 +17182,44 @@ async fn execute_one_plain_model(
                 }
             }
             skip_strategy_exec = bootstrap_is_the_load;
+            bootstrapped = true;
         }
     }
+
+    // A product range on the rows this build adds needs the table's count
+    // before the write. Taken only for such a model, and only when the
+    // build appends to a table that already holds rows from earlier runs.
+    // A failed count is kept as the reason the check is not evaluated; it
+    // never fails the build.
+    let created_or_replaced = bootstrapped
+        || matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::FullRefresh
+        );
+    let declared_basis = rocky_core::product::spec::VolumeBasis::of(
+        &recipe_ir.as_ref().unwrap_or(&model_ir).materialization,
+    );
+    let rows_before = if !created_or_replaced
+        && declared_basis == Some(rocky_core::product::spec::VolumeBasis::RowsAdded)
+        && exec_ctx
+            .product_volumes
+            .is_some_and(|volumes| volumes.declares(model_name))
+    {
+        Some(
+            super::run_volume::count_rows(
+                warehouse,
+                &[
+                    model_ir.target.catalog.clone(),
+                    model_ir.target.schema.clone(),
+                    model_ir.target.table.clone(),
+                ],
+                None,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     // An incremental run against an existing target must have been planned
     // by `run_incremental::prepare` (column check, named INSERT). If that
@@ -17135,6 +17248,14 @@ async fn execute_one_plain_model(
     // same `bytes_scanned` / `bytes_written` shape that replication
     // tables already have. Skipped on a first-run bootstrap that already
     // loaded the data via CTAS (Incremental / DeleteInsert / Microbatch).
+    //
+    // The rows the warehouse reports the one strategy statement changed.
+    // A volume range reads this as the INSERT's or the MERGE's count, so it
+    // exists only when exactly one statement ran and that statement
+    // reported: summing several would count a statement that is not the
+    // write (a DROP, a CTAS, an ALTER).
+    let mut rows_reported: Option<u64> = None;
+    let mut reported_per_statement: Vec<Option<u64>> = Vec::new();
     // A full refresh on a dialect with no atomic replace (Trino) runs the
     // staged swap through its executor, which adds the probes and the
     // rollback that the plain statement list cannot (ADR-REPLACE). The swap
@@ -17184,6 +17305,7 @@ async fn execute_one_plain_model(
                     })?;
             bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
             bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+            egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
         } else {
             match warehouse
                 .overwrite_in_place(&target_ref, &model_ir.sql)
@@ -17222,6 +17344,7 @@ async fn execute_one_plain_model(
             .with_context(|| format!("model '{model_name}' failed"))?;
         bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, outcome.stats.bytes_scanned);
         bytes_written_acc = accumulate_bytes(bytes_written_acc, outcome.stats.bytes_written);
+        egress_acc = accumulate_bytes(egress_acc, outcome.stats.egress_bytes);
         if let Some(jid) = outcome.stats.job_id {
             job_ids_acc.push(jid);
         }
@@ -17247,6 +17370,7 @@ async fn execute_one_plain_model(
                 Ok(Some(stats)) => {
                     bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                     bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                    egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                     if let Some(jid) = stats.job_id {
                         job_ids_acc.push(jid);
                     }
@@ -17281,6 +17405,8 @@ async fn execute_one_plain_model(
                 Ok(stats) => {
                     bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                     bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                    reported_per_statement.push(stats.rows_affected);
+                    egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                     if let Some(jid) = stats.job_id {
                         job_ids_acc.push(jid);
                     }
@@ -17299,6 +17425,7 @@ async fn execute_one_plain_model(
                 "Dropped {existing_name} {target_ref}: model '{model_name}' now requires a {expected_name} ({drop_sql})."
             );
         }
+        rows_reported = super::run_volume::single_statement_rows(&reported_per_statement);
     }
 
     // Report the watermark an `incremental` model now stands at, read back
@@ -17376,6 +17503,11 @@ async fn execute_one_plain_model(
     let upstream_reads = reads_acc.finish(&model_ir.target, warehouse.default_catalog().as_deref());
     Ok(MaterializationOutput {
         volume: None,
+        write_evidence: Some(crate::output::WriteEvidence {
+            created_or_replaced,
+            rows_before,
+            rows_reported,
+        }),
         upstream_reads,
         asset_key,
         notes: pending_drop
@@ -17404,6 +17536,7 @@ async fn execute_one_plain_model(
         cost_usd: None,
         bytes_scanned: bytes_scanned_acc,
         bytes_written: bytes_written_acc,
+        egress_bytes: egress_acc,
         // Transformation models carry no tenant dimension (their asset
         // key is `[catalog, schema, table]`, not a source-schema parse).
         tenant: None,
@@ -17632,6 +17765,7 @@ async fn execute_snapshot_model(
 
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
+    let mut egress_acc: Option<u64> = None;
     let mut job_ids_acc: Vec<String> = Vec::new();
     for sql in &statements {
         let stats = warehouse
@@ -17640,6 +17774,7 @@ async fn execute_snapshot_model(
             .map_err(|e| anyhow::Error::from(e).context(format!("model '{model_name}' failed")))?;
         bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
         bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+        egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
         if let Some(jid) = stats.job_id {
             job_ids_acc.push(jid);
         }
@@ -17662,6 +17797,7 @@ async fn execute_snapshot_model(
     .await;
     Ok(MaterializationOutput {
         volume: None,
+        write_evidence: None,
         asset_key: vec![
             model_ir.target.catalog.clone(),
             model_ir.target.schema.clone(),
@@ -17687,6 +17823,7 @@ async fn execute_snapshot_model(
         cost_usd: None,
         bytes_scanned: bytes_scanned_acc,
         bytes_written: bytes_written_acc,
+        egress_bytes: egress_acc,
         tenant: None,
         job_ids: job_ids_acc,
         skip_internal: None,
@@ -18249,12 +18386,14 @@ async fn run_one_partition(
     let mut exec_err: Option<anyhow::Error> = None;
     let mut bytes_scanned_acc: Option<u64> = None;
     let mut bytes_written_acc: Option<u64> = None;
+    let mut egress_acc: Option<u64> = None;
     let mut job_ids_acc: Vec<String> = Vec::new();
     for stmt in &stmts {
         match warehouse.execute_statement_with_stats(stmt).await {
             Ok(stats) => {
                 bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
                 bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
                 if let Some(jid) = stats.job_id {
                     job_ids_acc.push(jid);
                 }
@@ -18338,6 +18477,7 @@ async fn run_one_partition(
         duration_ms: record.duration_ms,
         outcome: Ok(Some(MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.to_vec(),
             notes: vec![],
             attempts: Vec::new(),
@@ -18361,6 +18501,7 @@ async fn run_one_partition(
             cost_usd: None,
             bytes_scanned: bytes_scanned_acc,
             bytes_written: bytes_written_acc,
+            egress_bytes: egress_acc,
             // time_interval models carry no tenant dimension.
             tenant: None,
             job_ids: job_ids_acc,
@@ -20093,6 +20234,7 @@ async fn process_table(
         probe_rate_limited,
         materialization: MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.clone(),
             notes,
             attempts: Vec::new(),
@@ -20115,6 +20257,7 @@ async fn process_table(
             cost_usd: None,
             bytes_scanned: exec_stats.bytes_scanned,
             bytes_written: exec_stats.bytes_written,
+            egress_bytes: exec_stats.egress_bytes,
             // Tenant lifted from the discover-time schema-pattern
             // `{tenant}` component on the task. `None` for non-tenant
             // patterns; carried onto the persisted ModelExecution.
@@ -26817,6 +26960,7 @@ auto_create_schemas = true
     ) -> crate::output::MaterializationOutput {
         crate::output::MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),
@@ -26835,6 +26979,7 @@ auto_create_schemas = true
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,
@@ -27166,6 +27311,7 @@ auto_create_schemas = true
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -27191,6 +27337,7 @@ auto_create_schemas = true
         let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30827,6 +30974,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -30912,6 +31060,7 @@ email = "pii"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31081,6 +31230,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31213,6 +31363,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31295,6 +31446,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: true,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31354,6 +31506,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31516,6 +31669,7 @@ table = "orders_view"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31646,6 +31800,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31764,6 +31919,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31836,6 +31992,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -31961,6 +32118,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -32076,6 +32234,7 @@ table = "fct_daily"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -32185,6 +32344,7 @@ table = "fct_daily"
         let recorded = std::collections::BTreeSet::from(["fct_daily_orders".to_string()]);
         let ctx = |models| super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: Some(super::ReviewedFirstRunFills {
                 plan_id: "plan-x",
                 models,
@@ -32423,6 +32583,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -32547,6 +32708,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -32648,6 +32810,7 @@ table = "fct_events"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -39474,6 +39637,7 @@ backend = "local"
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -44367,6 +44531,7 @@ auto_create_schemas = true
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: None,
                 input_hash: None,
@@ -44401,6 +44566,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         state.record_run(&failed).unwrap();
 
@@ -46784,6 +46950,7 @@ auto_create_schemas = true
             upstream_freshness: Some(prior_baseline),
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some(identity.recipe_hash.clone()),
             input_hash: None,
@@ -46826,6 +46993,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -46995,6 +47163,7 @@ auto_create_schemas = true
             upstream_freshness: Some(prior_baseline),
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some(identity.recipe_hash.clone()),
             input_hash: None,
@@ -47035,6 +47204,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         store.record_run(&base_run).unwrap();
         store
@@ -47136,6 +47306,7 @@ auto_create_schemas = true
             upstream_freshness: Some(prior_baseline),
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             recipe_hash: Some(identity.recipe_hash.clone()),
             input_hash: None,
@@ -47285,6 +47456,7 @@ auto_create_schemas = true
                 upstream_freshness: Some(prior_baseline),
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: Some(identity.recipe_hash.clone()),
                 input_hash: None,
@@ -47319,6 +47491,7 @@ auto_create_schemas = true
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
+            output_volumes: Vec::new(),
         };
         store.record_run(&run).unwrap();
 
@@ -48276,6 +48449,7 @@ auto_create_schemas = true
                 upstream_freshness: Some(prior_baseline),
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: Some(identity.recipe_hash.clone()),
                 input_hash: None,
@@ -48316,6 +48490,7 @@ auto_create_schemas = true
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
+                output_volumes: Vec::new(),
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -48590,6 +48765,7 @@ auto_create_schemas = true
                 upstream_freshness: Some(prior_baseline),
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 tenant: None,
                 recipe_hash: Some(identity.recipe_hash.clone()),
                 input_hash: None,
@@ -48631,6 +48807,7 @@ auto_create_schemas = true
                     run_scope: Some(rocky_core::state::RunScope::Production),
                     queued_ms: None,
                     source_volumes: Vec::new(),
+                    output_volumes: Vec::new(),
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness
@@ -48792,6 +48969,7 @@ auto_create_schemas = true
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -48940,6 +49118,7 @@ auto_create_schemas = true
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
             record_upstream_reads: false,
+            product_volumes: None,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
             model_timings: &model_timings,
@@ -55951,6 +56130,7 @@ mod staged_swap_wiring_tests {
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            product_volumes: None,
             record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,
@@ -56154,6 +56334,7 @@ mod in_place_overwrite_wiring_tests {
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
         let exec_ctx = super::ExecutionContext {
+            product_volumes: None,
             record_upstream_reads: false,
             reviewed_first_run_fills: None,
             typed_models: &typed_models,

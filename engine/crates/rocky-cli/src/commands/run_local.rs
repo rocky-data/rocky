@@ -1841,6 +1841,7 @@ pub async fn run_snapshot(
         .await;
         output.materializations.push(MaterializationOutput {
             volume: None,
+            write_evidence: None,
             upstream_reads: None,
             attempts: Vec::new(),
             notes: vec![],
@@ -1867,6 +1868,7 @@ pub async fn run_snapshot(
             // attribution + job-id capture is a follow-up wave.
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             // snapshot models carry no tenant dimension.
             tenant: None,
             job_ids: Vec::new(),

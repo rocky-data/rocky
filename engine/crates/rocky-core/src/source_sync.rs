@@ -50,7 +50,11 @@
 //! Rocky's POST is answered, and is still running then, is counted as
 //! Rocky's: with `force = false` Fivetran starts no second sync, so the POST
 //! joins the running one, and Rocky cannot tell the two apart. That window can
-//! last minutes when earlier connectors hit 429 backoff.
+//! last minutes when earlier connectors hit 429 backoff. Airbyte starts no
+//! job for a connection that already runs one and answers 409, so on Airbyte
+//! that case takes the busy path below instead: the running sync is waited
+//! out and not counted. If Airbyte ever answered 2xx there, the window would
+//! be the same as on Fivetran.
 //!
 //! A request whose answer is unknown (a timeout, a 5xx) is treated as sent:
 //! the row stays `triggered`, and the wait goes on like it does for a slow

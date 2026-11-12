@@ -721,29 +721,7 @@ pub fn generate_transformation_sql_with_warehouse(
             // The runtime is responsible for populating `window` before calling
             // us; static planning leaves it None.
             let window = window.as_ref().ok_or(SqlGenError::MissingPartitionWindow)?;
-
-            // SECURITY: time_column comes from user TOML — validate as a SQL
-            // identifier before interpolating into the WHERE clause. The
-            // compiler also runs this check at validate_time_interval_models
-            // time (E023), but defense in depth: re-validate at the planning
-            // boundary so a buggy or skipped compile pass can't get past us.
-            // Per repo CLAUDE.md: never use format!() with untrusted input.
-            validation::validate_identifier(time_column).map_err(|e| {
-                SqlGenError::UnsafeFragment {
-                    value: time_column.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
-
-            // Build the partition filter. Timestamps are formatted by chrono
-            // from a fixed format string — never user input — into the
-            // dialect's literal (`'YYYY-MM-DD HH:MM:SS'` unless overridden).
-            let filter = format!(
-                "{tc} >= {start} AND {tc} < {end}",
-                tc = time_column,
-                start = dialect.timestamp_literal(&window.start),
-                end = dialect.timestamp_literal(&window.end),
-            );
+            let filter = time_interval_partition_filter(time_column, window, dialect)?;
 
             let substituted = substitute_partition_placeholders_for(&model_ir.sql, window, &|ts| {
                 dialect.timestamp_literal(ts)
@@ -1373,6 +1351,43 @@ fn ephemeral_refused(model_ir: &ModelIr) -> SqlGenError {
          a CTE into each model that reads it, so there is nothing to build (E038 when selected \
          directly)",
         model_ir.name
+    ))
+}
+
+/// The predicate that selects one `time_interval` partition's rows:
+/// `<time_column> >= <start> AND <time_column> < <end>`.
+///
+/// The partition overwrite deletes (or replaces) exactly these rows, and
+/// `rocky run`'s volume check counts the written partitions with the same
+/// predicate, so the two can never disagree about a partition's rows.
+///
+/// # Errors
+///
+/// [`SqlGenError::UnsafeFragment`] when `time_column` is not a plain SQL
+/// identifier.
+pub fn time_interval_partition_filter(
+    time_column: &str,
+    window: &PartitionWindow,
+    dialect: &dyn SqlDialect,
+) -> Result<String, SqlGenError> {
+    // SECURITY: time_column comes from user TOML — validate as a SQL
+    // identifier before interpolating into the WHERE clause. The compiler
+    // also runs this check at validate_time_interval_models time (E023), but
+    // defense in depth: re-validate at the planning boundary so a buggy or
+    // skipped compile pass can't get past us. Per repo CLAUDE.md: never use
+    // format!() with untrusted input.
+    validation::validate_identifier(time_column).map_err(|e| SqlGenError::UnsafeFragment {
+        value: time_column.to_string(),
+        reason: e.to_string(),
+    })?;
+    // Timestamps are formatted by chrono from a fixed format string — never
+    // user input — into the dialect's literal (`'YYYY-MM-DD HH:MM:SS'` unless
+    // overridden).
+    Ok(format!(
+        "{tc} >= {start} AND {tc} < {end}",
+        tc = time_column,
+        start = dialect.timestamp_literal(&window.start),
+        end = dialect.timestamp_literal(&window.end),
     ))
 }
 

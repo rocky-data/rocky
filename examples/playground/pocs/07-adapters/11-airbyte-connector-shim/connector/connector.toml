@@ -1,0 +1,14 @@
+# Manifest for the Airbyte connector shim.
+# The source's credentials are declared in rocky.toml (`secrets`), not here:
+# the manifest refuses unknown keys.
+protocol_version     = 0
+name                 = "airbyte-shim"
+command              = ["./main.py"]
+state_schema_version = 1
+# The shim never pulls an image, so it calls no host itself. The faker
+# source needs none. A real source image calls its own API hosts: list them
+# here, as a statement of intent.
+egress_hosts         = []
+
+[limits]
+wall_time_secs = 600

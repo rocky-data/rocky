@@ -1393,6 +1393,12 @@ pub struct MaterializationOutput {
     /// release can populate it without a schema break.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
+    /// Bytes the statements moved out of the warehouse's region, summed
+    /// over the statements that reported it. No adapter reports it yet, so
+    /// it is absent today. `bytes_scanned` and `bytes_written` are not
+    /// egress. Carried onto the run record for `rocky cost --month`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_bytes: Option<u64>,
     /// Tenant this materialization is attributed to, taken from the
     /// discover-time schema-pattern `{tenant}` component. Present only
     /// for replication pipelines whose schema pattern declares a
@@ -1514,9 +1520,20 @@ pub struct MaterializationOutput {
     pub stored_bytes: Option<rocky_core::state::StoredBytes>,
     /// The product volume check on this output, when a product declares
     /// `[product.output.volume]` for the model and this was a production
-    /// build. Absent otherwise.
+    /// build. Absent otherwise. A `time_interval` model carries one on each
+    /// partition this run wrote, judging that partition's rows. That includes
+    /// partitions written in a run where another partition failed to run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<VolumeCheckOutput>,
+    /// State-internal facts about this build's write that the volume check
+    /// needs (the count before the write, the rows the warehouse reported).
+    /// Set by the plain transformation path; `None` everywhere else.
+    ///
+    /// Never serialized and never part of the JSON schema — same pattern as
+    /// [`Self::stored_bytes`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub write_evidence: Option<WriteEvidence>,
     /// What this build read from each upstream table, measured from the
     /// DuckDB query profile. Each read carries the rows scanned, the columns
     /// read and an estimated byte count (`est_bytes`, fixed-width columns
@@ -1532,19 +1549,47 @@ pub struct MaterializationOutput {
     pub upstream_reads: Option<rocky_core::state::UpstreamReads>,
 }
 
+/// What one build's write left behind for the product volume check, taken
+/// by the plain transformation path. State-internal: never serialized.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteEvidence {
+    /// The build created the table or replaced all of it (a first-run
+    /// bootstrap, `--full-refresh`, a full-refresh strategy), so every row
+    /// in it is this build's.
+    pub created_or_replaced: bool,
+    /// `SELECT COUNT(*)` on the table right before the write, taken only
+    /// when a `rows_added` volume needs it. `Err` is why the count failed.
+    pub rows_before: Option<Result<u64, String>>,
+    /// The rows the warehouse reported the build's one strategy statement
+    /// changed (the INSERT or the MERGE). `None` when no statement ran, more
+    /// than one did, or the one did not report.
+    pub rows_reported: Option<u64>,
+}
+
 /// The row count `rocky run` took on a product output after its build,
 /// judged against the product's `[product.output.volume]`.
 ///
-/// The count is the table's total rows (`SELECT COUNT(*)`), not the rows
-/// this load wrote. Only a full-refresh output is counted.
+/// What is counted depends on the output model's strategy; `basis` says
+/// which (`total_rows`, `rows_added`, `rows_touched`, `partition_rows`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VolumeCheckOutput {
     /// The product that declares the range.
     pub product: String,
     /// The Rocky model counted: the product's output model.
     pub model: String,
-    /// The table's total rows after the build. Absent when no count was
-    /// taken or it could not be read (`verdict = "not_evaluated"`).
+    /// What `row_count` counts: `total_rows` (the whole table, for a
+    /// full-refresh output), `rows_added` (the rows this run appended,
+    /// for an incremental output), `rows_touched` (the rows this run's
+    /// MERGE inserted or updated, matched rows included even when their
+    /// values did not change, for a merge output or an incremental one with
+    /// a `unique_key`), or `partition_rows` (the rows in this partition, for
+    /// a time-interval output, which is judged one partition at a time).
+    /// Absent when
+    /// the strategy is not counted (`volume-strategy-unsupported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<rocky_core::product::spec::VolumeBasis>,
+    /// The count judged, on `basis`. Absent when no count was taken or it
+    /// could not be read (`verdict = "not_evaluated"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count: Option<u64>,
     /// The declared `min_rows` (inclusive), when set.
@@ -1597,6 +1642,25 @@ pub struct SourceVolumeCheckOutput {
     /// output model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+impl VolumeCheckOutput {
+    /// The persisted twin of this check, for the run record. `partition` is
+    /// the key of the partition it judged, for a `time_interval` model.
+    pub fn to_record(&self, partition: Option<String>) -> rocky_core::state::OutputVolumeRecord {
+        rocky_core::state::OutputVolumeRecord {
+            product: self.product.clone(),
+            model: self.model.clone(),
+            partition,
+            basis: self.basis,
+            row_count: self.row_count,
+            min_rows: self.min_rows,
+            max_rows: self.max_rows,
+            severity: self.severity,
+            verdict: self.verdict,
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 impl SourceVolumeCheckOutput {
@@ -6794,6 +6858,27 @@ impl RunOutput {
             tracing::warn!("{summary}");
         }
 
+        // Models an `error` volume breach marks failed. Each execution is
+        // failed by its own check, so a time-interval model fails only the
+        // partitions that breached; the model's `errors` entry is not
+        // recorded again for any of them (see below).
+        let volume_failed: std::collections::BTreeSet<String> = self
+            .materializations
+            .iter()
+            .filter_map(|mat| mat.volume.as_ref())
+            .filter(|volume| volume.fails_the_model())
+            .map(|volume| volume.model.clone())
+            .collect();
+        let output_volumes: Vec<rocky_core::state::OutputVolumeRecord> = self
+            .materializations
+            .iter()
+            .filter_map(|mat| {
+                mat.volume
+                    .as_ref()
+                    .map(|volume| volume.to_record(mat.partition.as_ref().map(|p| p.key.clone())))
+            })
+            .collect();
+
         for mat in &self.materializations {
             let duration_ms = mat.duration_ms;
             let model_started = mat.started_at;
@@ -6846,6 +6931,7 @@ impl RunOutput {
                     .or_else(|| mat.consumed_column_baseline.clone()),
                 bytes_scanned: mat.bytes_scanned,
                 bytes_written: mat.bytes_written,
+                egress_bytes: mat.egress_bytes,
                 tenant: mat.tenant.clone(),
                 // Recipe identity. `recipe_hash` / `env_hash` / scheme come
                 // from the per-model carrier stamped at the execution site;
@@ -6881,15 +6967,9 @@ impl RunOutput {
             });
         }
 
-        // Models whose materialization above already records the volume
-        // failure. Their `errors` entry would be a second execution.
-        let volume_failed: std::collections::BTreeSet<&str> = self
-            .materializations
-            .iter()
-            .filter_map(|mat| mat.volume.as_ref())
-            .filter(|volume| volume.fails_the_model())
-            .map(|volume| volume.model.as_str())
-            .collect();
+        // Models whose materializations above already record the volume
+        // failure (`volume_failed`). Their `errors` entry would be a
+        // second execution.
 
         for (idx, err) in self.errors.iter().enumerate() {
             // A run that stopped at its first failure reports one entry under
@@ -6903,7 +6983,7 @@ impl RunOutput {
                     .cloned()
                     .unwrap_or_else(|| "<unknown>".to_string())
             });
-            if volume_failed.contains(model_name.as_str()) {
+            if volume_failed.contains(&model_name) {
                 continue;
             }
             // The retry loop's measurement for this model, when it ran
@@ -6928,6 +7008,7 @@ impl RunOutput {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                egress_bytes: None,
                 // Errors carry only the asset key, not the parsed schema
                 // components, so the tenant dimension is unavailable here.
                 tenant: None,
@@ -7015,6 +7096,7 @@ impl RunOutput {
                 .iter()
                 .map(SourceVolumeCheckOutput::to_record)
                 .collect(),
+            output_volumes,
         }
     }
 
@@ -8806,6 +8888,7 @@ mod cost_finalize_tests {
     fn mat(asset_key: &[&str], duration_ms: u64) -> MaterializationOutput {
         MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),
@@ -8824,6 +8907,7 @@ mod cost_finalize_tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,
@@ -9107,6 +9191,7 @@ mod run_record_tests {
     ) -> MaterializationOutput {
         MaterializationOutput {
             volume: None,
+            write_evidence: None,
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
             notes: vec![],
             attempts: Vec::new(),
@@ -9125,6 +9210,7 @@ mod run_record_tests {
             cost_usd: None,
             bytes_scanned: None,
             bytes_written: None,
+            egress_bytes: None,
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,
@@ -12708,6 +12794,15 @@ pub enum CostUnit {
     // Byte-hours of stored data, measured as allocated storage blocks (an
     // estimate).
     StorageByteHoursAllocatedBlocks,
+    // Bytes moved out of the warehouse's region, as an adapter reported
+    // them. No adapter reports it yet, so this unit does not appear today.
+    EgressBytes,
+    // AI input tokens recorded in this state store, as the provider
+    // reported them.
+    AiInputTokens,
+    // AI output tokens recorded in this state store, as the provider
+    // reported them.
+    AiOutputTokens,
 }
 
 impl From<rocky_core::cost_split::Unit> for CostUnit {
@@ -12717,6 +12812,9 @@ impl From<rocky_core::cost_split::Unit> for CostUnit {
             Unit::ComputeMs => Self::ComputeMs,
             Unit::StorageDataFiles => Self::StorageByteHoursDataFiles,
             Unit::StorageAllocatedBlocks => Self::StorageByteHoursAllocatedBlocks,
+            Unit::EgressBytes => Self::EgressBytes,
+            Unit::AiInputTokens => Self::AiInputTokens,
+            Unit::AiOutputTokens => Self::AiOutputTokens,
         }
     }
 }
@@ -12753,7 +12851,8 @@ impl From<rocky_core::cost_split::SplitBasis> for CostSplitBasis {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostAmount {
     pub unit: CostUnit,
-    /// Whole units. Milliseconds, or byte-hours rounded down per interval.
+    /// Whole units: milliseconds, byte-hours rounded down per interval,
+    /// bytes, or tokens.
     pub amount: u64,
 }
 
@@ -12810,8 +12909,11 @@ pub struct ProductMonthCost {
     /// What the product is charged: `kept` plus `allocated_upstream`.
     pub charged: Vec<CostAmount>,
     /// `charged` in USD, priced only from prices set in `[cost]`. Present
-    /// only when `money_status` is `priced`. It covers compute and storage;
-    /// egress and AI tokens are not measured and are not in it.
+    /// only when `money_status` is `priced`. It covers compute, storage,
+    /// egress when an adapter reported it this month, and AI tokens when
+    /// this state store recorded calls this month and recorded the whole
+    /// month. A figure whose part is `not_measured` or (for AI tokens)
+    /// `partial` is not in it.
     pub money: Option<f64>,
     /// Why `money` is or is not present.
     pub money_status: MoneyStatus,
@@ -12889,7 +12991,9 @@ pub struct ProductBudgetCheck {
     pub actual: Option<f64>,
     /// `breached` when `actual` is greater than `limit`. Equal is in budget.
     pub verdict: ProductBudgetVerdict,
-    /// Why the limit is `not_evaluated`.
+    /// Why the limit is `not_evaluated`. On a `max_usd` limit that is
+    /// `breached` from the priced figures alone (`actual` is then that
+    /// floor), what the figure leaves out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -12962,10 +13066,13 @@ pub enum MoneyStatus {
     // A measured figure has no price in `[cost]`. Rocky's shipped default
     // prices are never used here.
     NoPrice,
-    // Rocky does not measure this figure. It is unknown, not $0.
+    // Rocky did not measure this figure this month. It is unknown, not $0.
     NotMeasured,
     // Run history does not cover the whole month, so the amounts are
-    // partial and no money is shown for them.
+    // partial and no money is shown for them. On the `ai_tokens` part
+    // alone: the state store started recording AI calls after the month
+    // began, so calls before that are unknown; the part is left out of
+    // the total.
     Partial,
 }
 
@@ -12980,9 +13087,16 @@ pub enum MoneyFigure {
     // `storage_byte_hours_allocated_blocks`, priced by
     // `storage_cost_per_gb_month`.
     StorageAllocatedBlocks,
-    // Data moved across regions. Not measured.
+    // `egress_bytes`, priced by `cross_region_transfer_cost_per_gb`
+    // (1 GB = 2^30 bytes). `not_measured` when no production execution in
+    // the month reported egress, which is every month today: no adapter
+    // reports it yet.
     Egress,
-    // AI tokens. Not measured.
+    // `ai_input_tokens` plus `ai_output_tokens`, priced by
+    // `ai_cost_per_million_tokens`, one blended price for input and output.
+    // Covers the calls recorded in this state store only: developer spend,
+    // with no production scope. `not_measured` when the month has no
+    // recorded call with token counts.
     AiTokens,
 }
 
@@ -13012,6 +13126,22 @@ pub struct CostNotMeasured {
     /// Rocky keeps or before the reader began. The same name can also be
     /// charged for later reads. The cost of an unlinked read is not split.
     pub unattributed_read_tables: u64,
+    /// Production executions this month that reported no egress, counted
+    /// only when at least one execution did report it (then the egress
+    /// figure is a floor). Zero when none reported: egress is then not
+    /// measured at all.
+    #[serde(default)]
+    pub egress_unreported_executions: u64,
+    /// AI calls this month whose response did not report both token
+    /// counts. They add nothing to the AI amounts.
+    #[serde(default)]
+    pub ai_calls_without_usage: u64,
+    /// AI usage records the state store could not read: spool lines that did
+    /// not parse (dropped when the spool was drained, or skipped now) and
+    /// table rows it could not decode. Their tokens are in no AI amount, so
+    /// the AI figure is a floor when this is above zero.
+    #[serde(default)]
+    pub ai_records_dropped: u64,
 }
 
 /// `rocky cost --month YYYY-MM --by product`: one month of production cost,
@@ -13019,8 +13149,10 @@ pub struct CostNotMeasured {
 /// `[cost]` sets a price.
 ///
 /// For every unit, `sum(charged) + unallocated` equals `measured_total`,
-/// exactly. Shadow and branch spend (`shadow_branch`) and `not_measured`
-/// sit outside that equation. Money is priced from each figure on its own,
+/// exactly, AI tokens included. Shadow and branch spend (`shadow_branch`)
+/// and `not_measured` sit outside that equation. An AI call about a model a
+/// product owns is charged to that product; every other call is
+/// `unallocated`. Money is priced from each figure on its own,
 /// so the money figures are floating point and are not claimed to add up
 /// to the cent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -13048,7 +13180,8 @@ pub struct ProductMonthCostOutput {
     pub products: Vec<ProductMonthCost>,
     /// Cost of tables no product owns that no measured reader took.
     pub unallocated: Vec<CostAmount>,
-    /// Shadow and branch compute. Real spend, but not production.
+    /// Shadow and branch compute, and egress where reported. Real spend,
+    /// but not production.
     pub shadow_branch: Vec<CostAmount>,
     /// Everything measured in production this month.
     pub measured_total: Vec<CostAmount>,

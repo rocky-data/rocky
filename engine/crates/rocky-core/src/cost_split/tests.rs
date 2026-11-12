@@ -35,6 +35,7 @@ fn exec(model: &str, started: DateTime<Utc>, ms: u64) -> ModelExecution {
         upstream_freshness: None,
         bytes_scanned: None,
         bytes_written: None,
+        egress_bytes: None,
         tenant: None,
         recipe_hash: None,
         input_hash: None,
@@ -133,6 +134,7 @@ fn run(
         run_scope: scope,
         queued_ms: None,
         source_volumes: Vec::new(),
+        output_volumes: Vec::new(),
     }
 }
 
@@ -244,6 +246,7 @@ fn input<'a>(
         owners,
         declared_children: children,
         default_catalog: None,
+        ai_usage: &[],
     }
 }
 
@@ -303,7 +306,9 @@ fn assert_f1(split: &MonthSplit) {
         NotMeasured {
             failed_executions: 1,
             storage_unknown_tables: 0,
-            unattributed_read_tables: 0
+            unattributed_read_tables: 0,
+            egress_unreported_executions: 0,
+            ai_calls_without_usage: 0,
         }
     );
     assert!(split.invariant_violations().is_empty());
@@ -973,6 +978,7 @@ struct Case {
     carry: Vec<ModelExecution>,
     owners: BTreeMap<String, String>,
     children: BTreeMap<String, BTreeSet<String>>,
+    ai_usage: Vec<AiUsageRecord>,
 }
 
 fn random_execution(
@@ -994,6 +1000,9 @@ fn random_execution(
     if rng.chance(4, 1) {
         let (first, second) = (rng.below(50_000), rng.below(50_000));
         e = attempts(e, &[first, second]);
+    }
+    if rng.chance(3, 1) {
+        e.egress_bytes = Some(rng.below(5_000_000_000));
     }
     if rng.chance(3, 2) {
         let basis = rng.basis();
@@ -1077,11 +1086,34 @@ fn random_case(seed: u64) -> Case {
         }
         runs.push(run(&format!("run-{r}"), start, scope, execs));
     }
+    let mut ai_usage = Vec::new();
+    for c in 0..rng.below(12) {
+        let at =
+            utc(2026, 9, 28, 0, 0, 0) + Duration::hours(i64::try_from(rng.below(36 * 24)).unwrap());
+        // About a model (owned or not), about an unknown name, or about none.
+        let model = match rng.below(4) {
+            0 => None,
+            1 => Some("not_a_model".to_string()),
+            _ => Some(name(usize::try_from(rng.below(models as u64)).unwrap())),
+        };
+        let tokens = |rng: &mut Rng| (!rng.chance(6, 1)).then(|| rng.below(2_000_000));
+        let (input_tokens, output_tokens) = (tokens(&mut rng), tokens(&mut rng));
+        ai_usage.push(AiUsageRecord {
+            id: format!("call-{c}"),
+            at,
+            command: "ai".to_string(),
+            model,
+            llm_model: "m".to_string(),
+            input_tokens,
+            output_tokens,
+        });
+    }
     Case {
         runs,
         carry,
         owners,
         children,
+        ai_usage,
     }
 }
 
@@ -1090,6 +1122,8 @@ fn the_invariant_holds_on_seeded_random_graphs() {
     let window = october();
     let mut with_unallocated = 0;
     let mut with_allocation = 0;
+    let mut with_egress = 0;
+    let mut with_ai = 0;
     for seed in 0..600u64 {
         let case = random_case(seed);
         let mut rng = Rng(seed ^ 0xABCD);
@@ -1103,6 +1137,7 @@ fn the_invariant_holds_on_seeded_random_graphs() {
             owners: &case.owners,
             declared_children: &case.children,
             default_catalog: None,
+            ai_usage: &case.ai_usage,
         });
         assert!(
             split.invariant_violations().is_empty(),
@@ -1114,6 +1149,28 @@ fn the_invariant_holds_on_seeded_random_graphs() {
             independent_compute_total(&case.runs, window),
             "seed {seed}: compute total"
         );
+        assert_eq!(
+            amount(&split.measured_total, Unit::EgressBytes),
+            independent_egress_total(&case.runs, window),
+            "seed {seed}: egress total"
+        );
+        let (tokens_in, tokens_out) = independent_ai_totals(&case.ai_usage, window, as_of);
+        assert_eq!(
+            amount(&split.measured_total, Unit::AiInputTokens),
+            tokens_in,
+            "seed {seed}: AI input total"
+        );
+        assert_eq!(
+            amount(&split.measured_total, Unit::AiOutputTokens),
+            tokens_out,
+            "seed {seed}: AI output total"
+        );
+        if amount(&split.measured_total, Unit::EgressBytes) > 0 {
+            with_egress += 1;
+        }
+        if tokens_in > 0 {
+            with_ai += 1;
+        }
         if Unit::ALL
             .iter()
             .any(|u| split.unallocated.get(u).is_some_and(|v| *v > 0))
@@ -1131,6 +1188,42 @@ fn the_invariant_holds_on_seeded_random_graphs() {
     // The generator must exercise the split, not only the fallbacks.
     assert!(with_allocation > 50, "{with_allocation}");
     assert!(with_unallocated > 50, "{with_unallocated}");
+    assert!(with_egress > 50, "{with_egress}");
+    assert!(with_ai > 50, "{with_ai}");
+}
+
+fn amount(amounts: &Amounts, unit: Unit) -> u128 {
+    amounts.get(&unit).copied().unwrap_or(0)
+}
+
+/// Egress every production execution in the month reported, summed with no
+/// reference to the split.
+fn independent_egress_total(runs: &[RunRecord], window: MonthWindow) -> u128 {
+    runs.iter()
+        .filter(|r| r.counts_as_production(UnrecordedScope::Count))
+        .flat_map(|r| &r.models_executed)
+        .filter(|e| window.contains(e.started_at))
+        .filter_map(|e| e.egress_bytes)
+        .map(u128::from)
+        .sum()
+}
+
+fn independent_ai_totals(
+    calls: &[AiUsageRecord],
+    window: MonthWindow,
+    as_of: DateTime<Utc>,
+) -> (u128, u128) {
+    let mut totals = (0, 0);
+    for call in calls {
+        if call.at < window.start || call.at >= window.end || call.at > as_of {
+            continue;
+        }
+        if let (Some(i), Some(o)) = (call.input_tokens, call.output_tokens) {
+            totals.0 += u128::from(i);
+            totals.1 += u128::from(o);
+        }
+    }
+    totals
 }
 
 #[test]
@@ -1687,6 +1780,7 @@ fn plan_lookup_agrees_with_the_linear_scans() {
                     finished_at: start + Duration::minutes(minutes) + Duration::seconds(1),
                     in_month: !rng.chance(8, 1),
                     compute_ms: 1,
+                    egress: None,
                     measured: None,
                     reads,
                 });
@@ -1747,4 +1841,262 @@ fn plan_lookup_agrees_with_the_linear_scans() {
         unmeasured_seen > 50 && unmeasured_seen + 50 < checked,
         "{unmeasured_seen} of {checked}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AI tokens and egress
+// ---------------------------------------------------------------------------
+
+fn call(
+    id: &str,
+    at: DateTime<Utc>,
+    model: Option<&str>,
+    tokens: Option<(u64, u64)>,
+) -> AiUsageRecord {
+    AiUsageRecord {
+        id: id.to_string(),
+        at,
+        command: "ai_explain".to_string(),
+        model: model.map(str::to_string),
+        llm_model: "claude".to_string(),
+        input_tokens: tokens.map(|t| t.0),
+        output_tokens: tokens.map(|t| t.1),
+    }
+}
+
+#[test]
+fn an_ai_call_about_an_owned_model_is_charged_to_its_product() {
+    let (o, c) = (owners(), BTreeMap::new());
+    let calls = [call("1", oct(3, 0, 0), Some("fct_orders"), Some((100, 7)))];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, after_october())
+    });
+    let a = &split.products["A"];
+    assert_eq!(amount(&a.kept, Unit::AiInputTokens), 100);
+    assert_eq!(amount(&a.kept, Unit::AiOutputTokens), 7);
+    assert_eq!(amount(&a.built, Unit::AiInputTokens), 100, "built memo");
+    assert_eq!(a.charged(Unit::AiInputTokens), 100);
+    assert!(a.allocated_upstream.is_empty(), "AI calls are never split");
+    assert!(split.unallocated.is_empty());
+    assert_eq!(amount(&split.measured_total, Unit::AiInputTokens), 100);
+    assert_eq!(amount(&split.measured_total, Unit::AiOutputTokens), 7);
+    assert!(split.invariant_violations().is_empty());
+}
+
+#[test]
+fn an_ai_call_about_no_owned_model_is_unallocated() {
+    let (o, c) = (owners(), BTreeMap::new());
+    let calls = [
+        call("1", oct(3, 0, 0), Some("stg_orders"), Some((10, 1))),
+        call("2", oct(4, 0, 0), None, Some((20, 2))),
+    ];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, after_october())
+    });
+    assert_eq!(amount(&split.unallocated, Unit::AiInputTokens), 30);
+    assert_eq!(amount(&split.unallocated, Unit::AiOutputTokens), 3);
+    for product in ["A", "B", "C"] {
+        assert_eq!(split.products[product].charged(Unit::AiInputTokens), 0);
+    }
+    assert!(split.invariant_violations().is_empty());
+}
+
+/// Mutation: drop the `let ... else` and a call missing a count would be
+/// counted as zero tokens without being flagged.
+#[test]
+fn an_ai_call_without_both_counts_adds_nothing_and_is_counted() {
+    let (o, c) = (owners(), BTreeMap::new());
+    let mut half = call("1", oct(3, 0, 0), Some("fct_orders"), Some((100, 7)));
+    half.output_tokens = None;
+    let calls = [half, call("2", oct(3, 0, 0), Some("fct_orders"), None)];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, after_october())
+    });
+    assert_eq!(split.not_measured.ai_calls_without_usage, 2);
+    assert_eq!(amount(&split.measured_total, Unit::AiInputTokens), 0);
+    assert_eq!(split.products["A"].charged(Unit::AiInputTokens), 0);
+}
+
+/// Mutation: drop the window check and September's call lands in October.
+#[test]
+fn ai_calls_outside_the_month_or_after_as_of_do_not_count() {
+    let (o, c) = (owners(), BTreeMap::new());
+    let calls = [
+        call(
+            "sep",
+            utc(2026, 9, 30, 23, 59, 59),
+            Some("fct_orders"),
+            Some((1, 1)),
+        ),
+        call(
+            "nov",
+            utc(2026, 11, 1, 0, 0, 0),
+            Some("fct_orders"),
+            Some((2, 2)),
+        ),
+        call("late", oct(20, 0, 0), Some("fct_orders"), Some((4, 4))),
+        call("in", oct(1, 0, 0), Some("fct_orders"), Some((8, 8))),
+    ];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, oct(10, 0, 0))
+    });
+    assert_eq!(amount(&split.measured_total, Unit::AiInputTokens), 8);
+    assert_eq!(split.not_measured.ai_calls_without_usage, 0);
+}
+
+#[test]
+fn ai_units_are_reported_on_their_own() {
+    assert_eq!(Unit::AiInputTokens.as_str(), "ai_input_tokens");
+    assert_eq!(Unit::AiOutputTokens.as_str(), "ai_output_tokens");
+    assert_eq!(Unit::EgressBytes.as_str(), "egress_bytes");
+    assert_eq!(
+        owned_build_policy(Unit::EgressBytes),
+        OwnedBuildPolicy::ReadersPay,
+        "egress is a build cost, like model time"
+    );
+}
+
+fn egress(mut e: ModelExecution, bytes: u64) -> ModelExecution {
+    e.egress_bytes = Some(bytes);
+    e
+}
+
+/// Egress follows the same split as model time: `stg_orders`' egress goes to
+/// A and C by what each read (3:1), and `fct_orders`' to B, its reader.
+#[test]
+fn egress_is_split_across_readers_like_compute() {
+    let runs = vec![run(
+        "r1",
+        oct(5, 2, 0),
+        production(),
+        vec![
+            egress(exec("stg_orders", oct(5, 2, 0), 60_000), 4_000),
+            egress(
+                reads(
+                    exec("fct_orders", oct(5, 2, 2), 50_000),
+                    &[("stg_orders", Some(300_000_000), 3_000)],
+                ),
+                1_000,
+            ),
+            reads(
+                exec("fct_refunds", oct(5, 2, 2), 20_000),
+                &[("stg_orders", Some(100_000_000), 1_000)],
+            ),
+            reads(
+                exec("fct_ltv", oct(5, 2, 4), 10_000),
+                &[("fct_orders", Some(50_000_000), 500)],
+            ),
+        ],
+    )];
+    let (o, c) = (owners(), children());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    let egress_of = |product: &str| split.products[product].charged(Unit::EgressBytes);
+    // A pays 3/4 of stg_orders' 4,000 bytes and C 1/4. fct_orders' own
+    // 1,000 bytes go to its only reader, B.
+    assert_eq!(egress_of("A"), 3_000);
+    assert_eq!(egress_of("C"), 1_000);
+    assert_eq!(egress_of("B"), 1_000);
+    assert_eq!(amount(&split.measured_total, Unit::EgressBytes), 5_000);
+    assert!(split.invariant_violations().is_empty());
+    // Two of the four executions reported no egress.
+    assert_eq!(split.not_measured.egress_unreported_executions, 2);
+    // The same split as model time, unit by unit.
+    let shares = |unit: Unit| -> Vec<(String, u128)> {
+        split
+            .products
+            .iter()
+            .flat_map(|(p, row)| {
+                row.allocated_upstream
+                    .iter()
+                    .filter(move |a| a.unit == unit)
+                    .map(move |a| (format!("{p}:{}", a.table), a.of_total))
+            })
+            .collect()
+    };
+    let compute: Vec<String> = shares(Unit::ComputeMs).into_iter().map(|s| s.0).collect();
+    let bytes: Vec<String> = shares(Unit::EgressBytes).into_iter().map(|s| s.0).collect();
+    assert_eq!(compute, bytes);
+}
+
+/// Mutation: count unreported executions with no execution reporting, and
+/// every month would claim a count for a figure it does not measure.
+#[test]
+fn with_no_execution_reporting_egress_it_is_absent_and_nothing_is_counted() {
+    let runs = f1_runs();
+    let (o, c) = (owners(), children());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert!(!split.measured_total.contains_key(&Unit::EgressBytes));
+    assert_eq!(split.not_measured.egress_unreported_executions, 0);
+}
+
+/// Shadow egress sits with shadow compute, outside the invariant.
+#[test]
+fn shadow_egress_is_outside_the_production_total() {
+    let runs = vec![run(
+        "s",
+        oct(5, 0, 0),
+        Some(RunScope::Shadow { schema: None }),
+        vec![egress(exec("fct_orders", oct(5, 0, 0), 10), 77)],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(amount(&split.shadow_branch, Unit::EgressBytes), 77);
+    assert!(!split.measured_total.contains_key(&Unit::EgressBytes));
+}
+
+/// Mutation: set the flag from the sums and a reported zero reads as not
+/// measured.
+#[test]
+fn a_reported_zero_of_egress_is_measured() {
+    let runs = vec![run(
+        "r",
+        oct(5, 0, 0),
+        production(),
+        vec![egress(exec("fct_orders", oct(5, 0, 0), 10), 0)],
+    )];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert!(split.egress_reported);
+    assert!(!split.measured_total.contains_key(&Unit::EgressBytes));
+    let none = split_month(&input(&[], &[], &o, &c, after_october()));
+    assert!(!none.egress_reported);
+}
+
+/// Mutation: set the flag from the sums and a call with zero tokens reads as
+/// not measured.
+#[test]
+fn an_ai_call_with_zero_tokens_is_measured() {
+    let (o, c) = (owners(), BTreeMap::new());
+    let calls = [call("1", oct(3, 0, 0), Some("fct_orders"), Some((0, 0)))];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, after_october())
+    });
+    assert!(split.ai_measured);
+    let calls = [call("2", oct(3, 0, 0), Some("fct_orders"), None)];
+    let split = split_month(&SplitInput {
+        ai_usage: &calls,
+        ..input(&[], &[], &o, &c, after_october())
+    });
+    assert!(!split.ai_measured, "a call with no counts measured nothing");
+}
+
+/// Mutation: `continue` before the egress is added and a failed execution
+/// with no target loses the egress it reported.
+#[test]
+fn egress_of_a_failed_execution_with_no_target_is_unallocated() {
+    let mut f = failed("fct_orders", oct(5, 0, 0));
+    f.egress_bytes = Some(900);
+    let runs = vec![run("r", oct(5, 0, 0), production(), vec![f])];
+    let (o, c) = (owners(), BTreeMap::new());
+    let split = split_month(&input(&runs, &[], &o, &c, after_october()));
+    assert_eq!(amount(&split.unallocated, Unit::EgressBytes), 900);
+    assert_eq!(amount(&split.measured_total, Unit::EgressBytes), 900);
+    assert!(split.egress_reported);
+    assert_eq!(split.not_measured.egress_unreported_executions, 0);
+    assert!(split.invariant_violations().is_empty());
 }
