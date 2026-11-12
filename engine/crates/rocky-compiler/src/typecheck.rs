@@ -2820,6 +2820,31 @@ fn sum_keeps_decimal_scale(target: &OperandTarget) -> bool {
         })
 }
 
+/// The type of `SUM` over a `FLOAT` column on the warehouses of `target`:
+/// the one type they all give, else `Unknown`.
+///
+/// DuckDB (probed with `typeof` on the bundled DuckDB) and Databricks/Spark
+/// sum a `FLOAT` into a `DOUBLE`; PostgreSQL and Trino keep `REAL`. The other
+/// warehouses are not ruled, so they give `Unknown`. Keeping the input's
+/// `Float32` everywhere failed a correct `Float64` contract on DuckDB with
+/// `E011`.
+fn sum_of_float_type(target: &OperandTarget) -> RockyType {
+    let per_dialect = |dialect: &OperandDialect| match dialect {
+        OperandDialect::DuckDb | OperandDialect::Databricks => Some(RockyType::Float64),
+        OperandDialect::Postgres | OperandDialect::Trino => Some(RockyType::Float32),
+        OperandDialect::Snowflake
+        | OperandDialect::BigQuery
+        | OperandDialect::SqlServer
+        | OperandDialect::Redshift => None,
+    };
+    let dialects = target.known_dialects();
+    let mut types = dialects.iter().map(per_dialect);
+    match types.next() {
+        Some(Some(first)) if types.all(|t| t.as_ref() == Some(&first)) => first,
+        _ => RockyType::Unknown,
+    }
+}
+
 /// Infer the result type of an aggregate function on the warehouses of
 /// `target`.
 fn infer_aggregation_type(
@@ -2837,6 +2862,8 @@ fn infer_aggregation_type(
             // `s` is kept only where every target warehouse keeps it (#2398).
             let ty = if input_type.is_integer() {
                 RockyType::Int64
+            } else if *input_type == RockyType::Float32 {
+                sum_of_float_type(target)
             } else if input_type.is_decimal() {
                 RockyType::DecimalUnsized {
                     scale: input_type
@@ -3248,10 +3275,20 @@ fn infer_binary_op_type(
         // no bit. `%` is over the cap only when an operand is: its result
         // has `min` integer digits and `max` scale, which is no wider than
         // the operand with the larger scale.
-        ast::BinaryOperator::Divide => (
-            arithmetic_result_type(DecimalOp::Divide, &left_type, &right_type).ty,
-            true,
-        ),
+        //
+        // On DuckDB alone `/` has the warehouse's own type
+        // ([`duckdb_division_type`]). Elsewhere it keeps the ADR-TYPES bound
+        // (`Float64` with a float operand, else `Unknown`), which is not
+        // exact, so a contract never compares against it.
+        ast::BinaryOperator::Divide => {
+            let ty = match duckdb_division_type(&left_type, &right_type, &scope.target) {
+                RockyType::Unknown => {
+                    arithmetic_result_type(DecimalOp::Divide, &left_type, &right_type).ty
+                }
+                ty => ty,
+            };
+            (ty, true)
+        }
         ast::BinaryOperator::Modulo => (
             arithmetic_result_type(DecimalOp::Modulo, &left_type, &right_type).ty,
             true,
@@ -3264,6 +3301,69 @@ fn infer_binary_op_type(
         ast::BinaryOperator::StringConcat => (RockyType::String, nullable),
 
         _ => (RockyType::Unknown, nullable),
+    }
+}
+
+/// The most digits a number literal can have and still be an integer or a
+/// decimal in DuckDB (`DECIMAL(38, s)`); a longer one is a `DOUBLE`.
+const MAX_DECIMAL_LITERAL_DIGITS: usize = 38;
+
+/// The type of `left / right` when every warehouse the model runs on is
+/// DuckDB, else `Unknown`.
+///
+/// DuckDB's `/` is float division (`//` divides integers), and its result
+/// depends only on the operand categories. Probed with `typeof` on the
+/// DuckDB that `rocky-duckdb` bundles (DuckDB 2.0.0):
+///
+/// | operands                                    | result   |
+/// |---------------------------------------------|----------|
+/// | any `DOUBLE`                                | `DOUBLE` |
+/// | `FLOAT` with `FLOAT`, an integer or a decimal | `FLOAT`  |
+/// | integers and decimals only                  | `DOUBLE` |
+///
+/// This assumes DuckDB's default `integer_division = false`. With
+/// `SET integer_division = true`, `/` over integers is an integer; Rocky
+/// sets no such option, and a project that does is not supported here.
+///
+/// Any other operand (a date, a string, `Unknown`) gives `Unknown`. Other
+/// warehouses keep `Unknown`: Databricks and Snowflake divide decimals into
+/// a decimal whose digits differ between them, and PostgreSQL divides
+/// integers into an integer.
+fn duckdb_division_type(left: &RockyType, right: &RockyType, target: &OperandTarget) -> RockyType {
+    let dialects = target.known_dialects();
+    let duckdb_only = !dialects.is_empty() && dialects.iter().all(|d| *d == OperandDialect::DuckDb);
+    if !duckdb_only || !left.is_numeric() || !right.is_numeric() {
+        return RockyType::Unknown;
+    }
+    if matches!(left, RockyType::Float64) || matches!(right, RockyType::Float64) {
+        RockyType::Float64
+    } else if matches!(left, RockyType::Float32) || matches!(right, RockyType::Float32) {
+        RockyType::Float32
+    } else {
+        RockyType::Float64
+    }
+}
+
+/// Whether an operand of a DuckDB `/` has a category Rocky is sure of: an
+/// exact expression, or a numeric literal without an exponent and with at
+/// most 38 digits. Rocky types every number literal `Int64`; DuckDB reads `2`
+/// as an integer and `1.5` as a decimal, which divide the same way, but `1e3`
+/// as a `DOUBLE`, which does not. A literal with more than 38 digits fits no
+/// DuckDB integer or decimal, so DuckDB reads it as a `DOUBLE` too.
+fn division_operand_is_exact(expr: &Expr, scope: &TypeScope) -> bool {
+    match expr {
+        Expr::Value(v) => matches!(
+            &v.value,
+            ast::Value::Number(n, _)
+                if !n.contains(['e', 'E'])
+                    && n.bytes().filter(u8::is_ascii_digit).count() <= MAX_DECIMAL_LITERAL_DIGITS
+        ),
+        Expr::Nested(inner) => division_operand_is_exact(inner, scope),
+        Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus | ast::UnaryOperator::Plus,
+            expr,
+        } => division_operand_is_exact(expr, scope),
+        _ => has_exact_type(expr, scope),
     }
 }
 
@@ -4184,8 +4284,41 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
         }
         Expr::CompoundIdentifier(_) | Expr::Cast { .. } => true,
         Expr::Nested(inner) => has_exact_type(inner, scope),
+        // DuckDB's `/` takes its type from the operand categories alone, so
+        // it is exact when they are ([`duckdb_division_type`]).
+        Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Divide,
+            right,
+        } => {
+            division_operand_is_exact(left, scope)
+                && division_operand_is_exact(right, scope)
+                && duckdb_division_type(
+                    &infer_expr_type(left, scope).0,
+                    &infer_expr_type(right, scope).0,
+                    &scope.target,
+                ) != RockyType::Unknown
+        }
         Expr::Function(func) => match func.name.to_string().to_uppercase().as_str() {
             "COUNT" => true,
+            // A case change of a string is a string on every warehouse. Only
+            // over one argument that is exactly a string: a binary argument
+            // is cast, refused or kept binary depending on the warehouse.
+            "UPPER" | "LOWER" if func.over.is_none() && func.filter.is_none() => match &func.args {
+                ast::FunctionArguments::List(list)
+                    if list.args.len() == 1
+                        && list.duplicate_treatment.is_none()
+                        && list.clauses.is_empty() =>
+                {
+                    matches!(
+                        list.args.first(),
+                        Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
+                            if has_exact_type(arg, scope)
+                                && infer_expr_type(arg, scope).0 == RockyType::String
+                    )
+                }
+                _ => false,
+            },
             "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
@@ -11383,6 +11516,274 @@ mod tests {
             .iter()
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("{model}.{name} missing"))
+    }
+
+    fn duckdb_target() -> OperandTarget {
+        OperandTarget::Targets {
+            dialects: vec![OperandDialect::DuckDb],
+            unruled: vec![],
+        }
+    }
+
+    fn division_sources() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([(
+            "raw.orders".to_string(),
+            source_schema(&[
+                ("cents", RockyType::Int32, false),
+                ("qty", RockyType::Int64, false),
+                (
+                    "price",
+                    RockyType::Decimal {
+                        precision: 12,
+                        scale: 2,
+                    },
+                    false,
+                ),
+                ("ratio", RockyType::Float32, false),
+                ("weight", RockyType::Float64, false),
+                ("status", RockyType::String, false),
+                ("note", RockyType::String, true),
+                ("blob", RockyType::Binary, false),
+            ]),
+        )])
+    }
+
+    /// DuckDB's `/` has one type per operand category (probed with `typeof`
+    /// on the bundled DuckDB): DOUBLE with a DOUBLE, FLOAT with a FLOAT and no DOUBLE,
+    /// DOUBLE over integers and decimals. Always nullable (#2295). The same
+    /// SQL on an unconfigured or non-DuckDB target stays `Unknown`.
+    #[test]
+    fn duckdb_division_types_from_the_operand_categories() {
+        let cases = [
+            ("CAST(price AS DECIMAL(12, 2)) / 100", RockyType::Float64),
+            ("cents / 100", RockyType::Float64),
+            ("cents / qty", RockyType::Float64),
+            ("price / price", RockyType::Float64),
+            ("price / 1.5", RockyType::Float64),
+            ("ratio / 2", RockyType::Float32),
+            ("ratio / price", RockyType::Float32),
+            ("ratio / ratio", RockyType::Float32),
+            ("ratio / weight", RockyType::Float64),
+            ("weight / cents", RockyType::Float64),
+            ("(cents) / -(2)", RockyType::Float64),
+            // `1e3` is a DOUBLE in DuckDB, so a FLOAT over it is not a FLOAT.
+            ("ratio / 1e3", RockyType::Unknown),
+            // 38 digits is a DECIMAL in DuckDB; 39 is a DOUBLE.
+            (
+                "ratio / 12345678901234567890123456789012345678",
+                RockyType::Float32,
+            ),
+            (
+                "ratio / 123456789012345678901234567890123456789",
+                RockyType::Unknown,
+            ),
+            ("status / 2", RockyType::Unknown),
+        ];
+        for (expr, expected) in &cases {
+            let sql = format!("SELECT {expr} AS v FROM raw.orders");
+            let r = compile_typed_on(&[("m", &sql)], division_sources(), duckdb_target());
+            let col = column(&r, "m", "v");
+            assert_eq!(&col.data_type, expected, "{expr}");
+            assert!(col.nullable, "{expr}: `/` is nullable");
+            for other in [
+                OperandTarget::Unconfigured,
+                OperandTarget::Targets {
+                    dialects: vec![OperandDialect::DuckDb, OperandDialect::Databricks],
+                    unruled: vec![],
+                },
+                OperandTarget::Targets {
+                    dialects: vec![OperandDialect::Postgres],
+                    unruled: vec![],
+                },
+            ] {
+                let r = compile_typed_on(&[("m", &sql)], division_sources(), other.clone());
+                assert_eq!(
+                    column(&r, "m", "v").data_type,
+                    RockyType::Unknown,
+                    "{expr} on {other:?}"
+                );
+            }
+        }
+    }
+
+    /// Each `/` Rocky types exactly on DuckDB has that type on the bundled
+    /// DuckDB, probed with `typeof`. A DuckDB upgrade that changes a cell
+    /// fails here instead of turning a correct contract into a false `E011`.
+    /// `SUM` of a `FLOAT` is a `DOUBLE` in DuckDB, so Rocky must not claim
+    /// the `FLOAT` it infers for it.
+    #[test]
+    fn duckdb_division_types_match_the_bundled_duckdb() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE SCHEMA raw; CREATE TABLE raw.orders (cents INTEGER, qty BIGINT, \
+             price DECIMAL(12, 2), ratio FLOAT, weight DOUBLE); \
+             INSERT INTO raw.orders VALUES (1, 2, 3.50, 0.5, 0.25);",
+        )
+        .unwrap();
+        // Rows Rocky must leave untyped; every other row must carry DuckDB's
+        // own type, so no row passes by being `Unknown`.
+        let untyped = [
+            "ratio / 1e3",
+            "ratio / 123456789012345678901234567890123456789",
+        ];
+        let exprs = [
+            "ratio / .5",
+            "ratio / 1.",
+            "cents / 100",
+            "cents / qty",
+            "price / price",
+            "price / 1.5",
+            "CAST(price AS DECIMAL(12, 2)) / 100",
+            "ratio / 2",
+            "ratio / price",
+            "ratio / ratio",
+            "ratio / weight",
+            "weight / cents",
+            "(cents) / -(2)",
+            "ratio / 1e3",
+            "ratio / 12345678901234567890123456789012345678",
+            "ratio / 123456789012345678901234567890123456789",
+            "SUM(ratio) / 2",
+            "SUM(ratio)",
+            "SUM(cents) / 2",
+            "MAX(ratio) / 2",
+        ];
+        for expr in exprs {
+            let duck: String = conn
+                .query_row(&format!("SELECT typeof({expr}) FROM raw.orders"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let (duck_type, duck_rocky) = match duck.as_str() {
+                "DOUBLE" => ("Float64", RockyType::Float64),
+                "FLOAT" => ("Float32", RockyType::Float32),
+                other => panic!("{expr}: unmapped DuckDB type {other}"),
+            };
+            let sql = format!("SELECT {expr} AS v FROM raw.orders");
+            let r = compile_typed_on(&[("m", &sql)], division_sources(), duckdb_target());
+            let contract: crate::contracts::CompilerContract = toml::from_str(&format!(
+                "[[columns]]\nname = \"v\"\ntype = \"{duck_type}\"\n"
+            ))
+            .unwrap();
+            let diags = crate::contracts::validate_contract(
+                "m",
+                &r.type_check.typed_models["m"],
+                &contract,
+            );
+            let rocky = &column(&r, "m", "v").data_type;
+            assert!(
+                diags.iter().all(|d| &*d.code != "E011"),
+                "{expr}: DuckDB says {duck}, Rocky says {rocky:?}: {diags:?}"
+            );
+            if untyped.contains(&expr) {
+                assert_eq!(rocky, &RockyType::Unknown, "{expr}");
+            } else {
+                assert_eq!(rocky, &duck_rocky, "{expr}: DuckDB says {duck}");
+            }
+        }
+        // An operand read through a CTE or a derived table is exact only when
+        // the expression that built it is: `1e3` is a DOUBLE in DuckDB, so
+        // `ratio / k` is too, and Rocky leaves it untyped.
+        for sql in [
+            "WITH c AS (SELECT 1e3 AS k, ratio FROM raw.orders) SELECT ratio / k AS v FROM c",
+            "SELECT d.ratio / d.k AS v FROM (SELECT 1e3 AS k, ratio FROM raw.orders) AS d",
+        ] {
+            let duck: String = conn
+                .query_row(&format!("SELECT typeof(v) FROM ({sql})"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(duck, "DOUBLE", "{sql}");
+            let r = compile_typed_on(&[("m", sql)], division_sources(), duckdb_target());
+            assert_eq!(column(&r, "m", "v").data_type, RockyType::Unknown, "{sql}");
+        }
+    }
+
+    /// `SUM` over a `FLOAT` has the type every target warehouse gives:
+    /// `Float64` on DuckDB and Databricks, `Float32` on PostgreSQL and Trino,
+    /// `Unknown` when they disagree or a warehouse is not ruled.
+    #[test]
+    fn sum_of_a_float_follows_the_target_warehouses() {
+        use OperandDialect as D;
+        let sql = "SELECT SUM(ratio) AS v FROM raw.orders";
+        let on = |dialects: Vec<D>| OperandTarget::Targets {
+            dialects,
+            unruled: vec![],
+        };
+        let cases = [
+            (on(vec![D::DuckDb]), RockyType::Float64),
+            (on(vec![D::DuckDb, D::Databricks]), RockyType::Float64),
+            (on(vec![D::Postgres]), RockyType::Float32),
+            (on(vec![D::Postgres, D::Trino]), RockyType::Float32),
+            (on(vec![D::DuckDb, D::Postgres]), RockyType::Unknown),
+            (on(vec![D::Snowflake]), RockyType::Unknown),
+            (on(vec![D::DuckDb, D::Redshift]), RockyType::Unknown),
+            (OperandTarget::Unconfigured, RockyType::Unknown),
+        ];
+        for (target, expected) in cases {
+            let r = compile_typed_on(&[("m", sql)], division_sources(), target.clone());
+            assert_eq!(column(&r, "m", "v").data_type, expected, "{target:?}");
+        }
+    }
+
+    /// The DuckDB division type reaches a downstream aggregate, and a contract
+    /// that declares the wrong type is refused instead of passing as `I003`.
+    #[test]
+    fn duckdb_division_type_flows_downstream_and_is_checked() {
+        let r = compile_typed_on(
+            &[
+                (
+                    "stg",
+                    "SELECT CAST(cents AS DECIMAL(12, 2)) / 100 AS amount FROM raw.orders",
+                ),
+                ("agg", "SELECT SUM(s.amount) AS total FROM stg AS s"),
+            ],
+            division_sources(),
+            duckdb_target(),
+        );
+        assert_eq!(column(&r, "stg", "amount").data_type, RockyType::Float64);
+        assert_eq!(column(&r, "agg", "total").data_type, RockyType::Float64);
+        let contract: crate::contracts::CompilerContract =
+            toml::from_str("[[columns]]\nname = \"amount\"\ntype = \"Decimal\"\n").unwrap();
+        let diags = crate::contracts::validate_contract(
+            "stg",
+            &r.type_check.typed_models["stg"],
+            &contract,
+        );
+        assert!(
+            diags.iter().any(|d| &*d.code == "E011"),
+            "a Decimal contract over a DOUBLE column is refused: {diags:?}"
+        );
+    }
+
+    /// `UPPER` / `LOWER` over an exact string column is a string, and non-null
+    /// over a NOT NULL one (#2298). Over a binary, `Unknown`, or a nullable
+    /// column the result keeps what is proven.
+    #[test]
+    fn case_change_of_a_string_is_an_exact_string() {
+        for target in [OperandTarget::Unconfigured, duckdb_target()] {
+            let r = compile_typed_on(
+                &[
+                    (
+                        "stg",
+                        "SELECT LOWER(status) AS lo, UPPER(o.status) AS up, \
+                         LOWER(note) AS ln, UPPER(blob) AS ub, LOWER(mystery) AS lm \
+                         FROM raw.orders AS o",
+                    ),
+                    ("agg", "SELECT MAX(s.lo) AS last_lo FROM stg AS s"),
+                ],
+                division_sources(),
+                target.clone(),
+            );
+            let lo = column(&r, "stg", "lo");
+            assert_eq!((&lo.data_type, lo.nullable), (&RockyType::String, false));
+            let up = column(&r, "stg", "up");
+            assert_eq!((&up.data_type, up.nullable), (&RockyType::String, false));
+            let ln = column(&r, "stg", "ln");
+            assert_eq!((&ln.data_type, ln.nullable), (&RockyType::String, true));
+            assert_eq!(column(&r, "stg", "ub").data_type, RockyType::Unknown);
+            assert_eq!(column(&r, "stg", "lm").data_type, RockyType::Unknown);
+            let last = column(&r, "agg", "last_lo");
+            assert_eq!((&last.data_type, last.nullable), (&RockyType::String, true));
+        }
     }
 
     fn product_sources() -> HashMap<String, Vec<TypedColumn>> {

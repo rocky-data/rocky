@@ -82,7 +82,9 @@ fn parse_describe_rows(rows: &[Vec<serde_json::Value>]) -> HashMap<String, Vec<C
         let nullable = row
             .get(3)
             .and_then(|v| v.as_str())
-            .map(|s| s.eq_ignore_ascii_case("YES"))
+            // Only an explicit NO proves NOT NULL; any other value fails
+            // safe to nullable.
+            .map(|s| !s.trim().eq_ignore_ascii_case("NO"))
             .unwrap_or(true);
 
         if table.is_empty() || col_name.is_empty() {
@@ -189,6 +191,24 @@ mod tests {
         let rows = vec![row("t", "c", "STRING", "yes")];
         let map = parse_describe_rows(&rows);
         assert!(map["t"][0].nullable);
+    }
+
+    /// Only an explicit `NO` proves NOT NULL. An empty, unexpected or
+    /// missing cell is nullable, so a column is never wrongly proven non-null.
+    #[test]
+    fn parse_nullability_fails_safe() {
+        let mut missing = row("t", "missing", "STRING", "");
+        missing[3] = serde_json::Value::Null;
+        let rows = vec![
+            row("t", "no", "STRING", " no "),
+            row("t", "empty", "STRING", ""),
+            row("t", "odd", "STRING", "N"),
+            missing,
+        ];
+        let map = parse_describe_rows(&rows);
+        let cols = &map["t"];
+        assert!(!cols[0].nullable, "NO is NOT NULL");
+        assert!(cols[1..].iter().all(|c| c.nullable), "{cols:?}");
     }
 
     #[test]

@@ -1,0 +1,55 @@
+# Answer key for the `contract_quality` fixture: the contract a careful author
+# writes for each model. 4 models x 5 columns x 4 attributes = 80 items.
+#
+# `type` is the column's type in the warehouse after `rocky run` (DuckDB
+# `DESCRIBE`), in the contract's type vocabulary. `nullable = false` only
+# where the column cannot hold NULL: a NOT NULL source column passed through,
+# or an expression over such columns that cannot produce NULL. A nullable
+# column that holds no NULL today (`referral_code`, `method`) is still
+# `nullable = true`. `required` and `protected` list the table's key columns:
+# its primary key and its foreign keys (the `_id` columns), nothing else.
+
+[pass_line]
+min_matched = 64
+max_overclaims = 4
+max_unverified = 0
+
+[[models]]
+name = "stg_customers"
+columns = [
+  { name = "customer_id", type = "Int64", nullable = false, required = true, protected = true },
+  { name = "email", type = "String", nullable = false },
+  { name = "country", type = "String", nullable = true },
+  { name = "signup_date", type = "Date", nullable = false },
+  { name = "referral_code", type = "String", nullable = true },
+]
+
+[[models]]
+name = "stg_orders"
+columns = [
+  { name = "order_id", type = "Int64", nullable = false, required = true, protected = true },
+  { name = "customer_id", type = "Int64", nullable = false, required = true, protected = true },
+  { name = "amount", type = "Float64", nullable = false },
+  { name = "status", type = "String", nullable = false },
+  { name = "coupon", type = "String", nullable = true },
+]
+
+[[models]]
+name = "customer_orders"
+columns = [
+  { name = "customer_id", type = "Int64", nullable = false, required = true, protected = true },
+  { name = "country", type = "String", nullable = true },
+  { name = "order_count", type = "Int64", nullable = false },
+  { name = "total_amount", type = "Float64", nullable = true },
+  { name = "last_status", type = "String", nullable = true },
+]
+
+[[models]]
+name = "order_payments"
+columns = [
+  { name = "payment_id", type = "Int64", nullable = false, required = true, protected = true },
+  { name = "order_id", type = "Int64", nullable = false, required = true, protected = true },
+  { name = "customer_id", type = "Int64", nullable = false, required = true, protected = true },
+  { name = "method", type = "String", nullable = true },
+  { name = "paid_at", type = "Timestamp", nullable = true },
+]

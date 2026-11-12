@@ -808,6 +808,11 @@ pub struct AiContractResult {
     /// when every `nullable = false` in the draft was proven.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unproven_non_null: Vec<String>,
+    /// Leaf source tables Rocky could not describe in the warehouse, one
+    /// message each. Their columns kept a schema-cache entry, or stayed
+    /// untyped without one. Empty when every leaf source was described.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_sources: Vec<String>,
 }
 
 /// One generated test assertion in an `ai_test` result.

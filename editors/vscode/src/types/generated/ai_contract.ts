@@ -45,6 +45,12 @@ export interface AiContractOutput {
    */
   unproven_non_null?: string[];
   /**
+   * Leaf source tables Rocky could not describe in the warehouse, one message each (`schema.table: reason`).
+   *
+   * `rocky ai-contract` reads the column types of every table the project's models read and no model writes, so the drafted types and `nullable = false` claims are checked against the warehouse. A table listed here kept its schema-cache entry, or stayed untyped without one. Empty when every leaf source was described.
+   */
+  unresolved_sources?: string[];
+  /**
    * Declared column types the compiler could NOT check, one message each.
    *
    * The drafting loop only fails on error-severity diagnostics. A column whose type Rocky could not infer reports `I003` instead, and the declared type is then accepted without being compared to anything. With a cold schema cache that is every leaf column, so an empty `errors` list is not evidence the declared types are right. Empty when every declared type was actually checked.
