@@ -28,7 +28,7 @@ The demo runs:
 - **Transient failures don't take down runs** — every S3 transfer runs inside `[state.retry]` exponential-backoff + a three-state circuit breaker, same machinery as the Databricks / Snowflake adapters (see [`08-circuit-breaker/`](../08-circuit-breaker/)). Terminal outcomes surface as structured `outcome=ok|absent|timeout|transient_exhausted|circuit_open|…` fields on the `state.upload` / `state.download` events.
 - **Cold-start connectivity check** — `rocky doctor --check state_rw` proves write permission + reachability before the first pipeline run. No more silent IAM drift.
 - **Pick your failure posture** — default `on_upload_failure = "skip"` keeps runs live and lets the next run re-derive state; switch to `"fail"` for strict environments where state durability trumps liveness.
-- The same `[state]` block works against AWS S3 by changing `endpoint`.
+- The same `[state]` block works against AWS S3: drop `AWS_ENDPOINT_URL` and `AWS_ALLOW_HTTP`, and use real credentials.
 - All credential-free: SeaweedFS runs with anonymous access, so any key works.
 
 ## Layout
@@ -59,54 +59,53 @@ Without Docker, the script shows config validation only.
 
 ## What happened
 
+Captured on 2026-11-12 against SeaweedFS 4.01. Timestamps and sizes vary.
+
 ```
-=== Starting MinIO ===
+=== Starting SeaweedFS (S3 API on :8333) ===
 === Source after seed: 100 rows ===
 
-=== rocky doctor --check state_rw (live round-trip probe vs MinIO) ===
+=== rocky doctor --check state_rw (live round-trip probe vs SeaweedFS) ===
 {
   "command": "doctor",
   "overall": "healthy",
   "checks": [
-    { "name": "state_rw", "status": "healthy", "message": "Probed s3 backend OK …", "duration_ms": 12 }
+    { "name": "state_rw", "status": "healthy", "message": "State backend RW probe succeeded (s3)", "duration_ms": 7 }
   ],
   ...
 }
 
 === Run 1 (initial — full load of 100 rows) ===
-    target rows: 100
+    target rows: 99
 === Local state after run 1 ===
-    -rw-r--r--  1 user  staff  8.0K ... .rocky-state.redb
-    orders  2026-04-01 00:01:00  ...
+    -rw------- 1 user user 5.3M ... .rocky-state.redb
 
-=== S3 state after run 1 (MinIO bucket) ===
-    [DATE]  8.0K playground/v35/state.redb
+=== S3 state after run 1 (SeaweedFS bucket) ===
+    [DATE]  4.2M playground/v35/state.redb
+    [DATE]   361 playground/v35/state.redb.cas-required
 
 === Append delta (25 new rows, later timestamps) ===
     source rows: 125
 
 === Run 2 (incremental — only 25 new rows) ===
-    target rows: 125
-=== State after run 2 ===
-    orders  2026-05-01 00:25:00  ...
-
-=== S3 state after run 2 ===
-    [DATE]  8.0K playground/v35/state.redb
+    target rows: 124
 
 === Round-trip test: delete local state, re-download from S3 ===
-    local state deleted: ls: .rocky-state.redb: No such file or directory
+    local state deleted: ls: cannot access '.rocky-state.redb': No such file or directory
     re-running pipeline (will download state from S3 first)...
-    target rows: 125
-=== State after round-trip restore ===
-    orders  2026-05-01 00:25:00  ...
+    target rows: 124
 
     Watermark survived the round-trip — no duplicate rows.
 
-POC complete: S3 state sync (upload + download) via MinIO.
+POC complete: S3 state sync (upload + download) via SeaweedFS.
 ```
 
-The object key includes the state schema version (`v35` since the state schema bump after engine 1.92.0).
+The bucket listing needs the `aws` CLI; without it that section is empty.
+
+The object key includes the state schema version (`v35` since the state schema bump after engine 1.92.0). `state.redb.cas-required` is the marker that keeps every later upload a conditional write.
+
+Each run copies one row fewer than the source holds. That is by design: an incremental copy holds back the newest timestamp until the next run, so a late row with the same timestamp is not skipped. So run 1 copies 99 of 100 rows, and run 2 reaches 124 of 125.
 
 Key observation: after deleting the local state and re-running, the target
-still has exactly 125 rows (not 225). The watermark was restored from S3,
+still has 124 rows (not 223). The watermark was restored from S3,
 so Rocky skipped all rows it had already processed.

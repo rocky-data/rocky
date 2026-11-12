@@ -41,6 +41,8 @@ export AWS_ACCESS_KEY_ID="rocky"
 export AWS_SECRET_ACCESS_KEY="rocky-secret"
 export AWS_ENDPOINT_URL="http://localhost:8333"
 export AWS_REGION="us-east-1"
+# The local store speaks plain HTTP; Rocky's S3 client refuses it otherwise.
+export AWS_ALLOW_HTTP="true"
 
 rocky validate
 echo
