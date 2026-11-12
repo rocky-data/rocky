@@ -802,6 +802,10 @@ pub struct RockyMcpServer {
     state_path_override: Option<PathBuf>,
     /// An explicit `--state-namespace`, validated by the CLI (#2587).
     state_namespace: Option<String>,
+    /// The store [`Self::state_path`] resolved, once per session, so a
+    /// `rocky.toml` edited mid-session cannot move the server to another
+    /// store halfway through (#2587).
+    resolved_state_path: std::sync::OnceLock<PathBuf>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -2297,6 +2301,7 @@ impl RockyMcpServer {
             actor: profile.default_actor(),
             state_path_override: None,
             state_namespace: None,
+            resolved_state_path: std::sync::OnceLock::new(),
             tool_router,
             prompt_router,
         })
@@ -2319,12 +2324,14 @@ impl RockyMcpServer {
     #[must_use]
     pub fn with_state_path(mut self, path: Option<PathBuf>) -> Self {
         self.state_path_override = path;
+        self.resolved_state_path = std::sync::OnceLock::new();
         self
     }
 
     /// Route the server to a `--state-namespace` store, as the CLI does.
     pub fn with_state_namespace(mut self, namespace: Option<String>) -> Self {
         self.state_namespace = namespace;
+        self.resolved_state_path = std::sync::OnceLock::new();
         self
     }
 
@@ -2332,8 +2339,15 @@ impl RockyMcpServer {
     /// resolved as the CLI resolves it: `--state-path`, then
     /// `--state-namespace`, then the project's `[state] namespacing`
     /// (#2587). Before, it ignored any namespace, so its AI calls landed in
-    /// a spool `rocky cost` did not read.
+    /// a spool `rocky cost` did not read. Resolved at the first call and
+    /// kept for the session, as the CLI resolves it once per command.
     fn state_path(&self) -> PathBuf {
+        self.resolved_state_path
+            .get_or_init(|| self.resolve_state_path())
+            .clone()
+    }
+
+    fn resolve_state_path(&self) -> PathBuf {
         // The config is read only when no flag decides the store.
         let config = if self.state_path_override.is_none() && self.state_namespace.is_none() {
             rocky_core::config::load_rocky_config(&self.config_path).ok()
@@ -11610,6 +11624,10 @@ database = ":memory:"
         ));
         let models = tmp.path().join("models");
         let cli_state = rocky_core::state::resolve_state_path_ns(None, &models, Some("xf")).path;
+        assert_eq!(server.state_path(), cli_state);
+        // A `rocky.toml` broken mid-session does not move the server to
+        // another store: the store is resolved once.
+        std::fs::write(tmp.path().join("rocky.toml"), "not toml [").unwrap();
         assert_eq!(server.state_path(), cli_state);
         server.ai_usage_sink("mcp_explain_model", "m")(&rocky_ai::client::LlmUsage {
             llm_model: "claude-sonnet-4-6".to_string(),

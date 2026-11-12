@@ -19,10 +19,14 @@ if $HAVE_DOCKER; then
     echo "=== Starting SeaweedFS (S3 API on :8333) ==="
     docker compose up -d 2>&1 || true
     # The `bucket` service exits once it has created the bucket.
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 90); do
         [ "$(docker compose ps -a --format '{{.State}}' bucket 2>/dev/null)" = "exited" ] && break
         sleep 1
     done
+    if [ "$(docker compose ps -a --format '{{.ExitCode}}' bucket 2>/dev/null)" != "0" ]; then
+        echo "the S3 bucket was not created; see: docker compose logs bucket" >&2
+        exit 1
+    fi
 else
     echo "docker not installed; showing config-only demo."
 fi

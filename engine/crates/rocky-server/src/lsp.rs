@@ -908,7 +908,7 @@ impl RockyLsp {
     /// not, so this read never stops it.
     /// A recorder that spools each AI call of a code action for
     /// `rocky cost`, next to the project's state file (see
-    /// [`ai_usage_state_path`]). `None` before
+    /// [`lsp_state_path`]). `None` before
     /// `initialize` sets the models directory.
     async fn ai_usage_recorder(
         &self,
@@ -916,7 +916,7 @@ impl RockyLsp {
         model: Option<&str>,
     ) -> Option<rocky_ai::usage::UsageRecorder> {
         let models_dir = self.models_dir.read().await.clone()?;
-        let state_path = ai_usage_state_path(
+        let state_path = lsp_state_path(
             std::path::Path::new(&models_dir),
             STATE_LOCATION.get_or_init(StateLocation::default),
         );
@@ -1359,10 +1359,9 @@ impl RockyLsp {
     /// `rocky-cli::source_schemas::load_cached_source_schemas` but (a)
     /// reuses the LSP's per-session throttle so the info log doesn't
     /// fire on every recompile, and (b) resolves the state file via
-    /// [`rocky_core::state::resolve_state_path`] so the LSP observes the
-    /// same file the CLI writes to — unified default
-    /// `<models>/.rocky-state.redb` with the legacy CWD fallback for
-    /// existing projects.
+    /// [`lsp_state_path`] so the LSP observes the same file the CLI writes
+    /// to, including under `--state-path`, `--state-namespace` and
+    /// `[state] namespacing` (#2587).
     ///
     /// Honours `[cache.schemas]` from the project's `rocky.toml` (found
     /// one level above `models_dir` — the same `<root>/models` layout the
@@ -1404,11 +1403,12 @@ impl RockyLsp {
             return HashMap::new();
         }
 
-        let resolved = rocky_core::state::resolve_state_path(None, models_dir);
-        if let Some(ref w) = resolved.warning {
-            tracing::debug!(target: "rocky::state_path", "{w}");
-        }
-        let state_path = resolved.path;
+        // The store the CLI writes the cache to, under the same flags and
+        // `[state] namespacing` (#2587).
+        let state_path = lsp_state_path(
+            models_dir,
+            STATE_LOCATION.get_or_init(StateLocation::default),
+        );
         if !state_path.exists() {
             return HashMap::new();
         }
@@ -5729,17 +5729,14 @@ pub fn set_state_location(location: StateLocation) {
     let _ = STATE_LOCATION.set(location);
 }
 
-/// The state file whose AI usage spool an LSP code action writes to,
-/// resolved as the CLI resolves its store: `--state-path`, then
+/// The state file the LSP reads its schema cache from and spools AI usage
+/// next to, resolved as the CLI resolves its store: `--state-path`, then
 /// `--state-namespace`, then the project's `[state] namespacing`, else the
 /// global file (#2587). Before, the LSP always used the global file, so
 /// under a namespace its AI calls landed in a spool `rocky cost` did not
 /// read. A `rocky.toml` that does not load falls back to the global file,
 /// as the CLI does.
-fn ai_usage_state_path(
-    models_dir: &std::path::Path,
-    location: &StateLocation,
-) -> std::path::PathBuf {
+fn lsp_state_path(models_dir: &std::path::Path, location: &StateLocation) -> std::path::PathBuf {
     let config = if location.explicit.is_none() && location.namespace.is_none() {
         RockyLsp::project_config_path(models_dir)
             .filter(|p| p.is_file())
@@ -8035,13 +8032,13 @@ adapter = "db"
             explicit: Some(explicit.clone()),
             namespace: Some("other".into()),
         };
-        assert_eq!(ai_usage_state_path(&models, &flagged), explicit);
+        assert_eq!(lsp_state_path(&models, &flagged), explicit);
         let ns_flag = StateLocation {
             explicit: None,
             namespace: Some("other".into()),
         };
         assert_eq!(
-            ai_usage_state_path(&models, &ns_flag),
+            lsp_state_path(&models, &ns_flag),
             rocky_core::state::resolve_state_path_ns(None, &models, Some("other")).path
         );
     }

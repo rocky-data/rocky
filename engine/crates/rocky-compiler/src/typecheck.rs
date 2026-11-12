@@ -2899,7 +2899,9 @@ fn infer_aggregation_type(
             // so an unresolved argument does not silently drop out of contract
             // validation. A known non-numeric input is `Unknown`: DuckDB
             // averages a `DATE` or `TIMESTAMP` to a `TIMESTAMP`, not a
-            // `DOUBLE` (#2578).
+            // `DOUBLE` (#2578). `AVG` over an unresolved argument is never
+            // exact ([`has_exact_type`]), so this guess does not override a
+            // type read from the SQL.
             let ty = match input_type {
                 RockyType::Int32
                 | RockyType::Int64
@@ -4351,11 +4353,25 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
                 }
                 _ => false,
             },
-            "SUM" | "MIN" | "MAX" | "AVG" => match &func.args {
+            "SUM" | "MIN" | "MAX" => match &func.args {
                 ast::FunctionArguments::List(list) => matches!(
                     list.args.first(),
                     Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
                         if has_exact_type(arg, scope)
+                ),
+                _ => false,
+            },
+            // `AVG` over an argument of unknown type is typed `Float64` only
+            // so a contract on it is still checked; that is a guess, not a
+            // type read from the SQL. A cast to a type Rocky does not model
+            // (`AVG(CAST(x AS INTERVAL))`) is exact but `Unknown`, so `AVG`
+            // is exact only over an argument whose type is known (#2578).
+            "AVG" => match &func.args {
+                ast::FunctionArguments::List(list) => matches!(
+                    list.args.first(),
+                    Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
+                        if has_exact_type(arg, scope)
+                            && infer_expr_type(arg, scope).0 != RockyType::Unknown
                 ),
                 _ => false,
             },
@@ -11777,7 +11793,8 @@ mod tests {
         )]);
         let sql = "SELECT AVG(ts) AS avg_ts, AVG(tsn) AS avg_tsn, AVG(d) AS avg_d, \
                    AVG(b) AS avg_b, SUM(b) AS sum_b, SUM(s) AS sum_s, SUM(d) AS sum_d, \
-                   AVG(n) AS avg_n, SUM(n) AS sum_n, SUM(f) AS sum_f FROM raw.t";
+                   AVG(n) AS avg_n, SUM(n) AS sum_n, SUM(f) AS sum_f, \
+                   AVG(CAST(n AS INTERVAL)) AS avg_iv FROM raw.t";
         for target in [duckdb_target(), OperandTarget::Unconfigured] {
             let r = compile_typed_on(&[("m", sql)], sources.clone(), target.clone());
             for name in [
@@ -11790,6 +11807,11 @@ mod tests {
                 );
             }
             assert_eq!(column(&r, "m", "avg_n").data_type, RockyType::Float64);
+            assert_eq!(
+                column(&r, "m", "avg_iv").data_type,
+                RockyType::Unknown,
+                "AVG over a cast to an unmodelled type on {target:?}"
+            );
             assert_eq!(column(&r, "m", "sum_n").data_type, RockyType::Int64);
             assert_eq!(column(&r, "m", "sum_f").data_type, RockyType::Float64);
         }

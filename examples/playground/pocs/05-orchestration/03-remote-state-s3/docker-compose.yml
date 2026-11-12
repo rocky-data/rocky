@@ -21,11 +21,19 @@ services:
     image: curlimages/curl@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
     depends_on:
       - s3
-    entrypoint: >
-      /bin/sh -c "
-      until curl -fsS -X PUT http://s3:8333/rocky-state; do echo 'waiting for s3'; sleep 1; done;
-      echo 'rocky-state bucket ready'
-      "
+    # 200 creates the bucket; 409 means a previous run already did.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT http://s3:8333/rocky-state)
+          case "$$code" in
+            200|409) echo "rocky-state bucket ready ($$code)"; exit 0 ;;
+          esac
+          echo "waiting for s3 ($$code)"; sleep 1
+        done
+        echo "s3 did not answer"; exit 1
 
 volumes:
   s3-data:

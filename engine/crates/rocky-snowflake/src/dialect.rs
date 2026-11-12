@@ -642,7 +642,9 @@ mod tests {
         // unquoted lowercase input still resolves a default-uppercase object;
         // double-quoting would lock in a case-sensitive lowercase name that
         // would not match. The MCP grounding path was live-verified against
-        // Snowflake on the unquoted form.
+        // Snowflake on the unquoted form for a dotted source ref. A model
+        // name is addressed with `format_table_ref` instead, the quoted ref
+        // `rocky run` created the table with (#2582).
         let d = dialect();
         assert_eq!(
             d.ground_table_ref(&["mydb", "public", "users"]).unwrap(),
