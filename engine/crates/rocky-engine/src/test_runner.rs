@@ -602,7 +602,7 @@ fn run_one_unit_test(
                 Vec::new(),
             );
         }
-        if let Some(sql) = fixture_to_sql(fx, &DuckDbSqlDialect)
+        if let Some(sql) = fixture_to_sql(fx, &DuckDbSqlDialect::plain())
             && let Err(e) = db.execute_statement(&sql)
         {
             return fail(
@@ -724,7 +724,7 @@ fn expected_table_sql(rows: &[serde_json::Value], cols: &[String]) -> String {
                 .map(|c| {
                     let lit = obj.and_then(|o| o.get(c)).map_or_else(
                         || "NULL".to_string(),
-                        |v| json_to_sql_literal(v, &DuckDbSqlDialect),
+                        |v| json_to_sql_literal(v, &DuckDbSqlDialect::plain()),
                     );
                     format!("{lit} AS {c}")
                 })

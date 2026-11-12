@@ -440,6 +440,36 @@ class Dialect(StrEnum):
     duckdb = "duckdb"
 
 
+class DuckDbAttachAuthorization2(StrEnum):
+    """
+    No catalog authentication (`AUTHORIZATION_TYPE 'none'`).
+    """
+
+    none = "none"
+
+
+class DuckDbAttachAuthorization(RootModel[DuckDbAttachAuthorization2]):
+    root: DuckDbAttachAuthorization2
+    """
+    How a [`DuckDbAttach`] entry authenticates to its catalog.
+    """
+
+
+class DuckDbAttachType2(StrEnum):
+    """
+    An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
+    """
+
+    iceberg = "iceberg"
+
+
+class DuckDbAttachType(RootModel[DuckDbAttachType2]):
+    root: DuckDbAttachType2
+    """
+    The kind of catalog a [`DuckDbAttach`] entry attaches.
+    """
+
+
 class ExecutionConfig(BaseModel):
     """
     Controls parallelism and error handling for table processing.
@@ -1778,6 +1808,22 @@ class RunRetryConfig(BaseModel):
     """
 
 
+class S3UrlStyle3(StrEnum):
+    """
+    `https://host/bucket/key`.
+    """
+
+    path = "path"
+
+
+class S3UrlStyle4(StrEnum):
+    """
+    `https://bucket.host/key`.
+    """
+
+    vhost = "vhost"
+
+
 class ScheduleDefaultsConfig(BaseModel):
     """
     Project-level schedule defaults (`[schedule]`).
@@ -2186,165 +2232,6 @@ class WorkspaceBindingConfig(BaseModel):
     id: conint(ge=0)
 
 
-class AdapterConfig(BaseModel):
-    """
-    Configuration for a named adapter instance.
-
-    The `type` field determines which adapter crate handles this config. Adapter-specific fields are captured via `serde(flatten)`.
-
-    Credential fields (`token`, `client_secret`, `api_key`, `api_secret`, `password`, `oauth_token`) are wrapped in [`RedactedString`] so that `Debug` output never leaks secrets.
-
-    The DuckDB, Databricks and Snowflake connection fields (`path`, `host`, `http_path`, `client_id`, `account`, `warehouse`, `username`, `private_key_path`, `role`, `database`) are [`EnvString`]s. A resolved `${VAR}` value in one of them prints only as `${NAME}` (#1919). The adapter connect path reads the plaintext with [`EnvString::expose`].
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    account: str | None = None
-    """
-    Snowflake account identifier (e.g., "xy12345.us-east-1").
-    """
-    allow_sync_trigger: bool | None = None
-    """
-    The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
-    """
-    api_key: str | None = None
-    api_secret: str | None = None
-    cache: FivetranCacheConfig | None = None
-    """
-    Optional cache backend for the Fivetran state envelope.
-
-    When set on a `type = "fivetran"` adapter, the resolved envelope is read from and written to the configured cache backend so concurrent `rocky` processes share one fetcher per org. Ignored on every other adapter type. When absent the adapter behaves as if `backend = "none"` — every fetch goes straight to the Fivetran API.
-    """
-    circuit_breaker: FivetranCircuitBreakerConfig | None = None
-    """
-    Optional per-account circuit breaker (Fivetran-only).
-
-    Trips after `failure_threshold` consecutive remote failures and short-circuits subsequent HTTP attempts with a `CircuitOpen` error until a cooldown elapses. Coordinated across processes via the configured backend (Valkey). Ignored on non-fivetran adapters; absent block defaults to `AlwaysClosed` (no breaker).
-    """
-    client_id: str | None = None
-    client_secret: str | None = None
-    database: str | None = None
-    """
-    Default database for the session.
-    """
-    destination_id: str | None = None
-    extension_directory: str | None = None
-    """
-    Directory DuckDB keeps its extensions in. Rocky sets it as the only entry of DuckDB's `extension_directories` setting. When unset or empty, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
-    """
-    extra: dict[str, Any] | None = None
-    """
-    Escape hatch for adapter-specific keys this struct doesn't model.
-
-    `AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the top level (`tooken` for `token`) surface as parse errors rather than silent ignores. That guard, however, also blocks legitimate adapter-specific settings — an out-of-tree Trino adapter wanting a `default_schema` slot, a Postgres adapter wanting a non-standard `application_name`, etc. — from ever reaching the adapter.
-
-    Authors of such adapters declare the keys under a nested `[extra]` table:
-
-    ```toml [adapter.my_trino] type = "trino" host = "https://trino.example.com" token = "${TRINO_JWT}"
-
-    [adapter.my_trino.extra] default_schema = "analytics" x_trino_user = "service-account" ```
-
-    Top-level typos still error (`tooken = "..."` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.expose().get("...")` and validate them themselves — Rocky doesn't schema-check the contents.
-
-    Values are `serde_json::Value` so the field survives `just codegen` (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables / arrays still round-trip through serde because they all map to the JSON shape.
-    """
-    host: str | None = None
-    http_path: str | None = None
-    kind: AdapterKind3 | AdapterKind4 | None = None
-    """
-    Role this adapter block plays. See [`AdapterKind`] for the required-vs-optional rules per adapter type.
-    """
-    location: str | None = None
-    """
-    BigQuery processing location (e.g., "US", "EU", "us-central1").
-    """
-    oauth_token: str | None = None
-    """
-    OAuth access token (pre-obtained from an IdP).
-    """
-    offline: bool | None = None
-    """
-    When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.
-    """
-    password: str | None = None
-    """
-    Snowflake password (for password auth).
-    """
-    pat: str | None = None
-    """
-    Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header — distinct from `oauth_token`.
-    """
-    path: str | None = None
-    """
-    Optional file path for a persistent DuckDB database. When unset, the adapter uses an in-memory database. A persistent path is required when the same DuckDB adapter is also used as a discovery source — discovery and warehouse share the same database.
-    """
-    private_key_path: str | None = None
-    """
-    Path to RSA private key file (PEM) for key-pair auth.
-    """
-    project_id: str | None = None
-    """
-    Google Cloud project ID.
-    """
-    ratelimit: FivetranRatelimitConfig | None = None
-    """
-    Optional cross-pod rate-limit budget backend (Fivetran-only).
-
-    Phase 1 ratelimit coordination is per-host (file in `${TMPDIR}/rocky-fivetran-ratelimit/`). Setting `backend = "valkey"` here lifts the budget into a shared store so several pods on different hosts observe the same `wake_at` window after one of them is throttled. Ignored on non-fivetran adapters. When absent the adapter falls back to the per-host file backend.
-    """
-    retry: RetryConfig | None = Field(
-        {
-            "backoff_multiplier": 2.0,
-            "circuit_breaker_recovery_timeout_secs": None,
-            "circuit_breaker_threshold": 5,
-            "initial_backoff_ms": 1000,
-            "jitter": True,
-            "max_backoff_ms": 30000,
-            "max_retries": 3,
-            "max_retries_per_run": None,
-        },
-        validate_default=True,
-    )
-    """
-    Retry policy for this adapter.
-    """
-    role: str | None = None
-    """
-    Snowflake role to use for the session.
-    """
-    schemas: list[ManualSchemaConfig] | None = None
-    """
-    The source schemas and tables a `type = "manual"` discovery adapter returns, listed in config instead of fetched from an API.
-
-    ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
-
-    [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items"] ```
-
-    Required (non-empty) on a `manual` adapter and refused on every other type; see [`validate_manual_adapters`].
-    """
-    stampede: FivetranStampedeConfig | None = None
-    """
-    Optional distributed cache-stampede lock (Fivetran-only).
-
-    On a cold-start herd, N processes simultaneously miss the cache, fan out N API calls, and write back N times. The stampede lock elects a single leader to issue the API call; followers poll the cache until the leader publishes the envelope. Ignored on non-fivetran adapters. When absent the adapter behaves as if every process is the leader (the pre-stampede behavior).
-    """
-    timeout_secs: conint(ge=0) | None = None
-    token: str | None = None
-    type: str
-    """
-    Adapter type: "databricks", "fivetran", "duckdb", etc.
-    """
-    username: str | None = None
-    """
-    Snowflake username (for password or key-pair auth).
-    """
-    warehouse: str | None = None
-    """
-    Snowflake warehouse to use for query execution.
-    """
-
-
 class AggregateCheckToggle1(BaseModel):
     """
     Explicit struct form with per-check severity.
@@ -2480,6 +2367,44 @@ class DiscoverySyncConfig(BaseModel):
     wait_timeout_secs: conint(ge=0) | None = 3600
     """
     Longest wait for the whole phase, in seconds. Must be at most half of `[state.idempotency] in_flight_ttl_hours`. Default 3600.
+    """
+
+
+class DuckDbAttachS3(BaseModel):
+    """
+    The S3 settings of a [`DuckDbAttach`] entry. Every field is optional; an unset one leaves DuckDB's default.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    endpoint: str | None = None
+    """
+    The S3 endpoint as `host[:port]`, for an S3-compatible store.
+    """
+    key_id: str | None = None
+    """
+    Access key id.
+    """
+    region: str | None = None
+    """
+    The bucket region.
+    """
+    scope: str | None = None
+    """
+    The path prefix the secret applies to, for example `s3://warehouse`. When unset the secret applies to every `s3://` path of the connection.
+    """
+    secret: str | None = None
+    """
+    Secret access key.
+    """
+    url_style: S3UrlStyle3 | S3UrlStyle4 | None = None
+    """
+    `"path"` or `"vhost"`.
+    """
+    use_ssl: bool | None = None
+    """
+    Whether to use HTTPS. DuckDB's default is `true`.
     """
 
 
@@ -3497,6 +3422,46 @@ class DiscoveryConfig(BaseModel):
     """
 
 
+class DuckDbAttach(BaseModel):
+    """
+    One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"` adapter attaches to its connection under `alias`.
+
+    ```toml [[adapter.lake.attach]] alias = "lk" type = "iceberg" warehouse = "demo" endpoint = "${ICEBERG_ENDPOINT}"
+
+    [adapter.lake.attach.s3] key_id = "${S3_KEY_ID}" secret = "${S3_SECRET}" endpoint = "localhost:8333" url_style = "path" use_ssl = false ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    alias: str
+    """
+    The catalog name models use to target this attachment. A SQL identifier. It must not be `memory`, `main`, `temp`, `system`, the database file's own catalog name or another entry's alias.
+    """
+    authorization: DuckDbAttachAuthorization | None = Field(
+        "none", validate_default=True
+    )
+    """
+    How Rocky authenticates to the REST catalog. Only `"none"` today.
+    """
+    endpoint: str
+    """
+    The REST catalog's base URL, for example `http://localhost:8181/catalog`.
+    """
+    s3: DuckDbAttachS3 | None = None
+    """
+    Object-store credentials for the table files. Rocky turns them into a temporary DuckDB secret scoped to this attachment.
+    """
+    type: DuckDbAttachType
+    """
+    What the attachment is. Only `"iceberg"` (an Iceberg REST catalog).
+    """
+    warehouse: str
+    """
+    The warehouse name the REST catalog knows.
+    """
+
+
 class GovernanceConfig(BaseModel):
     """
     Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.
@@ -4009,6 +3974,169 @@ class TransformationTargetConfig(BaseModel):
     region: str | None = None
     """
     Region label where the target stores the data. See [`ResidencyConfig`].
+    """
+
+
+class AdapterConfig(BaseModel):
+    """
+    Configuration for a named adapter instance.
+
+    The `type` field determines which adapter crate handles this config. Adapter-specific fields are captured via `serde(flatten)`.
+
+    Credential fields (`token`, `client_secret`, `api_key`, `api_secret`, `password`, `oauth_token`) are wrapped in [`RedactedString`] so that `Debug` output never leaks secrets.
+
+    The DuckDB, Databricks and Snowflake connection fields (`path`, `host`, `http_path`, `client_id`, `account`, `warehouse`, `username`, `private_key_path`, `role`, `database`) are [`EnvString`]s. A resolved `${VAR}` value in one of them prints only as `${NAME}` (#1919). The adapter connect path reads the plaintext with [`EnvString::expose`].
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    account: str | None = None
+    """
+    Snowflake account identifier (e.g., "xy12345.us-east-1").
+    """
+    allow_sync_trigger: bool | None = None
+    """
+    The credential owner's opt-in to let Rocky start a Fivetran sync with this adapter's key (`POST /v1/connections/{id}/sync`, never `force`). A pipeline also has to ask for it with `[pipeline.<name>.source.discovery.sync] trigger = true`. Without this key the adapter sends no `POST`, and `rocky validate` refuses a pipeline that sets `trigger = true`. Ignored on every other adapter type. Default `false`.
+    """
+    api_key: str | None = None
+    api_secret: str | None = None
+    attach: list[DuckDbAttach] | None = None
+    """
+    Other catalogs this DuckDB connection attaches when `rocky run` connects. Each entry is an Iceberg REST catalog that models target by its `alias` (`[target] catalog = "<alias>"`). `rocky compile` and `rocky plan` never attach. Refused on every other adapter type; see [`validate_duckdb_attachments`] and `docs/adr/ADR-ICEBERG-DUCKDB.md`.
+    """
+    cache: FivetranCacheConfig | None = None
+    """
+    Optional cache backend for the Fivetran state envelope.
+
+    When set on a `type = "fivetran"` adapter, the resolved envelope is read from and written to the configured cache backend so concurrent `rocky` processes share one fetcher per org. Ignored on every other adapter type. When absent the adapter behaves as if `backend = "none"` — every fetch goes straight to the Fivetran API.
+    """
+    circuit_breaker: FivetranCircuitBreakerConfig | None = None
+    """
+    Optional per-account circuit breaker (Fivetran-only).
+
+    Trips after `failure_threshold` consecutive remote failures and short-circuits subsequent HTTP attempts with a `CircuitOpen` error until a cooldown elapses. Coordinated across processes via the configured backend (Valkey). Ignored on non-fivetran adapters; absent block defaults to `AlwaysClosed` (no breaker).
+    """
+    client_id: str | None = None
+    client_secret: str | None = None
+    database: str | None = None
+    """
+    Default database for the session.
+    """
+    destination_id: str | None = None
+    extension_directory: str | None = None
+    """
+    Directory DuckDB keeps its extensions in. Rocky sets it as the only entry of DuckDB's `extension_directories` setting. When unset or empty, DuckDB uses its own default under the home directory. Every extension Rocky loads reads from, and installs into, this one directory.
+    """
+    extra: dict[str, Any] | None = None
+    """
+    Escape hatch for adapter-specific keys this struct doesn't model.
+
+    `AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the top level (`tooken` for `token`) surface as parse errors rather than silent ignores. That guard, however, also blocks legitimate adapter-specific settings — an out-of-tree Trino adapter wanting a `default_schema` slot, a Postgres adapter wanting a non-standard `application_name`, etc. — from ever reaching the adapter.
+
+    Authors of such adapters declare the keys under a nested `[extra]` table:
+
+    ```toml [adapter.my_trino] type = "trino" host = "https://trino.example.com" token = "${TRINO_JWT}"
+
+    [adapter.my_trino.extra] default_schema = "analytics" x_trino_user = "service-account" ```
+
+    Top-level typos still error (`tooken = "..."` is still rejected); only keys nested under `[adapter.<name>.extra]` flow through to the adapter unchanged. Adapters read these via `.extra.expose().get("...")` and validate them themselves — Rocky doesn't schema-check the contents.
+
+    Values are `serde_json::Value` so the field survives `just codegen` (`toml::Value` doesn't derive `JsonSchema`); TOML scalars / tables / arrays still round-trip through serde because they all map to the JSON shape.
+    """
+    host: str | None = None
+    http_path: str | None = None
+    kind: AdapterKind3 | AdapterKind4 | None = None
+    """
+    Role this adapter block plays. See [`AdapterKind`] for the required-vs-optional rules per adapter type.
+    """
+    location: str | None = None
+    """
+    BigQuery processing location (e.g., "US", "EU", "us-central1").
+    """
+    oauth_token: str | None = None
+    """
+    OAuth access token (pre-obtained from an IdP).
+    """
+    offline: bool | None = None
+    """
+    When `true`, Rocky never runs `INSTALL` for a DuckDB extension and turns DuckDB's extension auto-install off. It loads `icu` from the extension directory only, and refuses to connect if `icu` is missing there. For `rocky compile`, a missing extension only logs a warning. A model's own SQL can still install an extension. Default `false`.
+    """
+    password: str | None = None
+    """
+    Snowflake password (for password auth).
+    """
+    pat: str | None = None
+    """
+    Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header — distinct from `oauth_token`.
+    """
+    path: str | None = None
+    """
+    Optional file path for a persistent DuckDB database. When unset, the adapter uses an in-memory database. A persistent path is required when the same DuckDB adapter is also used as a discovery source — discovery and warehouse share the same database.
+    """
+    private_key_path: str | None = None
+    """
+    Path to RSA private key file (PEM) for key-pair auth.
+    """
+    project_id: str | None = None
+    """
+    Google Cloud project ID.
+    """
+    ratelimit: FivetranRatelimitConfig | None = None
+    """
+    Optional cross-pod rate-limit budget backend (Fivetran-only).
+
+    Phase 1 ratelimit coordination is per-host (file in `${TMPDIR}/rocky-fivetran-ratelimit/`). Setting `backend = "valkey"` here lifts the budget into a shared store so several pods on different hosts observe the same `wake_at` window after one of them is throttled. Ignored on non-fivetran adapters. When absent the adapter falls back to the per-host file backend.
+    """
+    retry: RetryConfig | None = Field(
+        {
+            "backoff_multiplier": 2.0,
+            "circuit_breaker_recovery_timeout_secs": None,
+            "circuit_breaker_threshold": 5,
+            "initial_backoff_ms": 1000,
+            "jitter": True,
+            "max_backoff_ms": 30000,
+            "max_retries": 3,
+            "max_retries_per_run": None,
+        },
+        validate_default=True,
+    )
+    """
+    Retry policy for this adapter.
+    """
+    role: str | None = None
+    """
+    Snowflake role to use for the session.
+    """
+    schemas: list[ManualSchemaConfig] | None = None
+    """
+    The source schemas and tables a `type = "manual"` discovery adapter returns, listed in config instead of fetched from an API.
+
+    ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
+
+    [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items"] ```
+
+    Required (non-empty) on a `manual` adapter and refused on every other type; see [`validate_manual_adapters`].
+    """
+    stampede: FivetranStampedeConfig | None = None
+    """
+    Optional distributed cache-stampede lock (Fivetran-only).
+
+    On a cold-start herd, N processes simultaneously miss the cache, fan out N API calls, and write back N times. The stampede lock elects a single leader to issue the API call; followers poll the cache until the leader publishes the envelope. Ignored on non-fivetran adapters. When absent the adapter behaves as if every process is the leader (the pre-stampede behavior).
+    """
+    timeout_secs: conint(ge=0) | None = None
+    token: str | None = None
+    type: str
+    """
+    Adapter type: "databricks", "fivetran", "duckdb", etc.
+    """
+    username: str | None = None
+    """
+    Snowflake username (for password or key-pair auth).
+    """
+    warehouse: str | None = None
+    """
+    Snowflake warehouse to use for query execution.
     """
 
 

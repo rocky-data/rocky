@@ -24,6 +24,13 @@ async-trait = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 
+[features]
+# Gates the live Iceberg conformance test in `tests/iceberg_conformance.rs`.
+# It needs a Lakekeeper REST catalog and an S3 store (see
+# `.github/workflows/iceberg-conformance.yml`), and its tests are
+# `#[ignore]`, so `--all-features` runs stay network-free.
+iceberg-conformance = []
+
 [dev-dependencies]
 # `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's
 # tests use to build the hostile metadata columns `select_clause` must refuse.

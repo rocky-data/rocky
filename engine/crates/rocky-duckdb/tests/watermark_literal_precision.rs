@@ -88,7 +88,7 @@ fn setup(column_type: &str, zone: &str) -> DuckDbConnector {
 
 #[test]
 fn both_bounds_compare_at_the_column_precision_in_every_session_zone() {
-    let d = DuckDbSqlDialect;
+    let d = DuckDbSqlDialect::plain();
     for column_type in COLUMN_TYPES {
         for zone in ZONES {
             let case = format!("{column_type} in session zone {zone}");

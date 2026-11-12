@@ -22,7 +22,7 @@ use tempfile::TempDir;
 // ===========================================================================
 
 fn dialect() -> DuckDbSqlDialect {
-    DuckDbSqlDialect
+    DuckDbSqlDialect::plain()
 }
 
 fn temp_state() -> (StateStore, TempDir) {

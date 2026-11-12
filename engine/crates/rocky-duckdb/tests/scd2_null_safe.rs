@@ -23,7 +23,7 @@ use rocky_ir::{GovernanceConfig, ModelIr, SourceRef, TargetRef};
 #[tokio::test]
 async fn duckdb_null_safe_neq_captures_null_value_transitions() {
     let adapter = DuckDbWarehouseAdapter::in_memory().expect("in-memory DuckDB");
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
 
     // Two-column probe table mirroring the SCD2 MERGE's
     // `source.updated_at != target.updated_at` shape.
@@ -79,7 +79,7 @@ async fn duckdb_null_safe_neq_captures_null_value_transitions() {
 #[tokio::test]
 async fn snapshot_merge_inserts_explicit_columns_and_closes_changed_rows() {
     let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
     adapter.execute_statement("CREATE TABLE main.source (id INTEGER, name VARCHAR, \"DisplayName\" VARCHAR, \"Order Total\" VARCHAR, updated_at TIMESTAMP); INSERT INTO main.source VALUES (1, 'Alice', 'Alice A', '100', TIMESTAMP '2026-01-01')").await.unwrap();
     let config = SnapshotConfig {
         source: SourceRef {
@@ -135,7 +135,7 @@ async fn snapshot_merge_inserts_explicit_columns_and_closes_changed_rows() {
 #[tokio::test]
 async fn snapshot_accepts_quoted_key_and_change_column() {
     let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
     adapter.execute_statement("CREATE TABLE main.source (\"Order Id\" INTEGER, \"Order Total\" VARCHAR, \"Changed At\" TIMESTAMP); INSERT INTO main.source VALUES (1, '100', TIMESTAMP '2026-01-01')").await.unwrap();
     let config = SnapshotConfig {
         source: SourceRef {
@@ -179,7 +179,7 @@ async fn snapshot_accepts_quoted_key_and_change_column() {
 #[tokio::test]
 async fn changed_version_insert_maps_reordered_view_columns_by_name() {
     let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
     adapter.execute_statement("CREATE TABLE main.base (id INTEGER, a VARCHAR, b VARCHAR, updated_at TIMESTAMP); INSERT INTO main.base VALUES (1, 'a1', 'b1', TIMESTAMP '2026-01-01'); CREATE VIEW main.source AS SELECT id, a, b, updated_at FROM main.base").await.unwrap();
     let config = SnapshotConfig {
         source: SourceRef {
@@ -262,7 +262,7 @@ async fn changed_version_insert_maps_reordered_view_columns_by_name() {
 #[tokio::test]
 async fn scd2_change_predicate_captures_null_to_value_on_duckdb() {
     let adapter = DuckDbWarehouseAdapter::in_memory().expect("in-memory DuckDB");
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
 
     // Seed a synthetic source / target pair: target holds the
     // pre-transition NULL updated_at; source carries the new value.

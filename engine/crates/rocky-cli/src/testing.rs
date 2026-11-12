@@ -799,7 +799,7 @@ mod tests {
     fn duckdb_emits_no_catalog_statement_which_is_why_this_double_exists() {
         use rocky_core::traits::SqlDialect as _;
         assert!(
-            rocky_duckdb::dialect::DuckDbSqlDialect
+            rocky_duckdb::dialect::DuckDbSqlDialect::plain()
                 .create_catalog_sql("fixture")
                 .is_none(),
             "DuckDB gained a catalog statement — the justification for this \

@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, conint
+from pydantic import BaseModel, ConfigDict, Field, RootModel, conint
 
 
 class AdapterKind1(StrEnum):
@@ -23,6 +23,36 @@ class AdapterKind2(StrEnum):
     """
 
     discovery = "discovery"
+
+
+class DuckDbAttachAuthorization1(StrEnum):
+    """
+    No catalog authentication (`AUTHORIZATION_TYPE 'none'`).
+    """
+
+    none = "none"
+
+
+class DuckDbAttachAuthorization(RootModel[DuckDbAttachAuthorization1]):
+    root: DuckDbAttachAuthorization1
+    """
+    How a [`DuckDbAttach`] entry authenticates to its catalog.
+    """
+
+
+class DuckDbAttachType1(StrEnum):
+    """
+    An Apache Iceberg REST catalog, through DuckDB's `iceberg` extension.
+    """
+
+    iceberg = "iceberg"
+
+
+class DuckDbAttachType(RootModel[DuckDbAttachType1]):
+    root: DuckDbAttachType1
+    """
+    The kind of catalog a [`DuckDbAttach`] entry attaches.
+    """
 
 
 class FivetranCacheBackend1(StrEnum):
@@ -360,6 +390,100 @@ class RetryConfig(BaseModel):
     """
 
 
+class S3UrlStyle1(StrEnum):
+    """
+    `https://host/bucket/key`.
+    """
+
+    path = "path"
+
+
+class S3UrlStyle2(StrEnum):
+    """
+    `https://bucket.host/key`.
+    """
+
+    vhost = "vhost"
+
+
+class DuckDbAttachS3(BaseModel):
+    """
+    The S3 settings of a [`DuckDbAttach`] entry. Every field is optional; an unset one leaves DuckDB's default.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    endpoint: str | None = None
+    """
+    The S3 endpoint as `host[:port]`, for an S3-compatible store.
+    """
+    key_id: str | None = None
+    """
+    Access key id.
+    """
+    region: str | None = None
+    """
+    The bucket region.
+    """
+    scope: str | None = None
+    """
+    The path prefix the secret applies to, for example `s3://warehouse`. When unset the secret applies to every `s3://` path of the connection.
+    """
+    secret: str | None = None
+    """
+    Secret access key.
+    """
+    url_style: S3UrlStyle1 | S3UrlStyle2 | None = None
+    """
+    `"path"` or `"vhost"`.
+    """
+    use_ssl: bool | None = None
+    """
+    Whether to use HTTPS. DuckDB's default is `true`.
+    """
+
+
+class DuckDbAttach(BaseModel):
+    """
+    One `[[adapter.<name>.attach]]` entry: a catalog a `type = "duckdb"` adapter attaches to its connection under `alias`.
+
+    ```toml [[adapter.lake.attach]] alias = "lk" type = "iceberg" warehouse = "demo" endpoint = "${ICEBERG_ENDPOINT}"
+
+    [adapter.lake.attach.s3] key_id = "${S3_KEY_ID}" secret = "${S3_SECRET}" endpoint = "localhost:8333" url_style = "path" use_ssl = false ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    alias: str
+    """
+    The catalog name models use to target this attachment. A SQL identifier. It must not be `memory`, `main`, `temp`, `system`, the database file's own catalog name or another entry's alias.
+    """
+    authorization: DuckDbAttachAuthorization | None = Field(
+        "none", validate_default=True
+    )
+    """
+    How Rocky authenticates to the REST catalog. Only `"none"` today.
+    """
+    endpoint: str
+    """
+    The REST catalog's base URL, for example `http://localhost:8181/catalog`.
+    """
+    s3: DuckDbAttachS3 | None = None
+    """
+    Object-store credentials for the table files. Rocky turns them into a temporary DuckDB secret scoped to this attachment.
+    """
+    type: DuckDbAttachType
+    """
+    What the attachment is. Only `"iceberg"` (an Iceberg REST catalog).
+    """
+    warehouse: str
+    """
+    The warehouse name the REST catalog knows.
+    """
+
+
 class AdapterConfig(BaseModel):
     """
     Configuration for a named adapter instance.
@@ -384,6 +508,10 @@ class AdapterConfig(BaseModel):
     """
     api_key: str | None = None
     api_secret: str | None = None
+    attach: list[DuckDbAttach] | None = None
+    """
+    Other catalogs this DuckDB connection attaches when `rocky run` connects. Each entry is an Iceberg REST catalog that models target by its `alias` (`[target] catalog = "<alias>"`). `rocky compile` and `rocky plan` never attach. Refused on every other adapter type; see [`validate_duckdb_attachments`] and `docs/adr/ADR-ICEBERG-DUCKDB.md`.
+    """
     cache: FivetranCacheConfig | None = None
     """
     Optional cache backend for the Fivetran state envelope.

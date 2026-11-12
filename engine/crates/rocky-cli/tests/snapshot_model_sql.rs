@@ -176,7 +176,7 @@ fn bigquery_quotes_with_backticks_and_hashes_with_to_hex() {
 #[test]
 fn duckdb_statement_shapes_match_the_e2e_path() {
     let stmts = statements(
-        &DuckDbSqlDialect,
+        &DuckDbSqlDialect::plain(),
         &spec(timestamp(), SnapshotHardDeletes::NewRecord),
         &["id", "region", "name", "updated_at"],
     );

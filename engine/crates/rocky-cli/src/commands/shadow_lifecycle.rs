@@ -326,7 +326,7 @@ mod tests {
     impl WarehouseAdapter for MissingNamespaceWarehouse {
         fn dialect(&self) -> &dyn SqlDialect {
             static DIALECT: rocky_duckdb::dialect::DuckDbSqlDialect =
-                rocky_duckdb::dialect::DuckDbSqlDialect;
+                rocky_duckdb::dialect::DuckDbSqlDialect::plain();
             &DIALECT
         }
         fn is_missing_object_error(&self, error: &AdapterError) -> bool {

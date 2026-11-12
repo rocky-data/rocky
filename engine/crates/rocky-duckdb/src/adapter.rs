@@ -217,7 +217,7 @@ impl DuckDbWarehouseAdapter {
         let connector = DuckDbConnector::in_memory()?;
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: Some(crate::dialect::catalog_name_for_path(":memory:")),
         })
@@ -228,7 +228,7 @@ impl DuckDbWarehouseAdapter {
         let connector = DuckDbConnector::in_memory_with(opts)?;
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: Some(crate::dialect::catalog_name_for_path(":memory:")),
         })
@@ -247,7 +247,7 @@ impl DuckDbWarehouseAdapter {
         let connector = DuckDbConnector::open_with(path, opts)?;
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: Some(crate::dialect::catalog_name_for_path(
                 &path.to_string_lossy(),
@@ -259,7 +259,7 @@ impl DuckDbWarehouseAdapter {
     pub fn new(connector: DuckDbConnector) -> Self {
         Self {
             connector: Arc::new(Mutex::new(connector)),
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: None,
         }
@@ -271,7 +271,7 @@ impl DuckDbWarehouseAdapter {
     pub fn from_shared(connector: Arc<Mutex<DuckDbConnector>>) -> Self {
         Self {
             connector,
-            dialect: DuckDbSqlDialect,
+            dialect: DuckDbSqlDialect::plain(),
             concurrent_for_test: false,
             default_catalog: None,
         }
@@ -289,6 +289,36 @@ impl DuckDbWarehouseAdapter {
     pub fn with_concurrent_for_test(mut self, concurrent: bool) -> Self {
         self.concurrent_for_test = concurrent;
         self
+    }
+
+    /// Attach the `[[adapter.<name>.attach]]` catalogs to this adapter's
+    /// connection, and make its dialect treat them as Iceberg catalogs
+    /// (ADR-ICEBERG-DUCKDB). Call it once, right after opening.
+    ///
+    /// # Errors
+    ///
+    /// An invalid alias, a missing extension, or a failed secret or attach.
+    pub fn with_attachments(
+        mut self,
+        entries: &[rocky_core::config::DuckDbAttach],
+        opts: &crate::ExtensionOptions,
+    ) -> Result<Self, crate::DuckDbError> {
+        if entries.is_empty() {
+            return Ok(self);
+        }
+        let own_catalog = self.default_catalog.clone().unwrap_or_default();
+        {
+            let conn = self
+                .connector
+                .lock()
+                .map_err(|e| crate::DuckDbError::AttachInvalid {
+                    alias: entries[0].alias.clone(),
+                    detail: format!("connection mutex poisoned: {e}"),
+                })?;
+            conn.attach_catalogs(entries, &own_catalog, opts)?;
+        }
+        self.dialect = DuckDbSqlDialect::with_iceberg_catalogs(entries.iter().map(|e| &e.alias));
+        Ok(self)
     }
 
     /// Returns a clone of the underlying connector handle for sharing
@@ -410,6 +440,29 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
                 .lock()
                 .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
             conn.atomic_drop_and_create(&drop_sql, &create_sql)
+                .map_err(AdapterError::new)?;
+            Ok(Some(rocky_core::traits::ExecutionStats::default()))
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
+    async fn overwrite_in_place(
+        &self,
+        target: &str,
+        select_sql: &str,
+    ) -> AdapterResult<Option<rocky_core::traits::ExecutionStats>> {
+        let conn = Arc::clone(&self.connector);
+        let target = target.to_string();
+        let select_sql = select_sql.to_string();
+        // The lock is held for the whole transaction, so no other adapter
+        // call can run a statement inside it.
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let mut session: &DuckDbConnector = &conn;
+            crate::iceberg::overwrite_in_place(&mut session, &target, &select_sql)
                 .map_err(AdapterError::new)?;
             Ok(Some(rocky_core::traits::ExecutionStats::default()))
         })
@@ -759,11 +812,22 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         self.concurrent_for_test
     }
 
-    async fn list_tables(&self, _catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
+    async fn list_tables(&self, catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
         validation::validate_identifier(schema).map_err(AdapterError::new)?;
-        let sql = format!(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
-        );
+        // An attached Iceberg catalog is never the default, so its tables
+        // are listed by catalog too (ADR-ICEBERG-DUCKDB D2). A plain DuckDB
+        // schema keeps the catalog-blind query.
+        let sql = if self.dialect.is_iceberg_catalog(catalog) {
+            validation::validate_identifier(catalog).map_err(AdapterError::new)?;
+            format!(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE lower(table_catalog) = lower('{catalog}') AND table_schema = '{schema}'"
+            )
+        } else {
+            format!(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
+            )
+        };
         let conn = Arc::clone(&self.connector);
         spawn_blocking(move || {
             let conn = conn
