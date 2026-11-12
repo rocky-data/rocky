@@ -168,6 +168,12 @@ pub struct ClaimRecord {
     /// bounded grace can elapse before it is force-resolved. RFC3339.
     #[serde(default)]
     pub first_swept_at: Option<String>,
+    /// When a sweep first found this claim's child still running past the
+    /// schedule's `timeout` and wrote the one `"overrun"` warning incident.
+    /// RFC3339. Additive and omitted when `None`, so an older record reads
+    /// as never warned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrun_warned_at: Option<String>,
     /// The instant of the last transition. RFC3339. Read by
     /// `StateStore::gc_schedule_claims` to age out terminal claims.
     #[serde(default)]
@@ -188,6 +194,7 @@ impl ClaimRecord {
             child_start_time: None,
             child_host: None,
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now.to_rfc3339()),
         }
     }
@@ -303,6 +310,7 @@ pub fn decide_pre_spawn(
                     child_start_time: None,
                     child_host: None,
                     first_swept_at: None,
+                    overrun_warned_at: None,
                     last_transition_at: Some(now.to_rfc3339()),
                 })
             }
@@ -392,6 +400,7 @@ fn terminal_claim(
         child_start_time: current.child_start_time,
         child_host: current.child_host.clone(),
         first_swept_at: None,
+        overrun_warned_at: None,
         last_transition_at: Some(now.to_rfc3339()),
     }
 }
@@ -441,6 +450,7 @@ pub fn decide_post_attempt(
             child_start_time: None,
             child_host: None,
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now.to_rfc3339()),
         });
     }
@@ -501,6 +511,7 @@ pub fn decide_resolver(
             child_start_time: current.child_start_time,
             child_host: current.child_host.clone(),
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now.to_rfc3339()),
         });
     }
@@ -530,6 +541,7 @@ mod tests {
             child_start_time: None,
             child_host: None,
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now().to_rfc3339()),
         }
     }

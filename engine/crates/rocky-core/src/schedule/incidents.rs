@@ -42,7 +42,9 @@ pub struct IncidentBundle {
     pub source: String,
     /// The terminal outcome: `"failure"` or `"partial"`. Partial failures
     /// trip the scheduler's partial backoff exactly like full failures trip
-    /// failure backoff, so both are incidents.
+    /// failure backoff, so both are incidents. `"overrun"` is a warning, not
+    /// an outcome: a stuck claim's child is still running past the
+    /// schedule's `timeout_minutes`, and the claim is kept.
     pub outcome: String,
     /// The occurrence the run was for, when the emission site knows it (the
     /// orphan sweep deliberately does not reconstruct it).

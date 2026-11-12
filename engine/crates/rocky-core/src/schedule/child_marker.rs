@@ -153,7 +153,7 @@ pub fn identity_for(rocky_dir: &Path, claim: &ClaimRecord) -> Option<ChildMarker
 }
 
 /// Whether the child recorded for `claim` may still be running. See the module
-/// docs for the rules. `probe` is [`crate::process::process_liveness`] in
+/// docs for the rules. `probe` is [`crate::process::running_process_start_time`] in
 /// production; `this_host` is [`host_identity`].
 pub fn child_may_be_alive(
     identity: Option<&ChildMarker>,
