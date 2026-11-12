@@ -59,7 +59,7 @@ export type DuckDbAttach =
        */
       alias: string;
       /**
-       * Where DuckLake writes the Parquet data files: a local directory or an `s3://` prefix. A relative local path is made absolute when Rocky connects, because DuckLake stores it verbatim and would resolve it against each later process's working directory. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new catalog).
+       * Where DuckLake writes the Parquet data files: a local directory (an `s3://` prefix is refused until it has a conformance case). A relative path is made absolute when Rocky connects, because DuckLake stores it verbatim and would resolve it against each later process's working directory. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new catalog).
        */
       data_path?: string | null;
       /**
@@ -67,7 +67,7 @@ export type DuckDbAttach =
        */
       metadata_path: string;
       /**
-       * Object-store credentials for an `s3://` `data_path`. Rocky turns them into a temporary DuckDB secret; its scope defaults to `data_path`.
+       * Object-store credentials for a future `s3://` `data_path`. Refused by `rocky validate` today; the attach step would scope its secret to `data_path`.
        */
       s3?: DuckDbAttachS3 | null;
       type: "ducklake";

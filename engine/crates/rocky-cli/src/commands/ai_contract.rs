@@ -454,9 +454,8 @@ pub(crate) async fn prepare_table_query(
         rocky_sql::validation::validate_identifier(&t.catalog)
             .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
     }
-    let target_ref = format!("{schema}.{table}");
-
     let adapter = registry.warehouse_adapter(&target_adapter)?;
+    let target_ref = profile_ref(adapter.dialect(), &t.catalog, schema, table);
 
     // Probe the model's declared target. We use `describe_table` rather than
     // information_schema so the existence check goes through the adapter trait
@@ -499,6 +498,24 @@ pub(crate) async fn prepare_table_query(
     }
 }
 
+/// The name a profile query reads: DuckDB's two-part `schema.table`, or
+/// `catalog.schema.table` for a catalog the dialect knows is attached
+/// (an Iceberg or DuckLake alias is never the default catalog, so the
+/// two-part name would read another table or none).
+fn profile_ref(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    catalog: &str,
+    schema: &str,
+    table: &str,
+) -> String {
+    match dialect.catalog_kind(catalog) {
+        rocky_core::traits::CatalogKind::Native
+        | rocky_core::traits::CatalogKind::DuckLakeMetadata => format!("{schema}.{table}"),
+        rocky_core::traits::CatalogKind::IcebergRest
+        | rocky_core::traits::CatalogKind::DuckLake => format!("{catalog}.{schema}.{table}"),
+    }
+}
+
 /// Find the first source table for `model` that actually exists in the
 /// warehouse. Tries explicit `[[sources]]` sidecar declarations first, then
 /// falls back to FROM clauses parsed out of the model's SQL — useful when the
@@ -516,7 +533,12 @@ async fn first_existing_source(
             table: src.table.clone(),
         };
         if adapter.describe_table(&r).await.is_ok() {
-            return Some(format!("{}.{}", src.schema, src.table));
+            return Some(profile_ref(
+                adapter.dialect(),
+                &src.catalog,
+                &src.schema,
+                &src.table,
+            ));
         }
     }
     // SQL-extracted fallback. `referenced_tables` returns lowercased
@@ -539,7 +561,12 @@ async fn first_existing_source(
             _ => continue,
         };
         if adapter.describe_table(&table_ref).await.is_ok() {
-            return Some(format!("{}.{}", table_ref.schema, table_ref.table));
+            return Some(profile_ref(
+                adapter.dialect(),
+                &table_ref.catalog,
+                &table_ref.schema,
+                &table_ref.table,
+            ));
         }
     }
     None
@@ -885,6 +912,19 @@ pub async fn run_ai_contract(
 
 #[cfg(test)]
 mod tests {
+
+    /// A table in an attached catalog keeps its catalog, so a profile reads
+    /// the lake table and not a same-named one in the default catalog.
+    #[test]
+    fn a_profile_of_an_attached_catalog_keeps_the_catalog() {
+        let d = rocky_duckdb::dialect::DuckDbSqlDialect::with_catalogs([(
+            "dl",
+            rocky_core::traits::CatalogKind::DuckLake,
+        )]);
+        assert_eq!(profile_ref(&d, "dl", "demo", "agg"), "dl.demo.agg");
+        assert_eq!(profile_ref(&d, "warehouse", "demo", "agg"), "demo.agg");
+    }
+
     use super::*;
 
     /// The `rocky ai-contract` / MCP `ai_contract` profile: its statistics

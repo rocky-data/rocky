@@ -142,19 +142,20 @@ data_path = "lake/data/"
 | `alias` | string | Yes | The catalog name models target. The same rules as an Iceberg alias, and it must not start with `__ducklake_metadata_`. |
 | `type` | string | Yes | `"ducklake"`. |
 | `metadata_path` | string | Yes | The DuckDB file that holds the catalog. It is created on the first attach. It must not be the adapter's own `path`, and it must not hold a `:` (`sqlite:`, `postgres:` and `:memory:` are not supported). |
-| `data_path` | string | No | A local directory or an `s3://` prefix. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new one). |
-| `s3` | table | No | Only with an `s3://` `data_path`. The same keys as for Iceberg; `scope` defaults to `data_path`. |
+| `data_path` | string | No | A local directory. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new one). An `s3://` data path is not supported yet. |
 
 Rocky makes a relative `metadata_path` and `data_path` absolute against the working directory before it attaches. DuckLake stores the data path as written, and a relative one would resolve differently in each later process. For the same reason Rocky refuses a lake whose stored data path is relative. Rocky never overrides the stored data path, so a different `data_path` for an existing lake fails at attach.
 
-`rocky run` loads the `ducklake` extension (and `httpfs` for an `s3://` data path). With `offline = true`, they must already be in the extension directory.
+A lake stays at the absolute directory it was created in. If the project moves, the attach fails until `data_path` names the stored path or the data moves back.
+
+`rocky run` loads the `ducklake` extension. With `offline = true`, it must already be in the extension directory.
 
 What Rocky writes to an attached DuckLake catalog:
 
 - **`full_refresh`** is `CREATE OR REPLACE TABLE … AS`, one atomic snapshot, as on a plain DuckDB file.
 - **`ephemeral`, `incremental`, `merge`, `delete_insert`, `time_interval`** and replication work as on a plain DuckDB file.
 
-Refused before any model runs, with an error that names the strategy and the catalog: `view` (a view stored in DuckLake looks up its table names in the lake, not the main database), `materialized_view`, `dynamic_table`, `microbatch`, `content_addressed`, snapshots, a lakehouse `format`, seeds, `rocky load`, quarantine and branch promote.
+Refused before any model runs, with an error that names the strategy and the catalog: `view` (a view stored in DuckLake looks up its table names in the lake, not the main database), `materialized_view`, `dynamic_table`, `microbatch`, `content_addressed`, snapshots, a lakehouse `format`, seeds, `rocky load`, quarantine and branch promote. A promote is refused when the plan is built. `rocky run --branch` and `--shadow` work, because they write renamed schemas of the same lake.
 
 Things to know:
 

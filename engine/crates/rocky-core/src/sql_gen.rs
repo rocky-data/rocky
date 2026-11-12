@@ -1096,19 +1096,16 @@ pub fn refuse_on_catalog_kind(
     dialect: &dyn SqlDialect,
 ) -> Result<(), SqlGenError> {
     let catalog = &model_ir.target.catalog;
-    if catalog
-        .to_ascii_lowercase()
-        .starts_with(crate::config::DUCKLAKE_METADATA_CATALOG_PREFIX)
-    {
-        return Err(SqlGenError::InvalidRequest(format!(
-            "model '{}': catalog '{catalog}' is a DuckLake metadata catalog; Rocky never writes \
-             there",
-            model_ir.name
-        )));
-    }
     let kind = dialect.catalog_kind(catalog);
     let (refused, supported): (Option<&str>, &str) = match kind {
         CatalogKind::Native => return Ok(()),
+        CatalogKind::DuckLakeMetadata => {
+            return Err(SqlGenError::InvalidRequest(format!(
+                "model '{}': catalog '{catalog}' is {}",
+                model_ir.name,
+                kind.describe()
+            )));
+        }
         CatalogKind::IcebergRest => (
             iceberg_refusal(&model_ir.materialization),
             "full_refresh and append incremental only (ADR-ICEBERG-DUCKDB)",
@@ -4095,7 +4092,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             match catalog {
                 "lk" => CatalogKind::IcebergRest,
                 "dl" => CatalogKind::DuckLake,
-                _ => CatalogKind::Native,
+                _ => CatalogKind::reserved(catalog).unwrap_or(CatalogKind::Native),
             }
         }
         fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
@@ -4294,6 +4291,33 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 },
                 "dynamic_table",
             ),
+            (
+                MaterializationStrategy::Microbatch {
+                    timestamp_column: "ts".into(),
+                    granularity: rocky_ir::TimeGrain::Hour,
+                },
+                "microbatch",
+            ),
+            (
+                MaterializationStrategy::ContentAddressed {
+                    storage_prefix: "s3://b/t".into(),
+                    partition_columns: vec![],
+                },
+                "content_addressed",
+            ),
+            (
+                MaterializationStrategy::Snapshot(Box::new(rocky_ir::snapshot::SnapshotSpec {
+                    unique_key: vec!["id".into()],
+                    change: rocky_ir::snapshot::SnapshotChangeStrategy::Check {
+                        check_cols: rocky_ir::snapshot::SnapshotCheckColumns::All,
+                        updated_at: None,
+                    },
+                    hard_deletes: rocky_ir::snapshot::SnapshotHardDeletes::NewRecord,
+                    meta_columns: rocky_ir::snapshot::SnapshotMetaColumns::default(),
+                    valid_to_current: None,
+                })),
+                "snapshot",
+            ),
         ];
         for (strategy, word) in cases {
             let err = refuse_on_catalog_kind(&ducklake_ir(strategy), &d)
@@ -4319,6 +4343,10 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             .unwrap_err()
             .to_string();
         assert!(err.contains("DuckLake metadata catalog"), "{err}");
+        assert_eq!(
+            TestDialect.catalog_kind("__ducklake_metadata_x"),
+            CatalogKind::DuckLakeMetadata
+        );
     }
 
     // -----------------------------------------------------------------------

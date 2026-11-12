@@ -1378,6 +1378,124 @@ mod unit_tests {
         assert!(plan.is_none());
     }
 
+    /// Quarantine is refused on an attached DuckLake catalog and on a
+    /// DuckLake metadata catalog, and still compiles on a native one.
+    #[test]
+    fn quarantine_is_refused_on_a_non_native_catalog() {
+        struct Kinded;
+        impl SqlDialect for Kinded {
+            fn watermark_hold_back(
+                &self,
+                a: &str,
+                b: &chrono::DateTime<chrono::Utc>,
+                c: crate::traits::NullTimestamps,
+            ) -> AdapterResult<String> {
+                TestDialect.watermark_hold_back(a, b, c)
+            }
+            fn literal_escape(&self) -> crate::traits::LiteralEscape {
+                TestDialect.literal_escape()
+            }
+            fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
+                TestDialect.format_table_ref(c, s, t)
+            }
+            fn create_table_as(&self, t: &str, q: &str) -> String {
+                TestDialect.create_table_as(t, q)
+            }
+            fn insert_into(&self, t: &str, q: &str) -> String {
+                TestDialect.insert_into(t, q)
+            }
+            fn merge_into(
+                &self,
+                t: &str,
+                q: &str,
+                k: &[std::sync::Arc<str>],
+                u: &ColumnSelection,
+            ) -> AdapterResult<String> {
+                TestDialect.merge_into(t, q, k, u)
+            }
+            fn select_clause(
+                &self,
+                c: &ColumnSelection,
+                m: &[MetadataColumn],
+            ) -> AdapterResult<String> {
+                TestDialect.select_clause(c, m)
+            }
+            fn watermark_where(
+                &self,
+                ts: &str,
+                last: Option<&chrono::DateTime<chrono::Utc>>,
+            ) -> AdapterResult<String> {
+                TestDialect.watermark_where(ts, last)
+            }
+            fn describe_table_sql(&self, t: &str) -> String {
+                TestDialect.describe_table_sql(t)
+            }
+            fn drop_table_sql(&self, t: &str) -> String {
+                TestDialect.drop_table_sql(t)
+            }
+            fn create_catalog_sql(&self, n: &str) -> Option<AdapterResult<String>> {
+                TestDialect.create_catalog_sql(n)
+            }
+            fn create_schema_sql(&self, c: &str, s: &str) -> Option<AdapterResult<String>> {
+                TestDialect.create_schema_sql(c, s)
+            }
+            fn tablesample_clause(&self, p: u32) -> Option<String> {
+                TestDialect.tablesample_clause(p)
+            }
+            fn insert_overwrite_partition(
+                &self,
+                t: &str,
+                f: &str,
+                q: &str,
+            ) -> AdapterResult<Vec<String>> {
+                TestDialect.insert_overwrite_partition(t, f, q)
+            }
+            fn regex_match_predicate(&self, c: &str, p: &str) -> AdapterResult<String> {
+                TestDialect.regex_match_predicate(c, p)
+            }
+            fn star_excluding(&self, c: &[&str]) -> Option<String> {
+                TestDialect.star_excluding(c)
+            }
+            fn catalog_kind(&self, catalog: &str) -> crate::traits::CatalogKind {
+                if catalog == "dl" {
+                    crate::traits::CatalogKind::DuckLake
+                } else {
+                    crate::traits::CatalogKind::reserved(catalog)
+                        .unwrap_or(crate::traits::CatalogKind::Native)
+                }
+            }
+        }
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        let compile = |catalog: &str| {
+            let t = TableRef {
+                catalog: catalog.into(),
+                ..table()
+            };
+            compile_quarantine_sql(
+                &assertions,
+                "orders",
+                &t,
+                &Kinded,
+                &split_config(),
+                &SourceColumns::read(Vec::new()),
+            )
+        };
+        for (catalog, needle) in [
+            ("dl", "attached DuckLake catalog"),
+            ("__ducklake_metadata_dl", "DuckLake metadata catalog"),
+        ] {
+            let err = compile(catalog).expect_err("refused");
+            assert!(matches!(err, QuarantineError::NotSupportedOnCatalog { .. }));
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+        assert!(compile("poc").unwrap().is_some());
+    }
+
     #[test]
     fn no_quarantinable_assertions_returns_none() {
         let cfg = split_config();

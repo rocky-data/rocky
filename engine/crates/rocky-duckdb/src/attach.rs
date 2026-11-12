@@ -195,6 +195,24 @@ fn check_stored_data_path(conn: &Connection, alias: &str) -> Result<(), DuckDbEr
     }
 }
 
+/// A Rocky message for DuckLake's refusal of a `DATA_PATH` that differs from
+/// the stored one: a lake is pinned to the absolute directory it was created
+/// in, so a moved project or another mount hits this. DuckLake's own hint
+/// (`OVERRIDE_DATA_PATH`) names an option Rocky does not offer.
+fn relocated_lake(alias: &str, err: &duckdb::Error) -> Option<DuckDbError> {
+    let cause = err.to_string();
+    cause
+        .contains("does not match existing data path")
+        .then(|| DuckDbError::AttachInvalid {
+            alias: alias.to_string(),
+            detail: format!(
+                "data_path does not match the data path this lake stored when it was created \
+                 ({cause}). A lake stays at the absolute directory it was created in; move the \
+                 data back, or set data_path to the stored one. Rocky never overrides it"
+            ),
+        })
+}
+
 /// The `ATTACH` statement for a DuckLake entry. `DATA_PATH` is omitted when
 /// unset; `OVERRIDE_DATA_PATH` is never sent, so DuckLake refuses a data
 /// path that differs from the one the catalog stored.
@@ -210,8 +228,7 @@ pub fn ducklake_attach_sql(alias: &str, paths: &DuckLakePaths) -> String {
     }
 }
 
-/// A driver error with every credential and every path of `entry` that
-/// could carry one replaced by `***`.
+/// A driver error with every S3 credential of `entry` replaced by `***`.
 fn redacted_cause(entry: &DuckDbAttach, err: &duckdb::Error) -> String {
     let mut cause = err.to_string();
     if let Some(s3) = entry.s3() {
@@ -285,8 +302,29 @@ fn own_database_file(conn: &Connection) -> Option<PathBuf> {
     .map(PathBuf::from)
 }
 
+/// Whether two paths name one existing file: the same device and inode on
+/// Unix (so a hard link or a symlink counts), the same canonical path
+/// elsewhere.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 /// Refuse a DuckLake metadata file that is the connection's own database
-/// file (compared after resolving symlinks, when both exist).
+/// file, also through a symlink or a hard link.
 fn check_metadata_is_not_own_file(
     conn: &Connection,
     alias: &str,
@@ -295,11 +333,7 @@ fn check_metadata_is_not_own_file(
     let Some(own) = own_database_file(conn) else {
         return Ok(());
     };
-    let same = match (std::fs::canonicalize(&own), std::fs::canonicalize(metadata)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    if same {
+    if same_file(&own, Path::new(metadata)) {
         return Err(DuckDbError::AttachInvalid {
             alias: alias.to_string(),
             detail: "metadata_path is the adapter's own database file; DuckLake metadata \
@@ -372,7 +406,10 @@ pub(crate) fn attach_catalogs(
                         .map_err(|e| failed("create the S3 secret", &e))?;
                 }
                 conn.execute_batch(&ducklake_attach_sql(alias, &paths))
-                    .map_err(|e| failed("attach the catalog", &e))?;
+                    .map_err(|e| {
+                        relocated_lake(alias, &e)
+                            .unwrap_or_else(|| failed("attach the catalog", &e))
+                    })?;
                 check_stored_data_path(conn, alias)?;
             }
         }
@@ -541,6 +578,61 @@ mod tests {
         assert!(is_stable_data_path("C:/lake/d"));
         #[cfg(unix)]
         assert!(is_stable_data_path("/w/d/"));
+    }
+
+    /// The stored-path check reads DuckLake's metadata catalog. A plain
+    /// in-memory database named like it stands in for a lake.
+    #[test]
+    fn a_lake_with_a_relative_stored_data_path_is_refused_and_detached() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "ATTACH ':memory:' AS dl; \
+             ATTACH ':memory:' AS __ducklake_metadata_dl; \
+             CREATE TABLE __ducklake_metadata_dl.main.ducklake_metadata (key VARCHAR, value VARCHAR); \
+             INSERT INTO __ducklake_metadata_dl.main.ducklake_metadata VALUES ('data_path', 'rel/')",
+        )
+        .unwrap();
+        let err = check_stored_data_path(&conn, "dl").expect_err("relative");
+        assert!(
+            err.to_string().contains("relative data path ('rel/')"),
+            "{err}"
+        );
+        let attached: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'dl'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attached, 0, "the lake is detached");
+
+        conn.execute_batch(
+            "ATTACH ':memory:' AS dl; \
+             UPDATE __ducklake_metadata_dl.main.ducklake_metadata SET value = 's3://b/d/'",
+        )
+        .unwrap();
+        assert!(check_stored_data_path(&conn, "dl").is_ok());
+    }
+
+    #[test]
+    fn the_own_database_file_is_refused_as_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("w.duckdb");
+        let conn = Connection::open(&own).unwrap();
+        let err = check_metadata_is_not_own_file(&conn, "dl", &own.to_string_lossy())
+            .expect_err("the same file");
+        assert!(err.to_string().contains("own database file"), "{err}");
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.ducklake");
+            std::os::unix::fs::symlink(&own, &link).unwrap();
+            assert!(check_metadata_is_not_own_file(&conn, "dl", &link.to_string_lossy()).is_err());
+            let hard = dir.path().join("hard.ducklake");
+            std::fs::hard_link(&own, &hard).unwrap();
+            assert!(check_metadata_is_not_own_file(&conn, "dl", &hard.to_string_lossy()).is_err());
+        }
+        let other = dir.path().join("m.ducklake");
+        assert!(check_metadata_is_not_own_file(&conn, "dl", &other.to_string_lossy()).is_ok());
     }
 
     #[test]

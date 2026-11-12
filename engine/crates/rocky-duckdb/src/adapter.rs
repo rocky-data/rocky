@@ -959,6 +959,33 @@ mod tests {
         assert!(adapter.is_missing_object_error(&missing), "{missing}");
     }
 
+    /// With an attachment, `list_tables` reads the own schema from the own
+    /// catalog only, and an attached schema from its catalog. A second
+    /// in-memory database stands in for the lake (no extension needed).
+    #[tokio::test]
+    async fn list_tables_keeps_the_own_and_attached_catalogs_apart() {
+        let mut adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "ATTACH ':memory:' AS lake",
+            "CREATE SCHEMA demo",
+            "CREATE TABLE demo.own_t (id INTEGER)",
+            "CREATE SCHEMA lake.demo",
+            "CREATE TABLE lake.demo.lake_t (id INTEGER)",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        adapter.dialect =
+            DuckDbSqlDialect::with_catalogs([("lake", rocky_core::traits::CatalogKind::DuckLake)]);
+        assert_eq!(
+            adapter.list_tables("memory", "demo").await.unwrap(),
+            vec!["own_t"]
+        );
+        assert_eq!(
+            adapter.list_tables("lake", "demo").await.unwrap(),
+            vec!["lake_t"]
+        );
+    }
+
     #[test]
     fn classify_lock_contention_is_transient() {
         for phrase in [

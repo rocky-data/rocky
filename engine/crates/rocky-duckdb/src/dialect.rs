@@ -83,7 +83,9 @@ impl DuckDbSqlDialect {
         Self {
             attached: catalogs
                 .into_iter()
-                .filter(|(_, kind)| *kind != CatalogKind::Native)
+                .filter(|(_, kind)| {
+                    matches!(kind, CatalogKind::IcebergRest | CatalogKind::DuckLake)
+                })
                 .map(|(c, kind)| (c.as_ref().to_ascii_lowercase(), kind))
                 .collect(),
         }
@@ -356,11 +358,16 @@ impl SqlDialect for DuckDbSqlDialect {
     fn table_replace(&self, catalog: &str) -> TableReplace {
         match self.catalog_kind(catalog) {
             CatalogKind::IcebergRest => TableReplace::InPlaceOverwrite,
-            CatalogKind::Native | CatalogKind::DuckLake => TableReplace::Atomic,
+            CatalogKind::Native | CatalogKind::DuckLake | CatalogKind::DuckLakeMetadata => {
+                TableReplace::Atomic
+            }
         }
     }
 
     fn catalog_kind(&self, catalog: &str) -> CatalogKind {
+        if let Some(reserved) = CatalogKind::reserved(catalog) {
+            return reserved;
+        }
         if self.attached.is_empty() {
             return CatalogKind::Native;
         }

@@ -49,6 +49,18 @@ pub async fn run_snapshot(
 
     // Build the snapshot config from pipeline config.
     let config = SnapshotConfig::from_pipeline_config(snapshot_cfg);
+
+    // ADR-ICEBERG-DUCKDB D4, ADR-DUCKLAKE D3: snapshots are not written to an
+    // attached catalog in v1.
+    let kind = dialect.catalog_kind(&config.target.catalog);
+    if kind != rocky_core::traits::CatalogKind::Native {
+        anyhow::bail!(
+            "snapshot is not supported on catalog '{}', {}; nothing was written",
+            config.target.catalog,
+            kind.describe()
+        );
+    }
+
     // The insert must enumerate the source columns. Use the warehouse's
     // existing schema description API before creating the target or writing rows.
     let source_columns = adapter
@@ -81,17 +93,6 @@ pub async fn run_snapshot(
         },
         "running snapshot"
     );
-
-    // ADR-ICEBERG-DUCKDB D4, ADR-DUCKLAKE D3: snapshots are not written to an
-    // attached catalog in v1.
-    let kind = dialect.catalog_kind(&config.target.catalog);
-    if kind != rocky_core::traits::CatalogKind::Native {
-        anyhow::bail!(
-            "snapshot is not supported on catalog '{}', {}; nothing was written",
-            config.target.catalog,
-            kind.describe()
-        );
-    }
 
     let mut steps: Vec<SnapshotStepOutput> = Vec::new();
 

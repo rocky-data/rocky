@@ -5977,16 +5977,18 @@ pub struct DuckDbDuckLakeAttach {
     /// the adapter's own `path` is. It must not be the adapter's own `path`,
     /// and it must not hold a `:` (v1 supports a local DuckDB file only).
     pub metadata_path: EnvString,
-    /// Where DuckLake writes the Parquet data files: a local directory or an
-    /// `s3://` prefix. A relative local path is made absolute when Rocky
+    /// Where DuckLake writes the Parquet data files: a local directory (an
+    /// `s3://` prefix is refused until it has a conformance case). A
+    /// relative path is made absolute when Rocky
     /// connects, because DuckLake stores it verbatim and would resolve it
     /// against each later process's working directory. When unset, DuckLake
     /// uses the path it stored when the catalog was created
     /// (`<metadata_path>.files/` for a new catalog).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<EnvString>,
-    /// Object-store credentials for an `s3://` `data_path`. Rocky turns them
-    /// into a temporary DuckDB secret; its scope defaults to `data_path`.
+    /// Object-store credentials for a future `s3://` `data_path`. Refused by
+    /// `rocky validate` today; the attach step would scope its secret to
+    /// `data_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3: Option<DuckDbAttachS3>,
 }
@@ -9776,24 +9778,22 @@ pub fn validate_duckdb_attachments(config: &RockyConfig) -> Vec<ConfigError> {
                              DuckLake metadata needs a file of its own"
                         ));
                     }
+                    // v1 writes a local data directory only: an object-store data
+                    // path has no conformance case yet (ADR-DUCKLAKE D1).
                     match a.data_path.as_ref().map(EnvString::expose) {
                         Some("") => invalid(format!("attach[{index}].data_path is empty")),
-                        Some(data) if data.contains("://") && !data.starts_with("s3://") => {
+                        Some(data) if data.contains("://") => {
                             invalid(format!(
-                                "attach[{index}].data_path '{data}': only a local directory or \
-                                 an s3:// prefix is supported"
+                                "attach[{index}].data_path '{data}': only a local directory is \
+                                 supported for a DuckLake catalog today"
                             ));
                         }
                         _ => {}
                     }
-                    if a.s3.is_some()
-                        && !a
-                            .data_path
-                            .as_ref()
-                            .is_some_and(|d| d.expose().starts_with("s3://"))
-                    {
+                    if a.s3.is_some() {
                         invalid(format!(
-                            "attach[{index}].s3 is set but data_path is not an s3:// prefix"
+                            "attach[{index}].s3: a DuckLake catalog takes a local data_path \
+                             only today, so it has no S3 secret"
                         ));
                     }
                 }
@@ -9806,9 +9806,12 @@ pub fn validate_duckdb_attachments(config: &RockyConfig) -> Vec<ConfigError> {
         let with_s3 = adapter.attach.iter().filter(|e| e.s3().is_some()).count();
         if with_s3 > 1 {
             for (index, entry) in adapter.attach.iter().enumerate() {
-                if let DuckDbAttach::Iceberg(a) = entry
-                    && a.s3.as_ref().is_some_and(|s3| s3.scope.is_none())
-                {
+                let unscoped = match entry {
+                    DuckDbAttach::Iceberg(a) => a.s3.as_ref().is_some_and(|s3| s3.scope.is_none()),
+                    // Its scope defaults to its data_path.
+                    DuckDbAttach::DuckLake(_) => false,
+                };
+                if unscoped {
                     invalid(format!(
                         "attach[{index}].s3 has no `scope`; with more than one attachment, \
                          each S3 secret needs one (for example scope = \"s3://<bucket>\")"
@@ -18538,11 +18541,15 @@ data_path = "lake/data/"
             ),
             (
                 DUCKLAKE_BLOCK.replace("lake/data/", "gs://bucket/x"),
-                "only a local directory or an s3://",
+                "only a local directory",
+            ),
+            (
+                DUCKLAKE_BLOCK.replace("lake/data/", "s3://bucket/x/"),
+                "only a local directory",
             ),
             (
                 format!("{DUCKLAKE_BLOCK}\n[adapter.attach.s3]\nkey_id = \"k\"\n"),
-                "data_path is not an s3://",
+                "has no S3 secret",
             ),
         ];
         for (toml_text, needle) in cases {

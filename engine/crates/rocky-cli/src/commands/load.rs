@@ -128,14 +128,17 @@ pub async fn run_load(
     // where a fresh in-memory loader would land staging in a separate DB).
     // ADR-ICEBERG-DUCKDB D4, ADR-DUCKLAKE D3: `rocky load` does not write to
     // an attached catalog in v1.
-    if let Some(a) = adapter_cfg
-        .attach
-        .iter()
-        .find(|a| a.alias().eq_ignore_ascii_case(target_catalog))
-    {
+    let kind = rocky_core::traits::CatalogKind::reserved(target_catalog).or_else(|| {
+        adapter_cfg
+            .attach
+            .iter()
+            .find(|a| a.alias().eq_ignore_ascii_case(target_catalog))
+            .map(rocky_core::config::DuckDbAttach::kind)
+    });
+    if let Some(kind) = kind {
         anyhow::bail!(
             "rocky load is not supported on catalog '{target_catalog}', {}; nothing was loaded",
-            a.kind().describe()
+            kind.describe()
         );
     }
     let loader: Box<dyn LoaderAdapter> = build_loader(adapter_name, adapter_cfg, &registry)?;

@@ -487,3 +487,41 @@ mod tests {
         assert_eq!(cell_as_i64(&marker.rows[0][0]), 2);
     }
 }
+
+#[cfg(test)]
+mod attached_catalog_tests {
+    use super::*;
+
+    /// A seed into an attached DuckLake catalog, or into a DuckLake metadata
+    /// catalog, is refused before any statement runs (ADR-DUCKLAKE D3): the
+    /// pre-hook that would fail if it ran never runs.
+    #[tokio::test]
+    async fn a_seed_into_a_non_native_catalog_is_refused_before_any_write() {
+        let adapter =
+            rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().expect("in-memory DuckDB");
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::with_catalogs([(
+            "dl",
+            rocky_core::traits::CatalogKind::DuckLake,
+        )]);
+        let seed = SeedFile {
+            name: "s".into(),
+            file_path: std::path::PathBuf::from("/nonexistent/s.csv"),
+            format: rocky_core::seeds::SeedFormat::default(),
+            config: rocky_core::seeds::SeedConfig {
+                pre_hook: vec!["SELECT error('the pre-hook ran')".into()],
+                ..Default::default()
+            },
+        };
+        for (catalog, needle) in [
+            ("dl", "attached DuckLake catalog"),
+            ("__ducklake_metadata_dl", "DuckLake metadata catalog"),
+        ] {
+            let err = load_single_seed(&seed, &dialect, &adapter, catalog, "main")
+                .await
+                .expect_err("refused");
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{msg}");
+            assert!(!msg.contains("pre-hook ran"), "{msg}");
+        }
+    }
+}

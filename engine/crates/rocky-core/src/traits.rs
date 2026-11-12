@@ -1191,6 +1191,10 @@ pub enum CatalogKind {
     IcebergRest,
     /// A DuckLake catalog attached to DuckDB (ADR-DUCKLAKE).
     DuckLake,
+    /// A name with DuckLake's hidden metadata-catalog prefix
+    /// (`__ducklake_metadata_<alias>`). Rocky never writes there, on any
+    /// dialect: it would edit a lake's own catalog tables.
+    DuckLakeMetadata,
 }
 
 impl CatalogKind {
@@ -1201,7 +1205,19 @@ impl CatalogKind {
             Self::Native => "a native catalog",
             Self::IcebergRest => "an attached Iceberg catalog",
             Self::DuckLake => "an attached DuckLake catalog",
+            Self::DuckLakeMetadata => "a DuckLake metadata catalog, which Rocky never writes",
         }
+    }
+
+    /// [`CatalogKind::DuckLakeMetadata`] when `catalog` has DuckLake's
+    /// metadata-catalog prefix (case-insensitive), else `None`. Every
+    /// [`SqlDialect::catalog_kind`] checks it first.
+    #[must_use]
+    pub fn reserved(catalog: &str) -> Option<Self> {
+        catalog
+            .to_ascii_lowercase()
+            .starts_with(crate::config::DUCKLAKE_METADATA_CATALOG_PREFIX)
+            .then_some(Self::DuckLakeMetadata)
     }
 }
 
@@ -1281,8 +1297,7 @@ pub trait SqlDialect: Send + Sync {
     /// [`CatalogKind::Native`] unless the dialect was configured with
     /// attachments (the DuckDB `[[adapter.<name>.attach]]` list).
     fn catalog_kind(&self, catalog: &str) -> CatalogKind {
-        let _ = catalog;
-        CatalogKind::Native
+        CatalogKind::reserved(catalog).unwrap_or(CatalogKind::Native)
     }
 
     /// `ALTER TABLE <from> RENAME TO <to>`, both formatted table refs in the
