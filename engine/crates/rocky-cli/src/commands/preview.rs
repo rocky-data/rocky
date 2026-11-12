@@ -3698,7 +3698,7 @@ mod tests {
     #[cfg(feature = "duckdb")]
     #[test]
     fn branch_schema_create_sql_duckdb_double_quotes() {
-        let duck = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let duck = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         assert_eq!(
             branch_schema_create_sql(&duck, "branch__x").unwrap(),
             "CREATE SCHEMA IF NOT EXISTS \"branch__x\""
@@ -4414,7 +4414,7 @@ mod tests {
 
         #[cfg(feature = "duckdb")]
         {
-            let duck = Recorder::new(rocky_duckdb::dialect::DuckDbSqlDialect);
+            let duck = Recorder::new(rocky_duckdb::dialect::DuckDbSqlDialect::plain());
             copy_into_branch(&duck, &by_name, "branch__x", &names(&["a", "c"]), &[]).await;
             assert_eq!(
                 &duck.log()[..1],

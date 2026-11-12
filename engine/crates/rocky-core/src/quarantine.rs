@@ -75,6 +75,17 @@ pub enum QuarantineError {
     )]
     TagNeedsSourceReplacement { dialect: &'static str },
 
+    /// Quarantine rebuilds tables by replace, which an in-place-overwrite
+    /// catalog does not offer (ADR-ICEBERG-DUCKDB D4).
+    #[error(
+        "quarantine is not supported on catalog '{catalog}' ({dialect}): it is an attached \
+         Iceberg catalog, which Rocky writes with full_refresh and append incremental only"
+    )]
+    NotSupportedOnCatalog {
+        dialect: &'static str,
+        catalog: String,
+    },
+
     /// The staged replace of the valid table could not be rendered.
     #[error(transparent)]
     Replace(Box<crate::replace::ReplaceError>),
@@ -404,9 +415,15 @@ fn compile_with_token(
     }
 
     let replace = dialect.table_replace(&table_ref.catalog);
+    if replace == TableReplace::InPlaceOverwrite {
+        return Err(QuarantineError::NotSupportedOnCatalog {
+            dialect: dialect.name(),
+            catalog: table_ref.catalog.clone(),
+        });
+    }
     if matches!(config.mode, QuarantineMode::Tag) {
         match replace {
-            TableReplace::Atomic => {}
+            TableReplace::Atomic | TableReplace::InPlaceOverwrite => {}
             TableReplace::StagedSwap => {
                 return Err(QuarantineError::TagNeedsSourceReplacement {
                     dialect: dialect.name(),
@@ -525,12 +542,10 @@ fn compile_with_token(
                 .collect::<Vec<_>>()
                 .join(" AND ");
             match replace {
-                TableReplace::Atomic => statements.push(build_valid_ctas(
-                    &valid_table,
-                    &source_table,
-                    &valid_where,
-                    dialect,
-                )),
+                // Refused above; kept with Atomic so the match stays total.
+                TableReplace::Atomic | TableReplace::InPlaceOverwrite => statements.push(
+                    build_valid_ctas(&valid_table, &source_table, &valid_where, dialect),
+                ),
                 // No atomic replace: build the valid rows under a stage name
                 // and swap it in (ADR-REPLACE). Run in order, a failure at
                 // any step leaves the previous valid table at its own name or

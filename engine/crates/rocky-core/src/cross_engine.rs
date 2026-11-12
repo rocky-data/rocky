@@ -532,6 +532,7 @@ mod tests {
             location: None,
             path: None,
             extension_directory: None,
+            attach: Vec::new(),
             offline: false,
             allow_sync_trigger: false,
             schemas: Vec::new(),

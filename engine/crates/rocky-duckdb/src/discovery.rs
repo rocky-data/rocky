@@ -49,7 +49,7 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
             "SELECT schema_name FROM information_schema.schemata \
              WHERE starts_with(schema_name, {}) \
              ORDER BY schema_name",
-            string_literal(&DuckDbSqlDialect, schema_prefix)
+            string_literal(&DuckDbSqlDialect::plain(), schema_prefix)
         );
         let schema_result = conn.execute_sql(&schema_sql).map_err(AdapterError::new)?;
 
@@ -68,7 +68,7 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
                 "SELECT table_name FROM information_schema.tables \
                  WHERE table_schema = {} AND table_type = 'BASE TABLE' \
                  ORDER BY table_name",
-                string_literal(&DuckDbSqlDialect, &schema)
+                string_literal(&DuckDbSqlDialect::plain(), &schema)
             );
             let table_result = conn.execute_sql(&table_sql).map_err(AdapterError::new)?;
 

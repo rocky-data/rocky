@@ -581,6 +581,22 @@ pub trait WarehouseAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Replace every row of the existing table `target` (a formatted table
+    /// ref) with the rows of `select_sql`, in one transaction that also
+    /// reconciles the table's columns with the query's
+    /// ([`TableReplace::InPlaceOverwrite`], ADR-ICEBERG-DUCKDB D3).
+    ///
+    /// Any failure rolls the transaction back and leaves the old table and
+    /// rows in place. `Ok(None)` means the adapter cannot do this; the
+    /// caller must then refuse, never fall back to a drop.
+    async fn overwrite_in_place(
+        &self,
+        _target: &str,
+        _select_sql: &str,
+    ) -> AdapterResult<Option<ExecutionStats>> {
+        Ok(None)
+    }
+
     /// Whether `object_kind` can distinguish table from view on this adapter.
     fn supports_object_kind_probe(&self) -> bool {
         false
@@ -1157,6 +1173,11 @@ pub enum TableReplace {
     /// No atomic replace: build a stage, then swap it in by rename
     /// ([`crate::replace::StagedSwap`]).
     StagedSwap,
+    /// No atomic replace and no rename in a write transaction (an Iceberg
+    /// catalog attached to DuckDB): reconcile the columns, delete every row
+    /// and insert the new ones, all in one transaction, through
+    /// [`WarehouseAdapter::overwrite_in_place`]. See ADR-ICEBERG-DUCKDB D3.
+    InPlaceOverwrite,
 }
 
 /// Generates warehouse-specific SQL syntax.

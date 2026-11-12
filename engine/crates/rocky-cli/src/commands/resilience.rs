@@ -372,7 +372,7 @@ mod tests {
                 remaining_transient_failures: std::sync::atomic::AtomicU32::new(
                     fail_transient_times,
                 ),
-                dialect: DuckDbSqlDialect,
+                dialect: DuckDbSqlDialect::plain(),
             }
         }
     }
@@ -711,7 +711,7 @@ mod tests {
                 classify_duckdb_failure(err)
             }
         }
-        let adapter = PermAdapter(DuckDbSqlDialect);
+        let adapter = PermAdapter(DuckDbSqlDialect::plain());
         let cfg = ResilienceConfig {
             initial_backoff_ms: 0,
             jitter: false,
@@ -913,7 +913,7 @@ mod tests {
                 FailureClass::Transient(TransientKind::Auth)
             }
         }
-        let adapter = AuthAdapter(DuckDbSqlDialect);
+        let adapter = AuthAdapter(DuckDbSqlDialect::plain());
         let cfg = ResilienceConfig {
             initial_backoff_ms: 0,
             jitter: false,

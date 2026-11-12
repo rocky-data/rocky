@@ -2556,7 +2556,7 @@ mod tests {
             "_rocky_shadow".to_string(),
         )?;
         let target = rocky_core::shadow::shadow_target(&model.to_model_ir().target, &shadow);
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let executed_target = rocky_core::traits::SqlDialect::format_table_ref(
             &dialect,
             &target.catalog,
@@ -2620,7 +2620,7 @@ mod tests {
         )?;
         assert_eq!(compiled.project.models.len(), 1);
         let model = &compiled.project.models[0];
-        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         let expected = super::super::plan::conditional_kind_drop_detail(
             model,
             &model.to_model_ir(),

@@ -9,6 +9,7 @@
 pub mod adapter;
 pub mod dialect;
 pub mod discovery;
+pub mod iceberg;
 pub mod loader;
 pub mod seed;
 pub mod test_harness;
@@ -58,6 +59,41 @@ pub enum DuckDbError {
         cause: String,
         build: String,
         build_dir: String,
+    },
+
+    /// A `[[adapter.<name>.attach]]` alias that cannot be attached.
+    #[error("attach '{alias}': {detail}")]
+    AttachInvalid { alias: String, detail: String },
+
+    /// Loading an extension, creating the secret, or the `ATTACH` failed.
+    #[error("attach '{alias}': could not {step}: {cause}")]
+    AttachFailed {
+        alias: String,
+        step: &'static str,
+        cause: String,
+    },
+
+    /// An in-place overwrite refused a column change; the table is unchanged.
+    #[error("full refresh of {target} refused, the table is unchanged: {detail}")]
+    InPlaceOverwrite { target: String, detail: String },
+
+    /// The `COMMIT` of an in-place overwrite failed in a way that does not
+    /// say whether the catalog applied it.
+    #[error(
+        "full refresh of {target}: COMMIT failed ({cause}); the catalog may have committed it, \
+         so check the table's latest snapshot. Running the model again is safe"
+    )]
+    InPlaceOverwriteCommitUncertain { target: String, cause: String },
+
+    /// An in-place overwrite failed and so did its `ROLLBACK`.
+    #[error(
+        "full refresh of {target} failed ({cause}) and its ROLLBACK failed too ({rollback}); \
+         check the table's latest snapshot before the next run"
+    )]
+    InPlaceOverwriteRollbackFailed {
+        target: String,
+        cause: String,
+        rollback: String,
     },
 
     #[error("DuckDB kind switch COMMIT failed; target state is uncertain: {0}")]
@@ -257,7 +293,7 @@ fn offline_extension_missing_message(
 }
 
 /// Quotes `value` as a SQL string literal.
-fn sql_literal(value: &str) -> String {
+pub(crate) fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
@@ -302,26 +338,37 @@ fn prepare_extensions(conn: &Connection, opts: &ExtensionOptions) -> Result<(), 
     // demand, so no statement can reach the network behind our back.
     conn.execute_batch("SET autoinstall_known_extensions = false")?;
     if let Err(err) = conn.execute_batch("LOAD icu") {
-        let directory = match configured {
-            Some(dir) => Some(dir.to_string_lossy().into_owned()),
-            None => Some(first_extension_directory(conn)).filter(|d| !d.is_empty()),
-        };
-        let (version, platform): (String, String) = conn
-            .query_row(
-                "SELECT version(), platform FROM pragma_platform()",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap_or_default();
-        return Err(DuckDbError::OfflineExtensionMissing {
-            extension: "icu",
-            directory,
-            cause: err.to_string(),
-            build_dir: format!("{version}/{platform}"),
-            build: format!("{version}, {platform}"),
-        });
+        return Err(offline_extension_missing(conn, configured, "icu", &err));
     }
     Ok(())
+}
+
+/// The [`DuckDbError::OfflineExtensionMissing`] for `extension`, naming the
+/// directory it was looked for in and the DuckDB build it must match.
+pub(crate) fn offline_extension_missing(
+    conn: &Connection,
+    configured: Option<&Path>,
+    extension: &'static str,
+    err: &duckdb::Error,
+) -> DuckDbError {
+    let directory = match configured {
+        Some(dir) => Some(dir.to_string_lossy().into_owned()),
+        None => Some(first_extension_directory(conn)).filter(|d| !d.is_empty()),
+    };
+    let (version, platform): (String, String) = conn
+        .query_row(
+            "SELECT version(), platform FROM pragma_platform()",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or_default();
+    DuckDbError::OfflineExtensionMissing {
+        extension,
+        directory,
+        cause: err.to_string(),
+        build_dir: format!("{version}/{platform}"),
+        build: format!("{version}, {platform}"),
+    }
 }
 
 /// Loads DuckDB's `icu` extension before the connection runs any statement.
@@ -547,6 +594,28 @@ impl DuckDbConnector {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Attach Iceberg catalogs to this connection; see
+    /// [`iceberg::attach_catalogs`]. `own_catalog` is the database's own
+    /// catalog name, which no alias may take.
+    ///
+    /// # Errors
+    ///
+    /// An invalid alias, a missing extension, or a failed secret or attach.
+    pub fn attach_catalogs(
+        &self,
+        entries: &[rocky_core::config::DuckDbAttach],
+        own_catalog: &str,
+        opts: &ExtensionOptions,
+    ) -> Result<(), DuckDbError> {
+        iceberg::attach_catalogs(
+            &self.conn,
+            entries,
+            own_catalog,
+            opts.configured_directory(),
+            opts.offline,
+        )
     }
 
     /// Executes a SQL statement without returning results.

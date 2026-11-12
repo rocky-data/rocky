@@ -1,0 +1,6 @@
+depends_on = ["orders"]
+
+[strategy]
+type = "incremental"
+timestamp_column = "ordered_at"
+

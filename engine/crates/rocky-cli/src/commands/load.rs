@@ -126,6 +126,18 @@ pub async fn run_load(
     // warehouse adapter's *shared* connector so the staging table the loader
     // writes is visible to `describe_table`/promote SQL (critical on DuckDB,
     // where a fresh in-memory loader would land staging in a separate DB).
+    // ADR-ICEBERG-DUCKDB D4: `rocky load` does not write to an attached
+    // Iceberg catalog in v1.
+    if adapter_cfg
+        .attach
+        .iter()
+        .any(|a| a.alias.eq_ignore_ascii_case(target_catalog))
+    {
+        anyhow::bail!(
+            "rocky load is not supported on catalog '{target_catalog}', an attached Iceberg \
+             catalog; nothing was loaded"
+        );
+    }
     let loader: Box<dyn LoaderAdapter> = build_loader(adapter_name, adapter_cfg, &registry)?;
 
     // The warehouse adapter is only needed for the staging-promote gate.

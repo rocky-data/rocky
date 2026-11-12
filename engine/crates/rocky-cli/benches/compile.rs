@@ -327,7 +327,7 @@ fn bench_dag_resolution(c: &mut Criterion) {
 
 fn bench_sql_generation(c: &mut Criterion) {
     let mut group = c.benchmark_group("sql_generation");
-    let dialect = DuckDbSqlDialect;
+    let dialect = DuckDbSqlDialect::plain();
 
     for size in [10, 100, 500] {
         // Pre-build replication IRs directly (no Plan intermediate).

@@ -1,0 +1,35 @@
+# DuckDB writing Iceberg tables through a REST catalog.
+#
+# The DuckDB adapter attaches a Lakekeeper REST catalog as `lk`. Models whose
+# target catalog is `lk` are written as Iceberg tables; their data files go
+# to a SeaweedFS S3 bucket. No credentials leave this machine: the catalog
+# runs with authorization off and the S3 keys are dummies.
+
+[adapter]
+type = "duckdb"
+
+[[adapter.attach]]
+alias = "lk"
+type = "iceberg"
+warehouse = "demo"
+endpoint = "${ICEBERG_ENDPOINT:-http://localhost:8181/catalog}"
+authorization = "none"
+
+[adapter.attach.s3]
+key_id = "${S3_KEY_ID:-rocky-poc}"
+secret = "${S3_SECRET:-rocky-poc-secret}"
+endpoint = "${S3_ENDPOINT:-localhost:8333}"
+url_style = "path"
+use_ssl = false
+region = "us-east-1"
+scope = "s3://warehouse"
+
+[pipeline.demo]
+type = "transformation"
+models = "models/**"
+
+[pipeline.demo.target]
+adapter = "default"
+
+[pipeline.demo.target.governance]
+auto_create_schemas = true

@@ -1,0 +1,5 @@
+depends_on = ["orders"]
+
+[strategy]
+type = "full_refresh"
+
