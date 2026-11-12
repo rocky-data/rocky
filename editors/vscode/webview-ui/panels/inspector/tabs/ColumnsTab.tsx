@@ -61,7 +61,7 @@ export function ColumnsTab({
   );
 
   // Profile this model's columns (distinct / null-rate) inline — the same
-  // DuckDB aggregate the Profile tab uses. DuckDB-only; degrades to "—".
+  // aggregate the Profile tab uses. Degrades to "—" when unavailable.
   useEffect(() => {
     let active = true;
     void getRpc()

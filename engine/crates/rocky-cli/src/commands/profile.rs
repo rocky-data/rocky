@@ -19,7 +19,8 @@ use rocky_core::traits::WarehouseAdapter;
 use crate::output::{ProfileColumnStats, ProfileOutput, print_json};
 
 use super::ai_contract::{
-    FallbackPolicy, PreparedKind, compile_project, prepare_table_query, profile_column, str_cell,
+    CellValues, FallbackPolicy, PreparedKind, compile_project, prepare_table_query, profile_column,
+    str_cell,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -200,8 +201,13 @@ pub async fn build_profile_output(
         // strict behaviour: any per-column error is a real problem.
         // `rocky profile` prints min/max/distinct to the user locally — no LLM
         // egress — so it always wants the full per-column values.
-        let result =
-            profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col, true).await;
+        let result = profile_column(
+            prepared.adapter.as_ref(),
+            &prepared.table_ref,
+            col,
+            CellValues::Included,
+        )
+        .await;
         let result = match result {
             Ok(p) if sample > 0 => sample_column_values(
                 prepared.adapter.as_ref(),
@@ -338,9 +344,14 @@ mod tests {
             data_type: RockyType::String,
             nullable: true,
         };
-        let profile = profile_column(adapter.as_ref(), "main.orders", &status_col, true)
-            .await
-            .expect("profile_column should succeed on duckdb");
+        let profile = profile_column(
+            adapter.as_ref(),
+            "main.orders",
+            &status_col,
+            CellValues::Included,
+        )
+        .await
+        .expect("profile_column should succeed on duckdb");
         assert_eq!(profile.rows, 3);
         assert_eq!(profile.distinct, 2);
         assert_eq!(profile.nulls, 0);
@@ -352,9 +363,14 @@ mod tests {
             data_type: RockyType::Int64,
             nullable: true,
         };
-        let id_profile = profile_column(adapter.as_ref(), "main.orders", &id_col, true)
-            .await
-            .unwrap();
+        let id_profile = profile_column(
+            adapter.as_ref(),
+            "main.orders",
+            &id_col,
+            CellValues::Included,
+        )
+        .await
+        .unwrap();
         assert_eq!(id_profile.rows, 3);
         assert_eq!(id_profile.nulls, 1);
     }

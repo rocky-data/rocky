@@ -1510,7 +1510,7 @@ class RockyResource(dg.ConfigurableResource):
         *,
         save: bool = False,
     ) -> AiContractOutput:
-        """AI-draft a data contract from a model's observed data (DuckDB only)."""
+        """AI-draft a data contract from a model's observed data."""
         with _translating():
             return self._get_client().ai_contract(model, save=save)
 

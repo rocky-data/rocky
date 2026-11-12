@@ -3793,7 +3793,7 @@ impl RockyMcpServer {
     /// Issues **aggregate statistics only** — `COUNT(*)`, `COUNT(col)`,
     /// `COUNT(DISTINCT col)` — and never selects `MIN`/`MAX` or a domain sample.
     /// No raw cell value leaves the machine; the prompt the LLM sees carries
-    /// counts, not data. This is the CLI's default (`with_data = false`); its
+    /// counts, not data. This is the CLI's default (`CellValues::Withheld`); its
     /// `--with-data` opt-in, which would send observed min/max and
     /// low-cardinality samples, is intentionally NOT exposed over MCP.
     /// `null_rate` + `distinct` are enough to draft the nullable / required /
@@ -3813,14 +3813,13 @@ impl RockyMcpServer {
 
         let mut columns = Vec::with_capacity(schema.len());
         for typed_col in schema {
-            // Statistics only (`with_data = false`): counts, never raw cell
-            // values, so nothing observable from the table's contents reaches
-            // the LLM prompt.
+            // Statistics only: counts, never raw cell values, so nothing
+            // observable from the table's contents reaches the LLM prompt.
             let profile = rocky_cli::commands::profile_column(
                 prepared.adapter.as_ref(),
                 &prepared.table_ref,
                 typed_col,
-                false,
+                rocky_cli::commands::CellValues::Withheld,
             )
             .await?;
             columns.push(profile);

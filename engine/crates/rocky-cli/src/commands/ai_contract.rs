@@ -426,6 +426,19 @@ fn dialect_table_ref(adapter: &dyn WarehouseAdapter, t: &rocky_ir::TableRef) -> 
         .map_err(|e| anyhow::anyhow!("invalid table reference '{}': {e}", display_table_name(t)))
 }
 
+/// Whether `sql_ref` resolves on the warehouse, by a zero-row query through
+/// the exact ref the profile will use. `describe_table` is not enough: an
+/// adapter may build its own differently-quoted ref for it (Snowflake's
+/// describe quotes, while a source's grounding ref does not), so a describe
+/// can pass for a ref that then fails to query, or fail for one that works.
+/// Zero rows, so it reads no data.
+async fn ref_resolves(adapter: &dyn WarehouseAdapter, sql_ref: &str) -> bool {
+    let sql = adapter
+        .dialect()
+        .select_limited("1 AS probe", &format!("FROM {sql_ref}"), 0);
+    adapter.execute_query(&sql).await.is_ok()
+}
+
 /// The dialect's grounding ref for a table Rocky did not create (a source):
 /// see [`first_existing_source`] for why it differs from [`dialect_table_ref`].
 fn grounding_table_ref(adapter: &dyn WarehouseAdapter, t: &rocky_ir::TableRef) -> Result<String> {
@@ -473,14 +486,24 @@ pub(crate) async fn prepare_table_query(
     };
 
     let adapter = registry.warehouse_adapter(&target_adapter)?;
-    // Validates every segment through the dialect before any query runs.
-    let target_ref = dialect_table_ref(adapter.as_ref(), &target)?;
     let target_name = display_table_name(&target);
+    // Validates every segment through the dialect before any query runs. A
+    // name this dialect cannot address (an empty BigQuery project, a catalog
+    // on ClickHouse) makes the profile unavailable, not an error.
+    let target_ref = match dialect_table_ref(adapter.as_ref(), &target) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(PreparedKind::Unavailable(format!(
+                "model '{model_name}' target '{target_name}' cannot be profiled on the \
+                 '{}' adapter: {e:#}",
+                resolved.adapter_type
+            )));
+        }
+    };
 
-    // Probe the model's declared target. We use `describe_table` rather than
-    // information_schema so the existence check goes through the adapter trait
-    // (works for any warehouse), and is cheap even on cold tables.
-    if adapter.describe_table(&target).await.is_ok() {
+    // Probe the model's declared target with the ref the profile will query,
+    // so "exists" means "the profile query resolves".
+    if ref_resolves(adapter.as_ref(), &target_ref).await {
         return Ok(PreparedKind::Ready(PreparedTable {
             adapter,
             table: target,
@@ -542,7 +565,7 @@ async fn first_existing_source(
         let Ok(sql_ref) = grounding_table_ref(adapter, &r) else {
             continue;
         };
-        if adapter.describe_table(&r).await.is_ok() {
+        if ref_resolves(adapter, &sql_ref).await {
             return Some((r, sql_ref));
         }
     }
@@ -568,20 +591,56 @@ async fn first_existing_source(
         let Ok(sql_ref) = grounding_table_ref(adapter, &table_ref) else {
             continue;
         };
-        if adapter.describe_table(&table_ref).await.is_ok() {
+        if ref_resolves(adapter, &sql_ref).await {
             return Some((table_ref, sql_ref));
         }
     }
     None
 }
 
-/// Read a `serde_json::Value` cell as a `u64`, tolerating string-encoded ints.
-fn as_u64(v: &serde_json::Value) -> u64 {
+/// Read a count cell as a `u64`, tolerating string-encoded and integral
+/// float values (`"17"`, `17.0`, `"17.0"`), which some warehouses return.
+///
+/// Anything else is an error, never 0: a row count read as 0 would show an
+/// empty table, and a null count that comes out 0 would back a draft
+/// `nullable = false` the data does not support.
+fn as_u64(v: &serde_json::Value) -> Option<u64> {
+    let integral = |f: f64| (f.is_finite() && f >= 0.0 && f.fract() == 0.0).then_some(f as u64);
     match v {
-        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
-        serde_json::Value::String(s) => s.parse().unwrap_or(0),
-        _ => 0,
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| n.as_f64().and_then(integral)),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            s.parse()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().and_then(integral))
+        }
+        _ => None,
     }
+}
+
+/// Read count cell `i` of a profile row, or say which one did not parse.
+fn count_cell(row: &[serde_json::Value], i: usize, what: &str, column: &str) -> Result<u64> {
+    let cell = row.get(i);
+    cell.and_then(as_u64).ok_or_else(|| {
+        anyhow::anyhow!(
+            "profile query for column '{column}' returned an unreadable {what}: {}",
+            cell.map_or_else(|| "nothing".to_string(), ToString::to_string)
+        )
+    })
+}
+
+/// Whether a profile may read raw cell values.
+///
+/// An enum, not a `bool`, so every caller names its egress choice: a stray
+/// `true` would send real values to the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellValues {
+    /// Aggregate counts only. No raw cell value is read. The MCP
+    /// `ai_contract` tool and `rocky ai-contract` without `--with-data`.
+    Withheld,
+    /// Also read `MIN`/`MAX` and a low-cardinality column's value list.
+    /// `rocky profile` and `rocky ai-contract --with-data`.
+    Included,
 }
 
 /// Read a `serde_json::Value` cell as a display string, mapping SQL NULL to
@@ -596,10 +655,10 @@ pub(crate) fn str_cell(v: Option<&serde_json::Value>) -> Option<String> {
 
 /// Profile one column.
 ///
-/// By default this issues only aggregate **statistics** queries
-/// (count / non-null / distinct count) — no raw cell values leave the machine.
-/// When `with_data` is `true` the caller has opted into sending observed cell
-/// values to the LLM, so it additionally captures `MIN`/`MAX` and (for
+/// With [`CellValues::Withheld`] this issues only aggregate **statistics**
+/// queries (count / non-null / distinct count) — no raw cell values leave the
+/// machine. With [`CellValues::Included`] the caller has opted into reading
+/// observed cell values, so it additionally captures `MIN`/`MAX` and (for
 /// low-cardinality columns) the observed domain values.
 ///
 /// SQL is built from the already-validated `table_ref` and a freshly-validated
@@ -615,8 +674,9 @@ pub async fn profile_column(
     adapter: &dyn WarehouseAdapter,
     table_ref: &str,
     typed_col: &TypedColumn,
-    with_data: bool,
+    values: CellValues,
 ) -> Result<ColumnProfile> {
+    let with_data = values == CellValues::Included;
     let col = rocky_sql::validation::validate_identifier(&typed_col.name)
         .map_err(|e| anyhow::anyhow!("invalid column identifier: {e}"))?;
 
@@ -645,9 +705,9 @@ pub async fn profile_column(
         anyhow::anyhow!("profile query returned no rows for '{}'", typed_col.name)
     })?;
 
-    let total = row.first().map(as_u64).unwrap_or(0);
-    let non_null = row.get(1).map(as_u64).unwrap_or(0);
-    let distinct = row.get(2).map(as_u64).unwrap_or(0);
+    let total = count_cell(row, 0, "row count", &typed_col.name)?;
+    let non_null = count_cell(row, 1, "non-null count", &typed_col.name)?;
+    let distinct = count_cell(row, 2, "distinct count", &typed_col.name)?;
     let nulls = total.saturating_sub(non_null);
     let null_rate = if total == 0 {
         0.0
@@ -807,7 +867,11 @@ pub async fn run_ai_contract(
             prepared.adapter.as_ref(),
             &prepared.table_ref,
             col,
-            with_data,
+            if with_data {
+                CellValues::Included
+            } else {
+                CellValues::Withheld
+            },
         )
         .await?;
         profiles.push(p);
@@ -964,10 +1028,23 @@ mod tests {
 
     #[test]
     fn as_u64_handles_number_and_string() {
-        assert_eq!(as_u64(&serde_json::json!(42)), 42);
-        assert_eq!(as_u64(&serde_json::json!("17")), 17);
-        assert_eq!(as_u64(&serde_json::json!(null)), 0);
-        assert_eq!(as_u64(&serde_json::json!("not-a-number")), 0);
+        assert_eq!(as_u64(&serde_json::json!(42)), Some(42));
+        assert_eq!(as_u64(&serde_json::json!("17")), Some(17));
+        assert_eq!(as_u64(&serde_json::json!(17.0)), Some(17));
+        assert_eq!(as_u64(&serde_json::json!(" 17.0 ")), Some(17));
+        // Never a silent 0: an unreadable count is an error upstream.
+        assert_eq!(as_u64(&serde_json::json!(null)), None);
+        assert_eq!(as_u64(&serde_json::json!("not-a-number")), None);
+        assert_eq!(as_u64(&serde_json::json!(1.5)), None);
+        assert_eq!(as_u64(&serde_json::json!(-3)), None);
+        let row = vec![serde_json::json!(10), serde_json::json!("x")];
+        assert_eq!(count_cell(&row, 0, "row count", "c").unwrap(), 10);
+        let err = count_cell(&row, 1, "non-null count", "c").unwrap_err();
+        assert!(
+            err.to_string().contains("unreadable non-null count"),
+            "{err}"
+        );
+        assert!(count_cell(&row, 2, "distinct count", "c").is_err());
     }
 
     #[test]
@@ -983,7 +1060,7 @@ mod tests {
 
     /// A stub warehouse on the Trino dialect, which double-quotes every
     /// segment in `format_table_ref` and leaves `ground_table_ref` unquoted.
-    /// `describe_table` succeeds only for the tables listed in `existing`.
+    /// Only a query naming a table in `existing` by its unquoted ref works.
     struct QuotingWarehouse {
         dialect: rocky_trino::TrinoDialect,
         existing: Vec<(String, String, String)>,
@@ -997,16 +1074,26 @@ mod tests {
         async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
             unimplemented!("not used")
         }
-        async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
-            unimplemented!("not used")
-        }
-        async fn describe_table(&self, t: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
-            let key = (t.catalog.clone(), t.schema.clone(), t.table.clone());
-            if self.existing.contains(&key) {
-                Ok(Vec::new())
+        /// Answers the zero-row probe only when it names an existing table
+        /// by its unquoted ref, the way a case-folding warehouse resolves a
+        /// source; a quoted ref never resolves here.
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            let hit = self
+                .existing
+                .iter()
+                .any(|(c, s, t)| sql.contains(&format!("FROM {c}.{s}.{t} ")));
+            if hit {
+                Ok(QueryResult {
+                    columns: vec!["probe".into()],
+                    rows: Vec::new(),
+                })
             } else {
                 Err(AdapterError::msg("no such table"))
             }
+        }
+        async fn describe_table(&self, _t: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            // Succeeds for everything: the probe must not trust it.
+            Ok(Vec::new())
         }
     }
 
@@ -1181,9 +1268,14 @@ adapter = "warehouse"
     #[tokio::test]
     async fn profile_column_without_data_sends_no_values() {
         let adapter = RecordingAdapter::new();
-        let profile = profile_column(&adapter, "main.orders", &col("status"), false)
-            .await
-            .expect("profile should succeed");
+        let profile = profile_column(
+            &adapter,
+            "main.orders",
+            &col("status"),
+            CellValues::Withheld,
+        )
+        .await
+        .expect("profile should succeed");
 
         let queries = adapter.recorded();
         assert_eq!(queries.len(), 1, "exactly one statistics query expected");
@@ -1279,9 +1371,14 @@ adapter = "warehouse"
         let adapter = WithDataAdapter {
             queries: Mutex::new(Vec::new()),
         };
-        let profile = profile_column(&adapter, "main.orders", &col("status"), true)
-            .await
-            .expect("profile should succeed");
+        let profile = profile_column(
+            &adapter,
+            "main.orders",
+            &col("status"),
+            CellValues::Included,
+        )
+        .await
+        .expect("profile should succeed");
 
         assert_eq!(profile.min.as_deref(), Some("active"));
         assert_eq!(profile.max.as_deref(), Some("inactive"));
