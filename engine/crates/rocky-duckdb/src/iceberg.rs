@@ -456,19 +456,26 @@ pub struct OverwriteReport {
 }
 
 /// Whether a driver error is the catalog refusing a commit because another
-/// writer committed first (Iceberg REST `409 Conflict` /
-/// `CommitFailedException`).
+/// writer committed first. DuckDB-Iceberg 2.0 reports two shapes, both
+/// measured against Lakekeeper:
+///
+/// - its own check: `Failed to commit Iceberg transaction: DELETE on "t"
+///   conflicts with a concurrent commit (scanned snapshot …)`;
+/// - the catalog's: `Failed to commit Iceberg transaction: Request to '…'
+///   returned a non-200 status code (Conflict_409). … CatalogCommitConflicts`.
+///
+/// Both start with the commit-failure prefix, so a failed statement inside
+/// the transaction (which never says that) is never retried.
 #[must_use]
 pub fn is_commit_conflict(err: &DuckDbError) -> bool {
     let DuckDbError::Database(e) = err else {
         return false;
     };
-    let message = e.to_string().to_ascii_lowercase();
-    message.contains("commitfailed")
-        || message.contains("commit failed")
-        || message.contains("commit conflict")
-        || message.contains("409 conflict")
-        || message.contains("http 409")
+    let message = e.to_string();
+    message.contains("Failed to commit Iceberg transaction")
+        && (message.contains("conflicts with a concurrent commit")
+            || message.contains("(Conflict_409)")
+            || message.contains("CatalogCommitConflicts"))
 }
 
 /// Replace every row of `target` with `select_sql`'s rows, reconciling the
@@ -819,7 +826,12 @@ mod tests {
     #[test]
     fn a_commit_conflict_runs_the_transaction_again() {
         let mut s = Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")])
-            .failing("COMMIT", "CommitFailedException: 409 Conflict");
+            .failing(
+                "COMMIT",
+                "TransactionContext Error: Failed to commit: Failed to commit Iceberg \
+                 transaction: DELETE on \"t\" conflicts with a concurrent commit (scanned \
+                 snapshot 1, now at 2); re-run the DELETE.",
+            );
         let report = overwrite_in_place(&mut s, "lk.s.t", "SELECT 1 AS a").unwrap();
         assert_eq!(report.attempts, 2);
         assert_eq!(
@@ -832,7 +844,12 @@ mod tests {
     fn commit_conflicts_stop_after_the_attempt_limit() {
         let mut s = Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")]);
         for _ in 0..COMMIT_CONFLICT_ATTEMPTS {
-            s = s.failing("COMMIT", "409 Conflict");
+            s = s.failing(
+                "COMMIT",
+                "Failed to commit: Failed to commit Iceberg transaction: Request to \
+                 'http://lk/catalog/v1' returned a non-200 status code (Conflict_409). \
+                 type: CatalogCommitConflicts",
+            );
         }
         let err = overwrite_in_place(&mut s, "lk.s.t", "SELECT 1 AS a").unwrap_err();
         assert!(is_commit_conflict(&err));
@@ -840,6 +857,21 @@ mod tests {
             s.log.iter().filter(|l| *l == "BEGIN TRANSACTION").count(),
             COMMIT_CONFLICT_ATTEMPTS as usize
         );
+    }
+
+    #[test]
+    fn only_a_commit_conflict_is_retried() {
+        for message in [
+            "Conversion Error: value 409 is out of range",
+            "Catalog Error: Column 'v' can't be altered (Conflict_409)",
+            "Failed to commit Iceberg transaction: Request returned a non-200 status code (Bad_Request_400)",
+        ] {
+            assert!(!is_commit_conflict(&db_error(message)), "{message}");
+        }
+        assert!(!is_commit_conflict(&DuckDbError::InPlaceOverwrite {
+            target: "t".into(),
+            detail: "CatalogCommitConflicts".into(),
+        }));
     }
 
     #[test]
