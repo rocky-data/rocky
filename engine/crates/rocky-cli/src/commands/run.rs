@@ -19675,6 +19675,10 @@ async fn process_table(
         },
     );
 
+    // ADR-ICEBERG-DUCKDB D4: on an attached Iceberg catalog, only the
+    // strategies v1 writes there pass, before any SQL runs.
+    sql_gen::refuse_on_in_place_catalog(&model_ir, dialect)?;
+
     let strategy_name;
     let sql = if use_full_refresh {
         strategy_name = "full_refresh";
@@ -19884,12 +19888,25 @@ async fn process_table(
             // ADR-ICEBERG-DUCKDB D4: a replication full refresh of an existing
             // Iceberg table is not in v1. The first copy (a plain CREATE) and
             // incremental appends are.
-            rocky_core::traits::TableReplace::InPlaceOverwrite => anyhow::bail!(
-                "table {}: a replication full_refresh of an existing table is not supported on \
-                 catalog '{}' (an attached Iceberg catalog); use strategy = \"incremental\"",
-                target_table.full_name(),
-                target_table.catalog
-            ),
+            rocky_core::traits::TableReplace::InPlaceOverwrite => {
+                // An incremental table lands here when it needs a rebuild: a
+                // drift the target cannot absorb, or no stored watermark.
+                let why = if matches!(strategy, MaterializationStrategy::FullRefresh) {
+                    "use strategy = \"incremental\"".to_string()
+                } else if drift_action.is_some() {
+                    "the schema drift needs a rebuild".to_string()
+                } else {
+                    "there is no stored watermark for it (a lost or new state store); \
+                     restore the state store, or drop the table to copy it again"
+                        .to_string()
+                };
+                anyhow::bail!(
+                    "table {}: a replication rebuild of an existing table is not supported on \
+                     catalog '{}' (an attached Iceberg catalog), and nothing was written: {why}",
+                    target_table.full_name(),
+                    target_table.catalog
+                )
+            }
             rocky_core::traits::TableReplace::StagedSwap => {
                 let names = rocky_core::replace::SwapNames::for_target(&target_table)
                     .map_err(anyhow::Error::from)?;
@@ -56021,5 +56038,240 @@ mod staged_swap_wiring_tests {
             "{:?}",
             wh.log()
         );
+    }
+}
+
+/// The run path's wiring of the in-place overwrite (ADR-ICEBERG-DUCKDB D3):
+/// on a catalog whose dialect says `InPlaceOverwrite`, a transformation full
+/// refresh of an existing table goes through `overwrite_in_place`, and a
+/// first build is a plain `CREATE TABLE … AS`. An in-memory DuckDB whose
+/// dialect treats its own `memory` catalog as an Iceberg catalog runs the
+/// real transaction, with no network.
+#[cfg(all(test, feature = "duckdb"))]
+mod in_place_overwrite_wiring_tests {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use rocky_core::models::load_model_pair;
+    use rocky_core::traits::{
+        AdapterError, AdapterResult, ExecutionStats, ObjectKind, QueryResult, SqlDialect,
+        WarehouseAdapter,
+    };
+    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+    use rocky_duckdb::dialect::DuckDbSqlDialect;
+    use rocky_ir::{ColumnInfo, TableRef};
+
+    struct LakeOnDuckDb {
+        inner: DuckDbWarehouseAdapter,
+        dialect: DuckDbSqlDialect,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl LakeOnDuckDb {
+        async fn new(setup: &[&str]) -> Self {
+            let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+            for sql in setup {
+                inner.execute_statement(sql).await.unwrap();
+            }
+            Self {
+                inner,
+                dialect: DuckDbSqlDialect::with_iceberg_catalogs(["memory"]),
+                log: Mutex::new(Vec::new()),
+            }
+        }
+        async fn ids(&self) -> Vec<String> {
+            let rows = self
+                .inner
+                .execute_query("SELECT id FROM memory.tgt.orders ORDER BY id")
+                .await
+                .unwrap();
+            rows.rows
+                .into_iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect()
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for LakeOnDuckDb {
+        fn dialect(&self) -> &dyn SqlDialect {
+            &self.dialect
+        }
+        async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+            self.log.lock().unwrap().push(sql.to_string());
+            self.inner.execute_statement(sql).await
+        }
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+        fn classify_failure(&self, e: &AdapterError) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(e)
+        }
+        async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+        fn supports_object_kind_probe(&self) -> bool {
+            true
+        }
+        async fn object_kind(&self, table: &TableRef) -> AdapterResult<ObjectKind> {
+            self.inner.object_kind(table).await
+        }
+        async fn overwrite_in_place(
+            &self,
+            target: &str,
+            select_sql: &str,
+        ) -> AdapterResult<Option<ExecutionStats>> {
+            self.log.lock().unwrap().push(format!("OVERWRITE {target}"));
+            self.inner.overwrite_in_place(target, select_sql).await
+        }
+    }
+
+    async fn run_model(
+        wh: &LakeOnDuckDb,
+        strategy: &str,
+        select: &str,
+    ) -> anyhow::Result<crate::output::MaterializationOutput> {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            format!(
+                "name = \"orders\"\n{strategy}\n\n[target]\n\
+                 catalog = \"memory\"\nschema = \"tgt\"\ntable = \"orders\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), select).unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders.sql"),
+            &dir.path().join("orders.toml"),
+            None,
+        )
+        .unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        super::execute_one_plain_model(&model, wh, wh.dialect(), "orders", Instant::now(), exec_ctx)
+            .await
+    }
+
+    const FULL: &str = "[strategy]\ntype = \"full_refresh\"";
+    const SETUP: [&str; 4] = [
+        "CREATE SCHEMA src",
+        "CREATE SCHEMA tgt",
+        "CREATE TABLE src.events AS SELECT * FROM (VALUES (1), (2)) t(id)",
+        "CREATE TABLE tgt.orders AS SELECT 99 AS id",
+    ];
+
+    #[tokio::test]
+    async fn an_existing_table_is_overwritten_in_place() {
+        let wh = LakeOnDuckDb::new(&SETUP).await;
+        run_model(&wh, FULL, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids().await, ["1", "2"]);
+        let log = wh.log();
+        assert!(
+            log.iter().any(|s| s == "OVERWRITE memory.tgt.orders"),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|s| s.contains("CREATE OR REPLACE TABLE") || s.starts_with("DROP")),
+            "no replace and no drop: {log:?}"
+        );
+    }
+
+    /// A model that reads its own target sees the old rows, as it does with
+    /// `CREATE OR REPLACE` elsewhere (red-team finding 1).
+    #[tokio::test]
+    async fn a_model_that_reads_its_own_target_keeps_the_old_rows() {
+        let wh = LakeOnDuckDb::new(&SETUP).await;
+        run_model(
+            &wh,
+            FULL,
+            "SELECT id FROM memory.tgt.orders UNION ALL SELECT 100 AS id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(wh.ids().await, ["99", "100"]);
+    }
+
+    #[tokio::test]
+    async fn a_first_build_is_a_plain_create() {
+        let wh = LakeOnDuckDb::new(&SETUP[..3]).await;
+        run_model(&wh, FULL, "SELECT id FROM src.events")
+            .await
+            .unwrap();
+        assert_eq!(wh.ids().await, ["1", "2"]);
+        let log = wh.log();
+        assert!(
+            log.iter()
+                .any(|s| s.starts_with("CREATE TABLE memory.tgt.orders AS")),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|s| s.starts_with("OVERWRITE")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_select_keeps_the_old_rows() {
+        let wh = LakeOnDuckDb::new(&SETUP).await;
+        run_model(&wh, FULL, "SELECT id FROM src.missing")
+            .await
+            .unwrap_err();
+        assert_eq!(wh.ids().await, ["99"]);
+    }
+
+    #[tokio::test]
+    async fn another_kind_of_object_is_never_dropped() {
+        let wh = LakeOnDuckDb::new(&[
+            SETUP[0],
+            SETUP[1],
+            SETUP[2],
+            "CREATE VIEW tgt.orders AS SELECT 7 AS id",
+        ])
+        .await;
+        // Even with the model's consent to drop the view, Rocky does not
+        // drop anything in an Iceberg catalog.
+        let err = run_model(
+            &wh,
+            "drop_existing_kind = \"view\"\n[strategy]\ntype = \"full_refresh\"",
+            "SELECT id FROM src.events",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("another kind of object"),
+            "{err:#}"
+        );
+        assert_eq!(wh.ids().await, ["7"]);
+    }
+
+    #[tokio::test]
+    async fn merge_is_refused_before_any_sql() {
+        let wh = LakeOnDuckDb::new(&SETUP).await;
+        let err = run_model(
+            &wh,
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]",
+            "SELECT id FROM src.events",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("merge is not supported on catalog 'memory'"),
+            "{err:#}"
+        );
+        assert_eq!(wh.ids().await, ["99"]);
+        assert!(wh.log().is_empty(), "{:?}", wh.log());
     }
 }

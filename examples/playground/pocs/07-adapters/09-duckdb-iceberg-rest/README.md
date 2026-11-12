@@ -26,14 +26,16 @@ Iceberg commit:
 
 ```
 BEGIN TRANSACTION
+  CREATE OR REPLACE TEMP TABLE temp.main.__rocky_overwrite AS <model SQL>
   ALTER TABLE … ADD / DROP / ALTER COLUMN … TYPE   (only when the model's columns changed)
   DELETE FROM lk.demo.orders
-  INSERT INTO lk.demo.orders BY NAME <model SQL>
+  INSERT INTO lk.demo.orders BY NAME SELECT * FROM temp.main.__rocky_overwrite
 COMMIT                       any failure → ROLLBACK, the old table and rows stay
 ```
 
 A re-run with no model change runs no `ALTER`. A change Iceberg cannot make
-in place (a narrowing, a nested type change, dropping a partition column) is
+in place (a narrowing, a nested type change, a new nested column, dropping a
+partition column) is
 refused and the table is left as it was.
 
 `rocky emit-sql` shows the same transaction without

@@ -104,6 +104,15 @@ An append and its watermark write are not one transaction. A crash between them 
 - A live conformance test runs against Lakekeeper and SeaweedFS in Docker (`rocky-duckdb/tests/iceberg_conformance.rs`, feature `iceberg-conformance`, `#[ignore]`). It runs in `.github/workflows/iceberg-conformance.yml`, path-filtered and non-required, plus a weekly schedule. Images are pinned by digest. Extensions are downloaded on each run: no cache action is pinned in this repository, and adding one is a separate supply-chain decision.
 - A credential-free POC sits in `examples/playground/pocs/07-adapters/`.
 
+### Amendments from implementation and red team (2026-11-12)
+
+- **Stage first.** The transaction starts with `CREATE OR REPLACE TEMP TABLE temp.main.__rocky_overwrite AS <select>` and inserts from it. Measured: `DELETE` then `INSERT … SELECT … FROM <target>` in one transaction reads the emptied table, so a model that reads its own target lost its old rows. A temporary table in the same transaction is allowed. "A full refresh reads nothing it wrote" is now true by construction.
+- **Nested columns.** DuckDB-Iceberg refuses `ADD COLUMN` of a nested type. Rocky refuses it before any write.
+- **Uncertain commit.** A `COMMIT` that fails and is not a recognised conflict is reported as possibly committed (`InPlaceOverwriteCommitUncertain`). A conflict is a certain refusal and is retried.
+- **Conflict messages.** Two shapes measured against Lakekeeper: DuckDB's own `conflicts with a concurrent commit`, and the catalog's `(Conflict_409) … CatalogCommitConflicts`. Only these, after `Failed to commit Iceberg transaction`, are retried.
+- **Secret scope.** With more than one attachment, each `s3` table must set `scope`.
+- **Replication.** Every replication strategy passes the same refusal as models. A rebuild of an existing table (drift, missing watermark) is refused with the reason.
+
 ## Consequences
 
 - Iceberg becomes a Rocky target with no vendor warehouse.

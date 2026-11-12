@@ -77,6 +77,14 @@ pub enum DuckDbError {
     #[error("full refresh of {target} refused, the table is unchanged: {detail}")]
     InPlaceOverwrite { target: String, detail: String },
 
+    /// The `COMMIT` of an in-place overwrite failed in a way that does not
+    /// say whether the catalog applied it.
+    #[error(
+        "full refresh of {target}: COMMIT failed ({cause}); the catalog may have committed it, \
+         so check the table's latest snapshot. Running the model again is safe"
+    )]
+    InPlaceOverwriteCommitUncertain { target: String, cause: String },
+
     /// An in-place overwrite failed and so did its `ROLLBACK`.
     #[error(
         "full refresh of {target} failed ({cause}) and its ROLLBACK failed too ({rollback}); \

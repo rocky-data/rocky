@@ -331,14 +331,15 @@ pub fn reconcile_columns(
     let mut widens = Vec::new();
     for (name, query_type) in query {
         let Some(table_type) = find(table, name) else {
-            let normalized = normalize_type(query_type);
-            // A nested type keeps its own spelling: normalising would also
-            // rewrite a struct field whose name is a type name.
-            let data_type = if is_nested(&normalized) {
-                query_type.clone()
-            } else {
-                normalized
-            };
+            let data_type = normalize_type(query_type);
+            // Measured on DuckDB 2.0: "ADD COLUMN for Nested Types not
+            // supported for Iceberg tables". Refused here, before any write.
+            if is_nested(&data_type) {
+                return Err(format!(
+                    "new column '{name}' is {query_type}; DuckDB cannot add a nested column to \
+                     an Iceberg table, so drop the table by hand to rebuild it"
+                ));
+            }
             adds.push(ColumnChange::Add {
                 name: name.clone(),
                 data_type,
@@ -517,7 +518,18 @@ pub fn overwrite_in_place<S: OverwriteSession>(
     }
 }
 
+/// The temporary table that holds the model's rows during the overwrite.
+/// One connection runs one overwrite at a time (the adapter holds its
+/// mutex), so one name is enough.
+pub const OVERWRITE_STAGE: &str = rocky_core::sql_gen::IN_PLACE_OVERWRITE_STAGE;
+
 /// One run of the transaction. Any error after `BEGIN` rolls it back.
+///
+/// The model's rows are materialised into [`OVERWRITE_STAGE`] before the
+/// `DELETE`, so a model that reads its own target sees the old rows, as it
+/// does with `CREATE OR REPLACE` on every other catalog. Measured on DuckDB
+/// 2.0: without the stage, `DELETE` then `INSERT … SELECT … FROM <target>`
+/// in one transaction reads the emptied table.
 fn overwrite_once<S: OverwriteSession>(
     session: &mut S,
     target: &str,
@@ -525,38 +537,67 @@ fn overwrite_once<S: OverwriteSession>(
 ) -> Result<Vec<String>, DuckDbError> {
     session.execute("BEGIN TRANSACTION")?;
     let mut statements = vec!["BEGIN TRANSACTION".to_string()];
+    let mut committing = false;
     let result = (|| {
+        // The newlines keep a trailing `-- comment` in the model SQL from
+        // swallowing what follows.
+        let stage = format!("CREATE OR REPLACE TEMP TABLE {OVERWRITE_STAGE} AS\n{select_sql}\n");
+        session.execute(&stage)?;
+        let mut body = vec![stage];
         let table = session.describe(target)?;
-        let query = session.describe(&format!("({select_sql})"))?;
+        let query = session.describe(OVERWRITE_STAGE)?;
         let changes =
             reconcile_columns(&table, &query).map_err(|detail| DuckDbError::InPlaceOverwrite {
                 target: target.to_string(),
                 detail,
             })?;
-        let mut body: Vec<String> = changes.iter().map(|c| alter_sql(target, c)).collect();
+        body.extend(changes.iter().map(|c| alter_sql(target, c)));
         body.push(format!("DELETE FROM {target}"));
-        body.push(format!("INSERT INTO {target} BY NAME\n{select_sql}"));
-        body.push("COMMIT".to_string());
-        for sql in &body {
+        body.push(format!(
+            "INSERT INTO {target} BY NAME\nSELECT * FROM {OVERWRITE_STAGE}"
+        ));
+        for sql in &body[1..] {
             session.execute(sql)?;
         }
+        committing = true;
+        session.execute("COMMIT")?;
+        body.push("COMMIT".to_string());
         Ok(body)
     })();
     match result {
         Ok(body) => {
             statements.extend(body);
+            // The stage is temporary; a failed drop only costs memory until
+            // the connection closes.
+            let _ = session.execute(&format!("DROP TABLE IF EXISTS {OVERWRITE_STAGE}"));
             Ok(statements)
         }
-        Err(err) => match session.execute("ROLLBACK") {
-            Ok(()) => Err(err),
-            // A failed statement or COMMIT has already ended the transaction.
-            Err(rollback) if rollback.to_string().contains("no transaction is active") => Err(err),
-            Err(rollback) => Err(DuckDbError::InPlaceOverwriteRollbackFailed {
-                target: target.to_string(),
-                cause: err.to_string(),
-                rollback: rollback.to_string(),
-            }),
-        },
+        Err(err) => {
+            let err = if committing && !is_commit_conflict(&err) {
+                // The catalog may have accepted a commit whose answer was
+                // lost; Rocky cannot tell. A conflict is a certain refusal.
+                DuckDbError::InPlaceOverwriteCommitUncertain {
+                    target: target.to_string(),
+                    cause: err.to_string(),
+                }
+            } else {
+                err
+            };
+            let outcome = match session.execute("ROLLBACK") {
+                Ok(()) => Err(err),
+                // A failed statement or COMMIT has already ended the transaction.
+                Err(rollback) if rollback.to_string().contains("no transaction is active") => {
+                    Err(err)
+                }
+                Err(rollback) => Err(DuckDbError::InPlaceOverwriteRollbackFailed {
+                    target: target.to_string(),
+                    cause: err.to_string(),
+                    rollback: rollback.to_string(),
+                }),
+            };
+            let _ = session.execute(&format!("DROP TABLE IF EXISTS {OVERWRITE_STAGE}"));
+            outcome
+        }
     }
 }
 
@@ -669,16 +710,11 @@ mod tests {
     }
 
     #[test]
-    fn a_new_nested_column_keeps_its_spelling() {
-        let changes =
-            reconcile_columns(&cols(&[]), &cols(&[("s", "STRUCT(smallint TINYINT)")])).unwrap();
-        assert_eq!(
-            changes,
-            vec![ColumnChange::Add {
-                name: "s".into(),
-                data_type: "STRUCT(smallint TINYINT)".into()
-            }]
-        );
+    fn a_new_nested_column_is_refused() {
+        for nested in ["STRUCT(x INTEGER)", "INTEGER[]", "MAP(VARCHAR, INTEGER)"] {
+            let err = reconcile_columns(&cols(&[]), &cols(&[("s", nested)])).unwrap_err();
+            assert!(err.contains("cannot add a nested column"), "{err}");
+        }
     }
 
     #[test]
@@ -741,7 +777,7 @@ mod tests {
         }
         fn describe(&mut self, relation: &str) -> Result<Vec<(String, String)>, DuckDbError> {
             self.log.push(format!("DESCRIBE {relation}"));
-            Ok(if relation.starts_with('(') {
+            Ok(if relation == OVERWRITE_STAGE {
                 self.query.clone()
             } else {
                 self.table.clone()
@@ -757,8 +793,9 @@ mod tests {
             report.statements,
             vec![
                 "BEGIN TRANSACTION",
+                "CREATE OR REPLACE TEMP TABLE temp.main.__rocky_overwrite AS\nSELECT 1 AS a\n",
                 "DELETE FROM lk.s.t",
-                "INSERT INTO lk.s.t BY NAME\nSELECT 1 AS a",
+                "INSERT INTO lk.s.t BY NAME\nSELECT * FROM temp.main.__rocky_overwrite",
                 "COMMIT"
             ]
         );
@@ -768,21 +805,25 @@ mod tests {
 
     #[test]
     fn every_failure_point_rolls_back() {
-        for prefix in ["ALTER TABLE", "DELETE", "INSERT", "COMMIT"] {
+        for prefix in [
+            "CREATE OR REPLACE TEMP",
+            "ALTER TABLE",
+            "DELETE",
+            "INSERT",
+            "COMMIT",
+        ] {
             let mut s = Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER"), ("b", "VARCHAR")])
                 .failing(prefix, "boom");
             let err = overwrite_in_place(&mut s, "lk.s.t", "SELECT 1 AS a, 'x' AS b").unwrap_err();
             assert!(err.to_string().contains("boom"), "{prefix}: {err}");
-            assert_eq!(
-                s.log.last().map(String::as_str),
-                Some("ROLLBACK"),
-                "{prefix}"
-            );
             let after = s.log.iter().position(|l| l.starts_with(prefix)).unwrap();
             assert_eq!(
-                after + 2,
-                s.log.len(),
-                "{prefix}: nothing ran after the failure"
+                s.log[after + 1..],
+                [
+                    "ROLLBACK".to_string(),
+                    format!("DROP TABLE IF EXISTS {OVERWRITE_STAGE}")
+                ],
+                "{prefix}: only the rollback and the stage drop ran after the failure"
             );
         }
     }
@@ -797,18 +838,48 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("DELETE") || l.starts_with("ALTER"))
         );
-        assert_eq!(s.log.last().map(String::as_str), Some("ROLLBACK"));
+        assert!(s.log.iter().any(|l| l == "ROLLBACK"));
     }
 
     #[test]
     fn no_active_transaction_on_rollback_keeps_the_first_error() {
         let mut s =
-            Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")]).failing("COMMIT", "boom");
+            Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")]).failing("INSERT", "boom");
         s.rollback_error =
             Some("TransactionContext Error: cannot rollback - no transaction is active".into());
         let err = overwrite_in_place(&mut s, "lk.s.t", "SELECT 1 AS a").unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
         assert!(matches!(err, DuckDbError::Database(_)));
+    }
+
+    #[test]
+    fn a_failed_commit_that_is_not_a_conflict_is_uncertain() {
+        let mut s = Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")])
+            .failing("COMMIT", "IO Error: connection reset");
+        let err = overwrite_in_place(&mut s, "lk.s.t", "SELECT 1 AS a").unwrap_err();
+        assert!(
+            matches!(err, DuckDbError::InPlaceOverwriteCommitUncertain { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("may have committed"), "{err}");
+    }
+
+    #[test]
+    fn the_stage_reads_the_model_before_the_delete() {
+        let mut s = Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")]);
+        overwrite_in_place(&mut s, "lk.s.t", "SELECT a FROM lk.s.t -- trailing note").unwrap();
+        let stage = s
+            .log
+            .iter()
+            .position(|l| l.starts_with("CREATE OR REPLACE TEMP"))
+            .unwrap();
+        let delete = s.log.iter().position(|l| l.starts_with("DELETE")).unwrap();
+        assert!(stage < delete);
+        assert!(
+            s.log[stage].ends_with("-- trailing note\n"),
+            "{}",
+            s.log[stage]
+        );
     }
 
     #[test]
@@ -825,13 +896,12 @@ mod tests {
 
     #[test]
     fn a_commit_conflict_runs_the_transaction_again() {
-        let mut s = Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")])
-            .failing(
-                "COMMIT",
-                "TransactionContext Error: Failed to commit: Failed to commit Iceberg \
+        let mut s = Scripted::new(&[("a", "INTEGER")], &[("a", "INTEGER")]).failing(
+            "COMMIT",
+            "TransactionContext Error: Failed to commit: Failed to commit Iceberg \
                  transaction: DELETE on \"t\" conflicts with a concurrent commit (scanned \
                  snapshot 1, now at 2); re-run the DELETE.",
-            );
+        );
         let report = overwrite_in_place(&mut s, "lk.s.t", "SELECT 1 AS a").unwrap();
         assert_eq!(report.attempts, 2);
         assert_eq!(

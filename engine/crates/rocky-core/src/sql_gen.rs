@@ -1050,10 +1050,14 @@ fn has_table_options(model_ir: &ModelIr) -> bool {
     redshift_table_options(model_ir).is_some() || clickhouse_table_options(model_ir).is_some()
 }
 
+/// The temporary table an in-place overwrite holds the model's rows in,
+/// so a model that reads its own target sees the old rows.
+pub const IN_PLACE_OVERWRITE_STAGE: &str = "temp.main.__rocky_overwrite";
+
 /// The statements `rocky plan` shows for an in-place overwrite of `target`
-/// (ADR-ICEBERG-DUCKDB D3). `rocky run` adds the column reconcile, decided
-/// from the live table, between `BEGIN` and `DELETE`. On a first build it
-/// runs `CREATE TABLE … AS` instead.
+/// (ADR-ICEBERG-DUCKDB D3), the same ones `rocky run` executes. `rocky run`
+/// adds the column reconcile, decided from the live table, before the
+/// `DELETE`. On a first build it runs `CREATE TABLE … AS` instead.
 #[must_use]
 pub fn in_place_overwrite_statements(
     dialect: &dyn SqlDialect,
@@ -1062,8 +1066,9 @@ pub fn in_place_overwrite_statements(
 ) -> Vec<String> {
     vec![
         "BEGIN TRANSACTION".to_string(),
+        format!("CREATE OR REPLACE TEMP TABLE {IN_PLACE_OVERWRITE_STAGE} AS\n{select_sql}\n"),
         format!("DELETE FROM {target}"),
-        dialect.insert_into(target, select_sql),
+        dialect.insert_into(target, &format!("SELECT * FROM {IN_PLACE_OVERWRITE_STAGE}")),
         "COMMIT".to_string(),
     ]
 }
@@ -4101,11 +4106,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         let d = InPlaceDialect(TestDialect);
         let stmts = generate_transformation_sql(&lake_ir(MaterializationStrategy::FullRefresh), &d)
             .unwrap();
-        assert_eq!(stmts.len(), 4);
+        assert_eq!(stmts.len(), 5);
         assert_eq!(stmts[0], "BEGIN TRANSACTION");
-        assert!(stmts[1].starts_with("DELETE FROM lk.silver.dim_accounts"));
-        assert!(stmts[2].contains("SELECT id, name, email"));
-        assert_eq!(stmts[3], "COMMIT");
+        assert!(stmts[1].contains("SELECT id, name, email"));
+        assert!(stmts[2].starts_with("DELETE FROM lk.silver.dim_accounts"));
+        assert!(stmts[3].contains(IN_PLACE_OVERWRITE_STAGE));
+        assert_eq!(stmts[4], "COMMIT");
         // No swap: the runner hands the query to `overwrite_in_place`.
         assert!(
             full_refresh_swap(&lake_ir(MaterializationStrategy::FullRefresh), &d)

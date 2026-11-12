@@ -821,7 +821,7 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             validation::validate_identifier(catalog).map_err(AdapterError::new)?;
             format!(
                 "SELECT table_name FROM information_schema.tables \
-                 WHERE table_catalog = '{catalog}' AND table_schema = '{schema}'"
+                 WHERE lower(table_catalog) = lower('{catalog}') AND table_schema = '{schema}'"
             )
         } else {
             format!(

@@ -41,7 +41,10 @@ fn attachment() -> DuckDbAttach {
         s3: Some(DuckDbAttachS3 {
             key_id: Some(EnvString::from_resolved("rocky-conformance")),
             secret: Some(RedactedString::new("rocky-conformance".to_string())),
-            endpoint: Some(EnvString::from_resolved(env_or("S3_ENDPOINT", "localhost:8333"))),
+            endpoint: Some(EnvString::from_resolved(env_or(
+                "S3_ENDPOINT",
+                "localhost:8333",
+            ))),
             url_style: Some(S3UrlStyle::Path),
             use_ssl: Some(false),
             region: Some(EnvString::from_resolved("us-east-1")),
@@ -92,10 +95,17 @@ async fn columns(a: &DuckDbWarehouseAdapter, table: &str) -> Vec<(String, String
 #[ignore = "needs a live Lakekeeper catalog and S3 store"]
 async fn full_refresh_overwrites_in_place_and_reconciles_columns() {
     let a = adapter();
-    assert_eq!(a.dialect().table_replace("lk"), TableReplace::InPlaceOverwrite);
+    assert_eq!(
+        a.dialect().table_replace("lk"),
+        TableReplace::InPlaceOverwrite
+    );
     assert_eq!(a.dialect().table_replace("memory"), TableReplace::Atomic);
     let schema = fresh_schema();
-    let create_schema = a.dialect().create_schema_sql("lk", &schema).unwrap().unwrap();
+    let create_schema = a
+        .dialect()
+        .create_schema_sql("lk", &schema)
+        .unwrap()
+        .unwrap();
     a.execute_statement(&create_schema).await.unwrap();
     let t = format!("lk.{schema}.t");
 
@@ -110,11 +120,17 @@ async fn full_refresh_overwrites_in_place_and_reconciles_columns() {
 
     // A re-run with the same query (UTINYINT comes back INTEGER) changes no
     // column.
-    a.overwrite_in_place(&t, "SELECT 2::INTEGER AS id, 'b' AS name, 2::UTINYINT AS small")
-        .await
-        .unwrap()
-        .expect("supported");
-    assert_eq!(rows(&a, &format!("SELECT id, name FROM {t}")).await, vec![vec!["2", "b"]]);
+    a.overwrite_in_place(
+        &t,
+        "SELECT 2::INTEGER AS id, 'b' AS name, 2::UTINYINT AS small",
+    )
+    .await
+    .unwrap()
+    .expect("supported");
+    assert_eq!(
+        rows(&a, &format!("SELECT id, name FROM {t}")).await,
+        vec![vec!["2", "b"]]
+    );
     assert_eq!(
         columns(&a, &t).await,
         vec![
@@ -124,8 +140,8 @@ async fn full_refresh_overwrites_in_place_and_reconciles_columns() {
         ]
     );
 
-    // Add a nested column, drop one, widen one.
-    a.overwrite_in_place(&t, "SELECT 3::BIGINT AS id, [1, 2] AS tags, 'c' AS name")
+    // Add a column, drop one, widen one.
+    a.overwrite_in_place(&t, "SELECT 3::BIGINT AS id, 'x' AS tag, 'c' AS name")
         .await
         .unwrap()
         .expect("supported");
@@ -134,10 +150,42 @@ async fn full_refresh_overwrites_in_place_and_reconciles_columns() {
         vec![
             ("id".into(), "BIGINT".into()),
             ("name".into(), "VARCHAR".into()),
-            ("tags".into(), "INTEGER[]".into())
+            ("tag".into(), "VARCHAR".into())
         ]
     );
-    assert_eq!(rows(&a, &format!("SELECT id, name FROM {t}")).await, vec![vec!["3", "c"]]);
+    assert_eq!(
+        rows(&a, &format!("SELECT id, name FROM {t}")).await,
+        vec![vec!["3", "c"]]
+    );
+
+    // DuckDB cannot add a nested column to an Iceberg table: refused before
+    // any write, the table unchanged.
+    let err = a
+        .overwrite_in_place(
+            &t,
+            "SELECT 4::BIGINT AS id, 'd' AS name, 'y' AS tag, [1] AS l",
+        )
+        .await
+        .expect_err("nested add");
+    assert!(err.to_string().contains("nested column"), "{err}");
+    assert_eq!(
+        rows(&a, &format!("SELECT id, name FROM {t}")).await,
+        vec![vec!["3", "c"]]
+    );
+
+    // A model that reads its own target sees the old rows; a trailing line
+    // comment does not break the statement.
+    a.overwrite_in_place(
+        &t,
+        &format!("SELECT id, name, tag FROM {t} UNION ALL SELECT 5, 'e', 'z' -- note"),
+    )
+    .await
+    .unwrap()
+    .expect("supported");
+    assert_eq!(
+        rows(&a, &format!("SELECT id FROM {t} ORDER BY id")).await,
+        vec![vec!["3"], vec!["5"]]
+    );
 }
 
 #[tokio::test]
@@ -160,7 +208,10 @@ async fn a_failed_overwrite_keeps_the_old_table_and_rows() {
         .await
         .expect_err("the insert overflows");
     assert!(err.to_string().contains("out of range"), "{err}");
-    assert_eq!(rows(&a, &format!("SELECT * FROM {t}")).await, vec![vec!["1"]]);
+    assert_eq!(
+        rows(&a, &format!("SELECT * FROM {t}")).await,
+        vec![vec!["1"]]
+    );
     assert_eq!(columns(&a, &t).await, vec![("id".into(), "INTEGER".into())]);
 
     // A narrowing is refused before any write.
@@ -197,5 +248,8 @@ async fn dropping_a_partition_column_is_refused_and_rolled_back() {
         .await
         .expect_err("the partition column cannot be dropped");
     assert!(err.to_string().contains("partition"), "{err}");
-    assert_eq!(rows(&a, &format!("SELECT id FROM {t}")).await, vec![vec!["1"]]);
+    assert_eq!(
+        rows(&a, &format!("SELECT id FROM {t}")).await,
+        vec![vec!["1"]]
+    );
 }

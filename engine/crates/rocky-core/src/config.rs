@@ -9652,6 +9652,19 @@ pub fn validate_duckdb_attachments(config: &RockyConfig) -> Vec<ConfigError> {
                 invalid(format!("attach[{index}].endpoint is empty"));
             }
         }
+        // An unscoped S3 secret covers every `s3://` path. With two, DuckDB
+        // could read one catalog's files with the other's key.
+        let with_s3 = adapter.attach.iter().filter(|e| e.s3.is_some()).count();
+        if with_s3 > 1 {
+            for (index, entry) in adapter.attach.iter().enumerate() {
+                if entry.s3.as_ref().is_some_and(|s3| s3.scope.is_none()) {
+                    invalid(format!(
+                        "attach[{index}].s3 has no `scope`; with more than one attachment, \
+                         each S3 secret needs one (for example scope = \"s3://<bucket>\")"
+                    ));
+                }
+            }
+        }
     }
     errors
 }
@@ -18280,6 +18293,14 @@ use_ssl = false
                      warehouse = \"w\"\nendpoint = \"http://x\"\n"
                 ),
                 "used by another",
+            ),
+            (
+                format!(
+                    "{ATTACH_BLOCK}\n[[adapter.attach]]\nalias = \"lk2\"\ntype = \"iceberg\"\n\
+                     warehouse = \"w\"\nendpoint = \"http://x\"\n[adapter.attach.s3]\n\
+                     scope = \"s3://b\"\n"
+                ),
+                "attach[0].s3 has no `scope`",
             ),
         ];
         for (toml_text, needle) in cases {
