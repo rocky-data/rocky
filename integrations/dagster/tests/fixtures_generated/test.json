@@ -21,18 +21,6 @@
   ],
   "diagnostics": [
     {
-      "severity": "Info",
-      "code": "I002",
-      "message": "1 column(s) have unknown types \u2014 provide source schemas for full type checking",
-      "span": {
-        "file": "models/revenue_summary.sql",
-        "line": 1,
-        "col": 1
-      },
-      "model": "revenue_summary",
-      "suggestion": null
-    },
-    {
       "severity": "Warning",
       "code": "W005",
       "message": "model 'raw_orders' has temporal column(s) (order_date) but no `freshness` block declared",

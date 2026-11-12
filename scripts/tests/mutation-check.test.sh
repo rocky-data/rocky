@@ -109,6 +109,11 @@ run_case "could not compile is inconclusive" \
 run_case "uncoded compiler error is inconclusive" \
     'error: linking with `cc` failed: exit status: 1' 1 3
 
+# A test that prints a diagnostic of its own in the compiler's shape (Rocky's
+# three-digit codes) still ran and failed: verdict 0.
+run_case "a test's own error[E012] output is a killed mutant" \
+    "error[E012]: column 'id' must be non-nullable per contract" 1 0
+
 # A test that still passes under mutation proves nothing: verdict 1.
 run_case "surviving mutant fails the check" "" 0 1
 

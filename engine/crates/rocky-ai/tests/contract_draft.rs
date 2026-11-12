@@ -140,3 +140,42 @@ async fn observed_nulls_still_send_e012_to_the_retry() {
     assert_eq!(drafted.attempts, 2, "E012 on observed NULLs is retried");
     assert!(drafted.unproven_non_null.is_empty());
 }
+
+/// The retry carries the rejected draft beside the diagnostics, so the LLM
+/// fixes what they name instead of rewriting the contract from the profile.
+#[tokio::test]
+async fn the_retry_shows_the_rejected_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(reply(&draft(false)))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(reply(&draft(true)))
+        .mount(&server)
+        .await;
+
+    draft_contract(&profile(7), &unknown_schema(), &client(&server), 3)
+        .await
+        .expect("the retry verifies");
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2);
+    let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let retry = body["messages"][1]["content"].as_str().unwrap();
+    assert!(retry.contains("E012"), "{retry}");
+    assert!(
+        retry.contains("The rejected contract was:") && retry.contains(&draft(false)),
+        "the retry names the rejected draft: {retry}"
+    );
+    // The first request carries Rocky's proof beside the observed counts.
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let evidence = first["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        evidence.contains("rocky_nullability=not proven non-null"),
+        "{evidence}"
+    );
+}

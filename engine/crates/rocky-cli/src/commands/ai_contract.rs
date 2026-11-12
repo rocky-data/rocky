@@ -5,6 +5,7 @@
 //! proposal is compile-verified against the model before it's accepted, so the
 //! reported contract is one `rocky compile` will accept.
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -110,13 +111,36 @@ pub(crate) fn compile_project(
     models_dir: &str,
     cache_ttl_override: Option<u64>,
 ) -> Result<CompileResult> {
+    compile_project_with_live(
+        config_path,
+        state_path,
+        models_dir,
+        cache_ttl_override,
+        &HashMap::new(),
+    )
+}
+
+/// [`compile_project`], with `live` source schemas laid over the cached ones.
+///
+/// `live` is what [`describe_leaf_sources`] read from the warehouse. A live
+/// entry replaces the cached entry of the same `schema.table`: the warehouse
+/// is the fresher answer. A leaf with no live entry keeps its cached schema,
+/// and a leaf with neither stays `Unknown`.
+pub(crate) fn compile_project_with_live(
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &str,
+    cache_ttl_override: Option<u64>,
+    live: &HashMap<String, Vec<TypedColumn>>,
+) -> Result<CompileResult> {
     // Present-but-unloadable `rocky.toml` refuses (#1625); absent still gives
     // a cold map.
-    let source_schemas = crate::source_schemas::load_project_source_schemas(
+    let mut source_schemas = crate::source_schemas::load_project_source_schemas(
         config_path,
         state_path,
         cache_ttl_override,
     )?;
+    overlay_live_schemas(&mut source_schemas, live);
 
     let config = CompilerConfig {
         models_dir: PathBuf::from(models_dir),
@@ -128,6 +152,192 @@ pub(crate) fn compile_project(
         ..Default::default()
     };
     compile(&config).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Leaf source schemas read live from the warehouse for one compile.
+#[derive(Debug, Default)]
+pub struct LiveLeafSchemas {
+    /// `schema.table` (as the model SQL spells it, lowercased) to the columns
+    /// the warehouse reported, typed by the same mapper the schema cache uses.
+    pub schemas: HashMap<String, Vec<TypedColumn>>,
+    /// Leaf reads Rocky could not describe, one entry each. Their columns stay
+    /// `Unknown` (or keep a cached schema when there is one).
+    pub unresolved: Vec<String>,
+}
+
+/// The tables the project's models read that no model writes: the leaves
+/// whose column types only the warehouse (or the schema cache) can supply.
+///
+/// Reads come from `rocky_sql::lineage::referenced_tables`, which lowercases
+/// them. A one-part name is a model reference (or unresolvable without a
+/// default schema) and is skipped. A two- or three-part name that matches a
+/// model's own `schema.table` target is that model, not a leaf, and is
+/// skipped too, the same rule as the `E045` missing-table check.
+///
+/// Only the reads of the models named in `scope` count (see
+/// [`live_describe_scope`]); every model's target still counts as written.
+pub fn leaf_source_reads(
+    models: &[rocky_core::models::Model],
+    scope: &HashSet<String>,
+) -> BTreeSet<String> {
+    let written: HashSet<String> = models
+        .iter()
+        .map(|m| {
+            format!(
+                "{}.{}",
+                m.config.target.schema.to_lowercase(),
+                m.config.target.table.to_lowercase()
+            )
+        })
+        .collect();
+    let mut leaves = BTreeSet::new();
+    for model in models.iter().filter(|m| scope.contains(&m.config.name)) {
+        let Ok(reads) = rocky_sql::lineage::referenced_tables(&model.sql) else {
+            continue;
+        };
+        for read in reads {
+            let parts: Vec<&str> = read.split('.').collect();
+            let two_part = match parts.as_slice() {
+                [s, t] | [_, s, t] => format!("{s}.{t}"),
+                _ => continue,
+            };
+            if written.contains(&two_part) {
+                continue;
+            }
+            leaves.insert(read);
+        }
+    }
+    leaves
+}
+
+/// Describe every leaf source of `models` through `adapter` and type the
+/// columns it reports.
+///
+/// The schema cache is filled only by a replication `rocky run` and by
+/// `rocky discover --with-schemas`, so in a transformation-only project every
+/// leaf column typechecks as `Unknown`. The contract validator then compares
+/// no declared type (`I003`) and can prove no column non-null (`E012`), and a
+/// wrong draft goes through. A command that already holds a warehouse
+/// connection reads the leaves' real schemas here instead.
+///
+/// Nothing is written: the result lives for one compile. A leaf whose
+/// describe fails, or comes back with no columns, is reported in
+/// [`LiveLeafSchemas::unresolved`] and stays `Unknown`. Rocky never guesses
+/// a leaf's type.
+///
+/// `nullable` is what the adapter reports. The cache stores the same field
+/// from the same adapters, so `E012` places no new trust in it.
+pub async fn describe_leaf_sources(
+    adapter: &dyn WarehouseAdapter,
+    models: &[rocky_core::models::Model],
+    scope: &HashSet<String>,
+) -> LiveLeafSchemas {
+    let mut out = LiveLeafSchemas::default();
+    for read in leaf_source_reads(models, scope) {
+        let parts: Vec<&str> = read.split('.').collect();
+        let (catalog, schema, table) = match parts.as_slice() {
+            [s, t] => ("", *s, *t),
+            [c, s, t] => (*c, *s, *t),
+            _ => continue,
+        };
+        let table_ref = rocky_ir::TableRef {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+        };
+        match adapter.describe_table(&table_ref).await {
+            Ok(columns) if !columns.is_empty() => {
+                let typed = columns
+                    .into_iter()
+                    .map(|c| TypedColumn {
+                        data_type: rocky_compiler::compile::default_type_mapper(&c.data_type),
+                        name: c.name,
+                        nullable: c.nullable,
+                    })
+                    .collect();
+                out.schemas.insert(read, typed);
+            }
+            Ok(_) => out
+                .unresolved
+                .push(format!("{read}: the warehouse reported no columns")),
+            Err(e) => out.unresolved.push(format!("{read}: {e}")),
+        }
+    }
+    out
+}
+
+/// The models whose leaf reads a live describe for `model_name` may type:
+/// the model itself and every model upstream of it, each kept only when every
+/// warehouse it runs on is the default pipeline's target adapter, the one the
+/// describe runs on.
+///
+/// A live entry replaces the cached entry for every model that reads the same
+/// table, so a leaf read by a model on another warehouse would be typed by the
+/// wrong warehouse. A model whose warehouses are unknown, or include another
+/// adapter, is left out and keeps its cached schema. A config that does not
+/// load gives an empty scope: no live describe at all.
+pub fn live_describe_scope(
+    config_path: &Path,
+    project: &rocky_compiler::project::Project,
+    model_name: &str,
+) -> HashSet<String> {
+    let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) else {
+        return HashSet::new();
+    };
+    let Ok((_, pipeline)) = crate::registry::resolve_pipeline(&cfg, None) else {
+        return HashSet::new();
+    };
+    let Some(adapter) = cfg.adapters.get(pipeline.target_adapter()) else {
+        return HashSet::new();
+    };
+    let targets = rocky_compiler::model_targets::ModelTargets::resolve(&cfg, config_path);
+    upstream_kept(project, model_name, |name| {
+        let on = targets.for_model(name);
+        !on.is_empty() && on.iter().all(|a| std::ptr::eq(*a, adapter))
+    })
+}
+
+/// `model_name` and every model upstream of it, through the resolved DAG,
+/// that `keep` accepts. The walk goes through a model `keep` refuses, so a
+/// model above it can still be kept.
+fn upstream_kept(
+    project: &rocky_compiler::project::Project,
+    model_name: &str,
+    keep: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    let deps: HashMap<&str, &[String]> = project
+        .dag_nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+        .collect();
+    let mut upstream = HashSet::new();
+    let mut stack = vec![model_name.to_string()];
+    while let Some(name) = stack.pop() {
+        if !upstream.insert(name.clone()) {
+            continue;
+        }
+        if let Some(parents) = deps.get(name.as_str()) {
+            stack.extend(parents.iter().cloned());
+        }
+    }
+    upstream.retain(|name| keep(name));
+    upstream
+}
+
+/// Lay `live` over `cached`: a live entry replaces the cached entry of the
+/// same key, compared without regard to ASCII case so a cached
+/// `Seeds.Orders` does not survive beside a live `seeds.orders`.
+pub fn overlay_live_schemas(
+    cached: &mut HashMap<String, Vec<TypedColumn>>,
+    live: &HashMap<String, Vec<TypedColumn>>,
+) {
+    if live.is_empty() {
+        return;
+    }
+    cached.retain(|key, _| !live.keys().any(|l| l.eq_ignore_ascii_case(key)));
+    for (key, columns) in live {
+        cached.insert(key.clone(), columns.clone());
+    }
 }
 
 /// A validated, DuckDB-runnable table reference plus the adapter to run it on.
@@ -461,18 +671,15 @@ pub async fn run_ai_contract(
 ) -> Result<()> {
     let client = make_client(config_path, model_name)?;
     let compile_result = compile_project(config_path, state_path, models_dir, cache_ttl_override)?;
-
-    // The model's inferred output schema — the basis for compile-verification.
-    let inferred_schema: Vec<TypedColumn> = compile_result
+    if !compile_result
         .type_check
         .typed_models
-        .get(model_name)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "model '{model_name}' not found in compiled project (or has no inferred schema)"
-            )
-        })?;
+        .contains_key(model_name)
+    {
+        anyhow::bail!(
+            "model '{model_name}' not found in compiled project (or has no inferred schema)"
+        );
+    }
 
     // Resolve the target table — refuses non-DuckDB adapters with a clear
     // message before any LLM tokens are spent. `Strict` policy: refuse if the
@@ -491,6 +698,41 @@ pub async fn run_ai_contract(
             anyhow::bail!(reason);
         }
     };
+
+    // Type the leaf sources from the warehouse this command is connected to,
+    // then compile again. Without this a transformation-only project has an
+    // empty schema cache, every leaf column is `Unknown`, and the validator
+    // checks no declared type and proves no column non-null.
+    let scope = live_describe_scope(config_path, &compile_result.project, model_name);
+    let live = describe_leaf_sources(
+        prepared.adapter.as_ref(),
+        &compile_result.project.models,
+        &scope,
+    )
+    .await;
+    let compile_result = if live.schemas.is_empty() {
+        compile_result
+    } else {
+        compile_project_with_live(
+            config_path,
+            state_path,
+            models_dir,
+            cache_ttl_override,
+            &live.schemas,
+        )?
+    };
+
+    // The model's inferred output schema — the basis for compile-verification.
+    let inferred_schema: Vec<TypedColumn> = compile_result
+        .type_check
+        .typed_models
+        .get(model_name)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model '{model_name}' not found in compiled project (or has no inferred schema)"
+            )
+        })?;
 
     // Egress notice: `rocky ai-contract` sends an LLM prompt to
     // api.anthropic.com. By default that prompt carries only aggregate
@@ -582,6 +824,7 @@ pub async fn run_ai_contract(
             unverified_types: drafted.unverified_types.clone(),
             unmatched_columns: drafted.unmatched_columns.clone(),
             unproven_non_null: drafted.unproven_non_null.clone(),
+            unresolved_sources: live.unresolved.clone(),
         };
         print_json(&output)?;
     } else {
@@ -598,6 +841,16 @@ pub async fn run_ai_contract(
                 drafted.unmatched_columns.len()
             );
             for message in &drafted.unmatched_columns {
+                println!("  - {message}");
+            }
+        }
+        if !live.unresolved.is_empty() {
+            println!();
+            println!(
+                "{} source table(s) could not be described, so their columns stay untyped:",
+                live.unresolved.len()
+            );
+            for message in &live.unresolved {
                 println!("  - {message}");
             }
         }
@@ -843,7 +1096,7 @@ adapter = "warehouse"
             model: "orders".to_string(),
             columns: vec![profile],
         };
-        let evidence = rocky_ai::contract::render_profile_evidence(&table);
+        let evidence = rocky_ai::contract::render_profile_evidence(&table, &[]);
         assert!(
             !evidence.contains("min="),
             "prompt must omit min: {evidence}"
@@ -928,6 +1181,225 @@ adapter = "warehouse"
                 .any(|q| q.to_uppercase().contains("DISTINCT CAST")),
             "with-data path must issue the domain query"
         );
+    }
+
+    /// A transformation project on DuckDB with a cold schema cache: the leaf
+    /// `raw.orders` is untyped from the cache alone, so the validator checks
+    /// no drafted type (`I003`) and proves no column non-null. Read live from
+    /// the warehouse, the same compile types every column, keeps the NOT
+    /// NULL proof, and refuses a wrong drafted type with `E011`. Nothing is
+    /// written to the state store.
+    #[tokio::test]
+    async fn live_leaf_schemas_type_a_cold_cache_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db_path = root.join("w.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t.target.governance]\nauto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("stg.sql"),
+            "SELECT id, LOWER(status) AS status, note FROM raw.orders",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("stg.toml"),
+            "[target]\ncatalog = \"w\"\nschema = \"main\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        // A second model reads the first by its qualified target: that read
+        // is a model, not a leaf, and is never described.
+        std::fs::write(models_dir.join("downstream.sql"), "SELECT id FROM main.stg").unwrap();
+        std::fs::write(
+            models_dir.join("downstream.toml"),
+            "depends_on = [\"stg\"]\n[target]\ncatalog = \"w\"\nschema = \"main\"\ntable = \"downstream\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let registry = crate::registry::AdapterRegistry::from_config(&cfg).unwrap();
+        let adapter = registry.warehouse_adapter("default").unwrap();
+        for stmt in [
+            "CREATE SCHEMA raw",
+            "CREATE TABLE raw.orders (id BIGINT NOT NULL, status VARCHAR NOT NULL, note VARCHAR)",
+            "INSERT INTO raw.orders VALUES (1, 'A', NULL)",
+        ] {
+            adapter.execute_statement(stmt).await.unwrap();
+        }
+        let state_path = root.join("state.redb");
+        let models = models_dir.to_str().unwrap();
+
+        let cold = compile_project(&config_path, &state_path, models, None).unwrap();
+        let cold_stg = &cold.type_check.typed_models["stg"];
+        assert!(
+            cold_stg
+                .iter()
+                .all(|c| c.data_type == rocky_compiler::types::RockyType::Unknown && c.nullable),
+            "a cold cache types nothing: {cold_stg:?}"
+        );
+        let scope = live_describe_scope(&config_path, &cold.project, "downstream");
+        assert_eq!(
+            scope,
+            HashSet::from(["downstream".to_string(), "stg".to_string()]),
+            "the drafted model and its upstream chain, all on the one warehouse"
+        );
+        assert_eq!(
+            live_describe_scope(&config_path, &cold.project, "stg"),
+            HashSet::from(["stg".to_string()]),
+            "a downstream model is not in the scope"
+        );
+        assert_eq!(
+            leaf_source_reads(&cold.project.models, &scope),
+            BTreeSet::from(["raw.orders".to_string()]),
+            "`main.stg` is a model's target, not a leaf"
+        );
+
+        let live = describe_leaf_sources(adapter.as_ref(), &cold.project.models, &scope).await;
+        assert!(live.unresolved.is_empty(), "{:?}", live.unresolved);
+        let warm =
+            compile_project_with_live(&config_path, &state_path, models, None, &live.schemas)
+                .unwrap();
+        let stg = &warm.type_check.typed_models["stg"];
+        let get = |name: &str| stg.iter().find(|c| c.name == name).unwrap();
+        use rocky_compiler::types::RockyType;
+        assert_eq!(
+            (&get("id").data_type, get("id").nullable),
+            (&RockyType::Int64, false)
+        );
+        assert_eq!(
+            (&get("status").data_type, get("status").nullable),
+            (&RockyType::String, false)
+        );
+        assert_eq!(
+            (&get("note").data_type, get("note").nullable),
+            (&RockyType::String, true)
+        );
+
+        // The validator now checks the drafted type instead of passing it.
+        let wrong: rocky_compiler::contracts::CompilerContract =
+            toml::from_str("[[columns]]\nname = \"id\"\ntype = \"String\"\n").unwrap();
+        let cold_diags = rocky_compiler::contracts::validate_contract("stg", cold_stg, &wrong);
+        assert!(cold_diags.iter().all(|d| !d.is_error()), "{cold_diags:?}");
+        let warm_diags = rocky_compiler::contracts::validate_contract("stg", stg, &wrong);
+        assert!(
+            warm_diags.iter().any(|d| &*d.code == "E011"),
+            "{warm_diags:?}"
+        );
+        assert!(!state_path.exists(), "the live read persists nothing");
+    }
+
+    /// A leaf the warehouse does not have is reported and stays untyped;
+    /// the compile does not fail.
+    #[tokio::test]
+    async fn an_undescribable_leaf_is_reported_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT a FROM nowhere.missing").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "[target]\ncatalog = \"w\"\nschema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        let compiled = compile_project(
+            &config_path,
+            &dir.path().join("state.redb"),
+            models_dir.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        let live = describe_leaf_sources(
+            &adapter,
+            &compiled.project.models,
+            &HashSet::from(["m".to_string()]),
+        )
+        .await;
+        assert!(live.schemas.is_empty());
+        assert_eq!(live.unresolved.len(), 1);
+        assert!(
+            live.unresolved[0].starts_with("nowhere.missing: "),
+            "{:?}",
+            live.unresolved
+        );
+    }
+
+    /// The scope follows the DAG upstream only, and leaves out a model the
+    /// filter refuses (one on another warehouse) without cutting off the
+    /// models above it. A model outside the scope adds no leaf.
+    #[test]
+    fn the_live_scope_is_the_upstream_chain_on_the_one_warehouse() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (name, sql, deps) in [
+            ("base", "SELECT a FROM raw.base", ""),
+            (
+                "mid",
+                "SELECT a FROM raw.elsewhere JOIN base USING (a)",
+                "\"base\"",
+            ),
+            ("top", "SELECT a FROM mid", "\"mid\""),
+            ("side", "SELECT a FROM raw.side", ""),
+        ] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "depends_on = [{deps}]\n[target]\ncatalog = \"w\"\nschema = \"main\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let compiled = compile_project(
+            &dir.path().join("rocky.toml"),
+            &dir.path().join("state.redb"),
+            models_dir.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let scope = upstream_kept(&compiled.project, "top", |name| name != "mid");
+        assert_eq!(
+            scope,
+            HashSet::from(["top".to_string(), "base".to_string()])
+        );
+        assert_eq!(
+            leaf_source_reads(&compiled.project.models, &scope),
+            BTreeSet::from(["raw.base".to_string()]),
+            "`raw.elsewhere` is read only by the refused model, `raw.side` by none in scope"
+        );
+    }
+
+    #[test]
+    fn a_live_entry_replaces_a_cached_one_whatever_its_case() {
+        use rocky_compiler::types::RockyType;
+        let col = |ty| {
+            vec![TypedColumn {
+                name: "id".into(),
+                data_type: ty,
+                nullable: true,
+            }]
+        };
+        let mut cached = HashMap::from([
+            ("Raw.Orders".to_string(), col(RockyType::String)),
+            ("raw.other".to_string(), col(RockyType::Date)),
+        ]);
+        let live = HashMap::from([("raw.orders".to_string(), col(RockyType::Int64))]);
+        overlay_live_schemas(&mut cached, &live);
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached["raw.orders"][0].data_type, RockyType::Int64);
+        assert_eq!(cached["raw.other"][0].data_type, RockyType::Date);
     }
 
     /// Live end-to-end: profiles a real DuckDB table and drafts a

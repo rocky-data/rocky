@@ -1,0 +1,9 @@
+{
+  "model": "stg_customers",
+  "exchanges": [
+    {
+      "request_sha256": "fbb3d49dd7ebf6a44c22e3bcdbb7eb5c5ec3924f42443f64a72bb5f90d9c124b",
+      "response_text": "[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"email\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"country\"\ntype = \"String\"\nnullable = true\n\n[[columns]]\nname = \"signup_date\"\ntype = \"Date\"\nnullable = false\n\n[[columns]]\nname = \"referral_code\"\ntype = \"String\"\nnullable = false\n\n[rules]\nrequired = [\"customer_id\", \"email\"]\nprotected = [\"customer_id\"]\n"
+    }
+  ]
+}

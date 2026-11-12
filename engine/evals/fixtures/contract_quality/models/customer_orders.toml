@@ -1,0 +1,1 @@
+depends_on = ["stg_customers", "stg_orders"]

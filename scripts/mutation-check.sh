@@ -169,7 +169,10 @@ if [ "$filter_rc" -gt 1 ]; then
     echo "that was not searched." >&2
     exit 3
 fi
-if grep -qE '^error(\[E[0-9]+\])?:|error: could not compile' "$filtered_log"; then
+# rustc codes have four digits (`error[E0308]`). A test may print its own
+# diagnostics in the same shape with fewer (Rocky's `error[E012]: ...`); those
+# are the test's output, not a broken build.
+if grep -qE '^error(\[E[0-9]{4}\])?:|error: could not compile' "$filtered_log"; then
     echo "mutation-check: INCONCLUSIVE — the mutation broke the build, so the test" >&2
     echo "never ran. Choose a mutation that still compiles (flip a condition to" >&2
     echo "\`false &&\`, change a constant) rather than one that deletes code." >&2
