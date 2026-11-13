@@ -20,8 +20,8 @@ Three modes share one path through the real `rocky` binary:
   stale answers. Replay proves the verify loop, the withholding and the scoring
   against fixed responses. It does not measure the prompt.
 * ``live``: the server forwards each request to the Anthropic API with the
-  caller's ``ANTHROPIC_API_KEY`` and records the exchange. This is the real
-  quality measurement.
+  caller's ``ANTHROPIC_API_KEY`` and records the exchange in the ``live``
+  recording set (see ``RECORDING_SETS``). This is the real quality measurement.
 * ``rehash``: replay the recorded response texts in order and rewrite each
   exchange's request hash. Use it only after an intentional prompt change, and
   say so in the PR: the rehashed responses were not written for the new prompt.
@@ -74,6 +74,32 @@ OUTCOMES = ("match", "unverified", "unclaimed", "overclaim", "underclaim")
 UPSTREAM = "https://api.anthropic.com"
 
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
+
+
+@dataclass(frozen=True)
+class RecordingSet:
+    """One set of recorded responses, its golden outcomes and its scorecard name."""
+
+    name: str
+    recordings: str
+    expected: str
+    output_stem: str
+
+
+# Two sets, both replayed in CI:
+#
+# * ``scripted``: hand-written responses that drive every path of the drafting
+#   loop (a type retry, a refused claim, an overclaim, withheld items, a fenced
+#   reply). A regression check of the harness and the compiler.
+# * ``live``: the responses from the last live run. A pin of real drafts.
+#
+# A live run writes only the ``live`` set, so it never overwrites the scripted one.
+RECORDING_SETS: dict[str, RecordingSet] = {
+    "scripted": RecordingSet("scripted", "recordings", "expected_replay.json", "contract_quality"),
+    "live": RecordingSet(
+        "live", "recordings_live", "expected_replay_live.json", "contract_quality_live"
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -460,11 +486,12 @@ def run_contract_quality(
     fixture_name: str = "contract_quality",
     mode: str = "replay",
     recordings_dir: Path | None = None,
+    recording_set: str = "scripted",
 ) -> dict:
     """Draft and score a contract for every model in the fixture's answer key."""
     fixture = _FIXTURES_DIR / fixture_name
     key = load_answer_key(fixture / "answer_key.toml")
-    recordings = Recordings(recordings_dir or fixture / "recordings")
+    recordings = Recordings(recordings_dir or fixture / RECORDING_SETS[recording_set].recordings)
     api_key = os.environ.get("ANTHROPIC_API_KEY") if mode == "live" else None
     if mode == "live" and not api_key:
         raise RuntimeError("live mode needs ANTHROPIC_API_KEY")
@@ -505,6 +532,7 @@ def run_contract_quality(
         "suite": "contract_quality",
         "fixture": fixture_name,
         "mode": mode,
+        "recording_set": recording_set,
         "rocky_version": _rocky_version(rocky_bin),
         **summary,
         "models": [
@@ -533,7 +561,8 @@ def render_markdown(card: dict) -> str:
     t = card["totals"]
     line = card["pass_line"]
     lines = [
-        f"# Contract quality — {card['fixture']} ({card['mode']})",
+        f"# Contract quality — {card['fixture']} ({card['mode']}, "
+        f"{card.get('recording_set', 'scripted')} recordings)",
         "",
         f"**{'PASS' if card['passed'] else 'FAIL'}** — {t['match']}/{card['items']} matched "
         f"(need >= {line['min_matched']}), {t['overclaim']} overclaim(s) accepted "
@@ -586,17 +615,46 @@ def outcome_map(card: dict) -> dict[str, str]:
     }
 
 
-def main(mode: str, output_dir: Path, fixture_name: str = "contract_quality") -> int:
-    """Run the contract-quality eval; write ``contract_quality.{json,md}``.
+def resolve_sets(mode: str, requested: str | None) -> list[str]:
+    """The recording sets a run covers.
+
+    ``replay`` and ``rehash`` cover both sets unless one is named. ``live``
+    writes only the ``live`` set: a live run must never overwrite the
+    hand-written ``scripted`` responses.
+    """
+    if mode == "live":
+        if requested not in (None, "live"):
+            raise ValueError("a live run records only the `live` set")
+        return ["live"]
+    if requested in (None, "all"):
+        return list(RECORDING_SETS)
+    return [requested]
+
+
+def main(
+    mode: str,
+    output_dir: Path,
+    fixture_name: str = "contract_quality",
+    recording_set: str | None = None,
+) -> int:
+    """Run the contract-quality eval once per recording set.
+
+    Each set writes ``<output_stem>.{json,md}``: ``contract_quality`` for the
+    scripted set, ``contract_quality_live`` for the live set.
 
     Exit codes: in ``replay`` mode the run is deterministic, so it gates: it
-    fails (1) when a model errored or when any item's outcome differs from
-    ``expected_replay.json`` next to the answer key. ``live`` and ``rehash``
-    never gate on the score (a fail is data, as in the agent suite); they
-    fail only when the harness itself could not run.
+    fails (1) when a model errored or when any item's outcome differs from the
+    set's expected file next to the answer key. ``live`` and ``rehash`` never
+    gate on the score (a fail is data, as in the agent suite); they fail only
+    when the harness itself could not run.
     """
     from harness.environ import resolve_rocky_bin
 
+    try:
+        sets = resolve_sets(mode, recording_set)
+    except ValueError as e:
+        print(f"contract-quality: {e}")
+        return 1
     rocky_bin = resolve_rocky_bin()
     if rocky_bin is None:
         print(
@@ -604,28 +662,39 @@ def main(mode: str, output_dir: Path, fixture_name: str = "contract_quality") ->
             "(set $ROCKY_BIN or build it with `cargo build` in engine/)"
         )
         return 1
+    status = 0
+    for name in sets:
+        status = max(status, _run_set(rocky_bin, mode, output_dir, fixture_name, name))
+    return status
+
+
+def _run_set(rocky_bin: Path, mode: str, output_dir: Path, fixture_name: str, set_name: str) -> int:
+    spec = RECORDING_SETS[set_name]
     try:
-        card = run_contract_quality(rocky_bin, fixture_name=fixture_name, mode=mode)
+        card = run_contract_quality(
+            rocky_bin, fixture_name=fixture_name, mode=mode, recording_set=set_name
+        )
     except RuntimeError as e:
-        print(f"contract-quality: {e}")
+        print(f"contract-quality ({set_name}): {e}")
         return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "contract_quality.json").write_text(json.dumps(card, indent=2) + "\n")
+    (output_dir / f"{spec.output_stem}.json").write_text(json.dumps(card, indent=2) + "\n")
     markdown = render_markdown(card)
-    (output_dir / "contract_quality.md").write_text(markdown)
+    (output_dir / f"{spec.output_stem}.md").write_text(markdown)
     print(markdown)
 
     errored = [m["model"] for m in card["models"] if m["error"]]
     if mode != "replay":
         if mode == "live":
             print(
-                "Live run recorded. Commit the recordings and this scorecard together; "
-                "then refresh expected_replay.json with --contract-quality-update-expected."
+                f"Live run recorded in {spec.recordings}/. Commit the recordings with this "
+                f"scorecard; then run a replay and refresh {spec.expected} with "
+                "--contract-quality-update-expected."
             )
         return 1 if errored and mode == "rehash" else 0
 
-    expected_path = _FIXTURES_DIR / fixture_name / "expected_replay.json"
+    expected_path = _FIXTURES_DIR / fixture_name / spec.expected
     expected = json.loads(expected_path.read_text()) if expected_path.is_file() else {}
     actual = outcome_map(card)
     drift = sorted(
@@ -634,21 +703,35 @@ def main(mode: str, output_dir: Path, fixture_name: str = "contract_quality") ->
         if expected.get(k) != actual.get(k)
     )
     if errored:
-        print(f"contract-quality: replay errored for {', '.join(errored)}")
+        print(f"contract-quality ({set_name}): replay errored for {', '.join(errored)}")
     if drift:
-        print("contract-quality: replay outcomes drifted from expected_replay.json:")
+        print(f"contract-quality ({set_name}): replay outcomes drifted from {spec.expected}:")
         for line in drift:
             print(f"  - {line}")
     return 1 if errored or drift else 0
 
 
-def update_expected(output_dir: Path, fixture_name: str = "contract_quality") -> int:
-    """Write the last replay scorecard's outcomes to ``expected_replay.json``."""
-    card = json.loads((output_dir / "contract_quality.json").read_text())
-    if card["mode"] != "replay":
-        print("contract-quality: run a replay first; only a replay scorecard is a golden")
-        return 1
-    path = _FIXTURES_DIR / fixture_name / "expected_replay.json"
-    path.write_text(json.dumps(dict(sorted(outcome_map(card).items())), indent=2) + "\n")
-    print(f"wrote {path}")
-    return 0
+def update_expected(
+    output_dir: Path, fixture_name: str = "contract_quality", recording_set: str | None = None
+) -> int:
+    """Write each set's last replay scorecard outcomes to that set's expected file."""
+    status = 0
+    for name in resolve_sets("replay", recording_set):
+        spec = RECORDING_SETS[name]
+        scorecard = output_dir / f"{spec.output_stem}.json"
+        if not scorecard.is_file():
+            print(f"contract-quality ({name}): no scorecard at {scorecard}; run a replay first")
+            status = 1
+            continue
+        card = json.loads(scorecard.read_text())
+        if card["mode"] != "replay" or card.get("recording_set", "scripted") != name:
+            print(
+                f"contract-quality ({name}): run a replay first; "
+                "only a replay scorecard is a golden"
+            )
+            status = 1
+            continue
+        path = _FIXTURES_DIR / fixture_name / spec.expected
+        path.write_text(json.dumps(dict(sorted(outcome_map(card).items())), indent=2) + "\n")
+        print(f"wrote {path}")
+    return status

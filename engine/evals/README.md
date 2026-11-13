@@ -146,8 +146,10 @@ fixtures/contract_quality ──copy──▶ temp project
    for each model in answer_key.toml:
        rocky ai-contract <model> --output json
            └─ ROCKY_AI_BASE_URL ──▶ local server ──replay──▶ recordings/<model>.json
-                                                 └─live────▶ api.anthropic.com (recorded)
-       drafted contract ──score──▶ results/contract_quality.{json,md}
+                                                 │           recordings_live/<model>.json
+                                                 └─live────▶ api.anthropic.com
+                                                             (recorded to recordings_live/)
+       drafted contract ──score──▶ results/contract_quality{,_live}.{json,md}
 ```
 
 The fixture is a DuckDB transformation pipeline over three raw tables with
@@ -176,20 +178,29 @@ column left out of `required` / `protected` is not safe: the contract no
 longer stops that column being dropped. (Splitting "wrong" by direction was
 an advisor ruling of 2026-11-11; Hugo to confirm.)
 
+There are two recording sets. CI replays both.
+
+| set | recordings | golden | scorecard | what it proves |
+|---|---|---|---|---|
+| `scripted` | `recordings/` | `expected_replay.json` | `results/contract_quality.{json,md}` | Written **by hand** to drive every path of the drafting loop: a type retry, a refused claim, an overclaim, withheld items, a fenced reply (see `recordings/README.md`). A regression check of the harness and the compiler. |
+| `live` | `recordings_live/` | `expected_replay_live.json` | `results/contract_quality_live.{json,md}` | The real responses of the last live run (see `recordings_live/README.md`). Pins real drafts, but covers only the paths that run took. |
+
+`--contract-quality-set scripted|live|all` picks a set. Without it, `replay`
+and `rehash` cover both sets, and `live` records only the `live` set.
+
 The three modes:
 
-- **`replay`** (default) answers each request from `recordings/<model>.json`.
+- **`replay`** (default) answers each request from the set's recordings.
   Each recorded exchange stores the SHA-256 of the request it answered. A
   request that does not match fails the run, so a changed prompt never scores
-  against stale answers. The recordings in the repo were **written by hand**
-  to exercise every outcome (see `recordings/README.md`), so the replay score
-  is a regression check, not a quality measurement. Replay gates: every item's
-  outcome must equal `expected_replay.json`, or the run exits 1.
+  against stale answers. Replay gates: every item's outcome must equal the
+  set's golden file, or the run exits 1.
 - **`live`** forwards each request to the Anthropic API with
-  `ANTHROPIC_API_KEY` and overwrites the recordings with the real responses.
-  This is the quality measurement. It never gates on the score. Commit the
-  recordings with the scorecard they produced, then run a replay and
-  `--contract-quality-update-expected` so CI pins the real responses.
+  `ANTHROPIC_API_KEY` and overwrites `recordings_live/` with the real
+  responses. It never touches `recordings/`. This is the quality measurement.
+  It never gates on the score. Commit the recordings with the scorecard they
+  produced, then run a replay and `--contract-quality-update-expected` so CI
+  pins the real responses.
 - **`rehash`** keeps the recorded response texts and re-keys them to the
   current requests. Use it only after an intentional prompt change, and say
   so in the PR: the responses were not written for the new prompt.
@@ -216,10 +227,10 @@ cd engine && cargo build -p rocky && cd evals && ANTHROPIC_API_KEY=<your key> py
 - It reads `fixtures/contract_quality/` (the project, its seed data and `answer_key.toml`).
 - It builds a DuckDB warehouse in a temporary directory and deletes it afterwards.
 - It sends four drafting requests, one per model, each retried at most twice. The prompt carries the model's schema and aggregate statistics, not raw rows.
-- It **overwrites** `fixtures/contract_quality/recordings/<model>.json` with the real responses.
-- It writes the scorecard to `results/contract_quality.md` and `results/contract_quality.json`. `results/` is git-ignored.
+- It **overwrites** `fixtures/contract_quality/recordings_live/<model>.json` with the real responses. The hand-written `recordings/` stay as they are.
+- It writes the scorecard to `results/contract_quality_live.md` and `results/contract_quality_live.json`. `results/` is git-ignored.
 
-**Reading the result.** The last block printed (also in `results/contract_quality.md`) starts with a line like this:
+**Reading the result.** The last block printed (also in `results/contract_quality_live.md`) starts with a line like this:
 
 ```
 **PASS** — 75/80 matched (need >= 64), 1 overclaim(s) accepted (max 4), 0 unverified type(s) (max 0).
@@ -239,9 +250,9 @@ cd engine && cargo build -p rocky && cd evals && ANTHROPIC_API_KEY=<your key> py
 
 Do not paste the key, request bodies or raw responses. Write the comment in your own name, with no tool or agent attribution footer. To make CI pin the real responses, open a PR with:
 
-- the new recordings;
-- the scorecard;
-- a refreshed `expected_replay.json`: run `python3 run_evals.py --contract-quality`, then `python3 run_evals.py --contract-quality-update-expected`.
+- the new `recordings_live/` files;
+- the scorecard, in the PR body (`results/` is git-ignored);
+- a refreshed `expected_replay_live.json`: run `python3 run_evals.py --contract-quality`, then `python3 run_evals.py --contract-quality-update-expected --contract-quality-set live`.
 
 The PR body gets no agent attribution either.
 
