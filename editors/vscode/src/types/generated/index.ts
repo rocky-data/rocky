@@ -395,6 +395,8 @@ export type {
 export type { ProductCostMonth, ProductStatusOutput } from "./product_status";
 // `rocky product journal <name>`, also served at `GET /api/v1/products/{name}/journal`.
 export type { ProductJournalOutput, ProductJournalEntry } from "./product_journal";
+// `rocky product clear-breach <name> --model <model>`.
+export type { ProductClearBreachOutput } from "./product_clear_breach";
 
 // `rocky snapshot` — SCD2 snapshot execution.
 export type { SnapshotOutput, SnapshotStepOutput } from "./snapshot";
