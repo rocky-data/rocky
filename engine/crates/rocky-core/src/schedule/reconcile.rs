@@ -1396,7 +1396,9 @@ async fn execute_claimed(
                 let attempts = terminal_claim.attempts;
                 let bundle_attempts = terminal_claim.cycle_attempts;
                 // Read before the CAS: is a freeze-hold episode already open?
-                let episode_open = hold.is_some() && freeze_episode_open(phase.store(), demand);
+                let episode_open = hold
+                    .as_ref()
+                    .is_some_and(|h| freeze_episode_open(phase.store(), demand, &h.freeze_id));
                 let mutation = terminal_mutation(&bookkeeping, hold.as_ref());
                 match phase.store().schedule_claim_cas(
                     key,
@@ -1589,15 +1591,16 @@ fn attempt_hold(
     }
 }
 
-/// Whether `demand`'s pipeline is inside a freeze-hold episode: its last
-/// terminal attempt was held. A cursor read error is "not open", so the
-/// incident is written rather than lost.
-fn freeze_episode_open(store: &StateStore, demand: &Demand) -> bool {
+/// Whether `demand`'s pipeline is inside a hold episode of the freeze
+/// `freeze_id`: its last terminal attempt was held by that same freeze. A
+/// different freeze opens a new episode, so its incident names it. A cursor
+/// read error is "not open", so the incident is written rather than lost.
+fn freeze_episode_open(store: &StateStore, demand: &Demand, freeze_id: &str) -> bool {
     store
         .get_schedule_state(&demand.pipeline)
         .ok()
         .flatten()
-        .is_some_and(|cursor| cursor.freeze_hold_id.is_some())
+        .is_some_and(|cursor| cursor.freeze_hold_id.as_deref() == Some(freeze_id))
 }
 
 /// The cursor mutation for a terminal attempt: a freeze hold leaves
@@ -2136,8 +2139,17 @@ fn resolve_stuck(
     } else {
         schedule.retry_max
     };
-    let episode_open = hold.is_some() && freeze_episode_open(store, demand);
-    let resolved = decide_resolver(current, outcome, demand.source, retry_max, now);
+    let episode_open = hold
+        .as_ref()
+        .is_some_and(|h| freeze_episode_open(store, demand, &h.freeze_id));
+    // A legacy claim reads `cycle_attempts = 0`, and the resolver would then
+    // take it as budget left even at `retry_max = 0` (see
+    // `sweep_terminal_claim`). A held run must not re-run, so it counts as one.
+    let mut basis = current.clone();
+    if hold.is_some() {
+        basis.cycle_attempts = basis.cycle_attempts.max(1);
+    }
+    let resolved = decide_resolver(&basis, outcome, demand.source, retry_max, now);
     let resolution = commit_resolution(
         key,
         &demand.pipeline,
@@ -5398,16 +5410,16 @@ adapter = "db"
     // --- freeze hold (#2569) ---------------------------------------------------
 
     /// A child that writes its run record like `rocky run` does: `Failure`
-    /// with a freeze hold when the next scripted entry is `true`, `Success`
-    /// when it is `false`. Past the script it repeats the last entry.
+    /// with a hold by the scripted freeze id, or `Success` for `None`. Past
+    /// the script it repeats the last entry.
     struct FreezeSpawner {
         state_path: std::path::PathBuf,
-        script: Mutex<Vec<bool>>,
+        script: Mutex<Vec<Option<&'static str>>>,
         runs: Mutex<usize>,
     }
 
     impl FreezeSpawner {
-        fn new(state_path: &Path, script: &[bool]) -> Self {
+        fn new(state_path: &Path, script: &[Option<&'static str>]) -> Self {
             Self {
                 state_path: state_path.to_path_buf(),
                 script: Mutex::new(script.to_vec()),
@@ -5423,7 +5435,7 @@ adapter = "db"
     impl Spawner for FreezeSpawner {
         async fn run(&self, request: &SpawnRequest) -> RunOutcome {
             *self.runs.lock().unwrap() += 1;
-            let held = {
+            let freeze = {
                 let mut script = self.script.lock().unwrap();
                 if script.len() > 1 {
                     script.remove(0)
@@ -5431,6 +5443,7 @@ adapter = "db"
                     script[0]
                 }
             };
+            let held = freeze.is_some();
             let store = StateStore::open(&self.state_path).unwrap();
             let now = Utc::now();
             let mut record = make_run(
@@ -5444,10 +5457,10 @@ adapter = "db"
                 now,
                 now,
             );
-            if held {
+            if let Some(freeze_id) = freeze {
                 record.hold = Some(crate::state::RunHold {
                     kind: crate::state::RunHoldKind::Freeze,
-                    freeze_id: "f-1".to_string(),
+                    freeze_id: freeze_id.to_string(),
                     scope: "any".to_string(),
                     reason: "release freeze".to_string(),
                 });
@@ -5481,8 +5494,12 @@ adapter = "db"
     fn a_held_cron_run_is_not_retried_and_opens_one_freeze_hold_episode() {
         let (state_path, _dir, opts) = temp_env();
         let config = cfg(CRON_RETRY2);
-        // Held, held, then a clean run, then held again.
-        let spawner = FreezeSpawner::new(&state_path, &[true, true, false, true]);
+        // Held, held by the same freeze, a clean run, held again, then held
+        // by a different freeze.
+        let spawner = FreezeSpawner::new(
+            &state_path,
+            &[Some("f-1"), Some("f-1"), None, Some("f-1"), Some("f-2")],
+        );
         rt().block_on(tick_once(
             &config,
             &state_path,
@@ -5558,6 +5575,21 @@ adapter = "db"
         .unwrap();
         assert_eq!(spawner.runs(), 4);
         assert_eq!(incident_outcomes(&opts), vec!["freeze_hold", "freeze_hold"]);
+
+        // A different freeze opens its own episode, so its incident names it.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 6, 4, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(incident_outcomes(&opts).len(), 3);
+        with_store(&state_path, |store| {
+            let cursor = store.get_schedule_state("raw").unwrap().unwrap();
+            assert_eq!(cursor.freeze_hold_id.as_deref(), Some("f-2"));
+        });
     }
 
     #[test]
@@ -5574,7 +5606,7 @@ adapter = "db"
                 at(2026, 5, 2, 3, 10),
             );
         });
-        let spawner = FreezeSpawner::new(&state_path, &[true]);
+        let spawner = FreezeSpawner::new(&state_path, &[Some("f-1")]);
         let t0 = at(2026, 5, 2, 4, 0);
         rt().block_on(tick_once(&config, &state_path, t0, &spawner, &opts))
             .unwrap();

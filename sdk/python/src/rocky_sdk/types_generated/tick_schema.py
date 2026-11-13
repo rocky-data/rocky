@@ -98,11 +98,11 @@ class TickCounts(BaseModel):
     """
     held: conint(ge=0) | None = 0
     """
-    Executed runs an active freeze marker held (#2569). Their `outcome` is still `failure`, but they are not in `failed` and do not fail the tick.
+    Executed runs an active freeze marker held (#2569). Their `outcome` is still `failure` or `partial`, but they are not in `failed` or `partial` and do not fail the tick.
     """
     partial: conint(ge=0)
     """
-    Executed runs that were partial (exit 2).
+    Executed runs that were partial (exit 2), not counting runs a freeze held.
     """
     skipped: conint(ge=0)
     """

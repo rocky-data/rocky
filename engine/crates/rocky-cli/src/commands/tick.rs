@@ -449,9 +449,13 @@ fn build_tick_output(
     }
 
     let succeeded = executed.iter().filter(|e| e.outcome == "success").count();
-    let partial = executed.iter().filter(|e| e.outcome == "partial").count();
-    // A run a freeze held is counted as held, not failed: the freeze, not the
-    // pipeline, stopped it, so it does not fail the tick (#2569).
+    // A run a freeze held is counted as held, not failed or partial: the
+    // freeze, not the pipeline, stopped it, so it does not fail the tick
+    // (#2569). A fence hit after earlier layers committed ends `partial`.
+    let partial = executed
+        .iter()
+        .filter(|e| e.outcome == "partial" && e.hold.is_none())
+        .count();
     let held = executed.iter().filter(|e| e.hold.is_some()).count();
     let failed = executed
         .iter()
@@ -855,6 +859,47 @@ freshness = true
     /// The control for the arm above: with a readable spool the same failing
     /// run still reports exit 2, carrying the run id. Without this, returning
     /// `SpoolUnreadable` unconditionally would look like a fix.
+    /// A run a freeze held does not fail the tick, whether it ended `failure`
+    /// or `partial` (a fence hit after earlier layers committed) (#2569).
+    #[test]
+    fn a_held_run_does_not_fail_the_tick_even_when_partial() {
+        let hold = rocky_core::state::RunHold {
+            kind: rocky_core::state::RunHoldKind::Freeze,
+            freeze_id: "f-1".to_string(),
+            scope: "any".to_string(),
+            reason: "release".to_string(),
+        };
+        let held = |outcome, exit_code, id: &str| ExecutedDemand {
+            pipeline: "raw".to_string(),
+            source: DemandKind::Cron,
+            logical_ts: ts("2026-05-02T03:00:00Z"),
+            submission_id: id.to_string(),
+            exit_code,
+            outcome,
+            attempts: 1,
+            hold: Some(hold.clone()),
+        };
+        let report = TickReport {
+            executed: vec![
+                held(TerminalOutcome::Partial, 2, "sub-p"),
+                held(TerminalOutcome::Failure, 1, "sub-f"),
+            ],
+            ..TickReport::default()
+        };
+        let output = build_tick_output(&report, ts("2026-05-02T03:05:00Z"), false, 0);
+        assert_eq!(output.counts.held, 2);
+        assert_eq!(output.counts.partial, 0);
+        assert_eq!(output.counts.failed, 0);
+        assert_eq!(tick_verdict(&report, &output), TickVerdict::Ok);
+        assert_eq!(
+            output.executed[0]
+                .hold
+                .as_ref()
+                .map(|h| h.freeze_id.as_str()),
+            Some("f-1")
+        );
+    }
+
     #[test]
     fn a_failed_run_with_a_readable_spool_is_still_exit_two() {
         let (report, output) = unhealthy_pair(None);

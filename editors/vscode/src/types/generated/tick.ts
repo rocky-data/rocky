@@ -81,11 +81,11 @@ export interface TickCounts {
    */
   failed: number;
   /**
-   * Executed runs an active freeze marker held (#2569). Their `outcome` is still `failure`, but they are not in `failed` and do not fail the tick.
+   * Executed runs an active freeze marker held (#2569). Their `outcome` is still `failure` or `partial`, but they are not in `failed` or `partial` and do not fail the tick.
    */
   held?: number;
   /**
-   * Executed runs that were partial (exit 2).
+   * Executed runs that were partial (exit 2), not counting runs a freeze held.
    */
   partial: number;
   /**

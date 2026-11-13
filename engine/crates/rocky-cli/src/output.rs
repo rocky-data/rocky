@@ -7725,13 +7725,15 @@ pub struct TickCounts {
     pub executed: usize,
     /// Executed runs that succeeded (exit 0).
     pub succeeded: usize,
-    /// Executed runs that were partial (exit 2).
+    /// Executed runs that were partial (exit 2), not counting runs a freeze
+    /// held.
     pub partial: usize,
     /// Executed runs that failed (exit 1/other), not counting runs a freeze
     /// held.
     pub failed: usize,
     /// Executed runs an active freeze marker held (#2569). Their `outcome` is
-    /// still `failure`, but they are not in `failed` and do not fail the tick.
+    /// still `failure` or `partial`, but they are not in `failed` or `partial`
+    /// and do not fail the tick.
     #[serde(default)]
     pub held: usize,
     /// Demands suppressed (the length of `skipped`).
