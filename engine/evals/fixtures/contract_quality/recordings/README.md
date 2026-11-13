@@ -16,6 +16,6 @@ exercise every path of the drafting loop and every scoring outcome:
 
 So the replay score is a regression check of the harness, the verify loop
 and the compiler, never a quality measurement. Only a live run measures the
-prompt. A live run (`--contract-quality-mode live`) overwrites these files
-with real responses; commit those only together with the scorecard they
-produced.
+prompt. A live run (`--contract-quality-mode live`) never touches these
+files: it writes the real responses to `../recordings_live/`. CI replays
+both sets, so keep these files for the paths a real model rarely takes.

@@ -1,0 +1,9 @@
+{
+  "model": "order_payments",
+  "exchanges": [
+    {
+      "request_sha256": "2f5e757617b008215f5e15bd26acea0ddee2a21aee25c94d5421722e1d3baa1d",
+      "response_text": "[[columns]]\nname = \"payment_id\"\ntype = \"Int64\"\nnullable = false\ndescription = \"Primary key identifying each payment record.\"\n\n[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\ndescription = \"Foreign key referencing the associated order.\"\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\ndescription = \"Foreign key referencing the customer who made the payment.\"\n\n[[columns]]\nname = \"method\"\ntype = \"String\"\nnullable = true\ndescription = \"Payment method used (e.g. credit card, bank transfer).\"\n\n[[columns]]\nname = \"paid_at\"\ntype = \"Timestamp\"\nnullable = true\ndescription = \"Timestamp when the payment was completed; nullable for pending payments.\"\n\n[rules]\nrequired = [\"payment_id\", \"order_id\", \"customer_id\"]\nprotected = [\"payment_id\", \"order_id\", \"customer_id\"]"
+    }
+  ]
+}

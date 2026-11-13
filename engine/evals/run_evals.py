@@ -227,17 +227,29 @@ def main(argv: list[str]) -> int:
         "with $ANTHROPIC_API_KEY and record; rehash: re-key recordings after a prompt change",
     )
     parser.add_argument(
+        "--contract-quality-set",
+        choices=("all", *contract_quality_mod.RECORDING_SETS),
+        default=None,
+        help="recording set: scripted (hand-written, every loop path) or live (the last live "
+        "run). Replay and rehash cover both by default; a live run records only `live`",
+    )
+    parser.add_argument(
         "--contract-quality-update-expected",
         action="store_true",
-        help="write the last replay's outcomes to fixtures/contract_quality/expected_replay.json",
+        help="write each set's last replay outcomes to its expected file "
+        "(expected_replay.json, expected_replay_live.json)",
     )
     args = parser.parse_args(argv)
 
     if args.contract_quality_update_expected:
-        return contract_quality_mod.update_expected(args.output_dir)
+        return contract_quality_mod.update_expected(
+            args.output_dir, recording_set=args.contract_quality_set
+        )
 
     if args.contract_quality:
-        return contract_quality_mod.main(args.contract_quality_mode, args.output_dir)
+        return contract_quality_mod.main(
+            args.contract_quality_mode, args.output_dir, recording_set=args.contract_quality_set
+        )
 
     if args.selftest:
         return selftest_mod.run()
