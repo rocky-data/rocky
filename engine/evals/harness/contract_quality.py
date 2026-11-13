@@ -88,22 +88,51 @@ class RecordingSet:
     recordings: str
     expected: str
     output_stem: str
+    # The verdict a replay of this set must produce. The golden files pin
+    # outcomes only, so without these a broken pass line, or a refreshed
+    # golden for a live run that FAILs, would stay green.
+    expected_passed: bool
+    expected_key_omissions: int
 
 
 # Two sets, both replayed in CI:
 #
 # * ``scripted``: hand-written responses that drive every path of the drafting
 #   loop (a type retry, a refused claim, an overclaim, withheld items, a fenced
-#   reply). A regression check of the harness and the compiler.
-# * ``live``: the responses from the last live run. A pin of real drafts.
+#   reply). A regression check of the harness and the compiler. It FAILs on
+#   purpose: its two ``customer_id`` key-column omissions prove that check fires.
+# * ``live``: the responses from the last live run. A pin of real drafts. It
+#   must PASS: a live run that fails the pass line is a finding to fix, not a
+#   golden to pin.
 #
 # A live run writes only the ``live`` set, so it never overwrites the scripted one.
 RECORDING_SETS: dict[str, RecordingSet] = {
-    "scripted": RecordingSet("scripted", "recordings", "expected_replay.json", "contract_quality"),
+    "scripted": RecordingSet(
+        "scripted",
+        "recordings",
+        "expected_replay.json",
+        "contract_quality",
+        expected_passed=False,
+        expected_key_omissions=2,
+    ),
     "live": RecordingSet(
-        "live", "recordings_live", "expected_replay_live.json", "contract_quality_live"
+        "live",
+        "recordings_live",
+        "expected_replay_live.json",
+        "contract_quality_live",
+        expected_passed=True,
+        expected_key_omissions=0,
     ),
 }
+
+
+def verdict_mismatch(spec: RecordingSet, card: dict) -> str | None:
+    """Describe how a replay's verdict differs from the set's pinned one."""
+    want = ("PASS" if spec.expected_passed else "FAIL", spec.expected_key_omissions)
+    got = ("PASS" if card["passed"] else "FAIL", card["key_omissions"])
+    if want == got:
+        return None
+    return f"expected {want[0]} with {want[1]} key-column omission(s), got {got[0]} with {got[1]}"
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +308,7 @@ def is_key_omission(item: dict) -> bool:
     """A key column the draft left out of ``required`` / ``protected``.
 
     The contract then no longer stops that column being dropped, so this is
-    the one underclaim that counts against the pass line (Fable ruling 2026-11-13, DECISIONS N9).
+    the one underclaim that counts against the pass line (Fable ruling 2026-11-13).
     A missing draft omits every key column too.
     """
     return (
@@ -734,7 +763,10 @@ def _run_set(rocky_bin: Path, mode: str, output_dir: Path, fixture_name: str, se
         print(f"contract-quality ({set_name}): replay outcomes drifted from {spec.expected}:")
         for line in drift:
             print(f"  - {line}")
-    return 1 if errored or drift else 0
+    mismatch = verdict_mismatch(spec, card)
+    if mismatch:
+        print(f"contract-quality ({set_name}): replay verdict moved: {mismatch}")
+    return 1 if errored or drift or mismatch else 0
 
 
 def update_expected(
@@ -762,6 +794,14 @@ def update_expected(
             print(
                 f"contract-quality ({name}): the last replay errored for "
                 f"{', '.join(errored)}; an errored replay is not a golden"
+            )
+            status = 1
+            continue
+        mismatch = verdict_mismatch(spec, card)
+        if mismatch:
+            print(
+                f"contract-quality ({name}): the last replay's verdict is not the pinned one "
+                f"({mismatch}); fix the drafts, or change the pin in RECORDING_SETS on purpose"
             )
             status = 1
             continue
