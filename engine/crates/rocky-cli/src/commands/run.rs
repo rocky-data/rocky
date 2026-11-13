@@ -14720,6 +14720,13 @@ async fn execute_models_phase(
                     to_build.push((idx, name, model, None));
                     continue;
                 }
+                // An open volume breach holds this output (#2581): build it,
+                // so the volume check fails it, rather than skip it as
+                // unchanged and let its descendants build.
+                if super::run_volume::held_by_marker(&product_volumes, &breach_ledger, name) {
+                    to_build.push((idx, name, model, None));
+                    continue;
+                }
                 // Build the fully-typed IR (merge the typechecker's columns,
                 // mirroring `project_ir_from_compile`) so `skip_hash()` can
                 // canonicalise. An empty `typed_columns` ⇒ `skip_hash()` is

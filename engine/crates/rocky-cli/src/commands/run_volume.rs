@@ -61,8 +61,10 @@
 //!   marker open, rebuild in range ──▶ marker deleted, model passes
 //! ```
 //!
-//! A marker is written per model, right after its judgment, so a crash
-//! cannot lose a breach. A failed write of a new marker fails the model
+//! A marker is written per model to the local store, right after its
+//! judgment, so a crash later in the run does not lose it locally. Other
+//! machines see it when the run uploads its state (under the run's
+//! `on_upload_failure` policy). A failed write of a new marker fails the model
 //! (closed). A failed delete only warns: the marker stays and the model
 //! stays failed. A run with no state store, and a non-production run,
 //! neither reads nor writes markers. A run that does not build a held
@@ -332,6 +334,15 @@ impl BreachLedger<'_> {
             }
         }
     }
+}
+
+/// True when an open breach marker (or a marker read that failed) holds
+/// `model`. The skip gate builds such a model, so the volume check judges
+/// it instead of an "unchanged" skip passing it.
+pub(crate) fn held_by_marker(volumes: &ProductVolumes, ledger: &BreachLedger<'_>, model: &str) -> bool {
+    volumes
+        .for_model(model)
+        .is_some_and(|range| !matches!(ledger.read(&range.product, model), Ok(None)))
 }
 
 /// The outputs an open breach holds failed that this run does not build,

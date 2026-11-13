@@ -2428,6 +2428,16 @@ pub async fn run_product_clear_breach(
             config_path.display()
         )
     })?;
+    if config.state.backend != rocky_core::config::StateBackend::Local
+        && !rocky_core::state_sync::cas_effective(&config.state)
+    {
+        tracing::warn!(
+            backend = ?config.state.backend,
+            "this state backend has no conditional upload: a run that downloaded the state \
+             before this clear and uploads after it puts the marker back. Clear the breach \
+             while no run is in flight"
+        );
+    }
     let mut session = rocky_core::state_sync::RemoteStateSession::new(
         &config.state,
         state_path,
