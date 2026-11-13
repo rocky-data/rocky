@@ -2406,7 +2406,14 @@ pub(crate) fn product_clear_breach(
 }
 
 /// Execute `rocky product clear-breach <name> --model <model>`.
-pub fn run_product_clear_breach(
+///
+/// The marker table replicates, so the delete runs inside a durable
+/// remote-state session: download first, delete, upload. A run that cannot
+/// read the remote state refuses, because the next download would restore
+/// the marker. Nothing is printed until the upload has landed, so
+/// `was_open: true` means the delete is durable.
+pub async fn run_product_clear_breach(
+    config_path: &Path,
     product_name: &str,
     model: &str,
     state_path: &Path,
@@ -2414,7 +2421,47 @@ pub fn run_product_clear_breach(
 ) -> Result<()> {
     rocky_sql::validation::validate_identifier(model)
         .map_err(|e| anyhow::anyhow!("invalid --model '{model}': {e}"))?;
-    let output = product_clear_breach(state_path, product_name, model)?;
+    let config = rocky_core::config::load_rocky_config(config_path).with_context(|| {
+        format!(
+            "failed to load {} — clear-breach reads [state] from it to clear the marker \
+             where every pod sees it",
+            config_path.display()
+        )
+    })?;
+    let mut session = rocky_core::state_sync::RemoteStateSession::new(
+        &config.state,
+        state_path,
+        rocky_core::state_sync::FinalizeDurability::Durable,
+        config.cache.schemas.replicate,
+    );
+    if let Err(e) = session.acquire().await {
+        session.abandon("clear-breach acquire failed").await;
+        return Err(e.into());
+    }
+    // Fail closed: deleting from a store that missed the remote copy would
+    // be undone by the next download, and the marker would come back.
+    if let Err(e) = session.require_synced() {
+        session
+            .abandon("clear-breach download failure (fail-closed)")
+            .await;
+        return Err(anyhow::Error::new(e).context(
+            "failed to download remote state before clearing the breach; the marker \
+             replicates, so a delete made without it would be restored (fail-closed)",
+        ));
+    }
+    let output = match product_clear_breach(state_path, product_name, model) {
+        Ok(output) => output,
+        Err(e) => {
+            session.abandon("clear-breach failed before finalize").await;
+            return Err(e);
+        }
+    };
+    if output.was_open {
+        session.finalize().await?;
+    } else {
+        // Nothing changed, so there is nothing to upload.
+        session.abandon("clear-breach: no open marker").await;
+    }
     if output_json {
         print_json(&output)?;
     } else if output.was_open {
@@ -2909,6 +2956,22 @@ pub fn run_product_status(
     let root = product_command_root(config_path);
     let mut output = product_status_in(&root, Some(state_path), product_name)?;
     attach_cost_month(&mut output, config_path, state_path, chrono::Utc::now());
+    // `status` is read-only and never downloads remote state. With a remote
+    // backend the local file can lag another pod, so say where the open
+    // breaches were read from.
+    let remote_backend = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .map(|config| config.state.backend)
+        .filter(|backend| *backend != rocky_core::config::StateBackend::Local);
+    if let Some(backend) = remote_backend {
+        tracing::warn!(
+            backend = ?backend,
+            state_path = %state_path.display(),
+            "product status reads open volume breaches from the local state file only; \
+             with a remote state backend it may miss a breach another pod recorded or \
+             cleared until the next run downloads state"
+        );
+    }
     if output_json {
         print_json(&output)?;
     } else {
@@ -2962,6 +3025,12 @@ pub fn run_product_status(
         }
         for breach in &output.open_volume_breaches {
             print_volume_breach(breach);
+        }
+        if remote_backend.is_some() {
+            println!(
+                "  note: open volume breaches come from the local state file; with a remote \
+                 state backend they may lag another pod until the next run downloads state"
+            );
         }
         for source in &output.source_volumes {
             print_source_volume(source);

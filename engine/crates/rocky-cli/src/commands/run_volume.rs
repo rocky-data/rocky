@@ -19,7 +19,7 @@
 //!                          disagreeing is not_evaluated)
 //!          merge ───────── the MERGE's reported row count ──── rows_touched
 //!          time_interval ─ COUNT(*) per partition written ───── partition_rows
-//!                   │ cancelled / error / not reported ──▶ not_evaluated
+//!                   │ error / not reported ──────────▶ not_evaluated
 //!                   │ count                                (never a failure, but
 //!                   │                                      a `volume_warnings` line)
 //!          in range ─────────────────▶ in_range
@@ -65,8 +65,12 @@
 //! cannot lose a breach. A failed write of a new marker fails the model
 //! (closed). A failed delete only warns: the marker stays and the model
 //! stays failed. A run with no state store, and a non-production run,
-//! neither reads nor writes markers. A model a run does not build is not
-//! held by this check.
+//! neither reads nor writes markers. A run that does not build a held
+//! output (`rocky run --model <downstream>`) withholds the output's
+//! descendants instead ([`held_outputs_not_built`]).
+//!
+//! A cancel does not skip the count: the check runs after the build
+//! committed its rows, so a breach must still open its marker.
 //!
 //! Counting assumes this run is the table's only writer. A reported count
 //! needs no such assumption, but the cross-check against the table's own
@@ -126,6 +130,15 @@ enum Standing {
     /// A marker could not be read or written; the sentence says what. The
     /// model fails.
     StoreFailed(String),
+}
+
+/// Add `text` to a check's reason, keeping what it already says (a
+/// `not_evaluated` check keeps why it was not counted).
+fn append_reason(reason: &mut Option<String>, text: &str) {
+    *reason = Some(match reason.take() {
+        Some(own) if !own.is_empty() => format!("{own} {text}"),
+        _ => text.to_string(),
+    });
 }
 
 fn held_message(marker: &VolumeBreachMarker, partitions: &[String]) -> String {
@@ -321,6 +334,40 @@ impl BreachLedger<'_> {
     }
 }
 
+/// The outputs an open breach holds failed that this run does not build,
+/// by output model, each with the sentence why.
+///
+/// Read once at the start of the model phase. An output this run builds is
+/// judged by [`check_volume`] or [`check_partition_volume`] instead, and its
+/// failure withholds its descendants as any failure does. An output this
+/// run does not build (`rocky run --model <downstream>`) would otherwise let
+/// its descendants build over the breached rows, so the caller withholds
+/// them. A marker that cannot be read holds the output (fail closed).
+pub(crate) fn held_outputs_not_built(
+    volumes: &ProductVolumes,
+    ledger: &BreachLedger<'_>,
+    builds: impl Fn(&str) -> bool,
+) -> std::collections::BTreeMap<String, String> {
+    let mut held = std::collections::BTreeMap::new();
+    for range in &volumes.ranges {
+        let model = range.output_model.as_str();
+        if builds(model) {
+            continue;
+        }
+        match ledger.read(&range.product, model) {
+            Ok(None) => {}
+            Ok(Some(marker)) => {
+                held.insert(model.to_string(), held_message(&marker, &marker.partitions));
+            }
+            Err(Standing::StoreFailed(text) | Standing::Held(text)) => {
+                held.insert(model.to_string(), text);
+            }
+            Err(Standing::Clear) => {}
+        }
+    }
+    held
+}
+
 /// The output and source ranges this run checks, read in one scan of the
 /// project's `products/`.
 ///
@@ -382,13 +429,13 @@ pub(crate) async fn check_volume(
     strategy: &MaterializationStrategy,
     materialization: &mut MaterializationOutput,
     output: &mut RunOutput,
-    cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<anyhow::Error> {
     let range = volumes.for_model(model)?;
     let basis = VolumeBasis::of(strategy);
     let counted = match basis {
         None => Err(unsupported_reason()),
-        Some(_) if cancel.is_cancelled() => Err("the run was cancelled before the count".into()),
+        // A cancel does not skip the count: the build already committed its
+        // rows, so a breach must still open its marker.
         Some(basis) => count_load(warehouse, basis, materialization).await,
     };
     let mut judged = judge(range, model, basis, None, counted);
@@ -431,7 +478,6 @@ pub(crate) async fn check_partition_volume(
     model: &rocky_core::models::Model,
     output: &mut RunOutput,
     first: usize,
-    cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<anyhow::Error> {
     let model_name = model.config.name.as_str();
     let range = volumes.for_model(model_name)?;
@@ -450,9 +496,9 @@ pub(crate) async fn check_partition_volume(
         };
         let counted = match (&strategy, basis) {
             (_, None) => Err(unsupported_reason()),
-            _ if cancel.is_cancelled() => {
-                Err("the run was cancelled before every partition ran or before the count".into())
-            }
+            // Each entry here is a partition this run wrote. A cancel does not
+            // skip its count: the rows are committed, so a breach must still
+            // open its marker.
             (MaterializationStrategy::TimeInterval { time_column, .. }, Some(_)) => {
                 match &partition {
                     None => Err("this partition recorded no time window; not counted".to_string()),
@@ -508,7 +554,7 @@ pub(crate) async fn check_partition_volume(
                     && !volume.fails_the_model()
                 {
                     volume.held_by_open_breach = true;
-                    volume.reason = Some(text.clone());
+                    append_reason(&mut volume.reason, text);
                 }
             }
             Some(text.clone())
@@ -517,7 +563,7 @@ pub(crate) async fn check_partition_volume(
             for mat in &mut output.materializations[first..] {
                 if let Some(volume) = mat.volume.as_mut() {
                     volume.held_by_open_breach = true;
-                    volume.reason = Some(text.clone());
+                    append_reason(&mut volume.reason, text);
                 }
             }
             Some(text.clone())
@@ -705,7 +751,7 @@ impl Judged {
             Some(own) => self.failure = Some(anyhow::anyhow!("{own:#}; {text}")),
             None => {
                 self.check.held_by_open_breach = true;
-                self.check.reason = Some(text.clone());
+                append_reason(&mut self.check.reason, &text);
                 self.failure = Some(anyhow::anyhow!("{text}"));
             }
         }
@@ -1715,6 +1761,17 @@ mod tests {
             partitions: &PartitionRunOptions,
             skip: &SkipRunOptions,
         ) -> (anyhow::Result<()>, RunRecord, serde_json::Value) {
+            run_in_selecting(dir, shadow, partitions, skip, None).await
+        }
+
+        /// [`run_in_with`] with `--model <model>`.
+        async fn run_in_selecting(
+            dir: &std::path::Path,
+            shadow: Option<&rocky_core::shadow::ShadowConfig>,
+            partitions: &PartitionRunOptions,
+            skip: &SkipRunOptions,
+            model: Option<&str>,
+        ) -> (anyhow::Result<()>, RunRecord, serde_json::Value) {
             let config_path = dir.join("rocky.toml");
             let state_path = dir.join("state.redb");
             let run_id = format!("volume-{}", uuid::Uuid::new_v4());
@@ -1735,7 +1792,7 @@ mod tests {
                 false,
                 shadow,
                 partitions,
-                None,
+                model,
                 None,
                 None,
                 None,
@@ -3485,6 +3542,159 @@ mod tests {
             let ran = two_partition_runs("min_rows = 3").await;
             ran.result.as_ref().expect("a warning never fails the run");
             assert!(markers(ran._tmp.path()).is_empty());
+        }
+
+        /// `rocky run --model down` does not build `vol`, so the volume
+        /// check never sees it. The open breach on `vol` still withholds
+        /// `down`: it must not build over the breached rows. Once the
+        /// breach is cleared, the same run builds `down`.
+        /// Mutation: drop the `held_outputs_not_built` withholding in the
+        /// model phase and the first `--model down` run builds `down`.
+        #[tokio::test]
+        async fn a_held_output_withholds_a_downstream_model_run_alone() {
+            let (ran, _) = two_runs(
+                |n| incremental_models(&src_rows(n)),
+                95,
+                100,
+                ERROR_MAX_4,
+                [&PartitionRunOptions::default(); 2],
+            )
+            .await;
+            assert!(ran.result.is_err(), "5 added rows breach max 4");
+            let root = ran._tmp.path();
+            assert_eq!(markers(root).len(), 1);
+
+            let (result, record, output) = run_in_selecting(
+                root,
+                None,
+                &PartitionRunOptions::default(),
+                &SkipRunOptions::default(),
+                Some("down"),
+            )
+            .await;
+            let err = error_text(&output);
+            assert!(err.contains("model 'down' was withheld"), "{err}");
+            assert!(err.contains("open volume breach"), "{err}");
+            assert!(
+                err.contains("rocky product clear-breach vol_product --model vol"),
+                "{err}"
+            );
+            assert!(result.is_err() || output["tables_failed"] != 0, "{output}");
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .all(|e| e.status != "success"),
+                "down is withheld: {:?}",
+                record.models_executed
+            );
+            assert!(executions_of(&record, "vol").is_empty(), "vol is not run");
+
+            super::super::super::product::product_clear_breach(
+                &root.join("state.redb"),
+                "vol_product",
+                "vol",
+            )
+            .expect("clear");
+            let (result, record, _) = run_in_selecting(
+                root,
+                None,
+                &PartitionRunOptions::default(),
+                &SkipRunOptions::default(),
+                Some("down"),
+            )
+            .await;
+            result.expect("with the breach cleared, down builds");
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .any(|e| e.status == "success"),
+                "{:?}",
+                record.models_executed
+            );
+        }
+
+        /// A time-interval output held by an open breach, in a run that
+        /// writes no partition (`--missing` with nothing missing), still
+        /// records the model failed.
+        #[tokio::test]
+        async fn a_held_time_interval_run_that_writes_no_partition_still_fails() {
+            let today = chrono::Utc::now().date_naive();
+            let yesterday = today - chrono::Duration::days(1);
+            let src = format!(
+                "SELECT CAST(d AS DATE) AS d, x FROM (VALUES \
+                 ('{yesterday}', 1), ('{yesterday}', 2), \
+                 ('{today}', 3), ('{today}', 4), ('{today}', 5)) AS t(d, x)\n"
+            );
+            let vol_toml = format!(
+                "depends_on = [\"src\"]\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"d\"\n\
+                 granularity = \"day\"\nfirst_partition = \"{yesterday}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\n"
+            );
+            let models: Vec<(&str, &str, &str)> = vec![
+                ("src", src.as_str(), SRC_TOML),
+                (
+                    "vol",
+                    "SELECT d, x FROM main.src WHERE d >= @start_date AND d < @end_date\n",
+                    vol_toml.as_str(),
+                ),
+                ("down", "SELECT x FROM main.vol\n", DOWN_TOML),
+            ];
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path();
+            write_project(
+                root,
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &models,
+                "",
+            );
+            let (result, _, _) = run_in(
+                root,
+                None,
+                &days(&yesterday.to_string(), &today.to_string()),
+            )
+            .await;
+            assert!(result.is_err(), "today's 3 rows breach max 2");
+            assert_eq!(markers(root)[0].partitions, [today.to_string()]);
+
+            // Every partition is recorded computed (say, a lost `Failed`
+            // mark), so `--missing` plans nothing.
+            {
+                let store = StateStore::open(&root.join("state.redb")).unwrap();
+                let records: Vec<_> = store
+                    .list_partitions("vol")
+                    .unwrap()
+                    .into_iter()
+                    .map(|mut record| {
+                        record.status = rocky_core::incremental::PartitionStatus::Computed;
+                        record
+                    })
+                    .collect();
+                assert_eq!(records.len(), 2, "{records:?}");
+                store.record_partitions(&records).unwrap();
+            }
+            let missing = PartitionRunOptions {
+                missing: true,
+                parallel: 1,
+                ..Default::default()
+            };
+            let (result, record, output) = run_in(root, None, &missing).await;
+            assert!(result.is_err(), "the open breach holds the model");
+            let err = error_text(&output);
+            assert!(err.contains("open volume breach"), "{err}");
+            let vol = executions_of(&record, "vol");
+            assert!(
+                !vol.is_empty(),
+                "a failure is recorded: {:?}",
+                record.models_executed
+            );
+            assert!(vol.iter().all(|e| e.status == "failed"), "{vol:?}");
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .all(|e| e.status != "success"),
+                "downstream is withheld"
+            );
         }
     }
 }

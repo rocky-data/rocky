@@ -22202,6 +22202,15 @@ mod volume_breach_state_tests {
         txn.commit().expect("commit");
     }
 
+    /// Pins the state schema version on its own, apart from any upgrade
+    /// test. A bump changes this number together with its upgrade test and
+    /// the `EXPECTED_VERSION` stanza.
+    #[test]
+    fn current_schema_version_is_pinned() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
+        assert_eq!(current_schema_version(), 36);
+    }
+
     /// Mutation: drop the table creation in `init_db` and the upgraded store
     /// cannot write a marker.
     #[test]

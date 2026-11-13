@@ -4270,7 +4270,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             ),
             ProductSubcommand::ClearBreach { product, model } => {
-                rocky_cli::commands::run_product_clear_breach(&product, &model, &state_path, json)
+                rocky_cli::commands::run_product_clear_breach(
+                    &cli.config,
+                    &product,
+                    &model,
+                    &state_path,
+                    json,
+                )
+                .await
             }
         },
         Command::Policy { subcommand } => match subcommand {

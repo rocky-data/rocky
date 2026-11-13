@@ -103,7 +103,7 @@ What counts as a rebuild:
 
 The marker lives in the replicated state table `product_volume_breaches` (state schema 36), so every machine that shares the state sees it. Rocky writes it right after the model's check, not at the end of the run, so a crash cannot lose a breach. If the state store cannot record a new breach, the model fails. If it cannot delete a marker, Rocky warns, the marker stays and the model stays failed.
 
-A `warning` breach opens no marker, and neither does a count that was not evaluated. A marker that is already open still holds the model when a later run is `not_evaluated`. A shadow or branch run neither reads nor writes markers. A model that a run does not build is not held by this check, so a run that leaves out the output model can still build models that read it.
+A `warning` breach opens no marker, and neither does a count that was not evaluated. A marker that is already open still holds the model when a later run is `not_evaluated`. A shadow or branch run neither reads nor writes markers. A run that does not build a held output model, such as `rocky run --model <downstream>`, withholds every model downstream of it, with the same message. Those models do not build over the breached rows. A cancel after the write does not skip the count, so a breach that a cancelled run wrote still opens its marker.
 
 ### `rocky product clear-breach`
 
@@ -111,7 +111,7 @@ A `warning` breach opens no marker, and neither does a count that was not evalua
 rocky product clear-breach <name> --model <model>
 ```
 
-Deletes the open volume breach of the product's output model, without a rebuild. Use it when you have judged the breached rows acceptable. The next run judges the model as usual. It reports whether a marker was open. With none open it changes nothing and exits 0, so it is safe to repeat. `--output json` returns `product`, `model`, `was_open` and the `cleared` marker.
+Deletes the open volume breach of the product's output model, without a rebuild. Use it when you have judged the breached rows acceptable. It reads `[state]` from `rocky.toml`. With a remote state backend it downloads the state first, deletes the marker, and uploads the change before it reports. If the download fails it refuses and changes nothing, because the next download would restore the marker. The next run judges the model as usual. It reports whether a marker was open. With none open it changes nothing and exits 0, so it is safe to repeat. `--output json` returns `product`, `model`, `was_open` and the `cleared` marker.
 
 An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Every `not_evaluated` check adds a `volume_warnings` line with its reason, at either severity. It never fails the run. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
 
@@ -289,7 +289,7 @@ When the spec declares `[product.output.volume]`, status also reports `volume`:
 | `verdict` | That build's count judged against the range the spec declares now: `in_range`, `below_min`, `above_max`. It is `not_evaluated` when the build took no count, or counted on a basis the output model no longer has. |
 | `reason` | Why the verdict is `not_evaluated`. |
 
-Status also lists `open_volume_breaches`, one row for each breach still open for the product (empty and omitted when there is none): `product`, `model`, `opened_at`, `run_id`, `partitions` (empty means the whole output), `rows`, `min_rows`, `max_rows` and `reason`. The text view prints each as `OPEN VOLUME BREACH` with the command that clears it.
+Status also lists `open_volume_breaches`, one row for each breach still open for the product (empty and omitted when there is none): `product`, `model`, `opened_at`, `run_id`, `partitions` (empty means the whole output), `rows`, `min_rows`, `max_rows` and `reason`. The text view prints each as `OPEN VOLUME BREACH` with the command that clears it. Status reads the local state file and does not download remote state. With a remote state backend it warns that the list may lag another machine until the next run downloads the state.
 
 When the spec declares `[[product.source.volume]]`, status also reports `source_volumes`, one row per declared range:
 
