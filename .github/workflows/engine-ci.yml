@@ -226,6 +226,17 @@ jobs:
         env:
           ROCKY_TEST_VALKEY_URL: redis://localhost:6379
         run: cargo nextest run -p rocky-core --all-features --no-fail-fast --no-tests=fail -E 'test(/idempotency::tests::live_/)'
+      # Replays recorded model responses through the real `rocky ai-contract`
+      # (both recording sets) and gates on every item's outcome matching the
+      # set's golden file. No key and no network. It runs here because a
+      # change to rocky-ai, rocky-compiler or rocky-cli can move a draft, and
+      # engine-evals.yml only triggers on engine/evals and rocky-mcp. An
+      # intentional prompt change must rehash the recordings and refresh the
+      # goldens in the same PR (see engine/evals/README.md).
+      - name: Contract-quality replay
+        run: |
+          cargo build -p rocky --all-features
+          cd evals && ROCKY_BIN="$GITHUB_WORKSPACE/engine/target/debug/rocky" python3 run_evals.py --contract-quality
 
   clippy:
     name: Clippy

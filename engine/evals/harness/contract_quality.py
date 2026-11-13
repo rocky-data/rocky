@@ -45,11 +45,12 @@ gets one outcome:
 Every item of an accepted draft passed the compiler, so an overclaim or an
 underclaim is a wrong item the compiler accepted. The pass line (from the
 answer key's ``[pass_line]``) is: matches >= ``min_matched``, overclaims <=
-``max_overclaims``, and unverified <= ``max_unverified``. A drafted column
-the key does not list is one more overclaim. Underclaims are reported but do
-not gate. Only a nullable underclaim is safe: the contract promises less than
-the data gives. A key column left out of ``required`` / ``protected`` is not
-safe: the contract no longer stops that column being dropped.
+``max_overclaims``, unverified <= ``max_unverified``, and key-column
+omissions <= ``max_key_omissions``. A drafted column the key does not list is
+one more overclaim. A nullable underclaim is safe and does not gate: the
+contract promises less than the data gives. A key column left out of
+``required`` / ``protected`` is not safe: the contract no longer stops that
+column being dropped. That is a key-column omission, and it gates.
 """
 
 from __future__ import annotations
@@ -122,6 +123,7 @@ class AnswerKey:
     min_matched: int
     max_overclaims: int
     max_unverified: int
+    max_key_omissions: int
 
     @property
     def item_count(self) -> int:
@@ -149,6 +151,7 @@ def load_answer_key(path: Path) -> AnswerKey:
         min_matched=int(line.get("min_matched", 0)),
         max_overclaims=int(line.get("max_overclaims", 0)),
         max_unverified=int(line.get("max_unverified", 0)),
+        max_key_omissions=int(line.get("max_key_omissions", 0)),
     )
 
 
@@ -269,24 +272,43 @@ def _drafted_value(column: str, attribute: str, draft: Draft | None):
     return column in (draft.required if attribute == "required" else draft.protected)
 
 
+def is_key_omission(item: dict) -> bool:
+    """A key column the draft left out of ``required`` / ``protected``.
+
+    The contract then no longer stops that column being dropped, so this is
+    the one underclaim that gates (Fable ruling 2026-11-13, DECISIONS N9).
+    A missing draft omits every key column too.
+    """
+    return (
+        item["attribute"] in ("required", "protected")
+        and item["expected"] is True
+        and item["outcome"] != "match"
+    )
+
+
 def summarize(key: AnswerKey, scores: list[ModelScore]) -> dict:
     totals = dict.fromkeys(OUTCOMES, 0)
+    key_omissions = 0
     for s in scores:
         for outcome, n in s.counts().items():
             totals[outcome] += n
+        key_omissions += sum(1 for item in s.items if is_key_omission(item))
     passed = (
         totals["match"] >= key.min_matched
         and totals["overclaim"] <= key.max_overclaims
         and totals["unverified"] <= key.max_unverified
+        and key_omissions <= key.max_key_omissions
     )
     return {
         "items": key.item_count,
         "totals": totals,
+        "key_omissions": key_omissions,
         "wrong_accepted": totals["overclaim"] + totals["underclaim"],
         "pass_line": {
             "min_matched": key.min_matched,
             "max_overclaims": key.max_overclaims,
             "max_unverified": key.max_unverified,
+            "max_key_omissions": key.max_key_omissions,
         },
         "passed": passed,
     }
@@ -567,7 +589,8 @@ def render_markdown(card: dict) -> str:
         f"**{'PASS' if card['passed'] else 'FAIL'}** — {t['match']}/{card['items']} matched "
         f"(need >= {line['min_matched']}), {t['overclaim']} overclaim(s) accepted "
         f"(max {line['max_overclaims']}), {t['unverified']} unverified type(s) "
-        f"(max {line['max_unverified']}).",
+        f"(max {line['max_unverified']}), {card['key_omissions']} key-column omission(s) "
+        f"(max {line['max_key_omissions']}).",
         "",
         f"Wrong items the compiler accepted: {card['wrong_accepted']} "
         f"({t['overclaim']} overclaim, {t['underclaim']} underclaim). Unclaimed: {t['unclaimed']}.",
