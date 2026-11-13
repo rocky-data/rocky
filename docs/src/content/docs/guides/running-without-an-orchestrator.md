@@ -575,7 +575,17 @@ A scheduled run is a plain `rocky run --pipeline <name>` in a child process. The
 
 The child sets only `ROCKY_RUN_TRIGGER`, `ROCKY_SUBMISSION_ID` and the trace context. It never passes `--principal`. `rocky run` reads no principal, so a `ROCKY_PRINCIPAL` the scheduler inherits changes nothing.
 
-A freeze that covers a scheduled pipeline does not skip the tick. The child starts, the freeze fence withholds its work, and the run records a failure. The usual retries, incident bundle and failure backoff follow, so the operator sees that a freeze blocked a scheduled run.
+A freeze that covers a scheduled pipeline does not skip the tick. The child starts, the freeze fence withholds its work, and the run records a failure. The run record and `rocky run --output json` also carry a `hold` that names the freeze (`kind`, `freeze_id`, `scope`, `reason`). The scheduler reads it:
+
+- A held run is not retried. A retry cannot succeed while the freeze stands.
+- `consecutive_failures` does not move, and the cursor records `freeze_hold`.
+- A standing (`after` or `freshness`) demand is re-probed every 15 minutes after its last attempt started. This interval does not grow.
+- A held cron or webhook occurrence is finished, not kept. It is not run again when the freeze is lifted. A cron pipeline runs at its next occurrence.
+- The first held run writes one `freeze_hold` incident bundle that names the freeze. Later runs held by the same freeze write none. A run that is not held ends the episode, and a different freeze starts a new one.
+- A held run counts as a hold even when it also had other failures. Its incident names only the freeze, and `consecutive_failures` does not grow. Read the run in `rocky history` for the rest.
+- `rocky tick` counts a held run under `counts.held`, not `counts.failed` or `counts.partial`. A hold alone does not make the tick exit non-zero.
+
+When the fence cannot list the freeze markers, the run fails with no `hold`. That is a fault, so the usual retries, incident bundle and failure backoff follow.
 
 ### Preview before you wire the timer
 

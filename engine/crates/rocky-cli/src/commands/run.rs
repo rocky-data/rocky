@@ -4268,7 +4268,7 @@ pub async fn run_with_explicit_contracts(
                 // reconcile, recorded as a failure so the terminal path
                 // (persist + session finalize) still runs on the committed
                 // build.
-                if let Some(msg) = freeze_fence
+                if let Some(withhold) = freeze_fence
                     .check_withhold(
                         // Only the EXECUTING model — the captured snapshot
                         // carries every COMPILED model, so a freeze on an
@@ -4283,10 +4283,11 @@ pub async fn run_with_explicit_contracts(
                     )
                     .await
                 {
+                    withhold.note_on(&mut output);
                     output.tables_failed += 1;
                     output.errors.push(crate::output::TableErrorOutput {
                         asset_key: vec!["<freeze>".to_string()],
-                        error: msg,
+                        error: withhold.message(),
                         failure_kind: crate::output::FailureKind::Unknown,
                         cooldown_seconds: None,
                     });
@@ -6996,7 +6997,9 @@ pub async fn run_with_explicit_contracts(
         // and cannot under-gate a shadow run tomorrow.
         .check_withhold(fence_names.iter().map(String::as_str))
         .await;
-    if let Some(msg) = &freeze_withheld {
+    if let Some(withhold) = &freeze_withheld {
+        withhold.note_on(&mut output);
+        let msg = withhold.message();
         table_errors.push(TableError {
             asset_key: vec!["<freeze>".to_string()],
             error: format!(
@@ -8143,15 +8146,16 @@ pub async fn run_with_explicit_contracts(
             // failure, never an `Err` — see the fence's withhold contract).
             if exec_ok
                 && let Some(snapshot) = &governance_snapshot
-                && let Some(msg) = freeze_fence
+                && let Some(withhold) = freeze_fence
                     .check_withhold(snapshot.models.iter().map(|m| m.name.as_str()))
                     .await
             {
                 exec_ok = false;
                 model_phase_clean = false;
+                withhold.note_on(&mut output);
                 table_errors.push(TableError {
                     asset_key: vec!["<freeze>".to_string()],
-                    error: msg,
+                    error: withhold.message(),
                     task_index: None,
                     model: None,
                     copy: None,
@@ -12679,11 +12683,12 @@ pub(crate) async fn execute_backfill_set(
                         }
                         None => None,
                     };
-                    if let Some(msg) = fence_withhold {
+                    if let Some(withhold) = fence_withhold {
+                        withhold.note_on(&mut output);
                         output.tables_failed += 1;
                         output.errors.push(crate::output::TableErrorOutput {
                             asset_key: vec!["<freeze>".to_string()],
-                            error: msg,
+                            error: withhold.message(),
                             failure_kind: crate::output::FailureKind::Unknown,
                             cooldown_seconds: None,
                         });
@@ -13824,7 +13829,7 @@ async fn execute_models_phase(
     // that the layer loop can execute.
     if let Some(gate) = exec_fp_gate
         && let Some(fence) = freeze_fence
-        && let Some(msg) = fence
+        && let Some(withhold) = fence
             .check_withhold(
                 compile_result
                     .project
@@ -13841,10 +13846,11 @@ async fn execute_models_phase(
             plan_id = gate.plan_id.as_str(),
             "freeze fence hit before execution"
         );
+        withhold.note_on(output);
         output.tables_failed += 1;
         output.errors.push(crate::output::TableErrorOutput {
             asset_key: vec!["<freeze>".to_string()],
-            error: msg,
+            error: withhold.message(),
             failure_kind: crate::output::FailureKind::Unknown,
             cooldown_seconds: None,
         });
@@ -14524,7 +14530,7 @@ async fn execute_models_phase(
         // `session.abandon`). A fail-closed LIST failure records the same
         // withhold.
         if let Some(fence) = freeze_fence
-            && let Some(msg) = fence
+            && let Some(withhold) = fence
                 .check_withhold(
                     // Only this layer's SELECTED, COMPILABLE names — the same
                     // `model_name_filter` / `model_set` / compile-failure
@@ -14543,10 +14549,11 @@ async fn execute_models_phase(
                 )
                 .await
         {
+            withhold.note_on(output);
             output.tables_failed += 1;
             output.errors.push(crate::output::TableErrorOutput {
                 asset_key: vec!["<freeze>".to_string()],
-                error: msg,
+                error: withhold.message(),
                 failure_kind: crate::output::FailureKind::Unknown,
                 cooldown_seconds: None,
             });
@@ -27537,6 +27544,7 @@ auto_create_schemas = true
         let output = RunOutput {
             volume_warnings: Vec::new(),
             source_volumes: Vec::new(),
+            hold: None,
             version: "1.0.2".into(),
             command: "run".into(),
             scheduling_warnings: Vec::new(),
@@ -44567,6 +44575,7 @@ auto_create_schemas = true
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         };
         state.record_run(&failed).unwrap();
 
@@ -46994,6 +47003,7 @@ auto_create_schemas = true
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -47205,6 +47215,7 @@ auto_create_schemas = true
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         };
         store.record_run(&base_run).unwrap();
         store
@@ -47492,6 +47503,7 @@ auto_create_schemas = true
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         };
         store.record_run(&run).unwrap();
 
@@ -48491,6 +48503,7 @@ auto_create_schemas = true
                 queued_ms: None,
                 source_volumes: Vec::new(),
                 output_volumes: Vec::new(),
+                hold: None,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -48808,6 +48821,7 @@ auto_create_schemas = true
                     queued_ms: None,
                     source_volumes: Vec::new(),
                     output_volumes: Vec::new(),
+                    hold: None,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

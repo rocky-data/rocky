@@ -222,12 +222,20 @@ class ScheduleThrottleKind2(StrEnum):
     partial_backoff = "partial_backoff"
 
 
+class ScheduleThrottleKind3(StrEnum):
+    """
+    The flat re-probe after a run an active freeze marker held (#2569).
+    """
+
+    freeze_hold = "freeze_hold"
+
+
 class ScheduleThrottleStatus(BaseModel):
     """
     An active backoff window.
     """
 
-    kind: ScheduleThrottleKind1 | ScheduleThrottleKind2
+    kind: ScheduleThrottleKind1 | ScheduleThrottleKind2 | ScheduleThrottleKind3
     """
     Which backoff is suppressing the demand.
     """

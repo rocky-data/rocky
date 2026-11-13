@@ -215,6 +215,12 @@ pub enum SkipReason {
         /// When the demand becomes eligible again.
         resume_at: DateTime<Utc>,
     },
+    /// A standing demand whose last attempt a freeze held, waiting for the
+    /// flat re-probe interval (#2569).
+    FreezeHold {
+        /// When the demand becomes eligible again.
+        resume_at: DateTime<Utc>,
+    },
     /// A higher-priority source already produced the demand this tick.
     Superseded,
     /// The run history could not be read (store fault or a corrupt row), so a
@@ -699,6 +705,7 @@ fn apply_standing_throttle(
         Throttle::Clear => Ok(()),
         Throttle::FailureBackoff { resume_at } => Err(SkipReason::FailureBackoff { resume_at }),
         Throttle::PartialBackoff { resume_at } => Err(SkipReason::PartialBackoff { resume_at }),
+        Throttle::FreezeHold { resume_at } => Err(SkipReason::FreezeHold { resume_at }),
     }
 }
 

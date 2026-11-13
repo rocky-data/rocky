@@ -1469,6 +1469,50 @@
       ],
       "type": "object"
     },
+    "RunHold": {
+      "description": "A governance hold on a run: an active freeze marker withheld its work. See [`RunRecord::hold`].",
+      "properties": {
+        "freeze_id": {
+          "description": "The freeze marker's id.",
+          "type": "string"
+        },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunHoldKind"
+            }
+          ],
+          "description": "The kind of hold. Only `freeze` today."
+        },
+        "reason": {
+          "description": "The freeze marker's reason, as its author wrote it.",
+          "type": "string"
+        },
+        "scope": {
+          "description": "The freeze marker's scope selector (`any` for an unreadable body).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "freeze_id",
+        "kind",
+        "reason",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "RunHoldKind": {
+      "description": "What kind of governance hold stopped a run.",
+      "oneOf": [
+        {
+          "description": "An active freeze marker bound a model or table the run was executing.",
+          "enum": [
+            "freeze"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "RunProductBudget": {
       "description": "One product budget checked at the end of a `rocky run`, on [`RunOutput::product_budgets`].",
       "properties": {
@@ -2211,6 +2255,17 @@
     },
     "filter": {
       "type": "string"
+    },
+    "hold": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RunHold"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Set when an active freeze marker, not the run's own work, withheld work in this run (#2569). `status` still reports the failure. The scheduler reads it from the run record to stop retrying while the freeze stands. Omitted for every other run, including one the freeze fence stopped because it could not list the markers (a fault, which stays retryable). The first freeze that withheld work is kept."
     },
     "idempotency_key": {
       "description": "The `--idempotency-key` value this run was invoked with, echoed back for operator cross-reference in logs and `rocky history`. `None` for runs that didn't pass the flag.",

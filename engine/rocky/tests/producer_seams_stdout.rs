@@ -110,6 +110,7 @@ fn seed_state(state_path: &Path) {
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         })
         .unwrap();
 }

@@ -256,11 +256,12 @@ pub async fn run_transformation(
                         }
                         None => None,
                     };
-                    if let Some(msg) = fence_withhold {
+                    if let Some(withhold) = fence_withhold {
+                        withhold.note_on(&mut output);
                         output.tables_failed += 1;
                         output.errors.push(crate::output::TableErrorOutput {
                             asset_key: vec!["<freeze>".to_string()],
-                            error: msg,
+                            error: withhold.message(),
                             failure_kind: crate::output::FailureKind::Unknown,
                             cooldown_seconds: None,
                         });

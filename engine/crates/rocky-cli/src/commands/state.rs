@@ -1001,6 +1001,7 @@ mod retention_sweep_config_tests {
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         }
     }
 

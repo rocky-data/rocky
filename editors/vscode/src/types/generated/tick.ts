@@ -6,6 +6,11 @@
  */
 
 /**
+ * What kind of governance hold stopped a run.
+ */
+export type RunHoldKind = "freeze";
+
+/**
  * JSON output for `rocky tick` — one demand-reconciliation pass.
  *
  * A tick evaluates every scheduled pipeline's standing demand once, runs what is due (sequentially, via child `rocky run` processes), and records the outcome. This payload is the machine surface: an orchestration wrapper (a systemd timer, cron, CI) reads it to see what ran, what was suppressed, and why.
@@ -72,11 +77,15 @@ export interface TickCounts {
    */
   executed: number;
   /**
-   * Executed runs that failed (exit 1/other).
+   * Executed runs that failed (exit 1/other), not counting runs a freeze held.
    */
   failed: number;
   /**
-   * Executed runs that were partial (exit 2).
+   * Executed runs an active freeze marker held (#2569). Their `outcome` is still `failure` or `partial`, but they are not in `failed` or `partial` and do not fail the tick.
+   */
+  held?: number;
+  /**
+   * Executed runs that were partial (exit 2), not counting runs a freeze held.
    */
   partial: number;
   /**
@@ -124,11 +133,11 @@ export interface SourceEvaluation {
    */
   missed?: number | null;
   /**
-   * The reason string for this source: `due` | `not_due` | `disabled` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `superseded` | `history_unavailable`.
+   * The reason string for this source: `due` | `not_due` | `disabled` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `freeze_hold` | `superseded` | `history_unavailable`.
    */
   reason: string;
   /**
-   * When the source becomes eligible again — present for `failure_backoff` and `partial_backoff`.
+   * When the source becomes eligible again — present for `failure_backoff`, `partial_backoff` and `freeze_hold`.
    */
   resume_at?: string | null;
   /**
@@ -149,6 +158,10 @@ export interface ExecutedRunOutput {
    * The child's exit code: `0` success, `2` partial, `1`/other failure.
    */
   exit_code: number;
+  /**
+   * Set when an active freeze marker held this run (#2569): the freeze, not the pipeline, stopped it. A held run is not retried and does not fail the tick. Omitted otherwise.
+   */
+  hold?: RunHold | null;
   /**
    * The logical timestamp of the demand.
    */
@@ -172,6 +185,28 @@ export interface ExecutedRunOutput {
   [k: string]: unknown;
 }
 /**
+ * A governance hold on a run: an active freeze marker withheld its work. See [`RunRecord::hold`].
+ */
+export interface RunHold {
+  /**
+   * The freeze marker's id.
+   */
+  freeze_id: string;
+  /**
+   * The kind of hold. Only `freeze` today.
+   */
+  kind: RunHoldKind;
+  /**
+   * The freeze marker's reason, as its author wrote it.
+   */
+  reason: string;
+  /**
+   * The freeze marker's scope selector (`any` for an unreadable body).
+   */
+  scope: string;
+  [k: string]: unknown;
+}
+/**
  * One demand suppressed this tick.
  */
 export interface SkippedDemandOutput {
@@ -184,7 +219,7 @@ export interface SkippedDemandOutput {
    */
   pipeline?: string | null;
   /**
-   * Why it was skipped: `not_due` | `disabled` | `in_flight` | `tick_in_progress` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `dedup` | `history_unavailable` | `state_busy` | `spool_unreadable`.
+   * Why it was skipped: `not_due` | `disabled` | `in_flight` | `tick_in_progress` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `freeze_hold` | `dedup` | `history_unavailable` | `state_busy` | `spool_unreadable`.
    *
    * `spool_unreadable` is pipeline-less and `webhook`-sourced: something is at `.rocky/pending-demands` that could not be read (a dangling symlink, a permission denial, a file where the directory belongs), so no pending webhook demand was consumed this tick. An ABSENT spool directory is the ordinary shape for a project that takes no webhooks and never produces this — it reads as an empty list, not a fault. The next tick does not fix any of the causes that do produce it (#1731).
    */

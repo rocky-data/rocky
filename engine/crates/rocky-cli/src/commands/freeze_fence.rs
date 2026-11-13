@@ -184,29 +184,74 @@ impl FreezeFence {
     }
 
     /// [`Self::check`], folding both a hit and a fail-closed transport error
-    /// into the withhold message the run loop RECORDS (`Some` = withhold,
-    /// `None` = clear) — never an `Err`.
+    /// into the withhold the run loop RECORDS (`Some` = withhold, `None` =
+    /// clear) — never an `Err`.
     ///
     /// The recorded-failure shape is load-bearing at the mid-run boundaries:
     /// an `Err` escaping the run body routes to `session.abandon`, stranding
     /// already-committed layers' local state un-uploaded. Recording instead
     /// flows to the normal terminal path (persist run record → finalize
     /// upload), so a fence hit is a partial failure, never state loss.
+    ///
+    /// The two withholds differ for the scheduler (#2569): a
+    /// [`Withhold::Frozen`] carries a [`rocky_core::state::RunHold`], so a
+    /// scheduled run held by a freeze is not retried while it stands. A
+    /// [`Withhold::Unverifiable`] (the marker LIST failed) carries none: it is
+    /// a fault, and stays an ordinary retryable failure.
     pub(crate) async fn check_withhold<'a>(
         &self,
         names: impl Iterator<Item = &'a str>,
-    ) -> Option<String> {
+    ) -> Option<Withhold> {
         match self.check(names).await {
             Ok(None) => None,
-            Ok(Some(hit)) => Some(format!(
+            Ok(Some(hit)) => Some(Withhold::Frozen(hit)),
+            Err(e) => Some(Withhold::Unverifiable(format!("{e:#}"))),
+        }
+    }
+}
+
+/// Why the fence withheld work. See [`FreezeFence::check_withhold`].
+pub(crate) enum Withhold {
+    /// An active freeze marker bound a fenced name.
+    Frozen(FenceHit),
+    /// The marker LIST failed, so an active freeze could not be ruled out.
+    /// Carries the rendered error.
+    Unverifiable(String),
+}
+
+impl Withhold {
+    /// The message the run records as the withhold's error.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Withhold::Frozen(hit) => format!(
                 "freeze fence: active freeze marker {} (scope '{}', reason: {}) — remaining \
                  work withheld fail-closed",
                 hit.freeze_id, hit.scope, hit.reason
-            )),
-            Err(e) => Some(format!(
-                "freeze fence: durable freeze-marker listing failed ({e:#}) — an active freeze \
+            ),
+            Withhold::Unverifiable(e) => format!(
+                "freeze fence: durable freeze-marker listing failed ({e}) — an active freeze \
                  marker cannot be ruled out, remaining work withheld fail-closed"
-            )),
+            ),
+        }
+    }
+
+    /// The run's hold: `Some` only for [`Withhold::Frozen`].
+    pub(crate) fn hold(&self) -> Option<rocky_core::state::RunHold> {
+        match self {
+            Withhold::Frozen(hit) => Some(rocky_core::state::RunHold {
+                kind: rocky_core::state::RunHoldKind::Freeze,
+                freeze_id: hit.freeze_id.clone(),
+                scope: hit.scope.clone(),
+                reason: hit.reason.clone(),
+            }),
+            Withhold::Unverifiable(_) => None,
+        }
+    }
+
+    /// Record this withhold's hold on `output`, keeping the first one.
+    pub(crate) fn note_on(&self, output: &mut crate::output::RunOutput) {
+        if output.hold.is_none() {
+            output.hold = self.hold();
         }
     }
 }
@@ -284,15 +329,57 @@ mod tests {
         let fence = FreezeFence::build(&s3_cfg(), true, None).expect("build fence");
 
         harness.faults.arm(FaultOp::List, FaultMode::FailAll);
-        let msg = fence
+        let withhold = fence
             .check_withhold(["orders"].into_iter())
             .await
             .expect("a fail-closed LIST failure must fold into a recorded withhold");
         harness.faults.clear();
+        let msg = withhold.message();
         assert!(
             msg.contains("withheld fail-closed"),
             "the recorded message must state the fail-closed withhold; got: {msg}"
         );
+        assert!(
+            matches!(withhold, Withhold::Unverifiable(_)),
+            "a LIST failure is unverifiable, not a freeze"
+        );
+        assert_eq!(
+            withhold.hold(),
+            None,
+            "an unverifiable withhold is a fault, never a hold (#2569)"
+        );
+    }
+
+    /// A marker that binds is a `Frozen` withhold, and only it carries the
+    /// run's hold (#2569). The first hold noted on the output is kept.
+    #[tokio::test]
+    async fn a_freeze_hit_is_a_hold_and_the_first_hold_is_kept() {
+        let _serial = remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        seed_marker(&harness, "f-hold", "any").await;
+        let fence = FreezeFence::build(&s3_cfg(), true, None).expect("build fence");
+
+        let withhold = fence
+            .check_withhold(["orders"].into_iter())
+            .await
+            .expect("an active marker withholds");
+        assert!(withhold.message().contains("f-hold"));
+        let hold = withhold.hold().expect("a freeze hit is a hold");
+        assert_eq!(hold.kind, rocky_core::state::RunHoldKind::Freeze);
+        assert_eq!(hold.freeze_id, "f-hold");
+        assert_eq!(hold.scope, "any");
+        assert_eq!(hold.reason, "test freeze f-hold");
+
+        let mut output = crate::output::RunOutput::new(String::new(), 0, 1);
+        withhold.note_on(&mut output);
+        Withhold::Frozen(FenceHit {
+            freeze_id: "f-later".into(),
+            scope: "any".into(),
+            reason: "later".into(),
+        })
+        .note_on(&mut output);
+        Withhold::Unverifiable("boom".into()).note_on(&mut output);
+        assert_eq!(output.hold.map(|h| h.freeze_id).as_deref(), Some("f-hold"));
     }
 
     /// With NO `[policy]` plane the fence is inert even on a durable-tier

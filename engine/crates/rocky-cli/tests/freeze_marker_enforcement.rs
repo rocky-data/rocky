@@ -769,6 +769,12 @@ async fn layer_fence_withholds_remaining_layers_and_finalizes() {
         RunStatus::Failure,
         "every layer was withheld — the run records as a Failure, not a success"
     );
+    // #2569: the record names the freeze that held it, so the scheduler does
+    // not retry a run that cannot succeed while the freeze stands.
+    let hold = record.hold.expect("a freeze-withheld run records its hold");
+    assert_eq!(hold.kind, rocky_core::state::RunHoldKind::Freeze);
+    assert_eq!(hold.freeze_id, "f-layer");
+    assert_eq!(hold.scope, "any");
 }
 
 /// The fence sees only the EXECUTING (selected) models: a `model=drop` freeze
@@ -873,12 +879,14 @@ async fn replication_fanout_withholds_and_finalizes() {
         .await
         .expect("pod B start-download");
     let store = harness.open_store(&harness.pod_b);
-    assert!(
-        store
-            .get_run("run-fanout-freeze")
-            .expect("read run record")
-            .is_some(),
-        "the fenced run's record must ride the finalize upload"
+    let record = store
+        .get_run("run-fanout-freeze")
+        .expect("read run record")
+        .expect("the fenced run's record must ride the finalize upload");
+    assert_eq!(
+        record.hold.map(|h| h.freeze_id).as_deref(),
+        Some("f-fanout"),
+        "the replication fan-out withhold records its hold (#2569)"
     );
 }
 
@@ -1122,6 +1130,11 @@ async fn a_scheduled_run_is_fenced_exactly_like_a_manual_one() {
             std::mem::discriminant(&want_trigger),
             "{label}: the trigger is the one difference, recorded as {:?}",
             record.trigger
+        );
+        assert_eq!(
+            record.hold.as_ref().map(|h| h.freeze_id.as_str()),
+            Some("f-sched"),
+            "{label}: the record names the freeze that held it (#2569)"
         );
         outcomes.push((
             label,

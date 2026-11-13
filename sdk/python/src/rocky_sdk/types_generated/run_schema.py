@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import AwareDatetime, BaseModel, Field, conint
+from pydantic import AwareDatetime, BaseModel, Field, RootModel, conint
 
 
 class AnomalyEvaluationOutput(BaseModel):
@@ -553,6 +553,21 @@ class RunCostSummary(BaseModel):
     total_duration_ms: conint(ge=0)
     """
     Wall-clock time summed across every materialization. Separate from [`RunOutput::duration_ms`] (which includes setup / governance overhead) so budget enforcement can target model-compute time specifically.
+    """
+
+
+class RunHoldKind1(StrEnum):
+    """
+    An active freeze marker bound a model or table the run was executing.
+    """
+
+    freeze = "freeze"
+
+
+class RunHoldKind(RootModel[RunHoldKind1]):
+    root: RunHoldKind1
+    """
+    What kind of governance hold stopped a run.
     """
 
 
@@ -1191,6 +1206,29 @@ class ProductBudgetStatus(BaseModel):
     """
 
 
+class RunHold(BaseModel):
+    """
+    A governance hold on a run: an active freeze marker withheld its work. See [`RunRecord::hold`].
+    """
+
+    freeze_id: str
+    """
+    The freeze marker's id.
+    """
+    kind: RunHoldKind
+    """
+    The kind of hold. Only `freeze` today.
+    """
+    reason: str
+    """
+    The freeze marker's reason, as its author wrote it.
+    """
+    scope: str
+    """
+    The freeze marker's scope selector (`any` for an unreadable body).
+    """
+
+
 class SourceVolumeCheckOutput(BaseModel):
     """
     One source row count `rocky run` took when a production run started, judged against a product's `[[product.source.volume]]` range.
@@ -1447,6 +1485,10 @@ class RunOutput(BaseModel):
     """
     execution: ExecutionSummary
     filter: str
+    hold: RunHold | None = None
+    """
+    Set when an active freeze marker, not the run's own work, withheld work in this run (#2569). `status` still reports the failure. The scheduler reads it from the run record to stop retrying while the freeze stands. Omitted for every other run, including one the freeze fence stopped because it could not list the markers (a fault, which stays retryable). The first freeze that withheld work is kept.
+    """
     idempotency_key: str | None = None
     """
     The `--idempotency-key` value this run was invoked with, echoed back for operator cross-reference in logs and `rocky history`. `None` for runs that didn't pass the flag.

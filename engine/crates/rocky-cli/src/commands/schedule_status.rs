@@ -819,6 +819,10 @@ fn reportable_throttle(
             kind: ScheduleThrottleKind::PartialBackoff,
             resume_at,
         }),
+        Throttle::FreezeHold { resume_at } => Some(ScheduleThrottleStatus {
+            kind: ScheduleThrottleKind::FreezeHold,
+            resume_at,
+        }),
     }
 }
 

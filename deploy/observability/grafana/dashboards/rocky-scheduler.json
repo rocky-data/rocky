@@ -83,7 +83,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Skipped demands per second, by reason",
-      "description": "rate(rocky_scheduler_skipped) split by the reason label (not_due, disabled, paused, in_flight, catchup_skipped, failure_backoff, partial_backoff, dedup, config_error, history_unavailable, state_busy, spool_unreadable). failure_backoff / partial_backoff climbing is the fingerprint of a sick pipeline the loop is deliberately backing off.",
+      "description": "rate(rocky_scheduler_skipped) split by the reason label (not_due, disabled, paused, in_flight, catchup_skipped, failure_backoff, partial_backoff, freeze_hold, dedup, config_error, history_unavailable, state_busy, spool_unreadable). failure_backoff / partial_backoff climbing is the fingerprint of a sick pipeline the loop is deliberately backing off.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "fieldConfig": {

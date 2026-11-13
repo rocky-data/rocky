@@ -49,6 +49,12 @@ pub struct ScheduleStateRecord {
     /// sibling is `[schedule] enabled = false` (a different skip reason).
     #[serde(default)]
     pub paused: bool,
+    /// The freeze id of the current freeze-hold episode (#2569): set when an
+    /// attempt ends held by an active freeze marker, cleared by the next
+    /// attempt that is not held. While set, a later held attempt writes no
+    /// new incident. Additive: an older record reads as no episode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_hold_id: Option<String>,
 }
 
 /// The cross-tick backoff ceiling: failure backoff never exceeds this.
@@ -57,6 +63,9 @@ const MAX_FAILURE_BACKOFF: Duration = Duration::hours(6);
 const BASE_FAILURE_BACKOFF: Duration = Duration::minutes(5);
 /// The fixed partial-success backoff.
 const PARTIAL_BACKOFF: Duration = Duration::minutes(60);
+/// The flat re-probe interval for a standing demand held by a freeze: it does
+/// not grow, because the freeze, not the pipeline, decides when it can run.
+pub const FREEZE_HOLD_REPROBE: Duration = Duration::minutes(15);
 
 /// The suppression a standing demand is under right now, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +79,11 @@ pub enum Throttle {
     },
     /// Suppressed by the fixed partial backoff until `resume_at`.
     PartialBackoff {
+        /// When the demand becomes eligible again.
+        resume_at: DateTime<Utc>,
+    },
+    /// The last attempt was held by a freeze; re-probed at a flat interval.
+    FreezeHold {
         /// When the demand becomes eligible again.
         resume_at: DateTime<Utc>,
     },
@@ -118,6 +132,8 @@ impl ScheduleStateRecord {
     /// - last attempt partial (exit 2): suppressed until `last_attempt_at + 60min`.
     ///   Load-bearing: a partial is not a success, so the standing demand stays
     ///   due — without this a reliably-partial pipeline re-runs every tick.
+    /// - last attempt held by a freeze (`freeze_hold`): suppressed until
+    ///   `last_attempt_at + 15min`, a flat re-probe that does not grow.
     /// - last attempt succeeded: no suppression.
     pub fn standing_throttle(&self, now: DateTime<Utc>) -> Throttle {
         let Some(last_attempt) = self.last_attempt() else {
@@ -139,6 +155,14 @@ impl ScheduleStateRecord {
                 let resume_at = last_attempt + PARTIAL_BACKOFF;
                 if now < resume_at {
                     Throttle::PartialBackoff { resume_at }
+                } else {
+                    Throttle::Clear
+                }
+            }
+            Some(FREEZE_HOLD_OUTCOME) => {
+                let resume_at = last_attempt + FREEZE_HOLD_REPROBE;
+                if now < resume_at {
+                    Throttle::FreezeHold { resume_at }
                 } else {
                     Throttle::Clear
                 }
@@ -182,8 +206,20 @@ impl ScheduleStateRecord {
             CfDelta::Unchanged => {}
         }
         self.last_attempt_outcome = Some(outcome.as_str().to_string());
+        self.freeze_hold_id = None;
+    }
+
+    /// Record an attempt held by the freeze `freeze_id`: `consecutive_failures`
+    /// does not move (the pipeline did not fail), the outcome reads
+    /// `freeze_hold`, and the episode is opened or kept.
+    pub fn apply_freeze_hold(&mut self, freeze_id: &str) {
+        self.last_attempt_outcome = Some(FREEZE_HOLD_OUTCOME.to_string());
+        self.freeze_hold_id = Some(freeze_id.to_string());
     }
 }
+
+/// The `last_attempt_outcome` an attempt held by a freeze records.
+pub const FREEZE_HOLD_OUTCOME: &str = "freeze_hold";
 
 /// A mutation applied to a pipeline's [`ScheduleStateRecord`] atomically with a
 /// claim compare-and-swap (see `StateStore::schedule_claim_cas`), so the cursor
@@ -219,6 +255,12 @@ pub enum ScheduleStateMutation {
         /// How `consecutive_failures` moves.
         cf_delta: CfDelta,
     },
+    /// A terminal attempt held by a freeze (#2569): see
+    /// [`ScheduleStateRecord::apply_freeze_hold`].
+    FreezeHold {
+        /// The freeze marker that held the attempt.
+        freeze_id: String,
+    },
 }
 
 impl ScheduleStateMutation {
@@ -240,6 +282,9 @@ impl ScheduleStateMutation {
             ScheduleStateMutation::Terminal { outcome, cf_delta } => {
                 rec.apply_bookkeeping(*outcome, *cf_delta);
             }
+            ScheduleStateMutation::FreezeHold { freeze_id } => {
+                rec.apply_freeze_hold(freeze_id);
+            }
         }
     }
 }
@@ -251,6 +296,46 @@ mod tests {
 
     fn at(h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 1, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn a_freeze_hold_is_a_flat_re_probe_and_a_clean_outcome_ends_the_episode() {
+        let mut r = ScheduleStateRecord {
+            last_attempt_at: Some(at(0, 0).to_rfc3339()),
+            consecutive_failures: 3,
+            ..Default::default()
+        };
+        ScheduleStateMutation::FreezeHold {
+            freeze_id: "f-1".into(),
+        }
+        .apply(&mut r);
+        assert_eq!(r.consecutive_failures, 3, "a hold moves no failure count");
+        assert_eq!(r.freeze_hold_id.as_deref(), Some("f-1"));
+        assert_eq!(
+            r.standing_throttle(at(0, 14)),
+            Throttle::FreezeHold {
+                resume_at: at(0, 15)
+            }
+        );
+        assert_eq!(r.standing_throttle(at(0, 15)), Throttle::Clear);
+        ScheduleStateMutation::Terminal {
+            outcome: TerminalOutcome::Success,
+            cf_delta: CfDelta::Reset,
+        }
+        .apply(&mut r);
+        assert_eq!(r.freeze_hold_id, None);
+    }
+
+    #[test]
+    fn an_older_cursor_reads_as_no_freeze_hold_episode() {
+        let r: ScheduleStateRecord =
+            serde_json::from_str(r#"{"consecutive_failures": 1}"#).unwrap();
+        assert_eq!(r.freeze_hold_id, None);
+        let json = serde_json::to_string(&ScheduleStateRecord::default()).unwrap();
+        assert!(
+            !json.contains("freeze_hold_id"),
+            "omitted when None: {json}"
+        );
     }
 
     #[test]

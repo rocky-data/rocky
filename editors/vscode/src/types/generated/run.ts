@@ -108,6 +108,10 @@ export type FailureKind =
   | "compile-error"
   | "unknown";
 /**
+ * What kind of governance hold stopped a run.
+ */
+export type RunHoldKind = "freeze";
+/**
  * What a `[product.output.volume]` check counts, set by the output model's strategy.
  *
  * ```text full_refresh                     total_rows      the whole table is this load incremental (no unique_key)      rows_added      the INSERT's reported rows incremental (unique_key), merge  rows_touched    the MERGE's reported row count time_interval                    partition_rows  COUNT(*) in each partition written ```
@@ -213,6 +217,10 @@ export interface RunOutput {
   excluded_tables?: ExcludedTableOutput[];
   execution: ExecutionSummary;
   filter: string;
+  /**
+   * Set when an active freeze marker, not the run's own work, withheld work in this run (#2569). `status` still reports the failure. The scheduler reads it from the run record to stop retrying while the freeze stands. Omitted for every other run, including one the freeze fence stopped because it could not list the markers (a fault, which stays retryable). The first freeze that withheld work is kept.
+   */
+  hold?: RunHold | null;
   /**
    * The `--idempotency-key` value this run was invoked with, echoed back for operator cross-reference in logs and `rocky history`. `None` for runs that didn't pass the flag.
    */
@@ -554,6 +562,28 @@ export interface ExecutionSummary {
    */
   tables_failed: number;
   tables_processed: number;
+  [k: string]: unknown;
+}
+/**
+ * A governance hold on a run: an active freeze marker withheld its work. See [`RunRecord::hold`].
+ */
+export interface RunHold {
+  /**
+   * The freeze marker's id.
+   */
+  freeze_id: string;
+  /**
+   * The kind of hold. Only `freeze` today.
+   */
+  kind: RunHoldKind;
+  /**
+   * The freeze marker's reason, as its author wrote it.
+   */
+  reason: string;
+  /**
+   * The freeze marker's scope selector (`any` for an unreadable body).
+   */
+  scope: string;
   [k: string]: unknown;
 }
 export interface MaterializationOutput {

@@ -5691,6 +5691,7 @@ fn seed_run_history(models_dir: &Path) {
         queued_ms: None,
         source_volumes: Vec::new(),
         output_volumes: Vec::new(),
+        hold: None,
     };
     store.record_run(&run).expect("record run");
 

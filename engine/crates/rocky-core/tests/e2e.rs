@@ -551,6 +551,7 @@ fn test_run_history_flow() {
         queued_ms: None,
         source_volumes: Vec::new(),
         output_volumes: Vec::new(),
+        hold: None,
     };
 
     store.record_run(&run).unwrap();
@@ -2221,6 +2222,7 @@ mod delivery_timing_e2e {
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         }
     }
 
