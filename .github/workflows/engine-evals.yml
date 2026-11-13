@@ -80,8 +80,9 @@ jobs:
         run: uv run python run_evals.py --error-contract
 
       # Replays recorded model responses through the real `rocky ai-contract`
-      # and gates on every item's outcome matching expected_replay.json. No
-      # key and no network: the responses come from a local server.
+      # (both recording sets) and gates on every item's outcome matching the
+      # set's golden file (expected_replay.json, expected_replay_live.json).
+      # No key and no network: the responses come from a local server.
       - name: Contract-quality replay
         working-directory: engine/evals
         env:
