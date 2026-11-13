@@ -15,3 +15,7 @@ The replay pins these drafts, so a change to the compiler or the scoring that
 moves one of their outcomes fails CI. It covers only the paths this run took:
 no retry, no refused claim, no overclaim. The hand-written set in
 `../recordings/` covers those paths.
+
+A `rehash` re-keys these responses to a changed prompt they never answered.
+After one, they are no longer a live run's output: say so in the PR, and
+replace them with a new live run when a key is at hand.

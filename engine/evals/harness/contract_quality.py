@@ -470,7 +470,7 @@ def prepare_project(fixture: Path, rocky_bin: Path, env: dict) -> Path:
     """Copy the fixture, seed its DuckDB through `rocky shell`, materialize it."""
     workdir = Path(tempfile.mkdtemp(prefix="rocky-contract-quality-"))
     project = workdir / fixture.name
-    shutil.copytree(fixture, project, ignore=shutil.ignore_patterns("recordings", "*.duckdb*"))
+    shutil.copytree(fixture, project, ignore=shutil.ignore_patterns("recordings*", "*.duckdb*"))
     seeded = _run([str(rocky_bin), "shell"], project, env, stdin=project / "data" / "seed.sql")
     # `rocky shell` reports a failed statement on stderr and still exits 0.
     if seeded.returncode != 0 or "Error:" in seeded.stdout + seeded.stderr:
@@ -728,6 +728,23 @@ def update_expected(
             print(
                 f"contract-quality ({name}): run a replay first; "
                 "only a replay scorecard is a golden"
+            )
+            status = 1
+            continue
+        errored = [m["model"] for m in card["models"] if m["error"]]
+        if errored:
+            print(
+                f"contract-quality ({name}): the last replay errored for "
+                f"{', '.join(errored)}; an errored replay is not a golden"
+            )
+            status = 1
+            continue
+        recordings = _FIXTURES_DIR / fixture_name / spec.recordings
+        newest = max((p.stat().st_mtime for p in recordings.glob("*.json")), default=0.0)
+        if scorecard.stat().st_mtime < newest:
+            print(
+                f"contract-quality ({name}): {scorecard.name} is older than {spec.recordings}/; "
+                "run a replay first"
             )
             status = 1
             continue
