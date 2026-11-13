@@ -13424,6 +13424,11 @@ async fn execute_models_phase(
             .map(|project| project.root.as_path()),
         shadow_config.is_none(),
     )?;
+    // Where the volume check keeps its open-breach markers (#2581).
+    let breach_ledger = super::run_volume::BreachLedger {
+        store: state_store,
+        run_id,
+    };
 
     // Build the run-scoped classified-retry plan once. The budget + breaker
     // carry interior atomics, so their caps are observed across the whole run
@@ -14318,6 +14323,66 @@ async fn execute_models_phase(
     }
     compile_excluded_models.extend(newly_excluded);
 
+    // An open volume breach (#2581) holds its output failed. A run that does
+    // not build that output (`rocky run --model <downstream>`, a model set)
+    // would otherwise build its descendants over the breached rows: withhold
+    // them, as for an upstream failure. An output this run builds is judged
+    // by the volume check instead.
+    let held_outputs =
+        super::run_volume::held_outputs_not_built(&product_volumes, &breach_ledger, |name| {
+            in_run(name) && !compile_excluded_models.contains(name)
+        });
+    if !held_outputs.is_empty() {
+        let mut breach_blocked: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for node in &compile_result.project.dag_nodes {
+                if held_outputs.contains_key(&node.name) {
+                    continue;
+                }
+                let direct: Vec<String> = node
+                    .depends_on
+                    .iter()
+                    .filter(|d| held_outputs.contains_key(*d) || breach_blocked.contains_key(*d))
+                    .cloned()
+                    .collect();
+                if !direct.is_empty() && breach_blocked.get(&node.name) != Some(&direct) {
+                    breach_blocked.insert(node.name.clone(), direct);
+                    changed = true;
+                }
+            }
+        }
+        for (model, blocked_by) in breach_blocked {
+            if !in_run(&model) || compile_excluded_models.contains(&model) {
+                continue;
+            }
+            let reasons: Vec<&str> = blocked_by
+                .iter()
+                .filter_map(|upstream| held_outputs.get(upstream).map(String::as_str))
+                .collect();
+            let why = if reasons.is_empty() {
+                format!(
+                    "upstream model(s) {} are withheld by an open volume breach",
+                    blocked_by.join(", ")
+                )
+            } else {
+                reasons.join(" ")
+            };
+            output.tables_failed += 1;
+            output.push_model_error(
+                crate::output::TableErrorOutput {
+                    asset_key: vec![model.clone()],
+                    error: format!("model '{model}' was withheld: {why}"),
+                    failure_kind: crate::output::FailureKind::Unknown,
+                    cooldown_seconds: None,
+                },
+                &model,
+            );
+            compile_excluded_models.insert(model);
+        }
+    }
+
     let mut models_executed = 0usize;
 
     // Bundle borrowed compile-time facts (typed schemas + per-model timings)
@@ -14655,6 +14720,13 @@ async fn execute_models_phase(
                     to_build.push((idx, name, model, None));
                     continue;
                 }
+                // An open volume breach holds this output (#2581): build it,
+                // so the volume check fails it, rather than skip it as
+                // unchanged and let its descendants build.
+                if super::run_volume::held_by_marker(&product_volumes, &breach_ledger, name) {
+                    to_build.push((idx, name, model, None));
+                    continue;
+                }
                 // Build the fully-typed IR (merge the typechecker's columns,
                 // mirroring `project_ir_from_compile`) so `skip_hash()` can
                 // canonicalise. An empty `typed_columns` ⇒ `skip_hash()` is
@@ -14849,12 +14921,12 @@ async fn execute_models_phase(
                         );
                         let volume_failure = super::run_volume::check_volume(
                             &product_volumes,
+                            &breach_ledger,
                             warehouse,
                             name,
                             &strategy,
                             &mut materialization,
                             output,
-                            cancel,
                         )
                         .await;
                         output.materializations.push(materialization);
@@ -15555,18 +15627,18 @@ async fn execute_models_phase(
                 }
                 // The product volume check over the partitions this run wrote,
                 // made even when another partition failed: the written
-                // partitions hold rows, and each is judged on its own. A
-                // cancelled run is `not_evaluated`. An `error` breach marks
+                // partitions hold rows, and each is judged on its own, even
+                // after a cancel (the rows are committed). An `error` breach marks
                 // that partition `Failed` in the partition state, so
                 // `--missing` rewrites and judges it again.
                 let volume_failure = super::run_volume::check_partition_volume(
                     &product_volumes,
+                    &breach_ledger,
                     warehouse,
                     dialect,
                     model,
                     output,
                     first_partition,
-                    cancel,
                 )
                 .await;
                 if volume_failure.is_some()
@@ -15713,12 +15785,12 @@ async fn execute_models_phase(
                     );
                     let volume_failure = super::run_volume::check_volume(
                         &product_volumes,
+                        &breach_ledger,
                         warehouse,
                         model_name,
                         &strategy,
                         &mut materialization,
                         output,
-                        cancel,
                     )
                     .await;
                     output.materializations.push(materialization);

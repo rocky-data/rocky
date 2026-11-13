@@ -1298,6 +1298,10 @@ class VolumeCheckOutput(BaseModel):
     """
     What `row_count` counts: `total_rows` (the whole table, for a full-refresh output), `rows_added` (the rows this run appended, for an incremental output), `rows_touched` (the rows this run's MERGE inserted or updated, matched rows included even when their values did not change, for a merge output or an incremental one with a `unique_key`), or `partition_rows` (the rows in this partition, for a time-interval output, which is judged one partition at a time). Absent when the strategy is not counted (`volume-strategy-unsupported`).
     """
+    held_by_open_breach: bool | None = None
+    """
+    True when an open volume breach, from this run or an earlier one, holds the model failed (#2581). The count itself may be in range. The model stays failed until the breached rows are rebuilt or the breach is cleared with `rocky product clear-breach`.
+    """
     max_rows: conint(ge=0) | None = None
     """
     The declared `max_rows` (inclusive), when set.

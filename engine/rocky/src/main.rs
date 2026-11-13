@@ -2992,6 +2992,21 @@ enum ProductSubcommand {
         #[arg(long)]
         expect_digest: Option<String>,
     },
+
+    /// Clear a product output's open volume breach by hand.
+    ///
+    /// An `error` volume breach holds the output model failed in every run
+    /// until the breached rows are rebuilt. This deletes that marker without
+    /// a rebuild, for a breach you have judged acceptable. The next run
+    /// judges the model as usual. Idempotent: with no open breach it reports
+    /// that and changes nothing.
+    ClearBreach {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+        /// The product's output model whose breach to clear.
+        #[arg(long)]
+        model: String,
+    },
 }
 
 /// Subcommands under `rocky policy`.
@@ -4254,6 +4269,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 expect_digest.as_deref(),
                 json,
             ),
+            ProductSubcommand::ClearBreach { product, model } => {
+                rocky_cli::commands::run_product_clear_breach(
+                    &cli.config,
+                    &product,
+                    &model,
+                    &state_path,
+                    json,
+                )
+                .await
+            }
         },
         Command::Policy { subcommand } => match subcommand {
             PolicySubcommand::Check {

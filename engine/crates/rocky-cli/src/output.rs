@@ -1615,6 +1615,12 @@ pub struct VolumeCheckOutput {
     /// means for the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// True when an open volume breach, from this run or an earlier one,
+    /// holds the model failed (#2581). The count itself may be in range. The
+    /// model stays failed until the breached rows are rebuilt or the breach
+    /// is cleared with `rocky product clear-breach`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_by_open_breach: bool,
 }
 
 /// One source row count `rocky run` took when a production run started,
@@ -1694,6 +1700,12 @@ impl VolumeCheckOutput {
     pub fn fails_the_model(&self) -> bool {
         self.severity == rocky_core::product::spec::VolumeSeverity::Error
             && self.verdict.is_out_of_range()
+    }
+
+    /// True when the run record marks this check's build failed: it breached
+    /// at `error` itself, or an open breach holds the model failed.
+    pub fn fails_the_build(&self) -> bool {
+        self.fails_the_model() || self.held_by_open_breach
     }
 }
 
@@ -6875,7 +6887,7 @@ impl RunOutput {
             .materializations
             .iter()
             .filter_map(|mat| mat.volume.as_ref())
-            .filter(|volume| volume.fails_the_model())
+            .filter(|volume| volume.fails_the_build())
             .map(|volume| volume.model.clone())
             .collect();
         let output_volumes: Vec<rocky_core::state::OutputVolumeRecord> = self
@@ -6913,7 +6925,7 @@ impl RunOutput {
                 status: if mat
                     .volume
                     .as_ref()
-                    .is_some_and(VolumeCheckOutput::fails_the_model)
+                    .is_some_and(VolumeCheckOutput::fails_the_build)
                 {
                     "failed".to_string()
                 } else {

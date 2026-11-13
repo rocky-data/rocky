@@ -767,6 +767,10 @@ export interface VolumeCheckOutput {
    */
   basis?: VolumeBasis | null;
   /**
+   * True when an open volume breach, from this run or an earlier one, holds the model failed (#2581). The count itself may be in range. The model stays failed until the breached rows are rebuilt or the breach is cleared with `rocky product clear-breach`.
+   */
+  held_by_open_breach?: boolean;
+  /**
    * The declared `max_rows` (inclusive), when set.
    */
   max_rows?: number | null;
