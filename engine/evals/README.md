@@ -171,12 +171,26 @@ Each item gets one outcome:
 Every item of a returned draft passed the compiler, so an overclaim or an
 underclaim is a wrong item the compiler accepted. The pass line is in the
 answer key's `[pass_line]`: at least 64 of 80 matched, at most 4 overclaims,
-and no unverified type. A drafted column the key does not list counts as one
-more overclaim. Underclaims are reported but do not gate. Only a nullable
-underclaim is safe: the contract promises less than the data gives. A key
-column left out of `required` / `protected` is not safe: the contract no
-longer stops that column being dropped. (Splitting "wrong" by direction was
-an advisor ruling of 2026-11-11; Hugo to confirm.)
+no unverified type, and no key-column omission. A drafted column the key does
+not list counts as one more overclaim.
+
+Underclaims split in two:
+
+- A nullable underclaim is safe: the contract promises less than the data
+  gives. It is reported but does not gate.
+- A key column left out of `required` / `protected` is a **key-column
+  omission**. It is not safe: the contract no longer stops that column being
+  dropped. It counts against the pass line. Without this check, a draft with right types and
+  nullability but empty key lists would score 66/80 with 0 overclaims and pass.
+
+The pass line sets the PASS or FAIL verdict. It never sets the exit code. A
+replay exits 1 only when an outcome moves from its golden file, so
+`--contract-quality-update-expected` accepts whatever the replay produced.
+Read the scorecard before you refresh a golden: a live set that turns from
+PASS to FAIL is a finding, not drift to accept.
+
+(Splitting "wrong" by direction was an advisor ruling of 2026-11-11. The
+key-omission gate is a Fable ruling of 2026-11-13. Both are Hugo to confirm.)
 
 There are two recording sets. CI replays both.
 
@@ -233,11 +247,11 @@ cd engine && cargo build -p rocky && cd evals && ANTHROPIC_API_KEY=<your key> py
 **Reading the result.** The last block printed (also in `results/contract_quality_live.md`) starts with a line like this:
 
 ```
-**PASS** — 75/80 matched (need >= 64), 1 overclaim(s) accepted (max 4), 0 unverified type(s) (max 0).
+**PASS** — 78/80 matched (need >= 64), 0 overclaim(s) accepted (max 4), 0 unverified type(s) (max 0), 0 key-column omission(s) (max 0).
 ```
 
-- `PASS` means all three conditions hold: at least 64 of 80 items matched, at most 4 overclaims, and no unverified type. An overclaim is a wrong item the compiler accepted that promises more than the data gives.
-- Underclaims are listed but do not gate.
+- `PASS` means all four conditions hold: at least 64 of 80 items matched, at most 4 overclaims, no unverified type, and no key-column omission. An overclaim is a wrong item the compiler accepted that promises more than the data gives. A key-column omission is a key column left out of `required` / `protected`.
+- Nullable underclaims are listed but do not gate.
 - `FAIL` is a finding, not a broken run. The exit code is 0 either way; a non-zero exit means the harness itself could not run.
 - The table under the summary gives the outcomes per model, and the list after it names every item that did not match.
 

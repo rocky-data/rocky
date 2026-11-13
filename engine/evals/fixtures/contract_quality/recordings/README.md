@@ -14,6 +14,10 @@ exercise every path of the drafting loop and every scoring outcome:
   NULLs; `E012` goes back to the retry. `method` is withheld, and
   `customer_id` is left out of the keys (two underclaims).
 
+The two `customer_id` omissions are key-column omissions, so this set's
+scorecard reads FAIL on purpose: it proves the key-omission gate fires. The
+replay gates on `expected_replay.json`, not on PASS.
+
 So the replay score is a regression check of the harness, the verify loop
 and the compiler, never a quality measurement. Only a live run measures the
 prompt. A live run (`--contract-quality-mode live`) never touches these
