@@ -339,7 +339,11 @@ impl BreachLedger<'_> {
 /// True when an open breach marker (or a marker read that failed) holds
 /// `model`. The skip gate builds such a model, so the volume check judges
 /// it instead of an "unchanged" skip passing it.
-pub(crate) fn held_by_marker(volumes: &ProductVolumes, ledger: &BreachLedger<'_>, model: &str) -> bool {
+pub(crate) fn held_by_marker(
+    volumes: &ProductVolumes,
+    ledger: &BreachLedger<'_>,
+    model: &str,
+) -> bool {
     volumes
         .for_model(model)
         .is_some_and(|range| !matches!(ledger.read(&range.product, model), Ok(None)))
