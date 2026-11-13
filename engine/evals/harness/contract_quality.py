@@ -50,7 +50,10 @@ omissions <= ``max_key_omissions``. A drafted column the key does not list is
 one more overclaim. A nullable underclaim is safe and does not gate: the
 contract promises less than the data gives. A key column left out of
 ``required`` / ``protected`` is not safe: the contract no longer stops that
-column being dropped. That is a key-column omission, and it gates.
+column being dropped. That is a key-column omission, and it counts against
+the pass line. The pass line sets the PASS or FAIL verdict, never the exit
+code: in replay, CI catches a new omission only because the golden outcomes
+move.
 """
 
 from __future__ import annotations
@@ -276,7 +279,7 @@ def is_key_omission(item: dict) -> bool:
     """A key column the draft left out of ``required`` / ``protected``.
 
     The contract then no longer stops that column being dropped, so this is
-    the one underclaim that gates (Fable ruling 2026-11-13, DECISIONS N9).
+    the one underclaim that counts against the pass line (Fable ruling 2026-11-13, DECISIONS N9).
     A missing draft omits every key column too.
     """
     return (

@@ -180,8 +180,14 @@ Underclaims split in two:
   gives. It is reported but does not gate.
 - A key column left out of `required` / `protected` is a **key-column
   omission**. It is not safe: the contract no longer stops that column being
-  dropped. It gates. Without this gate, a draft with right types and
+  dropped. It counts against the pass line. Without this check, a draft with right types and
   nullability but empty key lists would score 66/80 with 0 overclaims and pass.
+
+The pass line sets the PASS or FAIL verdict. It never sets the exit code. A
+replay exits 1 only when an outcome moves from its golden file, so
+`--contract-quality-update-expected` accepts whatever the replay produced.
+Read the scorecard before you refresh a golden: a live set that turns from
+PASS to FAIL is a finding, not drift to accept.
 
 (Splitting "wrong" by direction was an advisor ruling of 2026-11-11. The
 key-omission gate is a Fable ruling of 2026-11-13. Both are Hugo to confirm.)
