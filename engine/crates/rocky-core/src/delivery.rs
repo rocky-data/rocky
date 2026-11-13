@@ -339,10 +339,8 @@ pub fn stamp_delivery_timing(
 
     if let Some(submission_id) = record.submission_id.as_deref() {
         let logical_ts = store
-            .list_schedule_claims()?
-            .into_iter()
-            .filter(|(_, claim)| claim.submission_id == submission_id)
-            .find_map(|(key, _)| crate::schedule::parse_claim_key(&key).and_then(|(_, _, ts)| ts));
+            .find_schedule_claim_by_submission_id(submission_id)?
+            .and_then(|(key, _)| crate::schedule::parse_claim_key(&key).and_then(|(_, _, ts)| ts));
         record.queued_ms = logical_ts.and_then(|due| elapsed_ms(due, run_started));
     }
 

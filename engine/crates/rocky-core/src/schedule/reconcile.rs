@@ -49,10 +49,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::config::RockyConfig;
 use crate::state::{StateError, StateStore};
 
+use super::child_marker;
 use super::claim::{
-    ClaimCas, ClaimRecord, ClaimState, DemandKind, PostAttempt, PreSpawn, Resolved,
-    TerminalOutcome, decide_post_attempt, decide_pre_spawn, decide_resolver, parse_claim_key,
-    sweep_terminal_claim,
+    ClaimCas, ClaimRecord, DemandKind, PostAttempt, PreSpawn, Resolved, TerminalOutcome,
+    decide_post_attempt, decide_pre_spawn, decide_resolver, parse_claim_key, sweep_terminal_claim,
 };
 use super::demand::{
     CursorError, Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView,
@@ -69,6 +69,21 @@ use super::spool::{self, WebhookKind};
 /// claim and writing a record). `now` is injected, so the grace is deterministic
 /// under test and a crash never stalls a standing demand indefinitely.
 const RECOVERY_GRACE: Duration = Duration::minutes(5);
+
+/// A `completed` or `released` claim is removed once its last transition is
+/// this old. A `submitted` claim is never removed by the GC.
+///
+/// Removal is safe because claim presence is not what stops a spent demand
+/// from running again. A cron occurrence is deduplicated by the monotonic fire
+/// anchor ([`ScheduleStateRecord::advance_fire_anchor`]), which moves on
+/// submission. A standing `after`/`freshness` demand is due only while the
+/// pipeline's own run history lacks a newer success. A webhook claim is kept
+/// while its spool file exists (see [`gc_schedule_claims_if_due`]).
+const CLAIM_RETENTION: Duration = Duration::days(7);
+
+/// The claim GC runs in a tick at most this often, per the persisted
+/// `last_schedule_claim_gc_at` stamp.
+const CLAIM_GC_INTERVAL: Duration = Duration::hours(24);
 
 /// A held tick lock whose heartbeat is older than this is a wedged owner: a
 /// later tick proceeds via the wedge override rather than skipping forever.
@@ -317,9 +332,10 @@ pub enum TickSkipReason {
     /// corrupt row), so the demand was skipped rather than misclassified —
     /// fail-closed, and surfaced loudly rather than silently dropped.
     ///
-    /// Covers the run history for a standing demand, and the schedule cursor
-    /// for a spooled webhook demand (#1831): in both cases an unreadable
-    /// answer must not be resolved into a permissive one.
+    /// Covers the run history for a standing demand, the schedule cursor
+    /// for a spooled webhook demand (#1831), and a due demand's own claim row
+    /// that does not parse: in each case an unreadable answer must not be
+    /// resolved into a permissive one.
     HistoryUnavailable,
     /// The state store was held by another `rocky` process past the bounded
     /// reopen retry, so this demand's post-run bookkeeping (or the whole tick,
@@ -603,6 +619,10 @@ pub async fn tick_once(
     //    store still open.
     if !opts.dry_run {
         sweep_orphan_claims(&schedules, phase.store(), &opts.rocky_dir, now)?;
+        // Age out terminal claims. Under the tick's lock and open store, after
+        // the sweep so nothing it still needs is removed. A failure warns; the
+        // tick's outcome is already decided.
+        gc_schedule_claims_if_due(phase.store(), &opts.rocky_dir, now, Utc::now());
         // Bound the id-dedup window: drop `.done` tombstones past their TTL.
         // `sweep_tombstones` resolves the spool itself, so it takes the `.rocky`
         // dir — the same argument `list_pending_files` takes above. Passing
@@ -1153,7 +1173,24 @@ async fn execute_demand(
         if iterations > MAX_DEMAND_ITERATIONS {
             return Err(TickError::LoopBound(key.clone()));
         }
-        let observed = phase.store().get_schedule_claim(&key)?;
+        let observed = match phase.store().get_schedule_claim(&key) {
+            Ok(observed) => observed,
+            // A claim row that does not parse: skip this demand, never
+            // overwrite what cannot be read, and let the rest of the tick run.
+            Err(StateError::Serialization(error)) => {
+                tracing::warn!(
+                    pipeline = %demand.pipeline,
+                    key = %key,
+                    error = %error,
+                    "scheduler: the claim row for a due demand is unreadable; skipping it"
+                );
+                return Ok(ExecOutcome::Skipped(skip(
+                    demand,
+                    TickSkipReason::HistoryUnavailable,
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let fresh_id = new_submission_id();
         match decide_pre_spawn(observed.as_ref(), fresh_id.clone(), now) {
             PreSpawn::SkipCompleted => {
@@ -1242,6 +1279,7 @@ async fn execute_claimed(
             trace_context: opts.trace_context.clone(),
             timeout: schedule.timeout.map(to_std_timeout),
             trigger: RunTriggerKind::for_source(demand.source),
+            rocky_dir: opts.rocky_dir.clone(),
         };
         // Release the store — both locks — for the child's whole window: the
         // child `rocky run` opens the SAME state file, and the redb + advisory
@@ -1267,6 +1305,8 @@ async fn execute_claimed(
                 }
             }
         };
+        // The child has exited, so its identity sidecar is no longer needed.
+        child_marker::remove(&opts.rocky_dir, &submission_id);
         // Take the store back to observe and decide. Contention here means a
         // third `rocky` process slipped in between the child's release and our
         // reopen: defer — the claim stays `submitted{submission_id}` and the
@@ -1430,6 +1470,36 @@ fn record_incident(
         TerminalOutcome::Partial => "partial",
         TerminalOutcome::Success => return,
     };
+    write_incident_bundle(
+        rocky_dir,
+        pipeline,
+        source,
+        outcome_str,
+        logical_ts,
+        submission_id,
+        exit_code,
+        attempts,
+        consecutive_failures,
+        now,
+    );
+}
+
+/// Write one incident bundle with `outcome_str` and warn on the result. See
+/// [`record_incident`] for the contract; this is its body, shared with
+/// [`hold_for_live_child`]'s `"overrun"` warning.
+#[allow(clippy::too_many_arguments)]
+fn write_incident_bundle(
+    rocky_dir: &Path,
+    pipeline: &str,
+    source: crate::schedule::claim::DemandKind,
+    outcome_str: &str,
+    logical_ts: Option<DateTime<Utc>>,
+    submission_id: &str,
+    exit_code: Option<i32>,
+    attempts: u32,
+    consecutive_failures: Option<u32>,
+    now: DateTime<Utc>,
+) {
     let bundle = crate::schedule::incidents::IncidentBundle {
         incident_version: 1,
         recorded_at: now,
@@ -1463,6 +1533,109 @@ fn record_incident(
     }
 }
 
+/// Remove aged terminal claims, at most once per [`CLAIM_GC_INTERVAL`].
+///
+/// Removes `completed` and `released` claims whose last transition is older
+/// than [`CLAIM_RETENTION`]. A `submitted` claim is never removed. A webhook
+/// claim is kept while its spool file still exists, because a spool file that
+/// outlived its claim would run again. If the spool cannot be listed or read,
+/// every webhook claim is kept this pass. A claim key this code cannot
+/// interpret is kept.
+///
+/// `now` is the tick's (possibly injected) time, clamped to `wall_now`, the
+/// real clock: a far-future `--now` cannot remove a claim that is still
+/// recent. The last-run stamp is written only after a successful
+/// pass, so a failed pass is retried next tick. Every failure warns and
+/// returns: the GC never fails the tick, like [`record_incident`].
+///
+/// Known gap: a `submitted` claim stuck for a pipeline that was removed from
+/// config is not force-finalized here (follow-up).
+fn gc_schedule_claims_if_due(
+    store: &StateStore,
+    rocky_dir: &Path,
+    now: DateTime<Utc>,
+    wall_now: DateTime<Utc>,
+) {
+    // A tick may run with an injected `--now`. A far-future one must not age
+    // out claims that are live on the real clock, so the GC never runs ahead
+    // of the wall clock.
+    let now = now.min(wall_now);
+    match store.get_last_schedule_claim_gc_at() {
+        Ok(Some(last)) if last <= now && now - last < CLAIM_GC_INTERVAL => return,
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "schedule claim GC stamp unreadable; treating it as never run"
+        ),
+    }
+
+    let spooled = live_webhook_demands(rocky_dir);
+    let is_protected = |key: &str, _claim: &ClaimRecord| -> bool {
+        let Some((_, source, _)) = parse_claim_key(key) else {
+            return true;
+        };
+        if source != DemandKind::Webhook {
+            return false;
+        }
+        match (&spooled, key.split('\u{1f}').nth(2)) {
+            (Some(live), Some(uid)) => live.contains(&(key_pipeline(key), uid.to_string())),
+            _ => true,
+        }
+    };
+
+    let cutoff = now - CLAIM_RETENTION;
+    match store.gc_schedule_claims(cutoff, &is_protected) {
+        Ok(gc) => {
+            if gc.removed > 0 || gc.protected > 0 || gc.skipped_corrupt > 0 {
+                tracing::info!(
+                    removed = gc.removed,
+                    kept_for_spool = gc.protected,
+                    skipped_corrupt = gc.skipped_corrupt,
+                    "schedule claim GC"
+                );
+            }
+            if let Err(e) = store.set_last_schedule_claim_gc_at(now) {
+                tracing::warn!(error = %e, "schedule claim GC could not record its run time");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "schedule claim GC failed"),
+    }
+    child_marker::sweep_stale(rocky_dir);
+}
+
+fn key_pipeline(key: &str) -> String {
+    key.split('\u{1f}').next().unwrap_or_default().to_string()
+}
+
+/// The `(pipeline, demand_uid)` of every pending webhook spool file, or `None`
+/// when the spool cannot be listed or a file cannot be read.
+fn live_webhook_demands(rocky_dir: &Path) -> Option<BTreeSet<(String, String)>> {
+    let files = match spool::list_pending_files(rocky_dir) {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::warn!(error = %e, "schedule claim GC could not list the webhook spool");
+            return None;
+        }
+    };
+    let mut live = BTreeSet::new();
+    for path in files {
+        match spool::read_pending(&path) {
+            Ok(d) => {
+                live.insert((d.pipeline, d.demand_uid));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    file = %path.display(),
+                    "schedule claim GC could not read a webhook spool file"
+                );
+                return None;
+            }
+        }
+    }
+    Some(live)
+}
+
 /// Resolve orphaned `submitted` claims independent of whether their demand is
 /// due again.
 ///
@@ -1472,8 +1645,8 @@ fn record_incident(
 /// resolves a stuck claim when it re-evaluates that key, but a cron occurrence
 /// advances its anchor on submission (so its key never recurs) and a satisfied
 /// `after`/`freshness` demand goes not-due; either way the loop never revisits
-/// the orphan, so its `submitted` claim would leak (no claim GC runs; #2567) and, for
-/// a standing demand, keep the key un-re-claimable. The sweep record-joins each
+/// the orphan, so its `submitted` claim would leak (the claim GC never removes a
+/// `submitted` claim) and, for a standing demand, keep the key un-re-claimable. The sweep record-joins each
 /// such claim and drives its CLAIM to a terminal state.
 ///
 /// **Claim-lifecycle only — no per-pipeline scalars.** The sweep deliberately
@@ -1502,10 +1675,7 @@ fn sweep_orphan_claims(
     rocky_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<(), TickError> {
-    for (key, claim) in store.list_schedule_claims()? {
-        if !matches!(claim.state, ClaimState::Submitted) {
-            continue;
-        }
+    for (key, claim) in store.list_submitted_schedule_claims()? {
         // The discriminator is deliberately ignored here: it is a timestamp for
         // cron/after/freshness but a `demand_uid` for a webhook, and the sweep
         // needs neither.
@@ -1514,9 +1684,9 @@ fn sweep_orphan_claims(
         };
         // Only sweep claims for pipelines in this tick's scope (honors
         // `--pipeline`).
-        if !schedules.contains_key(&pipeline) {
+        let Some(schedule) = schedules.get(&pipeline) else {
             continue;
-        }
+        };
         let Some(outcome) = store
             .find_terminal_run_by_submission_id(&claim.submission_id)?
             .and_then(|run| run.status.terminal_outcome())
@@ -1527,7 +1697,16 @@ fn sweep_orphan_claims(
             // it. Without this it stays `submitted` forever, the occurrence is
             // lost with no incident. Same grace rule as the demand path.
             if source == DemandKind::Cron {
-                sweep_lost_cron_claim(&key, &pipeline, logical_ts, &claim, store, rocky_dir, now)?;
+                sweep_lost_cron_claim(
+                    &key,
+                    &pipeline,
+                    logical_ts,
+                    &claim,
+                    schedule.timeout,
+                    store,
+                    rocky_dir,
+                    now,
+                )?;
             }
             continue;
         };
@@ -1540,6 +1719,7 @@ fn sweep_orphan_claims(
         // the per-pipeline scalars (see the note above). A lost CAS is a no-op
         // (nothing else mutates claims while this tick holds the lock).
         let terminal = sweep_terminal_claim(&claim, source, outcome, now);
+        child_marker::remove(rocky_dir, &claim.submission_id);
         let cas = store.schedule_claim_cas(
             &key,
             Some(&claim),
@@ -1570,6 +1750,110 @@ fn sweep_orphan_claims(
     Ok(())
 }
 
+/// Copy the spawner's child sidecar into `claim` (first sweep only), so the
+/// identity survives the sidecar's removal. Leaves the claim alone when the
+/// claim already has an identity or there is no sidecar.
+fn copy_child_identity(rocky_dir: &Path, claim: &mut ClaimRecord) {
+    if claim.child_pid.is_some() {
+        return;
+    }
+    if let Some(marker) = child_marker::read(rocky_dir, &claim.submission_id) {
+        claim.child_pid = Some(marker.pid);
+        claim.child_start_time = Some(marker.start_time);
+        claim.child_host = Some(marker.host);
+    }
+}
+
+/// Whether the child of a stuck claim may still be running, so the grace must
+/// not resolve it. Never true without a positively recorded identity. A zombie
+/// (exited, not yet reaped) is not running.
+fn child_still_running(rocky_dir: &Path, claim: &ClaimRecord, now: DateTime<Utc>) -> bool {
+    let identity = child_marker::identity_for(rocky_dir, claim);
+    let alive = child_marker::child_may_be_alive(
+        &identity,
+        claim,
+        &child_marker::host_identity(),
+        now,
+        crate::process::running_process_start_time,
+    );
+    if alive {
+        tracing::info!(
+            submission_id = %claim.submission_id,
+            "scheduler: a stuck claim's child is still running; grace not applied"
+        );
+    }
+    alive
+}
+
+/// The child of a stuck claim whose grace has expired: is it still running,
+/// so the claim must be kept? Returns `true` to keep the claim.
+///
+/// A live child is never cut short, even past the schedule's `timeout`. The
+/// spawner that would have enforced the timeout is gone (that is why the claim
+/// is stuck), and declaring a live child dead would re-run it as a duplicate
+/// or record a false failure. Past the timeout, measured from the claim's
+/// submission (`last_transition_at`), this writes ONE `"overrun"` warning
+/// incident and stamps `overrun_warned_at` on the claim, so later ticks do not
+/// repeat it. With no `timeout` configured the bound is
+/// [`child_marker::PROBE_ERROR_CAP`] (24 hours).
+#[allow(clippy::too_many_arguments)]
+fn hold_for_live_child(
+    key: &str,
+    pipeline: &str,
+    source: DemandKind,
+    logical_ts: Option<DateTime<Utc>>,
+    claim: &ClaimRecord,
+    timeout: Option<Duration>,
+    store: &StateStore,
+    rocky_dir: &Path,
+    now: DateTime<Utc>,
+) -> Result<bool, TickError> {
+    if !child_still_running(rocky_dir, claim, now) {
+        return Ok(false);
+    }
+    let submitted_at = claim
+        .last_transition_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    // With no `timeout_minutes`, a day is the bound, so a hung child that
+    // holds a standing demand is still surfaced once.
+    let bound = timeout.unwrap_or(child_marker::PROBE_ERROR_CAP);
+    let overrun = submitted_at.is_some_and(|at| now - at > bound);
+    if !overrun || claim.overrun_warned_at.is_some() {
+        return Ok(true);
+    }
+    let mut warned = claim.clone();
+    warned.overrun_warned_at = Some(now.to_rfc3339());
+    let cas = store.schedule_claim_cas(
+        key,
+        Some(claim),
+        &warned,
+        pipeline,
+        &ScheduleStateMutation::None,
+    )?;
+    if matches!(cas, ClaimCas::Won) {
+        tracing::warn!(
+            pipeline,
+            submission_id = %claim.submission_id,
+            "scheduler: a stuck claim's child is still running past the schedule timeout; the claim is kept"
+        );
+        write_incident_bundle(
+            rocky_dir,
+            pipeline,
+            source,
+            "overrun",
+            logical_ts,
+            &claim.submission_id,
+            None,
+            claim.cycle_attempts,
+            None,
+            now,
+        );
+    }
+    Ok(true)
+}
+
 /// Resolve a record-less `submitted` cron claim: stamp the grace on first
 /// sight, then, once [`RECOVERY_GRACE`] has passed with still no run record,
 /// finalize it as a lost `Failure` (`completed`) and write its incident.
@@ -1584,11 +1868,13 @@ fn sweep_orphan_claims(
 /// Claim-lifecycle only, like the rest of the sweep: no retry (the occurrence
 /// is past, and a cron's retries run inside the tick that claimed it) and no
 /// per-pipeline scalars (`ScheduleStateMutation::None`). A lost CAS is a no-op.
+#[allow(clippy::too_many_arguments)]
 fn sweep_lost_cron_claim(
     key: &str,
     pipeline: &str,
     logical_ts: Option<DateTime<Utc>>,
     claim: &ClaimRecord,
+    timeout: Option<Duration>,
     store: &StateStore,
     rocky_dir: &Path,
     now: DateTime<Utc>,
@@ -1602,6 +1888,7 @@ fn sweep_lost_cron_claim(
         None => {
             let mut stamped = claim.clone();
             stamped.first_swept_at = Some(now.to_rfc3339());
+            copy_child_identity(rocky_dir, &mut stamped);
             store.schedule_claim_cas(
                 key,
                 Some(claim),
@@ -1611,6 +1898,19 @@ fn sweep_lost_cron_claim(
             )?;
         }
         Some(swept_at) if now - swept_at >= RECOVERY_GRACE => {
+            if hold_for_live_child(
+                key,
+                pipeline,
+                DemandKind::Cron,
+                logical_ts,
+                claim,
+                timeout,
+                store,
+                rocky_dir,
+                now,
+            )? {
+                return Ok(());
+            }
             let terminal =
                 sweep_terminal_claim(claim, DemandKind::Cron, TerminalOutcome::Failure, now);
             let cas = store.schedule_claim_cas(
@@ -1621,6 +1921,7 @@ fn sweep_lost_cron_claim(
                 &ScheduleStateMutation::None,
             )?;
             if matches!(cas, ClaimCas::Won) {
+                child_marker::remove(rocky_dir, &claim.submission_id);
                 tracing::warn!(
                     pipeline,
                     submission_id = %claim.submission_id,
@@ -1727,6 +2028,7 @@ fn resolve_missing_record(
         None => {
             let mut updated = current.clone();
             updated.first_swept_at = Some(now.to_rfc3339());
+            copy_child_identity(rocky_dir, &mut updated);
             // Either outcome of this CAS means "skip this tick": on win the grace
             // has begun; on loss another reconciler owns the resolution.
             store.schedule_claim_cas(
@@ -1739,6 +2041,19 @@ fn resolve_missing_record(
             Ok(StuckResolution::InFlight)
         }
         Some(swept_at) if now - swept_at >= RECOVERY_GRACE => {
+            if hold_for_live_child(
+                key,
+                &demand.pipeline,
+                demand.source,
+                Some(demand.logical_ts),
+                current,
+                schedule.timeout,
+                store,
+                rocky_dir,
+                now,
+            )? {
+                return Ok(StuckResolution::InFlight);
+            }
             let resolved = decide_resolver(
                 current,
                 TerminalOutcome::Failure,
@@ -1747,6 +2062,7 @@ fn resolve_missing_record(
                 now,
             );
             let resolution = commit_resolution(key, &demand.pipeline, current, resolved, store)?;
+            child_marker::remove(rocky_dir, &current.submission_id);
             // A lost attempt (crash before any run record) that just
             // exhausted its budget is a failure nobody else will surface.
             if matches!(resolution, StuckResolution::Finished) {
@@ -3459,6 +3775,291 @@ freshness = true
         assert_eq!(incident_count(&opts), 1, "a second sweep adds nothing");
     }
 
+    /// This test process as a "child": its real pid and start time. `None`
+    /// only where no probe exists; on Linux and macOS a failed probe panics,
+    /// so the tests that use this can never pass by returning early.
+    fn live_marker() -> Option<child_marker::ChildMarker> {
+        let pid = std::process::id();
+        let probed = crate::process::running_process_start_time(pid);
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(
+                matches!(probed, Ok(Some(_))),
+                "the liveness probe must see this process: {probed:?}"
+            );
+        }
+        let start_time = probed.ok().flatten()?;
+        Some(child_marker::ChildMarker {
+            pid,
+            start_time,
+            host: child_marker::host_identity(),
+        })
+    }
+
+    #[test]
+    fn first_sweep_copies_the_child_sidecar_into_the_claim() {
+        let Some(marker) = live_marker() else { return };
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert_eq!(claim.child_pid, Some(marker.pid));
+            assert_eq!(claim.child_start_time, Some(marker.start_time));
+            assert_eq!(claim.child_host.as_deref(), Some(marker.host.as_str()));
+        });
+    }
+
+    #[test]
+    fn a_live_child_holds_a_lost_cron_claim_past_the_grace() {
+        let Some(marker) = live_marker() else { return };
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 6, 0));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(claim.state, ClaimState::Submitted));
+        });
+        assert_eq!(incident_count(&opts), 0, "a live child is not a lost run");
+    }
+
+    #[test]
+    fn a_reused_pid_does_not_hold_a_lost_cron_claim() {
+        let Some(mut marker) = live_marker() else {
+            return;
+        };
+        marker.start_time += 1;
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 5));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(
+                claim.state,
+                ClaimState::Completed {
+                    outcome: TerminalOutcome::Failure
+                }
+            ));
+        });
+        assert_eq!(incident_count(&opts), 1);
+        assert_eq!(child_marker::read(&opts.rocky_dir, "lost-1"), None);
+    }
+
+    #[test]
+    fn a_child_on_another_host_does_not_hold_a_lost_cron_claim() {
+        let Some(mut marker) = live_marker() else {
+            return;
+        };
+        marker.host = "some-other-host".to_string();
+        let (state_path, _dir, opts, config, key) = lost_cron_fixture();
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 5));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(claim.state, ClaimState::Completed { .. }));
+        });
+    }
+
+    #[test]
+    fn the_gc_pass_removes_stale_child_sidecars_only() {
+        let (_state_path, _dir, opts) = temp_env();
+        let marker = child_marker::ChildMarker {
+            pid: 1,
+            start_time: 1,
+            host: "h".to_string(),
+        };
+        child_marker::write(&opts.rocky_dir, "fresh", &marker).unwrap();
+        child_marker::write(&opts.rocky_dir, "old", &marker).unwrap();
+        let old_path = opts.rocky_dir.join("schedule-children").join("old.json");
+        let eight_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_modified(eight_days_ago)
+            .unwrap();
+        assert_eq!(child_marker::sweep_stale(&opts.rocky_dir), 1);
+        assert!(child_marker::read(&opts.rocky_dir, "fresh").is_some());
+        assert!(child_marker::read(&opts.rocky_dir, "old").is_none());
+        assert!(!old_path.exists());
+    }
+
+    /// A cron pipeline whose scheduler timeout is 30 minutes.
+    const CRON_TIMEOUT_30: &str = r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+cron = "0 3 * * *"
+timeout_minutes = 30
+"#;
+
+    #[test]
+    fn a_live_child_past_the_timeout_writes_one_overrun_incident_and_keeps_the_claim() {
+        let Some(marker) = live_marker() else { return };
+        let (state_path, _dir, opts, _config, key) = lost_cron_fixture();
+        let config = cfg(CRON_TIMEOUT_30);
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        // Submitted 03:00. First sight 04:00, past the grace 04:10 (70 min,
+        // past the 30 min timeout), and again 04:20.
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        assert_eq!(incident_count(&opts), 0);
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 10));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 20));
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(claim.state, ClaimState::Submitted), "kept");
+            assert!(claim.overrun_warned_at.is_some());
+        });
+        assert_eq!(incident_count(&opts), 1, "one warning, not one per tick");
+        let entry = std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let bundle: crate::schedule::incidents::IncidentBundle =
+            serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+        assert_eq!(bundle.outcome, "overrun");
+        assert_eq!(bundle.submission_id, "lost-1");
+    }
+
+    #[test]
+    fn a_live_child_inside_the_timeout_writes_no_incident() {
+        let Some(marker) = live_marker() else { return };
+        let (state_path, _dir, opts, _config, _key) = lost_cron_fixture();
+        // A 3 hour timeout: 03:00 + 70 min is inside it.
+        let config = cfg(&CRON_TIMEOUT_30.replace("timeout_minutes = 30", "timeout_minutes = 180"));
+        child_marker::write(&opts.rocky_dir, "lost-1", &marker).unwrap();
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 0));
+        sweep_tick(&config, &state_path, &opts, at(2026, 5, 2, 4, 10));
+        assert_eq!(incident_count(&opts), 0);
+    }
+
+    /// `resolve_missing_record` (the demand path for a standing claim) keeps a
+    /// claim whose child is still running past the grace, and spawns nothing.
+    #[test]
+    fn a_live_child_holds_a_stuck_standing_claim_past_the_grace() {
+        let Some(marker) = live_marker() else { return };
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(AFTER_ONLY);
+        let key = with_store(&state_path, |store| {
+            seed_run(
+                store,
+                "raw",
+                None,
+                RunStatus::Success,
+                at(2026, 5, 2, 3, 5),
+                at(2026, 5, 2, 3, 10),
+            );
+            seed_submitted_claim(
+                store,
+                "staging",
+                DemandKind::After,
+                at(2026, 5, 2, 3, 10),
+                "stuck-live",
+                at(2026, 5, 2, 3, 50),
+            )
+        });
+        child_marker::write(&opts.rocky_dir, "stuck-live", &marker).unwrap();
+        let spawner = CapturingSpawner::new(0);
+        for now in [at(2026, 5, 2, 4, 0), at(2026, 5, 2, 4, 10)] {
+            let report = rt()
+                .block_on(tick_once(&config, &state_path, now, &spawner, &opts))
+                .unwrap();
+            assert!(
+                report
+                    .skipped
+                    .iter()
+                    .any(|s| s.pipeline == "staging" && s.reason == TickSkipReason::InFlight),
+                "in flight at {now}"
+            );
+        }
+        assert_eq!(spawner.run_count(), 0, "never spawned over a live child");
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(matches!(claim.state, ClaimState::Submitted));
+            assert_eq!(claim.child_pid, Some(marker.pid), "identity copied");
+        });
+        assert_eq!(incident_count(&opts), 0);
+        assert!(
+            child_marker::read(&opts.rocky_dir, "stuck-live").is_some(),
+            "the sidecar stays while the child runs"
+        );
+    }
+
+    /// Two cron pipelines, so one bad claim row can be shown not to stop the
+    /// other.
+    const TWO_CRONS: &str = r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+cron = "0 3 * * *"
+
+[pipeline.other]
+type = "transformation"
+[pipeline.other.target]
+adapter = "db"
+[pipeline.other.schedule]
+cron = "0 3 * * *"
+"#;
+
+    #[test]
+    fn a_corrupt_claim_row_at_a_due_key_skips_that_demand_and_the_tick_goes_on() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(TWO_CRONS);
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        let key = claim_key_for(DemandKind::Cron, at(2026, 5, 2, 3, 0));
+        with_store(&state_path, |store| {
+            store.insert_corrupt_schedule_claim_row(&key).unwrap();
+        });
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(spawner.run_count(), 1, "the other pipeline still ran");
+        assert!(report.executed.iter().all(|e| e.pipeline == "other"));
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.pipeline == "raw" && s.reason == TickSkipReason::HistoryUnavailable)
+        );
+        with_store(&state_path, |store| {
+            assert!(
+                matches!(
+                    store.get_schedule_claim(&key),
+                    Err(StateError::Serialization(_))
+                ),
+                "the unreadable row is left as it was"
+            );
+        });
+    }
+
     #[test]
     fn sweep_resolves_a_lost_cron_claim_by_its_record_if_one_appears_inside_the_grace() {
         let (state_path, _dir, opts, config, key) = lost_cron_fixture();
@@ -4608,6 +5209,332 @@ adapter = "db"
                 .unwrap()
                 .is_empty(),
             "the affix-shaped demand was consumed"
+        );
+    }
+
+    // --- claim GC (#2567) ------------------------------------------------------
+
+    /// Seed a claim in `state`, last transitioned at `at`.
+    fn seed_claim_in_state(
+        store: &StateStore,
+        key: &str,
+        pipeline: &str,
+        state: ClaimState,
+        submission_id: &str,
+        at: DateTime<Utc>,
+    ) {
+        let mut claim = ClaimRecord::new_submitted(submission_id.to_string(), at);
+        claim.state = state;
+        let cas = store
+            .schedule_claim_cas(key, None, &claim, pipeline, &ScheduleStateMutation::None)
+            .unwrap();
+        assert!(matches!(cas, ClaimCas::Won));
+    }
+
+    fn done() -> ClaimState {
+        ClaimState::Completed {
+            outcome: TerminalOutcome::Success,
+        }
+    }
+
+    fn claim_key_for(source: DemandKind, ts: DateTime<Utc>) -> String {
+        claim_key(&Demand {
+            pipeline: "raw".to_string(),
+            source,
+            logical_ts: ts,
+            claim_discriminator: None,
+        })
+    }
+
+    #[test]
+    fn gc_removes_old_terminal_claims_and_keeps_submitted_and_recent_ones() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(8);
+        let recent = now - Duration::days(2);
+        let k_old_done = claim_key_for(DemandKind::Cron, at(2026, 5, 1, 3, 0));
+        let k_old_released = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        let k_old_submitted = claim_key_for(DemandKind::Freshness, at(2026, 5, 1, 5, 0));
+        let k_recent_done = claim_key_for(DemandKind::Cron, at(2026, 5, 18, 3, 0));
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &k_old_done, "raw", done(), "a", old);
+            seed_claim_in_state(
+                store,
+                &k_old_released,
+                "raw",
+                ClaimState::Released,
+                "b",
+                old,
+            );
+            seed_claim_in_state(
+                store,
+                &k_old_submitted,
+                "raw",
+                ClaimState::Submitted,
+                "c",
+                old,
+            );
+            seed_claim_in_state(store, &k_recent_done, "raw", done(), "d", recent);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now, DateTime::<Utc>::MAX_UTC);
+            assert!(store.get_schedule_claim(&k_old_done).unwrap().is_none());
+            assert!(store.get_schedule_claim(&k_old_released).unwrap().is_none());
+            assert!(
+                store
+                    .get_schedule_claim(&k_old_submitted)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(store.get_schedule_claim(&k_recent_done).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn gc_runs_in_the_tick_after_the_sweep() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let now = at(2026, 5, 20, 12, 0);
+        let k = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &k, "raw", done(), "a", now - Duration::days(9));
+        });
+        sweep_tick(&config, &state_path, &opts, now);
+        with_store(&state_path, |store| {
+            assert!(store.get_schedule_claim(&k).unwrap().is_none());
+            assert!(store.get_last_schedule_claim_gc_at().unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn gc_keeps_a_webhook_claim_whose_spool_file_exists() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(9);
+        let spool::AcceptOutcome::Created(live_uid) = spool::accept(
+            &opts.rocky_dir,
+            "raw",
+            WebhookKind::Id,
+            "evt-1",
+            "hash",
+            old,
+        )
+        .unwrap() else {
+            panic!("expected a created spool file");
+        };
+        let webhook_key = |uid: &str| {
+            claim_key(&Demand {
+                pipeline: "raw".to_string(),
+                source: DemandKind::Webhook,
+                logical_ts: old,
+                claim_discriminator: Some(uid.to_string()),
+            })
+        };
+        let live_key = webhook_key(&live_uid);
+        let gone_key = webhook_key("no-spool-file");
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &live_key, "raw", done(), "a", old);
+            seed_claim_in_state(store, &gone_key, "raw", done(), "b", old);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now, DateTime::<Utc>::MAX_UTC);
+            assert!(
+                store.get_schedule_claim(&live_key).unwrap().is_some(),
+                "a live spool file keeps its claim"
+            );
+            assert!(store.get_schedule_claim(&gone_key).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn gc_keeps_every_webhook_claim_when_the_spool_cannot_be_read() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(9);
+        let key = claim_key(&Demand {
+            pipeline: "raw".to_string(),
+            source: DemandKind::Webhook,
+            logical_ts: old,
+            claim_discriminator: Some("uid".to_string()),
+        });
+        let spool::AcceptOutcome::Created(_) = spool::accept(
+            &opts.rocky_dir,
+            "raw",
+            WebhookKind::Id,
+            "evt-2",
+            "hash",
+            old,
+        )
+        .unwrap() else {
+            panic!("expected a created spool file");
+        };
+        for entry in std::fs::read_dir(spool::spool_dir(&opts.rocky_dir)).unwrap() {
+            std::fs::write(entry.unwrap().path(), b"{not json").unwrap();
+        }
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &key, "raw", done(), "a", old);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now, DateTime::<Utc>::MAX_UTC);
+            assert!(store.get_schedule_claim(&key).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn gc_runs_at_most_once_per_24_hours() {
+        let (state_path, _dir, opts) = temp_env();
+        let t0 = at(2026, 5, 20, 12, 0);
+        let k = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, t0, DateTime::<Utc>::MAX_UTC);
+            seed_claim_in_state(store, &k, "raw", done(), "a", t0 - Duration::days(9));
+            gc_schedule_claims_if_due(
+                store,
+                &opts.rocky_dir,
+                t0 + Duration::hours(1),
+                DateTime::<Utc>::MAX_UTC,
+            );
+            assert!(
+                store.get_schedule_claim(&k).unwrap().is_some(),
+                "inside the 24h cadence"
+            );
+            gc_schedule_claims_if_due(
+                store,
+                &opts.rocky_dir,
+                t0 + Duration::hours(25),
+                DateTime::<Utc>::MAX_UTC,
+            );
+            assert!(store.get_schedule_claim(&k).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn gc_keeps_an_old_released_claim_whose_retry_cycle_is_open() {
+        let (state_path, _dir, opts) = temp_env();
+        let now = at(2026, 5, 20, 12, 0);
+        let old = now - Duration::days(9);
+        let k_open = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        let k_closed = claim_key_for(DemandKind::Freshness, at(2026, 5, 1, 5, 0));
+        with_store(&state_path, |store| {
+            let mut open = ClaimRecord::new_submitted("open".to_string(), old);
+            open.state = ClaimState::Released;
+            open.budget_open = true;
+            store
+                .schedule_claim_cas(&k_open, None, &open, "raw", &ScheduleStateMutation::None)
+                .unwrap();
+            seed_claim_in_state(store, &k_closed, "raw", ClaimState::Released, "closed", old);
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, now, DateTime::<Utc>::MAX_UTC);
+            assert!(
+                store.get_schedule_claim(&k_open).unwrap().is_some(),
+                "an open cycle keeps its budget"
+            );
+            assert!(store.get_schedule_claim(&k_closed).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn a_far_future_now_does_not_age_out_a_claim_recent_on_the_wall_clock() {
+        let (state_path, _dir, opts) = temp_env();
+        let wall = at(2026, 5, 20, 12, 0);
+        let far_future = wall + Duration::days(365);
+        let k = claim_key_for(DemandKind::After, at(2026, 5, 18, 4, 0));
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &k, "raw", done(), "a", wall - Duration::days(1));
+            gc_schedule_claims_if_due(store, &opts.rocky_dir, far_future, wall);
+            assert!(
+                store.get_schedule_claim(&k).unwrap().is_some(),
+                "a day-old claim survives a --now a year ahead"
+            );
+            assert_eq!(
+                store.get_last_schedule_claim_gc_at().unwrap(),
+                Some(wall),
+                "the stamp is the clamped time"
+            );
+        });
+    }
+
+    #[test]
+    fn a_corrupt_claim_row_is_skipped_by_the_sweep_and_the_gc_and_survives() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let now = at(2026, 5, 20, 12, 0);
+        let k = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            store.insert_corrupt_schedule_claim_row("junk").unwrap();
+            seed_claim_in_state(store, &k, "raw", done(), "a", now - Duration::days(9));
+        });
+        // The tick (sweep + GC) completes despite the bad row. The GC returns
+        // `()`, so it has no way to fail the tick.
+        sweep_tick(&config, &state_path, &opts, now);
+        with_store(&state_path, |store| {
+            assert!(store.get_schedule_claim(&k).unwrap().is_none());
+            let gc = store
+                .gc_schedule_claims(now + Duration::days(30), &|_, _| false)
+                .unwrap();
+            assert_eq!(gc.skipped_corrupt, 1, "the bad row is still there");
+            assert!(store.list_schedule_claims().unwrap().is_empty());
+            assert!(store.list_submitted_schedule_claims().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn submitted_listing_is_filtered_and_lookup_by_submission_id_finds_one() {
+        let (state_path, _dir, _opts) = temp_env();
+        let t = at(2026, 5, 20, 12, 0);
+        let ks = claim_key_for(DemandKind::Cron, at(2026, 5, 1, 3, 0));
+        let kd = claim_key_for(DemandKind::After, at(2026, 5, 1, 4, 0));
+        with_store(&state_path, |store| {
+            seed_claim_in_state(store, &ks, "raw", ClaimState::Submitted, "sub-1", t);
+            seed_claim_in_state(store, &kd, "raw", done(), "sub-2", t);
+            let submitted = store.list_submitted_schedule_claims().unwrap();
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0].0, ks);
+            assert_eq!(store.list_schedule_claims().unwrap().len(), 2);
+            let found = store
+                .find_schedule_claim_by_submission_id("sub-2")
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.0, kd);
+            assert!(
+                store
+                    .find_schedule_claim_by_submission_id("nope")
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn a_gcd_completed_cron_claim_does_not_refire_its_occurrence() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        let fired_at = at(2026, 5, 2, 4, 0);
+        rt().block_on(tick_once(&config, &state_path, fired_at, &spawner, &opts))
+            .unwrap();
+        assert_eq!(spawner.run_count(), 1);
+        let key = claim_key_for(DemandKind::Cron, at(2026, 5, 2, 3, 0));
+        with_store(&state_path, |store| {
+            assert!(
+                store.get_schedule_claim(&key).unwrap().is_some(),
+                "the fired occurrence holds a completed claim"
+            );
+            let gc = store
+                .gc_schedule_claims(fired_at + Duration::days(30), &|_, _| false)
+                .unwrap();
+            assert_eq!(gc.removed, 1);
+            assert!(store.get_schedule_claim(&key).unwrap().is_none());
+        });
+        // Same instant again: the claim is gone, but the monotonic anchor
+        // still says the 03:00 occurrence fired.
+        rt().block_on(tick_once(&config, &state_path, fired_at, &spawner, &opts))
+            .unwrap();
+        assert_eq!(
+            spawner.run_count(),
+            1,
+            "the anchor, not the claim, dedupes a cron occurrence"
         );
     }
 }

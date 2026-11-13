@@ -44,12 +44,38 @@ pub fn strip_dagster_pipes_env(command: &mut std::process::Command) {
 /// treat it as indefinite rather than dead — a transient read failure
 /// must never trigger a takeover.
 pub fn process_liveness(pid: u32) -> Result<Option<u64>, String> {
-    imp_process_liveness(pid)
+    imp_process_liveness(pid).map(|p| p.map(|p| p.start_time))
+}
+
+/// Like [`process_liveness`], but a zombie (a process that has exited and
+/// waits only to be reaped) is `None`: it runs no code and will never write
+/// anything again. Used where "still running" is the question, such as the
+/// scheduler's stuck-claim probe.
+///
+/// # Errors
+///
+/// Same as [`process_liveness`].
+pub fn running_process_start_time(pid: u32) -> Result<Option<u64>, String> {
+    imp_process_liveness(pid).map(|p| p.filter(|p| !p.zombie).map(|p| p.start_time))
+}
+
+/// What one probe of a pid found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", test)),
+    allow(dead_code)
+)]
+struct ProbedProcess {
+    start_time: u64,
+    /// The process has exited and is not yet reaped (`Z`, or Linux's `X`).
+    zombie: bool,
 }
 
 #[cfg(target_os = "macos")]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
+fn imp_process_liveness(pid: u32) -> Result<Option<ProbedProcess>, String> {
     use std::mem::MaybeUninit;
+    // `SZOMB` from <sys/proc.h>: the process has exited and awaits its reap.
+    const SZOMB: u32 = 5;
 
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -85,13 +111,14 @@ fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
     if info.pbi_pid != pid {
         return Ok(None);
     }
-    Ok(Some(
-        info.pbi_start_tvsec.saturating_mul(1_000_000) + info.pbi_start_tvusec,
-    ))
+    Ok(Some(ProbedProcess {
+        start_time: info.pbi_start_tvsec.saturating_mul(1_000_000) + info.pbi_start_tvusec,
+        zombie: info.pbi_status == SZOMB,
+    }))
 }
 
 #[cfg(target_os = "linux")]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
+fn imp_process_liveness(pid: u32) -> Result<Option<ProbedProcess>, String> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -104,24 +131,37 @@ fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
         .rsplit_once(')')
         .map(|(_, rest)| rest)
         .ok_or_else(|| format!("/proc/{pid}/stat has no comm terminator"))?;
-    let start = after_comm
-        .split_ascii_whitespace()
-        .nth(19) // after the comm split the first token is field 3 (state), so field 22 = index 19
+    parse_linux_stat(pid, after_comm).map(Some)
+}
+
+/// Parse the fields after the comm of `/proc/<pid>/stat`: field 3 (state) and
+/// field 22 (starttime).
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_stat(pid: u32, after_comm: &str) -> Result<ProbedProcess, String> {
+    let mut fields = after_comm.split_ascii_whitespace();
+    let state = fields
+        .next()
+        .ok_or_else(|| format!("/proc/{pid}/stat has no state field"))?;
+    let start = fields
+        .nth(18) // the state token was field 3, so field 22 is 18 further on
         .ok_or_else(|| format!("/proc/{pid}/stat has no starttime field"))?;
-    start
+    let start_time = start
         .parse::<u64>()
-        .map(Some)
-        .map_err(|e| format!("/proc/{pid}/stat starttime did not parse: {e}"))
+        .map_err(|e| format!("/proc/{pid}/stat starttime did not parse: {e}"))?;
+    Ok(ProbedProcess {
+        start_time,
+        zombie: matches!(state, "Z" | "X" | "x"),
+    })
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
+fn imp_process_liveness(pid: u32) -> Result<Option<ProbedProcess>, String> {
     let _ = pid;
     Err("no process start-time probe exists for this Unix platform".to_string())
 }
 
 #[cfg(not(unix))]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
+fn imp_process_liveness(pid: u32) -> Result<Option<ProbedProcess>, String> {
     let _ = pid;
     Err("no process start-time probe exists for this platform".to_string())
 }
@@ -252,5 +292,43 @@ mod tests {
             .expect("spawn probe child");
         assert!(output.status.success());
         assert!(output.stdout.is_empty(), "child inherited Pipes variable");
+    }
+
+    #[test]
+    fn linux_stat_parse_reads_state_and_starttime() {
+        // The fields after `(comm)`: state, then 18 more, then starttime.
+        let tail =
+            |state: &str| format!(" {state} 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 19");
+        let running = parse_linux_stat(1, &tail("S")).unwrap();
+        assert_eq!(running.start_time, 777);
+        assert!(!running.zombie);
+        assert!(parse_linux_stat(1, &tail("Z")).unwrap().zombie);
+        assert!(parse_linux_stat(1, &tail("X")).unwrap().zombie);
+        assert!(parse_linux_stat(1, " S 1 2").is_err());
+    }
+
+    /// An exited, unreaped child is a zombie: `process_liveness` still sees
+    /// it, `running_process_start_time` does not.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_zombie_child_is_not_running() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while running_process_start_time(pid).unwrap().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never became a zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            process_liveness(pid).unwrap().is_some(),
+            "the unreaped zombie still holds its pid"
+        );
+        child.wait().unwrap();
     }
 }

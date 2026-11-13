@@ -149,20 +149,33 @@ pub struct ClaimRecord {
     #[serde(default)]
     pub budget_open: bool,
     /// The spawned child's PID, recorded for the recovery sweep's liveness
-    /// probe. `None` until a child is spawned (or on platforms without a probe).
+    /// probe. The spawner writes it to a sidecar file
+    /// ([`super::child_marker`]) and the first sweep copies it here. `None`
+    /// until then, for a claim written by an older binary, and on platforms
+    /// without a start-time probe.
     #[serde(default)]
     pub child_pid: Option<u32>,
     /// The spawned child's process start time, paired with `child_pid` to make
-    /// a later liveness probe PID-reuse-proof. Populated by the recovery phase.
+    /// a later liveness probe PID-reuse-proof.
     #[serde(default)]
     pub child_start_time: Option<u64>,
+    /// The host the child ran on, paired with `child_pid`. A pid means nothing
+    /// on another machine, so a probe only runs when this matches the probing
+    /// host. Additive: an older record deserializes with `None`.
+    #[serde(default)]
+    pub child_host: Option<String>,
     /// When a stuck `submitted` claim was first re-encountered by a sweep, so a
     /// bounded grace can elapse before it is force-resolved. RFC3339.
     #[serde(default)]
     pub first_swept_at: Option<String>,
+    /// When a sweep first found this claim's child still running past the
+    /// schedule's `timeout` and wrote the one `"overrun"` warning incident.
+    /// RFC3339. Additive and omitted when `None`, so an older record reads
+    /// as never warned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrun_warned_at: Option<String>,
     /// The instant of the last transition. RFC3339. Read by
-    /// `StateStore::gc_schedule_claims`, which nothing calls yet: claim
-    /// retention is undecided (#2567).
+    /// `StateStore::gc_schedule_claims` to age out terminal claims.
     #[serde(default)]
     pub last_transition_at: Option<String>,
 }
@@ -179,7 +192,9 @@ impl ClaimRecord {
             budget_open: false,
             child_pid: None,
             child_start_time: None,
+            child_host: None,
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now.to_rfc3339()),
         }
     }
@@ -293,7 +308,9 @@ pub fn decide_pre_spawn(
                     budget_open: false,
                     child_pid: None,
                     child_start_time: None,
+                    child_host: None,
                     first_swept_at: None,
+                    overrun_warned_at: None,
                     last_transition_at: Some(now.to_rfc3339()),
                 })
             }
@@ -381,7 +398,9 @@ fn terminal_claim(
         budget_open: false,
         child_pid: current.child_pid,
         child_start_time: current.child_start_time,
+        child_host: current.child_host.clone(),
         first_swept_at: None,
+        overrun_warned_at: None,
         last_transition_at: Some(now.to_rfc3339()),
     }
 }
@@ -429,7 +448,9 @@ pub fn decide_post_attempt(
             budget_open: false,
             child_pid: None,
             child_start_time: None,
+            child_host: None,
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now.to_rfc3339()),
         });
     }
@@ -488,7 +509,9 @@ pub fn decide_resolver(
             budget_open: true,
             child_pid: current.child_pid,
             child_start_time: current.child_start_time,
+            child_host: current.child_host.clone(),
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now.to_rfc3339()),
         });
     }
@@ -516,7 +539,9 @@ mod tests {
             budget_open: false,
             child_pid: None,
             child_start_time: None,
+            child_host: None,
             first_swept_at: None,
+            overrun_warned_at: None,
             last_transition_at: Some(now().to_rfc3339()),
         }
     }
