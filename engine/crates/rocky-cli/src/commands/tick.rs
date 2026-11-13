@@ -223,7 +223,7 @@ fn tick_verdict(report: &TickReport, output: &TickOutput) -> TickVerdict {
         let run_id = output
             .executed
             .iter()
-            .find(|e| e.outcome != "success")
+            .find(|e| e.outcome != "success" && e.hold.is_none())
             .map(|e| e.submission_id.clone())
             .unwrap_or_default();
         return TickVerdict::Unhealthy { count, run_id };
@@ -388,6 +388,7 @@ fn build_tick_output(
             exit_code: e.exit_code,
             outcome: terminal_outcome_str(e.outcome).to_string(),
             attempts: e.attempts,
+            hold: e.hold.clone(),
         })
         .collect();
 
@@ -449,7 +450,13 @@ fn build_tick_output(
 
     let succeeded = executed.iter().filter(|e| e.outcome == "success").count();
     let partial = executed.iter().filter(|e| e.outcome == "partial").count();
-    let failed = executed.iter().filter(|e| e.outcome == "failure").count();
+    // A run a freeze held is counted as held, not failed: the freeze, not the
+    // pipeline, stopped it, so it does not fail the tick (#2569).
+    let held = executed.iter().filter(|e| e.hold.is_some()).count();
+    let failed = executed
+        .iter()
+        .filter(|e| e.outcome == "failure" && e.hold.is_none())
+        .count();
     let due = evaluated.iter().filter(|p| p.due).count();
 
     let counts = TickCounts {
@@ -459,6 +466,7 @@ fn build_tick_output(
         succeeded,
         partial,
         failed,
+        held,
         skipped: skipped.len(),
     };
 
@@ -486,6 +494,7 @@ fn map_source_skip(skip: &SourceSkip) -> SourceEvaluation {
         SkipReason::CatchupSkipped { missed } => ("catchup_skipped", None, Some(*missed)),
         SkipReason::FailureBackoff { resume_at } => ("failure_backoff", Some(*resume_at), None),
         SkipReason::PartialBackoff { resume_at } => ("partial_backoff", Some(*resume_at), None),
+        SkipReason::FreezeHold { resume_at } => ("freeze_hold", Some(*resume_at), None),
         SkipReason::Superseded => ("superseded", None, None),
         SkipReason::HistoryError | SkipReason::CursorError => ("history_unavailable", None, None),
     };
@@ -509,6 +518,7 @@ fn map_tick_skip_reason(
         TickSkipReason::CatchupSkipped { missed } => ("catchup_skipped", None, Some(*missed)),
         TickSkipReason::FailureBackoff { resume_at } => ("failure_backoff", Some(*resume_at), None),
         TickSkipReason::PartialBackoff { resume_at } => ("partial_backoff", Some(*resume_at), None),
+        TickSkipReason::FreezeHold { resume_at } => ("freeze_hold", Some(*resume_at), None),
         TickSkipReason::Dedup => ("dedup", None, None),
         TickSkipReason::ConfigError => ("config_error", None, None),
         TickSkipReason::HistoryUnavailable => ("history_unavailable", None, None),
@@ -550,8 +560,13 @@ fn render_text(o: &TickOutput) {
         println!("  note: proceeded via wedge override (prior reconciler's lock heartbeat stale)");
     }
     for e in &o.executed {
+        let held = e
+            .hold
+            .as_ref()
+            .map(|h| format!(", held by freeze {}", h.freeze_id))
+            .unwrap_or_default();
         println!(
-            "  ran {} ({}) → {} (exit {}, attempts {})",
+            "  ran {} ({}) → {} (exit {}, attempts {}{held})",
             e.pipeline, e.source, e.outcome, e.exit_code, e.attempts
         );
     }
@@ -796,6 +811,7 @@ freshness = true
             exit_code: 1,
             outcome: "failed".to_string(),
             attempts: 1,
+            hold: None,
         });
         (report, output)
     }
@@ -897,6 +913,7 @@ freshness = true
                 exit_code: 0,
                 outcome: TerminalOutcome::Success,
                 attempts: 1,
+                hold: None,
             }],
             skipped: vec![SkippedDemand {
                 pipeline: "staging".to_string(),

@@ -575,7 +575,15 @@ A scheduled run is a plain `rocky run --pipeline <name>` in a child process. The
 
 The child sets only `ROCKY_RUN_TRIGGER`, `ROCKY_SUBMISSION_ID` and the trace context. It never passes `--principal`. `rocky run` reads no principal, so a `ROCKY_PRINCIPAL` the scheduler inherits changes nothing.
 
-A freeze that covers a scheduled pipeline does not skip the tick. The child starts, the freeze fence withholds its work, and the run records a failure. The usual retries, incident bundle and failure backoff follow, so the operator sees that a freeze blocked a scheduled run.
+A freeze that covers a scheduled pipeline does not skip the tick. The child starts, the freeze fence withholds its work, and the run records a failure. The run record and `rocky run --output json` also carry a `hold` that names the freeze (`kind`, `freeze_id`, `scope`, `reason`). The scheduler reads it:
+
+- A held run is not retried. A retry cannot succeed while the freeze stands.
+- `consecutive_failures` does not move, and the cursor records `freeze_hold`.
+- A standing (`after` or `freshness`) demand is re-probed every 15 minutes. This interval does not grow. A cron demand waits for its next occurrence.
+- The first held run writes one `freeze_hold` incident bundle. Later held runs write none, until a run that is not held ends the episode.
+- `rocky tick` counts a held run under `counts.held`, not `counts.failed`. A hold alone does not make the tick exit non-zero.
+
+When the fence cannot list the freeze markers, the run fails with no `hold`. That is a fault, so the usual retries, incident bundle and failure backoff follow.
 
 ### Preview before you wire the timer
 

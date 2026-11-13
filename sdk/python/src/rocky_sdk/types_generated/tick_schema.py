@@ -3,41 +3,23 @@
 
 from __future__ import annotations
 
-from pydantic import AwareDatetime, BaseModel, conint
+from enum import StrEnum
+
+from pydantic import AwareDatetime, BaseModel, RootModel, conint
 
 
-class ExecutedRunOutput(BaseModel):
+class RunHoldKind2(StrEnum):
     """
-    One demand that executed to a terminal outcome this tick.
+    An active freeze marker bound a model or table the run was executing.
     """
 
-    attempts: conint(ge=0)
+    freeze = "freeze"
+
+
+class RunHoldKind(RootModel[RunHoldKind2]):
+    root: RunHoldKind2
     """
-    Total submissions made for this demand — the claim's monotonic audit counter across its whole lifetime, so in-tick retries AND earlier released cycles of a standing demand all count. `1` only when this was the demand's first-ever submission.
-    """
-    exit_code: int
-    """
-    The child's exit code: `0` success, `2` partial, `1`/other failure.
-    """
-    logical_ts: AwareDatetime
-    """
-    The logical timestamp of the demand.
-    """
-    outcome: str
-    """
-    The mapped terminal outcome: `success` | `partial` | `failure`.
-    """
-    pipeline: str
-    """
-    The pipeline that ran.
-    """
-    source: str
-    """
-    The source that made it due: `cron` | `after` | `freshness` | `webhook`.
-    """
-    submission_id: str
-    """
-    The submission id of the recorded attempt — the precise join key between this demand and *its* run record (`rocky history` shows the same id). This is the reconciler's demand↔run identity; there is no separate `run_id` field because a run is joined to its demand by `submission_id`.
+    What kind of governance hold stopped a run.
     """
 
 
@@ -56,7 +38,7 @@ class SkippedDemandOutput(BaseModel):
     """
     reason: str
     """
-    Why it was skipped: `not_due` | `disabled` | `in_flight` | `tick_in_progress` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `dedup` | `history_unavailable` | `state_busy` | `spool_unreadable`.
+    Why it was skipped: `not_due` | `disabled` | `in_flight` | `tick_in_progress` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `freeze_hold` | `dedup` | `history_unavailable` | `state_busy` | `spool_unreadable`.
 
     `spool_unreadable` is pipeline-less and `webhook`-sourced: something is at `.rocky/pending-demands` that could not be read (a dangling symlink, a permission denial, a file where the directory belongs), so no pending webhook demand was consumed this tick. An ABSENT spool directory is the ordinary shape for a project that takes no webhooks and never produces this — it reads as an empty list, not a fault. The next tick does not fix any of the causes that do produce it (#1731).
     """
@@ -81,11 +63,11 @@ class SourceEvaluation(BaseModel):
     """
     reason: str
     """
-    The reason string for this source: `due` | `not_due` | `disabled` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `superseded` | `history_unavailable`.
+    The reason string for this source: `due` | `not_due` | `disabled` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `freeze_hold` | `superseded` | `history_unavailable`.
     """
     resume_at: AwareDatetime | None = None
     """
-    When the source becomes eligible again — present for `failure_backoff` and `partial_backoff`.
+    When the source becomes eligible again — present for `failure_backoff`, `partial_backoff` and `freeze_hold`.
     """
     source: str
     """
@@ -112,7 +94,11 @@ class TickCounts(BaseModel):
     """
     failed: conint(ge=0)
     """
-    Executed runs that failed (exit 1/other).
+    Executed runs that failed (exit 1/other), not counting runs a freeze held.
+    """
+    held: conint(ge=0) | None = 0
+    """
+    Executed runs an active freeze marker held (#2569). Their `outcome` is still `failure`, but they are not in `failed` and do not fail the tick.
     """
     partial: conint(ge=0)
     """
@@ -152,6 +138,68 @@ class PipelineDemandStatus(BaseModel):
     sources: list[SourceEvaluation]
     """
     Per-source outcome for every source considered (the due source included, with reason `due`).
+    """
+
+
+class RunHold(BaseModel):
+    """
+    A governance hold on a run: an active freeze marker withheld its work. See [`RunRecord::hold`].
+    """
+
+    freeze_id: str
+    """
+    The freeze marker's id.
+    """
+    kind: RunHoldKind
+    """
+    The kind of hold. Only `freeze` today.
+    """
+    reason: str
+    """
+    The freeze marker's reason, as its author wrote it.
+    """
+    scope: str
+    """
+    The freeze marker's scope selector (`any` for an unreadable body).
+    """
+
+
+class ExecutedRunOutput(BaseModel):
+    """
+    One demand that executed to a terminal outcome this tick.
+    """
+
+    attempts: conint(ge=0)
+    """
+    Total submissions made for this demand — the claim's monotonic audit counter across its whole lifetime, so in-tick retries AND earlier released cycles of a standing demand all count. `1` only when this was the demand's first-ever submission.
+    """
+    exit_code: int
+    """
+    The child's exit code: `0` success, `2` partial, `1`/other failure.
+    """
+    hold: RunHold | None = None
+    """
+    Set when an active freeze marker held this run (#2569): the freeze, not the pipeline, stopped it. A held run is not retried and does not fail the tick. Omitted otherwise.
+    """
+    logical_ts: AwareDatetime
+    """
+    The logical timestamp of the demand.
+    """
+    outcome: str
+    """
+    The mapped terminal outcome: `success` | `partial` | `failure`.
+    """
+    pipeline: str
+    """
+    The pipeline that ran.
+    """
+    source: str
+    """
+    The source that made it due: `cron` | `after` | `freshness` | `webhook`.
+    """
+    submission_id: str
+    """
+    The submission id of the recorded attempt — the precise join key between this demand and *its* run record (`rocky history` shows the same id). This is the reconciler's demand↔run identity; there is no separate `run_id` field because a run is joined to its demand by `submission_id`.
     """
 
 

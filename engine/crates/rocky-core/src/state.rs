@@ -4011,6 +4011,45 @@ pub struct RunRecord {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_volumes: Vec<OutputVolumeRecord>,
+
+    /// Set when a governance hold, not the run's own work, stopped it: an
+    /// active freeze marker withheld the remaining work (#2569). The run's
+    /// `status` still says what happened (usually a failure). The scheduler
+    /// reads this to stop retrying a run that cannot succeed while the freeze
+    /// stands. `None` for every other run, including one the freeze fence
+    /// stopped because it could not LIST the markers: that is a fault, and
+    /// stays retryable.
+    ///
+    /// Added without a schema bump. Omitted when `None`, so the
+    /// `ledger_record_serialization_pinned` golden stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<RunHold>,
+}
+
+/// What kind of governance hold stopped a run.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RunHoldKind {
+    /// An active freeze marker bound a model or table the run was executing.
+    Freeze,
+}
+
+/// A governance hold on a run: an active freeze marker withheld its work.
+/// See [`RunRecord::hold`].
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct RunHold {
+    /// The kind of hold. Only `freeze` today.
+    pub kind: RunHoldKind,
+    /// The freeze marker's id.
+    pub freeze_id: String,
+    /// The freeze marker's scope selector (`any` for an unreadable body).
+    pub scope: String,
+    /// The freeze marker's reason, as its author wrote it.
+    pub reason: String,
 }
 
 /// Read a [`crate::product::spec::VolumeBasis`] leniently: a name this build
@@ -11282,6 +11321,7 @@ pub fn run_with_output_versions(
         queued_ms: None,
         source_volumes: Vec::new(),
         output_volumes: Vec::new(),
+        hold: None,
     }
 }
 
@@ -12499,6 +12539,7 @@ mod tests {
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         }
     }
 

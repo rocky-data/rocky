@@ -14638,6 +14638,7 @@ schema_template = "s__{source}"
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         };
         store.record_run(&record).unwrap();
     }

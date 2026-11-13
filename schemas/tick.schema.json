@@ -15,6 +15,17 @@
           "format": "int32",
           "type": "integer"
         },
+        "hold": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RunHold"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when an active freeze marker held this run (#2569): the freeze, not the pipeline, stopped it. A held run is not retried and does not fail the tick. Omitted otherwise."
+        },
         "logical_ts": {
           "description": "The logical timestamp of the demand.",
           "format": "date-time",
@@ -89,6 +100,50 @@
       ],
       "type": "object"
     },
+    "RunHold": {
+      "description": "A governance hold on a run: an active freeze marker withheld its work. See [`RunRecord::hold`].",
+      "properties": {
+        "freeze_id": {
+          "description": "The freeze marker's id.",
+          "type": "string"
+        },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunHoldKind"
+            }
+          ],
+          "description": "The kind of hold. Only `freeze` today."
+        },
+        "reason": {
+          "description": "The freeze marker's reason, as its author wrote it.",
+          "type": "string"
+        },
+        "scope": {
+          "description": "The freeze marker's scope selector (`any` for an unreadable body).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "freeze_id",
+        "kind",
+        "reason",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "RunHoldKind": {
+      "description": "What kind of governance hold stopped a run.",
+      "oneOf": [
+        {
+          "description": "An active freeze marker bound a model or table the run was executing.",
+          "enum": [
+            "freeze"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "SkippedDemandOutput": {
       "description": "One demand suppressed this tick.",
       "properties": {
@@ -109,7 +164,7 @@
           ]
         },
         "reason": {
-          "description": "Why it was skipped: `not_due` | `disabled` | `in_flight` | `tick_in_progress` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `dedup` | `history_unavailable` | `state_busy` | `spool_unreadable`.\n\n`spool_unreadable` is pipeline-less and `webhook`-sourced: something is at `.rocky/pending-demands` that could not be read (a dangling symlink, a permission denial, a file where the directory belongs), so no pending webhook demand was consumed this tick. An ABSENT spool directory is the ordinary shape for a project that takes no webhooks and never produces this — it reads as an empty list, not a fault. The next tick does not fix any of the causes that do produce it (#1731).",
+          "description": "Why it was skipped: `not_due` | `disabled` | `in_flight` | `tick_in_progress` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `freeze_hold` | `dedup` | `history_unavailable` | `state_busy` | `spool_unreadable`.\n\n`spool_unreadable` is pipeline-less and `webhook`-sourced: something is at `.rocky/pending-demands` that could not be read (a dangling symlink, a permission denial, a file where the directory belongs), so no pending webhook demand was consumed this tick. An ABSENT spool directory is the ordinary shape for a project that takes no webhooks and never produces this — it reads as an empty list, not a fault. The next tick does not fix any of the causes that do produce it (#1731).",
           "type": "string"
         },
         "resume_at": {
@@ -146,11 +201,11 @@
           ]
         },
         "reason": {
-          "description": "The reason string for this source: `due` | `not_due` | `disabled` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `superseded` | `history_unavailable`.",
+          "description": "The reason string for this source: `due` | `not_due` | `disabled` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `freeze_hold` | `superseded` | `history_unavailable`.",
           "type": "string"
         },
         "resume_at": {
-          "description": "When the source becomes eligible again — present for `failure_backoff` and `partial_backoff`.",
+          "description": "When the source becomes eligible again — present for `failure_backoff`, `partial_backoff` and `freeze_hold`.",
           "format": "date-time",
           "type": [
             "string",
@@ -190,7 +245,14 @@
           "type": "integer"
         },
         "failed": {
-          "description": "Executed runs that failed (exit 1/other).",
+          "description": "Executed runs that failed (exit 1/other), not counting runs a freeze held.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "held": {
+          "default": 0,
+          "description": "Executed runs an active freeze marker held (#2569). Their `outcome` is still `failure`, but they are not in `failed` and do not fail the tick.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"

@@ -655,6 +655,13 @@
             "partial_backoff"
           ],
           "type": "string"
+        },
+        {
+          "description": "The flat re-probe after a run an active freeze marker held (#2569).",
+          "enum": [
+            "freeze_hold"
+          ],
+          "type": "string"
         }
       ]
     },

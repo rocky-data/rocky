@@ -183,6 +183,7 @@ fn record_run(store: &StateStore, models: &[&str]) {
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         })
         .expect("record run");
 }

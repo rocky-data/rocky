@@ -199,6 +199,7 @@ pub const SCHEDULER_SKIP_REASONS: &[&str] = &[
     "catchup_skipped",
     "failure_backoff",
     "partial_backoff",
+    "freeze_hold",
     "dedup",
     "config_error",
     "history_unavailable",

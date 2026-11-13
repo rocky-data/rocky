@@ -477,6 +477,14 @@ pub struct RunOutput {
     /// when the run judged no source range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_volumes: Vec<SourceVolumeCheckOutput>,
+    /// Set when an active freeze marker, not the run's own work, withheld
+    /// work in this run (#2569). `status` still reports the failure. The
+    /// scheduler reads it from the run record to stop retrying while the
+    /// freeze stands. Omitted for every other run, including one the freeze
+    /// fence stopped because it could not list the markers (a fault, which
+    /// stays retryable). The first freeze that withheld work is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<rocky_core::state::RunHold>,
     /// Soft warnings raised by the per-table override resolver — one
     /// entry per `[[table_overrides]]` rule that matched zero
     /// `(connector, table)` pairs this run, or whose connector half
@@ -6593,6 +6601,7 @@ impl RunOutput {
             scheduling_warnings: Vec::new(),
             volume_warnings: Vec::new(),
             source_volumes: Vec::new(),
+            hold: None,
             filter,
             duration_ms,
             tables_copied: 0,
@@ -7097,6 +7106,7 @@ impl RunOutput {
                 .map(SourceVolumeCheckOutput::to_record)
                 .collect(),
             output_volumes,
+            hold: self.hold.clone(),
         }
     }
 
@@ -7628,11 +7638,11 @@ pub struct SourceEvaluation {
     /// The demand source: `cron` | `after` | `freshness` | `webhook`.
     pub source: String,
     /// The reason string for this source: `due` | `not_due` | `disabled` |
-    /// `catchup_skipped` | `failure_backoff` | `partial_backoff` | `superseded`
-    /// | `history_unavailable`.
+    /// `catchup_skipped` | `failure_backoff` | `partial_backoff` | `freeze_hold`
+    /// | `superseded` | `history_unavailable`.
     pub reason: String,
-    /// When the source becomes eligible again — present for `failure_backoff`
-    /// and `partial_backoff`.
+    /// When the source becomes eligible again — present for `failure_backoff`,
+    /// `partial_backoff` and `freeze_hold`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_at: Option<DateTime<Utc>>,
     /// Number of missed cron occurrences — present for `catchup_skipped`.
@@ -7663,6 +7673,11 @@ pub struct ExecutedRunOutput {
     /// released cycles of a standing demand all count. `1` only when this
     /// was the demand's first-ever submission.
     pub attempts: u32,
+    /// Set when an active freeze marker held this run (#2569): the freeze, not
+    /// the pipeline, stopped it. A held run is not retried and does not fail
+    /// the tick. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<rocky_core::state::RunHold>,
 }
 
 /// One demand suppressed this tick.
@@ -7679,8 +7694,8 @@ pub struct SkippedDemandOutput {
     pub source: Option<String>,
     /// Why it was skipped: `not_due` | `disabled` | `in_flight` |
     /// `tick_in_progress` | `catchup_skipped` | `failure_backoff` |
-    /// `partial_backoff` | `dedup` | `history_unavailable` | `state_busy` |
-    /// `spool_unreadable`.
+    /// `partial_backoff` | `freeze_hold` | `dedup` | `history_unavailable` |
+    /// `state_busy` | `spool_unreadable`.
     ///
     /// `spool_unreadable` is pipeline-less and `webhook`-sourced: something is
     /// at `.rocky/pending-demands` that could not be read (a dangling symlink,
@@ -7712,8 +7727,13 @@ pub struct TickCounts {
     pub succeeded: usize,
     /// Executed runs that were partial (exit 2).
     pub partial: usize,
-    /// Executed runs that failed (exit 1/other).
+    /// Executed runs that failed (exit 1/other), not counting runs a freeze
+    /// held.
     pub failed: usize,
+    /// Executed runs an active freeze marker held (#2569). Their `outcome` is
+    /// still `failure`, but they are not in `failed` and do not fail the tick.
+    #[serde(default)]
+    pub held: usize,
     /// Demands suppressed (the length of `skipped`).
     pub skipped: usize,
 }
@@ -8253,6 +8273,8 @@ pub enum ScheduleThrottleKind {
     FailureBackoff,
     /// The fixed backoff applied after a partial run.
     PartialBackoff,
+    /// The flat re-probe after a run an active freeze marker held (#2569).
+    FreezeHold,
 }
 
 /// One claim recorded against a pipeline.

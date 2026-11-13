@@ -289,6 +289,10 @@ pub struct ExecutedDemand {
     /// Total submissions made for this demand (the claim's monotonic audit
     /// counter at the terminal transition).
     pub attempts: u32,
+    /// Set when an active freeze marker held the run (#2569), read from its
+    /// run record. `outcome` is still the child's (a failure). A held run is
+    /// not retried, and does not fail the tick.
+    pub hold: Option<crate::state::RunHold>,
 }
 
 /// Why a demand did not execute this tick. Mirrors the frozen tick-contract
@@ -319,6 +323,12 @@ pub enum TickSkipReason {
     },
     /// A standing demand suppressed by the fixed partial backoff.
     PartialBackoff {
+        /// When the demand becomes eligible again.
+        resume_at: DateTime<Utc>,
+    },
+    /// A standing demand whose last attempt a freeze held, waiting for the
+    /// flat re-probe interval (#2569).
+    FreezeHold {
         /// When the demand becomes eligible again.
         resume_at: DateTime<Utc>,
     },
@@ -1074,6 +1084,9 @@ fn map_skip(pipeline: &str, skip: &SourceSkip) -> Option<SkippedDemand> {
         SkipReason::PartialBackoff { resume_at } => TickSkipReason::PartialBackoff {
             resume_at: *resume_at,
         },
+        SkipReason::FreezeHold { resume_at } => TickSkipReason::FreezeHold {
+            resume_at: *resume_at,
+        },
         // Recorded, never elided — a read fault must be visible in the report.
         // Same frozen-contract name as the history fault: both are "a store
         // read fault made the classification unreliable, surfaced loudly". The
@@ -1318,6 +1331,7 @@ async fn execute_claimed(
             )));
         }
         let outcome = TerminalOutcome::from_exit_code(run_outcome.exit_code);
+        let hold = attempt_hold(phase.store(), outcome, &submission_id);
         let next_id = new_submission_id();
         // On shutdown, do not start another attempt. A drain raised during this
         // attempt means the child was likely SIGTERM'd by the spawner (→ nonzero
@@ -1330,7 +1344,10 @@ async fn execute_claimed(
         // finalizes exactly once and nothing respawns. Consequence (failure-mode
         // ledger): a drain-interrupted run finalizes as failed and does not
         // auto-resume on restart; shutdown stays bounded to one in-flight child.
-        let effective_retry_max = if opts.drain.is_signalled() {
+        // A run a freeze held cannot succeed while the freeze stands, so it is
+        // not retried in-tick either (#2569): the next attempt is the flat
+        // re-probe (standing) or the next occurrence (cron).
+        let effective_retry_max = if opts.drain.is_signalled() || hold.is_some() {
             0
         } else {
             schedule.retry_max
@@ -1378,10 +1395,9 @@ async fn execute_claimed(
                 // attempts consumed by THIS demand cycle.
                 let attempts = terminal_claim.attempts;
                 let bundle_attempts = terminal_claim.cycle_attempts;
-                let mutation = ScheduleStateMutation::Terminal {
-                    outcome: bookkeeping.outcome,
-                    cf_delta: bookkeeping.cf_delta,
-                };
+                // Read before the CAS: is a freeze-hold episode already open?
+                let episode_open = hold.is_some() && freeze_episode_open(phase.store(), demand);
+                let mutation = terminal_mutation(&bookkeeping, hold.as_ref());
                 match phase.store().schedule_claim_cas(
                     key,
                     Some(&claim),
@@ -1401,7 +1417,21 @@ async fn execute_claimed(
                         // re-sample of the drain flag: a child that failed on
                         // its own and merely coincided with a drain still
                         // records its incident.
-                        if !run_outcome.drain_interrupted {
+                        if let Some(held) = &hold {
+                            if !episode_open {
+                                record_freeze_hold_incident(
+                                    &opts.rocky_dir,
+                                    &demand.pipeline,
+                                    demand.source,
+                                    held,
+                                    Some(demand.logical_ts),
+                                    &submission_id,
+                                    Some(run_outcome.exit_code),
+                                    bundle_attempts,
+                                    now,
+                                );
+                            }
+                        } else if !run_outcome.drain_interrupted {
                             // Post-CAS read of the cursor the mutation just
                             // updated; a read error yields `None`, never a
                             // fabricated zero.
@@ -1434,6 +1464,7 @@ async fn execute_claimed(
                             exit_code: run_outcome.exit_code,
                             outcome,
                             attempts,
+                            hold,
                         }));
                     }
                 }
@@ -1529,6 +1560,111 @@ fn write_incident_bundle(
             outcome = %outcome_str,
             error = %e,
             "scheduled run failed AND the incident bundle could not be written"
+        ),
+    }
+}
+
+/// The freeze hold of a finished, non-successful attempt, read from its run
+/// record (#2569). `None` for a success, for a run with no record or no hold,
+/// and when the record cannot be read: doubt keeps the ordinary retryable
+/// failure, never a hold.
+fn attempt_hold(
+    store: &StateStore,
+    outcome: TerminalOutcome,
+    submission_id: &str,
+) -> Option<crate::state::RunHold> {
+    if matches!(outcome, TerminalOutcome::Success) {
+        return None;
+    }
+    match store.find_terminal_run_by_submission_id(submission_id) {
+        Ok(run) => run.and_then(|run| run.hold),
+        Err(e) => {
+            tracing::warn!(
+                submission_id,
+                error = %e,
+                "scheduler: could not read the run record to check for a freeze hold"
+            );
+            None
+        }
+    }
+}
+
+/// Whether `demand`'s pipeline is inside a freeze-hold episode: its last
+/// terminal attempt was held. A cursor read error is "not open", so the
+/// incident is written rather than lost.
+fn freeze_episode_open(store: &StateStore, demand: &Demand) -> bool {
+    store
+        .get_schedule_state(&demand.pipeline)
+        .ok()
+        .flatten()
+        .is_some_and(|cursor| cursor.freeze_hold_id.is_some())
+}
+
+/// The cursor mutation for a terminal attempt: a freeze hold leaves
+/// `consecutive_failures` alone and records `freeze_hold` (#2569); anything
+/// else applies the outcome's bookkeeping.
+fn terminal_mutation(
+    bookkeeping: &super::claim::Bookkeeping,
+    hold: Option<&crate::state::RunHold>,
+) -> ScheduleStateMutation {
+    match hold {
+        Some(held) => ScheduleStateMutation::FreezeHold {
+            freeze_id: held.freeze_id.clone(),
+        },
+        None => ScheduleStateMutation::Terminal {
+            outcome: bookkeeping.outcome,
+            cf_delta: bookkeeping.cf_delta,
+        },
+    }
+}
+
+/// Write the one `freeze_hold` incident that opens a freeze-hold episode. Its
+/// `pointers` name the freeze, so the bundle reads as a governance hold, not a
+/// pipeline failure. Write failures warn, like [`record_incident`].
+#[allow(clippy::too_many_arguments)]
+fn record_freeze_hold_incident(
+    rocky_dir: &Path,
+    pipeline: &str,
+    source: DemandKind,
+    hold: &crate::state::RunHold,
+    logical_ts: Option<DateTime<Utc>>,
+    submission_id: &str,
+    exit_code: Option<i32>,
+    attempts: u32,
+    now: DateTime<Utc>,
+) {
+    let bundle = crate::schedule::incidents::IncidentBundle {
+        incident_version: 1,
+        recorded_at: now,
+        pipeline: pipeline.to_string(),
+        source: source.as_str().to_string(),
+        outcome: "freeze_hold".to_string(),
+        logical_ts,
+        submission_id: submission_id.to_string(),
+        exit_code,
+        attempts,
+        consecutive_failures: None,
+        pointers: vec![
+            format!(
+                "freeze {} (scope '{}'): {}",
+                hold.freeze_id, hold.scope, hold.reason
+            ),
+            "rocky policy unfreeze --help  # lift the freeze".to_string(),
+            format!("rocky history --output json  # run {submission_id}"),
+        ],
+    };
+    match crate::schedule::incidents::write_incident(rocky_dir, &bundle) {
+        Ok(path) => tracing::warn!(
+            pipeline = %pipeline,
+            freeze_id = %hold.freeze_id,
+            incident = %path.display(),
+            "scheduled run held by a freeze; incident bundle written"
+        ),
+        Err(e) => tracing::warn!(
+            pipeline = %pipeline,
+            freeze_id = %hold.freeze_id,
+            error = %e,
+            "scheduled run held by a freeze AND the incident bundle could not be written"
         ),
     }
 }
@@ -1687,10 +1823,9 @@ fn sweep_orphan_claims(
         let Some(schedule) = schedules.get(&pipeline) else {
             continue;
         };
-        let Some(outcome) = store
-            .find_terminal_run_by_submission_id(&claim.submission_id)?
-            .and_then(|run| run.status.terminal_outcome())
-        else {
+        let run = store.find_terminal_run_by_submission_id(&claim.submission_id)?;
+        let hold = run.as_ref().and_then(|run| run.hold.clone());
+        let Some(outcome) = run.and_then(|run| run.status.terminal_outcome()) else {
             // A record-less CRON claim is the one orphan no other path reaches:
             // its anchor advanced on submission, so its key never comes due
             // again and `resolve_missing_record` (the demand path) never sees
@@ -1732,7 +1867,24 @@ fn sweep_orphan_claims(
         // touches the per-pipeline scalars, so `consecutive_failures` is
         // honestly `None`, and the occurrence is not reconstructed
         // (`logical_ts: None`).
-        if matches!(cas, ClaimCas::Won) && !matches!(outcome, TerminalOutcome::Success) {
+        // A run a freeze held is labelled as a hold. The sweep never touches
+        // the cursor, so it opens no episode: a held orphan always writes one.
+        if matches!(cas, ClaimCas::Won)
+            && !matches!(outcome, TerminalOutcome::Success)
+            && let Some(held) = &hold
+        {
+            record_freeze_hold_incident(
+                rocky_dir,
+                &pipeline,
+                source,
+                held,
+                None,
+                &claim.submission_id,
+                None,
+                claim.cycle_attempts,
+                now,
+            );
+        } else if matches!(cas, ClaimCas::Won) && !matches!(outcome, TerminalOutcome::Success) {
             record_incident(
                 rocky_dir,
                 &pipeline,
@@ -1971,14 +2123,45 @@ fn resolve_stuck(
     rocky_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<StuckResolution, TickError> {
-    let outcome = store
-        .find_terminal_run_by_submission_id(&current.submission_id)?
-        .and_then(|run| run.status.terminal_outcome());
-    let Some(outcome) = outcome else {
+    let run = store.find_terminal_run_by_submission_id(&current.submission_id)?;
+    let Some(outcome) = run.as_ref().and_then(|run| run.status.terminal_outcome()) else {
         return resolve_missing_record(key, demand, schedule, current, store, rocky_dir, now);
     };
-    let resolved = decide_resolver(current, outcome, demand.source, schedule.retry_max, now);
-    let resolution = commit_resolution(key, &demand.pipeline, current, resolved, store)?;
+    // A run a freeze held is not retried (#2569), the same as the direct arm.
+    let hold = run
+        .and_then(|run| run.hold)
+        .filter(|_| !matches!(outcome, TerminalOutcome::Success));
+    let retry_max = if hold.is_some() {
+        0
+    } else {
+        schedule.retry_max
+    };
+    let episode_open = hold.is_some() && freeze_episode_open(store, demand);
+    let resolved = decide_resolver(current, outcome, demand.source, retry_max, now);
+    let resolution = commit_resolution(
+        key,
+        &demand.pipeline,
+        current,
+        resolved,
+        hold.as_ref(),
+        store,
+    )?;
+    if let Some(held) = &hold {
+        if matches!(resolution, StuckResolution::Finished) && !episode_open {
+            record_freeze_hold_incident(
+                rocky_dir,
+                &demand.pipeline,
+                demand.source,
+                held,
+                Some(demand.logical_ts),
+                &current.submission_id,
+                None,
+                current.cycle_attempts,
+                now,
+            );
+        }
+        return Ok(resolution);
+    }
     // The claim just finalized a failure this tick's spawn never saw (a prior
     // owner crashed after the child recorded its run). Same incident contract
     // as the direct arm; the child's exit code is unknowable here — the run
@@ -2061,7 +2244,8 @@ fn resolve_missing_record(
                 schedule.retry_max,
                 now,
             );
-            let resolution = commit_resolution(key, &demand.pipeline, current, resolved, store)?;
+            let resolution =
+                commit_resolution(key, &demand.pipeline, current, resolved, None, store)?;
             child_marker::remove(rocky_dir, &current.submission_id);
             // A lost attempt (crash before any run record) that just
             // exhausted its budget is a failure nobody else will surface.
@@ -2098,6 +2282,7 @@ fn commit_resolution(
     pipeline: &str,
     expected: &ClaimRecord,
     resolved: Resolved,
+    hold: Option<&crate::state::RunHold>,
     store: &StateStore,
 ) -> Result<StuckResolution, TickError> {
     match resolved {
@@ -2114,10 +2299,7 @@ fn commit_resolution(
             }
         }
         Resolved::Terminal { claim, bookkeeping } => {
-            let mutation = ScheduleStateMutation::Terminal {
-                outcome: bookkeeping.outcome,
-                cf_delta: bookkeeping.cf_delta,
-            };
+            let mutation = terminal_mutation(&bookkeeping, hold);
             match store.schedule_claim_cas(key, Some(expected), &claim, pipeline, &mutation)? {
                 ClaimCas::Won => Ok(StuckResolution::Finished),
                 ClaimCas::Lost(_) => Ok(StuckResolution::InFlight),
@@ -2333,6 +2515,7 @@ cron = "also invalid"
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         }
     }
 
@@ -5210,6 +5393,268 @@ adapter = "db"
                 .is_empty(),
             "the affix-shaped demand was consumed"
         );
+    }
+
+    // --- freeze hold (#2569) ---------------------------------------------------
+
+    /// A child that writes its run record like `rocky run` does: `Failure`
+    /// with a freeze hold when the next scripted entry is `true`, `Success`
+    /// when it is `false`. Past the script it repeats the last entry.
+    struct FreezeSpawner {
+        state_path: std::path::PathBuf,
+        script: Mutex<Vec<bool>>,
+        runs: Mutex<usize>,
+    }
+
+    impl FreezeSpawner {
+        fn new(state_path: &Path, script: &[bool]) -> Self {
+            Self {
+                state_path: state_path.to_path_buf(),
+                script: Mutex::new(script.to_vec()),
+                runs: Mutex::new(0),
+            }
+        }
+        fn runs(&self) -> usize {
+            *self.runs.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl Spawner for FreezeSpawner {
+        async fn run(&self, request: &SpawnRequest) -> RunOutcome {
+            *self.runs.lock().unwrap() += 1;
+            let held = {
+                let mut script = self.script.lock().unwrap();
+                if script.len() > 1 {
+                    script.remove(0)
+                } else {
+                    script[0]
+                }
+            };
+            let store = StateStore::open(&self.state_path).unwrap();
+            let now = Utc::now();
+            let mut record = make_run(
+                &request.pipeline,
+                Some(&request.submission_id),
+                if held {
+                    RunStatus::Failure
+                } else {
+                    RunStatus::Success
+                },
+                now,
+                now,
+            );
+            if held {
+                record.hold = Some(crate::state::RunHold {
+                    kind: crate::state::RunHoldKind::Freeze,
+                    freeze_id: "f-1".to_string(),
+                    scope: "any".to_string(),
+                    reason: "release freeze".to_string(),
+                });
+            }
+            store.record_run(&record).unwrap();
+            RunOutcome {
+                exit_code: if held { 1 } else { 0 },
+                pid: Some(4244),
+                drain_interrupted: false,
+            }
+        }
+    }
+
+    fn incident_outcomes(opts: &TickOptions) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir(opts.rocky_dir.join("incidents")) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = dir
+            .filter_map(Result::ok)
+            .map(|e| {
+                let bundle: crate::schedule::incidents::IncidentBundle =
+                    serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap();
+                (e.file_name().to_string_lossy().to_string(), bundle.outcome)
+            })
+            .collect();
+        out.sort();
+        out.into_iter().map(|(_, o)| o).collect()
+    }
+
+    #[test]
+    fn a_held_cron_run_is_not_retried_and_opens_one_freeze_hold_episode() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_RETRY2);
+        // Held, held, then a clean run, then held again.
+        let spawner = FreezeSpawner::new(&state_path, &[true, true, false, true]);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(
+            spawner.runs(),
+            1,
+            "retry.max = 2, but a held run is not retried"
+        );
+        let executed = &report.executed[0];
+        assert_eq!(executed.outcome, TerminalOutcome::Failure);
+        assert_eq!(
+            executed.hold.as_ref().map(|h| h.freeze_id.as_str()),
+            Some("f-1")
+        );
+        with_store(&state_path, |store| {
+            let cursor = store.get_schedule_state("raw").unwrap().unwrap();
+            assert_eq!(cursor.consecutive_failures, 0, "a hold is not a failure");
+            assert_eq!(cursor.last_attempt_outcome.as_deref(), Some("freeze_hold"));
+            assert_eq!(cursor.freeze_hold_id.as_deref(), Some("f-1"));
+        });
+        assert_eq!(incident_outcomes(&opts), vec!["freeze_hold"]);
+
+        // The next occurrence is held too: same episode, no new incident.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 3, 4, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.runs(), 2);
+        assert_eq!(incident_outcomes(&opts), vec!["freeze_hold"]);
+
+        // A clean run ends the episode.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 4, 4, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        with_store(&state_path, |store| {
+            let cursor = store.get_schedule_state("raw").unwrap().unwrap();
+            assert_eq!(cursor.freeze_hold_id, None);
+            assert_eq!(cursor.last_attempt_outcome.as_deref(), Some("success"));
+        });
+
+        // A new hold opens a new episode.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 5, 4, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.runs(), 4);
+        assert_eq!(incident_outcomes(&opts), vec!["freeze_hold", "freeze_hold"]);
+    }
+
+    #[test]
+    fn a_held_standing_demand_is_re_probed_at_the_flat_interval() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(AFTER_RETRY2);
+        with_store(&state_path, |store| {
+            seed_run(
+                store,
+                "raw",
+                None,
+                RunStatus::Success,
+                at(2026, 5, 2, 3, 5),
+                at(2026, 5, 2, 3, 10),
+            );
+        });
+        let spawner = FreezeSpawner::new(&state_path, &[true]);
+        let t0 = at(2026, 5, 2, 4, 0);
+        rt().block_on(tick_once(&config, &state_path, t0, &spawner, &opts))
+            .unwrap();
+        assert_eq!(spawner.runs(), 1, "no in-tick retry");
+
+        // Inside the 15 minute re-probe: skipped as a freeze hold.
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                t0 + Duration::minutes(10),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(spawner.runs(), 1);
+        assert!(
+            report.skipped.iter().any(|s| s.pipeline == "staging"
+                && matches!(s.reason, TickSkipReason::FreezeHold { .. })),
+            "skipped as freeze_hold: {:?}",
+            report.skipped
+        );
+
+        // Past it: re-probed. Held again, the interval stays flat (no ladder)
+        // and the episode writes no second incident.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            t0 + Duration::minutes(16),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.runs(), 2);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            t0 + Duration::minutes(32),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(
+            spawner.runs(),
+            3,
+            "still a flat 15 minutes, not a growing backoff"
+        );
+        assert_eq!(incident_outcomes(&opts), vec!["freeze_hold"]);
+        with_store(&state_path, |store| {
+            let cursor = store.get_schedule_state("staging").unwrap().unwrap();
+            assert_eq!(cursor.consecutive_failures, 0);
+        });
+    }
+
+    #[test]
+    fn a_failure_with_no_hold_still_retries() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(CRON_RETRY2);
+        let cap = CapturingSpawner::new(0);
+        cap.script("raw", [1, 1, 1]);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &cap,
+            &opts,
+        ))
+        .unwrap();
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 4, 0),
+                &cap,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(cap.run_count(), 3, "an unheld failure spends its retries");
+        assert!(report.executed[0].hold.is_none());
+        assert_eq!(incident_outcomes(&opts), vec!["failure"]);
     }
 
     // --- claim GC (#2567) ------------------------------------------------------

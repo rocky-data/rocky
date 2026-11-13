@@ -567,6 +567,10 @@ class RunResult(BaseModel):
     #: entry per ``[[product.source.volume]]`` range whose product output is
     #: in the run's selection. Empty when the run judged no source range.
     source_volumes: list[SourceVolumeCheckOutput] = Field(default_factory=list)
+    #: Set when an active freeze marker, not the run's own work, withheld work
+    #: in this run: ``kind``, ``freeze_id``, ``scope``, ``reason``. ``None``
+    #: otherwise, including when the freeze markers could not be listed.
+    hold: RunHold | None = None
     #: Soft warnings from the per-table override resolver — one entry per
     #: ``[[table_overrides]]`` rule that matched nothing. Empty when no
     #: overrides are declared.
@@ -1628,6 +1632,7 @@ from .types_generated.run_schema import (  # noqa: E402, F401
     OverrideWarningOutput,
     QuarantineOutput,
     RunCostSummary,
+    RunHold,
     RunProductBudget,
     SourceVolumeCheckOutput,
     UpstreamReads,

@@ -31,7 +31,7 @@ export type LatestStartState = "known" | "unknown";
 /**
  * Why a demand is currently suppressed.
  */
-export type ScheduleThrottleKind = "failure_backoff" | "partial_backoff";
+export type ScheduleThrottleKind = "failure_backoff" | "partial_backoff" | "freeze_hold";
 /**
  * Tick-lock states.
  *

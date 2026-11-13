@@ -400,7 +400,10 @@ fn tick_counts(report: &TickReport) -> TickCounts {
         failed: report
             .executed
             .iter()
-            .filter(|e| e.outcome != rocky_core::schedule::TerminalOutcome::Success)
+            // A run a freeze held is not a failure of the pipeline (#2569).
+            .filter(|e| {
+                e.outcome != rocky_core::schedule::TerminalOutcome::Success && e.hold.is_none()
+            })
             .count(),
         // The per-demand skips plus the ones the tick synthesises for a whole
         // source or the whole pass, from the one derivation the JSON and the
@@ -567,6 +570,7 @@ fn skip_reason_label(reason: &TickSkipReason) -> &'static str {
         TickSkipReason::CatchupSkipped { .. } => "catchup_skipped",
         TickSkipReason::FailureBackoff { .. } => "failure_backoff",
         TickSkipReason::PartialBackoff { .. } => "partial_backoff",
+        TickSkipReason::FreezeHold { .. } => "freeze_hold",
         TickSkipReason::Dedup => "dedup",
         TickSkipReason::ConfigError => "config_error",
         TickSkipReason::HistoryUnavailable => "history_unavailable",
@@ -1170,6 +1174,7 @@ cron = "* * * * *"
             TickSkipReason::CatchupSkipped { missed: 3 },
             TickSkipReason::FailureBackoff { resume_at: ts },
             TickSkipReason::PartialBackoff { resume_at: ts },
+            TickSkipReason::FreezeHold { resume_at: ts },
             TickSkipReason::Dedup,
             TickSkipReason::ConfigError,
             TickSkipReason::HistoryUnavailable,
@@ -1185,6 +1190,7 @@ cron = "* * * * *"
                 | TickSkipReason::CatchupSkipped { .. }
                 | TickSkipReason::FailureBackoff { .. }
                 | TickSkipReason::PartialBackoff { .. }
+                | TickSkipReason::FreezeHold { .. }
                 | TickSkipReason::Dedup
                 | TickSkipReason::ConfigError
                 | TickSkipReason::HistoryUnavailable

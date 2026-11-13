@@ -106,6 +106,7 @@ fn seed_last_month(state_path: &Path) -> String {
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
+            hold: None,
         })
         .unwrap();
     format!("{year:04}-{month:02}")
