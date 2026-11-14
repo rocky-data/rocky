@@ -1043,11 +1043,12 @@ struct MonthInputs {
 /// A warning when the default state file's AI usage spool holds calls this
 /// report does not read.
 ///
-/// `rocky lsp` and the MCP server spool next to the default state file
-/// (`<models>/.rocky-state.redb`). They take no `--state-path` or
-/// `--state-namespace`, so when this report reads another store those calls
-/// land where it never looks. Their count is unknown here, so the report says
-/// so and is not silent.
+/// `rocky lsp` and the MCP server spool next to the store they resolve, the
+/// same way the CLI does: `--state-path`, then `--state-namespace`, then
+/// `[state] namespacing`. A server started without the flags this report uses
+/// spools next to the default state file (`<models>/.rocky-state.redb`), where
+/// this report never looks. Older binaries always spooled there. Their count is
+/// unknown here, so the report says so and is not silent.
 fn stray_default_spool_warning(store: &StateStore, config_path: &Path) -> Option<String> {
     let used = store.ai_usage_spool_path()?;
     let models_dir = config_path
@@ -1070,8 +1071,8 @@ fn stray_default_spool_warning(store: &StateStore, config_path: &Path) -> Option
     }
     Some(format!(
         "AI calls from `rocky lsp` or the MCP server are spooled at {}, but this report reads \
-         {}; those calls are not counted. `rocky lsp` and MCP always use the default state \
-         file, not --state-path or --state-namespace",
+         {}; those calls are not counted. Start `rocky lsp` and MCP with the same \
+         --state-path or --state-namespace as this report",
         default.display(),
         used.display()
     ))
@@ -3823,8 +3824,8 @@ pub(crate) mod tests {
         assert_eq!(json["not_measured"]["ai_records_dropped"], 2);
     }
 
-    /// `rocky lsp` and MCP spool next to the default state file. A report on
-    /// another store says so. Mutation: drop the check and no warning.
+    /// `rocky lsp` or MCP started without the report's flags spools next to the
+    /// default state file. A report on another store says so. Mutation: drop the check and no warning.
     #[test]
     fn a_report_on_another_store_warns_about_the_default_spool() {
         let dir = TempDir::new().unwrap();
