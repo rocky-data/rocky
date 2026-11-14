@@ -122,6 +122,42 @@ pub(crate) struct BreachLedger<'a> {
     pub(crate) run_id: &'a str,
 }
 
+/// How a run's state store is tied to its remote-state session for the
+/// volume breach markers (#2593), taken from the session once its download
+/// authority and upload suppressions are settled.
+///
+/// ```text
+///   marker write ──▶ store ──(sink)──▶ session ──▶ terminal upload durable;
+///                                                   an opening it cannot upload errs
+///   suppressed upload ──▶ store markers unverified ──▶ every `error`-range
+///                                                       output held until rebuilt
+/// ```
+#[derive(Clone)]
+pub(crate) struct BreachBinding {
+    sink: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    unverified: Option<&'static str>,
+}
+
+impl BreachBinding {
+    /// The binding for `session`. Call it after the session's acquire and
+    /// after every upload suppression is recorded: a suppressed upload means
+    /// this run's local markers may not be the estate's.
+    pub(crate) fn of(session: &rocky_core::state_sync::RemoteStateSession) -> Self {
+        Self {
+            sink: session.breach_sink(),
+            unverified: session.suppress_reason(),
+        }
+    }
+
+    /// Tie `store` to the session.
+    pub(crate) fn bind(&self, store: &rocky_core::state::StateStore) {
+        store.attach_breach_sink(std::sync::Arc::clone(&self.sink));
+        if let Some(reason) = self.unverified {
+            store.set_breach_markers_unverified(reason);
+        }
+    }
+}
+
 /// What the marker ledger says about one model after this run's judgment.
 #[derive(Debug, PartialEq, Eq)]
 enum Standing {
@@ -167,7 +203,48 @@ fn held_message(marker: &VolumeBreachMarker, partitions: &[String]) -> String {
     )
 }
 
+/// Why an output is held although no local marker says so (#2593).
+fn unverified_message(product: &str, model: &str, reason: &str) -> String {
+    format!(
+        "model '{model}' is held failed: product '{product}' declares an `error` volume range, \
+         and this run cannot see breach markers recorded on other machines ({reason}). An \
+         open breach may hold it. Rebuild the whole output in range with `rocky run \
+         --full-refresh`, or rerun once the [state] backend is reachable."
+    )
+}
+
 impl BreachLedger<'_> {
+    /// Why `range`'s output must be treated as held by a breach this run
+    /// cannot see (#2593): the store's markers are not the estate's (the
+    /// remote download failed, or the store was recreated), and the range is
+    /// `error`, the only severity that opens a marker. `None` otherwise.
+    fn unverified(&self, range: &ProductVolume) -> Option<&'static str> {
+        let store = self.store?;
+        if range.volume.severity() != rocky_core::product::spec::VolumeSeverity::Error {
+            return None;
+        }
+        store.breach_markers_unverified()
+    }
+
+    /// Hold an output this run judged clear when its markers are unverified
+    /// and the run did not rebuild the whole output in range (#2593). A load
+    /// in range says nothing about an open breach recorded elsewhere,
+    /// whether it covers the whole output or other partitions.
+    fn hold_if_unverified(
+        &self,
+        range: &ProductVolume,
+        model: &str,
+        standing: Standing,
+        rebuilt_in_range: bool,
+    ) -> Standing {
+        match (standing, self.unverified(range)) {
+            (Standing::Clear, Some(reason)) if !rebuilt_in_range => {
+                Standing::Held(unverified_message(&range.product, model, reason))
+            }
+            (standing, _) => standing,
+        }
+    }
+
     fn read(&self, product: &str, model: &str) -> Result<Option<VolumeBreachMarker>, Standing> {
         let Some(store) = self.store else {
             return Ok(None);
@@ -208,7 +285,7 @@ impl BreachLedger<'_> {
         let Some(store) = self.store else {
             return Standing::Clear;
         };
-        match store.volume_breach_put(marker) {
+        match store.volume_breach_open(marker) {
             Ok(()) => Standing::Clear,
             Err(e) => Standing::StoreFailed(format!(
                 "the breach could not be recorded in the state store ({e}), so the next run \
@@ -223,6 +300,23 @@ impl BreachLedger<'_> {
     /// this load made. `rebuilt_in_range` is true when this build created or
     /// replaced the whole table and the count is in range.
     fn settle_whole(
+        &self,
+        range: &ProductVolume,
+        model: &str,
+        check: &VolumeCheckOutput,
+        breach: Option<&str>,
+        rebuilt_in_range: bool,
+    ) -> Standing {
+        let standing = self.settle_whole_local(range, model, check, breach, rebuilt_in_range);
+        // A breach this run found already fails the model.
+        if breach.is_some() {
+            return standing;
+        }
+        self.hold_if_unverified(range, model, standing, rebuilt_in_range)
+    }
+
+    /// [`Self::settle_whole`] against the local markers alone.
+    fn settle_whole_local(
         &self,
         range: &ProductVolume,
         model: &str,
@@ -261,6 +355,24 @@ impl BreachLedger<'_> {
     /// (with the newest breach's check and sentence), `in_range` each key
     /// this run rewrote and judged in range.
     fn settle_partitions(
+        &self,
+        range: &ProductVolume,
+        model: &str,
+        breaching: &[String],
+        newest: Option<(&VolumeCheckOutput, &str)>,
+        in_range: &[String],
+    ) -> Standing {
+        let standing = self.settle_partitions_local(range, model, breaching, newest, in_range);
+        // A breach this run found already fails the model. Otherwise a
+        // partition rewrite never replaces the whole output.
+        if newest.is_some() {
+            return standing;
+        }
+        self.hold_if_unverified(range, model, standing, false)
+    }
+
+    /// [`Self::settle_partitions`] against the local markers alone.
+    fn settle_partitions_local(
         &self,
         range: &ProductVolume,
         model: &str,
@@ -344,9 +456,9 @@ pub(crate) fn held_by_marker(
     ledger: &BreachLedger<'_>,
     model: &str,
 ) -> bool {
-    volumes
-        .for_model(model)
-        .is_some_and(|range| !matches!(ledger.read(&range.product, model), Ok(None)))
+    volumes.for_model(model).is_some_and(|range| {
+        !matches!(ledger.read(&range.product, model), Ok(None)) || ledger.unverified(range).is_some()
+    })
 }
 
 /// The outputs an open breach holds failed that this run does not build,
@@ -370,7 +482,14 @@ pub(crate) fn held_outputs_not_built(
             continue;
         }
         match ledger.read(&range.product, model) {
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(reason) = ledger.unverified(range) {
+                    held.insert(
+                        model.to_string(),
+                        unverified_message(&range.product, model, reason),
+                    );
+                }
+            }
             Ok(Some(marker)) => {
                 held.insert(model.to_string(), held_message(&marker, &marker.partitions));
             }

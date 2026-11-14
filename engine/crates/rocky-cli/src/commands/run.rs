@@ -4184,6 +4184,12 @@ pub async fn run_with_explicit_contracts(
         {
             model_session.set_suppress_upload("forward-incompat recreate");
         }
+        // Volume breach markers (#2593): a marker write makes the terminal
+        // upload durable, and a suppressed upload holds every `error`-range
+        // output this run cannot see the markers of.
+        if let Some(store) = state_store.as_ref() {
+            super::run_volume::BreachBinding::of(&model_session).bind(store);
+        }
         // `run_id` minted at the top of `run()` — model-only, replication,
         // and idempotency-claim paths all share one identifier.
         let mut output = RunOutput::new(
@@ -4729,6 +4735,10 @@ pub async fn run_with_explicit_contracts(
                     session.set_suppress_upload("forward-incompat recreate");
                 }
             }
+            // Volume breach markers (#2593), once every suppression is recorded.
+            let tx_breach_binding = tx_session
+                .as_ref()
+                .map(super::run_volume::BreachBinding::of);
             let dispatch_result = super::run_local::run_transformation(
                 models_dir_decision,
                 &models_glob,
@@ -4781,6 +4791,7 @@ pub async fn run_with_explicit_contracts(
                 defer_opts.target_dialects.as_ref(),
                 &cancel,
                 Some(config_path),
+                tx_breach_binding.as_ref(),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -5512,6 +5523,8 @@ pub async fn run_with_explicit_contracts(
     }
     let suppress_state_upload =
         state_store.was_recreated_for_forward_incompat() || !authority.is_usable();
+    // Volume breach markers (#2593), once every suppression is recorded.
+    super::run_volume::BreachBinding::of(session).bind(&state_store);
 
     // The decision ledger is authoritative for the auto-apply governor only
     // when it carries the estate's real freeze/budget history: the download
@@ -12585,6 +12598,10 @@ pub(crate) async fn execute_backfill_set(
                 .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
             {
                 session.set_suppress_upload("forward-incompat recreate");
+            }
+            // Volume breach markers (#2593), once every suppression is recorded.
+            if let Some(store) = state_store.as_ref() {
+                super::run_volume::BreachBinding::of(&session).bind(store);
             }
 
             let mut output = RunOutput::new(String::new(), 0, 1);

@@ -115,6 +115,17 @@ pub enum StateSyncError {
     CasUnsupported { backend: String, reason: String },
 
     #[error(
+        "this run opened a volume breach marker, but its state upload was skipped ({reason}), \
+         so the remote [state] backend does not hold it and a run on another machine will not \
+         hold the output. Rerun on this machine once the backend is reachable so the marker is \
+         uploaded"
+    )]
+    /// A run opened (or widened) a volume breach marker and its terminal
+    /// upload was suppressed, so the marker exists only in this machine's
+    /// local file (#2593).
+    BreachMarkerNotReplicated { reason: &'static str },
+
+    #[error(
         "refusing an unconditional state upload: '{marker}' exists, so other writers of this \
          state use compare-and-swap, and an unconditional upload could overwrite their committed \
          state. Fix: set [state] concurrency_control = \"cas\" (or remove the explicit \"off\") \
@@ -797,6 +808,10 @@ pub struct RemoteStateSession {
     /// so the acquire, periodic and finalize legs of one session can never
     /// disagree about the posture.
     replicate_schema_cache: bool,
+    /// The breach-marker writes of the store this session syncs, mirrored by
+    /// [`StateStore::attach_breach_sink`] (#2593). Any write makes the
+    /// terminal upload durable; an opening whose upload is suppressed errs.
+    breach_writes: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Whether Rocky performs compare-and-swap state writes on `backend` at all.
@@ -1928,7 +1943,15 @@ impl RemoteStateSession {
             periodic_shutdown: None,
             base: None,
             replicate_schema_cache,
+            breach_writes: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
+    }
+
+    /// The sink to attach to the run's store with
+    /// [`StateStore::attach_breach_sink`], so the volume breach markers this
+    /// run writes decide how its terminal upload is treated (#2593).
+    pub fn breach_sink(&self) -> Arc<std::sync::atomic::AtomicU8> {
+        Arc::clone(&self.breach_writes)
     }
 
     /// Whether this session performs compare-and-swap state writes — see
@@ -2298,6 +2321,13 @@ impl RemoteStateSession {
         self.suppress_reason.get_or_insert(reason);
     }
 
+    /// The recorded upload suppression, if any: why this run's local state is
+    /// not reconciled with the remote (an indeterminate download, a
+    /// forward-incompat recreate).
+    pub fn suppress_reason(&self) -> Option<&'static str> {
+        self.suppress_reason
+    }
+
     /// One-shot terminal upload. Stops (aborts + joins) the periodic uploader,
     /// then — unless suppressed — uploads via [`upload_state`]:
     ///
@@ -2322,17 +2352,20 @@ impl RemoteStateSession {
         // made the terminal decision and handles the Err; the tripwire exists
         // for *forgotten* sessions.
         self.finalized = true;
+        let breach_bits = self
+            .breach_writes
+            .load(std::sync::atomic::Ordering::SeqCst);
         if let Some(reason) = self.suppress_reason {
             info!(
                 reason,
                 outcome = "suppressed",
                 "skipping end-of-run state upload"
             );
-            return Ok(());
+            return breach_marker_suppressed(&self.cfg, breach_bits, reason);
         }
         terminal_upload(
             &self.cfg,
-            self.durability,
+            breach_durability(self.durability, breach_bits),
             &self.state_path,
             self.base.as_ref(),
             self.replicate_schema_cache,
@@ -2409,8 +2442,37 @@ impl RemoteStateSession {
             periodic_shutdown: self.periodic_shutdown.take(),
             base: self.base.take(),
             replicate_schema_cache: self.replicate_schema_cache,
+            breach_writes: Arc::clone(&self.breach_writes),
         }
     }
+}
+
+/// The terminal upload's durability once the run's breach-marker writes are
+/// known (#2593): a run that opened, widened, narrowed or cleared a marker
+/// uploads durably, since a lost upload loses the marker change with the
+/// machine's local file. A marker the run only read came from the remote.
+fn breach_durability(durability: FinalizeDurability, breach_bits: u8) -> FinalizeDurability {
+    if breach_bits == 0 {
+        durability
+    } else {
+        FinalizeDurability::Durable
+    }
+}
+
+/// What a suppressed terminal upload returns (#2593). A marker this run
+/// opened stays only in the local file, so a remote backend never holds it:
+/// that is an error. A suppressed clear or narrowing is `Ok`: the remote
+/// keeps the wider hold, which is the safe side.
+fn breach_marker_suppressed(
+    cfg: &StateConfig,
+    breach_bits: u8,
+    reason: &'static str,
+) -> Result<(), StateSyncError> {
+    let opened = breach_bits & crate::state::BREACH_OPENED != 0;
+    if opened && !matches!(cfg.backend, StateBackend::Local) {
+        return Err(StateSyncError::BreachMarkerNotReplicated { reason });
+    }
+    Ok(())
 }
 
 /// How long [`DroppedSession::settle`] waits for the dropped run's last
@@ -2580,6 +2642,7 @@ pub struct DroppedSession {
     periodic_shutdown: Option<Arc<tokio::sync::Notify>>,
     base: Option<Generation>,
     replicate_schema_cache: bool,
+    breach_writes: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl DroppedSession {
@@ -2616,14 +2679,25 @@ impl DroppedSession {
             let _ = handle.await;
         }
 
+        let breach_bits = self
+            .breach_writes
+            .load(std::sync::atomic::Ordering::SeqCst);
         if let Some(reason) = self.no_upload_reason() {
             info!(
                 reason,
                 outcome = "skipped",
                 "interrupted run: no terminal state upload owed"
             );
-            return Ok(());
+            // Only a recorded suppression is a skipped upload this run owed;
+            // a session that never downloaded wrote nothing worth keeping.
+            return match self.suppress_reason {
+                Some(suppressed) if self.acquired => {
+                    breach_marker_suppressed(&self.cfg, breach_bits, suppressed)
+                }
+                _ => Ok(()),
+            };
         }
+        self.durability = breach_durability(self.durability, breach_bits);
 
         let _writer = match wait_for_writer_lock(&self.state_path).await {
             Ok(lock) => lock,

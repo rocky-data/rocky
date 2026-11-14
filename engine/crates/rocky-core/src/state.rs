@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use fs4::FileExt;
 use redb::{
@@ -1555,6 +1555,33 @@ pub struct StateStore {
     // [`StateStore::drain_ai_usage_spool`]. Set for every path-backed open,
     // including the empty in-memory stand-in for a missing file.
     ai_usage_spool: Option<std::path::PathBuf>,
+    // What this handle did to the volume breach markers (#2593): bit
+    // [`BREACH_OPENED`] and bit [`BREACH_CHANGED`]. In-memory only. The run
+    // reads it before its terminal upload to decide whether that upload must
+    // succeed.
+    breach_writes: AtomicU8,
+    // The remote-state session's copy of [`Self::breach_writes`], attached by
+    // the run path, so the session knows at its terminal upload — and when a
+    // `--watch` iteration is dropped — whether the upload must succeed.
+    breach_sink: std::sync::OnceLock<std::sync::Arc<AtomicU8>>,
+    // Why this handle's breach markers may not be the estate's (#2593): the
+    // remote download failed, or the store was recreated. Set by the run
+    // path; `None` when the markers are authoritative.
+    breach_markers_unverified: std::sync::OnceLock<&'static str>,
+}
+
+/// [`StateStore::breach_writes`] bit: a marker was opened or widened.
+pub const BREACH_OPENED: u8 = 1;
+/// [`StateStore::breach_writes`] bit: a marker was written or deleted.
+pub const BREACH_CHANGED: u8 = 2;
+
+/// What one store handle did to the volume breach markers (#2593).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BreachMarkerWrites {
+    /// A marker was opened or widened: a breach this run found.
+    pub opened: bool,
+    /// Any marker was written or deleted, a clear or a narrowing included.
+    pub changed: bool,
 }
 
 /// The schema version this binary supports.
@@ -1797,6 +1824,9 @@ impl StateStore {
                     recreated_for_forward_incompat: false,
                     write_epoch: AtomicU64::new(0),
                     ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
+                    breach_writes: AtomicU8::new(0),
+                    breach_sink: std::sync::OnceLock::new(),
+                    breach_markers_unverified: std::sync::OnceLock::new(),
                 })
             }
             Err(error) => Err(error),
@@ -1944,6 +1974,9 @@ impl StateStore {
                 recreated_for_forward_incompat: false,
                 write_epoch: AtomicU64::new(0),
                 ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
+                breach_writes: AtomicU8::new(0),
+                breach_sink: std::sync::OnceLock::new(),
+                breach_markers_unverified: std::sync::OnceLock::new(),
             }),
             InitOutcome::RecreateForwardIncompat { found } => {
                 // Forward-incompatible store under `SchemaMismatchPolicy::Recreate`.
@@ -2054,6 +2087,9 @@ impl StateStore {
                         recreated_for_forward_incompat: true,
                         write_epoch: AtomicU64::new(0),
                         ai_usage_spool: Some(crate::ai_usage::spool_path(path)),
+                        breach_writes: AtomicU8::new(0),
+                        breach_sink: std::sync::OnceLock::new(),
+                        breach_markers_unverified: std::sync::OnceLock::new(),
                     }),
                     // A file we just created cannot carry a newer schema version.
                     InitOutcome::RecreateForwardIncompat { found } => {
@@ -10661,6 +10697,61 @@ impl StateStore {
         Ok(markers)
     }
 
+    /// Write the breach marker for a breach this run found: open it, or widen
+    /// an open one. As [`Self::volume_breach_put`], and recorded as an opening
+    /// in [`Self::breach_writes`], so the run's terminal upload must succeed
+    /// (#2593).
+    pub fn volume_breach_open(
+        &self,
+        marker: &crate::product::breach::VolumeBreachMarker,
+    ) -> Result<(), StateError> {
+        self.volume_breach_put(marker)?;
+        self.record_breach_write(BREACH_OPENED);
+        Ok(())
+    }
+
+    fn record_breach_write(&self, bit: u8) {
+        self.breach_writes.fetch_or(bit, Ordering::SeqCst);
+        if let Some(sink) = self.breach_sink.get() {
+            sink.fetch_or(bit, Ordering::SeqCst);
+        }
+    }
+
+    /// Mirror every later breach-marker write into `sink` (bits
+    /// [`BREACH_OPENED`] and [`BREACH_CHANGED`]). The run path attaches its
+    /// remote-state session's sink here (#2593). Only the first call counts.
+    pub fn attach_breach_sink(&self, sink: std::sync::Arc<AtomicU8>) {
+        let _ = self.breach_sink.set(sink);
+    }
+
+    /// What this handle did to the breach markers since it was opened.
+    pub fn breach_writes(&self) -> BreachMarkerWrites {
+        let bits = self.breach_writes.load(Ordering::SeqCst);
+        BreachMarkerWrites {
+            opened: bits & BREACH_OPENED != 0,
+            changed: bits & BREACH_CHANGED != 0,
+        }
+    }
+
+    /// Record that this handle's breach markers may not be the estate's: the
+    /// remote state download failed, so a marker another machine opened is
+    /// not here (#2593). The first reason wins.
+    pub fn set_breach_markers_unverified(&self, reason: &'static str) {
+        let _ = self.breach_markers_unverified.set(reason);
+    }
+
+    /// Why this handle's breach markers may not be the estate's, or `None`
+    /// when they are: a reason set by
+    /// [`Self::set_breach_markers_unverified`], or a store recreated after a
+    /// forward-incompatible schema, which wiped the markers (#2593).
+    pub fn breach_markers_unverified(&self) -> Option<&'static str> {
+        if let Some(reason) = self.breach_markers_unverified.get() {
+            return Some(reason);
+        }
+        self.recreated_for_forward_incompat
+            .then_some("the local state store was recreated for a newer schema")
+    }
+
     /// Write (open or update) the breach marker for its `(product, model)`.
     pub fn volume_breach_put(
         &self,
@@ -10674,6 +10765,7 @@ impl StateStore {
             table.insert(key.as_str(), bytes.as_slice())?;
         }
         self.commit_write(txn)?;
+        self.record_breach_write(BREACH_CHANGED);
         Ok(())
     }
 
@@ -10686,6 +10778,9 @@ impl StateStore {
             table.remove(key.as_str())?.is_some()
         };
         self.commit_write(txn)?;
+        if removed {
+            self.record_breach_write(BREACH_CHANGED);
+        }
         Ok(removed)
     }
 }
