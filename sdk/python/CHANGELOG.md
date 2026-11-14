@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-11-14
+
+For engine 1.93.0. Every new field is optional, so this release still parses older engines' output.
+
+### Upgrade notes
+
+- **0.32.0 cannot parse `rocky cost --month` from engine 1.93.0 once an AI call is recorded in that month.** Its generated `CostUnit` rejects `ai_input_tokens` and `ai_output_tokens`, and `egress_bytes`, which no adapter reports yet. `RockyClient.cost_by_product()` then raises, and `RockyClient.product_status()` can too, because it carries the same month cost. dagster-rocky wraps both. Upgrade to 0.33.0 before you run engine 1.93.0.
+- **0.32.0 cannot parse `rocky schedule status` from engine 1.93.0 when a source is freeze-held.** Its generated `ScheduleStatusOutput` rejects the throttle kind `freeze_hold`. Upgrade to 0.33.0 if you read schedule status with the generated models. `RockyClient` itself never parses that output.
+- **Numbered generated enums moved.** In `compile_schema`, `Type1`–`Type11` are now `Type3`–`Type13`. In `dag_schema`, `Type13`–`Type23` are now `Type15`–`Type25`. In `rocky_project_schema`, `Type` is now `Type28`, and `Type25`–`Type43` are now `Type29`–`Type47`. Most old names still import but name a different enum: `compile_schema.Type3` was `time_interval` and is now `incremental`. Do not import numbered helpers. Use the named classes (`CompileOutput`, `AdapterConfig` and so on).
+
+### Added
+
+- Freeze holds (engine #2569). A schedule throttle's `kind` accepts `freeze_hold` (new generated `ScheduleThrottleKind3`). New generated `RunHold` (`kind`, `freeze_id`, `scope`, `reason`): `RunResult.hold` and the tick's `ExecutedRunOutput.hold` are set when an active freeze marker withheld work. `TickCounts` gains `held`, and its `failed` and `partial` no longer count runs a freeze held.
+- Open volume breaches (engine #2581). New generated `ProductClearBreachOutput`, for `rocky product clear-breach`, and `ProductVolumeBreachStatus`. `ProductStatusOutput` gains `open_volume_breaches`, and `VolumeCheckOutput` gains `held_by_open_breach`. `RockyClient` has no method for `clear-breach` yet, and `parse_rocky_output()` does not route its output: import the model from `rocky_sdk.types_generated`.
+- Volume ranges judged per load (engine #2584). `VolumeCheckOutput` and the product status `ProductVolumeStatus` gain `basis` (`total_rows`, `rows_added`, `rows_touched` or `partition_rows`). `ProductVolumeStatus` gains `reason`, set when the verdict is `not_evaluated`.
+- AI-token and egress cost (engine #2584). `CostUnit` gains `egress_bytes`, `ai_input_tokens` and `ai_output_tokens`. The month cost's `not_measured` gains `egress_unreported_executions`, `ai_calls_without_usage` and `ai_records_dropped`. `MaterializationOutput`, the hand-written `MaterializationInfo` and `ModelExecution` gain `egress_bytes`; no adapter fills it yet.
+- `AiContractOutput` gains `unresolved_sources`: source tables the engine could not describe from the warehouse (engine #2579).
+- DuckDB `attach` config (engine #2580, #2585). The generated `AdapterConfig` gains `attach`, a list of Iceberg REST catalogs or DuckLake stores, with the new `DuckDbAttachS3` and `DuckDbAttachAuthorization`.
+
+### Changed
+
+- `RockyClient.profile()` and `RockyClient.ai_contract()` no longer say DuckDB only: engine 1.93.0 profiles on any configured warehouse (engine #2583). `sample > 0` is still DuckDB only; on another warehouse the profile comes back with `unavailable` set. `ProfileOutput.profiled_table` now carries the catalog when the target has one.
+- Generated docstrings follow engine 1.93.0, among them the product volume range, which is now judged per load.
+
 ## [0.32.0] — 2026-11-10
 
 For engine 1.92.0. Engine 1.92.0 is the first release that fills the money fields added in 0.31.0.
