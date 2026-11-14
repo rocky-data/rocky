@@ -8764,7 +8764,10 @@ mod tests {
             "Float64",
         );
         assert_eq!(ty, RockyType::Unknown);
-        assert!(!diagnostics.iter().any(|d| &*d.code == "E011"), "{diagnostics:?}");
+        assert!(
+            !diagnostics.iter().any(|d| &*d.code == "E011"),
+            "{diagnostics:?}"
+        );
     }
 
     /// An unresolved column next to resolved ones still gets the `Float64`
@@ -8779,7 +8782,10 @@ mod tests {
             "Boolean",
         );
         assert_eq!(ty, RockyType::Float64);
-        assert!(diagnostics.iter().any(|d| &*d.code == "E011"), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| &*d.code == "E011"),
+            "{diagnostics:?}"
+        );
     }
 
     /// Known gap, pinned (#2588): a column passed through from a missing
@@ -8811,7 +8817,10 @@ mod tests {
             rules: ContractRules::default(),
         };
         let diagnostics = validate_contract("b", columns, &contract);
-        assert!(diagnostics.iter().any(|d| &*d.code == "I003"), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| &*d.code == "I003"),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
