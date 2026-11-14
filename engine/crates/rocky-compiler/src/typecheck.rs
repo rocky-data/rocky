@@ -555,11 +555,21 @@ fn compute_model_typecheck(
             });
             // Whether the source column was found at all. A missing schema
             // and a column of a type Rocky does not model are both `Unknown`;
-            // `AVG` tells them apart (#2588).
-            let resolution = if upstream_col.is_some() {
-                ArgResolution::Resolved
-            } else {
-                ArgResolution::Unresolved
+            // `AVG` tells them apart (#2588). The index lookup is exact, but
+            // the SQL may spell the column in another case (`AVG(SPAN)` over
+            // `span`), which the expression pass resolves: a case-insensitive
+            // match counts as found, so the two passes agree.
+            let resolution = || {
+                let found = upstream_col.is_some()
+                    || typed_models.get(&source_model).is_some_and(|cols| {
+                        cols.iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&edge.source.column))
+                    });
+                if found {
+                    ArgResolution::Resolved
+                } else {
+                    ArgResolution::Unresolved
+                }
             };
             let upstream_type = upstream_col
                 .map(|c| (c.data_type.clone(), c.nullable))
@@ -578,7 +588,7 @@ fn compute_model_typecheck(
                 rocky_sql::lineage::TransformKind::TryCast => (RockyType::Unknown, true),
                 rocky_sql::lineage::TransformKind::Aggregation(func) => {
                     let func_upper = func.to_uppercase();
-                    infer_aggregation_type(&func_upper, &upstream_type.0, resolution, target)
+                    infer_aggregation_type(&func_upper, &upstream_type.0, resolution(), target)
                 }
                 rocky_sql::lineage::TransformKind::Expression => (RockyType::Unknown, true),
             }
@@ -2941,11 +2951,14 @@ fn infer_aggregation_type(
             // never exact ([`has_exact_type`]), so the `Float64` guess does
             // not override a type read from the SQL.
             //
-            // Known gap (#2588): a column passed through from a missing
-            // schema (a model or CTE `SELECT amount FROM src` with no schema
-            // for `src`) is resolved with type `Unknown`, so `AVG` over it one
-            // hop later is `Unknown` and its contract is reported not checked
-            // rather than checked against the guess. It never passes wrongly.
+            // Lineage traces a column through the model's own CTEs to its
+            // source, so a CTE column from a missing schema keeps the guess.
+            // Known gap (#2588): a column another *model* passes through from
+            // a missing schema (`a = SELECT amount FROM src`, no schema for
+            // `src`) is resolved in `a` with type `Unknown`, so `AVG` over it
+            // in a downstream model is `Unknown` and its contract is reported
+            // not checked rather than checked against the guess. It never
+            // passes wrongly.
             let ty = match input_type {
                 RockyType::Int32 | RockyType::Int64 | RockyType::Float32 | RockyType::Float64 => {
                     RockyType::Float64
@@ -4106,7 +4119,6 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
     }
 }
 
-/// Get the type of the first argument to a function.
 /// The first unnamed argument of a function call, if any.
 fn first_arg(func: &ast::Function) -> Option<&Expr> {
     match &func.args {
@@ -4118,6 +4130,7 @@ fn first_arg(func: &ast::Function) -> Option<&Expr> {
     }
 }
 
+/// Get the type of the first argument to a function.
 fn first_arg_type(func: &ast::Function, scope: &TypeScope) -> RockyType {
     match &func.args {
         ast::FunctionArguments::List(arg_list) => {
@@ -8734,6 +8747,8 @@ mod tests {
         for sql in [
             "SELECT AVG(span) AS avg_span FROM source.raw.t",
             "SELECT AVG(t.span) AS avg_span FROM source.raw.t AS t",
+            // The SQL spells the column in another case than the schema.
+            "SELECT AVG(SPAN) AS avg_span FROM source.raw.t",
         ] {
             let cols = [("span", RockyType::Unknown, true)];
             let (ty, diagnostics) = avg_case(sql, &cols, "avg_span", "Float64");
@@ -8786,6 +8801,29 @@ mod tests {
             diagnostics.iter().any(|d| &*d.code == "E011"),
             "{diagnostics:?}"
         );
+    }
+
+    /// A column read through the model's own CTE from a missing schema keeps
+    /// the `Float64` guess: lineage traces it to the unresolved source column,
+    /// so its contract is still checked (#2588).
+    #[test]
+    fn test_avg_through_a_cte_from_a_missing_schema_keeps_float64() {
+        let models = vec![make_model(
+            "m",
+            "WITH c AS (SELECT amount FROM source.raw.orders) \
+             SELECT AVG(amount) AS avg_amount FROM c",
+        )];
+        let project = Project::from_models(models).unwrap();
+        let mut external = HashMap::new();
+        external.insert("source.raw.orders".to_string(), vec![]);
+        let graph = build_semantic_graph(&project, &external).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+        let avg = result.typed_models["m"]
+            .iter()
+            .find(|c| c.name == "avg_amount")
+            .unwrap();
+        assert_eq!(avg.data_type, RockyType::Float64);
     }
 
     /// Known gap, pinned (#2588): a column passed through from a missing
@@ -9968,6 +10006,49 @@ mod tests {
         let (ty, nullable) = infer_expr_type(&expr, &scope);
         assert_eq!(ty, RockyType::Int64);
         assert!(nullable, "SUM should be nullable (empty group)");
+    }
+
+    /// The expression pass gives `AVG` the `Float64` guess only for a column
+    /// that is not in scope at all; a column in scope with a type Rocky does
+    /// not model, in any case spelling or qualified, and any expression of
+    /// unknown type, give `Unknown` (#2588).
+    #[test]
+    fn test_infer_expr_avg_unknown_argument_by_resolution() {
+        let mut scope = TypeScope::new();
+        scope
+            .columns
+            .insert(CiKey::owned("span".to_string()), (RockyType::Unknown, true));
+        scope.columns.insert(
+            CiKey::owned("start_ts".to_string()),
+            (RockyType::Timestamp, true),
+        );
+        scope.columns.insert(
+            CiKey::owned("end_ts".to_string()),
+            (RockyType::Timestamp, true),
+        );
+        let mut t = HashMap::new();
+        t.insert(CiKey::owned("span".to_string()), (RockyType::Unknown, true));
+        scope.qualified.insert(CiKey::owned("t".to_string()), t);
+        for sql in [
+            "AVG(span)",
+            "AVG(SPAN)",
+            "AVG((span))",
+            "AVG(t.span)",
+            "AVG(end_ts - start_ts)",
+        ] {
+            assert_eq!(
+                infer_expr_type(&parse_expr(sql), &scope).0,
+                RockyType::Unknown,
+                "{sql}"
+            );
+        }
+        for sql in ["AVG(missing)", "AVG(t.missing)", "AVG(u.span)"] {
+            assert_eq!(
+                infer_expr_type(&parse_expr(sql), &scope).0,
+                RockyType::Float64,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
