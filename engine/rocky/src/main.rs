@@ -4100,7 +4100,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // `.rocky-state.redb` in CWD with a one-time deprecation warning on
     // stderr, and picks the new default for fresh projects.
     //
-    // `models_dir` here is the top-level convention (`./models`); the
+    // `models_dir` here is `models/` beside the config file — the directory
+    // `rocky mcp` and `rocky lsp` resolve against, so all three read one
+    // store (#2589). A store left at the old default, `./models` under the
+    // working directory, keeps working with a warning to move it. The
     // per-command `--models` override (on `rocky run`, `rocky compile`,
     // etc.) intentionally doesn't feed back in — the state file lives
     // with the project, not with a one-shot `--models` override.
@@ -4118,10 +4121,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // up front; this never fails (#1919).
     rocky_core::config::prime_secret_registry(&cli.config);
     let state_namespace: Option<String> = resolve_state_namespace(&cli)?;
-    let resolved = rocky_core::state::resolve_state_path_ns(
+    let resolved = rocky_core::state::resolve_cli_state_path(
         cli.state_path.as_deref(),
-        std::path::Path::new("models"),
         state_namespace.as_deref(),
+        &cli.config,
+        std::path::Path::new("models"),
     );
     if let Some(ref w) = resolved.warning {
         warn!(target: "rocky::state_path", "{w}");
