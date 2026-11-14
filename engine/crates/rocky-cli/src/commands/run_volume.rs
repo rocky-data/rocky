@@ -143,9 +143,20 @@ impl BreachBinding {
     /// after every upload suppression is recorded: a suppressed upload means
     /// this run's local markers may not be the estate's.
     pub(crate) fn of(session: &rocky_core::state_sync::RemoteStateSession) -> Self {
+        let unverified = session.suppress_reason().map(|reason| match reason {
+            "indeterminate download" => {
+                "the remote state download failed, so markers recorded on other machines \
+                 are not here"
+            }
+            "forward-incompat recreate" => {
+                "the local state store was recreated for a newer schema, which wiped its \
+                 markers"
+            }
+            other => other,
+        });
         Self {
             sink: session.breach_sink(),
-            unverified: session.suppress_reason(),
+            unverified,
         }
     }
 
@@ -207,8 +218,8 @@ fn held_message(marker: &VolumeBreachMarker, partitions: &[String]) -> String {
 fn unverified_message(product: &str, model: &str, reason: &str) -> String {
     format!(
         "model '{model}' is held failed: product '{product}' declares an `error` volume range, \
-         and this run cannot see breach markers recorded on other machines ({reason}). An \
-         open breach may hold it. Rebuild the whole output in range with `rocky run \
+         and this run cannot trust its breach markers: {reason}. An open breach may hold \
+         it. Rebuild the whole output in range with `rocky run \
          --full-refresh`, or rerun once the [state] backend is reachable."
     )
 }
@@ -4022,7 +4033,7 @@ mod tests {
             .await;
             let err = error_text(&output);
             assert!(err.contains("model 'down' was withheld"), "{err}");
-            assert!(err.contains("cannot see breach markers"), "{err}");
+            assert!(err.contains("cannot trust its breach markers"), "{err}");
             assert!(result.is_err() || output["tables_failed"] != 0, "{output}");
             assert!(
                 executions_of(&record, "down")
@@ -4031,6 +4042,69 @@ mod tests {
                 "down is withheld: {:?}",
                 record.models_executed
             );
+        }
+
+        /// A `warning` range opens no marker, so a failed download does not
+        /// hold its output.
+        #[tokio::test]
+        async fn a_failed_download_does_not_hold_a_warning_range_output() {
+            let rig = remote();
+            rig.fail_downloads();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models = incremental_models(&src_rows(3));
+            write_remote_project(tmp.path(), &spec("max_rows = 4"), &borrowed(&models));
+            let (first, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            first.expect("first build");
+            let second = incremental_models(&src_rows(5));
+            write_remote_project(tmp.path(), &spec("max_rows = 4"), &borrowed(&second));
+            let (result, _, output) =
+                run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            result.unwrap_or_else(|e| panic!("a warning range is not held: {e:#} {output}"));
+        }
+
+        /// An interrupted run keeps exit 130 on a failed upload, except when
+        /// it opened a marker: then the failure propagates (#2593).
+        #[tokio::test]
+        async fn an_interrupted_run_that_opened_a_marker_does_not_swallow_a_lost_upload() {
+            use rocky_core::state_sync::{FinalizeDurability, RemoteStateSession};
+            let rig = remote();
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_remote_project(tmp.path(), &spec(ERROR_MAX_4), &one_model());
+            let cfg = rocky_core::config::load_rocky_config(&tmp.path().join("rocky.toml"))
+                .unwrap()
+                .state;
+            let interrupted = anyhow::Error::new(super::super::super::run::Interrupted {
+                custody: super::super::super::run::RecordCustody::Persisted,
+            });
+            for open_marker in [false, true] {
+                let local = tmp.path().join(format!("s{open_marker}.redb"));
+                let mut session =
+                    RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+                let _ = session.acquire().await.unwrap();
+                let store = StateStore::open(&local).unwrap();
+                store.attach_breach_sink(session.breach_sink());
+                if open_marker {
+                    store
+                        .volume_breach_open(&rocky_core::product::breach::VolumeBreachMarker {
+                            product: "vol_product".into(),
+                            model: "vol".into(),
+                            opened_at: chrono::Utc::now(),
+                            run_id: None,
+                            partitions: vec![],
+                            rows: Some(9),
+                            min_rows: None,
+                            max_rows: Some(4),
+                            reason: String::new(),
+                        })
+                        .unwrap();
+                }
+                drop(store);
+                rig.fail_uploads();
+                let result =
+                    super::super::super::run::finalize_after_error(session, &interrupted, "upload")
+                        .await;
+                assert_eq!(result.is_err(), open_marker, "open_marker = {open_marker}");
+            }
         }
 
         /// Gap 2: under a failed download an incremental output in range is
@@ -4062,7 +4136,7 @@ mod tests {
                 "an incremental load of 2 rows, in range, is held"
             );
             let err = error_text(&output);
-            assert!(err.contains("cannot see breach markers"), "{err}");
+            assert!(err.contains("cannot trust its breach markers"), "{err}");
         }
     }
 }

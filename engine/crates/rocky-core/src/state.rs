@@ -10748,8 +10748,9 @@ impl StateStore {
         if let Some(reason) = self.breach_markers_unverified.get() {
             return Some(reason);
         }
-        self.recreated_for_forward_incompat
-            .then_some("the local state store was recreated for a newer schema")
+        self.recreated_for_forward_incompat.then_some(
+            "the local state store was recreated for a newer schema, which wiped its markers",
+        )
     }
 
     /// Write (open or update) the breach marker for its `(product, model)`.

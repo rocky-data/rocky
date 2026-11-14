@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use thiserror::Error;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::circuit_breaker::TransitionOutcome;
 use crate::config::{
@@ -2371,18 +2371,80 @@ impl RemoteStateSession {
         .await
     }
 
-    /// Deliberate no-upload consumption for error/interrupted exits: stops
-    /// (aborts + joins) the periodic uploader and disarms the Drop tripwire
-    /// without touching the remote. Error paths never uploaded — the run's
-    /// terminal state writes did not happen, so there is nothing durable to
-    /// persist.
+    /// Consumption for error/interrupted exits: stops (aborts + joins) the
+    /// periodic uploader and disarms the Drop tripwire. The run's terminal
+    /// state writes did not happen, so it uploads nothing — with one
+    /// exception.
+    ///
+    /// A volume breach marker the run opened, changed or cleared (#2593) is
+    /// a write that did happen, and losing it with the machine's local file
+    /// is the fail-open #2593 closes. Then `abandon` makes a durable,
+    /// best-effort upload of the file as it stands: the same mid-run snapshot
+    /// the periodic uploader ships, without the run record. It waits for the
+    /// last local writer (so callers drop their `StateStore` first), CAS
+    /// commits against the base captured at acquire when CAS is effective,
+    /// and never retries or overwrites on a conflict. A failure is logged at
+    /// `error`; the run is already exiting non-zero. A marker opened while
+    /// the upload is suppressed is logged the same way.
     pub async fn abandon(mut self, reason: &str) {
         self.stop_periodic().await;
         self.finalized = true;
-        debug!(
-            reason,
-            "remote-state session abandoned without a terminal upload"
-        );
+        let breach_bits = self.breach_writes.load(std::sync::atomic::Ordering::SeqCst);
+        if breach_bits == 0 {
+            debug!(
+                reason,
+                "remote-state session abandoned without a terminal upload"
+            );
+            return;
+        }
+        if let Some(suppressed) = self.suppress_reason {
+            if let Err(e) = breach_marker_suppressed(&self.cfg, breach_bits, suppressed) {
+                error!(reason, error = %e, "volume breach marker not replicated");
+            }
+            return;
+        }
+        if !self.acquired
+            || !self.authority.is_usable()
+            || matches!(self.cfg.backend, StateBackend::Local)
+        {
+            return;
+        }
+        let _writer = match wait_for_writer_lock(&self.state_path).await {
+            Ok(lock) => lock,
+            Err(e) => {
+                error!(
+                    reason,
+                    error = %e,
+                    "a volume breach marker change was not uploaded: the state file stayed locked"
+                );
+                return;
+            }
+        };
+        match terminal_upload(
+            &self.cfg,
+            FinalizeDurability::Durable,
+            &self.state_path,
+            self.base.as_ref(),
+            self.replicate_schema_cache,
+        )
+        .await
+        {
+            Ok(()) => info!(
+                reason,
+                "abandoned run uploaded its state for a volume breach marker change"
+            ),
+            Err(e) => error!(
+                reason,
+                error = %e,
+                "a volume breach marker change was not uploaded; the remote does not hold it"
+            ),
+        }
+    }
+
+    /// Whether this run opened or widened a volume breach marker (#2593).
+    pub fn opened_breach_marker(&self) -> bool {
+        self.breach_writes.load(std::sync::atomic::Ordering::SeqCst) & crate::state::BREACH_OPENED
+            != 0
     }
 
     // -----------------------------------------------------------------------
@@ -7666,6 +7728,135 @@ mod tests {
             store.get_run_progress("interrupted-run").unwrap().is_some(),
             "the uploaded ledger carries what the run committed before the drop"
         );
+        test_support::clear();
+    }
+
+    /// A session whose store opened a breach marker: acquired on an empty
+    /// in-memory S3, the store bound to its sink, one marker opened.
+    async fn session_with_an_opened_marker(local: &Path, cfg: &StateConfig) -> RemoteStateSession {
+        let mut session =
+            RemoteStateSession::new(cfg, local, FinalizeDurability::ConfigDefault, false);
+        assert_eq!(session.acquire().await.unwrap(), StateAuthority::FreshStart);
+        let store = StateStore::open(local).unwrap();
+        store.attach_breach_sink(session.breach_sink());
+        store
+            .volume_breach_open(&crate::product::breach::VolumeBreachMarker {
+                product: "p".into(),
+                model: "m".into(),
+                opened_at: chrono::Utc::now(),
+                run_id: Some("r".into()),
+                partitions: vec![],
+                rows: Some(9),
+                min_rows: None,
+                max_rows: Some(4),
+                reason: "too many".into(),
+            })
+            .unwrap();
+        drop(store);
+        assert!(session.opened_breach_marker());
+        session
+    }
+
+    /// #2593: an error exit abandons the session, but a breach marker the
+    /// run opened is uploaded anyway, so the remote holds it.
+    #[tokio::test]
+    async fn abandon_uploads_a_breach_marker_the_run_opened() {
+        test_support::clear();
+        let provider = ObjectStoreProvider::in_memory();
+        let _guard = test_support::install(provider.clone());
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let cfg = s3_session_config(StateUploadFailureMode::Skip);
+        let session = session_with_an_opened_marker(&local, &cfg).await;
+        session.abandon("error exit after the model phase").await;
+
+        let restored = TempDir::new().unwrap();
+        let restored_path = restored.path().join(".rocky-state.redb");
+        assert_eq!(
+            download_state(&cfg, &restored_path, false).await.unwrap(),
+            StateAuthority::Authoritative,
+            "abandon must upload a marker change"
+        );
+        let store = StateStore::open(&restored_path).unwrap();
+        assert!(store.volume_breach_get("p", "m").unwrap().is_some());
+        test_support::clear();
+    }
+
+    /// Without a marker change, abandon still uploads nothing.
+    #[tokio::test]
+    async fn abandon_without_a_marker_change_uploads_nothing() {
+        test_support::clear();
+        let provider = ObjectStoreProvider::in_memory();
+        let _guard = test_support::install(provider.clone());
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let cfg = s3_session_config(StateUploadFailureMode::Skip);
+        let mut session =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let _ = session.acquire().await.unwrap();
+        seed_state_file(&local);
+        session.abandon("error exit").await;
+        let restored = TempDir::new().unwrap();
+        assert_eq!(
+            download_state(&cfg, &restored.path().join("s.redb"), false)
+                .await
+                .unwrap(),
+            StateAuthority::FreshStart,
+            "nothing was uploaded"
+        );
+        test_support::clear();
+    }
+
+    /// #2593: a suppressed finalize after an opened marker errs; a dropped
+    /// `--watch` iteration's settlement does the same.
+    #[tokio::test]
+    async fn a_suppressed_upload_after_an_opened_marker_errs_in_finalize_and_settle() {
+        test_support::clear();
+        let provider = ObjectStoreProvider::in_memory();
+        let _guard = test_support::install(provider.clone());
+        let cfg = s3_session_config(StateUploadFailureMode::Skip);
+
+        let dir = TempDir::new().unwrap();
+        let mut session =
+            session_with_an_opened_marker(&dir.path().join(".rocky-state.redb"), &cfg).await;
+        session.set_suppress_upload("indeterminate download");
+        assert!(matches!(
+            session.finalize().await,
+            Err(StateSyncError::BreachMarkerNotReplicated { .. })
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let mut session =
+            session_with_an_opened_marker(&dir.path().join(".rocky-state.redb"), &cfg).await;
+        session.set_suppress_upload("indeterminate download");
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, session, true).await;
+        assert!(matches!(
+            sink.settle_all().await,
+            Err(StateSyncError::BreachMarkerNotReplicated { .. })
+        ));
+        test_support::clear();
+    }
+
+    /// #2593: a dropped `--watch` iteration that opened a marker settles
+    /// durably, so a lost upload fails settlement even under `skip`.
+    #[tokio::test]
+    async fn settling_a_dropped_session_that_opened_a_marker_is_durable() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let cfg = s3_session_config(StateUploadFailureMode::Skip);
+        let dir = TempDir::new().unwrap();
+        let session =
+            session_with_an_opened_marker(&dir.path().join(".rocky-state.redb"), &cfg).await;
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailAll,
+        );
+        let sink = DroppedSessionSink::new();
+        drop_inside_scope(&sink, session, true).await;
+        sink.settle_all()
+            .await
+            .expect_err("a lost marker upload must not settle as Ok under skip");
         test_support::clear();
     }
 

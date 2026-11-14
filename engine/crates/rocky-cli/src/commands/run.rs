@@ -843,14 +843,20 @@ pub(crate) enum SessionDisposition {
 /// the cancel ended the run, and the local record is still written. The
 /// failure is logged, as the replication path logs its interrupted checkpoint
 /// upload. Every other error propagates the upload failure, as before.
+///
+/// The exception (#2593): an interrupted run that opened a volume breach
+/// marker propagates the failure, so it does not exit 130. An orchestrator
+/// that reads 130 as "retry later" would otherwise never learn that the
+/// hold was lost.
 pub(crate) async fn finalize_after_error(
     session: rocky_core::state_sync::RemoteStateSession,
     error: &anyhow::Error,
     context: &'static str,
 ) -> Result<()> {
+    let opened_marker = session.opened_breach_marker();
     match session.finalize().await {
         Ok(()) => Ok(()),
-        Err(upload) if error.is::<Interrupted>() => {
+        Err(upload) if error.is::<Interrupted>() && !opened_marker => {
             warn!(error = %upload, "interrupted run's state upload failed");
             Ok(())
         }
