@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Needs `rocky-sdk>=0.33.0`, so the floor rises from `0.29.0`. With engine 1.93.0, rocky-sdk 0.32.0 and older reject the new AI-token cost units, so `RockyResource.cost_by_product()` and `product_status()` raise once a month records an AI call.
+
 ## [1.74.0] — 2026-10-23
 
 Pairs with engine 1.89.0. Needs `rocky-sdk>=0.29.0`, so the floor rises from `0.28.0`.

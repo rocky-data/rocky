@@ -62,7 +62,10 @@ dependencies = [
     # Release rocky-sdk 0.27.0 BEFORE dagster-rocky 1.72.0.
     # 0.29.0: RockyClient.cost_by_product and the generated ProductMonthCostOutput.
     # Release rocky-sdk 0.29.0 BEFORE dagster-rocky 1.74.0.
-    "rocky-sdk>=0.29.0",
+    # 0.33.0: engine 1.93.0 emits AI-token cost units that 0.32.0's CostUnit
+    # rejects, so cost_by_product() and product_status() raise on older SDKs.
+    # Release rocky-sdk 0.33.0 BEFORE the next dagster-rocky release.
+    "rocky-sdk>=0.33.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.
