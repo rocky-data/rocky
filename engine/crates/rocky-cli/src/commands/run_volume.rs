@@ -457,7 +457,8 @@ pub(crate) fn held_by_marker(
     model: &str,
 ) -> bool {
     volumes.for_model(model).is_some_and(|range| {
-        !matches!(ledger.read(&range.product, model), Ok(None)) || ledger.unverified(range).is_some()
+        !matches!(ledger.read(&range.product, model), Ok(None))
+            || ledger.unverified(range).is_some()
     })
 }
 
@@ -3829,6 +3830,239 @@ mod tests {
                     .all(|e| e.status != "success"),
                 "downstream is withheld"
             );
+        }
+
+        // ---- #2593: remote durability of the breach marker ----
+
+        /// An in-memory "S3" standing in for the remote `[state]` backend,
+        /// with faults the test arms. Held for the test's whole body: the
+        /// provider override is per thread and the guard serialises users.
+        struct Remote {
+            faults: rocky_core::fault_store::FaultHandle,
+            _install: rocky_core::state_sync::remote_testing::GlobalOverrideGuard,
+            _serial: rocky_core::state_sync::remote_testing::SerialGuard,
+        }
+
+        fn remote() -> Remote {
+            use rocky_core::state_sync::remote_testing::{install_global, serial_guard};
+            let serial = serial_guard();
+            let (store, faults) = rocky_core::fault_store::FaultingStore::wrap(
+                std::sync::Arc::new(object_store::memory::InMemory::new()),
+            );
+            let provider =
+                rocky_core::object_store::ObjectStoreProvider::from_store(store, "s3", "test", "");
+            Remote {
+                faults,
+                _install: install_global(provider),
+                _serial: serial,
+            }
+        }
+
+        impl Remote {
+            /// The remote download fails: the run continues on its local file.
+            fn fail_downloads(&self) {
+                use rocky_core::fault_store::{FaultMode, FaultOp};
+                self.faults.arm(FaultOp::Get, FaultMode::FailAll);
+                self.faults.arm(FaultOp::Head, FaultMode::FailAll);
+            }
+
+            /// The terminal upload fails.
+            fn fail_uploads(&self) {
+                use rocky_core::fault_store::{FaultMode, FaultOp};
+                self.faults.arm(FaultOp::Put, FaultMode::FailAll);
+            }
+        }
+
+        /// Write the project in `dir` on the remote backend, with the default
+        /// `on_upload_failure = "skip"`.
+        fn write_remote_project(
+            dir: &std::path::Path,
+            spec_text: &str,
+            models: &[(&str, &str, &str)],
+        ) {
+            write_project(dir, spec_text, models, "");
+            let config = dir.join("rocky.toml");
+            let raw = std::fs::read_to_string(&config).unwrap().replace(
+                "backend = \"local\"",
+                "backend = \"s3\"\ns3_bucket = \"test\"\n\n[state.retry]\nmax_retries = 0",
+            );
+            std::fs::write(&config, raw).unwrap();
+        }
+
+        /// The machine loses its local state file (an ephemeral pod).
+        fn lose_local_state(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("state.redb"))
+                {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+
+        fn chain(result: &anyhow::Result<()>) -> String {
+            match result {
+                Ok(()) => String::new(),
+                Err(e) => format!("{e:#}"),
+            }
+        }
+
+        /// Gap 1: a run that opens a marker must not exit as if the marker
+        /// were replicated when its terminal upload fails, even under the
+        /// default `on_upload_failure = "skip"`.
+        #[tokio::test]
+        async fn a_run_that_opens_a_marker_uploads_it_durably() {
+            let rig = remote();
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_remote_project(
+                tmp.path(),
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &one_model(),
+            );
+            rig.fail_uploads();
+            let (result, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            let err = chain(&result);
+            assert!(
+                err.contains("could not be persisted to the remote [state] backend"),
+                "the lost marker upload must fail the run: {err}"
+            );
+        }
+
+        /// Gap 1: clearing a marker is a marker change too. A lost clear would
+        /// leave a hold only a full refresh lifts, so it is uploaded durably.
+        #[tokio::test]
+        async fn a_run_that_clears_a_marker_uploads_it_durably() {
+            let rig = remote();
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_remote_project(
+                tmp.path(),
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &one_model(),
+            );
+            let (first, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            assert!(first.is_err(), "the breach fails the first run");
+            assert_eq!(markers(tmp.path()).len(), 1);
+
+            write_remote_project(tmp.path(), &spec(ERROR_MAX_4), &one_model());
+            rig.fail_uploads();
+            let (result, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            assert!(
+                markers(tmp.path()).is_empty(),
+                "the rebuild cleared it locally"
+            );
+            let err = chain(&result);
+            assert!(
+                err.contains("could not be persisted to the remote [state] backend"),
+                "the lost clear must fail the run: {err}"
+            );
+        }
+
+        /// A run that writes no marker keeps the configured liveness default:
+        /// a failed upload under `skip` only warns.
+        #[tokio::test]
+        async fn a_run_that_writes_no_marker_keeps_skip() {
+            let rig = remote();
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_remote_project(tmp.path(), &spec(ERROR_MAX_4), &one_model());
+            rig.fail_uploads();
+            let (result, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            result.expect("an in-range run with no marker change exits 0 under skip");
+        }
+
+        /// Gap 1: when the remote could not be read, the upload is suppressed.
+        /// A marker this run opened then exists only in the local file, and
+        /// the run says so.
+        #[tokio::test]
+        async fn a_marker_opened_under_a_failed_download_is_reported_unreplicated() {
+            let rig = remote();
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_remote_project(
+                tmp.path(),
+                &spec("max_rows = 2\nseverity = \"error\""),
+                &one_model(),
+            );
+            rig.fail_downloads();
+            let (result, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            let err = chain(&result);
+            assert!(
+                err.contains("opened a volume breach marker, but its state upload was skipped"),
+                "{err}"
+            );
+        }
+
+        /// Gap 2: a breach recorded remotely, a fresh machine, and a failed
+        /// download. The run cannot see the marker, so the output is held:
+        /// a run of the downstream model alone is withheld.
+        #[tokio::test]
+        async fn a_failed_download_holds_an_error_range_output_it_cannot_see() {
+            let rig = remote();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path();
+            let first = incremental_models(&src_rows(95));
+            write_remote_project(root, &spec("min_rows = 0"), &borrowed(&first));
+            let (result, _, _) = run_in(root, None, &PartitionRunOptions::default()).await;
+            result.expect("the first run succeeds");
+            let second = incremental_models(&src_rows(100));
+            write_remote_project(root, &spec(ERROR_MAX_4), &borrowed(&second));
+            let (result, _, _) = run_in(root, None, &PartitionRunOptions::default()).await;
+            assert!(result.is_err(), "5 added rows breach max 4");
+
+            lose_local_state(root);
+            rig.fail_downloads();
+            let (result, record, output) = run_in_selecting(
+                root,
+                None,
+                &PartitionRunOptions::default(),
+                &SkipRunOptions::default(),
+                Some("down"),
+            )
+            .await;
+            let err = error_text(&output);
+            assert!(err.contains("model 'down' was withheld"), "{err}");
+            assert!(err.contains("cannot see breach markers"), "{err}");
+            assert!(result.is_err() || output["tables_failed"] != 0, "{output}");
+            assert!(
+                executions_of(&record, "down")
+                    .iter()
+                    .all(|e| e.status != "success"),
+                "down is withheld: {:?}",
+                record.models_executed
+            );
+        }
+
+        /// Gap 2: under a failed download an incremental output in range is
+        /// still held (its load says nothing about a breach elsewhere), and a
+        /// full refresh in range passes: it replaced the whole table.
+        #[tokio::test]
+        async fn a_failed_download_passes_only_a_whole_rebuild_in_range() {
+            let rig = remote();
+            rig.fail_downloads();
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_remote_project(tmp.path(), &spec(ERROR_MAX_4), &one_model());
+            let (result, _, output) =
+                run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            result.expect("a full refresh in range passes under a failed download");
+            assert!(markers(tmp.path()).is_empty(), "{output}");
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models = incremental_models(&src_rows(3));
+            write_remote_project(tmp.path(), &spec(ERROR_MAX_4), &borrowed(&models));
+            let (first, _, _) = run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            first.expect("the first incremental build creates the whole table, in range");
+            let second = incremental_models(&src_rows(5));
+            write_remote_project(tmp.path(), &spec(ERROR_MAX_4), &borrowed(&second));
+            let (result, _, output) =
+                run_in(tmp.path(), None, &PartitionRunOptions::default()).await;
+            assert!(
+                result.is_err(),
+                "an incremental load of 2 rows, in range, is held"
+            );
+            let err = error_text(&output);
+            assert!(err.contains("cannot see breach markers"), "{err}");
         }
     }
 }

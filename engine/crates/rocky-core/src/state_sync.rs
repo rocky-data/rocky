@@ -2352,9 +2352,7 @@ impl RemoteStateSession {
         // made the terminal decision and handles the Err; the tripwire exists
         // for *forgotten* sessions.
         self.finalized = true;
-        let breach_bits = self
-            .breach_writes
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let breach_bits = self.breach_writes.load(std::sync::atomic::Ordering::SeqCst);
         if let Some(reason) = self.suppress_reason {
             info!(
                 reason,
@@ -2679,9 +2677,7 @@ impl DroppedSession {
             let _ = handle.await;
         }
 
-        let breach_bits = self
-            .breach_writes
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let breach_bits = self.breach_writes.load(std::sync::atomic::Ordering::SeqCst);
         if let Some(reason) = self.no_upload_reason() {
             info!(
                 reason,
