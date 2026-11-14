@@ -7,7 +7,7 @@ sidebar:
 
 `rocky serve --ui` serves a browser UI for one project. It shows the project's models and runs, the plans waiting for a human, and the policy decisions and product history the engine recorded. On your own machine, the UI can also make changes (see [Operator mode](#operator-mode)). Every value on the page comes from a typed `/api/v1` payload. Most of those payloads are the same ones the CLI prints with `--output json`.
 
-![A tour of the Rocky browser UI: the estate with its DAG, the review queue, an agent's breaking change awaiting a human, the governor brief, a model's custody chain, and a data product's journal](/demo-ui-tour.gif)
+![A tour of the Rocky browser UI: the estate with its DAG, the review queue, an agent's breaking change awaiting a human, the governor brief, a model's custody chain, and a data product's delivery and cost](/demo-ui-tour.gif)
 
 The UI ships inside the release binaries and the container image. A sidebar lists eleven areas. Five open a screen today:
 
@@ -141,7 +141,7 @@ Apply runs the models as they are on disk, not SQL stored in the plan. So it che
 
 Products shows each [data product](/reference/commands/products/): its fulfillment loop state, its working spec digest, whether its approval is recorded, and its journal. The journal lists every event the engine recorded for the product, in order.
 
-![The products screen for revenue_daily: the loop state is observing, the approval is recorded, and the journal lists 82 events from ownership acquired through elicitation, spec approval, drafting and repair](/ui-governor-product.png)
+![The products screen for revenue_daily: the loop state is observing, the approval is recorded, and the Delivery and cost panel shows no deadline, no declared volumes, no known schedule, and this month's cost with no money figure because [cost] sets no price](/ui-governor-product.png)
 
 In operator mode, a product whose spec has no approval, or whose working spec differs from the approved one, shows an **Approve the spec** section. See [Approve a product spec](#approve-a-product-spec).
 
@@ -167,7 +167,7 @@ The scorecard shows acceptance, review and denial rates for a window you pick. G
 
 Enter a subject to trace its chain of custody. A subject is a model, a run id, a plan id, or another id the ledger records, such as `freeze:global`. It shows the decisions about it, the plan, the runs that applied it, any verification after apply, and its blast radius. It matches `rocky audit --for <subject>`.
 
-![The Custody tab for the model revenue_daily: ten policy decisions, the latest plan, two apply runs, no verification row, and a blast radius of zero downstream models](/ui-governor-custody.png)
+![The Custody tab for the model revenue_daily: a table of twelve policy decisions, agent proposals and breaking-change evaluations and the human approvals that applied them](/ui-governor-custody.png)
 
 ### Audit
 
