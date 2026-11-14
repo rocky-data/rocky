@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rocky -c <dir>/rocky.toml` now finds the default state store under `<dir>/models`, where `rocky mcp` and `rocky lsp` find it (#2589). Before, the CLI looked under `models/` in the working directory whatever `--config` said, so the CLI and the servers could use different stores. With the default `--config rocky.toml` nothing changes. A store already at `./models/.rocky-state.redb` (or under `./models/.rocky-state/`) keeps being used while the new location holds none, and the CLI warns you to move it beside the config. `rocky watch` and `rocky serve` without `--models` now read the project beside the config and the same store. An unreadable entry at the old location now stops the command with an error instead of being skipped.
 - The `rocky cost --month` warning about AI calls in the default store's spool no longer says that `rocky lsp` and MCP always use the default state file. Since 1.93.0 they pick the store as the CLI does. The warning now tells you to start them with the same `--state-path` or `--state-namespace` as the report.
 
 ## [1.93.0] — 2026-11-13

@@ -32,7 +32,7 @@ Each kind of record lives in its own table inside that one file.
 
 ## State file
 
-By default, Rocky stores state in `<models>/.rocky-state.redb`. A legacy `.rocky-state.redb` in the current directory keeps working. Rocky prints a one-time deprecation warning on stderr when it uses that path.
+By default, Rocky stores state in `<models>/.rocky-state.redb`, where `<models>` is the `models/` directory beside the config file. A legacy `.rocky-state.redb` in the current directory keeps working. Rocky prints a one-time deprecation warning on stderr when it uses that path.
 
 Override the location with the `--state-path` flag:
 

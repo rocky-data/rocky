@@ -219,7 +219,7 @@ Schema drift is not a standalone verb — there is no `rocky drift` command. Dri
 detection runs inside `rocky run` / `rocky plan` (surfaced on `RunOutput.drift`);
 see `drift.rs`.
 
-Global flags: `--config` (default: `rocky.toml`), `--output` (`json`|`table`), `--state-path` (default: `models/.rocky-state.redb`; an existing `.rocky-state.redb` in the current directory still works and emits a one-time deprecation warning)
+Global flags: `--config` (default: `rocky.toml`), `--output` (`json`|`table`), `--state-path` (default: `models/.rocky-state.redb` beside the config file; an existing `.rocky-state.redb` in the current directory still works and emits a one-time deprecation warning)
 
 ## Git Conventions
 

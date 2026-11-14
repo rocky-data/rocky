@@ -1215,7 +1215,7 @@ rocky state schedule spool                 # list queued webhook demands
 
 ### State-path resolution
 
-When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::state::resolve_state_path`:
+When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::state::resolve_state_path`. `<models>` is the `models/` directory beside the config file: `models` with the default `--config rocky.toml`, and `sub/models` for `rocky --config sub/rocky.toml`, wherever you run it from. `rocky mcp`, `rocky lsp`, and `rocky serve` and `rocky watch` without `--models` use the same directory, so every command reads one store.
 
 1. `<models>/.rocky-state.redb`: canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
 2. Legacy CWD `.rocky-state.redb`: still works; emits a one-time deprecation warning on stderr.
@@ -1223,6 +1223,8 @@ When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::s
 4. Neither present: fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists; otherwise it falls back to CWD (keeps replication-only pipelines working without inventing a `models/` directory just to hold state).
 
 Explicit `--state-path <PATH>` always wins; no resolver logic is applied.
+
+Up to 1.93, the CLI looked for `<models>` under the working directory whatever `--config` said. If `--config` points elsewhere, the store beside it does not exist yet, and `./models/.rocky-state.redb` (or `./models/.rocky-state/<key>.redb`) does, Rocky keeps using that file and warns you to move it beside the config. Until you move it, `rocky mcp` and `rocky lsp` do not see it.
 
 :::note[A legacy state file in the working directory]
 To silence the deprecation warning, move a `.rocky-state.redb` from the working directory into `models/`. Left where it is, it still works.
