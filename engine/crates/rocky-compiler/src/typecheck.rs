@@ -123,6 +123,21 @@ impl TypeScope {
             .is_some_and(|cols| cols.contains(CiStr::new(col)))
     }
 
+    /// Whether a column reference names no column in scope at all, as when
+    /// its source schema is missing. A column that is in scope with a type
+    /// Rocky does not model (`INTERVAL`, `TIME`) is resolved.
+    fn is_unresolved_column(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(ident) => !self.columns.contains_key(CiStr::new(&ident.value)),
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => !self
+                .qualified
+                .get(CiStr::new(&parts[parts.len() - 2].value))
+                .is_some_and(|cols| cols.contains_key(CiStr::new(&parts[parts.len() - 1].value))),
+            Expr::Nested(inner) => self.is_unresolved_column(inner),
+            _ => false,
+        }
+    }
+
     fn lookup(&self, name: &str) -> (RockyType, bool) {
         self.columns
             .get(CiStr::new(name))
@@ -532,14 +547,21 @@ fn compute_model_typecheck(
 
         let (data_type, nullable) = if let Some(edge) = producing_edge {
             let source_model = relation_key(&edge.source.model);
-            let upstream_type = typed_models
-                .get(&source_model)
-                .and_then(|cols| {
-                    col_index
-                        .get(&source_model)
-                        .and_then(|idx| idx.get(&*edge.source.column))
-                        .map(|&i| &cols[i])
-                })
+            let upstream_col = typed_models.get(&source_model).and_then(|cols| {
+                col_index
+                    .get(&source_model)
+                    .and_then(|idx| idx.get(&*edge.source.column))
+                    .map(|&i| &cols[i])
+            });
+            // Whether the source column was found at all. A missing schema
+            // and a column of a type Rocky does not model are both `Unknown`;
+            // `AVG` tells them apart (#2588).
+            let resolution = if upstream_col.is_some() {
+                ArgResolution::Resolved
+            } else {
+                ArgResolution::Unresolved
+            };
+            let upstream_type = upstream_col
                 .map(|c| (c.data_type.clone(), c.nullable))
                 .unwrap_or((RockyType::Unknown, true));
 
@@ -556,7 +578,7 @@ fn compute_model_typecheck(
                 rocky_sql::lineage::TransformKind::TryCast => (RockyType::Unknown, true),
                 rocky_sql::lineage::TransformKind::Aggregation(func) => {
                     let func_upper = func.to_uppercase();
-                    infer_aggregation_type(&func_upper, &upstream_type.0, target)
+                    infer_aggregation_type(&func_upper, &upstream_type.0, resolution, target)
                 }
                 rocky_sql::lineage::TransformKind::Expression => (RockyType::Unknown, true),
             }
@@ -2845,11 +2867,25 @@ fn sum_of_float_type(target: &OperandTarget) -> RockyType {
     }
 }
 
+/// Whether an aggregate's argument resolved to something, which `AVG` needs
+/// when its type is `Unknown` (#2588).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgResolution {
+    /// A column reference (or a lineage edge) that names no known column:
+    /// its source schema is missing, as with a cold cache or a fresh clone.
+    Unresolved,
+    /// Anything else: a column found with its type, including a type Rocky
+    /// does not model, or any expression.
+    Resolved,
+}
+
 /// Infer the result type of an aggregate function on the warehouses of
-/// `target`.
+/// `target`. `resolution` says whether the argument resolved; only `AVG`
+/// over an `Unknown` argument reads it.
 fn infer_aggregation_type(
     func: &str,
     input_type: &RockyType,
+    resolution: ArgResolution,
     target: &OperandTarget,
 ) -> (RockyType, bool) {
     match func {
@@ -2895,19 +2931,29 @@ fn infer_aggregation_type(
             // has no adapter context: DuckDB returns DOUBLE, Databricks returns
             // DECIMAL(p + 4, s + 4), BigQuery preserves NUMERIC/BIGNUMERIC, so
             // `Decimal` degrades to `Unknown` (#1238). An integer or float
-            // input, and an argument Rocky failed to resolve, keep `Float64`,
-            // so an unresolved argument does not silently drop out of contract
-            // validation. A known non-numeric input is `Unknown`: DuckDB
-            // averages a `DATE` or `TIMESTAMP` to a `TIMESTAMP`, not a
-            // `DOUBLE` (#2578). `AVG` over an unresolved argument is never
-            // exact ([`has_exact_type`]), so this guess does not override a
-            // type read from the SQL.
+            // input keeps `Float64`. So does a column Rocky failed to resolve
+            // at all (its source schema is missing), so it does not silently
+            // drop out of contract validation. A known non-numeric input is
+            // `Unknown`: DuckDB averages a `DATE` or `TIMESTAMP` to a
+            // `TIMESTAMP`, not a `DOUBLE` (#2578). So is a resolved argument
+            // of a type Rocky does not model: DuckDB averages an `INTERVAL`
+            // to an `INTERVAL` (#2588). `AVG` over an unresolved argument is
+            // never exact ([`has_exact_type`]), so the `Float64` guess does
+            // not override a type read from the SQL.
+            //
+            // Known gap (#2588): a column passed through from a missing
+            // schema (a model or CTE `SELECT amount FROM src` with no schema
+            // for `src`) is resolved with type `Unknown`, so `AVG` over it one
+            // hop later is `Unknown` and its contract is reported not checked
+            // rather than checked against the guess. It never passes wrongly.
             let ty = match input_type {
-                RockyType::Int32
-                | RockyType::Int64
-                | RockyType::Float32
-                | RockyType::Float64
-                | RockyType::Unknown => RockyType::Float64,
+                RockyType::Int32 | RockyType::Int64 | RockyType::Float32 | RockyType::Float64 => {
+                    RockyType::Float64
+                }
+                RockyType::Unknown => match resolution {
+                    ArgResolution::Unresolved => RockyType::Float64,
+                    ArgResolution::Resolved => RockyType::Unknown,
+                },
                 RockyType::Decimal { .. }
                 | RockyType::DecimalUnsized { .. }
                 | RockyType::Boolean
@@ -3539,11 +3585,16 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         "COUNT" => (RockyType::Int64, false),
         "SUM" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("SUM", &arg_type, &scope.target)
+            infer_aggregation_type("SUM", &arg_type, ArgResolution::Resolved, &scope.target)
         }
         "AVG" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("AVG", &arg_type, &scope.target)
+            let resolution = if first_arg(func).is_some_and(|arg| scope.is_unresolved_column(arg)) {
+                ArgResolution::Unresolved
+            } else {
+                ArgResolution::Resolved
+            };
+            infer_aggregation_type("AVG", &arg_type, resolution, &scope.target)
         }
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
@@ -4056,6 +4107,17 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
 }
 
 /// Get the type of the first argument to a function.
+/// The first unnamed argument of a function call, if any.
+fn first_arg(func: &ast::Function) -> Option<&Expr> {
+    match &func.args {
+        ast::FunctionArguments::List(arg_list) => match arg_list.args.first() {
+            Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr))) => Some(expr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn first_arg_type(func: &ast::Function, scope: &TypeScope) -> RockyType {
     match &func.args {
         ast::FunctionArguments::List(arg_list) => {
@@ -8616,6 +8678,140 @@ mod tests {
                     && diagnostic.message.contains("avg_amount")),
             "an unresolved AVG argument must not silence the contract check: {diagnostics:?}"
         );
+    }
+
+    /// Typecheck `sql` as model `m` over `source.raw.t` with `cols` and
+    /// return the type of output column `out`, plus the contract diagnostics
+    /// for a contract declaring `out` as `declared`.
+    fn avg_case(
+        sql: &str,
+        cols: &[(&str, RockyType, bool)],
+        out: &str,
+        declared: &str,
+    ) -> (RockyType, Vec<crate::diagnostic::Diagnostic>) {
+        let models = vec![make_model("m", sql)];
+        let project = Project::from_models(models).unwrap();
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.t".to_string(),
+            cols.iter()
+                .map(|(name, _, nullable)| rocky_ir::ColumnInfo {
+                    name: (*name).to_string(),
+                    data_type: "INTERVAL".to_string(),
+                    nullable: *nullable,
+                })
+                .collect(),
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+        let mut sources = HashMap::new();
+        sources.insert("source.raw.t".to_string(), source_schema(cols));
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let columns = &result.typed_models["m"];
+        let ty = columns
+            .iter()
+            .find(|col| col.name == out)
+            .unwrap()
+            .data_type
+            .clone();
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: out.to_string(),
+                type_name: Some(declared.to_string()),
+                nullable: Some(true),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        (ty, validate_contract("m", columns, &contract))
+    }
+
+    /// `AVG` over a source column that exists with a type Rocky does not
+    /// model (`INTERVAL`, `TIME`) is `Unknown`, not `Float64`: DuckDB
+    /// averages an `INTERVAL` to an `INTERVAL`. So a correct contract is not
+    /// failed with E011 and a `Float64` one is not passed (#2588).
+    #[test]
+    fn test_avg_over_a_resolved_unmodelled_column_is_unknown() {
+        for sql in [
+            "SELECT AVG(span) AS avg_span FROM source.raw.t",
+            "SELECT AVG(t.span) AS avg_span FROM source.raw.t AS t",
+        ] {
+            let cols = [("span", RockyType::Unknown, true)];
+            let (ty, diagnostics) = avg_case(sql, &cols, "avg_span", "Float64");
+            assert_eq!(ty, RockyType::Unknown, "{sql}");
+            assert!(
+                diagnostics.iter().any(|d| &*d.code == "I003"),
+                "a Float64 contract must be reported not checked, not passed: {diagnostics:?}"
+            );
+            assert!(
+                !diagnostics.iter().any(|d| &*d.code == "E011"),
+                "{sql}: {diagnostics:?}"
+            );
+        }
+    }
+
+    /// `AVG` over an expression of unknown type is `Unknown` too:
+    /// `AVG(end_ts - start_ts)` averages an `INTERVAL` (#2588).
+    #[test]
+    fn test_avg_over_an_unknown_expression_is_unknown() {
+        let cols = [
+            ("start_ts", RockyType::Timestamp, true),
+            ("end_ts", RockyType::Timestamp, true),
+        ];
+        let (ty, diagnostics) = avg_case(
+            "SELECT AVG(end_ts - start_ts) AS avg_span FROM source.raw.t",
+            &cols,
+            "avg_span",
+            "Float64",
+        );
+        assert_eq!(ty, RockyType::Unknown);
+        assert!(!diagnostics.iter().any(|d| &*d.code == "E011"), "{diagnostics:?}");
+    }
+
+    /// An unresolved column next to resolved ones still gets the `Float64`
+    /// guess, so its contract is checked (the pinned #2578 behavior).
+    #[test]
+    fn test_avg_over_a_column_missing_from_a_known_schema_keeps_float64() {
+        let cols = [("span", RockyType::Unknown, true)];
+        let (ty, diagnostics) = avg_case(
+            "SELECT AVG(amount) AS avg_amount FROM source.raw.t",
+            &cols,
+            "avg_amount",
+            "Boolean",
+        );
+        assert_eq!(ty, RockyType::Float64);
+        assert!(diagnostics.iter().any(|d| &*d.code == "E011"), "{diagnostics:?}");
+    }
+
+    /// Known gap, pinned (#2588): a column passed through from a missing
+    /// schema is resolved with type `Unknown` one hop later, so `AVG` over it
+    /// is `Unknown` and its contract is reported not checked (I003), never
+    /// passed. Closing it needs an "unresolved" bit carried with the type.
+    #[test]
+    fn test_avg_one_hop_from_a_missing_schema_is_unknown_not_a_wrong_pass() {
+        let models = vec![
+            make_model("a", "SELECT amount FROM source.raw.orders"),
+            make_model("b", "SELECT AVG(amount) AS avg_amount FROM a"),
+        ];
+        let project = Project::from_models(models).unwrap();
+        let mut external = HashMap::new();
+        external.insert("source.raw.orders".to_string(), vec![]);
+        let graph = build_semantic_graph(&project, &external).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+        let columns = &result.typed_models["b"];
+        let avg = columns.iter().find(|c| c.name == "avg_amount").unwrap();
+        assert_eq!(avg.data_type, RockyType::Unknown);
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "avg_amount".to_string(),
+                type_name: Some("Boolean".to_string()),
+                nullable: Some(true),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let diagnostics = validate_contract("b", columns, &contract);
+        assert!(diagnostics.iter().any(|d| &*d.code == "I003"), "{diagnostics:?}");
     }
 
     #[test]
