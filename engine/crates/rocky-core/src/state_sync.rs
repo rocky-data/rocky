@@ -5291,7 +5291,9 @@ fn is_transient(err: &StateSyncError) -> bool {
         // marker.
         | StateSyncError::CasUnsupported { .. }
         | StateSyncError::CasRequired { .. }
-        | StateSyncError::PublishRequiresCas { .. } => false,
+        | StateSyncError::PublishRequiresCas { .. }
+        // A suppressed upload is a decision, not a transport fault.
+        | StateSyncError::BreachMarkerNotReplicated { .. } => false,
     }
 }
 
