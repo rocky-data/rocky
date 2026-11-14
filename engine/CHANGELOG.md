@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The `rocky cost --month` warning about AI calls in the default store's spool no longer says that `rocky lsp` and MCP always use the default state file. Since 1.93.0 they pick the store as the CLI does. The warning now tells you to start them with the same `--state-path` or `--state-namespace` as the report.
+
 ## [1.93.0] — 2026-11-13
 
 ### Upgrade notes
