@@ -10419,29 +10419,42 @@ pub fn resolve_cli_state_path(
     cwd_models: &Path,
 ) -> ResolvedStatePath {
     let project_models = project_models_dir(config_path);
-    let resolved = resolve_state_path_ns(explicit, &project_models, namespace);
     if explicit.is_some() || same_dir(&project_models, cwd_models) {
-        return resolved;
+        return resolve_state_path_ns(explicit, &project_models, namespace);
     }
-    let legacy = match namespace.and_then(sanitize_namespace) {
-        Some(ns) => cwd_models
-            .join(STATE_NAMESPACE_DIR)
-            .join(format!("{ns}.redb")),
-        None => cwd_models.join(STATE_FILE_NAME),
+    // Probe before resolving: the namespaced resolution creates
+    // `<project models>/.rocky-state/`, which must not happen when the old
+    // store is the one used.
+    let (new_file, destination, legacy) = match namespace.and_then(sanitize_namespace) {
+        Some(ns) => {
+            let file = format!("{ns}.redb");
+            let new_file = project_models.join(STATE_NAMESPACE_DIR).join(&file);
+            (
+                new_file.clone(),
+                new_file,
+                cwd_models.join(STATE_NAMESPACE_DIR).join(&file),
+            )
+        }
+        None => (
+            resolve_state_path(None, &project_models).path,
+            project_models.join(STATE_FILE_NAME),
+            cwd_models.join(STATE_FILE_NAME),
+        ),
     };
-    if crate::path_presence::entry_is_present(&resolved.path)
+    if crate::path_presence::entry_is_present(&new_file)
         || !crate::path_presence::entry_is_present(&legacy)
     {
-        return resolved;
+        return resolve_state_path_ns(explicit, &project_models, namespace);
     }
     ResolvedStatePath {
         warning: Some(format!(
             "using state file `{}`, found under the working directory's `models/`. \
              The default store now lives beside the config file, at `{}`, which is \
-             where `rocky mcp` and `rocky lsp` read it. Move the file there; until \
-             then the CLI keeps using `{}` and the servers do not see it.",
+             where `rocky mcp` and `rocky lsp` read it. Move the file there (create \
+             the directory if needed); until then the CLI keeps using `{}` and the \
+             servers do not see it.",
             legacy.display(),
-            resolved.path.display(),
+            destination.display(),
             legacy.display(),
         )),
         path: legacy,
@@ -18257,6 +18270,39 @@ mod tests {
             assert_eq!(project_models_dir(Path::new("rocky.toml")), cwd_models);
             let cli = resolve_cli_state_path(None, None, Path::new("rocky.toml"), cwd_models);
             assert_eq!(cli.path, resolve_state_path(None, cwd_models).path);
+        });
+    }
+
+    /// A project without a `models/` directory: the warning names the
+    /// directory beside the config as the destination, not the working
+    /// directory, and the namespaced probe creates nothing there (#2589).
+    #[test]
+    fn cli_fallback_without_a_project_models_dir_names_the_config_dir_and_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&project).unwrap();
+        let config = project.join("rocky.toml");
+        let cwd_models = tmp.path().join("cwd").join("models");
+        let ns_dir = cwd_models.join(STATE_NAMESPACE_DIR);
+        std::fs::create_dir_all(&ns_dir).unwrap();
+        std::fs::File::create(cwd_models.join(STATE_FILE_NAME)).unwrap();
+        std::fs::File::create(ns_dir.join("silver.redb")).unwrap();
+        with_cwd(tmp.path(), || {
+            let resolved = resolve_cli_state_path(None, None, &config, &cwd_models);
+            assert_eq!(resolved.path, cwd_models.join(STATE_FILE_NAME));
+            let warning = resolved.warning.expect("migration warning");
+            let destination = project.join("models").join(STATE_FILE_NAME);
+            assert!(
+                warning.contains(&destination.display().to_string()),
+                "{warning}"
+            );
+
+            let resolved = resolve_cli_state_path(None, Some("silver"), &config, &cwd_models);
+            assert_eq!(resolved.path, ns_dir.join("silver.redb"));
+            assert!(
+                !project.join("models").exists(),
+                "using the old store must not create the project's models dir"
+            );
         });
     }
 

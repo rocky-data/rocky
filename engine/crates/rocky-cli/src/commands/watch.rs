@@ -20,10 +20,16 @@ use super::compile::run_compile;
 /// schema-cache read sees the same namespaced state file that `rocky run`
 /// targets. `None` (the default) keeps the global file, byte-identical to
 /// before.
+///
+/// `state_path` is the store the CLI resolved, passed when `--models` was not
+/// given: the watch then reads the same store as every other command (#2589).
+/// With `--models`, it is `None` and the store is resolved against that
+/// directory, as before.
 pub async fn run_watch(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     state_namespace: Option<&str>,
+    state_path: Option<&Path>,
     output_json: bool,
 ) -> Result<()> {
     // Validate the models directory exists before starting the watcher.
@@ -33,7 +39,13 @@ pub async fn run_watch(
 
     // Initial compile so the user gets immediate feedback.
     println!("[watch] compiling...");
-    print_compile_result(models_dir, contracts_dir, state_namespace, output_json);
+    print_compile_result(
+        models_dir,
+        contracts_dir,
+        state_namespace,
+        state_path,
+        output_json,
+    );
     println!("[watch] waiting for changes...");
 
     // Channel for watcher → debounce task communication.
@@ -88,53 +100,59 @@ pub async fn run_watch(
     // Debounce + recompile loop.
     loop {
         tokio::select! {
-            Some(paths) = rx.recv() => {
-                // Debounce: wait 200 ms, then drain any additional events
-                // that arrived during that window.
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                Some(paths) = rx.recv() => {
+                    // Debounce: wait 200 ms, then drain any additional events
+                    // that arrived during that window.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
 
-                let mut all_paths = paths;
-                while let Ok(more) = rx.try_recv() {
-                    all_paths.extend(more);
-                }
-
-                // Deduplicate for cleaner output.
-                all_paths.sort();
-                all_paths.dedup();
-
-                for p in &all_paths {
-                    println!("[watch] file changed: {p}");
-                }
-
-                println!("[watch] compiling...");
-                print_compile_result(models_dir, contracts_dir, state_namespace, output_json);
-                println!("[watch] waiting for changes...");
-            }
-            _ = &mut ctrl_c_signal => {
-                println!("\n[watch] stopped");
-                return Ok(());
-            }
-            Some(()) = async {
-                #[cfg(unix)]
-                {
-                    match sigterm_stream.as_mut() {
-                        Some(stream) => stream.recv().await,
-                        None => std::future::pending().await,
+                    let mut all_paths = paths;
+                    while let Ok(more) = rx.try_recv() {
+                        all_paths.extend(more);
                     }
+
+                    // Deduplicate for cleaner output.
+                    all_paths.sort();
+                    all_paths.dedup();
+
+                    for p in &all_paths {
+                        println!("[watch] file changed: {p}");
+                    }
+
+                    println!("[watch] compiling...");
+                    print_compile_result(
+            models_dir,
+            contracts_dir,
+            state_namespace,
+            state_path,
+            output_json,
+        );
+                    println!("[watch] waiting for changes...");
                 }
-                #[cfg(windows)]
-                {
-                    windows_stops.recv().await
+                _ = &mut ctrl_c_signal => {
+                    println!("\n[watch] stopped");
+                    return Ok(());
                 }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    std::future::pending().await
+                Some(()) = async {
+                    #[cfg(unix)]
+                    {
+                        match sigterm_stream.as_mut() {
+                            Some(stream) => stream.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    }
+                    #[cfg(windows)]
+                    {
+                        windows_stops.recv().await
+                    }
+                    #[cfg(not(any(unix, windows)))]
+                    {
+                        std::future::pending().await
+                    }
+                } => {
+                    println!("\n[watch] stopped");
+                    return Ok(());
                 }
-            } => {
-                println!("\n[watch] stopped");
-                return Ok(());
             }
-        }
     }
 }
 
@@ -144,6 +162,7 @@ fn print_compile_result(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     state_namespace: Option<&str>,
+    state_path: Option<&Path>,
     output_json: bool,
 ) {
     // Watch doesn't take a `--state-path` arg today; resolve via the
@@ -155,13 +174,20 @@ fn print_compile_result(
     // resolution. Fresh projects with no runs yet still land on the default
     // (`<models>/.rocky-state.redb` or `<models>/.rocky-state/<ns>.redb`) and
     // the cache loader gracefully returns an empty map.
-    let resolved = rocky_core::state::resolve_state_path_ns(None, models_dir, state_namespace);
-    if let Some(ref w) = resolved.warning {
-        warn!(target: "rocky::state_path", "{w}");
-    }
+    let resolved = match state_path {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let resolved =
+                rocky_core::state::resolve_state_path_ns(None, models_dir, state_namespace);
+            if let Some(ref w) = resolved.warning {
+                warn!(target: "rocky::state_path", "{w}");
+            }
+            resolved.path
+        }
+    };
     match run_compile(
         None,
-        &resolved.path,
+        &resolved,
         models_dir,
         contracts_dir,
         None,

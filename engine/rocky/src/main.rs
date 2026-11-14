@@ -2634,9 +2634,9 @@ enum Command {
 
     /// Watch models directory and auto-recompile on file changes
     Watch {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory (default: `models/` beside the config file)
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -5500,24 +5500,27 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // silently read the default store instead. With neither, the
             // override stays `None` and serve derives its default from its
             // own `--models`, not from the global `models` resolution above.
-            let serve_models = models
-                .as_deref()
-                .unwrap_or_else(|| std::path::Path::new("models"));
-            let serve_state_path: Option<PathBuf> = match (&cli.state_path, &state_namespace) {
-                (Some(explicit), _) => Some(explicit.clone()),
-                (None, Some(ns)) => Some(
-                    rocky_core::state::resolve_state_path_ns(None, serve_models, Some(ns)).path,
-                ),
-                (None, None) => None,
-            };
+            //
+            // Without `--models`, serve reads the project beside the config
+            // and the store the CLI resolved above, so it agrees with
+            // `rocky run`, MCP and the LSP (#2589).
+            let serve_models_dir = models_dir_or_default(&cli.config, models.as_deref());
+            let serve_models = serve_models_dir.as_path();
+            let serve_state_path: Option<PathBuf> =
+                match (&cli.state_path, &state_namespace, models.is_some()) {
+                    (Some(explicit), _, _) => Some(explicit.clone()),
+                    (None, _, false) => Some(state_path.clone()),
+                    (None, Some(ns), true) => Some(
+                        rocky_core::state::resolve_state_path_ns(None, serve_models, Some(ns)).path,
+                    ),
+                    (None, None, true) => None,
+                };
             rocky_cli::commands::run_serve(
                 // Everything else the server does with this path — compiling,
                 // watching, deriving the default state path — is unchanged by
                 // whether it was typed or defaulted, so it still receives one
                 // concrete directory. Only the DAG projection needs to know.
-                models
-                    .as_deref()
-                    .unwrap_or_else(|| std::path::Path::new("models")),
+                serve_models,
                 models.is_some(),
                 contracts.as_deref(),
                 config,
@@ -6241,10 +6244,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
         }
         Command::Watch { models, contracts } => {
+            // Without `--models`, watch the project beside the config and read
+            // the store the CLI resolved, so it agrees with `rocky run`, MCP
+            // and the LSP (#2589). `--models` keeps its own derivation.
+            let watch_models = models_dir_or_default(&cli.config, models.as_deref());
             rocky_cli::commands::run_watch(
-                &models,
+                &watch_models,
                 contracts.as_deref(),
                 state_namespace.as_deref(),
+                models.is_none().then_some(state_path.as_path()),
                 json,
             )
             .await
