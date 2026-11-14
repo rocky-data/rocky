@@ -96,8 +96,9 @@ struct Cli {
     /// State store path.
     ///
     /// When unset, Rocky resolves the location via
-    /// [`rocky_core::state::resolve_state_path`]: `<models>/.rocky-state.redb`
-    /// is the canonical default for new projects, but a legacy
+    /// [`rocky_core::state::resolve_cli_state_path`]: `<models>/.rocky-state.redb`,
+    /// with `<models>` the `models/` directory beside the config file, is the
+    /// canonical default for new projects, but a legacy
     /// `.rocky-state.redb` in the current directory keeps working (with
     /// a one-time deprecation warning on stderr) so existing watermarks,
     /// branch state, partitions, and run history aren't silently left
