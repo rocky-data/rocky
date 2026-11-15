@@ -169,6 +169,28 @@ impl SqlDialect for DuckDbSqlDialect {
         format!("INSERT INTO {target} BY NAME\n{select_sql}")
     }
 
+    fn delete_partitions_sql(
+        &self,
+        target: &str,
+        partition_cols: &[std::sync::Arc<str>],
+        source_sql: &str,
+    ) -> String {
+        // Partition replacement groups NULL keys together, including within a composite key.
+        let matches = partition_cols
+            .iter()
+            .map(|column| {
+                let column = self.quote_identifier(column);
+                format!("_rocky_target.{column} IS NOT DISTINCT FROM _rocky_incoming.{column}")
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!(
+            "DELETE FROM {target} AS _rocky_target WHERE EXISTS (\n\
+             SELECT 1 FROM (\n{source_sql}\n) AS _rocky_incoming\n\
+             WHERE {matches}\n)"
+        )
+    }
+
     /// Render a DuckDB-native `MERGE INTO ... USING ... WHEN MATCHED ... WHEN NOT MATCHED`.
     ///
     /// DuckDB 0.10+ supports the standard ANSI MERGE statement, but with two
@@ -1214,6 +1236,58 @@ mod tests {
         let sql = dialect().insert_into("tgt", "SELECT amount, id, note FROM src");
         conn.execute_sql(&sql).expect("insert must execute");
         assert_reordered_rows(&conn);
+    }
+
+    #[test]
+    fn delete_insert_replaces_nullable_partitions() {
+        let dialect = dialect();
+        for (partition_by, expected) in [
+            (&["region"][..], vec![12, 16, 20, 21, 22, 23, 24]),
+            (
+                &["tenant", "region"][..],
+                vec![12, 15, 16, 20, 21, 22, 23, 24],
+            ),
+        ] {
+            let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+            conn.execute_statement(
+                "CREATE TABLE tgt (tenant INT, region INT, amount INT);
+                 INSERT INTO tgt VALUES (NULL, NULL, 10), (NULL, 1, 11), (NULL, 2, 12),
+                       (1, NULL, 13), (1, 1, 14), (2, NULL, 15), (2, 2, 16);
+                 CREATE TABLE incoming (tenant INT, region INT, amount INT);
+                 INSERT INTO incoming VALUES (NULL, NULL, 20), (NULL, NULL, 21),
+                       (NULL, 1, 22), (1, NULL, 23), (1, 1, 24);",
+            )
+            .expect("seed target and incoming partitions");
+            let keys = partition_by
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect::<Vec<_>>();
+            let source = "SELECT tenant, region, amount FROM incoming";
+            let target = "memory.main.tgt";
+            let delete = dialect.delete_partitions_sql(target, &keys, source);
+            let insert = dialect.insert_into(target, source);
+
+            for run in 1..=3 {
+                if run == 3 {
+                    conn.execute_statement("DELETE FROM incoming")
+                        .expect("clear source");
+                }
+                conn.execute_statement(&delete)
+                    .expect("delete incoming partitions");
+                conn.execute_statement(&insert)
+                    .expect("insert incoming rows");
+                let result = conn
+                    .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+                    .unwrap();
+                let amounts = result
+                    .rows
+                    .iter()
+                    .map(|row| cell_i64(&row[0], "amount"))
+                    .collect::<Vec<_>>();
+                assert_eq!(amounts, expected, "keys {partition_by:?}, run {run}");
+            }
+        }
     }
 
     #[test]
