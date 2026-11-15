@@ -449,8 +449,7 @@ impl<'a> SkipGate<'a> {
     fn sig_unchanged(&self, prev: &UpstreamSig, cur: &UpstreamSig) -> bool {
         // Watermark first (the stronger signal).
         if let (Some(prev_ts), Some(cur_ts)) = (prev.max_ts, cur.max_ts) {
-            let delta = (cur_ts - prev_ts).num_seconds().unsigned_abs();
-            return delta <= self.cfg.lag_tolerance_seconds;
+            return watermark_within_tolerance(prev_ts, cur_ts, self.cfg.lag_tolerance_seconds);
         }
         // Rowcount fallback, only when explicitly enabled.
         if self.cfg.rowcount_fallback
@@ -556,6 +555,29 @@ impl<'a> SkipGate<'a> {
             });
         }
         Some(sigs)
+    }
+}
+
+/// Whether two `MAX(ts)` readings are within `tolerance_seconds` of each
+/// other, compared at full precision.
+///
+/// The gap is never rounded: a watermark that moved by 500 ms has moved, so
+/// with the default tolerance of `0` only an identical reading counts as
+/// unchanged. (An earlier version compared `num_seconds()`, which truncates
+/// toward zero and so let any sub-second advance skip the model.)
+fn watermark_within_tolerance(
+    prev: chrono::DateTime<chrono::Utc>,
+    cur: chrono::DateTime<chrono::Utc>,
+    tolerance_seconds: u64,
+) -> bool {
+    let gap = (cur - prev).abs();
+    // A tolerance too large for `TimeDelta` covers every representable gap.
+    match i64::try_from(tolerance_seconds)
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+    {
+        Some(tolerance) => gap <= tolerance,
+        None => true,
     }
 }
 
@@ -705,6 +727,71 @@ mod tests {
         let gate = SkipGate::new(cfg, &project)
             .with_function_callers(std::iter::once("m".to_string()).collect());
         assert!(!gate.is_eligible(&model, &ir));
+    }
+
+    /// B3a finding: a watermark that advanced by less than one second has
+    /// moved. With the default tolerance of `0`, only an identical reading is
+    /// unchanged; a tolerance compares the exact gap, in both directions.
+    #[test]
+    fn a_sub_second_watermark_advance_is_a_change() {
+        use chrono::{TimeDelta, TimeZone, Utc};
+        let prev = Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
+        let half = TimeDelta::milliseconds(500);
+
+        assert!(watermark_within_tolerance(prev, prev, 0));
+        assert!(!watermark_within_tolerance(prev, prev + half, 0));
+        assert!(!watermark_within_tolerance(prev, prev - half, 0));
+        assert!(!watermark_within_tolerance(
+            prev,
+            prev + TimeDelta::microseconds(1),
+            0
+        ));
+
+        assert!(watermark_within_tolerance(prev, prev + half, 1));
+        assert!(watermark_within_tolerance(
+            prev,
+            prev + TimeDelta::seconds(1),
+            1
+        ));
+        assert!(!watermark_within_tolerance(
+            prev,
+            prev + TimeDelta::seconds(1) + TimeDelta::microseconds(1),
+            1
+        ));
+        assert!(watermark_within_tolerance(
+            prev,
+            prev + TimeDelta::days(365 * 100),
+            u64::MAX
+        ));
+    }
+
+    /// The same finding through the gate's own comparison: a stored and a
+    /// current signature 500 ms apart are not unchanged at the default
+    /// tolerance, so the model builds.
+    #[test]
+    fn sig_unchanged_treats_a_sub_second_advance_as_changed() {
+        let project = rocky_compiler::project::Project::from_models(Vec::new()).unwrap();
+        let gate = SkipGate::new(
+            super::super::run::SkipGateConfig {
+                feature_enabled: true,
+                force_rebuild: false,
+                rowcount_fallback: false,
+                lag_tolerance_seconds: 0,
+                shadow_or_branch: false,
+                full_refresh: false,
+            },
+            &project,
+        );
+        let sig = |ts: &str| -> UpstreamSig {
+            serde_json::from_value(serde_json::json!({
+                "upstream_key": "c.raw.orders",
+                "max_ts": ts,
+            }))
+            .unwrap()
+        };
+        let prev = sig("2026-11-15T12:00:00.100Z");
+        assert!(gate.sig_unchanged(&prev, &sig("2026-11-15T12:00:00.100Z")));
+        assert!(!gate.sig_unchanged(&prev, &sig("2026-11-15T12:00:00.600Z")));
     }
 
     #[test]
