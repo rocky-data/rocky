@@ -10,9 +10,12 @@
 //! A one-part name can be a real warehouse table in the default schema that
 //! Rocky has no schema for, so the check fires only when all of these hold:
 //!
-//! - the read is one-part (`FROM name`), not a `WITH` name;
-//! - it is not a model's name, a model's target table, or the last part of
-//!   a known source schema key;
+//! - the read is a plain one-part table (`FROM name`): not quoted, not a
+//!   table function (`FROM range(10)`), not a `WITH` name;
+//! - it is not a model's name, a model's target table, the last part of a
+//!   known source schema key, or a name the caller knows from outside the
+//!   compiled set (`other_names`: the rest of the project's models when only
+//!   part of it is compiled, and resolved external dependencies such as seeds);
 //! - it is close to a model name: an optimal-string-alignment distance of at
 //!   most 2, or 1 when the name has fewer than 5 characters. Names compare
 //!   ignoring ASCII case.
@@ -24,8 +27,11 @@
 //! whole project on every compile, full and incremental alike.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::ControlFlow;
 
 use rocky_core::models::Model;
+use sqlparser::ast::{TableFactor, Visit, Visitor};
+use sqlparser::parser::Parser;
 
 use crate::diagnostic::{Diagnostic, E064};
 use crate::types::TypedColumn;
@@ -34,6 +40,7 @@ use crate::types::TypedColumn;
 pub fn check_unknown_relations(
     models: &[Model],
     source_schemas: &HashMap<String, Vec<TypedColumn>>,
+    other_names: &BTreeSet<String>,
 ) -> Vec<Diagnostic> {
     let model_names: Vec<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
     let mut known: BTreeSet<String> = model_names.iter().map(|n| n.to_ascii_lowercase()).collect();
@@ -42,25 +49,29 @@ pub fn check_unknown_relations(
             .iter()
             .map(|m| m.config.target.table.to_ascii_lowercase()),
     );
-    known.extend(source_schemas.keys().filter_map(|key| {
-        key.rsplit('.')
-            .next()
-            .map(|table| table.trim_matches(['"', '`']).to_ascii_lowercase())
-    }));
+    known.extend(
+        source_schemas
+            .keys()
+            .chain(other_names.iter())
+            .filter_map(|key| last_part(key)),
+    );
 
     let mut diagnostics = Vec::new();
     for model in models {
         let Ok(lineage) = rocky_sql::lineage::extract_lineage(&model.sql) else {
             continue;
         };
+        // Lineage removes `WITH` names; the parse keeps only plain base-table
+        // reads. A read must be both.
+        let plain = plain_table_reads(&model.sql);
         let reads: BTreeSet<String> = lineage
             .source_tables
             .iter()
             .filter(|t| t.binding == rocky_sql::lineage::TableBinding::Physical)
             .map(|t| t.name.clone())
             .chain(lineage.nested_sources.iter().cloned())
-            .filter(|name| !name.contains('.') && name != "(subquery)")
             .map(|name| name.to_ascii_lowercase())
+            .filter(|name| plain.contains(name))
             .collect();
         for read in reads {
             if known.contains(&read) {
@@ -92,6 +103,45 @@ pub fn check_unknown_relations(
         }
     }
     diagnostics
+}
+
+/// The last part of a dotted name, unquoted and lower-cased.
+fn last_part(name: &str) -> Option<String> {
+    name.rsplit('.').next().map(|table| {
+        table
+            .trim_matches(['"', '`', '[', ']'])
+            .to_ascii_lowercase()
+    })
+}
+
+/// Lower-cased one-part table names the SQL reads with no quotes and no
+/// arguments: `FROM orders`, not `FROM "orders"`, `FROM range(10)` or
+/// `FROM 'data'`. Unparsable SQL reads none.
+fn plain_table_reads(sql: &str) -> BTreeSet<String> {
+    struct Reads(BTreeSet<String>);
+    impl Visitor for Reads {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table {
+                name, args: None, ..
+            } = factor
+                && let [part] = name.0.as_slice()
+                && let Some(ident) = part.as_ident()
+                && ident.quote_style.is_none()
+            {
+                self.0.insert(ident.value.to_ascii_lowercase());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
+        return BTreeSet::new();
+    };
+    let mut reads = Reads(BTreeSet::new());
+    for statement in &statements {
+        let _ = statement.visit(&mut reads);
+    }
+    reads.0
 }
 
 /// The model names closest to `read` within the distance limit, every one
@@ -167,7 +217,7 @@ mod tests {
             .iter()
             .map(|s| (s.to_string(), Vec::new()))
             .collect();
-        check_unknown_relations(&models, &schemas)
+        check_unknown_relations(&models, &schemas, &BTreeSet::new())
     }
 
     /// #2620: the issue's repro, and the same read nested in a sub-query.
@@ -209,7 +259,33 @@ mod tests {
             renamed,
             model("m", "SELECT id FROM stg_ordrs"),
         ];
-        assert!(check_unknown_relations(&models, &HashMap::new()).is_empty());
+        assert!(check_unknown_relations(&models, &HashMap::new(), &BTreeSet::new()).is_empty());
+    }
+
+    /// #2620 red team: a quoted read, a table function, and a name the
+    /// caller knows from outside the compiled set never fire.
+    #[test]
+    fn quoted_function_and_outside_names_are_not_e064() {
+        for sql in [
+            "SELECT * FROM \"stg_ordrs\"",
+            "SELECT * FROM `stg_ordrs`",
+            "SELECT * FROM \"stg_orders\"",
+            "SELECT * FROM stg_ordrs(10)",
+            "SELECT * FROM orf(10)",
+        ] {
+            assert!(e064(sql, &[]).is_empty(), "{sql}");
+        }
+        let models = vec![
+            model("stg_orders", "SELECT 1 AS id"),
+            model("m", "SELECT id FROM stg_ordrs"),
+        ];
+        for outside in ["stg_ordrs", "seeds.stg_ordrs"] {
+            let names = BTreeSet::from([outside.to_string()]);
+            assert!(
+                check_unknown_relations(&models, &HashMap::new(), &names).is_empty(),
+                "{outside}"
+            );
+        }
     }
 
     /// A name under 5 characters allows one edit, not two. Ties list every
@@ -223,7 +299,7 @@ mod tests {
             model("stg_orderb", "SELECT 1 AS id"),
             model("m", "SELECT id FROM stg_orderc"),
         ];
-        let diags = check_unknown_relations(&models, &HashMap::new());
+        let diags = check_unknown_relations(&models, &HashMap::new(), &BTreeSet::new());
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(
             diags[0].message.contains("`stg_ordera` or `stg_orderb`"),

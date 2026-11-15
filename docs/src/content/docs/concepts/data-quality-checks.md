@@ -79,7 +79,7 @@ Each `[[columns]]` entry takes `name` (required), `type`, `nullable`, and `descr
 | `required` | These columns must exist in the output. A missing one is `E010`. |
 | `protected` | These columns must never be removed. A removed one is `E013`. |
 | `no_new_nullable` | Off by default. When on, a nullable output column that `[[columns]]` does not declare is `E014`. A contract that sets it and declares no `[[columns]]` is also `E014`, because there is no baseline. |
-| `no_extra_columns` | Off by default. When on, an output column that `[[columns]]` does not declare is `E063`. If Rocky cannot prove the model's column list (a `SELECT *`, or an expression with no alias), that is `E063` too, because it cannot show there is no extra column. |
+| `no_extra_columns` | Off by default. When on, an output column that the contract does not name in `[[columns]]`, `required` or `protected` is `E063`. If Rocky cannot prove the model's column list (a `SELECT *`, or an expression with no alias), that is `E063` too, because it cannot show there is no extra column. |
 
 | Code | Severity | Meaning |
 |---|---|---|

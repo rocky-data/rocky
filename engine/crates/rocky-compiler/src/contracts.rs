@@ -497,7 +497,7 @@ pub fn validate_contract_with(
 ///   (`[[columns]]`, `required`, `protected`). `repeated` holds the provable
 ///   repeated names, from [`crate::duplicate_output::repeated_names_for`].
 /// - `E063`, with `[rules] no_extra_columns`: an output column the contract
-///   does not declare, or, when `schema_complete` is false, the fact that
+///   does not name in `[[columns]]`, `required` or `protected`, or, when `schema_complete` is false, the fact that
 ///   Rocky cannot prove the column list at all.
 ///
 /// Names compare ignoring ASCII case: a contract that spells `Orders` for an
@@ -557,12 +557,9 @@ pub fn validate_contract_shape(
                 ),
             );
         } else {
+            // A column the contract requires or protects is declared too.
             for col in inferred_schema {
-                let declared = contract
-                    .columns
-                    .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(&col.name));
-                if !declared {
+                if !constrained(&col.name) {
                     diagnostics.push(
                         Diagnostic::error(
                             E063,
@@ -795,6 +792,9 @@ mod tests {
         assert!(diags[0].message.contains("cannot prove"), "{diags:?}");
         let declared = shape_contract(&["Customer_Id", "n"], &[], true);
         assert!(validate_contract_shape("m", &schema, &declared, &[], true).is_empty());
+        // A required column counts as declared (#2613 red team).
+        let required = shape_contract(&["customer_id"], &["n"], true);
+        assert!(validate_contract_shape("m", &schema, &required, &[], true).is_empty());
         let off = shape_contract(&["customer_id"], &[], false);
         assert!(validate_contract_shape("m", &schema, &off, &[], false).is_empty());
     }

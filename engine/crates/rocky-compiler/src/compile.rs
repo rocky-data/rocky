@@ -597,6 +597,7 @@ pub fn compile_project(
     diagnostics.extend(crate::unknown_relations::check_unknown_relations(
         &project.models,
         &config.source_schemas,
+        &names_outside_the_compile(config),
     ));
     // Downstream consumers: every `depends_on` entry must name a model (E060).
     let (consumers, consumer_diagnostics) =
@@ -965,6 +966,7 @@ pub fn compile_incremental(
     diagnostics.extend(crate::unknown_relations::check_unknown_relations(
         &project.models,
         &config.source_schemas,
+        &names_outside_the_compile(config),
     ));
     // Same check as the full path; it reads only the consumer files and the
     // model names, so recomputing it keeps incremental equal to from-scratch.
@@ -1205,6 +1207,17 @@ fn unknown_type_reason(
              warehouse (for example AVG over a DECIMAL), so Rocky does not state one"
         ),
     }
+}
+
+/// Relation names the compile knows from outside its own models: the rest
+/// of the project's models when only part of it is compiled, and resolved
+/// external dependencies such as seeds. `E064` never fires on these.
+fn names_outside_the_compile(config: &CompilerConfig) -> std::collections::BTreeSet<String> {
+    let mut names = config.external_dependencies.clone();
+    if let Some(project) = &config.project {
+        names.extend(project.model_names.iter().cloned());
+    }
+    names
 }
 
 /// What contract validation reads besides the typed schemas.
