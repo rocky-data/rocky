@@ -16,6 +16,8 @@ use rocky_core::traits::{
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
+const DELETE_INSERT_KEYS: &str = "temp.main.__rocky_delete_insert_keys";
+
 /// The column reference [`SqlDialect::watermark_where`] and
 /// [`SqlDialect::watermark_hold_back`] share, so both bounds read the same
 /// column the same way.
@@ -169,18 +171,29 @@ impl SqlDialect for DuckDbSqlDialect {
         format!("INSERT INTO {target} BY NAME\n{select_sql}")
     }
 
-    fn delete_partitions_sql(
+    fn delete_insert_sql(
         &self,
         target: &str,
         partition_cols: &[std::sync::Arc<str>],
         source_sql: &str,
-    ) -> String {
+    ) -> Vec<String> {
         let columns: Vec<_> = partition_cols
             .iter()
             .map(|column| self.quote_identifier(column))
             .collect();
-        // Deduplicate incoming keys before joining. A correlated subquery can
-        // group all target keys, even when only a few partitions are replaced.
+        // Stage distinct keys once so both deletes read the same partition set.
+        // Ordinary equality lets DuckDB prune target blocks and DuckLake files.
+        // The null-safe join only handles incoming keys that need it.
+        let nullable_key = columns
+            .iter()
+            .map(|column| format!("{column} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let nullable_target_key = columns
+            .iter()
+            .map(|column| format!("_rocky_target.{column} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
         let matches = columns
             .iter()
             .map(|column| {
@@ -189,11 +202,23 @@ impl SqlDialect for DuckDbSqlDialect {
             .collect::<Vec<_>>()
             .join(" AND ");
         let columns = columns.join(", ");
-        format!(
-            "DELETE FROM {target} AS _rocky_target\n\
-             USING (SELECT DISTINCT {columns} FROM (\n{source_sql}\n) AS _rocky_source) AS _rocky_incoming\n\
-             WHERE {matches}"
-        )
+        vec![
+            format!(
+                "CREATE TEMP TABLE {DELETE_INSERT_KEYS} AS\n\
+                 SELECT DISTINCT {columns} FROM (\n{source_sql}\n) AS _rocky_source"
+            ),
+            format!(
+                "DELETE FROM {target} WHERE ({columns}) IN (\n\
+                 SELECT {columns} FROM {DELETE_INSERT_KEYS} WHERE NOT ({nullable_key})\n)"
+            ),
+            format!(
+                "DELETE FROM {target} AS _rocky_target\n\
+                 USING (SELECT {columns} FROM {DELETE_INSERT_KEYS} WHERE {nullable_key}) AS _rocky_incoming\n\
+                 WHERE ({nullable_target_key}) AND {matches}"
+            ),
+            self.insert_into(target, source_sql),
+            format!("DROP TABLE {DELETE_INSERT_KEYS}"),
+        ]
     }
 
     /// Render a DuckDB-native `MERGE INTO ... USING ... WHEN MATCHED ... WHEN NOT MATCHED`.
@@ -1270,18 +1295,17 @@ mod tests {
                 .collect::<Vec<_>>();
             let source = "SELECT tenant, region, amount FROM incoming";
             let target = "memory.main.tgt";
-            let delete = dialect.delete_partitions_sql(target, &keys, source);
-            let insert = dialect.insert_into(target, source);
+            let statements = dialect.delete_insert_sql(target, &keys, source);
 
             for run in 1..=3 {
                 if run == 3 {
                     conn.execute_statement("DELETE FROM incoming")
                         .expect("clear source");
                 }
-                conn.execute_statement(&delete)
-                    .expect("delete incoming partitions");
-                conn.execute_statement(&insert)
-                    .expect("insert incoming rows");
+                for sql in &statements {
+                    conn.execute_statement(sql)
+                        .expect("replace incoming partitions");
+                }
                 let result = conn
                     .execute_sql("SELECT amount FROM tgt ORDER BY amount")
                     .unwrap();

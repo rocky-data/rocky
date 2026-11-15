@@ -584,8 +584,8 @@ pub trait WarehouseAdapter: Send + Sync {
             .map(|stats| (stats, None))
     }
 
-    /// Execute a `delete_insert` model's statements, reporting each statement
-    /// in order. The default preserves the dialect's statement boundaries.
+    /// Execute the statements from [`SqlDialect::delete_insert_sql`], reporting
+    /// each in order. The default preserves the dialect's statement boundaries.
     /// Adapters can override this to group the writes in one transaction.
     async fn execute_delete_insert(
         &self,
@@ -1746,6 +1746,20 @@ pub trait SqlDialect: Send + Sync {
     /// them, so a failed INSERT leaves the deleted rows in place.
     fn delete_insert_statements(&self, delete_sql: String, insert_sql: String) -> Vec<String> {
         vec![delete_sql, insert_sql]
+    }
+
+    /// Render a complete replacement for a `delete_insert` model.
+    /// The caller has validated the partition column identifiers.
+    fn delete_insert_sql(
+        &self,
+        target: &str,
+        partition_cols: &[std::sync::Arc<str>],
+        source_sql: &str,
+    ) -> Vec<String> {
+        self.delete_insert_statements(
+            self.delete_partitions_sql(target, partition_cols, source_sql),
+            self.insert_into(target, source_sql),
+        )
     }
 
     /// `Some(reason)` when this dialect cannot run the generic SCD2 snapshot

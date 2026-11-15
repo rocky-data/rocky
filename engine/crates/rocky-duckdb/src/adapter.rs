@@ -470,10 +470,14 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             let reports = statements
                 .iter()
                 .map(|sql| {
-                    let (rows_affected, reads) = if measure_reads {
+                    // Only the key staging query and the INSERT read the
+                    // model's inputs. The deletes read the target and staged keys.
+                    let reads_upstream =
+                        sql.starts_with("CREATE TEMP TABLE ") || sql.starts_with("INSERT INTO ");
+                    let (rows_affected, reads) = if measure_reads && reads_upstream {
                         conn.execute_statement_measured(sql)?
                     } else {
-                        (conn.execute_statement_counting_rows(sql)?, None)
+                        (conn.execute_statement_counting_rows(sql)?, measure_reads.then(UpstreamReads::default))
                     };
                     Ok((
                         ExecutionStats {
@@ -1241,10 +1245,7 @@ mod tests {
         let dialect = adapter.dialect();
         let target = "memory.main.tgt";
         let source = "SELECT region, amount FROM incoming";
-        let statements = [
-            dialect.delete_partitions_sql(target, &["region".into()], source),
-            dialect.insert_into(target, source),
-        ];
+        let statements = dialect.delete_insert_sql(target, &["region".into()], source);
         let target_rows = "SELECT region, amount FROM tgt ORDER BY region NULLS FIRST";
         let before = adapter.execute_query(target_rows).await.unwrap().rows;
 
@@ -1266,9 +1267,11 @@ mod tests {
             .execute_delete_insert(&statements, false)
             .await
             .unwrap();
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].0.rows_affected, Some(2));
-        assert_eq!(reports[1].0.rows_affected, Some(2));
+        let counted_rows: Vec<_> = reports
+            .iter()
+            .filter_map(|report| report.0.rows_affected)
+            .collect();
+        assert_eq!(counted_rows, vec![1, 1, 2]);
         let after = adapter.execute_query(target_rows).await.unwrap();
         assert_eq!(
             after.rows,
