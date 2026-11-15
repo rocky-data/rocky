@@ -4196,7 +4196,7 @@
       "properties": {
         "lag_tolerance_seconds": {
           "default": 0,
-          "description": "Treat an upstream `MAX(ts)` that moved by at most this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild.",
+          "description": "Treat an upstream `MAX(ts)` that moved by at most this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild. A `MAX(ts)` that went backwards forces a rebuild whatever this value is.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"

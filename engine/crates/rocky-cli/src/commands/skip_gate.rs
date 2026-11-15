@@ -440,7 +440,8 @@ impl<'a> SkipGate<'a> {
     /// Compare a stored vs current upstream signature for stability.
     ///
     /// Stable iff the applicable signal proves no movement:
-    /// - `MAX(ts)`: both present and within `lag_tolerance_seconds`;
+    /// - `MAX(ts)`: both present, not lower than the prior reading, and
+    ///   within `lag_tolerance_seconds`;
     /// - else `COUNT(*)` (only when `skip_rowcount_fallback` and both present
     ///   and equal).
     ///
@@ -558,27 +559,32 @@ impl<'a> SkipGate<'a> {
     }
 }
 
-/// Whether two `MAX(ts)` readings are within `tolerance_seconds` of each
-/// other, compared at full precision.
+/// Decide whether a `MAX(ts)` reading counts as unchanged since the prior one.
 ///
-/// The gap is never rounded: a watermark that moved by 500 ms has moved, so
-/// with the default tolerance of `0` only an identical reading counts as
-/// unchanged. (An earlier version compared `num_seconds()`, which truncates
-/// toward zero and so let any sub-second advance skip the model.)
+/// The gap is compared at full precision, never rounded: a watermark that
+/// moved by 500 ms has moved, so with the default tolerance of `0` only an
+/// identical reading counts as unchanged. (An earlier version compared
+/// `num_seconds()`, which truncates toward zero and so let any sub-second
+/// advance skip the model.)
+///
+/// A watermark that went backwards is always a change, whatever the
+/// tolerance. A lower `MAX(ts)` means rows were deleted or the table was
+/// reloaded, never a late-arriving micro-update. The tolerance covers only
+/// a forward move.
 fn watermark_within_tolerance(
     prev: chrono::DateTime<chrono::Utc>,
     cur: chrono::DateTime<chrono::Utc>,
     tolerance_seconds: u64,
 ) -> bool {
-    let gap = (cur - prev).abs();
+    if cur < prev {
+        return false;
+    }
+    let gap = cur - prev;
     // A tolerance too large for `TimeDelta` covers every representable gap.
-    match i64::try_from(tolerance_seconds)
+    i64::try_from(tolerance_seconds)
         .ok()
         .and_then(chrono::TimeDelta::try_seconds)
-    {
-        Some(tolerance) => gap <= tolerance,
-        None => true,
-    }
+        .is_none_or(|tolerance| gap <= tolerance)
 }
 
 /// The timestamp column a strategy tracks, if any. Used to issue the B3
@@ -748,6 +754,18 @@ mod tests {
         ));
 
         assert!(watermark_within_tolerance(prev, prev + half, 1));
+        // Backwards is a change at any tolerance: rows left the table.
+        assert!(!watermark_within_tolerance(prev, prev - half, 60));
+        assert!(!watermark_within_tolerance(
+            prev,
+            prev - TimeDelta::seconds(30),
+            60
+        ));
+        assert!(watermark_within_tolerance(
+            prev,
+            prev + TimeDelta::seconds(30),
+            60
+        ));
         assert!(watermark_within_tolerance(
             prev,
             prev + TimeDelta::seconds(1),
@@ -762,6 +780,12 @@ mod tests {
             prev,
             prev + TimeDelta::days(365 * 100),
             u64::MAX
+        ));
+        // Fits an `i64` but not a `TimeDelta` in seconds: the second overflow path.
+        assert!(watermark_within_tolerance(
+            prev,
+            prev + TimeDelta::days(365 * 100),
+            i64::MAX as u64
         ));
     }
 
