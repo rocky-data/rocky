@@ -115,7 +115,7 @@ The byte hash of a file is sound for tables Rocky writes content-addressed. That
 
 The shipped gate compared `(cur_ts - prev_ts).num_seconds()`. chrono's `num_seconds` truncates toward zero, so **any watermark advance under one second counted as unchanged**, even with `lag_tolerance_seconds = 0`. Mutation M1b shows it at SF1 through the harness's reproduction of the old comparison: it skipped Q1 after a sync wrote new rows 500 ms past the previous max. The bug is reachable in the engine: `parse_timestamp_cell` keeps fractional seconds and `UpstreamSig.max_ts` stores them. Two new unit tests cover the helper and `sig_unchanged` itself.
 
-The fix compares the exact gap (`watermark_within_tolerance`). It only turns a wrong skip into a build. No default changes.
+The fix compares the exact gap (`watermark_within_tolerance`). It also treats a watermark that went backwards as a change at any tolerance. Before, with `lag_tolerance_seconds` above `0`, a delete that lowered `MAX(ts)` by less than the tolerance read as unchanged. Both changes only turn a wrong skip into a build. No default changes.
 
 ## Where Rocky stands
 
@@ -160,6 +160,18 @@ A fresh read-only agent on Fable 5.2 reviewed the report, harness, data and engi
 | 10 | Harness install line names `blake3`, which is unused | Fixed |
 | 11 | "Rocky reads it" reads as shipped behaviour | Fixed: "a gate built on it (proposed, B3b) would" |
 | 12 | The DuckLake reader matches a bare id across every change kind | Kept, with a comment: it only over-reports change; this harness has tables only, so no id can belong to a view or schema |
+
+### Second review: the engine fix
+
+A second fresh read-only agent reviewed the skip-gate change alone (Fable was requested; the run fell back to Opus 5). It found no blocker, and showed that the new comparison can only turn skips into builds.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | With a tolerance above `0`, a backwards watermark could skip | Fixed: a lower `MAX(ts)` is always a change; test at tolerance 60 |
+| 2 | No end-to-end test through `rocky run` | Rebutted: that test lives in `run.rs`, which another work stream owns. `sig_unchanged_treats_a_sub_second_advance_as_changed` fails on the old code |
+| 3 | `SkipGateConfig::lag_tolerance_seconds` in `run.rs` still says "fewer than" | Left for the owner of `run.rs`; noted in the PR |
+| 4 | A tolerance too large for `TimeDelta` means "never rebuild on freshness", and one overflow path is untested | Test added for the second path. Validating the config would change public behaviour, so it is not done here |
+| 5 | Mixed timestamp precision between reads could stop a model ever skipping | Accepted: cost only, never a wrong skip |
 
 ## Reproduce
 
