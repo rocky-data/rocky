@@ -107,7 +107,7 @@ Reads change too, because an attached catalog shares the connection:
 - DuckLake keeps old data files until snapshots expire. Rocky expires nothing; run DuckLake's `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` yourself.
 - A lake is pinned to the absolute directory it was created in. A moved project, a CI checkout at another path or another mount fails at attach, loudly, until `data_path` names the stored path.
 - A missing metadata file is created on attach, as a missing main DuckDB file is. A typo in `metadata_path` starts an empty lake rather than failing.
-- Rocky runs `delete_insert` in one DuckDB transaction, for both native DuckDB and DuckLake. The SQL from `rocky emit-sql` includes the transaction.
+- Rocky runs `delete_insert` in one DuckDB transaction, for both native DuckDB and DuckLake. The SQL from `rocky emit-sql` includes the transaction. Use `duckdb -bail` to stop an exported script at the first error and roll back the open transaction.
 
 ## Alternatives considered
 
