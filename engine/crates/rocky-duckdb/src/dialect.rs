@@ -206,15 +206,16 @@ impl SqlDialect for DuckDbSqlDialect {
         let columns = columns.join(", ");
         vec![
             DELETE_INSERT_BEGIN.into(),
-            // The empty target projection carries the key types on DuckDB
-            // versions that would materialize an untyped NULL as INTEGER.
+            // Compare the keys as stored in the target. Assignment casts
+            // preserve untyped NULLs and avoid rounding the existing keys
+            // when the source has a less precise type.
             format!(
                 "CREATE TEMP TABLE {DELETE_INSERT_KEYS} AS\n\
-                 SELECT DISTINCT {columns} FROM (\n\
-                 SELECT {columns} FROM {target} WHERE FALSE\n\
-                 UNION ALL\n\
-                 SELECT {columns} FROM (\n{source_sql}\n) AS _rocky_source\n\
-                 ) AS _rocky_typed_keys"
+                 SELECT {columns} FROM {target} WHERE FALSE"
+            ),
+            format!(
+                "INSERT INTO {DELETE_INSERT_KEYS}\n\
+                 SELECT DISTINCT {columns} FROM (\n{source_sql}\n) AS _rocky_source"
             ),
             format!(
                 "DELETE FROM {target} WHERE ({columns}) IN (\n\
@@ -222,7 +223,7 @@ impl SqlDialect for DuckDbSqlDialect {
             ),
             format!(
                 "DELETE FROM {target} AS _rocky_target\n\
-                 USING (SELECT {columns} FROM {DELETE_INSERT_KEYS} WHERE {nullable_key}) AS _rocky_incoming\n\
+                 USING (SELECT DISTINCT {columns} FROM {DELETE_INSERT_KEYS} WHERE {nullable_key}) AS _rocky_incoming\n\
                  WHERE ({nullable_target_key}) AND {matches}"
             ),
             self.insert_into(target, source_sql),
@@ -1350,6 +1351,44 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![serde_json::json!("11")], vec![serde_json::json!("20")]]
+        );
+    }
+
+    #[test]
+    fn delete_insert_keeps_distinct_target_keys_that_round_to_the_same_double() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (tenant BIGINT, region INT, amount INT);
+             INSERT INTO tgt VALUES (1000000000000000000, NULL, 10),
+                                    (1000000000000000001, NULL, 11);",
+        )
+        .unwrap();
+        let statements = dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["tenant".into(), "region".into()],
+            "SELECT 1e18 AS tenant, NULL::INT AS region, 20 AS amount",
+        );
+        for _ in 0..2 {
+            for sql in &statements {
+                conn.execute_statement(sql).unwrap();
+            }
+        }
+        let rows = conn
+            .execute_sql("SELECT tenant, amount FROM tgt ORDER BY tenant")
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    serde_json::json!("1000000000000000000"),
+                    serde_json::json!("20")
+                ],
+                vec![
+                    serde_json::json!("1000000000000000001"),
+                    serde_json::json!("11")
+                ],
+            ],
         );
     }
 
