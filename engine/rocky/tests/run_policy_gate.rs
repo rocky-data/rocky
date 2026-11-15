@@ -14,8 +14,8 @@
 //!                                 is waived; only a `run` rule governs it
 //! ```
 //!
-//! `require_review` is recorded but not enforced in this change (a one-step
-//! run has no plan to review); an `apply` rule never matches a `run`.
+//! `require_review` refuses too (a one-step run has no plan to review); an
+//! `apply` rule never matches a `run`.
 //!
 //! End-to-end through the real binary: the gap was in the CLI wiring (the
 //! `Run` arm never resolved the principal), which no unit test of the
@@ -379,16 +379,21 @@ fn an_apply_rule_does_not_allow_a_run() {
     assert_denied(tmp.path(), &out, "run under an apply allow rule");
 }
 
-/// `require_review` has no plan to review on a one-step run. This change
-/// records the verdict and lets the run proceed; refusing it waits on the
-/// owner.
+/// `require_review` has no plan to review on a one-step run, so it refuses.
+/// An otherwise-empty `[policy]` block falls to the `require_review`
+/// default.
 #[test]
-fn a_require_review_verdict_is_recorded_and_the_run_proceeds() {
+fn a_require_review_verdict_refuses_an_agent_run() {
     let tmp = tempfile::tempdir().unwrap();
     transformation_project(tmp.path(), "\n[policy]\nversion = 1\n");
     let out = rocky(tmp.path(), &["--principal", "agent", "run"]);
-    assert!(out.status.success(), "{}", describe(&out));
-    assert_eq!(written_tables(tmp.path()).len(), 3);
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("policy requires review"),
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(written_tables(tmp.path()), Vec::<String>::new());
     let decisions = run_decisions(tmp.path());
     assert_eq!(decisions.len(), 3, "{decisions:?}");
     assert!(

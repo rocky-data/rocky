@@ -1376,7 +1376,7 @@ With no `[policy]` block, the gate returns `NotConfigured` and allows the action
 |---|---|
 | `allow` | Runs. |
 | `deny` | Refuses before any write, and exits 1. |
-| `require_review` | Records the verdict, warns, and runs. A one-step run has no plan to review, so this verdict is not enforced yet. Use `rocky plan` and `rocky apply <plan-id>` for a reviewed run. |
+| `require_review` | Refuses before any write, and exits 1. A one-step run has no plan to review. Build on a branch and promote it, or use a reviewed plan (`rocky plan`, `rocky review`, `rocky apply <plan-id>`). |
 
 A `rocky run --branch <name>` writes branch schemas, not production. `default_agent_effect` is not applied to it: only an explicit `run` rule governs it, so an agent can still build a branch and propose it with `rocky plan promote` under `default_agent_effect = "deny"`. A `run` rule cannot set `verify_after`: a one-step run has no post-apply check (V046).
 
