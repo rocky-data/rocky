@@ -556,23 +556,15 @@ pub async fn run_with_dag_and_contracts(
     // before any node runs, so a deny writes nothing.
     if let Some(gate) = direct_gate {
         let dag_id = format!("dag-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
-        let touched = super::run_policy_gate::dag_subjects(
+        super::run_policy_gate::gate_dag(
+            gate,
             cfg,
+            config_path,
+            state_path,
+            &dag_id,
             dag.nodes
                 .iter()
                 .map(|n| (n.kind, n.label.as_str(), n.pipeline.as_deref())),
-        );
-        let models_dir = super::apply::resolve_confined_config_models_dir(config_path, Some(cfg))?;
-        super::run_policy_gate::gate_subjects(
-            gate,
-            cfg,
-            state_path,
-            &dag_id,
-            &touched,
-            super::apply::EmptyTouched::NoOp,
-            &models_dir,
-            // `--dag` refuses `--branch` above.
-            false,
         )
         .await?;
     }

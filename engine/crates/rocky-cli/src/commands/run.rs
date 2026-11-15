@@ -3802,9 +3802,10 @@ pub(crate) async fn run_with_direct_gate(
     registry_override: Option<&AdapterRegistry>,
     direct_gate: Option<&super::run_policy_gate::DirectRunGate>,
 ) -> Result<RunTermination> {
-    debug_assert!(
+    anyhow::ensure!(
         !(governed_ctx.is_some() && direct_gate.is_some()),
-        "a governed apply is gated by its plan; it must not also take the direct-run gate"
+        "internal error: a governed apply is gated by its plan and must not also take the \
+         direct-run gate"
     );
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
@@ -3934,7 +3935,9 @@ pub(crate) async fn run_with_direct_gate(
     tracing::Span::current().record("run_id", run_id.as_str());
 
     // The direct-run policy gate (#2610), before the idempotency claim and
-    // every state or warehouse write, so a denied run claims nothing.
+    // every state or warehouse write. A replication run's tables are gated
+    // again after discovery (below); this gate refuses it up front only when
+    // no `run` rule could allow any table.
     let branch_run = shadow_config.is_some_and(|c| c.branch.is_some());
     super::run_policy_gate::gate_pre_run(
         direct_gate,
@@ -3945,8 +3948,10 @@ pub(crate) async fn run_with_direct_gate(
         &super::run_policy_gate::RunSelection {
             pipeline: pipeline_name_arg,
             model: model_name_filter,
+            selected: defer_opts.selected_models.as_ref(),
             models_dir,
             run_all,
+            run_vars,
         },
         branch_run,
     )

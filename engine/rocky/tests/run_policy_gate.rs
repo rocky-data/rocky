@@ -309,6 +309,12 @@ fn deny_denies_an_agent_dag_run() {
     transformation_project(tmp.path(), DENY_POLICY);
     let out = rocky(tmp.path(), &["--principal", "agent", "run", "--dag"]);
     assert_denied(tmp.path(), &out, "run --dag");
+    let mut models: Vec<String> = run_decisions(tmp.path())
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    models.sort();
+    assert_eq!(models, ["customer_orders", "status_counts", "stg_orders"]);
 }
 
 #[test]
@@ -432,4 +438,175 @@ fn an_agent_run_allowed_by_a_run_rule_writes() {
     let decisions = run_decisions(tmp.path());
     assert_eq!(decisions.len(), 3, "{decisions:?}");
     assert!(decisions.iter().all(|(_, e)| e == "allow"), "{decisions:?}");
+}
+
+/// A policy that allows agent runs by default and denies `run` on the models
+/// a scope names.
+fn scoped_deny(scope: &str) -> String {
+    format!(
+        "\n[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n\n[[policy.rules]]\n\
+         principal = \"agent\"\ncapability = \"run\"\neffect = \"deny\"\nscope = {scope}\n"
+    )
+}
+
+/// The subject set is the run's own selection, not a superset: a scoped deny
+/// refuses a run that selects the model, and leaves a run that does not
+/// select it alone. A default deny would refuse any subject string and hide
+/// a wrong subject set.
+#[test]
+fn a_scoped_deny_gates_exactly_the_selected_models() {
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(tmp.path(), &scoped_deny("{ models = [\"status_counts\"] }"));
+    let out = rocky(tmp.path(), &["--principal", "agent", "run"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("policy DENIES"));
+    assert_eq!(written_tables(tmp.path()), Vec::<String>::new());
+
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--model", "stg_orders"],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(written_tables(tmp.path()), ["main.stg_orders"]);
+
+    // A multi-model `--select` is gated over exactly its selection.
+    let out = rocky(
+        tmp.path(),
+        &[
+            "--principal",
+            "agent",
+            "run",
+            "--select",
+            "stg_orders",
+            "customer_orders",
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let out = rocky(
+        tmp.path(),
+        &[
+            "--principal",
+            "agent",
+            "run",
+            "--select",
+            "stg_orders",
+            "status_counts",
+        ],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(!written_tables(tmp.path()).contains(&"main.status_counts".to_string()));
+}
+
+/// A multi-model `--select` takes the model-only arm whatever the pipeline
+/// type. On a replication-only project it builds models from `models/`, so
+/// it must be gated over them, not treated as a replication run.
+#[test]
+fn deny_denies_a_multi_model_select_on_a_replication_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    replication_project(tmp.path(), DENY_POLICY);
+    let models = tmp.path().join("models");
+    fs::create_dir_all(&models).unwrap();
+    for name in ["m1", "m2"] {
+        fs::write(
+            models.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+                 catalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(models.join(format!("{name}.sql")), "select 1 as id").unwrap();
+    }
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--select", "m1", "m2"],
+    );
+    assert_denied(tmp.path(), &out, "run --select m1 m2 (replication project)");
+}
+
+/// `--dag` evaluates each pipeline's models against that pipeline's own
+/// models directory, so an attribute-scoped rule sees a model of the second
+/// pipeline with its real tags.
+#[test]
+fn a_dag_gate_reads_each_pipelines_model_attributes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(
+        root.join("rocky.toml"),
+        format!(
+            r#"
+[adapter]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.first]
+type = "transformation"
+models = "first/**"
+
+[pipeline.first.target.governance]
+auto_create_schemas = true
+
+[pipeline.second]
+type = "transformation"
+models = "second/**"
+
+[pipeline.second.target.governance]
+auto_create_schemas = true
+{}"#,
+            scoped_deny("{ tags = { tier = \"gold\" } }")
+        ),
+    )
+    .unwrap();
+    for (dir, name, extra) in [
+        ("first", "alpha", ""),
+        ("second", "beta", "\n[tags]\ntier = \"gold\"\n"),
+    ] {
+        let d = root.join(dir);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+                 catalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        fs::write(d.join(format!("{name}.sql")), "select 1 as id").unwrap();
+    }
+    duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
+    let out = rocky(root, &["--principal", "agent", "run", "--dag"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("policy DENIES"));
+    // One deny refuses the whole graph before any node runs.
+    assert_eq!(written_tables(root), Vec::<String>::new());
+    let decisions = run_decisions(root);
+    assert!(
+        decisions.contains(&("beta".to_string(), "deny".to_string())),
+        "{decisions:?}"
+    );
+}
+
+/// A replication pipeline in a `--dag` graph is gated over its discovered
+/// tables in its sub-run, not under a node label: a targeted allow of every
+/// real subject lets the graph run.
+#[test]
+fn a_dag_with_a_replication_pipeline_is_gated_on_its_tables() {
+    let tmp = tempfile::tempdir().unwrap();
+    replication_project(
+        tmp.path(),
+        "\n[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n\n[[policy.rules]]\n\
+         principal = \"agent\"\ncapability = \"run\"\neffect = \"allow\"\n\
+         scope = { models = [\"orders\", \"returns\"] }\n",
+    );
+    let out = rocky(tmp.path(), &["--principal", "agent", "run", "--dag"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let mut decisions = run_decisions(tmp.path());
+    decisions.sort();
+    assert_eq!(
+        decisions,
+        [
+            ("orders".to_string(), "allow".to_string()),
+            ("returns".to_string(), "allow".to_string())
+        ]
+    );
 }

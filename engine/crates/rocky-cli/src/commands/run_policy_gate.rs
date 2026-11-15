@@ -31,14 +31,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use rocky_core::config::{PolicyCapability, PolicyPrincipal, PrincipalRef, RockyConfig};
+use rocky_core::config::{
+    PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalRef, RockyConfig,
+};
 use rocky_core::state::StateStore;
 
 use super::apply::{
     EmptyTouched, GateSubjects, PolicyGate, evaluate_apply_policy_durable,
     evaluate_apply_policy_with_store, is_replication_only, marker_freezes_before_gate,
-    modelless_pipeline_writes, resolve_config_models_glob, resolve_confined_config_models_dir,
-    run_executable_models, run_model_selection,
+    modelless_pipeline_writes, pipeline_is_replication, resolve_config_models_glob,
+    resolve_confined_config_models_dir, run_model_selection,
 };
 use crate::output::RunPlan;
 
@@ -93,9 +95,32 @@ pub(crate) fn ledger_id(run_id: &str) -> String {
 /// What a direct run selected, in the terms the subject derivation needs.
 pub(crate) struct RunSelection<'a> {
     pub pipeline: Option<&'a str>,
+    /// `--model <name>`, or a one-model `--select`.
     pub model: Option<&'a str>,
+    /// A `--select` of two or more models. Like `model`, it takes the
+    /// model-only arm of the run, whatever the pipeline type.
+    pub selected: Option<&'a BTreeSet<String>>,
     pub models_dir: Option<&'a Path>,
     pub run_all: bool,
+    /// `--var` values: the gate's compile must resolve `@var()` as the run's
+    /// does, or it fails where the run would succeed.
+    pub run_vars: &'a rocky_core::run_vars::RunVars,
+}
+
+impl RunSelection<'_> {
+    /// The run takes the model-only arm (`--model`, or `--select`).
+    fn model_only(&self) -> bool {
+        self.model.is_some() || self.selected.is_some()
+    }
+
+    /// Whether a compiled model is one this run executes.
+    fn selects(&self, name: &str) -> bool {
+        match (self.model, self.selected) {
+            (Some(model), _) => model == name,
+            (None, Some(selected)) => selected.contains(name),
+            (None, None) => true,
+        }
+    }
 }
 
 /// The subjects a run will write before discovery: the compiled models it
@@ -103,29 +128,93 @@ pub(crate) struct RunSelection<'a> {
 /// known only after discovery and are gated in-run by
 /// [`enforce_replication_targets`].
 ///
-/// Mirrors the governed apply's derivation (`apply::execute_governed_run`)
-/// through the same helpers, so a one-step run and a two-step apply of the
-/// same selection gate the same set.
+/// Follows the run's own dispatch order: a model selection takes the
+/// model-only arm first, then the pipeline type decides. The directory and
+/// glob come from the same helper the governed apply uses
+/// ([`run_model_selection`]), so both gate what the run reads.
 fn pre_run_subjects(
     cfg: &RockyConfig,
     config_path: &Path,
     selection: &RunSelection<'_>,
+    branch: bool,
 ) -> Result<(BTreeMap<String, PolicyCapability>, EmptyTouched, PathBuf)> {
     let plan = selection_plan(selection);
     let (models_dir, models_glob) = run_model_selection(cfg, config_path, &plan)?;
-    if let Some((writes, empty_touched)) = modelless_pipeline_writes(cfg, selection.pipeline) {
-        return Ok((run_subjects(writes), empty_touched, models_dir));
+    if !selection.model_only() {
+        if let Some((writes, empty_touched)) = modelless_pipeline_writes(cfg, selection.pipeline) {
+            return Ok((run_subjects(writes), empty_touched, models_dir));
+        }
+        if pipeline_is_replication(cfg, selection.pipeline) {
+            // The tables are known only after discovery, and the run starts
+            // a vendor sync and claims its idempotency key before that. When
+            // no `run` rule could allow any table, refuse here, before any
+            // of it, under the pipeline's name.
+            let mut touched = BTreeMap::new();
+            if !run_could_be_allowed(cfg, branch) {
+                let label = crate::registry::resolve_pipeline(cfg, selection.pipeline)
+                    .map(|(name, _)| name.to_string())
+                    .unwrap_or_else(|_| "replication".to_string());
+                touched.insert(label, PolicyCapability::Run);
+            }
+            if is_replication_only(cfg, &plan) {
+                return Ok((touched, EmptyTouched::NoOp, models_dir));
+            }
+            // `--all` / `--models`: the model leg runs too.
+            let (models, empty_touched) =
+                selected_models(&models_dir, models_glob.as_deref(), selection);
+            touched.extend(run_subjects(models));
+            return Ok((touched, empty_touched, models_dir));
+        }
     }
-    if is_replication_only(cfg, &plan) {
-        return Ok((BTreeMap::new(), EmptyTouched::NoOp, models_dir));
-    }
-    let (models, empty_touched) =
-        match run_executable_models(&models_dir, models_glob.as_deref(), &plan) {
-            Some(models) => (models, EmptyTouched::NoOp),
-            // The compile failed, so what the run executes is unknown.
-            None => (Vec::new(), EmptyTouched::Refuse),
-        };
+    let (models, empty_touched) = selected_models(&models_dir, models_glob.as_deref(), selection);
     Ok((run_subjects(models), empty_touched, models_dir))
+}
+
+/// The compiled models the run executes, or `Refuse` when the compile fails
+/// and the set is unknown.
+fn selected_models(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    selection: &RunSelection<'_>,
+) -> (Vec<String>, EmptyTouched) {
+    use rocky_compiler::compile::{self, CompilerConfig};
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        run_vars: selection.run_vars.clone(),
+        ..Default::default()
+    };
+    let result = match models_glob {
+        Some(glob) => compile::compile_matching(&config, glob),
+        None => compile::compile(&config),
+    };
+    match result {
+        Ok(result) => (
+            result
+                .project
+                .models
+                .iter()
+                .map(|m| m.config.name.clone())
+                .filter(|name| selection.selects(name))
+                .collect(),
+            EmptyTouched::NoOp,
+        ),
+        Err(_) => (Vec::new(), EmptyTouched::Refuse),
+    }
+}
+
+/// Whether any `run` verdict for an agent could be other than `deny`: a
+/// non-deny default posture (or a waived one), or a non-deny `run` rule.
+fn run_could_be_allowed(cfg: &RockyConfig, branch: bool) -> bool {
+    let Some(policy) = cfg.policy.as_ref() else {
+        return true;
+    };
+    branch
+        || policy.default_agent_effect != PolicyEffect::Deny
+        || policy.rules.iter().any(|rule| {
+            rule.principal == PolicyPrincipal::Agent
+                && rule.capability.matches_input(PolicyCapability::Run)
+                && rule.effect != PolicyEffect::Deny
+        })
 }
 
 /// A `RunPlan` carrying only the selection fields the shared helpers read.
@@ -133,7 +222,11 @@ fn selection_plan(selection: &RunSelection<'_>) -> RunPlan {
     RunPlan {
         filter: None,
         pipeline: selection.pipeline.map(str::to_string),
-        model: selection.model.map(str::to_string),
+        // A multi-model `--select` resolves its directory as `--model` does.
+        model: selection
+            .model
+            .map(str::to_string)
+            .or_else(|| selection.selected.and_then(|s| s.iter().next().cloned())),
         branch: None,
         partition: None,
         partition_from: None,
@@ -203,7 +296,8 @@ pub(crate) async fn gate_pre_run(
     let Some(gate) = gate.filter(|g| !g.pregated && g.applies(cfg)) else {
         return Ok(());
     };
-    let (touched, empty_touched, models_dir) = pre_run_subjects(cfg, config_path, selection)?;
+    let (touched, empty_touched, models_dir) =
+        pre_run_subjects(cfg, config_path, selection, branch)?;
     gate_subjects(
         gate,
         cfg,
@@ -343,29 +437,93 @@ fn rule_suffix(rule_id: Option<usize>) -> String {
         .unwrap_or_default()
 }
 
-/// The DAG graph's writes, keyed for the gate: each transformation model and
-/// seed by name, each model-less pipeline by its write set. Replication
-/// pipelines are gated in their sub-runs, after discovery.
+/// Gate a `rocky run --dag` graph once, before any node runs, under the
+/// ledger id `run:<dag_id>`.
 ///
-/// A model-less node whose write set cannot be derived is gated under its own
-/// label, so an unknown write is evaluated (and denied under a deny) instead
-/// of skipped.
-pub(crate) fn dag_subjects<'a>(
+/// Every node that writes before discovery is a subject: each transformation
+/// model and seed by name, each model-less pipeline by its write set.
+/// Transformation models are evaluated per pipeline, against that pipeline's
+/// own models directory, so an attribute-scoped rule (tag, layer,
+/// classification, contract) sees each model's real attributes. Replication
+/// pipelines are gated in their sub-runs, after discovery.
+pub(crate) async fn gate_dag<'a>(
+    gate: &DirectRunGate,
+    cfg: &RockyConfig,
+    config_path: &Path,
+    state_path: &Path,
+    dag_id: &str,
+    nodes: impl IntoIterator<Item = (rocky_core::unified_dag::NodeKind, &'a str, Option<&'a str>)>,
+) -> Result<()> {
+    if !gate.applies(cfg) {
+        return Ok(());
+    }
+    for (pipeline, touched) in dag_subjects(cfg, nodes) {
+        let models_dir = match pipeline.as_deref() {
+            Some(name) => {
+                let plan = selection_plan(&RunSelection {
+                    pipeline: Some(name),
+                    model: None,
+                    selected: None,
+                    models_dir: None,
+                    run_all: false,
+                    run_vars: &rocky_core::run_vars::RunVars::new(),
+                });
+                run_model_selection(cfg, config_path, &plan)?.0
+            }
+            None => resolve_confined_config_models_dir(config_path, Some(cfg))?,
+        };
+        gate_subjects(
+            gate,
+            cfg,
+            state_path,
+            dag_id,
+            &touched,
+            EmptyTouched::NoOp,
+            &models_dir,
+            // `--dag` refuses `--branch`.
+            false,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The DAG graph's pre-discovery writes, grouped by the transformation
+/// pipeline whose models directory holds their attributes (`None` for seeds
+/// and model-less writes).
+///
+/// A model-less node whose write set cannot be derived is gated under its
+/// own label, so an unknown write is evaluated (and denied under a deny)
+/// instead of skipped.
+fn dag_subjects<'a>(
     cfg: &RockyConfig,
     nodes: impl IntoIterator<Item = (rocky_core::unified_dag::NodeKind, &'a str, Option<&'a str>)>,
-) -> BTreeMap<String, PolicyCapability> {
+) -> BTreeMap<Option<String>, BTreeMap<String, PolicyCapability>> {
     use rocky_core::unified_dag::NodeKind;
-    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut groups: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
     for (kind, label, pipeline) in nodes {
         match kind {
-            NodeKind::Transformation | NodeKind::Seed => {
-                names.insert(label.to_string());
+            NodeKind::Transformation => {
+                groups
+                    .entry(pipeline.map(str::to_string))
+                    .or_default()
+                    .insert(label.to_string());
             }
+            NodeKind::Seed => {
+                groups.entry(None).or_default().insert(label.to_string());
+            }
+            // A replication pipeline expands to `Source` + `Load` nodes; its
+            // sub-run gates the discovered tables.
+            NodeKind::Load if pipeline_is_replication(cfg, pipeline) => {}
             NodeKind::Quality | NodeKind::Snapshot | NodeKind::Load => {
+                let entry = groups.entry(None).or_default();
                 match pipeline.and_then(|p| modelless_pipeline_writes(cfg, Some(p))) {
-                    Some((writes, _)) => names.extend(writes),
+                    Some((writes, EmptyTouched::Refuse)) if writes.is_empty() => {
+                        entry.insert(label.to_string());
+                    }
+                    Some((writes, _)) => entry.extend(writes),
                     None => {
-                        names.insert(label.to_string());
+                        entry.insert(label.to_string());
                     }
                 }
             }
@@ -373,5 +531,8 @@ pub(crate) fn dag_subjects<'a>(
             NodeKind::Source | NodeKind::Replication | NodeKind::Test => {}
         }
     }
-    run_subjects(names)
+    groups
+        .into_iter()
+        .map(|(pipeline, names)| (pipeline, run_subjects(names)))
+        .collect()
 }
