@@ -6888,7 +6888,8 @@ mod tests {
     fn a_star_replace_does_not_keep_the_source_type() {
         let rows = star_over_t_and_u("SELECT * REPLACE (CAST(x AS VARCHAR) AS x) FROM t");
         assert_eq!(names(&rows), vec!["x", "n", "z"], "{rows:?}");
-        assert_ne!(rows[0].1, RockyType::Int32, "{rows:?}");
+        // The replacement's own type, read by inference in the star's scope.
+        assert_eq!(rows[0].1, RockyType::String, "{rows:?}");
         assert_eq!(rows[1], ("n".to_string(), RockyType::String, false));
         // A NULL replacement of a NOT NULL column is nullable.
         for sql in [
