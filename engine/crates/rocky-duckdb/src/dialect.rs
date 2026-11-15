@@ -17,6 +17,9 @@ use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
 const DELETE_INSERT_KEYS: &str = "temp.main.__rocky_delete_insert_keys";
+const DELETE_INSERT_ROWS: &str = "temp.main.__rocky_delete_insert_rows";
+pub(crate) const DELETE_INSERT_STAGE_ROWS: &str =
+    "CREATE TEMP TABLE temp.main.__rocky_delete_insert_rows AS";
 pub(crate) const DELETE_INSERT_BEGIN: &str = "BEGIN TRANSACTION";
 pub(crate) const DELETE_INSERT_COMMIT: &str = "COMMIT";
 
@@ -210,6 +213,9 @@ impl SqlDialect for DuckDbSqlDialect {
         let columns = columns.join(", ");
         vec![
             DELETE_INSERT_BEGIN.into(),
+            // Keep one input snapshot for the keys and the final rows. The
+            // model can read the target directly or through another relation.
+            format!("{DELETE_INSERT_STAGE_ROWS}\n{source_sql}\n"),
             // Compare the keys as stored in the target. Assignment casts
             // preserve untyped NULLs and avoid rounding the existing keys
             // when the source has a less precise type.
@@ -224,7 +230,7 @@ impl SqlDialect for DuckDbSqlDialect {
                  SELECT {key_fields} FROM (\n\
                  SELECT DISTINCT cast_to_type(ROW({columns}),\n\
                  (SELECT ROW({columns}) FROM {DELETE_INSERT_KEYS} WHERE FALSE)) AS _rocky_key\n\
-                 FROM (\n{source_sql}\n) AS _rocky_source\n\
+                 FROM {DELETE_INSERT_ROWS}\n\
                  ) AS _rocky_distinct_keys"
             ),
             format!(
@@ -236,8 +242,9 @@ impl SqlDialect for DuckDbSqlDialect {
                  USING (SELECT DISTINCT {columns} FROM {DELETE_INSERT_KEYS} WHERE {nullable_key}) AS _rocky_incoming\n\
                  WHERE ({nullable_target_key}) AND {matches}"
             ),
-            self.insert_into(target, source_sql),
+            self.insert_into(target, &format!("SELECT * FROM {DELETE_INSERT_ROWS}")),
             format!("DROP TABLE {DELETE_INSERT_KEYS}"),
+            format!("DROP TABLE {DELETE_INSERT_ROWS}"),
             DELETE_INSERT_COMMIT.into(),
         ]
     }
@@ -1431,6 +1438,32 @@ mod tests {
                 vec![serde_json::json!("21")],
                 vec![serde_json::json!("22")],
             ],
+        );
+    }
+
+    #[test]
+    fn delete_insert_does_not_recompute_a_model_after_deleting_its_input() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (region INT, amount INT);
+             INSERT INTO tgt VALUES (NULL, 10), (1, 11);
+             CREATE VIEW repair_input AS SELECT * FROM tgt WHERE region IS NULL;",
+        )
+        .unwrap();
+        for sql in dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["region".into()],
+            "SELECT region, amount * 2 AS amount FROM repair_input",
+        ) {
+            conn.execute_statement(&sql).unwrap();
+        }
+        let rows = conn
+            .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!("11")], vec![serde_json::json!("20")]]
         );
     }
 

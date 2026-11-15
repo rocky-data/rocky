@@ -24,7 +24,9 @@ use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation;
 
 use crate::DuckDbConnector;
-use crate::dialect::{DELETE_INSERT_BEGIN, DELETE_INSERT_COMMIT, DuckDbSqlDialect};
+use crate::dialect::{
+    DELETE_INSERT_BEGIN, DELETE_INSERT_COMMIT, DELETE_INSERT_STAGE_ROWS, DuckDbSqlDialect,
+};
 
 /// The first cell of the first row as a `u64`. The connector returns
 /// integers as strings.
@@ -482,9 +484,9 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             let reports = statements
                 .iter()
                 .map(|sql| {
-                    // Only the key staging query and the INSERT read the
-                    // model's inputs. The deletes read the target and staged keys.
-                    let reads_upstream = sql.starts_with("INSERT INTO ");
+                    // Only the snapshot query reads the model's inputs.
+                    // The other statements read internal staging or the target.
+                    let reads_upstream = sql.starts_with(DELETE_INSERT_STAGE_ROWS);
                     let (rows_affected, reads) = if measure_reads && reads_upstream {
                         conn.execute_statement_measured(sql)?
                     } else {
