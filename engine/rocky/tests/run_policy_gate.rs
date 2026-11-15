@@ -610,3 +610,30 @@ fn a_dag_with_a_replication_pipeline_is_gated_on_its_tables() {
         ]
     );
 }
+
+/// The in-run replication gate decides per discovered table: a `run` rule
+/// that allows `orders` but not `returns` refuses the run before any
+/// warehouse statement, and records both verdicts.
+#[test]
+fn a_replication_run_is_gated_per_discovered_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    replication_project(
+        tmp.path(),
+        "\n[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n\n[[policy.rules]]\n\
+         principal = \"agent\"\ncapability = \"run\"\neffect = \"allow\"\n\
+         scope = { models = [\"orders\"] }\n",
+    );
+    let out = rocky(tmp.path(), &["--principal", "agent", "run"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("policy DENIES"));
+    assert_eq!(written_tables(tmp.path()), Vec::<String>::new());
+    let mut decisions = run_decisions(tmp.path());
+    decisions.sort();
+    assert_eq!(
+        decisions,
+        [
+            ("orders".to_string(), "allow".to_string()),
+            ("returns".to_string(), "deny".to_string())
+        ]
+    );
+}
