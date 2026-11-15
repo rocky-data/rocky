@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The nextest default profile now has a slow-timeout (60s period, killed after 10 periods), so a stuck test fails after 10 minutes instead of hanging the job. No test is skipped or quarantined.
 
+### Added
+
+- `connector.toml` accepts an optional `license` key: an SPDX identifier or expression. A blank value is refused. Rocky records it and does not read it. A manifest with no `license` loads as before.
+
 ### Fixed
 
 - A model with a contract that repeats an output name the contract constrains is now the `E062` error (#2613). Before, `count(*) as orders, count(*) as orders` compiled with only `W002`, and the table gained an `orders_1` column the contract never checked. A repeat of a name the contract does not mention stays `W002` (or `E061`).
