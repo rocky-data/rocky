@@ -6905,13 +6905,53 @@ mod tests {
         }
     }
 
-    /// #2618: one star with modifiers beside another star cannot be told
-    /// apart in the merged expansion, so the columns are unknown rather than
-    /// over-claimed: none is reported.
+    /// #2618 red team: a modifier on a qualified star applies to its own
+    /// relation only. `t.* EXCEPT (n), u.*` keeps `u.n` and every column a
+    /// contract may require. An unqualified star beside another star cannot
+    /// be split by relation, so its columns are unknown, not over-claimed.
     #[test]
-    fn several_stars_with_a_modifier_claim_no_columns() {
-        let rows = star_over_t_and_u("SELECT t.* EXCLUDE (n), u.* FROM t JOIN u ON t.x = u.x");
+    fn a_qualified_star_modifier_applies_to_its_own_relation() {
+        for sql in [
+            "SELECT t.* EXCEPT (n), u.* FROM t JOIN u ON t.x = u.x",
+            "SELECT a.* EXCLUDE (n), b.* FROM t AS a JOIN u AS b ON a.x = b.x",
+        ] {
+            let rows = star_over_t_and_u(sql);
+            assert_eq!(names(&rows), vec!["x", "z", "n"], "{sql}: {rows:?}");
+            let contract = CompilerContract {
+                columns: vec![],
+                rules: ContractRules {
+                    required: vec!["x".to_string(), "n".to_string()],
+                    ..ContractRules::default()
+                },
+            };
+            let typed: Vec<TypedColumn> = rows
+                .into_iter()
+                .map(|(name, data_type, nullable)| TypedColumn {
+                    name,
+                    data_type,
+                    nullable,
+                })
+                .collect();
+            let diags = validate_contract("m", &typed, &contract);
+            assert!(diags.is_empty(), "{sql}: {diags:?}");
+        }
+        let rows = star_over_t_and_u("SELECT *, t.* EXCLUDE (n) FROM t");
         assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// #2618 red team: an outer `EXCLUDE` over an inner `REPLACE` drops the
+    /// column, and a column a body excludes and then re-adds is kept.
+    #[test]
+    fn star_modifiers_compose_across_layers() {
+        let rows =
+            star_over_t_and_u("SELECT * EXCLUDE (x) FROM (SELECT * REPLACE (1 AS x) FROM t) AS d");
+        assert_eq!(names(&rows), vec!["n", "z"], "{rows:?}");
+        let rows = star_over_t_and_u(
+            "WITH c AS (SELECT * EXCLUDE (n), UPPER(n) AS n FROM t) SELECT * FROM c",
+        );
+        let mut got = names(&rows);
+        got.sort_unstable();
+        assert_eq!(got, vec!["n", "x", "z"], "{rows:?}");
     }
 
     /// #2618: a star over an upstream model applies the exclusion too.

@@ -358,6 +358,12 @@ impl SemanticGraph {
     }
 }
 
+/// The names a per-relation star modifier can use for a table a `WITH`
+/// body or derived table passes on: its name and the last part of it.
+fn source_names(name: &str) -> [&str; 2] {
+    [name, name.rsplit('.').next().unwrap_or(name)]
+}
+
 /// Build a semantic graph from a resolved project.
 ///
 /// Iterates models in topological order, extracts per-model lineage,
@@ -514,7 +520,10 @@ pub fn build_semantic_graph(
                 // The modifiers for the sources a derived table or `WITH`
                 // body passes through its own star: the outer star's over
                 // the inner one's.
-                let through = top.over(&table_ref.star_modifiers);
+                // A star qualified by this relation applies its own modifiers
+                // here and nowhere else (`t.* EXCEPT (a), u.*`).
+                let rel = top.for_relation(&lineage::relation_names(table_ref));
+                let through = rel.over(&table_ref.star_modifiers);
                 if through.unmodelled {
                     star_unresolved = true;
                 }
@@ -530,7 +539,7 @@ pub fn build_semantic_graph(
                     let mut replaced = false;
                     for col in &table_ref.cte_columns {
                         if !col.extra_source {
-                            let effect = top.column(&col.target_column);
+                            let effect = rel.column(&col.target_column);
                             replaced = effect == StarColumn::Replaced;
                             keep = effect != StarColumn::Excluded
                                 && output_names.insert(col.target_column.clone());
@@ -579,11 +588,12 @@ pub fn build_semantic_graph(
                             Vec::new()
                         };
                         let inner_arc: Arc<str> = Arc::from(inner_name.as_str());
+                        let inner_names = source_names(inner_name);
                         for name in inner_columns {
                             if through.unmodelled {
                                 break;
                             }
-                            let effect = through.column(name);
+                            let effect = through.for_relation(&inner_names).column(name);
                             if effect == StarColumn::Excluded {
                                 continue;
                             }
@@ -637,7 +647,7 @@ pub fn build_semantic_graph(
                     .filter(|_| reader_depends_on_it)
                 {
                     for col in &upstream_schema.columns {
-                        let effect = top.column(&col.name);
+                        let effect = rel.column(&col.name);
                         if effect == StarColumn::Excluded {
                             continue;
                         }
@@ -671,7 +681,7 @@ pub fn build_semantic_graph(
                     // time_column check) without weakening any type-shape check.
                     star_unresolved = true;
                     for col_name in derived_cols {
-                        if top.column(col_name) == StarColumn::Excluded {
+                        if rel.column(col_name) == StarColumn::Excluded {
                             continue;
                         }
                         if output_names.insert(col_name.clone()) {
@@ -695,9 +705,10 @@ pub fn build_semantic_graph(
                         if through.unmodelled {
                             break;
                         }
+                        let via = through.for_relation(&source_names(inner_name));
                         if let Some(upstream_schema) = models.get(inner_name.as_str()) {
                             for col in &upstream_schema.columns {
-                                if through.column(&col.name) == StarColumn::Excluded {
+                                if via.column(&col.name) == StarColumn::Excluded {
                                     continue;
                                 }
                                 if output_names.insert(col.name.clone()) {
@@ -708,7 +719,7 @@ pub fn build_semantic_graph(
                             }
                         } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
                             for col in source_cols {
-                                if through.column(&col.name) == StarColumn::Excluded {
+                                if via.column(&col.name) == StarColumn::Excluded {
                                     continue;
                                 }
                                 if output_names.insert(col.name.clone()) {
@@ -722,7 +733,7 @@ pub fn build_semantic_graph(
                 } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
                     // External source with known schema
                     for col in source_cols {
-                        let effect = top.column(&col.name);
+                        let effect = rel.column(&col.name);
                         if effect == StarColumn::Excluded {
                             continue;
                         }

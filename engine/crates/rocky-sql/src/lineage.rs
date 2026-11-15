@@ -264,6 +264,27 @@ pub struct StarModifiers {
     /// source columns; its columns are unknown.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unmodelled: bool,
+    /// Modifiers that apply to one relation only: the projection has several
+    /// stars, each qualified by a different relation (`t.* EXCEPT (a), u.*`).
+    /// [`Self::excluded`] and [`Self::replaced`] then apply to every relation,
+    /// these to theirs. Read them with [`Self::for_relation`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_relation: Vec<RelationStarModifiers>,
+}
+
+/// The modifiers of one relation's star, see [`StarModifiers::by_relation`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationStarModifiers {
+    /// The relation, lower-cased: the star's qualifier (an alias or a table
+    /// name) in the query that has the star, or the physical table name
+    /// once carried out of a `WITH` body or a derived table.
+    pub relation: String,
+    /// Names the star removes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<String>,
+    /// Names the star recomputes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<String>,
 }
 
 /// What a star does to one column of a relation it expands, see
@@ -281,11 +302,35 @@ pub enum StarColumn {
 impl StarModifiers {
     /// Whether no star of the projection changes any column.
     pub fn is_empty(&self) -> bool {
-        self.excluded.is_empty() && self.replaced.is_empty() && !self.unmodelled
+        self.excluded.is_empty()
+            && self.replaced.is_empty()
+            && !self.unmodelled
+            && self.by_relation.is_empty()
     }
 
-    /// What the stars do to a column called `name`. Meaningless when
-    /// [`Self::unmodelled`] is set; the caller checks that first.
+    /// The modifiers for one relation, known by any of `names` (its alias,
+    /// its table name, the last part of that name): the shared ones plus the
+    /// relation's own. The result has no [`Self::by_relation`].
+    pub fn for_relation(&self, names: &[&str]) -> StarModifiers {
+        let mut flat = StarModifiers {
+            excluded: self.excluded.clone(),
+            replaced: self.replaced.clone(),
+            unmodelled: self.unmodelled,
+            by_relation: Vec::new(),
+        };
+        for own in &self.by_relation {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(&own.relation)) {
+                flat.excluded.extend(own.excluded.iter().cloned());
+                flat.replaced.extend(own.replaced.iter().cloned());
+            }
+        }
+        flat
+    }
+
+    /// What the stars do to a column called `name`. Reads the shared
+    /// modifiers only: with [`Self::by_relation`] set, call
+    /// [`Self::for_relation`] first. Meaningless when [`Self::unmodelled`] is
+    /// set; the caller checks that first.
     pub fn column(&self, name: &str) -> StarColumn {
         if self.excluded.iter().any(|e| e.eq_ignore_ascii_case(name)) {
             StarColumn::Excluded
@@ -303,23 +348,76 @@ impl StarModifiers {
         combined.excluded.extend(self.excluded.iter().cloned());
         combined.replaced.extend(self.replaced.iter().cloned());
         combined.unmodelled |= self.unmodelled;
+        if !self.by_relation.is_empty() {
+            if combined.by_relation.is_empty() {
+                combined.by_relation = self.by_relation.clone();
+            } else {
+                // Two layers of per-relation modifiers keyed by different
+                // names: not combined.
+                combined.unmodelled = true;
+            }
+        }
         combined
+    }
+
+    /// These modifiers re-keyed onto the physical tables a star over
+    /// `sources` passes on, for a consumer that sees only those table names.
+    /// `None` when they cannot be: per-relation modifiers over a relation
+    /// that is not a physical table.
+    fn keyed_by_source(&self, sources: &[TableReference]) -> Option<StarModifiers> {
+        if self.by_relation.is_empty() {
+            return Some(self.clone());
+        }
+        let mut keyed = StarModifiers {
+            excluded: self.excluded.clone(),
+            replaced: self.replaced.clone(),
+            unmodelled: self.unmodelled,
+            by_relation: Vec::new(),
+        };
+        for t in sources {
+            let own = self.for_relation(&relation_names(t));
+            let changes = own.excluded.len() > self.excluded.len()
+                || own.replaced.len() > self.replaced.len();
+            if !changes {
+                continue;
+            }
+            if t.binding != TableBinding::Physical || t.name == "(subquery)" {
+                return None;
+            }
+            keyed.by_relation.push(RelationStarModifiers {
+                relation: t.name.to_lowercase(),
+                excluded: own.excluded[self.excluded.len()..].to_vec(),
+                replaced: own.replaced[self.replaced.len()..].to_vec(),
+            });
+        }
+        Some(keyed)
     }
 
     /// The modifiers of a projection's star items.
     fn of_projection(projection: &[SelectItem]) -> Self {
         let mut modifiers = StarModifiers::default();
-        let mut stars = 0usize;
+        // One entry per star: its qualifier, if a plain one, and what it does.
+        let mut per_star: Vec<(Option<String>, StarModifiers)> = Vec::new();
         for item in projection {
-            let options = match item {
-                SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options) => {
-                    options
+            let (qualifier, options) = match item {
+                SelectItem::Wildcard(options) => (None, options),
+                SelectItem::QualifiedWildcard(kind, options) => {
+                    let qualifier = match kind {
+                        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => name
+                            .0
+                            .last()
+                            .and_then(|part| part.as_ident())
+                            .map(|ident| ident.value.to_lowercase()),
+                        sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(_) => None,
+                    };
+                    // `None` for a qualified star marks it unkeyable below.
+                    (Some(qualifier), options)
                 }
                 SelectItem::UnnamedExpr(_)
                 | SelectItem::ExprWithAlias { .. }
                 | SelectItem::ExprWithAliases { .. } => continue,
             };
-            stars += 1;
+            let mut modifiers = StarModifiers::default();
             // Destructured so a new sqlparser option fails to compile here
             // rather than being ignored.
             let WildcardAdditionalOptions {
@@ -366,12 +464,55 @@ impl StarModifiers {
                         .map(|element| element.column_name.value.clone()),
                 );
             }
+            per_star.push((qualifier.flatten(), modifiers));
         }
-        if stars > 1 && !modifiers.is_empty() {
-            modifiers.unmodelled = true;
+        match per_star.as_slice() {
+            [] => {}
+            [(_, only)] => modifiers = only.clone(),
+            _ if per_star.iter().all(|(_, m)| m.is_empty()) => {}
+            _ => {
+                // Several stars: each must name its own relation for its
+                // modifiers to be told apart (#2618 red team).
+                let mut seen: Vec<&str> = Vec::new();
+                for (qualifier, star) in &per_star {
+                    match qualifier.as_deref() {
+                        Some(q) if !seen.contains(&q) && !star.unmodelled => {
+                            seen.push(q);
+                            if !star.is_empty() {
+                                modifiers.by_relation.push(RelationStarModifiers {
+                                    relation: q.to_string(),
+                                    excluded: star.excluded.clone(),
+                                    replaced: star.replaced.clone(),
+                                });
+                            }
+                        }
+                        _ => {
+                            modifiers = StarModifiers {
+                                unmodelled: true,
+                                ..StarModifiers::default()
+                            };
+                            break;
+                        }
+                    }
+                }
+            }
         }
         modifiers
     }
+}
+
+/// The names a star qualifier can use for `t`: its alias, its full name, and
+/// the last part of that name.
+pub fn relation_names(t: &TableReference) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::with_capacity(3);
+    if let Some(alias) = &t.alias {
+        names.push(alias);
+    }
+    names.push(&t.name);
+    if let Some(last) = t.name.rsplit('.').next() {
+        names.push(last);
+    }
+    names
 }
 
 /// The modifiers that apply to the star sources of a derived table's inner
@@ -385,7 +526,7 @@ fn inner_star_modifiers(inner: &LineageResult) -> StarModifiers {
         .map(|t| &t.star_modifiers)
         .filter(|m| !m.is_empty())
         .collect();
-    let mut combined = match carried.as_slice() {
+    let combined = match carried.as_slice() {
         [] => StarModifiers::default(),
         [only] if inner.source_tables.len() == 1 => (*only).clone(),
         _ => StarModifiers {
@@ -393,8 +534,15 @@ fn inner_star_modifiers(inner: &LineageResult) -> StarModifiers {
             ..StarModifiers::default()
         },
     };
-    combined = inner.star_modifiers.over(&combined);
-    combined
+    // The inner query's per-relation modifiers name its own aliases, which
+    // mean nothing outside it: re-key them onto the tables it reads.
+    match inner.star_modifiers.keyed_by_source(&inner.source_tables) {
+        Some(own) => own.over(&combined),
+        None => StarModifiers {
+            unmodelled: true,
+            ..StarModifiers::default()
+        },
+    }
 }
 
 /// Full lineage result for a SQL statement.
@@ -860,32 +1008,34 @@ impl CteBody {
         if result.has_star && !own.unmodelled {
             // A column a listed relation passes through the star: dropped by
             // `EXCEPT`, kept with no known origin by `REPLACE` (#2618).
-            let pass = |body: &mut CteBody, name: &str, origin: &[ColumnOrigin]| {
-                if body.has_column(name) {
-                    return;
-                }
-                match own.column(name) {
-                    StarColumn::Kept => body.columns.push((name.to_string(), origin.to_vec())),
-                    StarColumn::Replaced => body.columns.push((name.to_string(), Vec::new())),
-                    StarColumn::Excluded => {}
-                }
-            };
+            let pass =
+                |body: &mut CteBody, own: &StarModifiers, name: &str, origin: &[ColumnOrigin]| {
+                    if body.has_column(name) {
+                        return;
+                    }
+                    match own.column(name) {
+                        StarColumn::Kept => body.columns.push((name.to_string(), origin.to_vec())),
+                        StarColumn::Replaced => body.columns.push((name.to_string(), Vec::new())),
+                        StarColumn::Excluded => {}
+                    }
+                };
             let mut carried: Vec<StarModifiers> = Vec::new();
             for t in &result.source_tables {
+                let own_t = own.for_relation(&relation_names(t));
                 match t.binding {
                     TableBinding::Cte => {
                         let Some(Some(inner)) = ctes.get(&t.name.to_lowercase()) else {
                             continue;
                         };
                         for (name, origin) in &inner.columns {
-                            pass(&mut body, name, origin);
+                            pass(&mut body, &own_t, name, origin);
                         }
                         body.star_sources.extend(inner.star_sources.iter().cloned());
                         carried.push(inner.star_modifiers.clone());
                     }
                     TableBinding::Physical if t.name == "(subquery)" => {
                         for name in t.derived_columns.iter().flatten() {
-                            pass(&mut body, name, &[]);
+                            pass(&mut body, &own_t, name, &[]);
                         }
                         body.star_sources.extend(t.derived_sources.iter().cloned());
                         carried.push(t.star_modifiers.clone());
@@ -904,7 +1054,17 @@ impl CteBody {
                     ..StarModifiers::default()
                 },
             };
-            body.star_modifiers = own.over(&inherited);
+            body.star_modifiers = match own.keyed_by_source(&result.source_tables) {
+                // Per-relation modifiers over a relation that is itself a
+                // `WITH` name or a derived table are not carried further.
+                Some(keyed) if keyed.by_relation.is_empty() || inherited.is_empty() => {
+                    keyed.over(&inherited)
+                }
+                _ => StarModifiers {
+                    unmodelled: true,
+                    ..StarModifiers::default()
+                },
+            };
             if body.star_modifiers.unmodelled {
                 body.star_sources.clear();
             }
@@ -932,12 +1092,14 @@ impl CteBody {
         {
             return origins.clone();
         }
-        if self.star_modifiers.unmodelled || self.star_modifiers.column(column) != StarColumn::Kept
-        {
-            return Vec::new();
-        }
         match self.star_sources.as_slice() {
-            [only] => vec![(only.clone(), column.to_string(), TransformKind::Direct)],
+            [only] => {
+                let modifiers = self.star_modifiers.for_relation(&[only.as_str()]);
+                if modifiers.unmodelled || modifiers.column(column) != StarColumn::Kept {
+                    return Vec::new();
+                }
+                vec![(only.clone(), column.to_string(), TransformKind::Direct)]
+            }
             _ => Vec::new(),
         }
     }
@@ -2316,8 +2478,22 @@ mod tests {
         assert_eq!(both.column("a"), StarColumn::Replaced);
         assert!(!both.unmodelled);
         assert!(m("SELECT * FROM t").is_empty());
-        // Two stars, one modified: one merged set cannot say which is which.
-        assert!(m("SELECT t.* EXCLUDE (a), u.* FROM t JOIN u ON t.k = u.k").unmodelled);
+        // Two qualified stars, one modified: the modifier is the relation's.
+        let two = m("SELECT t.* EXCLUDE (a), u.* FROM t JOIN u ON t.k = u.k");
+        assert!(!two.unmodelled);
+        assert_eq!(two.for_relation(&["t"]).column("a"), StarColumn::Excluded);
+        assert_eq!(two.for_relation(&["u"]).column("a"), StarColumn::Kept);
+        // An unqualified star beside another cannot be split by relation.
+        assert!(m("SELECT *, t.* EXCLUDE (a) FROM t").unmodelled);
+        // A WITH body whose star mixes a modified CTE with another relation
+        // cannot carry one set of modifiers: no star sources are passed on.
+        let r = extract_lineage(
+            "WITH a AS (SELECT * EXCLUDE (n) FROM t), \
+             b AS (SELECT * FROM a JOIN u ON a.x = u.x) SELECT * FROM b",
+        )
+        .unwrap();
+        assert!(r.source_tables[0].star_modifiers.unmodelled, "{r:?}");
+        assert!(r.source_tables[0].derived_sources.is_empty(), "{r:?}");
         // Two plain stars are not unmodelled.
         assert!(m("SELECT t.*, u.* FROM t JOIN u ON t.k = u.k").is_empty());
         // A qualified EXCLUDE name is not read.
