@@ -107,7 +107,7 @@ Reads change too, because an attached catalog shares the connection:
 - DuckLake keeps old data files until snapshots expire. Rocky expires nothing; run DuckLake's `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` yourself.
 - A lake is pinned to the absolute directory it was created in. A moved project, a CI checkout at another path or another mount fails at attach, loudly, until `data_path` names the stored path.
 - A missing metadata file is created on attach, as a missing main DuckDB file is. A typo in `metadata_path` starts an empty lake rather than failing.
-- `delete_insert` runs its `DELETE` and `INSERT` as two statements, so on DuckLake it is two snapshots and a reader can see the gap between them. Native DuckDB has the same gap today; it is tracked separately.
+- Rocky runs `delete_insert` in one DuckDB transaction, for both native DuckDB and DuckLake. If you run the statements from `rocky emit-sql` yourself, wrap them in a transaction.
 
 ## Alternatives considered
 
@@ -129,7 +129,7 @@ Reviewer: Claude Opus 5.5, a fresh read-only agent that did not author the rulin
 | 5 | A DuckLake scan reports `rows_scanned: 0`. | Fixed: counted as unattributed, measured and unit-tested on the real shape. |
 | 6 | A lake made elsewhere keeps a relative stored data path. A missing metadata file starts a new lake. | First half fixed: a relative stored path is refused (D1). Second half rebutted: it matches how a missing main file behaves; recorded in Consequences. |
 | 7 | The hidden metadata catalog can be named as a target. | Fixed: `CatalogKind::DuckLakeMetadata`, refused by every gate (second red team, finding 3). |
-| 8 | `delete_insert` is two autocommit statements, so two snapshots. | Recorded in Consequences. Native DuckDB has the same gap; a wrapping transaction needs its own rollback path, so it is a separate change. |
+| 8 | At launch, `delete_insert` used two autocommit statements. | The partition replacement fix groups both statements in one transaction with rollback (#2605). |
 | 9 | The matrix is otherwise sound; `content_addressed` was missing from the ruling's list; some refusals are scope choices. | Fixed: D3 lists `content_addressed` and says which refusals are scope choices. |
 | 10 | A defaulted scope needs a trailing `/`, and must count as a scope with two secrets. | Fixed (D1). |
 | 11 | The supported list rests on a non-required job. | Accepted: the PR that lands this ADR runs the conformance workflow once and records the run. |

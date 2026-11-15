@@ -17861,33 +17861,46 @@ async fn execute_one_plain_model(
                 }
             }
         }
-        for (index, exec_sql) in exec_stmts.iter().enumerate() {
-            if atomic_create_done && index == 0 {
-                continue;
+        let mut record_stats = |stats: rocky_core::traits::ExecutionStats| {
+            bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+            bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+            reported_per_statement.push(stats.rows_affected);
+            egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
+            if let Some(jid) = stats.job_id {
+                job_ids_acc.push(jid);
             }
-            match super::run_upstream_reads::run_model_statement(
+        };
+        let model_error = |err| {
+            let guidance = kind_probe_note
+                .as_ref()
+                .map(|note| format!("model '{model_name}' failed; {note}"))
+                .unwrap_or_else(|| format!("model '{model_name}' failed"));
+            anyhow::Error::from(err).context(guidance)
+        };
+        if matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::DeleteInsert { .. }
+        ) {
+            let reports = super::run_upstream_reads::run_delete_insert(
                 warehouse,
-                exec_sql,
+                &exec_stmts,
                 &mut reads_acc,
             )
             .await
-            {
-                Ok(stats) => {
-                    bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
-                    bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
-                    reported_per_statement.push(stats.rows_affected);
-                    egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
-                    if let Some(jid) = stats.job_id {
-                        job_ids_acc.push(jid);
-                    }
-                }
-                Err(e) => {
-                    let guidance = kind_probe_note
-                        .as_ref()
-                        .map(|note| format!("model '{model_name}' failed; {note}"))
-                        .unwrap_or_else(|| format!("model '{model_name}' failed"));
-                    return Err(anyhow::Error::from(e).context(guidance));
-                }
+            .map_err(model_error)?;
+            for stats in reports {
+                record_stats(stats);
+            }
+        } else if !atomic_create_done {
+            for exec_sql in &exec_stmts {
+                let stats = super::run_upstream_reads::run_model_statement(
+                    warehouse,
+                    exec_sql,
+                    &mut reads_acc,
+                )
+                .await
+                .map_err(model_error)?;
+                record_stats(stats);
             }
         }
         if let Some((drop_sql, existing_name, expected_name)) = &pending_drop {

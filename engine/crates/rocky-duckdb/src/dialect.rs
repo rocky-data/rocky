@@ -175,19 +175,24 @@ impl SqlDialect for DuckDbSqlDialect {
         partition_cols: &[std::sync::Arc<str>],
         source_sql: &str,
     ) -> String {
-        // Partition replacement groups NULL keys together, including within a composite key.
-        let matches = partition_cols
+        let columns: Vec<_> = partition_cols
+            .iter()
+            .map(|column| self.quote_identifier(column))
+            .collect();
+        // Deduplicate incoming keys before joining. A correlated subquery can
+        // group all target keys, even when only a few partitions are replaced.
+        let matches = columns
             .iter()
             .map(|column| {
-                let column = self.quote_identifier(column);
                 format!("_rocky_target.{column} IS NOT DISTINCT FROM _rocky_incoming.{column}")
             })
             .collect::<Vec<_>>()
             .join(" AND ");
+        let columns = columns.join(", ");
         format!(
-            "DELETE FROM {target} AS _rocky_target WHERE EXISTS (\n\
-             SELECT 1 FROM (\n{source_sql}\n) AS _rocky_incoming\n\
-             WHERE {matches}\n)"
+            "DELETE FROM {target} AS _rocky_target\n\
+             USING (SELECT DISTINCT {columns} FROM (\n{source_sql}\n) AS _rocky_source) AS _rocky_incoming\n\
+             WHERE {matches}"
         )
     }
 

@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use tokio::task::spawn_blocking;
 
 use rocky_core::failure_class::{FailureClass, TransientKind};
-use rocky_core::state::{StoredBytes, StoredBytesBasis};
+use rocky_core::state::{StoredBytes, StoredBytesBasis, UpstreamReads};
 use rocky_core::traits::{
-    AdapterError, AdapterResult, ExplainResult, ObjectKind, QueryResult, SqlDialect,
-    WarehouseAdapter,
+    AdapterError, AdapterResult, ExecutionStats, ExplainResult, ObjectKind, QueryResult,
+    SqlDialect, WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation;
@@ -449,6 +449,59 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
                 },
                 reads,
             ))
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
+    async fn execute_delete_insert(
+        &self,
+        statements: &[String],
+        measure_reads: bool,
+    ) -> AdapterResult<Vec<(ExecutionStats, Option<UpstreamReads>)>> {
+        let conn = Arc::clone(&self.connector);
+        let statements = statements.to_vec();
+        // Keep the connection lock until the replacement commits or rolls back.
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let transaction = conn.conn.unchecked_transaction().map_err(AdapterError::new)?;
+            let reports = statements
+                .iter()
+                .map(|sql| {
+                    let (rows_affected, reads) = if measure_reads {
+                        conn.execute_statement_measured(sql)?
+                    } else {
+                        (conn.execute_statement_counting_rows(sql)?, None)
+                    };
+                    Ok((
+                        ExecutionStats {
+                            rows_affected,
+                            ..ExecutionStats::default()
+                        },
+                        reads,
+                    ))
+                })
+                .collect::<Result<Vec<_>, crate::DuckDbError>>();
+            match reports {
+                Ok(reports) => {
+                    transaction.commit().map_err(|err| {
+                        AdapterError::msg(format!(
+                            "DuckDB partition replacement COMMIT failed ({err}); check the target before retrying"
+                        ))
+                    })?;
+                    Ok(reports)
+                }
+                Err(cause) => {
+                    transaction.rollback().map_err(|rollback| {
+                        AdapterError::msg(format!(
+                            "DuckDB partition replacement failed ({cause}); rollback also failed ({rollback})"
+                        ))
+                    })?;
+                    Err(AdapterError::new(cause))
+                }
+            }
         })
         .await
         .map_err(|e| join_error(&e))?
@@ -1171,6 +1224,60 @@ mod tests {
             .execute_statement("INSERT INTO t VALUES (1, 'Alice')")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_insert_rolls_back_when_the_insert_fails() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE tgt (region INT, amount INT NOT NULL);
+                 INSERT INTO tgt VALUES (NULL, 10), (7, 10), (8, 10);
+                 CREATE TABLE incoming (region INT, amount INT);
+                 INSERT INTO incoming VALUES (NULL, NULL), (7, 20);",
+            )
+            .await
+            .unwrap();
+        let dialect = adapter.dialect();
+        let target = "memory.main.tgt";
+        let source = "SELECT region, amount FROM incoming";
+        let statements = [
+            dialect.delete_partitions_sql(target, &["region".into()], source),
+            dialect.insert_into(target, source),
+        ];
+        let target_rows = "SELECT region, amount FROM tgt ORDER BY region NULLS FIRST";
+        let before = adapter.execute_query(target_rows).await.unwrap().rows;
+
+        let error = adapter
+            .execute_delete_insert(&statements, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("NOT NULL"), "{error}");
+        assert_eq!(
+            adapter.execute_query(target_rows).await.unwrap().rows,
+            before
+        );
+
+        adapter
+            .execute_statement("UPDATE incoming SET amount = 20")
+            .await
+            .unwrap();
+        let reports = adapter
+            .execute_delete_insert(&statements, false)
+            .await
+            .unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].0.rows_affected, Some(2));
+        assert_eq!(reports[1].0.rows_affected, Some(2));
+        let after = adapter.execute_query(target_rows).await.unwrap();
+        assert_eq!(
+            after.rows,
+            vec![
+                vec![serde_json::Value::Null, serde_json::json!("20")],
+                vec![serde_json::json!("7"), serde_json::json!("20")],
+                before[2].clone(),
+            ]
+        );
     }
 
     #[tokio::test]
