@@ -843,14 +843,20 @@ pub(crate) enum SessionDisposition {
 /// the cancel ended the run, and the local record is still written. The
 /// failure is logged, as the replication path logs its interrupted checkpoint
 /// upload. Every other error propagates the upload failure, as before.
+///
+/// The exception (#2593): an interrupted run that opened a volume breach
+/// marker propagates the failure, so it does not exit 130. An orchestrator
+/// that reads 130 as "retry later" would otherwise never learn that the
+/// hold was lost.
 pub(crate) async fn finalize_after_error(
     session: rocky_core::state_sync::RemoteStateSession,
     error: &anyhow::Error,
     context: &'static str,
 ) -> Result<()> {
+    let opened_marker = session.opened_breach_marker();
     match session.finalize().await {
         Ok(()) => Ok(()),
-        Err(upload) if error.is::<Interrupted>() => {
+        Err(upload) if error.is::<Interrupted>() && !opened_marker => {
             warn!(error = %upload, "interrupted run's state upload failed");
             Ok(())
         }
@@ -4184,6 +4190,12 @@ pub async fn run_with_explicit_contracts(
         {
             model_session.set_suppress_upload("forward-incompat recreate");
         }
+        // Volume breach markers (#2593): a marker write makes the terminal
+        // upload durable, and a suppressed upload holds every `error`-range
+        // output this run cannot see the markers of.
+        if let Some(store) = state_store.as_ref() {
+            super::run_volume::BreachBinding::of(&model_session).bind(store);
+        }
         // `run_id` minted at the top of `run()` — model-only, replication,
         // and idempotency-claim paths all share one identifier.
         let mut output = RunOutput::new(
@@ -4729,6 +4741,10 @@ pub async fn run_with_explicit_contracts(
                     session.set_suppress_upload("forward-incompat recreate");
                 }
             }
+            // Volume breach markers (#2593), once every suppression is recorded.
+            let tx_breach_binding = tx_session
+                .as_ref()
+                .map(super::run_volume::BreachBinding::of);
             let dispatch_result = super::run_local::run_transformation(
                 models_dir_decision,
                 &models_glob,
@@ -4781,6 +4797,7 @@ pub async fn run_with_explicit_contracts(
                 defer_opts.target_dialects.as_ref(),
                 &cancel,
                 Some(config_path),
+                tx_breach_binding.as_ref(),
             )
             .await;
             // A success whose record did not land is still a success here
@@ -5512,6 +5529,8 @@ pub async fn run_with_explicit_contracts(
     }
     let suppress_state_upload =
         state_store.was_recreated_for_forward_incompat() || !authority.is_usable();
+    // Volume breach markers (#2593), once every suppression is recorded.
+    super::run_volume::BreachBinding::of(session).bind(&state_store);
 
     // The decision ledger is authoritative for the auto-apply governor only
     // when it carries the estate's real freeze/budget history: the download
@@ -12585,6 +12604,10 @@ pub(crate) async fn execute_backfill_set(
                 .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
             {
                 session.set_suppress_upload("forward-incompat recreate");
+            }
+            // Volume breach markers (#2593), once every suppression is recorded.
+            if let Some(store) = state_store.as_ref() {
+                super::run_volume::BreachBinding::of(&session).bind(store);
             }
 
             let mut output = RunOutput::new(String::new(), 0, 1);

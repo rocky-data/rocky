@@ -155,6 +155,9 @@ pub async fn run_transformation(
     // The config file this run loaded. The `products/` next to it declare the
     // delivery deadlines stamped onto the run record. `None` stamps none.
     config_path: Option<&Path>,
+    // Ties the store this run opens to the dispatch site's remote-state
+    // session for the volume breach markers (#2593). `None` with no session.
+    breach_binding: Option<&super::run_volume::BreachBinding>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -185,6 +188,9 @@ pub async fn run_transformation(
             let store = StateStore::open(state_path).with_context(|| {
                 format!("failed to open state store at {}", state_path.display())
             })?;
+            if let Some(binding) = breach_binding {
+                binding.bind(&store);
+            }
 
             // #1884: ledger evidence that this run started, before it does any
             // work. A later run reads this pipeline's records
@@ -4212,6 +4218,7 @@ auto_create_schemas = true
             None,  // target_dialects
             &tokio_util::sync::CancellationToken::new(),
             None, // config_path
+            None, // breach_binding
         )
         .await;
         (result, state_path)
@@ -4345,6 +4352,7 @@ auto_create_schemas = true
             None,  // target_dialects
             &tokio_util::sync::CancellationToken::new(),
             None, // config_path
+            None, // breach_binding
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");
