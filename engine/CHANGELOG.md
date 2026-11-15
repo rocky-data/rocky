@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `connector.toml` accepts an optional `license` key: an SPDX identifier or expression. A blank value is refused. Rocky records it and does not read it. A manifest with no `license` loads as before.
+- `connector.toml` accepts an optional `license` key: an SPDX identifier or expression. A blank value is refused. Rocky checks only that it is not blank, and otherwise ignores it. A manifest with no `license` loads as before.
 
 ### Fixed
 

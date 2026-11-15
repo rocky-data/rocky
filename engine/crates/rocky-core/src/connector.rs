@@ -419,7 +419,7 @@ pub struct ConnectorManifest {
     pub egress_hosts: Vec<String>,
     /// The connector's license, as an SPDX identifier or expression
     /// (`MIT`, `Apache-2.0 OR MIT`). Optional. When set it must not be
-    /// empty. Rocky records it and does not interpret it.
+    /// empty. Rocky checks only that it is not blank, and otherwise ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
     /// Limits the author suggests. The user's limits can only lower them.
