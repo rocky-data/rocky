@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The nextest default profile now has a slow-timeout (60s period, killed after 10 periods), so a stuck test fails after 10 minutes instead of hanging the job. No test is skipped or quarantined.
+
 ### Fixed
 
 - A volume breach marker now fails closed on an ungoverned run with remote state (#2593). A run that opens, widens, narrows or clears a marker uploads its state as if `on_upload_failure = "fail"`, so a marker never lives only in a local file. When the state download fails, or the local store was recreated for a newer schema, every output whose product declares an `error` volume range is held: a run of its downstream models alone withholds them, and a build of the output passes only if it rebuilt the whole table in range. A marker opened while the upload is skipped fails the run with a message that it was not replicated. A run that leaves on an error after changing a marker still uploads its state, best effort, and an interrupted run that opened a marker and lost its upload no longer exits 130. Under `on_upload_failure = "skip"`, a run that changes a marker can now exit non-zero on a failed state upload, and a run whose state download failed can now fail an in-range incremental, merge or `time_interval` output.
