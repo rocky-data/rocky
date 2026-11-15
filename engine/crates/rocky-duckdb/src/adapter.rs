@@ -24,7 +24,7 @@ use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation;
 
 use crate::DuckDbConnector;
-use crate::dialect::DuckDbSqlDialect;
+use crate::dialect::{DELETE_INSERT_BEGIN, DELETE_INSERT_COMMIT, DuckDbSqlDialect};
 
 /// The first cell of the first row as a `u64`. The connector returns
 /// integers as strings.
@@ -459,8 +459,20 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         statements: &[String],
         measure_reads: bool,
     ) -> AdapterResult<Vec<(ExecutionStats, Option<UpstreamReads>)>> {
+        let [begin, body @ .., commit] = statements else {
+            return Err(AdapterError::msg(
+                "DuckDB partition replacement needs a transaction",
+            ));
+        };
+        if begin != DELETE_INSERT_BEGIN || commit != DELETE_INSERT_COMMIT {
+            return Err(AdapterError::msg(
+                "DuckDB partition replacement needs a transaction",
+            ));
+        }
         let conn = Arc::clone(&self.connector);
-        let statements = statements.to_vec();
+        let statements = body.to_vec();
+        // The generated transaction markers protect exported SQL too.
+        // Here the connection owns the transaction so it can roll back on error.
         // Keep the connection lock until the replacement commits or rolls back.
         spawn_blocking(move || {
             let conn = conn

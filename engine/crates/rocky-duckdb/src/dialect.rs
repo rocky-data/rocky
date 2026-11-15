@@ -17,6 +17,8 @@ use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
 const DELETE_INSERT_KEYS: &str = "temp.main.__rocky_delete_insert_keys";
+pub(crate) const DELETE_INSERT_BEGIN: &str = "BEGIN TRANSACTION";
+pub(crate) const DELETE_INSERT_COMMIT: &str = "COMMIT";
 
 /// The column reference [`SqlDialect::watermark_where`] and
 /// [`SqlDialect::watermark_hold_back`] share, so both bounds read the same
@@ -203,9 +205,16 @@ impl SqlDialect for DuckDbSqlDialect {
             .join(" AND ");
         let columns = columns.join(", ");
         vec![
+            DELETE_INSERT_BEGIN.into(),
+            // The empty target projection carries the key types on DuckDB
+            // versions that would materialize an untyped NULL as INTEGER.
             format!(
                 "CREATE TEMP TABLE {DELETE_INSERT_KEYS} AS\n\
-                 SELECT DISTINCT {columns} FROM (\n{source_sql}\n) AS _rocky_source"
+                 SELECT DISTINCT {columns} FROM (\n\
+                 SELECT {columns} FROM {target} WHERE FALSE\n\
+                 UNION ALL\n\
+                 SELECT {columns} FROM (\n{source_sql}\n) AS _rocky_source\n\
+                 ) AS _rocky_typed_keys"
             ),
             format!(
                 "DELETE FROM {target} WHERE ({columns}) IN (\n\
@@ -218,6 +227,7 @@ impl SqlDialect for DuckDbSqlDialect {
             ),
             self.insert_into(target, source_sql),
             format!("DROP TABLE {DELETE_INSERT_KEYS}"),
+            DELETE_INSERT_COMMIT.into(),
         ]
     }
 
@@ -1317,6 +1327,30 @@ mod tests {
                 assert_eq!(amounts, expected, "keys {partition_by:?}, run {run}");
             }
         }
+    }
+
+    #[test]
+    fn delete_insert_accepts_an_untyped_null_for_a_date_key() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (day_key DATE, amount INT);
+             INSERT INTO tgt VALUES (NULL, 10), (DATE '2026-11-15', 11);",
+        )
+        .unwrap();
+        for sql in dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["day_key".into()],
+            "SELECT NULL AS day_key, 20 AS amount",
+        ) {
+            conn.execute_statement(&sql).unwrap();
+        }
+        let result = conn
+            .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![serde_json::json!("11")], vec![serde_json::json!("20")]]
+        );
     }
 
     #[test]
