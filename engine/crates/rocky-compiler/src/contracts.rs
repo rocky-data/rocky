@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E014, E059, I003, W010};
+use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E014, E059, E062, E063, I003, W010};
 use crate::types::{RockyType, TypedColumn};
 
 /// A compile-time contract for a model's output schema.
@@ -51,6 +51,10 @@ pub struct ContractRules {
     /// If true, no new nullable columns may be added.
     #[serde(default)]
     pub no_new_nullable: bool,
+    /// If true, the model may output only the columns `[[columns]]`
+    /// declares, and its column list must be provable (`E063`, #2613).
+    #[serde(default)]
+    pub no_extra_columns: bool,
 }
 
 /// The project contracts directory that belongs to a models directory.
@@ -486,6 +490,102 @@ pub fn validate_contract_with(
     diagnostics
 }
 
+/// The contract checks on the shape of the model's output that need more than
+/// its inferred schema (#2613).
+///
+/// - `E062`, always: the projection repeats a name the contract constrains
+///   (`[[columns]]`, `required`, `protected`). `repeated` holds the provable
+///   repeated names, from [`crate::duplicate_output::repeated_names_for`].
+/// - `E063`, with `[rules] no_extra_columns`: an output column the contract
+///   does not declare, or, when `schema_complete` is false, the fact that
+///   Rocky cannot prove the column list at all.
+///
+/// Names compare ignoring ASCII case: a contract that spells `Orders` for an
+/// output `orders` is not reporting an extra column on DuckDB, and a repeat
+/// is reported only when its name is constrained either way.
+pub fn validate_contract_shape(
+    model_name: &str,
+    inferred_schema: &[TypedColumn],
+    contract: &CompilerContract,
+    repeated: &[(String, usize)],
+    schema_complete: bool,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let constrained = |name: &str| {
+        contract
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .chain(contract.rules.required.iter().map(String::as_str))
+            .chain(contract.rules.protected.iter().map(String::as_str))
+            .any(|c| c.eq_ignore_ascii_case(name))
+    };
+    for (name, count) in repeated {
+        if constrained(name) {
+            diagnostics.push(
+                Diagnostic::error(
+                    E062,
+                    model_name,
+                    format!(
+                        "the model's output has {count} columns called '{name}', which its \
+                         contract constrains. The contract checks one of them, and the \
+                         warehouse writes the others under other names"
+                    ),
+                )
+                .with_suggestion(format!(
+                    "give each '{name}' column its own name with an alias, and declare the ones \
+                     the contract should check"
+                )),
+            );
+        }
+    }
+    if contract.rules.no_extra_columns {
+        if !schema_complete {
+            diagnostics.push(
+                Diagnostic::error(
+                    E063,
+                    model_name,
+                    "`[rules] no_extra_columns` is set, but Rocky cannot prove the model's column \
+                     list (a `SELECT *` or an expression with no alias), so it cannot show that \
+                     every output column is declared"
+                        .to_string(),
+                )
+                .with_suggestion(
+                    "list the columns explicitly and alias every expression, or remove \
+                     `no_extra_columns`"
+                        .to_string(),
+                ),
+            );
+        } else {
+            for col in inferred_schema {
+                let declared = contract
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&col.name));
+                if !declared {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            E063,
+                            model_name,
+                            format!(
+                                "output column '{}' is not declared in the contract, and \
+                                 `[rules] no_extra_columns` forbids one",
+                                col.name
+                            ),
+                        )
+                        .with_suggestion(format!(
+                            "declare `{}` in `[[columns]]`, drop it from the SELECT, or remove \
+                             `no_extra_columns`",
+                            col.name
+                        )),
+                    );
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
 /// Whether a contract type names decimal digits: `Decimal(p)` or
 /// `Decimal(p,s)`, as opposed to a bare `Decimal`.
 fn declares_decimal_digits(type_name: &str) -> bool {
@@ -617,6 +717,96 @@ fn decimal_type_matches(precision: u8, scale: u8, type_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shape_column(name: &str) -> TypedColumn {
+        TypedColumn {
+            name: name.to_string(),
+            data_type: RockyType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn shape_contract(
+        columns: &[&str],
+        required: &[&str],
+        no_extra_columns: bool,
+    ) -> CompilerContract {
+        CompilerContract {
+            columns: columns
+                .iter()
+                .map(|name| ContractColumn {
+                    name: name.to_string(),
+                    type_name: None,
+                    nullable: None,
+                    description: None,
+                })
+                .collect(),
+            rules: ContractRules {
+                required: required.iter().map(ToString::to_string).collect(),
+                no_extra_columns,
+                ..ContractRules::default()
+            },
+        }
+    }
+
+    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
+        diags.iter().map(|d| &*d.code).collect()
+    }
+
+    /// #2613: a repeated name the contract constrains is `E062`, whether it
+    /// is declared, required or protected. A repeat it does not mention is
+    /// left to `W002`.
+    #[test]
+    fn a_repeated_constrained_name_is_e062() {
+        let schema = [shape_column("customer_id"), shape_column("orders")];
+        let repeated = [("orders".to_string(), 2)];
+        for contract in [
+            shape_contract(&["orders"], &[], false),
+            shape_contract(&[], &["ORDERS"], false),
+            CompilerContract {
+                columns: vec![],
+                rules: ContractRules {
+                    protected: vec!["orders".to_string()],
+                    ..ContractRules::default()
+                },
+            },
+        ] {
+            let diags = validate_contract_shape("m", &schema, &contract, &repeated, true);
+            assert_eq!(codes(&diags), vec![E062], "{contract:?}");
+            assert!(diags[0].message.contains("2 columns called 'orders'"));
+        }
+        let unconstrained = shape_contract(&["customer_id"], &[], false);
+        assert!(validate_contract_shape("m", &schema, &unconstrained, &repeated, true).is_empty());
+        let declared = shape_contract(&["orders"], &[], false);
+        assert!(validate_contract_shape("m", &schema, &declared, &[], true).is_empty());
+    }
+
+    /// #2613: `no_extra_columns` refuses an undeclared output column, and a
+    /// column list Rocky cannot prove. Off, it refuses neither.
+    #[test]
+    fn no_extra_columns_refuses_undeclared_and_unprovable_columns() {
+        let schema = [shape_column("customer_id"), shape_column("n")];
+        let strict = shape_contract(&["customer_id", "orders"], &[], true);
+        let diags = validate_contract_shape("m", &schema, &strict, &[], true);
+        assert_eq!(codes(&diags), vec![E063], "{diags:?}");
+        assert!(diags[0].message.contains("'n'"), "{diags:?}");
+        let diags = validate_contract_shape("m", &schema, &strict, &[], false);
+        assert_eq!(codes(&diags), vec![E063], "{diags:?}");
+        assert!(diags[0].message.contains("cannot prove"), "{diags:?}");
+        let declared = shape_contract(&["Customer_Id", "n"], &[], true);
+        assert!(validate_contract_shape("m", &schema, &declared, &[], true).is_empty());
+        let off = shape_contract(&["customer_id"], &[], false);
+        assert!(validate_contract_shape("m", &schema, &off, &[], false).is_empty());
+    }
+
+    /// `no_extra_columns` parses from a contract file and defaults to off.
+    #[test]
+    fn no_extra_columns_parses_and_defaults_off() {
+        let on: CompilerContract = toml::from_str("[rules]\nno_extra_columns = true\n").unwrap();
+        assert!(on.rules.no_extra_columns);
+        let off: CompilerContract = toml::from_str("[rules]\nrequired = [\"a\"]\n").unwrap();
+        assert!(!off.rules.no_extra_columns);
+    }
     use crate::diagnostic::Severity;
 
     #[test]

@@ -479,9 +479,12 @@ pub fn compile_project(
             validate_all_contracts(
                 &contracts,
                 &type_check.typed_models,
-                config
-                    .strict_contracts
-                    .then_some((&semantic_graph, &config.target_dialects)),
+                ContractScope {
+                    graph: &semantic_graph,
+                    targets: &config.target_dialects,
+                    models: &project.models,
+                    strict: config.strict_contracts,
+                },
             )
         };
         (diagnostics, files)
@@ -588,6 +591,12 @@ pub fn compile_project(
         &project.models,
         &config.source_schemas,
         &config.source_provenance,
+    ));
+    // E064: a one-part read that is a near-miss of a model name. Reads every
+    // model's name, so it is recomputed whole on both paths.
+    diagnostics.extend(crate::unknown_relations::check_unknown_relations(
+        &project.models,
+        &config.source_schemas,
     ));
     // Downstream consumers: every `depends_on` entry must name a model (E060).
     let (consumers, consumer_diagnostics) =
@@ -849,9 +858,12 @@ pub fn compile_incremental(
             validate_all_contracts(
                 &contracts,
                 &type_check.typed_models,
-                config
-                    .strict_contracts
-                    .then_some((&semantic_graph, &config.target_dialects)),
+                ContractScope {
+                    graph: &semantic_graph,
+                    targets: &config.target_dialects,
+                    models: &project.models,
+                    strict: config.strict_contracts,
+                },
             )
         };
         (diagnostics, files)
@@ -947,6 +959,12 @@ pub fn compile_incremental(
         &project.models,
         &config.source_schemas,
         &config.source_provenance,
+    ));
+    // E064: a one-part read that is a near-miss of a model name. Reads every
+    // model's name, so it is recomputed whole on both paths.
+    diagnostics.extend(crate::unknown_relations::check_unknown_relations(
+        &project.models,
+        &config.source_schemas,
     ));
     // Same check as the full path; it reads only the consumer files and the
     // model names, so recomputing it keeps incremental equal to from-scratch.
@@ -1189,13 +1207,29 @@ fn unknown_type_reason(
     }
 }
 
-/// `strict_graph` is `Some` under strict contracts: a declared type Rocky
-/// cannot check is then the `E059` error, with the reason read from the graph.
+/// What contract validation reads besides the typed schemas.
+#[derive(Clone, Copy)]
+struct ContractScope<'a> {
+    graph: &'a SemanticGraph,
+    targets: &'a crate::operand_check::TargetDialects,
+    /// The project's models, for the repeated-name check (`E062`).
+    models: &'a [rocky_core::models::Model],
+    /// Strict contracts: a declared type Rocky cannot check is then the
+    /// `E059` error, with the reason read from the graph.
+    strict: bool,
+}
+
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    strict_graph: Option<(&SemanticGraph, &crate::operand_check::TargetDialects)>,
+    scope: ContractScope<'_>,
 ) -> Vec<Diagnostic> {
+    let ContractScope {
+        graph,
+        targets,
+        models,
+        strict,
+    } = scope;
     let mut all_diags = Vec::new();
 
     // Sorted, not `HashMap` iteration order. Contract diagnostics are
@@ -1209,17 +1243,32 @@ fn validate_all_contracts(
     for model_name in model_names {
         let contract = &contract_map[model_name];
         if let Some(schema) = typed_models.get(model_name) {
-            let diags = match strict_graph {
-                Some((graph, targets)) => {
-                    let target = targets.for_model(model_name);
-                    let reason = |column: &str| {
-                        unknown_type_reason(graph, typed_models, model_name, column, target)
-                    };
-                    contracts::validate_contract_with(model_name, schema, contract, Some(&reason))
-                }
-                None => contracts::validate_contract(model_name, schema, contract),
+            let target = targets.for_model(model_name);
+            let diags = if strict {
+                let reason = |column: &str| {
+                    unknown_type_reason(graph, typed_models, model_name, column, target)
+                };
+                contracts::validate_contract_with(model_name, schema, contract, Some(&reason))
+            } else {
+                contracts::validate_contract(model_name, schema, contract)
             };
             all_diags.extend(diags);
+            // A model the graph does not know has no provable column list.
+            let schema_complete = graph
+                .model_schema(model_name)
+                .is_some_and(crate::semantic::ModelSchema::schema_is_complete);
+            let repeated = models
+                .iter()
+                .find(|m| m.config.name == *model_name)
+                .map(|m| crate::duplicate_output::repeated_names_for(m, target))
+                .unwrap_or_default();
+            all_diags.extend(contracts::validate_contract_shape(
+                model_name,
+                schema,
+                contract,
+                &repeated,
+                schema_complete,
+            ));
         } else {
             all_diags.push(Diagnostic::warning(
                 W011,
@@ -1904,7 +1953,16 @@ mod tests {
 
         let mut expected = names.clone();
         expected.sort();
-        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models, None)
+        let project = crate::project::Project::from_models(Vec::new()).unwrap();
+        let graph = crate::semantic::build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let targets = crate::operand_check::TargetDialects::default();
+        let scope = ContractScope {
+            graph: &graph,
+            targets: &targets,
+            models: &[],
+            strict: false,
+        };
+        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models, scope)
             .iter()
             .map(|d| d.model.clone())
             .collect();
@@ -2668,6 +2726,79 @@ mod tests {
 
     /// Incremental output equals from-scratch output: the same diagnostics
     /// and the same typed columns for every model.
+    /// #2613: the compile pipeline runs the contract shape checks. A
+    /// contracted model that repeats a declared name is `E062`.
+    #[test]
+    fn a_contracted_repeat_is_e062_through_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let contracts_dir = tmp.path().join("contracts");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::create_dir_all(&contracts_dir).expect("contracts dir");
+        write_flat_models(&models_dir, 2);
+        std::fs::write(models_dir.join("m00.sql"), "SELECT 1 AS id, 2 AS id\n").expect("sql");
+        std::fs::write(
+            contracts_dir.join("m00.contract.toml"),
+            "[[columns]]\nname = \"id\"\n",
+        )
+        .expect("contract");
+        let config = CompilerConfig {
+            models_dir,
+            contracts_dir: Some(contracts_dir),
+            ..Default::default()
+        };
+        let result = compile(&config).expect("compile");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.model == "m00" && d.code.as_ref() == "E062"),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(result.has_errors);
+    }
+
+    /// #2620: `E064` reads every model's name, so adding a model changes the
+    /// answer for a file nobody edited. Incremental must equal from-scratch.
+    #[test]
+    fn a_new_model_name_rechecks_unedited_reads_like_a_from_scratch_compile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_flat_models(&models_dir, 12);
+        std::fs::write(models_dir.join("m03.sql"), "SELECT id FROM stg_ordrs\n").expect("m03");
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+        let first = compile(&config).expect("baseline");
+        assert!(
+            !first.diagnostics.iter().any(|d| d.code.as_ref() == "E064"),
+            "no model is near `stg_ordrs` yet: {:?}",
+            first.diagnostics
+        );
+        let added = models_dir.join("stg_orders.sql");
+        std::fs::write(
+            models_dir.join("stg_orders.toml"),
+            "name = \"stg_orders\"\n",
+        )
+        .expect("sidecar");
+        std::fs::write(&added, "SELECT 1 AS id\n").expect("sql");
+        let incremental =
+            compile_incremental(&config, std::slice::from_ref(&added), &first).expect("incr");
+        let scratch = compile(&config).expect("scratch");
+        assert!(
+            scratch
+                .diagnostics
+                .iter()
+                .any(|d| d.model == "m03" && d.code.as_ref() == "E064"),
+            "{:?}",
+            scratch.diagnostics
+        );
+        assert_matches_from_scratch(&incremental, &scratch);
+    }
+
     fn assert_matches_from_scratch(incremental: &CompileResult, scratch: &CompileResult) {
         assert_eq!(
             diagnostic_set(incremental),
