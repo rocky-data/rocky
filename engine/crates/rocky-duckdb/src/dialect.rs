@@ -203,6 +203,10 @@ impl SqlDialect for DuckDbSqlDialect {
             })
             .collect::<Vec<_>>()
             .join(" AND ");
+        let key_fields = (1..=columns.len())
+            .map(|index| format!("struct_extract_at(_rocky_key, {index})"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let columns = columns.join(", ");
         vec![
             DELETE_INSERT_BEGIN.into(),
@@ -213,13 +217,19 @@ impl SqlDialect for DuckDbSqlDialect {
                 "CREATE TEMP TABLE {DELETE_INSERT_KEYS} AS\n\
                  SELECT {columns} FROM {target} WHERE FALSE"
             ),
+            // Cast before grouping. A row comparison keeps the source's
+            // string collation from collapsing separate target keys.
             format!(
                 "INSERT INTO {DELETE_INSERT_KEYS}\n\
-                 SELECT DISTINCT {columns} FROM (\n{source_sql}\n) AS _rocky_source"
+                 SELECT {key_fields} FROM (\n\
+                 SELECT DISTINCT cast_to_type(ROW({columns}),\n\
+                 (SELECT ROW({columns}) FROM {DELETE_INSERT_KEYS} WHERE FALSE)) AS _rocky_key\n\
+                 FROM (\n{source_sql}\n) AS _rocky_source\n\
+                 ) AS _rocky_distinct_keys"
             ),
             format!(
                 "DELETE FROM {target} WHERE ({columns}) IN (\n\
-                 SELECT {columns} FROM {DELETE_INSERT_KEYS} WHERE NOT ({nullable_key})\n)"
+                 SELECT DISTINCT {columns} FROM {DELETE_INSERT_KEYS} WHERE NOT ({nullable_key})\n)"
             ),
             format!(
                 "DELETE FROM {target} AS _rocky_target\n\
@@ -1388,6 +1398,38 @@ mod tests {
                     serde_json::json!("1000000000000000001"),
                     serde_json::json!("11")
                 ],
+            ],
+        );
+    }
+
+    #[test]
+    fn delete_insert_deduplicates_keys_using_the_target_collation() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (region VARCHAR, amount INT);
+             INSERT INTO tgt VALUES ('A', 10), ('a', 11), ('B', 12), ('b', 13);
+             CREATE TABLE incoming (region VARCHAR COLLATE NOCASE, amount INT);
+             INSERT INTO incoming VALUES ('A', 20), ('a', 21), ('B', 22);",
+        )
+        .unwrap();
+        for sql in dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["region".into()],
+            "SELECT region, amount FROM incoming",
+        ) {
+            conn.execute_statement(&sql).unwrap();
+        }
+        let rows = conn
+            .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![
+                vec![serde_json::json!("13")],
+                vec![serde_json::json!("20")],
+                vec![serde_json::json!("21")],
+                vec![serde_json::json!("22")],
             ],
         );
     }
