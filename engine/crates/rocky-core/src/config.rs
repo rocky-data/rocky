@@ -385,6 +385,13 @@ pub enum ConfigError {
     PolicyScopeEmpty { rule_index: usize },
 
     #[error(
+        "[policy] rules[{rule_index}] sets verify_after on a `run` rule — a one-step \
+         `rocky run` has no post-apply verification seam, so the checks would never \
+         run. Gate the two-step path with an `apply` rule instead"
+    )]
+    PolicyRunVerifyAfter { rule_index: usize },
+
+    #[error(
         "[policy] rules[{rule_index}] autonomy_budget.window = {window:?} is not a valid \
          duration — use a `<N>d` / `<N>h` span (e.g. \"7d\", \"24h\")"
     )]
@@ -4272,6 +4279,10 @@ pub enum PolicyCapability {
     Restore,
     /// Retry a failed run.
     Retry,
+    /// Build models in one step with `rocky run` (plan and apply fused, no
+    /// persisted plan). A sibling verb, not a refinement: only a rule naming
+    /// `run` matches it, so an `apply` rule never grants a one-step write.
+    Run,
     /// Quarantine a partition / model.
     Quarantine,
     /// An additive schema change (refinement of apply/promote).
@@ -4643,6 +4654,13 @@ pub struct PolicyConfig {
     /// Never read by any enforcement path — purely a testing surface.
     #[serde(default, rename = "tests", skip_serializing_if = "Vec::is_empty")]
     pub tests: Vec<PolicyTest>,
+    /// Set only by the `rocky run --branch` gate, never by config: an agent
+    /// with no matching rule is allowed instead of falling to
+    /// `default_agent_effect`, so only an explicit rule governs a run that
+    /// writes branch schemas (#2610). Not part of the `[policy]` surface.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub waive_default_posture: bool,
 }
 
 impl PolicyConfig {
@@ -4654,6 +4672,7 @@ impl PolicyConfig {
             default_agent_effect: PolicyEffect::RequireReview,
             rules: Vec::new(),
             tests: Vec::new(),
+            waive_default_posture: false,
         }
     }
 }
@@ -4679,6 +4698,9 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
         }
         if !rule.scope.any && !has_real {
             errors.push(ConfigError::PolicyScopeEmpty { rule_index: idx });
+        }
+        if rule.capability == PolicyCapability::Run && !rule.verify_after.is_empty() {
+            errors.push(ConfigError::PolicyRunVerifyAfter { rule_index: idx });
         }
         if let Some(budget) = &rule.autonomy_budget {
             if budget.failures == 0 {
@@ -11453,6 +11475,53 @@ effect = "deny"
             matches!(
                 errors.as_slice(),
                 [ConfigError::PolicyScopeEmpty { rule_index: 0 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    /// `run` is a sibling verb (#2610): it parses as `"run"`, and only a rule
+    /// naming `run` matches it. An `apply` rule was written for the two-step
+    /// path and must not grant a one-step write.
+    #[test]
+    fn run_capability_matches_only_run_rules() {
+        assert_eq!(
+            serde_json::to_string(&PolicyCapability::Run).unwrap(),
+            "\"run\""
+        );
+        assert!(PolicyCapability::Run.matches_input(PolicyCapability::Run));
+        assert!(!PolicyCapability::Run.is_refinement());
+        for other in [
+            PolicyCapability::Apply,
+            PolicyCapability::Promote,
+            PolicyCapability::Propose,
+            PolicyCapability::Retry,
+        ] {
+            assert!(!other.matches_input(PolicyCapability::Run), "{other:?}");
+            assert!(!PolicyCapability::Run.matches_input(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn policy_rejects_verify_after_on_a_run_rule() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "run"
+scope = { any = true }
+effect = "allow"
+verify_after = ["row_count_drift"]
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyRunVerifyAfter { rule_index: 0 }]
             ),
             "got {errors:?}"
         );

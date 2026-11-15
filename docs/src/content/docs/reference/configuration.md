@@ -1351,7 +1351,7 @@ Control what `rocky gc` is allowed to delete. Eviction is recorded, not destruct
 
 ## `[policy]`
 
-State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one of three effects. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) — `rocky apply`, branch promote, the MCP write tools, and drift auto-apply in `rocky run` when [`auto_apply_additive_drift`](#resilience) is on — and records every decision in the audit ledger. A run started by the native scheduler is a plain `rocky run` and is governed exactly like one; there is no `run` capability.
+State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one of three effects. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) — `rocky apply`, branch promote, the MCP write tools, `rocky run` run by an agent, and drift auto-apply in `rocky run` when [`auto_apply_additive_drift`](#resilience) is on — and records every decision in the audit ledger. A run started by the native scheduler is a plain `rocky run` and is governed exactly like one.
 
 :::caution[An absent block does not gate agents]
 With no `[policy]` block, the gate returns `NotConfigured` and allows the action whoever the principal is. Two surfaces differ. `rocky policy check` *predicts* against the safe default posture: agents on mutating actions require review, and humans are never gated. With no block, its prediction is stricter than what enforcement actually does. Drift auto-apply with `auto_apply_additive_drift = true` also governs as `require_review` with no block, so it refuses every drift change.
@@ -1369,6 +1369,16 @@ With no `[policy]` block, the gate returns `NotConfigured` and allows the action
 **Principals.** `"human"` is a person. `"agent"` is a non-human caller. In this version you supply the principal explicitly, for example `rocky policy check --principal agent`.
 
 **Capabilities.** `read` (always allowed), `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `quarantine`, plus three refinements of apply and promote: `schema_change.additive`, `schema_change.breaking`, and `value_change`. A rule naming `apply` or `promote` also matches those three refinements. Every other capability matches only itself, and a rule naming a refinement matches only that refinement.
+
+**The `run` capability.** An agent's `rocky run` is evaluated under `run`, one decision per model it builds and per replication table it copies, recorded under the ledger id `run:<run_id>`. Only a rule naming `run` matches it: an `apply` rule was written for the reviewed two-step path and never allows a one-step run. A human's run, or a project with no `[policy]` block, is not evaluated.
+
+| Verdict | What `rocky run` does |
+|---|---|
+| `allow` | Runs. |
+| `deny` | Refuses before any write, and exits 1. |
+| `require_review` | Records the verdict, warns, and runs. A one-step run has no plan to review, so this verdict is not enforced yet. Use `rocky plan` and `rocky apply <plan-id>` for a reviewed run. |
+
+A `rocky run --branch <name>` writes branch schemas, not production. `default_agent_effect` is not applied to it: only an explicit `run` rule governs it, so an agent can still build a branch and propose it with `rocky plan promote` under `default_agent_effect = "deny"`. A `run` rule cannot set `verify_after`: a one-step run has no post-apply check (V046).
 
 ### `[[policy.rules]]`
 

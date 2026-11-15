@@ -84,6 +84,7 @@ mod run_dag_exec;
 mod run_incremental;
 mod run_local;
 pub(crate) mod run_output_version;
+mod run_policy_gate;
 mod run_source_sync;
 pub(crate) mod run_source_volume;
 pub(crate) mod run_stored_bytes;
@@ -243,6 +244,7 @@ pub use run::{
     require_shadow_support_for_config, resolve_run_selection, run,
 };
 pub use run_dag_exec::{run_with_dag, run_with_dag_and_contracts};
+pub use run_policy_gate::DirectRunGate;
 pub use run_watch::run_watch as run_with_watch;
 pub use seed::run_seed;
 pub use serve::{resolve_serve_config_path, run_serve};

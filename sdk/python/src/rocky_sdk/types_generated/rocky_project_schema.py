@@ -1143,7 +1143,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability90(StrEnum):
+class PolicyCapability97(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -1151,7 +1151,7 @@ class PolicyCapability90(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability91(StrEnum):
+class PolicyCapability98(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -1159,7 +1159,7 @@ class PolicyCapability91(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability92(StrEnum):
+class PolicyCapability99(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -1167,7 +1167,7 @@ class PolicyCapability92(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability93(StrEnum):
+class PolicyCapability100(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -1175,7 +1175,7 @@ class PolicyCapability93(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability94(StrEnum):
+class PolicyCapability101(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -1183,7 +1183,7 @@ class PolicyCapability94(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability95(StrEnum):
+class PolicyCapability102(StrEnum):
     """
     Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).
     """
@@ -1191,7 +1191,7 @@ class PolicyCapability95(StrEnum):
     restore = "restore"
 
 
-class PolicyCapability96(StrEnum):
+class PolicyCapability103(StrEnum):
     """
     Retry a failed run.
     """
@@ -1199,7 +1199,15 @@ class PolicyCapability96(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability97(StrEnum):
+class PolicyCapability104(StrEnum):
+    """
+    Build models in one step with `rocky run` (plan and apply fused, no persisted plan). A sibling verb, not a refinement: only a rule naming `run` matches it, so an `apply` rule never grants a one-step write.
+    """
+
+    run = "run"
+
+
+class PolicyCapability105(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -1207,7 +1215,7 @@ class PolicyCapability97(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability98(StrEnum):
+class PolicyCapability106(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -1215,7 +1223,7 @@ class PolicyCapability98(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability99(StrEnum):
+class PolicyCapability107(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -1223,7 +1231,7 @@ class PolicyCapability99(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability100(StrEnum):
+class PolicyCapability108(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -1327,17 +1335,18 @@ class PolicyTest(BaseModel):
     )
     capability: (
         PolicyCapability
-        | PolicyCapability90
-        | PolicyCapability91
-        | PolicyCapability92
-        | PolicyCapability93
-        | PolicyCapability94
-        | PolicyCapability95
-        | PolicyCapability96
         | PolicyCapability97
         | PolicyCapability98
         | PolicyCapability99
         | PolicyCapability100
+        | PolicyCapability101
+        | PolicyCapability102
+        | PolicyCapability103
+        | PolicyCapability104
+        | PolicyCapability105
+        | PolicyCapability106
+        | PolicyCapability107
+        | PolicyCapability108
     )
     """
     The capability being attempted.
@@ -2579,17 +2588,18 @@ class PolicyRule(BaseModel):
     """
     capability: (
         PolicyCapability
-        | PolicyCapability90
-        | PolicyCapability91
-        | PolicyCapability92
-        | PolicyCapability93
-        | PolicyCapability94
-        | PolicyCapability95
-        | PolicyCapability96
         | PolicyCapability97
         | PolicyCapability98
         | PolicyCapability99
         | PolicyCapability100
+        | PolicyCapability101
+        | PolicyCapability102
+        | PolicyCapability103
+        | PolicyCapability104
+        | PolicyCapability105
+        | PolicyCapability106
+        | PolicyCapability107
+        | PolicyCapability108
     )
     """
     Which capability this rule governs.

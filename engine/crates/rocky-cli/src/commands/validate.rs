@@ -825,6 +825,10 @@ fn config_error_diagnostic(
         | ConfigError::PolicyScopeEmpty { rule_index } => {
             ("V046", Some(format!("policy.rules[{rule_index}].scope")))
         }
+        ConfigError::PolicyRunVerifyAfter { rule_index } => (
+            "V046",
+            Some(format!("policy.rules[{rule_index}].verify_after")),
+        ),
         ConfigError::PolicyBudgetInvalidWindow { rule_index, .. }
         | ConfigError::PolicyBudgetZeroFailures { rule_index, .. } => (
             "V046",

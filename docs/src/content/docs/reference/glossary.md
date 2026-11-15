@@ -189,7 +189,7 @@ Changing a table's columns over time without breaking the models that read it. R
 
 ### Seam
 
-A point where Rocky enforces a decision rather than only computing one. The mutating seams are `rocky apply`, branch promote, the MCP write tools, and drift auto-apply in `rocky run` when `auto_apply_additive_drift` is on. Those are exactly the points the `[policy]` plane gates. See [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
+A point where Rocky enforces a decision rather than only computing one. The mutating seams are `rocky apply`, branch promote, the MCP write tools, an agent's `rocky run` (the `run` capability), and drift auto-apply in `rocky run` when `auto_apply_additive_drift` is on. Those are exactly the points the `[policy]` plane gates. See [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
 
 ### Shadow mode
 

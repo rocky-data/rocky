@@ -27,7 +27,7 @@ use rocky_core::state_sync::DroppedSessionSink;
 
 use tokio_util::sync::CancellationToken;
 
-use super::run::{Interrupted, PartitionRunOptions, run};
+use super::run::{Interrupted, PartitionRunOptions};
 
 /// Debounce window: collect events for this long before triggering a re-run.
 /// Editor save bursts (e.g. vim's atomic-rename, vscode's two-phase write)
@@ -86,6 +86,9 @@ pub async fn run_watch(
     run_vars: &rocky_core::run_vars::RunVars,
     // Who is running (RV4-P1), handed to each iteration's `run()`.
     actor: &rocky_core::config::PrincipalRef,
+    // The direct-run policy gate (#2610). Each iteration is its own run and
+    // is gated on its own.
+    direct_gate: Option<&super::run_policy_gate::DirectRunGate>,
 ) -> Result<()> {
     // The watch loop logs iteration errors and keeps running. Refuse an
     // unusable Pipes channel before entering that loop.
@@ -324,6 +327,7 @@ pub async fn run_watch(
                 skip_opts,
                 run_vars,
                 actor,
+                direct_gate,
             ),
         )));
         let stop = tokio::select! {
@@ -458,6 +462,7 @@ pub async fn run_watch(
                     skip_opts,
                     run_vars,
                     actor,
+                    direct_gate,
                 ),
                 )));
                 let stop = tokio::select! {
@@ -766,6 +771,7 @@ async fn iter_once(
     skip_opts: &super::run::SkipRunOptions,
     run_vars: &rocky_core::run_vars::RunVars,
     actor: &rocky_core::config::PrincipalRef,
+    direct_gate: Option<&super::run_policy_gate::DirectRunGate>,
 ) -> IterOutcome {
     let started = std::time::Instant::now();
     // Load the config FRESH for THIS iteration — deliberately NEVER hoisted
@@ -792,7 +798,7 @@ async fn iter_once(
         }
     };
     let fingerprint = loaded.fingerprint.clone();
-    let result = run(
+    let result = super::run::run_with_direct_gate(
         config_path,
         loaded,
         filter,
@@ -821,13 +827,17 @@ async fn iter_once(
         run_vars,
         // `--watch` mints the usual timestamp run_id per iteration.
         None,
-        // `--watch` is a dev loop, never a governed two-step apply — no gate.
+        // `--watch` is a dev loop, never a governed two-step apply: its gate
+        // is the direct-run gate below.
         None,
         // `--assume-fresh-state` is not surfaced on the watch path (clap
         // rejects the combination at parse time).
         false,
         None, // #1460: dev watch loop, no persisted plan
+        None, // the project `contracts/` directory
         actor,
+        None, // no adapter registry override
+        direct_gate,
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();
@@ -1757,6 +1767,7 @@ mod tests {
             &super::super::run::SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             &rocky_core::config::PrincipalRef::unnamed(),
+            None,
         )
         .await
         .fingerprint
@@ -1820,6 +1831,7 @@ mod tests {
             &super::super::run::SkipRunOptions::default(),
             &vars,
             &rocky_core::config::PrincipalRef::unnamed(),
+            None,
         )
         .await;
         assert!(!outcome.interrupted);

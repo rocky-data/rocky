@@ -5,13 +5,17 @@
 //! `rocky audit` lists. A human under the same policy is never gated.
 //!
 //! ```text
-//!   path                          agent + deny        human + deny
-//!   run                           refused, 0 tables   3 tables
-//!   run --branch pr1              refused, 0 tables
-//!   run --dag                     refused, 0 tables
-//!   run --resume <id> (repl.)     refused by policy
+//!   path                          agent + deny          human + deny
+//!   run                           refused, 0 tables     3 tables
+//!   run --model / --dag           refused, 0 tables
 //!   run (replication)             refused, 0 tables
+//!   run --resume / --resume-latest refused, table not built
+//!   run --branch pr1              runs (branch schema): the default posture
+//!                                 is waived; only a `run` rule governs it
 //! ```
+//!
+//! `require_review` is recorded but not enforced in this change (a one-step
+//! run has no plan to review); an `apply` rule never matches a `run`.
 //!
 //! End-to-end through the real binary: the gap was in the CLI wiring (the
 //! `Run` arm never resolved the principal), which no unit test of the
@@ -103,11 +107,18 @@ fn transformation_project(dir: &Path, policy: &str) {
 }
 
 fn replication_project(dir: &Path, policy: &str) {
+    replication_project_with(dir, policy, "");
+}
+
+/// `extra` runs after the seed, e.g. to plant an object that fails a copy.
+fn replication_project_with(dir: &Path, policy: &str, extra: &str) {
     let conn = duckdb::Connection::open(dir.join("warehouse.duckdb")).expect("open duckdb");
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "CREATE SCHEMA raw__orders;
-         CREATE TABLE raw__orders.orders AS SELECT 1 AS id, 'a' AS name;",
-    )
+         CREATE TABLE raw__orders.orders AS SELECT 1 AS id, 'a' AS name;
+         CREATE TABLE raw__orders.returns AS SELECT 2 AS id;
+         {extra}"
+    ))
     .expect("seed source");
     drop(conn);
     fs::write(dir.join("rocky.toml"), format!("{REPLICATION}{policy}")).unwrap();
@@ -152,7 +163,11 @@ fn written_tables(dir: &Path) -> Vec<String> {
 /// The `run` decisions `rocky audit` lists, as `(model, effect)` pairs.
 fn run_decisions(dir: &Path) -> Vec<(String, String)> {
     let out = rocky(dir, &["--output", "json", "audit"]);
-    assert!(out.status.success(), "audit must succeed\n{}", describe(&out));
+    assert!(
+        out.status.success(),
+        "audit must succeed\n{}",
+        describe(&out)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("audit stdout is not JSON ({e})\n{}", describe(&out)));
     v["decisions"]
@@ -172,6 +187,11 @@ fn run_decisions(dir: &Path) -> Vec<(String, String)> {
 /// Assert an agent run under the deny policy was refused by the policy plane,
 /// wrote nothing, and left a `deny` decision in the ledger.
 fn assert_denied(dir: &Path, out: &Output, what: &str) {
+    assert_denied_from(dir, out, what, &[]);
+}
+
+/// [`assert_denied`] for a warehouse that already held `before`.
+fn assert_denied_from(dir: &Path, out: &Output, what: &str, before: &[&str]) {
     assert!(
         !out.status.success(),
         "{what}: a denied agent run must not exit 0\n{}",
@@ -185,7 +205,7 @@ fn assert_denied(dir: &Path, out: &Output, what: &str) {
     );
     assert_eq!(
         written_tables(dir),
-        Vec::<String>::new(),
+        before,
         "{what}: a denied run must write no table"
     );
     let decisions = run_decisions(dir);
@@ -241,14 +261,46 @@ fn deny_denies_an_agent_model_selection_run() {
     assert_denied(tmp.path(), &out, "run --model");
 }
 
+/// A branch run writes branch schemas, not production. The default posture
+/// is waived for it, so the documented agent flow (`run --branch`, then a
+/// gated `plan promote`) still works under `default_agent_effect = "deny"`.
+/// The verdict is still recorded, and an explicit `run` rule still decides.
 #[test]
-fn deny_denies_an_agent_branch_run() {
+fn an_agent_branch_run_is_governed_by_explicit_run_rules_only() {
     let tmp = tempfile::tempdir().unwrap();
     transformation_project(tmp.path(), DENY_POLICY);
     let created = rocky(tmp.path(), &["branch", "create", "pr1"]);
     assert!(created.status.success(), "{}", describe(&created));
-    let out = rocky(tmp.path(), &["--principal", "agent", "run", "--branch", "pr1"]);
-    assert_denied(tmp.path(), &out, "run --branch");
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--branch", "pr1"],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let tables = written_tables(tmp.path());
+    assert_eq!(tables.len(), 3, "{tables:?}");
+    assert!(
+        tables.iter().all(|t| !t.starts_with("main.")),
+        "a branch run must not write production: {tables:?}"
+    );
+    let decisions = run_decisions(tmp.path());
+    assert_eq!(decisions.len(), 3, "{decisions:?}");
+    assert!(decisions.iter().all(|(_, e)| e == "allow"), "{decisions:?}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(
+        tmp.path(),
+        &format!(
+            "{DENY_POLICY}\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"run\"\n\
+             effect = \"deny\"\nscope = {{ any = true }}\n"
+        ),
+    );
+    let created = rocky(tmp.path(), &["branch", "create", "pr1"]);
+    assert!(created.status.success(), "{}", describe(&created));
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--branch", "pr1"],
+    );
+    assert_denied(tmp.path(), &out, "run --branch under a deny run rule");
 }
 
 #[test]
@@ -267,17 +319,76 @@ fn deny_denies_an_agent_replication_run() {
     assert_denied(tmp.path(), &out, "replication run");
 }
 
+/// A resume is a replication write too. A human run fails one table (a
+/// view squats its target name); the squatter is removed; an agent's resume
+/// under the deny policy must still not build the table.
 #[test]
 fn deny_denies_an_agent_resume() {
-    let tmp = tempfile::tempdir().unwrap();
-    replication_project(tmp.path(), DENY_POLICY);
-    for args in [
-        ["--principal", "agent", "run", "--resume-latest"].as_slice(),
-        ["--principal", "agent", "run", "--resume", "run-0"].as_slice(),
-    ] {
-        let out = rocky(tmp.path(), args);
-        assert_denied(tmp.path(), &out, &format!("{args:?}"));
+    for flag in ["--resume-latest", "--resume"] {
+        let tmp = tempfile::tempdir().unwrap();
+        replication_project_with(
+            tmp.path(),
+            DENY_POLICY,
+            "CREATE SCHEMA staging__orders; CREATE VIEW staging__orders.returns AS SELECT 9 AS id;",
+        );
+        let first = rocky(tmp.path(), &["run"]);
+        assert!(
+            !first.status.success(),
+            "the seeded run must fail\n{}",
+            describe(&first)
+        );
+        let history = rocky(tmp.path(), &["--output", "json", "history"]);
+        let run_id = serde_json::from_slice::<serde_json::Value>(&history.stdout)
+            .ok()
+            .and_then(|v| v["runs"][0]["run_id"].as_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("history must list the failed run\n{}", describe(&history)));
+        let conn = duckdb::Connection::open(tmp.path().join("warehouse.duckdb")).unwrap();
+        conn.execute_batch("DROP VIEW staging__orders.returns")
+            .unwrap();
+        drop(conn);
+        assert_eq!(written_tables(tmp.path()), ["staging__orders.orders"]);
+
+        let mut args = vec!["--principal", "agent", "run", flag];
+        if flag == "--resume" {
+            args.push(&run_id);
+        }
+        let out = rocky(tmp.path(), &args);
+        assert_denied_from(tmp.path(), &out, flag, &["staging__orders.orders"]);
     }
+}
+
+/// An `apply` rule was written for the reviewed two-step path. It must not
+/// grant a one-step write.
+#[test]
+fn an_apply_rule_does_not_allow_a_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(
+        tmp.path(),
+        &format!(
+            "{DENY_POLICY}\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+             effect = \"allow\"\nscope = {{ any = true }}\n"
+        ),
+    );
+    let out = rocky(tmp.path(), &["--principal", "agent", "run"]);
+    assert_denied(tmp.path(), &out, "run under an apply allow rule");
+}
+
+/// `require_review` has no plan to review on a one-step run. This change
+/// records the verdict and lets the run proceed; refusing it waits on the
+/// owner.
+#[test]
+fn a_require_review_verdict_is_recorded_and_the_run_proceeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(tmp.path(), "\n[policy]\nversion = 1\n");
+    let out = rocky(tmp.path(), &["--principal", "agent", "run"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(written_tables(tmp.path()).len(), 3);
+    let decisions = run_decisions(tmp.path());
+    assert_eq!(decisions.len(), 3, "{decisions:?}");
+    assert!(
+        decisions.iter().all(|(_, e)| e == "require_review"),
+        "{decisions:?}"
+    );
 }
 
 #[test]

@@ -3628,9 +3628,78 @@ pub async fn run(
     .await
 }
 
-#[tracing::instrument(skip_all, name = "run", fields(run_id))]
+/// [`run_with_direct_gate`] with no direct-run policy gate: every caller
+/// that is not a CLI `rocky run` (the governed apply, internal re-runs, tests).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_explicit_contracts(
+    config_path: &Path,
+    loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
+    filter: Option<&str>,
+    pipeline_name_arg: Option<&str>,
+    state_path: &Path,
+    governance_override: Option<&GovernanceOverride>,
+    output_json: bool,
+    models_dir: Option<&Path>,
+    run_all: bool,
+    resume_run_id: Option<&str>,
+    resume_latest: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    partition_opts: &PartitionRunOptions,
+    model_name_filter: Option<&str>,
+    cache_ttl_override: Option<u64>,
+    idempotency_key: Option<&str>,
+    env: Option<&str>,
+    defer_opts: &DeferOptions,
+    skip_opts: &SkipRunOptions,
+    run_vars: &rocky_core::run_vars::RunVars,
+    run_id_override: Option<&str>,
+    governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
+    assume_fresh_state: bool,
+    reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+    contracts: Option<RunContracts<'_>>,
+    actor: &rocky_core::config::PrincipalRef,
+    registry_override: Option<&AdapterRegistry>,
+) -> Result<RunTermination> {
+    run_with_direct_gate(
+        config_path,
+        loaded,
+        filter,
+        pipeline_name_arg,
+        state_path,
+        governance_override,
+        output_json,
+        models_dir,
+        run_all,
+        resume_run_id,
+        resume_latest,
+        shadow_config,
+        partition_opts,
+        model_name_filter,
+        cache_ttl_override,
+        idempotency_key,
+        env,
+        defer_opts,
+        skip_opts,
+        run_vars,
+        run_id_override,
+        governed_ctx,
+        assume_fresh_state,
+        reviewed_source_state,
+        contracts,
+        actor,
+        registry_override,
+        None,
+    )
+    .await
+}
+
+/// The `rocky run` body. `direct_gate` is `Some` only for a CLI `rocky run`
+/// (plain, `--watch`, and `--dag` sub-runs): it gates the run under the
+/// `run` capability of the `[policy]` plane (#2610). It is never `Some`
+/// together with `governed_ctx`, whose plan gate already ran.
+#[tracing::instrument(skip_all, name = "run", fields(run_id))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_direct_gate(
     // Kept for directory resolution and sub-paths (models dir defaults,
     // hooks, the DAG replay) — NEVER re-read as a config: the parsed config
     // and its fingerprint arrive via `loaded` below.
@@ -3731,7 +3800,12 @@ pub async fn run_with_explicit_contracts(
     // one of them with an override is refused rather than silently bypassing
     // it — a test must never pass because a different path did the work.
     registry_override: Option<&AdapterRegistry>,
+    direct_gate: Option<&super::run_policy_gate::DirectRunGate>,
 ) -> Result<RunTermination> {
+    debug_assert!(
+        !(governed_ctx.is_some() && direct_gate.is_some()),
+        "a governed apply is gated by its plan; it must not also take the direct-run gate"
+    );
     // Refuse a broken Dagster Pipes launch before an idempotency claim, state
     // session, hook, or warehouse statement can run.
     crate::pipes::PipesEmitter::validate_requested()?;
@@ -3858,6 +3932,25 @@ pub async fn run_with_explicit_contracts(
     // The macro reserves the field at span entry with an empty value;
     // this call fills it in once minted.
     tracing::Span::current().record("run_id", run_id.as_str());
+
+    // The direct-run policy gate (#2610), before the idempotency claim and
+    // every state or warehouse write, so a denied run claims nothing.
+    let branch_run = shadow_config.is_some_and(|c| c.branch.is_some());
+    super::run_policy_gate::gate_pre_run(
+        direct_gate,
+        &loaded.config,
+        config_path,
+        state_path,
+        &run_id,
+        &super::run_policy_gate::RunSelection {
+            pipeline: pipeline_name_arg,
+            model: model_name_filter,
+            models_dir,
+            run_all,
+        },
+        branch_run,
+    )
+    .await?;
 
     // -------------------------------------------------------------------
     // Idempotency check + claim (before any state mutation / run_id mint).
@@ -5731,6 +5824,36 @@ pub async fn run_with_explicit_contracts(
             &state_store,
             rocky_cfg,
             &entry_marker_freezes,
+        )?;
+    }
+    // The direct-run counterpart (#2610): the same post-discovery target set,
+    // gated under `run` before any warehouse statement. Covers `--resume`
+    // and `--resume-latest`, which only this arm supports.
+    if direct_gate.is_some() {
+        let replication_targets: std::collections::BTreeSet<String> = connectors
+            .iter()
+            .filter(|conn| {
+                pattern.parse(&conn.schema).ok().is_some_and(|parsed| {
+                    parsed_filter.as_ref().is_none_or(|(k, v)| {
+                        matches_filter(conn, &parsed, k, v)
+                    })
+                })
+            })
+            .flat_map(|conn| {
+                conn.tables
+                    .iter()
+                    .flat_map(|t| shadow_gate_target_names(&t.name, shadow_config))
+            })
+            .collect();
+        super::run_policy_gate::enforce_replication_targets(
+            direct_gate,
+            rocky_cfg,
+            config_path,
+            &state_store,
+            &run_id,
+            &replication_targets,
+            &entry_marker_freezes,
+            shadow_config.is_some_and(|c| c.branch.is_some()),
         )?;
     }
 

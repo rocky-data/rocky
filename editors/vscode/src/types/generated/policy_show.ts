@@ -47,6 +47,7 @@ export type PolicyCapability =
   | "gc"
   | "restore"
   | "retry"
+  | "run"
   | "quarantine"
   | "schema_change.additive"
   | "schema_change.breaking"

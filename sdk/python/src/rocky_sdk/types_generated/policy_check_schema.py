@@ -8,7 +8,7 @@ from enum import StrEnum
 from pydantic import BaseModel, conint
 
 
-class PolicyCapability37(StrEnum):
+class PolicyCapability40(StrEnum):
     """
     Read model output / metadata. Always allowed.
     """
@@ -16,7 +16,7 @@ class PolicyCapability37(StrEnum):
     read = "read"
 
 
-class PolicyCapability38(StrEnum):
+class PolicyCapability41(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -24,7 +24,7 @@ class PolicyCapability38(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability39(StrEnum):
+class PolicyCapability42(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -32,7 +32,7 @@ class PolicyCapability39(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability40(StrEnum):
+class PolicyCapability43(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -40,7 +40,7 @@ class PolicyCapability40(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability41(StrEnum):
+class PolicyCapability44(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -48,7 +48,7 @@ class PolicyCapability41(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability42(StrEnum):
+class PolicyCapability45(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -56,7 +56,7 @@ class PolicyCapability42(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability43(StrEnum):
+class PolicyCapability46(StrEnum):
     """
     Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).
     """
@@ -64,7 +64,7 @@ class PolicyCapability43(StrEnum):
     restore = "restore"
 
 
-class PolicyCapability44(StrEnum):
+class PolicyCapability47(StrEnum):
     """
     Retry a failed run.
     """
@@ -72,7 +72,15 @@ class PolicyCapability44(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability45(StrEnum):
+class PolicyCapability48(StrEnum):
+    """
+    Build models in one step with `rocky run` (plan and apply fused, no persisted plan). A sibling verb, not a refinement: only a rule naming `run` matches it, so an `apply` rule never grants a one-step write.
+    """
+
+    run = "run"
+
+
+class PolicyCapability49(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -80,7 +88,7 @@ class PolicyCapability45(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability46(StrEnum):
+class PolicyCapability50(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -88,7 +96,7 @@ class PolicyCapability46(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability47(StrEnum):
+class PolicyCapability51(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -96,7 +104,7 @@ class PolicyCapability47(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability48(StrEnum):
+class PolicyCapability52(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -183,10 +191,7 @@ class PolicyCheckOutput(BaseModel):
     """
 
     capability: (
-        PolicyCapability37
-        | PolicyCapability38
-        | PolicyCapability39
-        | PolicyCapability40
+        PolicyCapability40
         | PolicyCapability41
         | PolicyCapability42
         | PolicyCapability43
@@ -195,6 +200,10 @@ class PolicyCheckOutput(BaseModel):
         | PolicyCapability46
         | PolicyCapability47
         | PolicyCapability48
+        | PolicyCapability49
+        | PolicyCapability50
+        | PolicyCapability51
+        | PolicyCapability52
     )
     """
     The capability that was checked.
