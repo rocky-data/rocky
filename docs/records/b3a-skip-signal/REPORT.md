@@ -135,7 +135,7 @@ Moving the gate onto commit identity changes public behaviour. It is out of scop
 
 ## Follow-ups
 
-The same whole-second truncation exists in other places. None is a skip decision, but each is lenient by up to one second:
+The same whole-second truncation exists in other places (#2621). None is a skip decision, but each is lenient by up to one second:
 
 - `engine/crates/rocky-fulfill/src/step.rs` (`lag.num_seconds() <= budget_seconds`)
 - `engine/crates/rocky-cli/src/commands/run.rs` (freshness lag; `unsigned_abs` also turns a future timestamp into lag)
@@ -155,7 +155,7 @@ A fresh read-only agent on Fable 5.2 reviewed the report, harness, data and engi
 | 5 | M1b shown by emulation, test covers only the helper | Fixed: wording, plus a test through `sig_unchanged` |
 | 6 | Signal lists omit M11 | Fixed |
 | 7 | Results table mixes two phases; commit cost not measured | Fixed: row and cost labelled |
-| 8 | Same truncation elsewhere | Recorded under "Follow-ups" |
+| 8 | Same truncation elsewhere | Recorded under "Follow-ups" and filed as #2621 |
 | 9 | Docs say "fewer than" N seconds; code uses `<=` | Fixed: docs, config doc comment and generated schemas now say "at most" |
 | 10 | Harness install line names `blake3`, which is unused | Fixed |
 | 11 | "Rocky reads it" reads as shipped behaviour | Fixed: "a gate built on it (proposed, B3b) would" |
