@@ -316,3 +316,230 @@ fn retry_failed_refuses_a_run_that_succeeded() {
         describe(&retry)
     );
 }
+
+const EDITED_STG_ORDERS: &str =
+    "select order_id, customer_id, status from main.raw_orders where order_id > 0";
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn retry_rebuilds_a_model_whose_sql_changed_since_it_succeeded() {
+    let dir = tempfile::tempdir().unwrap();
+    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    let first = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(!first.status.success(), "{}", describe(&first));
+    assert_eq!(status_of(&json(&first), "stg_orders"), "built");
+
+    // `stg_orders` succeeded in the failed run, but not with this SQL.
+    write_model(dir.path(), "stg_orders", EDITED_STG_ORDERS);
+    write_model(dir.path(), "zz_counts", FIXED_STATUS_COUNTS);
+    let retry = rocky(dir.path(), &["--output", "json", "run", "--retry-failed"]);
+    assert!(retry.status.success(), "{}", describe(&retry));
+    assert_eq!(
+        built(&json(&retry)),
+        ["customer_orders", "stg_orders", "zz_counts"],
+        "an edited model reruns even though its old build succeeded"
+    );
+}
+
+#[test]
+fn retry_rebuilds_the_downstream_of_a_rebuilt_model() {
+    let dir = tempfile::tempdir().unwrap();
+    // Contained: `stg_orders` and its dependent `customer_orders` both build,
+    // and the independent `zz_counts` fails.
+    project_with(dir.path(), CONTAIN, "zz_counts", BROKEN_STATUS_COUNTS);
+    let first = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(!first.status.success(), "{}", describe(&first));
+    let first = json(&first);
+    assert_eq!(status_of(&first, "stg_orders"), "built");
+    assert_eq!(status_of(&first, "customer_orders"), "built");
+
+    // Editing `stg_orders` leaves `customer_orders` byte-identical, yet it
+    // reads the rebuilt table, so it must rebuild too.
+    write_model(dir.path(), "stg_orders", EDITED_STG_ORDERS);
+    write_model(dir.path(), "zz_counts", FIXED_STATUS_COUNTS);
+    let retry = rocky(dir.path(), &["--output", "json", "run", "--retry-failed"]);
+    assert!(retry.status.success(), "{}", describe(&retry));
+    assert_eq!(
+        built(&json(&retry)),
+        ["customer_orders", "stg_orders", "zz_counts"]
+    );
+}
+
+#[test]
+fn contained_dependent_of_the_failing_model_is_skipped_upstream_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), CONTAIN, FIXED_STATUS_COUNTS);
+    write_model(
+        dir.path(),
+        "stg_orders",
+        "select order_id, customer_id, status from main.raw_orders where sum(order_id) > 0",
+    );
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(status_of(&v, "stg_orders"), "failed");
+    assert_eq!(status_of(&v, "status_counts"), "built");
+    let dependent = v["model_statuses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["model"] == "customer_orders")
+        .unwrap();
+    assert_eq!(dependent["status"], "skipped");
+    assert_eq!(dependent["reason"], "upstream_failed");
+    assert_eq!(dependent["blocked_by"], serde_json::json!(["stg_orders"]));
+}
+
+#[test]
+fn production_retry_ignores_a_newer_failed_shadow_run() {
+    let dir = tempfile::tempdir().unwrap();
+    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    let prod = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(!prod.status.success(), "{}", describe(&prod));
+    assert_eq!(status_of(&json(&prod), "stg_orders"), "built");
+
+    // A newer shadow run that fails on `stg_orders` instead. If the retry
+    // picked it, `stg_orders` would rerun.
+    write_model(
+        dir.path(),
+        "stg_orders",
+        "select order_id, customer_id, status from main.raw_orders where sum(order_id) > 0",
+    );
+    let shadow = rocky(dir.path(), &["--output", "json", "run", "--shadow"]);
+    assert!(!shadow.status.success(), "{}", describe(&shadow));
+    write_model(
+        dir.path(),
+        "stg_orders",
+        "select order_id, customer_id, status from main.raw_orders",
+    );
+    write_model(dir.path(), "zz_counts", FIXED_STATUS_COUNTS);
+
+    let retry = rocky(dir.path(), &["--output", "json", "run", "--retry-failed"]);
+    assert!(retry.status.success(), "{}", describe(&retry));
+    assert_eq!(
+        built(&json(&retry)),
+        ["customer_orders", "zz_counts"],
+        "the retry follows the production run, not the newer shadow run"
+    );
+
+    for flag in [&["--shadow"][..], &["--defer"], &["--defer-to", "x"]] {
+        let mut args = vec!["run", "--retry-failed"];
+        args.extend_from_slice(flag);
+        let out = rocky(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}\n{}", describe(&out));
+    }
+}
+
+#[test]
+fn retry_refuses_a_run_of_another_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), "", BROKEN_STATUS_COUNTS);
+    let mut config = fs::read_to_string(dir.path().join("rocky.toml")).unwrap();
+    config.push_str(
+        "\n[pipeline.other]\ntype = \"transformation\"\nmodels = \"other_models/**\"\n\n\
+         [pipeline.other.target]\n\n[pipeline.other.target.governance]\nauto_create_schemas = true\n",
+    );
+    fs::write(dir.path().join("rocky.toml"), config).unwrap();
+    let other_models = dir.path().join("other_models");
+    fs::create_dir_all(&other_models).unwrap();
+    fs::write(
+        other_models.join("solo.toml"),
+        "name = \"solo\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+         catalog = \"warehouse\"\nschema = \"main\"\ntable = \"solo\"\n",
+    )
+    .unwrap();
+    fs::write(other_models.join("solo.sql"), "select 1 as one").unwrap();
+
+    let other = rocky(
+        dir.path(),
+        &["--output", "json", "run", "--pipeline", "other"],
+    );
+    assert!(other.status.success(), "{}", describe(&other));
+    let other_id = json(&other)["run_id"].as_str().map(str::to_string);
+    let shop = rocky(
+        dir.path(),
+        &["--output", "json", "run", "--pipeline", "shop"],
+    );
+    assert!(!shop.status.success(), "{}", describe(&shop));
+
+    // The run id is not in the JSON; read it back from history.
+    let history = rocky(dir.path(), &["--output", "json", "history"]);
+    let history = json(&history);
+    let other_id = other_id.unwrap_or_else(|| {
+        history["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pipeline"] == "other")
+            .expect("the other pipeline's run")["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    });
+    let out = rocky(
+        dir.path(),
+        &["run", "--pipeline", "shop", "--retry-failed", &other_id],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        stderr(&out).contains("is not a production run of pipeline 'shop'"),
+        "{}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn retry_refuses_a_replication_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("rocky.toml"),
+        r#"
+[adapter]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+catalog_template = "warehouse"
+schema_template = "staging__{source}"
+"#,
+    )
+    .unwrap();
+    let out = rocky(dir.path(), &["run", "--retry-failed"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        stderr(&out).contains("reruns a transformation pipeline"),
+        "{}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn retry_refuses_a_remote_state_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    project(
+        dir.path(),
+        "\n[state]\nbackend = \"s3\"\ns3_bucket = \"rocky-test-never-contacted\"\n",
+        BROKEN_STATUS_COUNTS,
+    );
+    let out = rocky(dir.path(), &["run", "--retry-failed"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        stderr(&out).contains("run the failed models with --select"),
+        "{}",
+        describe(&out)
+    );
+}

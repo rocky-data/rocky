@@ -3980,6 +3980,21 @@ pub struct RunRecord {
     #[serde(default)]
     pub submission_id: Option<String>,
 
+    /// The failed run this run retried, set by `rocky run --retry-failed`.
+    ///
+    /// A retry builds only part of its pipeline, so it is not the pipeline's
+    /// delivery: [`StateStore::latest_successful_run`] and
+    /// [`StateStore::get_pipeline_duration_estimate`] skip it, which keeps a
+    /// retry from satisfying a schedule `after`/`freshness` demand or skewing
+    /// the duration estimate. `--retry-failed` itself still reads it, to see
+    /// that the latest run of the pipeline succeeded.
+    ///
+    /// Serde-defaulted and omitted when `None`, so a record without it is
+    /// byte-identical to an older one and an older record reads back `None` —
+    /// no `CURRENT_SCHEMA_VERSION` bump, as for `rocky_branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<String>,
+
     /// The check gate's severity-resolved verdict for this run (schema v25):
     /// `true` when at least one **error-severity** check failed (or could not
     /// be evaluated) **and** the pipeline's `[pipeline.<name>.checks]
@@ -5616,6 +5631,7 @@ impl StateStore {
             self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, usize::MAX, |run| {
                 if run.pipeline.as_deref() != Some(pipeline)
                     || !matches!(run.status, RunStatus::Success)
+                    || run.retry_of.is_some()
                     || !run.counts_as_production(unrecorded)
                 {
                     return None;
@@ -7858,6 +7874,7 @@ impl StateStore {
             let run: RunRecord = serde_json::from_slice(value.value())?;
             if run.pipeline.as_deref() == Some(pipeline)
                 && run.status == RunStatus::Success
+                && run.retry_of.is_none()
                 && run.counts_as_production(UnrecordedScope::Exclude)
                 && best
                     .as_ref()
@@ -11638,6 +11655,7 @@ pub fn run_with_output_versions(
         check_gate_failed: false,
         verify_after_failed: false,
         rocky_branch: None,
+        retry_of: None,
         run_scope: Some(RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),
@@ -12856,6 +12874,7 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -13262,6 +13281,36 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
         assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
         assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
+    }
+
+    /// `retry_of` is omitted when `None` and reads back `None` from a blob
+    /// without it, so adding it needs no schema bump. A retry is invisible to
+    /// the latest-successful-run and duration-estimate readers.
+    #[test]
+    fn retry_of_is_additive_and_hides_a_retry_from_delivery_readers() {
+        let plain = minimal_run_record("run-plain", vec![]);
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(
+            value.get("retry_of").is_none(),
+            "an unset retry_of is not serialized"
+        );
+        let back: RunRecord = serde_json::from_value(value).unwrap();
+        assert!(back.retry_of.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let mut full = minimal_run_record("run-full", vec![]);
+        full.pipeline = Some("shop".to_string());
+        full.run_scope = Some(RunScope::Production);
+        let mut retry = minimal_run_record("run-retry", vec![]);
+        retry.pipeline = Some("shop".to_string());
+        retry.run_scope = Some(RunScope::Production);
+        retry.retry_of = Some("run-full".to_string());
+        retry.finished_at = full.finished_at + chrono::Duration::hours(1);
+        store.record_run(&full).unwrap();
+        store.record_run(&retry).unwrap();
+        let latest = store.latest_successful_run("shop").unwrap().unwrap();
+        assert_eq!(latest.run_id, "run-full", "a retry is not the delivery");
     }
 
     /// A run record written before `output_volumes` existed, as the literal

@@ -433,6 +433,14 @@ class ModelRunStatusReason4(StrEnum):
     run_stopped = "run_stopped"
 
 
+class ModelRunStatusReason5(StrEnum):
+    """
+    A freeze on the model's scope held it back.
+    """
+
+    frozen = "frozen"
+
+
 class OverrideMatchCountOutput(BaseModel):
     """
     How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
@@ -1239,6 +1247,7 @@ class ModelRunStatusOutput(BaseModel):
         | ModelRunStatusReason2
         | ModelRunStatusReason3
         | ModelRunStatusReason4
+        | ModelRunStatusReason5
         | None
     ) = None
     """
@@ -1604,7 +1613,7 @@ class RunOutput(BaseModel):
     """
     model_statuses: list[ModelRunStatusOutput] | None = None
     """
-    What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation runs only.
+    What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`) only: a replication run, with or without models, never has it.
     """
     override_match_counts: list[OverrideMatchCountOutput] | None = None
     """

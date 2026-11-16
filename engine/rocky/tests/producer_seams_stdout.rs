@@ -106,6 +106,7 @@ fn seed_state(state_path: &Path) {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),

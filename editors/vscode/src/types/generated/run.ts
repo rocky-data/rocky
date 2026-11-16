@@ -134,7 +134,7 @@ export type ModelDecision = "build" | "skip" | "reused";
 /**
  * Why a model has status `skipped` or `not_started`.
  */
-export type ModelRunStatusReason = "unchanged" | "reused" | "upstream_failed" | "run_stopped";
+export type ModelRunStatusReason = "unchanged" | "reused" | "upstream_failed" | "run_stopped" | "frozen";
 /**
  * What happened to one model in a transformation run.
  */
@@ -244,7 +244,7 @@ export interface RunOutput {
    */
   model_decisions?: ModelDecisionOutput[];
   /**
-   * What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation runs only.
+   * What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`) only: a replication run, with or without models, never has it.
    */
   model_statuses?: ModelRunStatusOutput[];
   /**

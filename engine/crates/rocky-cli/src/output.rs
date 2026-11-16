@@ -394,6 +394,25 @@ pub struct RunOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) execution_set: Vec<(String, Vec<String>)>,
+    /// Models the executor held back without running them and without a
+    /// `contained` entry: descendants of a model that failed to compile or
+    /// whose function could not be created, and descendants of an open volume
+    /// breach. Each carries the direct upstreams that withheld it. Read by the
+    /// `model_statuses` roll-up. Not part of the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) withheld_models: std::collections::BTreeMap<String, Vec<String>>,
+    /// The freeze fence stopped the run at a layer boundary, so every model
+    /// not yet run was held back. Read by the `model_statuses` roll-up. Not
+    /// part of the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) frozen_stop: bool,
+    /// The failed run this run retried (`rocky run --retry-failed`), written
+    /// to the run record. Not part of the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) retry_of: Option<String>,
     /// `errors` index -> the model whose measurement in `failed_attempts`
     /// belongs to that entry. Matching by entry, never by name, so a
     /// replication table that shares a model's bare name gets nothing.
@@ -425,7 +444,9 @@ pub struct RunOutput {
     /// failed, skipped or never started. A roll-up of `materializations`,
     /// `errors`, `model_decisions` and `contained`; it changes none of them.
     /// Empty (and omitted) when every model was built, so a clean run is
-    /// unchanged on the wire. Transformation runs only.
+    /// unchanged on the wire. Transformation pipelines and model-only runs
+    /// (`--model`, `--select`, `--retry-failed`) only: a replication run, with
+    /// or without models, never has it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_statuses: Vec<ModelRunStatusOutput>,
     pub check_results: Vec<TableCheckOutput>,
@@ -1984,6 +2005,8 @@ pub enum ModelRunStatusReason {
     UpstreamFailed,
     /// The run stopped (a fail-fast stop, or an interrupt) before this model.
     RunStopped,
+    /// A freeze on the model's scope held it back.
+    Frozen,
 }
 
 /// One per-model entry on [`RunOutput::model_statuses`].
@@ -6698,6 +6721,9 @@ impl RunOutput {
             fail_fast_model: None,
             fail_fast_stopped_after: None,
             execution_set: Vec::new(),
+            withheld_models: Default::default(),
+            frozen_stop: false,
+            retry_of: None,
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
@@ -7165,6 +7191,7 @@ impl RunOutput {
             hostname: audit.hostname,
             rocky_version: audit.rocky_version,
             rocky_branch: audit.rocky_branch,
+            retry_of: self.retry_of.clone(),
             run_scope: Some(audit.run_scope),
             check_outcomes,
             pipeline: None,
@@ -7248,14 +7275,15 @@ impl RunOutput {
     /// classifies each one, first match wins:
     ///
     /// ```text
-    ///   failed        in error_models, or a compile-error entry of its own
-    ///   skipped       in `contained`            (upstream_failed + blocked_by)
-    ///   skipped       decision Skip / Reused    (unchanged / reused)
-    ///   built         has a materialization
-    ///   not_started   none of the above, and the run stopped or failed
+    ///   skipped  upstream_failed  in `contained` or `withheld_models`
+    ///   failed                    in error_models, or a compile-error entry
+    ///   skipped  unchanged/reused decision Skip / Reused
+    ///   built                     has a materialization
+    ///   skipped  frozen           the freeze fence stopped the run
+    ///   not_started run_stopped   the run was interrupted or stopped fail-fast
     /// ```
     ///
-    /// A model that matches nothing on a clean run is left out rather than
+    /// A model that matches nothing on any other run is left out rather than
     /// guessed. The list stays empty when every covered model was built.
     pub(crate) fn roll_up_model_statuses(&mut self) {
         self.model_statuses.clear();
@@ -7276,19 +7304,21 @@ impl RunOutput {
                     }),
             )
             .collect();
-        let run_ended_early =
-            self.interrupted || self.fail_fast_stopped_after.is_some() || self.tables_failed > 0;
+        let stopped = self.interrupted || self.fail_fast_stopped_after.is_some();
         let mut statuses = Vec::with_capacity(self.execution_set.len());
         for (model, asset_key) in &self.execution_set {
-            let contained = self.contained.iter().find(|c| &c.model == model);
+            let blocked_by = self
+                .contained
+                .iter()
+                .find(|c| &c.model == model)
+                .map(|c| c.blocked_by.clone())
+                .or_else(|| self.withheld_models.get(model).cloned());
             let decision = self.model_decisions.iter().find(|d| &d.model == model);
-            let (status, reason, blocked_by) = if let Some(contained) =
-                contained.filter(|_| !failed.contains(model.as_str()))
-            {
+            let (status, reason, blocked_by) = if let Some(blocked_by) = blocked_by {
                 (
                     ModelRunStatus::Skipped,
                     Some(ModelRunStatusReason::UpstreamFailed),
-                    contained.blocked_by.clone(),
+                    blocked_by,
                 )
             } else if failed.contains(model.as_str()) {
                 (ModelRunStatus::Failed, None, Vec::new())
@@ -7306,7 +7336,13 @@ impl RunOutput {
                 .any(|m| &m.asset_key == asset_key)
             {
                 (ModelRunStatus::Built, None, Vec::new())
-            } else if run_ended_early {
+            } else if self.frozen_stop {
+                (
+                    ModelRunStatus::Skipped,
+                    Some(ModelRunStatusReason::Frozen),
+                    Vec::new(),
+                )
+            } else if stopped {
                 (
                     ModelRunStatus::NotStarted,
                     Some(ModelRunStatusReason::RunStopped),
@@ -7357,6 +7393,7 @@ impl RunOutput {
                         Some(ModelRunStatusReason::UpstreamFailed) => {
                             format!("upstream failed: {}", s.blocked_by.join(", "))
                         }
+                        Some(ModelRunStatusReason::Frozen) => "frozen".to_string(),
                         Some(ModelRunStatusReason::RunStopped) | None => stopped_after(self),
                     };
                     lines.push(format!("  skipped: {} ({why})", s.model));

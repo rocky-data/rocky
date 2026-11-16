@@ -1076,7 +1076,10 @@ enum Command {
         /// Rerun the failed and never-built models of a failed transformation
         /// run. Without a value, the run is the latest of the pipeline (and
         /// `--branch`) that did not succeed; with one, that run. A model is
-        /// not rerun when the run built it with the SQL it has now. Refuses
+        /// not rerun when the run built it with the SQL it has now; the models
+        /// downstream of a rerun model are rerun too. A model the run skipped
+        /// as unchanged or reused is rebuilt. Retrying a failed retry rebuilds
+        /// the models the first run built. Needs a local `[state]` backend. Refuses
         /// when the run succeeded or nothing is left to retry. Not `--resume`:
         /// it re-selects models and keeps no checkpoint.
         #[arg(
@@ -1084,7 +1087,8 @@ enum Command {
             value_name = "RUN_ID",
             num_args = 0..=1,
             conflicts_with_all = [
-                "resume", "resume_latest", "watch", "dag", "model", "select", "exclude",
+                "resume", "resume_latest", "watch", "dag", "model", "select", "exclude", "shadow",
+                "shadow_schema", "defer", "defer_to", "defer_to_state", "defer_run_id",
             ],
         )]
         retry_failed: Option<Option<String>>,
@@ -4670,7 +4674,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // `--retry-failed` resolves to a model selection and the pipeline it
             // belongs to, then takes the same model-only path as `--select`.
             let mut pipeline = pipeline;
-            let mut retry_pipeline: Option<String> = None;
+            let mut retry_pipeline: Option<(String, String)> = None;
             let retry_selection = match retry_failed {
                 Some(run_id) => {
                     anyhow::ensure!(
@@ -4696,7 +4700,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     "retrying failed and unbuilt models"
                 );
                 pipeline = Some(retry.pipeline.clone());
-                retry_pipeline = Some(retry.pipeline);
+                retry_pipeline = Some((retry.pipeline, retry.run_id));
                 let mut set = retry.models;
                 if set.len() == 1 {
                     (set.pop_first(), None)
@@ -4898,7 +4902,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     run_id: defer_run_id,
                 }),
                 selected_models,
-                record_pipeline: retry_pipeline,
+                record_pipeline: retry_pipeline.as_ref().map(|(p, _)| p.clone()),
+                retry_of: retry_pipeline.map(|(_, id)| id),
                 ..Default::default()
             };
 

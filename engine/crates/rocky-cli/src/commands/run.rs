@@ -1355,6 +1355,9 @@ pub struct DeferOptions {
     /// retry reads it. `None` for every other model-only run, whose record
     /// names no pipeline.
     pub record_pipeline: Option<String>,
+    /// The failed run a `--retry-failed` run retries. Stamped on the run
+    /// record as `retry_of`; `None` for every other run.
+    pub retry_of: Option<String>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -4307,6 +4310,7 @@ pub(crate) async fn run_with_direct_gate(
             1, // concurrency
         );
         output.pipeline_type = Some("transformation".to_string());
+        output.retry_of = defer_opts.retry_of.clone();
         if let Some(ctx) = &idempotency_ctx {
             output.idempotency_key = Some(ctx.key.clone());
         }
@@ -14481,6 +14485,19 @@ async fn execute_models_phase(
             }
         }
     }
+    // The descendants of a model whose function failed were never run. Each
+    // one is withheld by the excluded models it reads directly.
+    for node in &compile_result.project.dag_nodes {
+        if newly_excluded.contains(&node.name) && !function_blocked.contains_key(&node.name) {
+            let blocked_by: Vec<String> = node
+                .depends_on
+                .iter()
+                .filter(|d| newly_excluded.contains(*d))
+                .cloned()
+                .collect();
+            output.withheld_models.insert(node.name.clone(), blocked_by);
+        }
+    }
     compile_excluded_models.extend(newly_excluded);
 
     // An open volume breach (#2581) holds its output failed. A run that does
@@ -14529,6 +14546,9 @@ async fn execute_models_phase(
             } else {
                 reasons.join(" ")
             };
+            output
+                .withheld_models
+                .insert(model.clone(), blocked_by.clone());
             output.tables_failed += 1;
             output.push_model_error(
                 crate::output::TableErrorOutput {
@@ -14802,6 +14822,7 @@ async fn execute_models_phase(
                 .await
         {
             withhold.note_on(output);
+            output.frozen_stop = true;
             output.tables_failed += 1;
             output.errors.push(crate::output::TableErrorOutput {
                 asset_key: vec!["<freeze>".to_string()],
@@ -27827,6 +27848,9 @@ auto_create_schemas = true
             fail_fast_model: None,
             fail_fast_stopped_after: None,
             execution_set: Vec::new(),
+            withheld_models: Default::default(),
+            frozen_stop: false,
+            retry_of: None,
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
@@ -44833,6 +44857,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47261,6 +47286,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47473,6 +47499,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47761,6 +47788,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -48761,6 +48789,7 @@ auto_create_schemas = true
                 check_gate_failed: false,
                 verify_after_failed: false,
                 rocky_branch: None,
+                retry_of: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
@@ -49079,6 +49108,7 @@ auto_create_schemas = true
                     check_gate_failed: false,
                     verify_after_failed: false,
                     rocky_branch: None,
+                    retry_of: None,
                     run_scope: Some(rocky_core::state::RunScope::Production),
                     queued_ms: None,
                     source_volumes: Vec::new(),

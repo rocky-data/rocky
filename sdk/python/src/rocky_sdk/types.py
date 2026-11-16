@@ -488,8 +488,8 @@ class ModelRunStatus(BaseModel):
     #: ``built``, ``failed``, ``skipped`` or ``not_started``.
     status: Literal["built", "failed", "skipped", "not_started"]
     #: Why the model was skipped or not started: ``unchanged``, ``reused``,
-    #: ``upstream_failed`` or ``run_stopped``. Omitted for built and failed.
-    reason: Literal["unchanged", "reused", "upstream_failed", "run_stopped"] | None = None
+    #: ``upstream_failed``, ``frozen`` or ``run_stopped``. Omitted for built and failed.
+    reason: Literal["unchanged", "reused", "upstream_failed", "frozen", "run_stopped"] | None = None
     #: For ``upstream_failed``: the failed or withheld upstream models.
     blocked_by: list[str] = Field(default_factory=list)
 
