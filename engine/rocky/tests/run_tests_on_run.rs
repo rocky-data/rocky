@@ -448,14 +448,8 @@ fn a_test_failure_is_recorded_for_a_model_whose_table_has_another_name() {
     assert_eq!(status_of(&json(&run), "customer_orders"), "failed");
 
     // The run record holds the failure, so `--retry-failed` reruns the
-    // model. A record that called it a success would leave nothing to retry.
-    write_model_to(
-        dir,
-        "customer_orders",
-        "orders_by_customer",
-        CLEAN,
-        UNIQUE_ERROR,
-    );
+    // model. Its SQL is unchanged, so only a recorded failure selects it: a
+    // record that called the build a success would skip it.
     let retry = rocky(
         dir,
         &[
@@ -464,7 +458,7 @@ fn a_test_failure_is_recorded_for_a_model_whose_table_has_another_name() {
             "run",
             "--retry-failed",
             "--tests",
-            "enforce",
+            "report",
         ],
     );
     assert!(retry.status.success(), "{}", describe(&retry));
