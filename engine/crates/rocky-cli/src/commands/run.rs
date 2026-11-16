@@ -13146,16 +13146,29 @@ fn adopt_contract_type_errors(
     executing: &mut rocky_compiler::compile::CompileResult,
     typed: rocky_compiler::compile::CompileResult,
 ) {
+    // `I003` and `E011` name the column in the same quoted form.
+    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
+    // Only an `E011` that replaces an `I003` of the executing compile crosses
+    // over. Any other `E011` the executing compile already has, or did not
+    // raise for a reason the describe does not settle; adopting it would
+    // duplicate an error or add one the run did not have (#2614).
+    let unchecked: BTreeSet<(String, Option<String>)> = executing
+        .contract_diagnostics
+        .iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::I003)
+        .map(|d| (d.model.clone(), column_of(&d.message)))
+        .collect();
     let new_errors: Vec<rocky_compiler::diagnostic::Diagnostic> = typed
         .contract_diagnostics
         .into_iter()
-        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::E011)
+        .filter(|d| {
+            d.code.as_ref() == rocky_compiler::diagnostic::E011
+                && unchecked.contains(&(d.model.clone(), column_of(&d.message)))
+        })
         .collect();
     if new_errors.is_empty() {
         return;
     }
-    // `I003` and `E011` name the column in the same quoted form.
-    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
     let resolved: BTreeSet<(String, Option<String>)> = new_errors
         .iter()
         .map(|d| (d.model.clone(), column_of(&d.message)))
@@ -13169,6 +13182,54 @@ fn adopt_contract_type_errors(
     executing.diagnostics.extend(new_errors.iter().cloned());
     executing.contract_diagnostics.extend(new_errors);
     executing.has_errors = true;
+}
+
+/// Drop each `E012` (a `nullable = false` contract on a nullable column) that
+/// the compile over the described sources does not reproduce (#2614).
+///
+/// An `E012` is dropped only when the described compile types that model's
+/// column as NOT NULL and raises no `E012` for it. A column the described
+/// compile does not type, or types as nullable, keeps its `E012`. This only
+/// ever removes errors, so a describe cannot refuse a run that passed before.
+fn drop_nullability_errors_the_describe_resolves(
+    executing: &mut rocky_compiler::compile::CompileResult,
+    typed: &rocky_compiler::compile::CompileResult,
+) {
+    use rocky_compiler::diagnostic::E012;
+    // `E012` names the column in quotes, like `I003` and `E011`.
+    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
+    let still_refused: BTreeSet<(String, Option<String>)> = typed
+        .contract_diagnostics
+        .iter()
+        .filter(|d| d.code.as_ref() == E012)
+        .map(|d| (d.model.clone(), column_of(&d.message)))
+        .collect();
+    let resolved = |d: &rocky_compiler::diagnostic::Diagnostic| {
+        if d.code.as_ref() != E012 {
+            return false;
+        }
+        let Some(column) = column_of(&d.message) else {
+            return false;
+        };
+        if still_refused.contains(&(d.model.clone(), Some(column.clone()))) {
+            return false;
+        }
+        typed
+            .type_check
+            .typed_models
+            .get(&d.model)
+            .and_then(|columns| columns.iter().find(|c| c.name == column))
+            .is_some_and(|c| !c.nullable)
+    };
+    let before = executing.diagnostics.len() + executing.contract_diagnostics.len();
+    executing.diagnostics.retain(|d| !resolved(d));
+    executing.contract_diagnostics.retain(|d| !resolved(d));
+    if executing.diagnostics.len() + executing.contract_diagnostics.len() != before {
+        executing.has_errors = executing
+            .diagnostics
+            .iter()
+            .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+    }
 }
 
 /// Move each `E059` the strict compile found into the compile that executes,
@@ -13203,9 +13264,9 @@ fn adopt_unchecked_contract_type_errors(
 }
 
 /// Describe the external sources behind each contract type the compile could
-/// not check.
+/// not check, and behind each `nullable = false` contract it refused.
 ///
-/// Starts from every model with an `I003` diagnostic and walks its upstream
+/// Starts from every model with an `I003` or `E012` diagnostic and walks its upstream
 /// models. Each upstream that is not a project model, has no known schema and
 /// is not satisfied outside the compile is described on `warehouse`. The
 /// result is keyed by the exact upstream name, which is how the type checker
@@ -13224,7 +13285,10 @@ async fn describe_sources_for_unchecked_contract_types(
     let mut pending: Vec<&str> = compile_result
         .diagnostics
         .iter()
-        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::I003)
+        .filter(|d| {
+            d.code.as_ref() == rocky_compiler::diagnostic::I003
+                || d.code.as_ref() == rocky_compiler::diagnostic::E012
+        })
         .map(|d| d.model.as_str())
         .collect();
     if pending.is_empty() {
@@ -13705,11 +13769,18 @@ async fn execute_models_phase(
     // contract types before any write. A governed apply replays its reviewed
     // source snapshot and never takes this path.
     //
-    // Only the second compile's `E011` (contract type mismatch) is kept. The
-    // first compile stays the one that executes, so the new source types
-    // cannot raise any other error and refuse a run that was valid before.
-    // Nullability is not taken from the describe either: some adapters
-    // report every column as nullable, which would be a false `E012`.
+    // Only the second compile's `E011` (contract type mismatch) for a type the
+    // first compile left unchecked (`I003`) is kept. The first compile stays
+    // the one that executes, so the new source types cannot raise any other
+    // error and refuse a run that was valid before.
+    //
+    // A `nullable = false` contract on a column read from such a source is
+    // refused with `E012`, because a column of unknown origin is nullable.
+    // Those sources are described too (#2614). The describe can only clear an
+    // `E012`, never raise one: it is dropped when the second compile infers
+    // the column as NOT NULL. Some adapters report every column as nullable;
+    // for them the `E012` stays, as it was. An adapter must report NOT NULL
+    // only where the warehouse enforces it on every row.
     let mut described_sources = std::collections::HashMap::new();
     if exec_fp_gate.is_none()
         && let Ok(first) = &mut compile
@@ -13726,6 +13797,7 @@ async fn execute_models_phase(
         typed_config.source_schemas.extend(described.clone());
         described_sources = described;
         if let Ok(typed) = run_compile(&typed_config) {
+            drop_nullability_errors_the_describe_resolves(first, &typed);
             adopt_contract_type_errors(first, typed);
         }
     }
@@ -37750,6 +37822,170 @@ backend = "local"
         result.expect("a clean run");
         assert!(output.errors.is_empty(), "no errors: {:?}", output.errors);
         assert_eq!(output.materializations.len(), 1);
+    }
+
+    /// Writes a model that reads the external source `src.orders`, a
+    /// `nullable = false` contract on `order_id` (plus `type = ...` when
+    /// `contract_type` is set), and the source table with `order_id`
+    /// declared `source_null`. No seed and no schema cache entry (#2614).
+    #[cfg(feature = "duckdb")]
+    fn described_nullability_fixture(
+        contract_type: Option<&str>,
+        source_null: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "fct", "SELECT order_id FROM src.orders");
+        let type_line = contract_type
+            .map(|t| format!("type = \"{t}\"\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            contracts.join("fct.contract.toml"),
+            format!("[[columns]]\nname = \"order_id\"\n{type_line}nullable = false\n"),
+        )
+        .expect("contract");
+        let conn =
+            rocky_duckdb::DuckDbConnector::open(&dir.path().join("t.duckdb")).expect("open db");
+        conn.execute_sql("CREATE SCHEMA src").expect("schema");
+        conn.execute_sql(&format!(
+            "CREATE TABLE src.orders (order_id BIGINT {source_null})"
+        ))
+        .expect("source");
+        conn.execute_sql("INSERT INTO src.orders VALUES (1)")
+            .expect("source row");
+        (dir, models)
+    }
+
+    /// #2614: a source column the warehouse reports as NOT NULL satisfies a
+    /// `nullable = false` contract, as `rocky compile` does from the seed.
+    /// Before the fix the run refused the model with `E012`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_takes_not_null_from_the_described_source() {
+        for contract_type in [Some("Int64"), None] {
+            let (dir, models) = described_nullability_fixture(contract_type, "NOT NULL");
+            let db_path = dir.path().join("t.duckdb");
+            let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+            result.expect("a clean run");
+            assert!(
+                output.errors.is_empty(),
+                "{contract_type:?}: no errors: {:?}",
+                output.errors
+            );
+            assert_eq!(output.materializations.len(), 1, "{contract_type:?}");
+        }
+    }
+
+    /// Control for the test above: a nullable source column keeps the
+    /// `E012`, and the model is not written.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_keeps_e012_when_the_described_source_is_nullable() {
+        for contract_type in [Some("Int64"), None] {
+            let (dir, models) = described_nullability_fixture(contract_type, "");
+            let db_path = dir.path().join("t.duckdb");
+            let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+            result.expect("the contract failure is carried in RunOutput");
+            assert!(
+                output.errors.iter().any(|e| e.error.contains("E012")),
+                "{contract_type:?}: E012 must stay: {:?}",
+                output.errors
+            );
+            assert!(output.materializations.is_empty(), "{contract_type:?}");
+        }
+    }
+
+    /// #2614 red team: a NOT NULL contract on a model two hops from the
+    /// source (contract on `fct`, which reads model `stg`, which reads the
+    /// source) is resolved too. In a model with two contracted columns, only
+    /// the column the warehouse reports NOT NULL is cleared.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_resolves_e012_through_an_upstream_model_per_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "stg", "SELECT order_id, note FROM src.orders");
+        write_plain_model(&models, "fct", "SELECT order_id, note FROM stg");
+        std::fs::write(
+            contracts.join("fct.contract.toml"),
+            "[[columns]]\nname = \"order_id\"\nnullable = false\n\n\
+             [[columns]]\nname = \"note\"\nnullable = false\n",
+        )
+        .expect("contract");
+        let db_path = dir.path().join("t.duckdb");
+        {
+            let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+            conn.execute_sql("CREATE SCHEMA src").expect("schema");
+            conn.execute_sql("CREATE TABLE src.orders (order_id BIGINT NOT NULL, note VARCHAR)")
+                .expect("source");
+        }
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+        let e012: Vec<&String> = output
+            .errors
+            .iter()
+            .filter(|e| e.error.contains("E012"))
+            .map(|e| &e.error)
+            .collect();
+        assert_eq!(e012.len(), 1, "one E012 remains: {:?}", output.errors);
+        assert!(e012[0].contains("'note'"), "{e012:?}");
+    }
+
+    /// #2614 red team: an `E011` the run already has (a literal of the wrong
+    /// type, no source involved) is not adopted a second time when another
+    /// model's `E012` makes the run describe a source.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_describe_for_e012_does_not_duplicate_an_existing_e011() {
+        let (dir, models) = described_nullability_fixture(None, "NOT NULL");
+        write_plain_model(&models, "lit", "SELECT CAST(TRUE AS BOOLEAN) AS id");
+        std::fs::write(
+            dir.path().join("contracts").join("lit.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\n",
+        )
+        .expect("contract");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+        let e011 = output
+            .errors
+            .iter()
+            .filter(|e| e.error.contains("E011"))
+            .count();
+        assert_eq!(e011, 1, "exactly one E011: {:?}", output.errors);
+        assert!(
+            !output.errors.iter().any(|e| e.error.contains("E012")),
+            "the described NOT NULL clears fct's E012: {:?}",
+            output.errors
+        );
+    }
+
+    /// A described NOT NULL source clears only the `E012`: a contract type
+    /// that does not match still refuses with `E011`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_described_not_null_source_still_checks_the_type() {
+        let (dir, models) = described_nullability_fixture(Some("String"), "NOT NULL");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+        assert!(
+            output.errors.iter().any(|e| e.error.contains("E011")),
+            "E011 must be raised: {:?}",
+            output.errors
+        );
+        assert!(
+            !output.errors.iter().any(|e| e.error.contains("E012")),
+            "E012 is resolved: {:?}",
+            output.errors
+        );
+        assert!(output.materializations.is_empty());
     }
 
     /// A `rocky run --dag` node prints only the error message, so a failed

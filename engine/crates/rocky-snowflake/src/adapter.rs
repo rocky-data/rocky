@@ -492,7 +492,10 @@ pub(crate) fn parse_describe_columns(result: &crate::connector::QueryResult) -> 
             nullable: row
                 .get(null_idx)
                 .and_then(|v| v.as_str())
-                .map(|s| s == "Y")
+                // Only an explicit `N` is NOT NULL: a value Rocky does not
+                // recognise must not clear a contract's nullability check
+                // (#2614).
+                .map(|s| !s.eq_ignore_ascii_case("N"))
                 .unwrap_or(true),
         })
         .collect()
