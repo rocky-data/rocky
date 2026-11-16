@@ -544,6 +544,9 @@ fn render_model_page(docs: &ProjectDocs, slugs: &Slugs, name: &str) -> String {
             if contract.no_new_nullable {
                 b.push_str("<tr><th>New nullable columns</th><td>refused</td></tr>\n");
             }
+            if contract.no_extra_columns {
+                b.push_str("<tr><th>Undeclared columns</th><td>refused</td></tr>\n");
+            }
             b.push_str("</tbody></table>\n");
             if !contract.columns.is_empty() {
                 b.push_str("<table><thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Description</th></tr></thead><tbody>\n");
@@ -777,6 +780,7 @@ mod tests {
                     required: vec!["id".into()],
                     protected: vec![],
                     no_new_nullable: true,
+                    no_extra_columns: true,
                 }),
                 ..ModelDetail::default()
             },
@@ -861,6 +865,7 @@ mod tests {
         assert!(page.contains("<code>updated_at</code>"));
         assert!(page.contains("Required columns"));
         assert!(page.contains("refused"), "no_new_nullable");
+        assert!(page.contains("Undeclared columns"), "no_extra_columns");
         assert!(page.contains("marts/orders.sql"));
         assert!(page.contains("../sources/raw.orders.html#col-id"));
         assert!(page.contains("../models/report.html#col-order_id"));

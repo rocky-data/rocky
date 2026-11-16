@@ -37,15 +37,30 @@ impl Dialect for DatabricksDialect {
     /// 15.8% of models unparseable and 12.3% of join sites invisible to any
     /// AST-based analysis (#1224).
     ///
-    /// `* REPLACE (…)` is deliberately NOT enabled alongside it. sqlparser
-    /// gates that separately (`supports_select_wildcard_replace`) and its
-    /// Databricks dialect leaves it off, enabling it only for BigQuery,
-    /// Snowflake, DuckDB and ClickHouse. Since `parse_sql` uses this one
-    /// dialect for every target warehouse, turning it on here would accept
-    /// `REPLACE` for Databricks models too — a widening this issue has no
-    /// evidence for. If a BigQuery corpus needs it, that is a per-target
-    /// dialect question rather than a flag to flip here.
+    /// `* EXCLUDE (…)` and `* REPLACE (…)` are enabled below (#2618).
     fn supports_select_wildcard_except(&self) -> bool {
+        true
+    }
+
+    /// `SELECT * EXCLUDE (a, b)` — DuckDB's and Snowflake's star-exclusion.
+    ///
+    /// `parse_sql` uses this one dialect for every target warehouse, so this
+    /// accepts `EXCLUDE` for a Databricks or BigQuery model too. That is
+    /// deliberate (#2618): refusing to parse a DuckDB model refused the whole
+    /// project, while a warehouse that lacks the syntax rejects it at run
+    /// time anyway. A project that sets `[portability] target_dialect` gets
+    /// a `P001` for it on a target without `EXCLUDE`. Every pass that expands
+    /// a star reads the exclusion (`rocky_sql::lineage::StarModifiers`).
+    fn supports_select_wildcard_exclude(&self) -> bool {
+        true
+    }
+
+    /// `SELECT * REPLACE (expr AS col)` — DuckDB, Snowflake and BigQuery.
+    ///
+    /// Same reasoning as `EXCLUDE` above; `P001` catches it on Databricks. A
+    /// replaced column keeps its name and position but not its source type,
+    /// so star expansion gives it no `Direct` lineage edge.
+    fn supports_select_wildcard_replace(&self) -> bool {
         true
     }
 }
@@ -53,6 +68,24 @@ impl Dialect for DatabricksDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2618: DuckDB's `* EXCLUDE` and `* REPLACE` parse, as `* EXCEPT` does.
+    /// Mutation that must turn this red: drop either dialect flag.
+    #[test]
+    fn star_exclude_and_replace_parse() {
+        for sql in [
+            "select * exclude (status) from main.raw_orders",
+            "SELECT * EXCLUDE status FROM t",
+            "SELECT t.* EXCLUDE (a, b) FROM t",
+            "SELECT * REPLACE (a + 1 AS a) FROM t",
+            "SELECT * EXCLUDE (b) REPLACE (a + 1 AS a) FROM t",
+            "WITH c AS (SELECT * EXCLUDE (x) FROM t) SELECT * FROM c",
+        ] {
+            crate::parser::parse_sql(sql).unwrap_or_else(|e| panic!("{sql:?} must parse: {e}"));
+        }
+        // `REPLACE` the function still parses as a function.
+        crate::parser::parse_sql("SELECT *, REPLACE(a, 'x', 'y') AS r FROM t").expect("function");
+    }
 
     /// #1224: `SELECT * EXCEPT (…)` is the single construct that accounted for
     /// 245 of 249 parse failures across a 1553-model real-world corpus.
