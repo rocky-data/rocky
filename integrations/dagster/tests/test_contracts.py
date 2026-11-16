@@ -278,6 +278,65 @@ def test_results_e014_maps_to_column_constraints():
     assert r.passed is False, "an E014 violation must fail the check, not pass silently"
 
 
+def test_discover_contract_rules_no_extra_columns_flag(tmp_path: Path):
+    """`no_extra_columns` alone turns the column-constraints check on (E063)."""
+    contract_file = tmp_path / "orders.contract.toml"
+    contract_file.write_text("[rules]\nno_extra_columns = true\n", encoding="utf-8")
+
+    result = discover_contract_rules(tmp_path)
+    assert result["orders"].has_column_constraints is True
+
+
+def test_results_e063_maps_to_column_constraints():
+    """E063 (no_extra_columns violated) fails the check instead of being dropped."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[_diag("E063", "orders", "output column 'n' is not declared")],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+    assert len(results) == 1
+    assert results[0].check_name == CONTRACT_COLUMN_CONSTRAINTS_CHECK
+    assert results[0].passed is False
+
+
+def test_results_e062_fails_a_declared_check():
+    """E062 (a constrained name repeated) fails a declared check, never passes.
+
+    A contract with only `required` has no column-constraints check, so E062
+    falls to the required-columns check.
+    """
+    asset_key = dg.AssetKey(["orders"])
+    for rules, expected in [
+        (
+            ContractRules(has_required=True, has_protected=False, has_column_constraints=True),
+            CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+        ),
+        (
+            ContractRules(has_required=True, has_protected=False, has_column_constraints=False),
+            CONTRACT_REQUIRED_COLUMNS_CHECK,
+        ),
+        (
+            ContractRules(has_required=False, has_protected=True, has_column_constraints=False),
+            CONTRACT_PROTECTED_COLUMNS_CHECK,
+        ),
+    ]:
+        results = list(
+            contract_check_results_from_diagnostics(
+                diagnostics=[_diag("E062", "orders", "2 columns called 'orders'")],
+                asset_key=asset_key,
+                model_name="orders",
+                rules=rules,
+            )
+        )
+        failed = [r for r in results if r.check_name == expected]
+        assert len(failed) == 1 and failed[0].passed is False, (rules, results)
+
+
 def test_results_e059_maps_to_column_constraints():
     """E059 (strict contracts: declared type not checkable) fails the check.
 
