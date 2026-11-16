@@ -3870,6 +3870,31 @@ impl RunRecord {
     }
 }
 
+/// One `[[tests]]` outcome recorded on a [`RunRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunTestRecord {
+    pub model: String,
+    pub test_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// `"error"` or `"warning"`.
+    pub severity: String,
+    /// `"pass"`, `"fail"`, or `"error"` (the test query could not run).
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl RunTestRecord {
+    /// Whether this outcome counts against the model: an error-severity test
+    /// that did not pass. A failure, a query that could not run, and any
+    /// status this binary does not know all block (fail closed), as they do
+    /// in the run under `tests_on_run = "enforce"`.
+    pub fn is_blocking(&self) -> bool {
+        self.severity != "warning" && self.status != "pass"
+    }
+}
+
 /// A complete pipeline run record.
 ///
 /// # Governance audit trail (schema v6)
@@ -3895,29 +3920,6 @@ impl RunRecord {
 /// is zero-touch at the storage layer: no in-place migration, no blob
 /// walk. A `test_v5_run_record_forward_deserializes_with_defaults` guard
 /// in this file pins the contract.
-/// One `[[tests]]` outcome recorded on a [`RunRecord`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RunTestRecord {
-    pub model: String,
-    pub test_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub column: Option<String>,
-    /// `"error"` or `"warning"`.
-    pub severity: String,
-    /// `"pass"`, `"fail"`, or `"error"` (the test query could not run).
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-impl RunTestRecord {
-    /// Whether this outcome counts against the model: an error-severity test
-    /// that failed, or whose query could not run (fail closed).
-    pub fn is_blocking(&self) -> bool {
-        self.severity == "error" && matches!(self.status.as_str(), "fail" | "error")
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
@@ -12917,6 +12919,24 @@ mod tests {
             output_volumes: Vec::new(),
             hold: None,
         }
+    }
+
+    /// A run record's `[[tests]]` outcomes survive the stored JSON form.
+    #[test]
+    fn a_run_record_with_test_results_round_trips() {
+        let mut record = minimal_run_record("run-tests", vec![]);
+        record.test_results = vec![RunTestRecord {
+            model: "orders".to_string(),
+            test_type: "unique".to_string(),
+            column: Some("id".to_string()),
+            severity: "error".to_string(),
+            status: "fail".to_string(),
+            detail: Some("2 duplicate value(s) found".to_string()),
+        }];
+        let bytes = serde_json::to_vec(&record).expect("serialize");
+        let back: RunRecord = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(back.test_results, record.test_results);
+        assert!(back.test_results[0].is_blocking());
     }
 
     /// v16 → v17 forward-compat: a `RunRecord` blob written before the

@@ -7023,17 +7023,33 @@ impl RunOutput {
             tracing::warn!("{summary}");
         }
 
-        // Models an `error` volume breach marks failed. Each execution is
-        // failed by its own check, so a time-interval model fails only the
-        // partitions that breached; the model's `errors` entry is not
-        // recorded again for any of them (see below).
-        let volume_failed: std::collections::BTreeSet<String> = self
+        // The Rocky model a materialization built. A transformation output
+        // carries its model in `output_target`; the asset key's last segment
+        // is the table name, which differs when `[target] table` is set.
+        fn mat_model(mat: &MaterializationOutput) -> &str {
+            mat.output_target.as_ref().map_or_else(
+                || mat.asset_key.last().map_or("<unknown>", String::as_str),
+                |target| target.model.as_str(),
+            )
+        }
+        // Models whose materialization below is recorded `failed`: an
+        // `error` volume breach, or a failing test under `tests_on_run =
+        // "enforce"`. Each execution is failed by its own check, so a
+        // time-interval model fails only the partitions that breached; the
+        // model's `errors` entry is not recorded again for any of them (see
+        // below). A model that failed with no materialization in this run
+        // keeps its `errors` entry, so the run record still holds a failed
+        // execution for it.
+        let failed_materialized: std::collections::BTreeSet<String> = self
             .materializations
             .iter()
-            .filter_map(|mat| mat.volume.as_ref())
-            .filter(|volume| volume.fails_the_build())
-            .map(|volume| volume.model.clone())
-            .chain(self.test_failed_models.iter().cloned())
+            .filter(|mat| {
+                mat.volume
+                    .as_ref()
+                    .is_some_and(VolumeCheckOutput::fails_the_build)
+                    || self.test_failed_models.contains(mat_model(mat))
+            })
+            .map(|mat| mat_model(mat).to_string())
             .collect();
         let output_volumes: Vec<rocky_core::state::OutputVolumeRecord> = self
             .materializations
@@ -7071,10 +7087,7 @@ impl RunOutput {
                     .volume
                     .as_ref()
                     .is_some_and(VolumeCheckOutput::fails_the_build)
-                    || mat
-                        .asset_key
-                        .last()
-                        .is_some_and(|m| self.test_failed_models.contains(m))
+                    || self.test_failed_models.contains(mat_model(mat))
                 {
                     "failed".to_string()
                 } else {
@@ -7137,9 +7150,9 @@ impl RunOutput {
             });
         }
 
-        // Models whose materializations above already record the volume
-        // failure (`volume_failed`). Their `errors` entry would be a
-        // second execution.
+        // Models whose materializations above already record the failure
+        // (`failed_materialized`). Their `errors` entry would be a second
+        // execution.
 
         for (idx, err) in self.errors.iter().enumerate() {
             // A run that stopped at its first failure reports one entry under
@@ -7153,7 +7166,7 @@ impl RunOutput {
                     .cloned()
                     .unwrap_or_else(|| "<unknown>".to_string())
             });
-            if volume_failed.contains(&model_name) {
+            if failed_materialized.contains(&model_name) {
                 continue;
             }
             // The retry loop's measurement for this model, when it ran

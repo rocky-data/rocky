@@ -10149,7 +10149,6 @@ mod tests {
         assert!(run("tests_on_run = \"always\"").is_err());
     }
 
-
     /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
     #[test]
     fn config_error_debug_prints_a_resolved_value_as_its_name() {

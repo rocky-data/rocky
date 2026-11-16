@@ -5,7 +5,7 @@
 //! outside `test.rs` because that module is built only with the `duckdb`
 //! feature and the run loop is not.
 
-use rocky_core::tests::{TestSeverity, TestType, generate_test_sql_with_dialect};
+use rocky_core::tests::{TestSeverity, TestType, generate_test_sql_for_table_ref};
 use rocky_core::traits::WarehouseAdapter;
 use tracing::warn;
 
@@ -15,10 +15,14 @@ use crate::output::DeclarativeTestResult;
 ///
 /// Shared by `rocky test --declarative` and `rocky run --tests`, so a test
 /// means the same thing in both.
+///
+/// The query reads the table as the dialect quotes it
+/// ([`rocky_core::traits::SqlDialect::format_table_ref`]), which is how the
+/// run wrote it. The result's `table` is the plain `catalog.schema.table`.
 pub(crate) async fn execute_one_test(
     test_decl: &rocky_core::tests::TestDecl,
     model_name: &str,
-    fq_table: &str,
+    target: &rocky_core::models::TargetConfig,
     adapter: &dyn WarehouseAdapter,
 ) -> DeclarativeTestResult {
     let test_type_name = test_type_label(&test_decl.test_type);
@@ -26,9 +30,19 @@ pub(crate) async fn execute_one_test(
         TestSeverity::Error => "error",
         TestSeverity::Warning => "warning",
     };
+    let fq_table = format!("{}.{}.{}", target.catalog, target.schema, target.table);
+    let fq_table = fq_table.as_str();
 
-    // Generate SQL.
-    let sql = match generate_test_sql_with_dialect(test_decl, fq_table, adapter.dialect()) {
+    // Generate SQL against the dialect-quoted reference.
+    let generated = adapter
+        .dialect()
+        .format_table_ref(&target.catalog, &target.schema, &target.table)
+        .map_err(|e| e.to_string())
+        .and_then(|table_ref| {
+            generate_test_sql_for_table_ref(test_decl, &table_ref, adapter.dialect())
+                .map_err(|e| e.to_string())
+        });
+    let sql = match generated {
         Ok(sql) => sql,
         Err(e) => {
             return DeclarativeTestResult {
@@ -83,7 +97,8 @@ pub(crate) async fn execute_one_test(
 
 /// Interpret the query result based on the test type.
 ///
-/// Returns `(status, detail)` where status is "pass" or "fail".
+/// Returns `(status, detail)` where status is "pass" or "fail", or "error"
+/// when a count cell cannot be read (fail closed, never a pass).
 fn interpret_result(
     test_type: &TestType,
     result: &rocky_core::traits::QueryResult,
@@ -98,7 +113,9 @@ fn interpret_result(
         | TestType::NotInFuture
         | TestType::OlderThanNDays { .. }
         | TestType::Aggregate { .. } => {
-            let count = first_row_count(result);
+            let Some(count) = first_row_count(result) else {
+                return unreadable_count(result);
+            };
             if count == 0 {
                 ("pass".to_string(), None)
             } else {
@@ -143,7 +160,9 @@ fn interpret_result(
 
         // row_count_range: SELECT COUNT(*) — pass when min <= count <= max
         TestType::RowCountRange { min, max } => {
-            let count = first_row_count(result);
+            let Some(count) = first_row_count(result) else {
+                return unreadable_count(result);
+            };
             let above_min = min.is_none_or(|lo| count >= lo);
             let below_max = max.is_none_or(|hi| count <= hi);
             let in_range = above_min && below_max;
@@ -166,17 +185,34 @@ fn interpret_result(
 }
 
 /// Extract the count from the first row's first column of a COUNT(*) query.
-fn first_row_count(result: &rocky_core::traits::QueryResult) -> u64 {
+///
+/// `None` when the cell is missing, NULL, negative, fractional or not a
+/// number. The caller reports that as status `error`, never as a pass.
+fn first_row_count(result: &rocky_core::traits::QueryResult) -> Option<u64> {
     result
         .rows
         .first()
         .and_then(|row| row.first())
         .and_then(|v| match v {
             serde_json::Value::Number(n) => n.as_u64(),
-            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
             _ => None,
         })
-        .unwrap_or(0)
+}
+
+/// The status and detail for a count cell that could not be read.
+fn unreadable_count(result: &rocky_core::traits::QueryResult) -> (String, Option<String>) {
+    let cell = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map_or_else(|| "no row".to_string(), ToString::to_string);
+    (
+        "error".to_string(),
+        Some(format!(
+            "the test query returned {cell}, not a non-negative whole count"
+        )),
+    )
 }
 
 /// Human-readable label for a test type.
@@ -195,5 +231,62 @@ fn test_type_label(tt: &TestType) -> &'static str {
         TestType::Composite { .. } => "composite",
         TestType::NotInFuture => "not_in_future",
         TestType::OlderThanNDays { .. } => "older_than_n_days",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interpret_result;
+    use rocky_core::tests::TestType;
+    use rocky_core::traits::QueryResult;
+    use serde_json::{Value, json};
+
+    fn one_cell(v: Value) -> QueryResult {
+        QueryResult {
+            columns: vec!["n".to_string()],
+            rows: vec![vec![v]],
+        }
+    }
+
+    #[test]
+    fn a_zero_count_passes_and_a_positive_count_fails() {
+        assert_eq!(
+            interpret_result(&TestType::NotNull, &one_cell(json!(0))).0,
+            "pass"
+        );
+        assert_eq!(
+            interpret_result(&TestType::NotNull, &one_cell(json!("0"))).0,
+            "pass"
+        );
+        assert_eq!(
+            interpret_result(&TestType::NotNull, &one_cell(json!(3))).0,
+            "fail"
+        );
+    }
+
+    #[test]
+    fn a_count_that_cannot_be_read_is_an_error_never_a_pass() {
+        let unreadable = [
+            one_cell(Value::Null),
+            one_cell(json!(-1)),
+            one_cell(json!(1.5)),
+            one_cell(json!("many")),
+            QueryResult {
+                columns: vec!["n".to_string()],
+                rows: vec![],
+            },
+        ];
+        for result in &unreadable {
+            for test_type in [
+                TestType::NotNull,
+                TestType::RowCountRange {
+                    min: None,
+                    max: None,
+                },
+            ] {
+                let (status, detail) = interpret_result(&test_type, result);
+                assert_eq!(status, "error", "{result:?} {detail:?}");
+            }
+        }
     }
 }

@@ -407,6 +407,21 @@ pub fn generate_test_sql_with_dialect(
     generate_test_sql_inner(test, table, Some(dialect))
 }
 
+/// Like [`generate_test_sql_with_dialect`], for a table reference the dialect
+/// already rendered with [`crate::traits::SqlDialect::format_table_ref`].
+///
+/// That reference is quoted and validated as the warehouse writes it, so it
+/// is used verbatim and not split on `.`. Use this to test the exact table a
+/// run wrote: on a dialect that quotes (Snowflake), an unquoted
+/// `catalog.schema.table` names a different object.
+pub fn generate_test_sql_for_table_ref(
+    test: &TestDecl,
+    table_ref: &str,
+    dialect: &dyn crate::traits::SqlDialect,
+) -> Result<String, TestGenError> {
+    generate_test_sql_unchecked_table(test, table_ref, Some(dialect))
+}
+
 fn generate_test_sql_inner(
     test: &TestDecl,
     table: &str,
@@ -418,7 +433,16 @@ fn generate_test_sql_inner(
     for part in table.split('.') {
         validation::validate_identifier(part)?;
     }
+    generate_test_sql_unchecked_table(test, table, dialect)
+}
 
+/// The generator body. `table` is trusted: the caller validated it (see
+/// [`generate_test_sql_inner`]) or a dialect rendered it.
+fn generate_test_sql_unchecked_table(
+    test: &TestDecl,
+    table: &str,
+    dialect: Option<&dyn crate::traits::SqlDialect>,
+) -> Result<String, TestGenError> {
     // Optional per-check `filter` applies to every kind by prefixing the
     // row-level WHERE clause. Unique / Relationships / RowCountRange
     // weave it in differently (see each arm).

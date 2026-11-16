@@ -46,13 +46,18 @@ const UNIQUE_WARNING: &str =
     "\n[[tests]]\ntype = \"unique\"\ncolumn = \"customer_id\"\nseverity = \"warning\"\n";
 
 fn write_model(dir: &Path, name: &str, sql: &str, extra_toml: &str) {
+    write_model_to(dir, name, name, sql, extra_toml);
+}
+
+/// A model whose `[target] table` is `table`, not its name.
+fn write_model_to(dir: &Path, name: &str, table: &str, sql: &str, extra_toml: &str) {
     let models = dir.join("models");
     fs::create_dir_all(&models).unwrap();
     fs::write(
         models.join(format!("{name}.toml")),
         format!(
             "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\n\
-             catalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n{extra_toml}"
+             catalog = \"warehouse\"\nschema = \"main\"\ntable = \"{table}\"\n{extra_toml}"
         ),
     )
     .unwrap();
@@ -284,6 +289,14 @@ fn promote_refuses_a_branch_whose_newest_run_failed_a_test() {
         ],
     );
     assert!(!run.status.success(), "{}", describe(&run));
+    // The branch table was tested and failed on its data: `fail`, not an
+    // `error` from reading a table that does not exist.
+    assert_eq!(
+        test_result(&json(&run), "customer_orders")["status"],
+        "fail",
+        "{}",
+        describe(&run)
+    );
 
     let refused = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
     assert!(!refused.status.success(), "{}", describe(&refused));
@@ -355,4 +368,158 @@ fn promote_warns_but_proceeds_when_the_branch_has_no_run() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no recorded run"), "{}", describe(&out));
     assert!(plan_texts(dir)[0].contains("test_evidence_missing"));
+}
+
+#[test]
+fn a_newer_branch_run_of_other_models_does_not_mask_a_failing_test() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir, "", FAN_OUT, UNIQUE_ERROR);
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    let failing = rocky(
+        dir,
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "enforce",
+        ],
+    );
+    assert!(!failing.status.success(), "{}", describe(&failing));
+    // A newer, successful branch run that does not touch customer_orders.
+    let other = rocky(
+        dir,
+        &[
+            "--output",
+            "json",
+            "run",
+            "--branch",
+            "pr1",
+            "--model",
+            "status_counts",
+        ],
+    );
+    assert!(other.status.success(), "{}", describe(&other));
+
+    let refused = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
+    assert!(!refused.status.success(), "{}", describe(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("customer_orders"),
+        "{}",
+        describe(&refused)
+    );
+    assert!(plan_texts(dir).is_empty());
+
+    // Fixing the data and recording a passing test clears it.
+    write_model(dir, "customer_orders", CLEAN, UNIQUE_ERROR);
+    let fixed = rocky(
+        dir,
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "enforce",
+        ],
+    );
+    assert!(fixed.status.success(), "{}", describe(&fixed));
+    let ok = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
+    assert!(ok.status.success(), "{}", describe(&ok));
+    assert!(
+        !String::from_utf8_lossy(&ok.stderr).contains("WARNING"),
+        "{}",
+        describe(&ok)
+    );
+}
+
+#[test]
+fn a_test_failure_is_recorded_for_a_model_whose_table_has_another_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir, "", FAN_OUT, UNIQUE_ERROR);
+    write_model_to(
+        dir,
+        "customer_orders",
+        "orders_by_customer",
+        FAN_OUT,
+        UNIQUE_ERROR,
+    );
+    write_model(
+        dir,
+        "customer_summary",
+        "select customer_id from orders_by_customer",
+        "",
+    );
+    let run = rocky(dir, &["--output", "json", "run", "--tests", "enforce"]);
+    assert!(!run.status.success(), "{}", describe(&run));
+    assert_eq!(status_of(&json(&run), "customer_orders"), "failed");
+
+    // The run record holds the failure, so `--retry-failed` reruns the
+    // model. A record that called it a success would leave nothing to retry.
+    write_model_to(
+        dir,
+        "customer_orders",
+        "orders_by_customer",
+        CLEAN,
+        UNIQUE_ERROR,
+    );
+    let retry = rocky(
+        dir,
+        &[
+            "--output",
+            "json",
+            "run",
+            "--retry-failed",
+            "--tests",
+            "enforce",
+        ],
+    );
+    assert!(retry.status.success(), "{}", describe(&retry));
+    assert!(
+        built(&json(&retry)).contains(&"orders_by_customer".to_string()),
+        "{}",
+        describe(&retry)
+    );
+}
+
+#[test]
+fn promote_names_an_untested_model_whose_table_has_another_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir, "", FAN_OUT, UNIQUE_ERROR);
+    write_model_to(
+        dir,
+        "customer_orders",
+        "orders_by_customer",
+        FAN_OUT,
+        UNIQUE_ERROR,
+    );
+    write_model(
+        dir,
+        "customer_summary",
+        "select customer_id from orders_by_customer",
+        "",
+    );
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    let run = rocky(dir, &["--output", "json", "run", "--branch", "pr1"]);
+    assert!(run.status.success(), "{}", describe(&run));
+
+    let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("customer_orders (run "),
+        "{}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn a_test_that_cannot_run_fails_closed_under_enforce() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // The column does not exist, so the test query errors.
+    project(
+        dir,
+        "",
+        CLEAN,
+        "\n[[tests]]\ntype = \"not_null\"\ncolumn = \"no_such_column\"\n",
+    );
+    let out = rocky(dir, &["--output", "json", "run", "--tests", "enforce"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(test_result(&v, "customer_orders")["status"], "error", "{v}");
+    assert_eq!(status_of(&v, "customer_orders"), "failed", "{v}");
 }

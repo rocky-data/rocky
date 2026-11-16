@@ -3528,8 +3528,8 @@ impl std::fmt::Display for PromoteBlockedByBreakingChanges {
 
 impl std::error::Error for PromoteBlockedByBreakingChanges {}
 
-/// Error returned by [`build_promote_plan_inner`] when the branch's newest run
-/// recorded an error-severity test that failed or could not run, and
+/// Error returned by [`build_promote_plan_inner`] when the branch's test
+/// evidence holds an error-severity test that failed or could not run, and
 /// `--allow-failing-tests` was not set (#2609). The plan is NOT written.
 ///
 /// Carries the recorded failures plus the partial audit (whose last entry is
@@ -3538,8 +3538,7 @@ impl std::error::Error for PromoteBlockedByBreakingChanges {}
 #[derive(Debug)]
 pub(crate) struct PromoteBlockedByFailingTests {
     pub branch: String,
-    pub run_id: String,
-    pub failures: Vec<rocky_core::state::RunTestRecord>,
+    pub failures: Vec<PromoteTestFailure>,
     pub audit: Vec<AuditEvent>,
     pub approvals_used: Vec<ApprovalArtifact>,
     pub approvals_rejected: Vec<RejectedApproval>,
@@ -3551,11 +3550,10 @@ impl std::fmt::Display for PromoteBlockedByFailingTests {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "promote plan blocked by {} failing test(s) recorded by run {} on branch '{}': {}. \
+            "promote plan blocked by {} failing test(s) recorded on branch '{}': {}. \
              Fix the data and re-run `rocky run --branch {} --tests enforce`, or re-run with \
              `--allow-failing-tests` to override.",
             self.failures.len(),
-            self.run_id,
             self.branch,
             describe_failing_tests(&self.failures),
             self.branch,
@@ -3565,126 +3563,179 @@ impl std::fmt::Display for PromoteBlockedByFailingTests {
 
 impl std::error::Error for PromoteBlockedByFailingTests {}
 
-fn describe_failing_tests(failures: &[rocky_core::state::RunTestRecord]) -> String {
+/// One blocking test outcome and the run that recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromoteTestFailure {
+    pub run_id: String,
+    pub test: rocky_core::state::RunTestRecord,
+}
+
+fn describe_failing_tests(failures: &[PromoteTestFailure]) -> String {
     failures
         .iter()
-        .map(|t| {
+        .map(|f| {
+            let t = &f.test;
             let column = t
                 .column
                 .as_deref()
                 .map(|c| format!(".{c}"))
                 .unwrap_or_default();
             format!(
-                "{}{column} [{}] {}{}",
+                "{}{column} [{}] {}{} in run {}",
                 t.model,
                 t.test_type,
                 t.status,
                 t.detail
                     .as_deref()
                     .map(|d| format!(" ({d})"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                f.run_id,
             )
         })
         .collect::<Vec<_>>()
         .join("; ")
 }
 
-/// What the branch's newest run says about its `[[tests]]`.
+/// What the branch's runs say about its `[[tests]]`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PromoteTestEvidence {
-    /// The newest run's id, when the branch has a run.
-    pub run_id: Option<String>,
-    /// Recorded error-severity tests that failed or could not run. These
-    /// refuse the promote.
-    pub failures: Vec<rocky_core::state::RunTestRecord>,
+    /// Error-severity tests that did not pass, in each model's current
+    /// evidence. These refuse the promote.
+    pub failures: Vec<PromoteTestFailure>,
     /// Gaps in the evidence. These warn and never refuse.
     pub warnings: Vec<String>,
 }
 
-/// Read the branch's newest run and decide what its test evidence means for a
-/// promote. `error_test_models` are the models that declare at least one
-/// error-severity `[[tests]]` entry.
+/// Decide what the branch's runs mean for a promote.
 ///
-/// Only a recorded failure refuses (#2609 case ii). Three gaps only warn: the
-/// newest run failed (i), a model that declares error-severity tests was built
-/// by that run with no recorded result (iii), and the branch has no run (iv).
-/// Refusing on (i), (iii) or (iv) is a separate change that waits on the
-/// owner's decision: every project that does not run tests on its branch runs
-/// would start to be refused.
+/// `runs_newest_first` are the branch's runs since the branch was created,
+/// skipped runs left out. `error_test_models` are the models that declare at
+/// least one error-severity `[[tests]]` entry.
+///
+/// Evidence is per model, not per run. For each model, the newest run that
+/// either recorded a test result for it or built it successfully decides:
+///
+/// - test results recorded: a blocking one refuses the promote (#2609 case
+///   ii);
+/// - built with no test result: the old results no longer describe the
+///   table, so nothing refuses, and a model with error-severity tests gets a
+///   warning (case iii).
+///
+/// A failed build does not replace the table, so it does not hide an older
+/// recorded failure. A newer run that did not touch a model (another model,
+/// another pipeline) leaves that model's evidence as it was.
+///
+/// Two more gaps only warn: the newest run did not succeed (case i), and the
+/// branch has no run (case iv). Refusing on (i), (iii) or (iv) is a separate
+/// change that waits on the owner's decision: every project that does not run
+/// tests on its branch runs would start to be refused.
 pub(crate) fn assess_branch_test_evidence(
     branch: &str,
-    newest_run: Option<&rocky_core::state::RunRecord>,
+    runs_newest_first: &[rocky_core::state::RunRecord],
     error_test_models: &std::collections::BTreeSet<String>,
 ) -> PromoteTestEvidence {
     use rocky_core::state::RunStatus;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    let Some(run) = newest_run else {
+    let Some(newest) = runs_newest_first.first() else {
         return PromoteTestEvidence {
-            run_id: None,
             failures: Vec::new(),
             warnings: vec![format!(
                 "branch '{branch}' has no recorded run, so there is no test evidence for it"
             )],
         };
     };
-    let failures: Vec<_> = run
-        .test_results
-        .iter()
-        .filter(|t| t.is_blocking())
-        .cloned()
-        .collect();
     let mut warnings = Vec::new();
-    if matches!(run.status, RunStatus::Failure | RunStatus::PartialFailure) {
+    if matches!(
+        newest.status,
+        RunStatus::Failure | RunStatus::PartialFailure
+    ) {
         warnings.push(format!(
             "the newest run of branch '{branch}' ({}) did not succeed ({:?})",
-            run.run_id, run.status
+            newest.run_id, newest.status
         ));
     }
-    let mut untested: Vec<&str> = run
-        .models_executed
-        .iter()
-        .filter(|m| m.status == "success" && error_test_models.contains(&m.model_name))
-        .filter(|m| !run.test_results.iter().any(|t| t.model == m.model_name))
-        .map(|m| m.model_name.as_str())
-        .collect();
-    untested.sort_unstable();
-    untested.dedup();
+
+    let mut decided: BTreeSet<String> = BTreeSet::new();
+    let mut failures = Vec::new();
+    // Model -> the run that built it with no test result.
+    let mut untested: BTreeMap<String, String> = BTreeMap::new();
+    for run in runs_newest_first {
+        let tested: BTreeSet<&str> = run.test_results.iter().map(|t| t.model.as_str()).collect();
+        for model in &tested {
+            if decided.contains(*model) {
+                continue;
+            }
+            failures.extend(
+                run.test_results
+                    .iter()
+                    .filter(|t| t.model == *model && t.is_blocking())
+                    .map(|t| PromoteTestFailure {
+                        run_id: run.run_id.clone(),
+                        test: t.clone(),
+                    }),
+            );
+        }
+        for model in &tested {
+            decided.insert((*model).to_string());
+        }
+        for exec in &run.models_executed {
+            let model = exec.rocky_model_name();
+            if exec.status != "success" || decided.contains(model) {
+                continue;
+            }
+            decided.insert(model.to_string());
+            if error_test_models.contains(model) {
+                untested.insert(model.to_string(), run.run_id.clone());
+            }
+        }
+    }
     if !untested.is_empty() {
+        let list = untested
+            .iter()
+            .map(|(model, run_id)| format!("{model} (run {run_id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
         warnings.push(format!(
-            "run {} built model(s) that declare error-severity tests but recorded no test \
-             result for them: {}. Run with `--tests report` or `--tests enforce` to record them",
-            run.run_id,
-            untested.join(", ")
+            "model(s) that declare error-severity tests were last built with no recorded \
+             test result: {list}. Run with `--tests report` or `--tests enforce` to record them"
         ));
     }
-    PromoteTestEvidence {
-        run_id: Some(run.run_id.clone()),
-        failures,
-        warnings,
-    }
+    PromoteTestEvidence { failures, warnings }
 }
 
 /// The models that declare at least one error-severity `[[tests]]` entry,
-/// across the project's transformation pipelines. Best effort: a project whose
-/// models cannot be loaded contributes none, so the "built but not tested"
-/// warning stays silent rather than refusing or guessing.
+/// across the project's transformation pipelines.
+///
+/// # Errors
+///
+/// A message when the models cannot all be loaded: a load error, or a
+/// pipeline whose models directory does not exist. The caller warns with it;
+/// it never refuses the promote and never reads as "no tested models".
 fn models_with_error_tests(
     config_path: &Path,
     cfg: &rocky_core::config::RockyConfig,
-) -> std::collections::BTreeSet<String> {
-    let Ok(loaded) = crate::models_loader::load_transformation_models(config_path, cfg) else {
-        return Default::default();
-    };
-    crate::models_loader::union_by_model_name(&loaded.by_pipeline)
-        .into_iter()
-        .filter(|m| {
-            m.config
-                .tests
-                .iter()
-                .any(|t| matches!(t.severity, rocky_core::tests::TestSeverity::Error))
-        })
-        .map(|m| m.config.name)
-        .collect()
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let loaded = crate::models_loader::load_transformation_models(config_path, cfg)
+        .map_err(|e| format!("the models could not be loaded ({e:#})"))?;
+    if let Some((pipeline, dir)) = loaded.missing_roots.first() {
+        return Err(format!(
+            "the models directory of pipeline '{pipeline}' ({}) does not exist",
+            dir.display()
+        ));
+    }
+    Ok(
+        crate::models_loader::union_by_model_name(&loaded.by_pipeline)
+            .into_iter()
+            .filter(|m| {
+                m.config
+                    .tests
+                    .iter()
+                    .any(|t| matches!(t.severity, rocky_core::tests::TestSeverity::Error))
+            })
+            .map(|m| m.config.name)
+            .collect(),
+    )
 }
 
 /// Build and persist a `PromotePlan` from the given parameters.
@@ -3838,27 +3889,36 @@ pub(crate) async fn build_promote_plan_inner(
     }
 
     // Failing-tests gate (#2609) — after the breaking-change gate, before the
-    // plan is written. The branch's newest run decides: a recorded
-    // error-severity test that failed or could not run refuses the promote
-    // unless `--allow-failing-tests`. Missing evidence (a failed newest run, a
-    // tested model with no recorded result, no run at all) only warns.
+    // plan is written. Each model's newest evidence on the branch decides
+    // (see `assess_branch_test_evidence`): a recorded error-severity test
+    // that failed or could not run refuses the promote unless
+    // `--allow-failing-tests`. Missing evidence (a failed newest run, a
+    // tested model built with no recorded result, no run at all) only warns.
     // Refusing on missing evidence is a separate change that waits on the
     // owner: it would refuse every project that does not run tests on its
     // branch runs.
-    let newest_run = store
-        .list_runs_matching(1, |r| {
-            r.rocky_branch.as_deref() == Some(branch_name)
-                && !matches!(
-                    r.status,
-                    rocky_core::state::RunStatus::SkippedIdempotent
-                        | rocky_core::state::RunStatus::SkippedInFlight
-                )
-        })?
-        .into_iter()
-        .next();
-    let error_test_models = models_with_error_tests(config_path, &rocky_cfg);
-    let evidence =
-        assess_branch_test_evidence(branch_name, newest_run.as_ref(), &error_test_models);
+    // Only this incarnation's runs: a branch deleted and created again under
+    // the same name starts with no evidence.
+    let branch_runs = store.list_runs_matching_since(record.created_at, |r| {
+        r.rocky_branch.as_deref() == Some(branch_name)
+            && !matches!(
+                r.status,
+                rocky_core::state::RunStatus::SkippedIdempotent
+                    | rocky_core::state::RunStatus::SkippedInFlight
+            )
+    })?;
+    let (error_test_models, models_load_warning) =
+        match models_with_error_tests(config_path, &rocky_cfg) {
+            Ok(models) => (models, None),
+            Err(why) => (
+                Default::default(),
+                Some(format!(
+                    "{why}, so models built with no recorded test result cannot be named"
+                )),
+            ),
+        };
+    let mut evidence = assess_branch_test_evidence(branch_name, &branch_runs, &error_test_models);
+    evidence.warnings.extend(models_load_warning);
     let test_audit = |kind: AuditEventKind, reason: String| AuditEvent {
         kind,
         at: Utc::now(),
@@ -3869,11 +3929,7 @@ pub(crate) async fn build_promote_plan_inner(
         breaking_changes: None,
     };
     if !evidence.failures.is_empty() {
-        let run_id = evidence.run_id.clone().unwrap_or_default();
-        let detail = format!(
-            "run {run_id}: {}",
-            describe_failing_tests(&evidence.failures)
-        );
+        let detail = describe_failing_tests(&evidence.failures);
         if allow_failing_tests {
             eprintln!(
                 "WARNING: promoting branch '{branch_name}' with {} failing test(s) \
@@ -3888,7 +3944,6 @@ pub(crate) async fn build_promote_plan_inner(
             audit.push(test_audit(AuditEventKind::FailingTestsBlocked, detail));
             return Err(PromoteBlockedByFailingTests {
                 branch: branch_name.to_string(),
-                run_id,
                 failures: evidence.failures,
                 audit: std::mem::take(&mut audit),
                 approvals_used,
@@ -6606,5 +6661,149 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
         let unknown = super::first_run_fill_previews([&model], Some(&garbage));
         assert!(unknown.unknown);
         assert!(unknown.previews.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod promote_test_evidence_tests {
+    use super::assess_branch_test_evidence;
+    use rocky_core::state::RunRecord;
+    use std::collections::BTreeSet;
+
+    /// A branch run built from JSON, so it does not track every
+    /// `RunRecord` field. `execs` are `(model, status)`; `tests` are
+    /// `(model, severity, status)`.
+    fn run(
+        id: &str,
+        status: &str,
+        execs: &[(&str, &str)],
+        tests: &[(&str, &str, &str)],
+    ) -> RunRecord {
+        let models_executed: Vec<_> = execs
+            .iter()
+            .map(|(m, s)| {
+                serde_json::json!({
+                    "model_name": m, "started_at": "2026-11-16T00:00:00Z",
+                    "finished_at": "2026-11-16T00:00:01Z", "duration_ms": 1,
+                    "rows_affected": null, "status": s, "sql_hash": "h",
+                })
+            })
+            .collect();
+        let test_results: Vec<_> = tests
+            .iter()
+            .map(|(m, sev, s)| {
+                serde_json::json!({
+                    "model": m, "test_type": "unique", "column": "id",
+                    "severity": sev, "status": s,
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "run_id": id, "started_at": "2026-11-16T00:00:00Z",
+            "finished_at": "2026-11-16T00:00:01Z", "status": status,
+            "models_executed": models_executed, "trigger": "Manual",
+            "config_hash": "c", "rocky_branch": "b", "test_results": test_results,
+        }))
+        .expect("run record")
+    }
+
+    fn tested(models: &[&str]) -> BTreeSet<String> {
+        models.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_newer_run_of_another_model_does_not_hide_a_failure() {
+        // Newest first: run-2 built only `b`; run-1 failed `a`'s test.
+        let runs = [
+            run("run-2", "Success", &[("b", "success")], &[]),
+            run(
+                "run-1",
+                "Failure",
+                &[("a", "failed")],
+                &[("a", "error", "fail")],
+            ),
+        ];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["a"]));
+        assert_eq!(ev.failures.len(), 1, "{ev:?}");
+        assert_eq!(ev.failures[0].run_id, "run-1");
+        assert_eq!(ev.failures[0].test.model, "a");
+    }
+
+    #[test]
+    fn a_failed_rebuild_does_not_hide_an_older_failure() {
+        let runs = [
+            run("run-2", "Failure", &[("a", "failed")], &[]),
+            run(
+                "run-1",
+                "Failure",
+                &[("a", "failed")],
+                &[("a", "error", "fail")],
+            ),
+        ];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["a"]));
+        assert_eq!(ev.failures.len(), 1, "{ev:?}");
+        assert!(ev.warnings.iter().any(|w| w.contains("did not succeed")));
+    }
+
+    #[test]
+    fn a_newer_passing_test_clears_the_failure() {
+        let runs = [
+            run(
+                "run-2",
+                "Success",
+                &[("a", "success")],
+                &[("a", "error", "pass")],
+            ),
+            run(
+                "run-1",
+                "Failure",
+                &[("a", "failed")],
+                &[("a", "error", "fail")],
+            ),
+        ];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["a"]));
+        assert!(ev.failures.is_empty(), "{ev:?}");
+        assert!(ev.warnings.is_empty(), "{ev:?}");
+    }
+
+    #[test]
+    fn a_newer_untested_rebuild_warns_instead_of_refusing() {
+        let runs = [
+            run("run-2", "Success", &[("a", "success")], &[]),
+            run(
+                "run-1",
+                "Failure",
+                &[("a", "failed")],
+                &[("a", "error", "fail")],
+            ),
+        ];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["a"]));
+        assert!(ev.failures.is_empty(), "{ev:?}");
+        assert_eq!(ev.warnings.len(), 1, "{ev:?}");
+        assert!(ev.warnings[0].contains("a (run run-2)"), "{ev:?}");
+    }
+
+    #[test]
+    fn error_status_and_unknown_status_block_but_warning_severity_does_not() {
+        let runs = [run(
+            "run-1",
+            "Success",
+            &[("a", "success"), ("c", "success"), ("d", "success")],
+            &[
+                ("a", "error", "error"),
+                ("c", "error", "some_future_status"),
+                ("d", "warning", "fail"),
+            ],
+        )];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["a", "c"]));
+        let models: Vec<_> = ev.failures.iter().map(|f| f.test.model.as_str()).collect();
+        assert_eq!(models, ["a", "c"], "{ev:?}");
+    }
+
+    #[test]
+    fn no_run_warns() {
+        let ev = assess_branch_test_evidence("b", &[], &tested(&["a"]));
+        assert!(ev.failures.is_empty());
+        assert!(ev.warnings[0].contains("no recorded run"), "{ev:?}");
     }
 }

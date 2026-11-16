@@ -36,12 +36,10 @@ pub(crate) async fn evaluate_model_tests(
         return None;
     }
     let name = model.config.name.as_str();
-    let target = &model.config.target;
-    let fq_table = format!("{}.{}.{}", target.catalog, target.schema, target.table);
 
     let mut blocking: Vec<String> = Vec::new();
     for decl in &model.config.tests {
-        let result = execute_one_test(decl, name, &fq_table, warehouse).await;
+        let result = execute_one_test(decl, name, &model.config.target, warehouse).await;
         let record = RunTestResultOutput {
             model: result.model,
             test_type: result.test_type,
@@ -60,7 +58,7 @@ pub(crate) async fn evaluate_model_tests(
                 record.detail.as_deref().unwrap_or("test did not pass")
             );
         }
-        if record.severity == "error" && record.status != "pass" {
+        if record.severity != "warning" && record.status != "pass" {
             let column = record
                 .column
                 .as_deref()

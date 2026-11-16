@@ -976,15 +976,13 @@ async fn execute_checks(
     // 4. Execute each test.
     let mut results = Vec::new();
     for model in &models_with_tests {
-        let target = &model.config.target;
-        let fq_table = format!("{}.{}.{}", target.catalog, target.schema, target.table);
         debug!(model = %model.config.name, tests = model.config.tests.len(), "running declarative tests");
 
         for test_decl in &model.config.tests {
             let result = execute_one_test(
                 test_decl,
                 &model.config.name,
-                &fq_table,
+                &model.config.target,
                 warehouse_adapter.as_ref(),
             )
             .await;

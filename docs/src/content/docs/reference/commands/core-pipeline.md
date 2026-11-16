@@ -455,10 +455,16 @@ On success the output is a `PlanOutput` with `plan_kind: "promote"` and the `pla
 
 #### The failing-tests gate
 
-After the breaking-change gate, Rocky reads the newest run of the branch (`rocky run --branch <name>`). The newest run decides.
+After the breaking-change gate, Rocky reads the runs of the branch (`rocky run --branch <name>`) since the branch was created. Each model's own newest evidence decides: the newest run that recorded a test result for the model, or built it successfully. A newer run that did not touch a model, or failed to build it, leaves that model's evidence as it was.
 
-- **Refused.** The run recorded an error-severity `[[tests]]` entry that failed, or whose query could not run. Exit code `1`, no plan written, and a `FailingTestsBlocked` audit event. Fix the data and re-run `rocky run --branch <name> --tests enforce`, or pass `--allow-failing-tests`.
-- **Warned, not refused.** The branch has no run. Its newest run failed. A model that declares error-severity tests was built by that run with no recorded test result (for example, the run used `--tests off`). Rocky prints a `WARNING` line to stderr and records a `TestEvidenceMissing` audit event. The promote goes on.
+```
+run 1  --tests enforce   orders FAILS a test
+run 2  --model status    builds only status
+promote                  refused: orders' newest evidence is run 1
+```
+
+- **Refused.** A model's newest evidence holds an error-severity `[[tests]]` entry that failed, or whose query could not run. Exit code `1`, no plan written, and a `FailingTestsBlocked` audit event naming each test and its run. Fix the data and re-run `rocky run --branch <name> --tests enforce`, or pass `--allow-failing-tests`.
+- **Warned, not refused.** The branch has no run. Its newest run failed. A model that declares error-severity tests was last built with no recorded test result (for example, the run used `--tests off`); that build replaced the table, so an older failure no longer refuses. Rocky cannot load the models to tell. Rocky prints a `WARNING` line to stderr and records a `TestEvidenceMissing` audit event. The promote goes on.
 
 Rocky only has test results when the run used `--tests report` or `--tests enforce`, or `[run] tests_on_run` set one of them. The default is off, so a project that never runs tests on its branch runs is warned, not refused. Refusing on missing evidence is a separate decision.
 
@@ -735,7 +741,7 @@ The retry is recorded under the same pipeline with `retry_of` set to the run it 
 | `report` | Tests run and are listed under `test_results`. A failing test never fails the model. |
 | `enforce` | As `report`. An error-severity test that fails, or whose query cannot run, fails the model. Its downstream models do not build. |
 
-A `severity = "warning"` test is listed in every mode and never fails a model. The table a failed model wrote stays in place. Nothing is rolled back. Tests run on the table the run wrote, so a `--shadow` or `--branch` run tests the shadow or branch table. `content_addressed` models write no warehouse table and are not tested. The results are saved on the run record, where [`rocky plan promote`](#the-failing-tests-gate) reads them. `rocky test --declarative` is unchanged.
+A `severity = "warning"` test is listed in every mode and never fails a model. The table a failed model wrote stays in place. Nothing is rolled back. Tests run on the table the run wrote, so a `--shadow` or `--branch` run tests the shadow or branch table. A `relationships` test's `to_table` is used as written, so on such a run it checks the branch or shadow table against the `to_table` you named, usually the production parent. `content_addressed` models write no warehouse table and are not tested. The results are saved on the run record, where [`rocky plan promote`](#the-failing-tests-gate) reads them. `rocky test --declarative` is unchanged.
 
 `--output json` carries `model_statuses` when at least one model did not build. It covers transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`). A replication run never has it, even with `--all`. It is a roll-up of `materializations`, `errors`, `model_decisions` and `contained`.
 
