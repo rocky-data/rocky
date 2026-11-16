@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rocky-verify` accepts rocky-manifest v0.2: v0.1 plus optional, unsigned `policy`, `checks` and `tests` claims. A v0.1 document validates exactly as before. Rocky does not write v0.2 yet.
 - `[policy]` rules can name the `run` capability (#2610). Only a rule naming `run` matches it. A `run` rule with `verify_after` is refused (V046), because a one-step run has no post-apply check.
 - `connector.toml` accepts an optional `license` key: an SPDX identifier or expression. A blank value is refused. Rocky checks only that it is not blank, and otherwise ignores it. A manifest with no `license` loads as before.
 
