@@ -3539,6 +3539,10 @@ impl std::error::Error for PromoteBlockedByBreakingChanges {}
 pub(crate) struct PromoteBlockedByFailingTests {
     pub branch: String,
     pub failures: Vec<PromoteTestFailure>,
+    /// Gaps in the test evidence: no branch run, a failed newest run, a
+    /// model with error-severity tests last built with no recorded result,
+    /// or models that could not be loaded to tell. Each refuses too.
+    pub gaps: Vec<String>,
     pub audit: Vec<AuditEvent>,
     pub approvals_used: Vec<ApprovalArtifact>,
     pub approvals_rejected: Vec<RejectedApproval>,
@@ -3548,14 +3552,27 @@ pub(crate) struct PromoteBlockedByFailingTests {
 
 impl std::fmt::Display for PromoteBlockedByFailingTests {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "promote plan blocked on branch '{}':", self.branch)?;
+        if !self.failures.is_empty() {
+            write!(
+                f,
+                " {} failing test(s) recorded: {}.",
+                self.failures.len(),
+                describe_failing_tests(&self.failures),
+            )?;
+        }
+        if !self.gaps.is_empty() {
+            write!(
+                f,
+                " no passing test evidence: {}.",
+                self.gaps.join("; ")
+            )?;
+        }
         write!(
             f,
-            "promote plan blocked by {} failing test(s) recorded on branch '{}': {}. \
-             Fix the data and re-run `rocky run --branch {} --tests enforce`, or re-run with \
-             `--allow-failing-tests` to override.",
-            self.failures.len(),
-            self.branch,
-            describe_failing_tests(&self.failures),
+            " Fix the data and re-run `rocky run --branch {}` (tests run by default under \
+             `[run] tests_on_run = \"enforce\"`), or re-run with `--allow-failing-tests` to \
+             override.",
             self.branch,
         )
     }
@@ -3637,10 +3654,9 @@ pub(crate) struct PromoteTestEvidence {
 /// A run that did not touch a model (another model, another pipeline)
 /// leaves that model's evidence as it was.
 ///
-/// Two more gaps only warn: the newest run did not succeed (case i), and the
-/// branch has no run (case iv). Refusing on (i), (iii) or (iv) is a separate
-/// change that waits on the owner's decision: every project that does not run
-/// tests on its branch runs would start to be refused.
+/// Two more gaps: the newest run did not succeed (case i), and the branch has
+/// no run (case iv). The caller refuses on every gap, as on a failure, unless
+/// `--allow-failing-tests`.
 pub(crate) fn assess_branch_test_evidence(
     branch: &str,
     runs_newest_first: &[rocky_core::state::RunRecord],
@@ -3972,10 +3988,10 @@ pub(crate) async fn build_promote_plan_inner(
     // (see `assess_branch_test_evidence`): a recorded error-severity test
     // that failed or could not run refuses the promote unless
     // `--allow-failing-tests`. Missing evidence (a failed newest run, a
-    // tested model built with no recorded result, no run at all) only warns.
-    // Refusing on missing evidence is a separate change that waits on the
-    // owner: it would refuse every project that does not run tests on its
-    // branch runs.
+    // tested model built with no recorded result, no run at all, models that
+    // cannot be loaded to tell) refuses too: with `[run] tests_on_run =
+    // "enforce"` the default, a branch run records its tests unless told not
+    // to.
     // Only this incarnation's runs: a branch deleted and created again under
     // the same name starts with no evidence.
     let branch_runs = store.list_runs_matching_since(record.created_at, |r| {
@@ -4012,23 +4028,35 @@ pub(crate) async fn build_promote_plan_inner(
         reason: Some(reason),
         breaking_changes: None,
     };
-    if !evidence.failures.is_empty() {
-        let detail = describe_failing_tests(&evidence.failures);
+    // A recorded failure and every gap in the evidence refuse the promote.
+    if !evidence.failures.is_empty() || !evidence.warnings.is_empty() {
+        let mut parts = Vec::new();
+        if !evidence.failures.is_empty() {
+            parts.push(describe_failing_tests(&evidence.failures));
+        }
+        parts.extend(evidence.warnings.iter().cloned());
+        let detail = parts.join("; ");
         if allow_failing_tests {
             eprintln!(
-                "WARNING: promoting branch '{branch_name}' with {} failing test(s) \
-                 (--allow-failing-tests was set): {detail}",
-                evidence.failures.len()
+                "WARNING: promoting branch '{branch_name}' without passing test evidence \
+                 (--allow-failing-tests was set): {detail}"
             );
             audit.push(test_audit(
                 AuditEventKind::FailingTestsAllowed,
                 format!("--allow-failing-tests CLI flag; {detail}"),
             ));
+            for warning in &evidence.warnings {
+                audit.push(test_audit(
+                    AuditEventKind::TestEvidenceMissing,
+                    warning.clone(),
+                ));
+            }
         } else {
             audit.push(test_audit(AuditEventKind::FailingTestsBlocked, detail));
             return Err(PromoteBlockedByFailingTests {
                 branch: branch_name.to_string(),
                 failures: evidence.failures,
+                gaps: evidence.warnings,
                 audit: std::mem::take(&mut audit),
                 approvals_used,
                 approvals_rejected,
@@ -4037,15 +4065,6 @@ pub(crate) async fn build_promote_plan_inner(
             }
             .into());
         }
-    }
-    for warning in &evidence.warnings {
-        eprintln!(
-            "WARNING: promote of branch '{branch_name}' has no passing test evidence: {warning}"
-        );
-        audit.push(test_audit(
-            AuditEventKind::TestEvidenceMissing,
-            warning.clone(),
-        ));
     }
 
     // Discover targets + build SQL at plan time (dialect-quoted, deterministic).

@@ -463,10 +463,17 @@ run 2  --model status    builds only status
 promote                  refused: orders' newest evidence is run 1
 ```
 
-- **Refused.** A model's newest evidence holds an error-severity `[[tests]]` entry that failed, or whose query could not run. Exit code `1`, no plan written, and a `FailingTestsBlocked` audit event naming each test and its run. Fix the data and re-run `rocky run --branch <name> --tests enforce`, or pass `--allow-failing-tests`.
-- **Warned, not refused.** The branch has no run. Its newest run failed. A model that declares error-severity tests was last built with no recorded test result (for example, the run used `--tests off`); that build replaced the table, so an older failure no longer refuses. Rocky cannot load the models to tell. Rocky prints a `WARNING` line to stderr and records a `TestEvidenceMissing` audit event. The promote goes on.
+Rocky refuses the promote when any of these holds. Exit code `1`, no plan written, and a `FailingTestsBlocked` audit event that names each reason.
 
-Rocky only has test results when the run used `--tests report` or `--tests enforce`, or `[run] tests_on_run` set one of them. The default is off, so a project that never runs tests on its branch runs is warned, not refused. Refusing on missing evidence is a separate decision.
+- A model's newest evidence holds an error-severity `[[tests]]` entry that failed, or whose query could not run.
+- The branch has no run.
+- Its newest run failed.
+- A model that declares error-severity tests was last built with no recorded test result (for example, the run used `--tests off`).
+- Rocky cannot load the models to tell.
+
+Fix the data and re-run `rocky run --branch <name>`, or pass `--allow-failing-tests`. The override prints a `WARNING`, and records a `FailingTestsAllowed` audit event and a `TestEvidenceMissing` event for each gap.
+
+`[run] tests_on_run` defaults to `enforce`, so a branch run records its tests unless it used `--tests off`.
 
 ### Examples
 
@@ -733,7 +740,7 @@ The retry is recorded under the same pipeline with `retry_of` set to the run it 
 
 ### Tests during a run
 
-`--tests <off|report|enforce>` runs each built model's sidecar `[[tests]]` against the table the run just wrote. The tests run before the model's downstream models build. It overrides `[run] tests_on_run`, which defaults to `off`.
+`--tests <off|report|enforce>` runs each built model's sidecar `[[tests]]` against the table the run just wrote. The tests run before the model's downstream models build. It overrides `[run] tests_on_run`, which defaults to `enforce`.
 
 | Mode | What happens |
 |---|---|
