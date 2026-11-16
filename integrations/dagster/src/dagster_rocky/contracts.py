@@ -61,6 +61,23 @@ CONTRACT_REQUIRED_COLUMNS_CHECK: str = "contract_required_columns"
 CONTRACT_PROTECTED_COLUMNS_CHECK: str = "contract_protected_columns"
 CONTRACT_COLUMN_CONSTRAINTS_CHECK: str = "contract_column_constraints"
 
+#: ``E062``: the model repeats an output name its contract constrains, through
+#: ``[[columns]]``, ``required`` or ``protected``. It fails whichever of those
+#: checks the contract turns on, so it is never dropped while one is declared.
+_CONTRACT_REPEATED_NAME_CODE = "E062"
+
+
+def _repeated_name_check(rules: ContractRules) -> str | None:
+    """The declared check an ``E062`` fails: column constraints first."""
+    if rules.has_column_constraints:
+        return CONTRACT_COLUMN_CONSTRAINTS_CHECK
+    if rules.has_required:
+        return CONTRACT_REQUIRED_COLUMNS_CHECK
+    if rules.has_protected:
+        return CONTRACT_PROTECTED_COLUMNS_CHECK
+    return None
+
+
 #: Compiler diagnostic codes that contract validation emits. Maps each code
 #: to the dagster check name it should fail. ``W010`` is a warning, not an
 #: error, but still attaches to the column-constraints check so users see it.
@@ -78,6 +95,10 @@ _CONTRACT_CODE_TO_CHECK: dict[str, str] = {
     # check is an error, not the `I003` note. Unmapped, the dispatch would drop
     # it and the check would pass on a run Rocky refused.
     "E059": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    # `[rules] no_extra_columns`: an undeclared output column, or a column
+    # list Rocky cannot prove. `has_column_constraints` turns the check on
+    # when that rule is set.
+    "E063": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
     "W010": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
 }
 
@@ -202,7 +223,9 @@ def _parse_contract_rules(path: Path) -> ContractRules:
     # Column constraints are present when at least one column declares a
     # type or nullability expectation, OR when the no_new_nullable
     # schema-level flag is set.
-    has_column_constraints = bool(rules_section.get("no_new_nullable"))
+    has_column_constraints = bool(rules_section.get("no_new_nullable")) or bool(
+        rules_section.get("no_extra_columns")
+    )
     if not has_column_constraints:
         for col in data.get("columns") or []:
             if isinstance(col, dict) and ("type" in col or "nullable" in col):
@@ -444,6 +467,8 @@ def contract_check_results_from_diagnostics(
             )
             return
         check_name = _CONTRACT_CODE_TO_CHECK.get(diag.code)
+        if diag.code == _CONTRACT_REPEATED_NAME_CODE:
+            check_name = _repeated_name_check(rules)
         if check_name is not None:
             by_check[check_name].append(diag)
             continue

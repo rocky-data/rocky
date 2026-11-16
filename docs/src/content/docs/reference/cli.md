@@ -532,7 +532,7 @@ How it behaves:
 | `edges.parquet` | model-level dependency | `upstream`, `downstream`, `upstream_kind` (`model` or `source`) |
 | `column_lineage.parquet` | column-level lineage edge | `source_model`, `source_column`, `target_model`, `target_column`, `transform` |
 | `tests.parquet` | declared test | `model`, `kind`, `column_name`, `severity`, `params`, `filter` |
-| `contracts.parquet` | contract constraint | `model`, `kind` (`column`, `required`, `protected`, `no_new_nullable`), `column_name`, `type_name`, `nullable` |
+| `contracts.parquet` | contract constraint | `model`, `kind` (`column`, `required`, `protected`, `no_new_nullable`, `no_extra_columns`), `column_name`, `type_name`, `nullable` |
 | `sources.parquet` | external table | `name`, `columns_read`, `used_by_count` |
 | `consumers.parquet` | downstream consumer and model it reads | `consumer`, `kind`, `owner`, `url`, `description`, `model` |
 

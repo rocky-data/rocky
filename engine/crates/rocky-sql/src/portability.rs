@@ -18,7 +18,7 @@
 //! construct we don't know about is silently portable. That's safer than
 //! false-positive-heavy over-rejection for the first wave.
 
-use sqlparser::ast::{Expr, Function, ObjectName, Query, TableFactor};
+use sqlparser::ast::{Expr, Function, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor};
 use sqlparser::ast::{Visit, Visitor};
 use std::ops::ControlFlow;
 
@@ -91,6 +91,35 @@ impl Visitor for PortabilityVisitor {
     }
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        // `* EXCLUDE (…)` / `* REPLACE (…)`: the one parser accepts them for
+        // every target (#2618), so the target that lacks them is caught here.
+        let mut selects = Vec::new();
+        selects_of(&query.body, &mut selects);
+        for select in selects {
+            for item in &select.projection {
+                let (SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options)) =
+                    item
+                else {
+                    continue;
+                };
+                if options.opt_exclude.is_some() && !supports_star_exclude(self.target) {
+                    self.issues.push(PortabilityIssue {
+                        construct: "EXCLUDE".to_string(),
+                        supported_by: vec![Dialect::DuckDB, Dialect::Snowflake],
+                        target: self.target,
+                        suggestion: suggestion_for("EXCLUDE", self.target),
+                    });
+                }
+                if options.opt_replace.is_some() && !supports_star_replace(self.target) {
+                    self.issues.push(PortabilityIssue {
+                        construct: "REPLACE".to_string(),
+                        supported_by: vec![Dialect::DuckDB, Dialect::Snowflake, Dialect::BigQuery],
+                        target: self.target,
+                        suggestion: suggestion_for("REPLACE", self.target),
+                    });
+                }
+            }
+        }
         if let sqlparser::ast::SetExpr::Select(select) = &*query.body
             && select.qualify.is_some()
             && !supports_qualify(self.target)
@@ -185,6 +214,35 @@ fn check_function_name(name: &ObjectName, target: Dialect) -> Option<Portability
     })
 }
 
+/// The `SELECT`s of a query body, through set operations. A nested query is
+/// a `Query` of its own, which the visitor reaches separately.
+fn selects_of<'q>(body: &'q SetExpr, out: &mut Vec<&'q Select>) {
+    match body {
+        SetExpr::Select(select) => out.push(select),
+        SetExpr::SetOperation { left, right, .. } => {
+            selects_of(left, out);
+            selects_of(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// `SELECT * EXCLUDE (…)`: DuckDB and Snowflake.
+fn supports_star_exclude(target: Dialect) -> bool {
+    match target {
+        Dialect::DuckDB | Dialect::Snowflake => true,
+        Dialect::Databricks | Dialect::BigQuery => false,
+    }
+}
+
+/// `SELECT * REPLACE (… AS col)`: DuckDB, Snowflake and BigQuery.
+fn supports_star_replace(target: Dialect) -> bool {
+    match target {
+        Dialect::DuckDB | Dialect::Snowflake | Dialect::BigQuery => true,
+        Dialect::Databricks => false,
+    }
+}
+
 fn supports_qualify(target: Dialect) -> bool {
     matches!(
         target,
@@ -247,6 +305,10 @@ fn suggestion_for(construct: &str, target: Dialect) -> String {
         ("TO_CHAR" | "TO_DATE" | "TO_TIMESTAMP", Dialect::BigQuery) => {
             format!("replace {construct}(...) with the BigQuery equivalent (PARSE_*/FORMAT_*)")
         }
+        ("EXCLUDE", Dialect::Databricks | Dialect::BigQuery) => {
+            "replace `* EXCLUDE (...)` with `* EXCEPT (...)`".into()
+        }
+        ("REPLACE", _) => "replace `* REPLACE (expr AS col)` with an explicit column list".into(),
         _ => format!("{construct} is not portable to {target}"),
     }
 }
@@ -254,6 +316,40 @@ fn suggestion_for(construct: &str, target: Dialect) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2618: `* EXCLUDE` is flagged where the target lacks it, `* REPLACE`
+    /// likewise, inside a CTE and a set operation too.
+    #[test]
+    fn star_exclude_and_replace_are_flagged_on_targets_without_them() {
+        let constructs = |sql: &str, target| -> Vec<String> {
+            detect_portability_issues(sql, target)
+                .into_iter()
+                .map(|i| i.construct)
+                .collect()
+        };
+        let exclude = "SELECT * EXCLUDE (a) FROM t";
+        assert_eq!(constructs(exclude, Dialect::Databricks), vec!["EXCLUDE"]);
+        assert_eq!(constructs(exclude, Dialect::BigQuery), vec!["EXCLUDE"]);
+        assert!(constructs(exclude, Dialect::DuckDB).is_empty());
+        assert!(constructs(exclude, Dialect::Snowflake).is_empty());
+        let replace = "SELECT * REPLACE (a + 1 AS a) FROM t";
+        assert_eq!(constructs(replace, Dialect::Databricks), vec!["REPLACE"]);
+        for target in [Dialect::DuckDB, Dialect::Snowflake, Dialect::BigQuery] {
+            assert!(constructs(replace, target).is_empty(), "{target}");
+        }
+        for nested in [
+            "WITH c AS (SELECT * EXCLUDE (a) FROM t) SELECT * FROM c",
+            "SELECT a FROM u UNION ALL SELECT * EXCLUDE (b) FROM t",
+        ] {
+            assert_eq!(
+                constructs(nested, Dialect::Databricks),
+                vec!["EXCLUDE"],
+                "{nested}"
+            );
+        }
+        // `* EXCEPT` and a plain star stay clean.
+        assert!(constructs("SELECT * EXCEPT (a) FROM t", Dialect::Databricks).is_empty());
+    }
 
     #[test]
     fn clean_sql_has_no_issues() {

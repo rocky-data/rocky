@@ -243,6 +243,28 @@ pub const E060: &str = "E060";
 /// `rocky compile` from [`crate::duplicate_output`]. Every other strategy
 /// gets [`W002`] for the same projection.
 pub const E061: &str = "E061";
+/// A model with a contract repeats an output name the contract constrains:
+/// one in its `[[columns]]`, `[rules] required` or `[rules] protected`
+/// (#2613). The contract checks one column of that name, while the warehouse
+/// writes another one (DuckDB renames the repeat `orders_1`), so the check
+/// cannot say which column it passed. Always on for a contracted model, in
+/// addition to [`W002`] / [`E061`]. Emitted by `rocky compile` from
+/// [`crate::contracts::validate_contract_shape`]; names match as in
+/// [`crate::duplicate_output`].
+pub const E062: &str = "E062";
+/// `[rules] no_extra_columns = true` and the model outputs a column its
+/// contract's `[[columns]]` do not declare, or Rocky cannot prove the
+/// model's column list (a `SELECT *` or an unnamed expression) and so cannot
+/// show there is none (#2613). Opt-in per contract; off by default. Emitted by
+/// `rocky compile` from [`crate::contracts::validate_contract_shape`].
+pub const E063: &str = "E063";
+/// A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no
+/// known source table, and is a near-miss of a model name (#2620). Without
+/// this the read is taken as a warehouse table and the typo fails only at
+/// `rocky run`. Emitted by `rocky compile` from
+/// [`crate::unknown_relations`]; a two-part read (`main.stg_ordrs`) is never
+/// checked.
+pub const E064: &str = "E064";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`

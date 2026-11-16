@@ -192,6 +192,13 @@ pub fn check_duplicate_output_names(model: &Model, target: &OperandTarget) -> Ve
         .collect()
 }
 
+/// The provable output names `model`'s outermost projection repeats, with how
+/// often each appears, matched by the rules of each warehouse in `target`.
+/// The contract check reads these (`E062`, #2613).
+pub(crate) fn repeated_names_for(model: &Model, target: &OperandTarget) -> Vec<(String, usize)> {
+    repeated_output_names(&model.sql, &NameFold::for_target(target))
+}
+
 /// The provable output names the outermost projection repeats under any of
 /// `folds`, with how often each appears, in projection order. Unparsable SQL
 /// repeats nothing.

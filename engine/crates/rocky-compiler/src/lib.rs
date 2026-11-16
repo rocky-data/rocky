@@ -48,6 +48,7 @@ pub mod source_refs;
 pub mod typecheck;
 pub mod types;
 pub mod udf;
+pub mod unknown_relations;
 
 // Re-export miette for downstream crates that need the rendering types.
 pub use miette;
