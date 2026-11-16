@@ -79,6 +79,7 @@ Each `[[columns]]` entry takes `name` (required), `type`, `nullable`, and `descr
 | `required` | These columns must exist in the output. A missing one is `E010`. |
 | `protected` | These columns must never be removed. A removed one is `E013`. |
 | `no_new_nullable` | Off by default. When on, a nullable output column that `[[columns]]` does not declare is `E014`. A contract that sets it and declares no `[[columns]]` is also `E014`, because there is no baseline. |
+| `no_extra_columns` | Off by default. When on, an output column that the contract does not name in `[[columns]]`, `required` or `protected` is `E063`. If Rocky cannot prove the model's column list (a `SELECT *`, or an expression with no alias), that is `E063` too, because it cannot show there is no extra column. |
 
 | Code | Severity | Meaning |
 |---|---|---|
@@ -87,6 +88,8 @@ Each `[[columns]]` entry takes `name` (required), `type`, `nullable`, and `descr
 | `E012` | Error | Nullability violation: the contract says non-nullable, the model says nullable |
 | `E013` | Error | Protected column removed |
 | `E014` | Error | Undeclared nullable column while `no_new_nullable` is on |
+| `E062` | Error | The output repeats a name the contract constrains (in `[[columns]]`, `required` or `protected`). The contract checks one of the columns; the warehouse writes the other under another name (DuckDB: `orders_1`) |
+| `E063` | Error | Undeclared output column, or an unprovable column list, while `no_extra_columns` is on |
 | `W010` | Warning | The contract defines a column that is not in the output and is not required |
 | `W011` | Warning | A contract exists for a model not found in the project |
 
