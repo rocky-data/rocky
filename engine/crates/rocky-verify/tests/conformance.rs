@@ -104,3 +104,29 @@ fn general_golden_is_a_real_recipe_identity_manifest() {
     // is heuristic — never a strong (byte-identity) claim on a watermark.
     assert_eq!(obj["inputs_proof_class"], serde_json::json!("heuristic"));
 }
+
+/// The v0.2 golden validates against the v0.2 schema and carries its claims.
+#[test]
+fn v0_2_golden_carries_claims_and_verifies() {
+    let file = fixtures().join("valid/run-claims-v0.2.json");
+    let value = read_json(&file);
+    assert_eq!(value["manifest_version"], serde_json::json!("0.2"));
+    assert!(value.get("policy").is_some() && value.get("checks").is_some());
+    let report = verify_file(&file, None).expect("schema compiles");
+    assert!(report.passed(), "{:?}", report.schema_errors);
+}
+
+/// The v0.2-specific tampered fixtures fail on schema grounds, not by accident.
+#[test]
+fn v0_2_tampered_fixtures_fail_schema() {
+    for name in [
+        "claims-on-v0.1.json",
+        "checks-do-not-sum-v0.2.json",
+        "ledger-ref-control-chars-v0.2.json",
+        "duplicate-checks-key-v0.2.json",
+    ] {
+        let file = fixtures().join("tampered").join(name);
+        let report = verify_file(&file, None).expect("schema compiles");
+        assert!(!report.schema_valid, "{name} must fail schema validation");
+    }
+}
