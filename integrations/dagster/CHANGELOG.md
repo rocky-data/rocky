@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The contract checks now fail on the engine's `E062` (a repeated output name the contract constrains) and `E063` (`[rules] no_extra_columns`). Before, both were unmapped and dropped, so the check passed on a violated contract. `no_extra_columns` alone now turns the column-constraints check on, and an `E062` on a contract with only `required` or `protected` fails that check.
+
 ### Changed
 
 - Needs `rocky-sdk>=0.33.0`, so the floor rises from `0.29.0`. With engine 1.93.0, rocky-sdk 0.32.0 and older reject the new AI-token cost units, so `RockyResource.cost_by_product()` and `product_status()` raise once a month records an AI call.

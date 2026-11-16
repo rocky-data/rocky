@@ -10,7 +10,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use rocky_ir::ColumnInfo;
 pub use rocky_sql::lineage::LineageGap;
-use rocky_sql::lineage::{self, RowSelectionKind, TransformKind};
+use rocky_sql::lineage::{self, RowSelectionKind, StarColumn, TransformKind};
 use serde::{Deserialize, Serialize};
 
 use crate::project::Project;
@@ -358,6 +358,12 @@ impl SemanticGraph {
     }
 }
 
+/// The names a per-relation star modifier can use for a table a `WITH`
+/// body or derived table passes on: its name and the last part of it.
+fn source_names(name: &str) -> [&str; 2] {
+    [name, name.rsplit('.').next().unwrap_or(name)]
+}
+
 /// Build a semantic graph from a resolved project.
 ///
 /// Iterates models in topological order, extracts per-model lineage,
@@ -500,9 +506,27 @@ pub fn build_semantic_graph(
         // A `SELECT *` whose columns come with no edge (a raw table with no
         // schema, a derived table) is a lineage gap (#2377).
         let mut star_unresolved = false;
+        // `* EXCEPT` / `* EXCLUDE` drop a column the star would otherwise
+        // expand to; `* REPLACE` keeps it but not as the source column, so it
+        // gets no `Direct` edge (#2618). A star the modifiers cannot describe
+        // expands to nothing: its columns are unknown, not over-claimed.
+        let top = &lineage_result.star_modifiers;
+        if lineage_result.has_star && top.unmodelled {
+            star_unresolved = true;
+        }
         // If SELECT *, expand upstream model columns into output
-        if lineage_result.has_star {
+        if lineage_result.has_star && !top.unmodelled {
             for table_ref in &lineage_result.source_tables {
+                // The modifiers for the sources a derived table or `WITH`
+                // body passes through its own star: the outer star's over
+                // the inner one's.
+                // A star qualified by this relation applies its own modifiers
+                // here and nowhere else (`t.* EXCEPT (a), u.*`).
+                let rel = top.for_relation(&lineage::relation_names(table_ref));
+                let through = rel.over(&table_ref.star_modifiers);
+                if through.unmodelled {
+                    star_unresolved = true;
+                }
                 // A star over a CTE returns the CTE body's columns, never
                 // those of a source or model that shares its name (#2307).
                 // Lineage has already traced each body column to its physical
@@ -512,16 +536,20 @@ pub fn build_semantic_graph(
                     // A CTE column built from several columns has one entry
                     // per origin: one output column, several edges (#2318).
                     let mut keep = false;
+                    let mut replaced = false;
                     for col in &table_ref.cte_columns {
                         if !col.extra_source {
-                            keep = output_names.insert(col.target_column.clone());
+                            let effect = rel.column(&col.target_column);
+                            replaced = effect == StarColumn::Replaced;
+                            keep = effect != StarColumn::Excluded
+                                && output_names.insert(col.target_column.clone());
                             if keep {
                                 output_columns.push(ColumnDef {
                                     name: col.target_column.clone(),
                                 });
                             }
                         }
-                        if !keep {
+                        if !keep || replaced {
                             continue;
                         }
                         if let Some(source) = &col.source_table {
@@ -560,12 +588,23 @@ pub fn build_semantic_graph(
                             Vec::new()
                         };
                         let inner_arc: Arc<str> = Arc::from(inner_name.as_str());
+                        let inner_names = source_names(inner_name);
                         for name in inner_columns {
+                            if through.unmodelled {
+                                break;
+                            }
+                            let effect = through.for_relation(&inner_names).column(name);
+                            if effect == StarColumn::Excluded {
+                                continue;
+                            }
                             if output_names.insert(name.to_string()) {
                                 let col_arc: Arc<str> = Arc::from(name);
                                 output_columns.push(ColumnDef {
                                     name: name.to_string(),
                                 });
+                                if effect == StarColumn::Replaced {
+                                    continue;
+                                }
                                 edges.push(LineageEdge {
                                     source: QualifiedColumn {
                                         model: inner_arc.clone(),
@@ -608,11 +647,18 @@ pub fn build_semantic_graph(
                     .filter(|_| reader_depends_on_it)
                 {
                     for col in &upstream_schema.columns {
+                        let effect = rel.column(&col.name);
+                        if effect == StarColumn::Excluded {
+                            continue;
+                        }
                         if output_names.insert(col.name.clone()) {
                             let col_arc: Arc<str> = Arc::from(col.name.as_str());
                             output_columns.push(ColumnDef {
                                 name: col.name.clone(),
                             });
+                            if effect == StarColumn::Replaced {
+                                continue;
+                            }
                             edges.push(LineageEdge {
                                 source: QualifiedColumn {
                                     model: table_name_arc.clone(), // cheap: atomic inc
@@ -635,6 +681,9 @@ pub fn build_semantic_graph(
                     // time_column check) without weakening any type-shape check.
                     star_unresolved = true;
                     for col_name in derived_cols {
+                        if rel.column(col_name) == StarColumn::Excluded {
+                            continue;
+                        }
                         if output_names.insert(col_name.clone()) {
                             output_columns.push(ColumnDef {
                                 name: col_name.clone(),
@@ -653,8 +702,15 @@ pub fn build_semantic_graph(
                     // without weakening any type-shape diagnostic.
                     star_unresolved = true;
                     for inner_name in &table_ref.derived_sources {
+                        if through.unmodelled {
+                            break;
+                        }
+                        let via = through.for_relation(&source_names(inner_name));
                         if let Some(upstream_schema) = models.get(inner_name.as_str()) {
                             for col in &upstream_schema.columns {
+                                if via.column(&col.name) == StarColumn::Excluded {
+                                    continue;
+                                }
                                 if output_names.insert(col.name.clone()) {
                                     output_columns.push(ColumnDef {
                                         name: col.name.clone(),
@@ -663,6 +719,9 @@ pub fn build_semantic_graph(
                             }
                         } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
                             for col in source_cols {
+                                if via.column(&col.name) == StarColumn::Excluded {
+                                    continue;
+                                }
                                 if output_names.insert(col.name.clone()) {
                                     output_columns.push(ColumnDef {
                                         name: col.name.clone(),
@@ -674,11 +733,18 @@ pub fn build_semantic_graph(
                 } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
                     // External source with known schema
                     for col in source_cols {
+                        let effect = rel.column(&col.name);
+                        if effect == StarColumn::Excluded {
+                            continue;
+                        }
                         if output_names.insert(col.name.clone()) {
                             let col_arc: Arc<str> = Arc::from(col.name.as_str());
                             output_columns.push(ColumnDef {
                                 name: col.name.clone(),
                             });
+                            if effect == StarColumn::Replaced {
+                                continue;
+                            }
                             edges.push(LineageEdge {
                                 source: QualifiedColumn {
                                     model: table_name_arc.clone(), // cheap: atomic inc

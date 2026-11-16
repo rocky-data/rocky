@@ -314,6 +314,9 @@ pub fn write_parquet_tables(docs: &ProjectDocs, dir: &Path) -> Result<Vec<String
         if contract.no_new_nullable {
             push("no_new_nullable", None, None, None, None);
         }
+        if contract.no_extra_columns {
+            push("no_extra_columns", None, None, None, None);
+        }
     }
     write_table(
         dir,

@@ -14,3 +14,10 @@ serial-api = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'package(rocky-cli) & test(api::tests)'
 test-group = 'serial-api'
+
+# A stuck test must fail, not hang the job. A test running longer than one
+# `period` is flagged SLOW; after `terminate-after` periods nextest kills it
+# and reports it as a failure (10 minutes in total). No test is skipped or
+# quarantined: a test that exceeds the limit fails like any other.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
