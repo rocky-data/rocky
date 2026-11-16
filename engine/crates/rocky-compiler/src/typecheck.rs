@@ -4789,6 +4789,89 @@ fn set_operation_column_type(
     }
 }
 
+/// What one `*` item does to the columns it expands to: `EXCEPT` /
+/// `EXCLUDE` drop a column, `REPLACE` recomputes it in place (#2618).
+struct StarOptions<'q> {
+    excluded: Vec<&'q str>,
+    replaced: Vec<(&'q str, &'q Expr)>,
+}
+
+impl<'q> StarOptions<'q> {
+    /// The star's options, or an error for one inference does not read
+    /// (`ILIKE`, `RENAME`, a star alias, a qualified `EXCLUDE` name). The
+    /// error fails inference for the query, which then claims nothing.
+    fn read(options: &'q ast::WildcardAdditionalOptions) -> Result<Self, String> {
+        // Destructured so a new sqlparser option fails to compile here.
+        let ast::WildcardAdditionalOptions {
+            wildcard_token: _,
+            opt_ilike,
+            opt_exclude,
+            opt_except,
+            opt_replace,
+            opt_rename,
+            opt_alias,
+        } = options;
+        if opt_ilike.is_some() || opt_rename.is_some() || opt_alias.is_some() {
+            return Err("star option not modelled".to_string());
+        }
+        let mut excluded = Vec::new();
+        if let Some(exclude) = opt_exclude {
+            let names = match exclude {
+                ast::ExcludeSelectItem::Single(name) => std::slice::from_ref(name),
+                ast::ExcludeSelectItem::Multiple(names) => names.as_slice(),
+            };
+            for name in names {
+                match name.0.as_slice() {
+                    [part] => match part.as_ident() {
+                        Some(ident) => excluded.push(ident.value.as_str()),
+                        None => return Err("star EXCLUDE name not modelled".to_string()),
+                    },
+                    _ => return Err("qualified star EXCLUDE name not modelled".to_string()),
+                }
+            }
+        }
+        if let Some(except) = opt_except {
+            excluded.push(except.first_element.value.as_str());
+            excluded.extend(except.additional_elements.iter().map(|i| i.value.as_str()));
+        }
+        let replaced = opt_replace
+            .iter()
+            .flat_map(|replace| replace.items.iter())
+            .map(|element| (element.column_name.value.as_str(), &element.expr))
+            .collect();
+        Ok(Self { excluded, replaced })
+    }
+
+    /// Push `col` as this star outputs it.
+    fn push(
+        &self,
+        inferred: &mut SelectInference,
+        col: &TypedColumn,
+        inexact: bool,
+        scope: &TypeScope,
+    ) {
+        if self
+            .excluded
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&col.name))
+        {
+            return;
+        }
+        if let Some((_, expr)) = self
+            .replaced
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&col.name))
+        {
+            inferred.push_expression(col.name.clone(), expr, scope);
+            return;
+        }
+        if inexact {
+            inferred.relation_inexact.insert(inferred.columns.len());
+        }
+        inferred.columns.push(col.clone());
+    }
+}
+
 fn infer_select_types_in_scope(
     select: &ast::Select,
     env: InferEnv<'_, '_>,
@@ -4823,28 +4906,26 @@ fn infer_select_types_in_scope(
                     inferred.push_expression(alias.value.clone(), expr, &type_scope);
                 }
             }
-            SelectItem::Wildcard(_) => {
+            SelectItem::Wildcard(options) => {
+                let star = StarOptions::read(options)?;
                 for col in &from_scope.columns {
-                    if from_scope.inexact.contains(CiStr::new(&col.name)) {
-                        inferred.relation_inexact.insert(inferred.columns.len());
-                    }
-                    inferred.columns.push(col.clone());
+                    let inexact = from_scope.inexact.contains(CiStr::new(&col.name));
+                    star.push(&mut inferred, col, inexact, &type_scope);
                 }
             }
             SelectItem::QualifiedWildcard(
                 ast::SelectItemQualifiedWildcardKind::ObjectName(name),
-                _,
+                options,
             ) => {
+                let star = StarOptions::read(options)?;
                 let Some(name) = name.0.last().and_then(ast::ObjectNamePart::as_ident) else {
                     continue;
                 };
                 for relation in &from_scope.relations {
                     if relation.qualifier.eq_ignore_ascii_case(&name.value) {
                         for col in &relation.columns {
-                            if relation.inexact.contains(CiStr::new(&col.name)) {
-                                inferred.relation_inexact.insert(inferred.columns.len());
-                            }
-                            inferred.columns.push(col.clone());
+                            let inexact = relation.inexact.contains(CiStr::new(&col.name));
+                            star.push(&mut inferred, col, inexact, &type_scope);
                         }
                     }
                 }
@@ -6694,6 +6775,212 @@ mod tests {
             .iter()
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect()
+    }
+
+    /// [`typecheck_over_t_and_u`] with the source schemas also given to the
+    /// semantic graph, which is what expands a star.
+    fn star_over_t_and_u(sql: &str) -> Vec<(String, RockyType, bool)> {
+        let schema = || {
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+                ("z", RockyType::Int32, true),
+            ])
+        };
+        let sources = HashMap::from([("t".to_string(), schema()), ("u".to_string(), schema())]);
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &column_infos(&sources)).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
+        typed_columns_of(&result, "m")
+    }
+
+    /// The graph's view of typed source schemas: names and nullability.
+    fn column_infos(
+        sources: &HashMap<String, Vec<TypedColumn>>,
+    ) -> HashMap<String, Vec<rocky_ir::ColumnInfo>> {
+        sources
+            .iter()
+            .map(|(name, columns)| {
+                let infos = columns
+                    .iter()
+                    .map(|col| rocky_ir::ColumnInfo {
+                        name: col.name.clone(),
+                        data_type: String::new(),
+                        nullable: col.nullable,
+                    })
+                    .collect();
+                (name.clone(), infos)
+            })
+            .collect()
+    }
+
+    fn names(rows: &[(String, RockyType, bool)]) -> Vec<&str> {
+        rows.iter().map(|r| r.0.as_str()).collect()
+    }
+
+    /// #2618: `* EXCEPT` / `* EXCLUDE` drop the column from the model's
+    /// output, at the top level, through a CTE and through a derived table.
+    /// Before the fix the star copied every source column, so a contract
+    /// that requires the dropped column passed.
+    #[test]
+    fn a_star_exclusion_drops_the_column() {
+        let x = ("x".to_string(), RockyType::Int32, false);
+        let z = ("z".to_string(), RockyType::Int32, true);
+        for sql in [
+            "SELECT * EXCEPT (n) FROM t",
+            "SELECT * EXCLUDE (n) FROM t",
+            "SELECT * EXCLUDE n FROM t",
+            "SELECT * EXCLUDE (N) FROM t",
+            "SELECT t.* EXCLUDE (n) FROM t",
+            "WITH c AS (SELECT * EXCLUDE (n) FROM t) SELECT * FROM c",
+            "WITH c AS (SELECT * FROM t) SELECT * EXCLUDE (n) FROM c",
+        ] {
+            let rows = star_over_t_and_u(sql);
+            assert_eq!(rows, vec![x.clone(), z.clone()], "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM (SELECT * EXCLUDE (n) FROM t) AS d",
+            "SELECT * EXCLUDE (n) FROM (SELECT * FROM t) AS d",
+        ] {
+            let rows = star_over_t_and_u(sql);
+            assert_eq!(names(&rows), vec!["x", "z"], "{sql}: {rows:?}");
+        }
+        let rows = star_over_t_and_u("SELECT * EXCLUDE (n, z) FROM t");
+        assert_eq!(rows, vec![x], "two names");
+    }
+
+    /// #2618: the contract sees the exclusion. `required = ["n"]` over
+    /// `* EXCEPT (n)` is the coded `E010`.
+    #[test]
+    fn a_contract_requiring_an_excluded_column_is_refused() {
+        let contract = CompilerContract {
+            columns: vec![],
+            rules: ContractRules {
+                required: vec!["n".to_string()],
+                ..ContractRules::default()
+            },
+        };
+        let typed = |sql: &str| -> Vec<TypedColumn> {
+            star_over_t_and_u(sql)
+                .into_iter()
+                .map(|(name, data_type, nullable)| TypedColumn {
+                    name,
+                    data_type,
+                    nullable,
+                })
+                .collect()
+        };
+        let diags = validate_contract("m", &typed("SELECT * EXCEPT (n) FROM t"), &contract);
+        assert!(diags.iter().any(|d| &*d.code == "E010"), "{diags:?}");
+        let diags = validate_contract("m", &typed("SELECT * FROM t"), &contract);
+        assert!(diags.is_empty(), "control: {diags:?}");
+    }
+
+    /// #2618: `* REPLACE (expr AS col)` keeps the column's name and position
+    /// but not the source column's type or NOT NULL.
+    #[test]
+    fn a_star_replace_does_not_keep_the_source_type() {
+        let rows = star_over_t_and_u("SELECT * REPLACE (CAST(x AS VARCHAR) AS x) FROM t");
+        assert_eq!(names(&rows), vec!["x", "n", "z"], "{rows:?}");
+        // The replacement's own type, read by inference in the star's scope.
+        assert_eq!(rows[0].1, RockyType::String, "{rows:?}");
+        assert_eq!(rows[1], ("n".to_string(), RockyType::String, false));
+        // A NULL replacement of a NOT NULL column is nullable.
+        for sql in [
+            "SELECT * REPLACE (NULL AS x) FROM t",
+            "WITH c AS (SELECT * REPLACE (NULL AS x) FROM t) SELECT * FROM c",
+            "WITH c AS (SELECT * REPLACE (NULL AS x) FROM t) SELECT x FROM c",
+            "SELECT * FROM (SELECT * REPLACE (NULL AS x) FROM t) AS d",
+        ] {
+            let rows = star_over_t_and_u(sql);
+            let x = rows.iter().find(|r| r.0 == "x").expect(sql);
+            assert!(x.2, "{sql}: x must be nullable: {rows:?}");
+            assert_ne!(x.1, RockyType::Int32, "{sql}: {rows:?}");
+        }
+    }
+
+    /// #2618 red team: a modifier on a qualified star applies to its own
+    /// relation only. `t.* EXCEPT (n), u.*` keeps `u.n` and every column a
+    /// contract may require. An unqualified star beside another star cannot
+    /// be split by relation, so its columns are unknown, not over-claimed.
+    #[test]
+    fn a_qualified_star_modifier_applies_to_its_own_relation() {
+        for sql in [
+            "SELECT t.* EXCEPT (n), u.* FROM t JOIN u ON t.x = u.x",
+            "SELECT a.* EXCLUDE (n), b.* FROM t AS a JOIN u AS b ON a.x = b.x",
+        ] {
+            let rows = star_over_t_and_u(sql);
+            assert_eq!(names(&rows), vec!["x", "z", "n"], "{sql}: {rows:?}");
+            let contract = CompilerContract {
+                columns: vec![],
+                rules: ContractRules {
+                    required: vec!["x".to_string(), "n".to_string()],
+                    ..ContractRules::default()
+                },
+            };
+            let typed: Vec<TypedColumn> = rows
+                .into_iter()
+                .map(|(name, data_type, nullable)| TypedColumn {
+                    name,
+                    data_type,
+                    nullable,
+                })
+                .collect();
+            let diags = validate_contract("m", &typed, &contract);
+            assert!(diags.is_empty(), "{sql}: {diags:?}");
+        }
+        let rows = star_over_t_and_u("SELECT *, t.* EXCLUDE (n) FROM t");
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// #2618 red team: an outer `EXCLUDE` over an inner `REPLACE` drops the
+    /// column, and a column a body excludes and then re-adds is kept.
+    #[test]
+    fn star_modifiers_compose_across_layers() {
+        let rows =
+            star_over_t_and_u("SELECT * EXCLUDE (x) FROM (SELECT * REPLACE (1 AS x) FROM t) AS d");
+        assert_eq!(names(&rows), vec!["n", "z"], "{rows:?}");
+        let rows = star_over_t_and_u(
+            "WITH c AS (SELECT * EXCLUDE (n), UPPER(n) AS n FROM t) SELECT * FROM c",
+        );
+        let mut got = names(&rows);
+        got.sort_unstable();
+        assert_eq!(got, vec!["n", "x", "z"], "{rows:?}");
+    }
+
+    /// #2618: a star over an upstream model applies the exclusion too.
+    #[test]
+    fn a_star_exclusion_over_a_model_drops_the_column() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+            ]),
+        )]);
+        let project = Project::from_models(vec![
+            make_model("up", "SELECT x, n FROM t"),
+            make_model("m", "SELECT * EXCLUDE (n) FROM up"),
+        ])
+        .unwrap();
+        let graph = build_semantic_graph(&project, &column_infos(&sources)).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
+        assert_eq!(
+            typed_columns_of(&result, "m"),
+            vec![("x".to_string(), RockyType::Int32, false)]
+        );
     }
 
     /// #2307: a CTE named like a source shadows it. The column comes from the
@@ -9540,6 +9827,9 @@ mod tests {
         for upstream_sql in [
             "SELECT * FROM raw.orders",
             "SELECT (order_id), amount FROM raw.orders",
+            // Parsed since #2618.
+            "SELECT * EXCLUDE (secret) FROM raw.orders",
+            "SELECT * REPLACE (1 AS amount) FROM raw.orders",
         ] {
             let result = compile_typechecks(vec![
                 make_model("upstream", upstream_sql),
@@ -9573,16 +9863,13 @@ mod tests {
     #[test]
     fn parser_062_star_modifier_compatibility_gate_is_explicit() {
         let dialect = rocky_sql::dialect::DatabricksDialect;
-        for sql in [
-            "SELECT * EXCLUDE (secret) FROM raw.orders",
-            "SELECT * REPLACE (1 AS amount) FROM raw.orders",
-            "SELECT * RENAME (amount AS order_amount) FROM raw.orders",
-        ] {
-            assert!(
-                Parser::parse_sql(&dialect, sql).is_err(),
-                "sqlparser 0.62 baseline unexpectedly accepts {sql}; add it to the incomplete-upstream controls before upgrading"
-            );
-        }
+        // `* EXCLUDE` and `* REPLACE` parse since #2618 and are in the
+        // incomplete-upstream controls above.
+        let sql = "SELECT * RENAME (amount AS order_amount) FROM raw.orders";
+        assert!(
+            Parser::parse_sql(&dialect, sql).is_err(),
+            "sqlparser 0.62 baseline unexpectedly accepts {sql}; add it to the incomplete-upstream controls before upgrading"
+        );
     }
 
     #[test]
