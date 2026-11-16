@@ -122,7 +122,7 @@ lag_tolerance_seconds = 0        # default: any MAX(ts) movement forces a rebuil
 ```
 
 - `skip_rowcount_fallback` (default `false`) allows a `COUNT(*)`-only stability signal when an upstream has no timestamp to probe. Only `incremental` and `microbatch` models that set a timestamp column have one, so a model with any other strategy that reads a raw source can never skip without this switch. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE`, or a matched insert plus delete. So it stays behind this switch.
-- `lag_tolerance_seconds` (default `0`) treats an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged. It is the late-arriving-but-irrelevant micro-update analog of a freshness SLA threshold.
+- `lag_tolerance_seconds` (default `0`) treats an upstream `MAX(ts)` that moved by at most this many seconds as unchanged. It is the late-arriving-but-irrelevant micro-update analog of a freshness SLA threshold. A `MAX(ts)` that went backwards forces a rebuild whatever this value is.
 
 The full `[run]` reference is in the [configuration reference](/reference/configuration/#run).
 

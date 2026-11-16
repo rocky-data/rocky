@@ -6,5 +6,6 @@ Finished records. They describe the project at a past date. They are not current
 |---|---|
 | [`PARITY.md`](PARITY.md) | The completed Python-to-Rust port answer key for the spec compiler |
 | [`security-audit-2026-05-08.md`](security-audit-2026-05-08.md) | The 2026-05-08 static security review |
+| [`b3a-skip-signal/REPORT.md`](b3a-skip-signal/REPORT.md) | B3a, 2026-11-15: which signal proves a source table is unchanged, tested on TPC-H SF1 |
 
 Architecture decisions live in [`../adr/`](../adr/).

@@ -1765,7 +1765,7 @@ class RunConfig(BaseModel):
     )
     lag_tolerance_seconds: conint(ge=0) | None = 0
     """
-    Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild.
+    Treat an upstream `MAX(ts)` that moved by at most this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild. A `MAX(ts)` that went backwards forces a rebuild whatever this value is.
     """
     skip_rowcount_fallback: bool | None = False
     """
