@@ -1762,40 +1762,6 @@ class RoleConfig(BaseModel):
     """
 
 
-class RunConfig(BaseModel):
-    """
-    `[run]` — opt-in tuning for the model-skip gate.
-
-    The gate lets `rocky run` skip re-materializing a model whose logic and upstream data both *appear* unchanged since the last successful build. It is a best-effort optimization, **not** a guarantee of result- equivalence: non-deterministic SQL is excluded, and any ambiguity rebuilds. Every field defaults to the safe (no-skip) choice — the whole feature is off unless `skip_unchanged = true` (or the `--skip-unchanged` flag) is set.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    lag_tolerance_seconds: conint(ge=0) | None = 0
-    """
-    Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild.
-    """
-    skip_rowcount_fallback: bool | None = False
-    """
-    Allow a rowcount-only data-stability signal (`COUNT(*)`) when an upstream has no tracked timestamp column. Default `false`: without an explicit opt-in, a model whose upstreams are not watermarkable is not skip-eligible. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE` (or a matched insert+delete) that mutates values without changing the row count, so it stays behind this switch.
-    """
-    skip_unchanged: bool | None = False
-    """
-    Master switch for the model-skip gate. `false` (default) ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value.
-    """
-    strict_scheduling: bool | None = False
-    """
-    Turn physical-read scheduling warnings into a run refusal.
-
-    `false` (default) keeps today's behaviour: #1352 derives ordering edges from physical `schema.table` reads and reports what it could NOT safely resolve — contradicting bare-read pairs, models whose reference extraction failed, colliding targets — as advisory warnings, and the run still exits 0. A consumer that ignores them can read a stale physical target and report success.
-
-    `true` refuses instead, for estates that want fail-closed ordering. Opt in rather than default, because making warnings fatal changes run semantics for every existing project (#1355).
-
-    Lives on `[run]` rather than `[execution]` deliberately: `[execution]` is per-pipeline, and `rocky run --dag` derives ordering ACROSS pipelines, so a per-pipeline switch would have no single answer on the path that most needs one.
-    """
-
-
 class RunRetryConfig(BaseModel):
     """
     Top-level retry configuration applied across every adapter for this run. See [`RockyConfig::retry`] for the cross-adapter semantics this unlocks.
@@ -2166,6 +2132,30 @@ class TestSeverity6(StrEnum):
     """
 
     warning = "warning"
+
+
+class TestsOnRun1(StrEnum):
+    """
+    No test runs during `rocky run`. The default.
+    """
+
+    off = "off"
+
+
+class TestsOnRun2(StrEnum):
+    """
+    Run the tests and record the results; never fail a model.
+    """
+
+    report = "report"
+
+
+class TestsOnRun3(StrEnum):
+    """
+    Run the tests; an error-severity failure fails the model.
+    """
+
+    enforce = "enforce"
 
 
 class WebhookConfig(BaseModel):
@@ -3192,6 +3182,48 @@ class QuarantineConfig(BaseModel):
     suffix_valid: str | None = "__valid"
     """
     Table-name suffix for the passing-rows table. Default `"__valid"`.
+    """
+
+
+class RunConfig(BaseModel):
+    """
+    `[run]` — opt-in tuning for the model-skip gate.
+
+    The gate lets `rocky run` skip re-materializing a model whose logic and upstream data both *appear* unchanged since the last successful build. It is a best-effort optimization, **not** a guarantee of result- equivalence: non-deterministic SQL is excluded, and any ambiguity rebuilds. Every field defaults to the safe (no-skip) choice — the whole feature is off unless `skip_unchanged = true` (or the `--skip-unchanged` flag) is set.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    lag_tolerance_seconds: conint(ge=0) | None = 0
+    """
+    Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild.
+    """
+    skip_rowcount_fallback: bool | None = False
+    """
+    Allow a rowcount-only data-stability signal (`COUNT(*)`) when an upstream has no tracked timestamp column. Default `false`: without an explicit opt-in, a model whose upstreams are not watermarkable is not skip-eligible. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE` (or a matched insert+delete) that mutates values without changing the row count, so it stays behind this switch.
+    """
+    skip_unchanged: bool | None = False
+    """
+    Master switch for the model-skip gate. `false` (default) ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value.
+    """
+    strict_scheduling: bool | None = False
+    """
+    Turn physical-read scheduling warnings into a run refusal.
+
+    `false` (default) keeps today's behaviour: #1352 derives ordering edges from physical `schema.table` reads and reports what it could NOT safely resolve — contradicting bare-read pairs, models whose reference extraction failed, colliding targets — as advisory warnings, and the run still exits 0. A consumer that ignores them can read a stale physical target and report success.
+
+    `true` refuses instead, for estates that want fail-closed ordering. Opt in rather than default, because making warnings fatal changes run semantics for every existing project (#1355).
+
+    Lives on `[run]` rather than `[execution]` deliberately: `[execution]` is per-pipeline, and `rocky run --dag` derives ordering ACROSS pipelines, so a per-pipeline switch would have no single answer on the path that most needs one.
+    """
+    tests_on_run: TestsOnRun1 | TestsOnRun2 | TestsOnRun3 | None = "off"
+    """
+    Run each model's sidecar `[[tests]]` against the table the run just built (#2611).
+
+    - `"off"` (default): no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `"report"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `"enforce"`: as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.
+
+    A `severity = "warning"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation.
     """
 
 
@@ -4642,6 +4674,7 @@ class RockyConfig(BaseModel):
             "skip_rowcount_fallback": False,
             "skip_unchanged": False,
             "strict_scheduling": False,
+            "tests_on_run": "off",
         },
         validate_default=True,
     )

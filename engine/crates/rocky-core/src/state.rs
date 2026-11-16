@@ -3895,6 +3895,29 @@ impl RunRecord {
 /// is zero-touch at the storage layer: no in-place migration, no blob
 /// walk. A `test_v5_run_record_forward_deserializes_with_defaults` guard
 /// in this file pins the contract.
+/// One `[[tests]]` outcome recorded on a [`RunRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunTestRecord {
+    pub model: String,
+    pub test_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// `"error"` or `"warning"`.
+    pub severity: String,
+    /// `"pass"`, `"fail"`, or `"error"` (the test query could not run).
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl RunTestRecord {
+    /// Whether this outcome counts against the model: an error-severity test
+    /// that failed, or whose query could not run (fail closed).
+    pub fn is_blocking(&self) -> bool {
+        self.severity == "error" && matches!(self.status.as_str(), "fail" | "error")
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
@@ -3994,6 +4017,17 @@ pub struct RunRecord {
     /// no `CURRENT_SCHEMA_VERSION` bump, as for `rocky_branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_of: Option<String>,
+
+    /// The `[[tests]]` this run evaluated after building models
+    /// (`[run] tests_on_run` / `rocky run --tests`), one entry per test.
+    /// `rocky plan promote` reads it to refuse a branch whose newest run
+    /// recorded a failing error-severity test (#2609).
+    ///
+    /// Serde-defaulted and omitted when empty, so a run that evaluated no test
+    /// is byte-identical to an older record and an older record reads back
+    /// empty — no `CURRENT_SCHEMA_VERSION` bump, as for `retry_of`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<RunTestRecord>,
 
     /// The check gate's severity-resolved verdict for this run (schema v25):
     /// `true` when at least one **error-severity** check failed (or could not
@@ -11656,6 +11690,7 @@ pub fn run_with_output_versions(
         verify_after_failed: false,
         rocky_branch: None,
         retry_of: None,
+        test_results: Vec::new(),
         run_scope: Some(RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),
@@ -12875,6 +12910,7 @@ mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),

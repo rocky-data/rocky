@@ -645,6 +645,7 @@ mod tests {
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
                 full_refresh: false,
+                tests_on_run: Default::default(),
             },
             &compiled.project,
         );
@@ -696,6 +697,7 @@ mod tests {
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         };
         let gate = SkipGate::new(cfg, &project);
         assert!(

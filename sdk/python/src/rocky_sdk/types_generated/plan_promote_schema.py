@@ -21,7 +21,7 @@ class ApproverSource(StrEnum):
     http_api = "http_api"
 
 
-class AuditEventKind7(StrEnum):
+class AuditEventKind10(StrEnum):
     """
     Categorical kind of an [`AuditEvent`] emitted by `branch promote`.
     """
@@ -31,7 +31,7 @@ class AuditEventKind7(StrEnum):
     promote_failed = "promote_failed"
 
 
-class AuditEventKind8(StrEnum):
+class AuditEventKind11(StrEnum):
     """
     Emitted when the approval gate was bypassed via `--skip-approval` or the `ROCKY_BRANCH_APPROVAL_SKIP` env-var override. The skip reason is recorded so a future audit can tell flag-skip apart from env-skip.
     """
@@ -39,7 +39,7 @@ class AuditEventKind8(StrEnum):
     approval_skipped = "approval_skipped"
 
 
-class AuditEventKind9(StrEnum):
+class AuditEventKind12(StrEnum):
     """
     Emitted when the semantic breaking-change gate blocked the promote. The findings list is carried on the parent [`AuditEvent`] so reviewers see exactly which structural changes triggered the block.
     """
@@ -47,7 +47,7 @@ class AuditEventKind9(StrEnum):
     breaking_changes_blocked = "breaking_changes_blocked"
 
 
-class AuditEventKind10(StrEnum):
+class AuditEventKind13(StrEnum):
     """
     Emitted when the semantic breaking-change gate detected one or more `Breaking`-severity findings but the operator overrode the block via `--allow-breaking`. Records the findings so the override leaves an audit trail equivalent to `ApprovalSkipped`.
     """
@@ -55,7 +55,7 @@ class AuditEventKind10(StrEnum):
     breaking_changes_allowed = "breaking_changes_allowed"
 
 
-class AuditEventKind11(StrEnum):
+class AuditEventKind14(StrEnum):
     """
     Emitted when the semantic breaking-change gate could not run — for example because the base ref failed to compile under the current Rocky version. Fail-open: the gate is skipped and the promote proceeds, but the reason is recorded so the bypass is auditable.
     """
@@ -63,7 +63,31 @@ class AuditEventKind11(StrEnum):
     breaking_changes_gate_skipped = "breaking_changes_gate_skipped"
 
 
-class AuditEventKind12(StrEnum):
+class AuditEventKind15(StrEnum):
+    """
+    Emitted when the branch's newest run recorded an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the run and the failing tests.
+    """
+
+    failing_tests_blocked = "failing_tests_blocked"
+
+
+class AuditEventKind16(StrEnum):
+    """
+    Emitted when the newest run recorded a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.
+    """
+
+    failing_tests_allowed = "failing_tests_allowed"
+
+
+class AuditEventKind17(StrEnum):
+    """
+    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, or a model that declares error-severity tests was built with no recorded test result. A warning only: the promote proceeds. `reason` says which.
+    """
+
+    test_evidence_missing = "test_evidence_missing"
+
+
+class AuditEventKind18(StrEnum):
     """
     Emitted by `rocky plan promote` when the plan has been successfully written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an audit consumer can correlate plan creation to a subsequent `rocky apply` event without scanning the filesystem.
     """
@@ -520,12 +544,15 @@ class AuditEvent(BaseModel):
     Breaking-change findings carried by `BreakingChangesBlocked` and `BreakingChangesAllowed` events. Always absent for other kinds.
     """
     kind: (
-        AuditEventKind7
-        | AuditEventKind8
-        | AuditEventKind9
-        | AuditEventKind10
+        AuditEventKind10
         | AuditEventKind11
         | AuditEventKind12
+        | AuditEventKind13
+        | AuditEventKind14
+        | AuditEventKind15
+        | AuditEventKind16
+        | AuditEventKind17
+        | AuditEventKind18
     )
     """
     Categorical kind of an [`AuditEvent`] emitted by `branch promote`.
@@ -560,6 +587,10 @@ class PromotePlan(BaseModel):
     allow_breaking: bool | None = False
     """
     Whether `--allow-breaking` was set at plan time.
+    """
+    allow_failing_tests: bool | None = False
+    """
+    Whether `--allow-failing-tests` was set at plan time.
     """
     approvals_rejected: list[RejectedApproval]
     """

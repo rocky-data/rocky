@@ -428,7 +428,7 @@ rocky plan --intent refactor --base main --output json
 
 ### `rocky plan promote`
 
-Plan a branch promotion. Rocky runs the approval gate and the breaking-change gate now, then stores a promote plan that `rocky apply <plan-id>` executes later. The gates are **not** re-run at apply time, which is what makes "plan in the pull request, apply on merge" work.
+Plan a branch promotion. Rocky runs the approval gate, the breaking-change gate and the failing-tests gate now, then stores a promote plan that `rocky apply <plan-id>` executes later. The gates are **not** re-run at apply time, which is what makes "plan in the pull request, apply on merge" work.
 
 ```bash
 rocky plan promote <branch> [flags]
@@ -446,11 +446,21 @@ rocky plan promote <branch> [flags]
 |------|------|---------|-------------|
 | `--base <ref>` | `string` | `main` | Git ref the breaking-change gate diffs against. |
 | `--allow-breaking` | `bool` | `false` | Bypass the breaking-change gate. Always records a `BreakingChangesAllowed` audit event in the plan, so the override leaves a paper trail. |
+| `--allow-failing-tests` | `bool` | `false` | Bypass the failing-tests gate. Always records a `FailingTestsAllowed` audit event in the plan, and prints a warning. |
 | `--filter <key=value>` | `string` | | Filter the promote targets. A transformation pipeline supports the keys `table`, `model`, `catalog`, and `schema`. |
 | `--pipeline <NAME>` | `string` | | Pipeline to plan against. Required when `rocky.toml` defines more than one pipeline. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
 
 On success the output is a `PlanOutput` with `plan_kind: "promote"` and the `plan_id` you pass to `rocky apply`.
+
+#### The failing-tests gate
+
+After the breaking-change gate, Rocky reads the newest run of the branch (`rocky run --branch <name>`). The newest run decides.
+
+- **Refused.** The run recorded an error-severity `[[tests]]` entry that failed, or whose query could not run. Exit code `1`, no plan written, and a `FailingTestsBlocked` audit event. Fix the data and re-run `rocky run --branch <name> --tests enforce`, or pass `--allow-failing-tests`.
+- **Warned, not refused.** The branch has no run. Its newest run failed. A model that declares error-severity tests was built by that run with no recorded test result (for example, the run used `--tests off`). Rocky prints a `WARNING` line to stderr and records a `TestEvidenceMissing` audit event. The promote goes on.
+
+Rocky only has test results when the run used `--tests report` or `--tests enforce`, or `[run] tests_on_run` set one of them. The default is off, so a project that never runs tests on its branch runs is warned, not refused. Refusing on missing evidence is a separate decision.
 
 ### Examples
 
@@ -659,6 +669,7 @@ rocky run [flags]
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--tests <MODE>` | `off`, `report`, `enforce` | config, else `off` | Evaluate each built model's `[[tests]]` after it builds. See [Tests during a run](#tests-during-a-run). |
 | `--retry-failed [<RUN_ID>]` | `string` | | Rerun the failed and never-built models of a failed transformation run, and the models downstream of them. Without a value, the run is the latest production run of the pipeline (or of `--branch`). A model is not rerun when that run built it with the SQL it has now. Refuses when the run succeeded, is not found, is not a production run of this pipeline, nothing is left to retry, or `[state]` uses a remote backend. Rejected with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model`, `--select`, `--exclude`, `--shadow`, `--shadow-schema` and the `--defer` flags. See [Retrying a failed run](#retrying-a-failed-run). |
 | `--shadow` | `bool` | `false` | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
 | `--keep-shadow` | `bool` | `false` | Requires `--shadow` and conflicts with `--watch`. Keep shadow objects for a separate `rocky compare`. |
@@ -713,6 +724,18 @@ The retry is recorded under the same pipeline with `retry_of` set to the run it 
 `--retry-failed` reads run history from the local state store. With a remote `[state]` backend, run the failed models with `--select`.
 
 ### Per-model status
+
+### Tests during a run
+
+`--tests <off|report|enforce>` runs each built model's sidecar `[[tests]]` against the table the run just wrote. The tests run before the model's downstream models build. It overrides `[run] tests_on_run`, which defaults to `off`.
+
+| Mode | What happens |
+|---|---|
+| `off` | No test query runs. The output has no `test_results`. |
+| `report` | Tests run and are listed under `test_results`. A failing test never fails the model. |
+| `enforce` | As `report`. An error-severity test that fails, or whose query cannot run, fails the model. Its downstream models do not build. |
+
+A `severity = "warning"` test is listed in every mode and never fails a model. The table a failed model wrote stays in place. Nothing is rolled back. Tests run on the table the run wrote, so a `--shadow` or `--branch` run tests the shadow or branch table. `content_addressed` models write no warehouse table and are not tested. The results are saved on the run record, where [`rocky plan promote`](#the-failing-tests-gate) reads them. `rocky test --declarative` is unchanged.
 
 `--output json` carries `model_statuses` when at least one model did not build. It covers transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`). A replication run never has it, even with `--all`. It is a roll-up of `materializations`, `errors`, `model_decisions` and `contained`.
 
@@ -1131,6 +1154,7 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 |------|------|---------|-------------|
 | `--plan <plan-id>` | `string` | (none) | Execute a promote plan written by `rocky plan promote`. The gates already ran at plan time. |
 | `--allow-breaking` | flag | off | Bypass the semantic breaking-change gate. Always emits a `breaking_changes_allowed` audit event so the override leaves a paper trail. |
+| `--allow-failing-tests` | flag | off | Bypass the failing-tests gate described under [`rocky plan promote`](#the-failing-tests-gate). Always emits a `failing_tests_allowed` audit event. |
 | `--base-ref <ref>` | `string` | `main` | Git ref to diff against for the breaking-change gate. |
 | `--models <path>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
 | `--skip-approval` | flag | off | Bypass the approval gate. Always emits an `approval_skipped` audit event so the bypass leaves a paper trail. |

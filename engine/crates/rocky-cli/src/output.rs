@@ -413,6 +413,12 @@ pub struct RunOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) retry_of: Option<String>,
+    /// Models an enforced `[[tests]]` failure marked failed after their write.
+    /// `to_run_record` records them as failed executions, as it does for a
+    /// volume breach. Not part of the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) test_failed_models: std::collections::BTreeSet<String>,
     /// `errors` index -> the model whose measurement in `failed_attempts`
     /// belongs to that entry. Matching by entry, never by name, so a
     /// replication table that shares a model's bare name gets nothing.
@@ -449,6 +455,13 @@ pub struct RunOutput {
     /// or without models, never has it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_statuses: Vec<ModelRunStatusOutput>,
+    /// The `[[tests]]` this run evaluated after building models, one entry per
+    /// test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run
+    /// --tests`). Omitted when no test ran, so a default run is unchanged on
+    /// the wire. The same list is persisted on the run record, where `rocky
+    /// plan promote` reads it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<RunTestResultOutput>,
     pub check_results: Vec<TableCheckOutput>,
     /// Row-quarantine outcomes — one entry per table the quality
     /// pipeline quarantined. Empty for runs that did not use
@@ -2026,6 +2039,38 @@ pub struct ModelRunStatusOutput {
     /// reach this one. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+}
+
+/// One `[[tests]]` outcome on [`RunOutput::test_results`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RunTestResultOutput {
+    /// The model the test belongs to.
+    pub model: String,
+    /// The test type (`not_null`, `unique`, `accepted_values`, ...).
+    pub test_type: String,
+    /// The column the test checks, when it checks one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// `error` or `warning`. Only `error` can fail a model.
+    pub severity: String,
+    /// `pass`, `fail`, or `error` (the test query could not run).
+    pub status: String,
+    /// What the test found, or why it could not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl From<&RunTestResultOutput> for rocky_core::state::RunTestRecord {
+    fn from(r: &RunTestResultOutput) -> Self {
+        Self {
+            model: r.model.clone(),
+            test_type: r.test_type.clone(),
+            column: r.column.clone(),
+            severity: r.severity.clone(),
+            status: r.status.clone(),
+            detail: r.detail.clone(),
+        }
+    }
 }
 
 /// One model withheld from a run because an upstream failed (or was itself
@@ -6724,6 +6769,8 @@ impl RunOutput {
             withheld_models: Default::default(),
             frozen_stop: false,
             retry_of: None,
+            test_failed_models: Default::default(),
+            test_results: Vec::new(),
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
@@ -6986,6 +7033,7 @@ impl RunOutput {
             .filter_map(|mat| mat.volume.as_ref())
             .filter(|volume| volume.fails_the_build())
             .map(|volume| volume.model.clone())
+            .chain(self.test_failed_models.iter().cloned())
             .collect();
         let output_volumes: Vec<rocky_core::state::OutputVolumeRecord> = self
             .materializations
@@ -7023,6 +7071,10 @@ impl RunOutput {
                     .volume
                     .as_ref()
                     .is_some_and(VolumeCheckOutput::fails_the_build)
+                    || mat
+                        .asset_key
+                        .last()
+                        .is_some_and(|m| self.test_failed_models.contains(m))
                 {
                     "failed".to_string()
                 } else {
@@ -7192,6 +7244,7 @@ impl RunOutput {
             rocky_version: audit.rocky_version,
             rocky_branch: audit.rocky_branch,
             retry_of: self.retry_of.clone(),
+            test_results: self.test_results.iter().map(Into::into).collect(),
             run_scope: Some(audit.run_scope),
             check_outcomes,
             pipeline: None,
@@ -10497,6 +10550,18 @@ pub enum AuditEventKind {
     /// Rocky version. Fail-open: the gate is skipped and the promote
     /// proceeds, but the reason is recorded so the bypass is auditable.
     BreakingChangesGateSkipped,
+    /// Emitted when the branch's newest run recorded an error-severity
+    /// `[[tests]]` failure and the promote was refused (#2609). `reason` names
+    /// the run and the failing tests.
+    FailingTestsBlocked,
+    /// Emitted when the newest run recorded a failing error-severity test and
+    /// the operator overrode the refusal with `--allow-failing-tests`.
+    FailingTestsAllowed,
+    /// Emitted when the promote has no passing test evidence to rely on: the
+    /// branch has no run, its newest run failed, or a model that declares
+    /// error-severity tests was built with no recorded test result. A warning
+    /// only: the promote proceeds. `reason` says which.
+    TestEvidenceMissing,
     /// Emitted by `rocky plan promote` when the plan has been successfully
     /// written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an
     /// audit consumer can correlate plan creation to a subsequent
@@ -10707,6 +10772,9 @@ pub struct PromotePlan {
     /// Whether `--allow-breaking` was set at plan time.
     #[serde(default)]
     pub allow_breaking: bool,
+    /// Whether `--allow-failing-tests` was set at plan time.
+    #[serde(default)]
+    pub allow_failing_tests: bool,
     /// Per-model SQL plan, in dispatch order. SQL is persisted verbatim so
     /// `rocky apply` executes the exact statements generated at plan time.
     pub targets: Vec<PromoteTargetPlan>,

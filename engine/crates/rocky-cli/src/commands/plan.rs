@@ -3409,6 +3409,7 @@ fn render_semantic_verdict_text(output: &PlanOutput) {
 /// - `filter` — optional replication filter (e.g. `"client=acme"`).
 /// - `pipeline_name` — optional pipeline selector.
 /// - `allow_breaking` — bypass the breaking-change block gate.
+/// - `allow_failing_tests` — bypass the failing-tests gate (#2609).
 /// - `state_path` — already-resolved (namespace-aware) state-file path threaded
 ///   from `main.rs`, so `rocky --state-namespace <ns> plan promote` reads the
 ///   namespaced branch state rather than the global file.
@@ -3423,6 +3424,7 @@ pub async fn plan_promote(
     filter: Option<&str>,
     pipeline_name: Option<&str>,
     allow_breaking: bool,
+    allow_failing_tests: bool,
     state_path: &Path,
     principal: PolicyPrincipal,
     output_json: bool,
@@ -3439,6 +3441,7 @@ pub async fn plan_promote(
         // gate honors `ROCKY_BRANCH_APPROVAL_SKIP` only on this path.
         false,
         allow_breaking,
+        allow_failing_tests,
         state_path,
         principal,
     )
@@ -3459,6 +3462,15 @@ pub async fn plan_promote(
             "Apply with: rocky apply {}",
             result.plan_output.plan_id.as_deref().unwrap_or("")
         );
+        if result.plan.allow_failing_tests
+            && result
+                .plan
+                .plan_audit
+                .iter()
+                .any(|e| matches!(e.kind, AuditEventKind::FailingTestsAllowed))
+        {
+            println!("WARNING: failing test(s) allowed (--allow-failing-tests was set)");
+        }
         if let Some(bc) = &result.plan.breaking_changes {
             let breaking_count = bc.iter().filter(|f| f.is_breaking()).count();
             if breaking_count > 0 {
@@ -3516,6 +3528,165 @@ impl std::fmt::Display for PromoteBlockedByBreakingChanges {
 
 impl std::error::Error for PromoteBlockedByBreakingChanges {}
 
+/// Error returned by [`build_promote_plan_inner`] when the branch's newest run
+/// recorded an error-severity test that failed or could not run, and
+/// `--allow-failing-tests` was not set (#2609). The plan is NOT written.
+///
+/// Carries the recorded failures plus the partial audit (whose last entry is
+/// `FailingTestsBlocked`), as [`PromoteBlockedByBreakingChanges`] does, so the
+/// bare `rocky branch promote` can reprint its block JSON.
+#[derive(Debug)]
+pub(crate) struct PromoteBlockedByFailingTests {
+    pub branch: String,
+    pub run_id: String,
+    pub failures: Vec<rocky_core::state::RunTestRecord>,
+    pub audit: Vec<AuditEvent>,
+    pub approvals_used: Vec<ApprovalArtifact>,
+    pub approvals_rejected: Vec<RejectedApproval>,
+    pub branch_state_hash: String,
+    pub breaking_changes: Option<Vec<rocky_core::breaking_change::BreakingFinding>>,
+}
+
+impl std::fmt::Display for PromoteBlockedByFailingTests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "promote plan blocked by {} failing test(s) recorded by run {} on branch '{}': {}. \
+             Fix the data and re-run `rocky run --branch {} --tests enforce`, or re-run with \
+             `--allow-failing-tests` to override.",
+            self.failures.len(),
+            self.run_id,
+            self.branch,
+            describe_failing_tests(&self.failures),
+            self.branch,
+        )
+    }
+}
+
+impl std::error::Error for PromoteBlockedByFailingTests {}
+
+fn describe_failing_tests(failures: &[rocky_core::state::RunTestRecord]) -> String {
+    failures
+        .iter()
+        .map(|t| {
+            let column = t
+                .column
+                .as_deref()
+                .map(|c| format!(".{c}"))
+                .unwrap_or_default();
+            format!(
+                "{}{column} [{}] {}{}",
+                t.model,
+                t.test_type,
+                t.status,
+                t.detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What the branch's newest run says about its `[[tests]]`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PromoteTestEvidence {
+    /// The newest run's id, when the branch has a run.
+    pub run_id: Option<String>,
+    /// Recorded error-severity tests that failed or could not run. These
+    /// refuse the promote.
+    pub failures: Vec<rocky_core::state::RunTestRecord>,
+    /// Gaps in the evidence. These warn and never refuse.
+    pub warnings: Vec<String>,
+}
+
+/// Read the branch's newest run and decide what its test evidence means for a
+/// promote. `error_test_models` are the models that declare at least one
+/// error-severity `[[tests]]` entry.
+///
+/// Only a recorded failure refuses (#2609 case ii). Three gaps only warn: the
+/// newest run failed (i), a model that declares error-severity tests was built
+/// by that run with no recorded result (iii), and the branch has no run (iv).
+/// Refusing on (i), (iii) or (iv) is a separate change that waits on the
+/// owner's decision: every project that does not run tests on its branch runs
+/// would start to be refused.
+pub(crate) fn assess_branch_test_evidence(
+    branch: &str,
+    newest_run: Option<&rocky_core::state::RunRecord>,
+    error_test_models: &std::collections::BTreeSet<String>,
+) -> PromoteTestEvidence {
+    use rocky_core::state::RunStatus;
+
+    let Some(run) = newest_run else {
+        return PromoteTestEvidence {
+            run_id: None,
+            failures: Vec::new(),
+            warnings: vec![format!(
+                "branch '{branch}' has no recorded run, so there is no test evidence for it"
+            )],
+        };
+    };
+    let failures: Vec<_> = run
+        .test_results
+        .iter()
+        .filter(|t| t.is_blocking())
+        .cloned()
+        .collect();
+    let mut warnings = Vec::new();
+    if matches!(run.status, RunStatus::Failure | RunStatus::PartialFailure) {
+        warnings.push(format!(
+            "the newest run of branch '{branch}' ({}) did not succeed ({:?})",
+            run.run_id, run.status
+        ));
+    }
+    let mut untested: Vec<&str> = run
+        .models_executed
+        .iter()
+        .filter(|m| m.status == "success" && error_test_models.contains(&m.model_name))
+        .filter(|m| !run.test_results.iter().any(|t| t.model == m.model_name))
+        .map(|m| m.model_name.as_str())
+        .collect();
+    untested.sort_unstable();
+    untested.dedup();
+    if !untested.is_empty() {
+        warnings.push(format!(
+            "run {} built model(s) that declare error-severity tests but recorded no test \
+             result for them: {}. Run with `--tests report` or `--tests enforce` to record them",
+            run.run_id,
+            untested.join(", ")
+        ));
+    }
+    PromoteTestEvidence {
+        run_id: Some(run.run_id.clone()),
+        failures,
+        warnings,
+    }
+}
+
+/// The models that declare at least one error-severity `[[tests]]` entry,
+/// across the project's transformation pipelines. Best effort: a project whose
+/// models cannot be loaded contributes none, so the "built but not tested"
+/// warning stays silent rather than refusing or guessing.
+fn models_with_error_tests(
+    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+) -> std::collections::BTreeSet<String> {
+    let Ok(loaded) = crate::models_loader::load_transformation_models(config_path, cfg) else {
+        return Default::default();
+    };
+    crate::models_loader::union_by_model_name(&loaded.by_pipeline)
+        .into_iter()
+        .filter(|m| {
+            m.config
+                .tests
+                .iter()
+                .any(|t| matches!(t.severity, rocky_core::tests::TestSeverity::Error))
+        })
+        .map(|m| m.config.name)
+        .collect()
+}
+
 /// Build and persist a `PromotePlan` from the given parameters.
 ///
 /// Extracted as a named function so both `plan_promote` (standalone command)
@@ -3541,6 +3712,9 @@ pub(crate) async fn build_promote_plan_inner(
     // call sites run the identical approval gate.
     skip_approval_flag: bool,
     allow_breaking: bool,
+    // Bypass the failing-tests gate (#2609); recorded as a
+    // `FailingTestsAllowed` audit event and on the plan.
+    allow_failing_tests: bool,
     state_path: &Path,
     // The resolved CLI authoring principal, stamped onto the persisted plan as
     // an ADVISORY/display record. Enforcement — `rocky apply <promote-plan>`,
@@ -3663,6 +3837,78 @@ pub(crate) async fn build_promote_plan_inner(
         }
     }
 
+    // Failing-tests gate (#2609) — after the breaking-change gate, before the
+    // plan is written. The branch's newest run decides: a recorded
+    // error-severity test that failed or could not run refuses the promote
+    // unless `--allow-failing-tests`. Missing evidence (a failed newest run, a
+    // tested model with no recorded result, no run at all) only warns.
+    // Refusing on missing evidence is a separate change that waits on the
+    // owner: it would refuse every project that does not run tests on its
+    // branch runs.
+    let newest_run = store
+        .list_runs_matching(1, |r| {
+            r.rocky_branch.as_deref() == Some(branch_name)
+                && !matches!(
+                    r.status,
+                    rocky_core::state::RunStatus::SkippedIdempotent
+                        | rocky_core::state::RunStatus::SkippedInFlight
+                )
+        })?
+        .into_iter()
+        .next();
+    let error_test_models = models_with_error_tests(config_path, &rocky_cfg);
+    let evidence =
+        assess_branch_test_evidence(branch_name, newest_run.as_ref(), &error_test_models);
+    let test_audit = |kind: AuditEventKind, reason: String| AuditEvent {
+        kind,
+        at: Utc::now(),
+        actor: actor.clone(),
+        branch: record.name.clone(),
+        branch_state_hash: branch_state_hash.clone(),
+        reason: Some(reason),
+        breaking_changes: None,
+    };
+    if !evidence.failures.is_empty() {
+        let run_id = evidence.run_id.clone().unwrap_or_default();
+        let detail = format!(
+            "run {run_id}: {}",
+            describe_failing_tests(&evidence.failures)
+        );
+        if allow_failing_tests {
+            eprintln!(
+                "WARNING: promoting branch '{branch_name}' with {} failing test(s) \
+                 (--allow-failing-tests was set): {detail}",
+                evidence.failures.len()
+            );
+            audit.push(test_audit(
+                AuditEventKind::FailingTestsAllowed,
+                format!("--allow-failing-tests CLI flag; {detail}"),
+            ));
+        } else {
+            audit.push(test_audit(AuditEventKind::FailingTestsBlocked, detail));
+            return Err(PromoteBlockedByFailingTests {
+                branch: branch_name.to_string(),
+                run_id,
+                failures: evidence.failures,
+                audit: std::mem::take(&mut audit),
+                approvals_used,
+                approvals_rejected,
+                branch_state_hash: branch_state_hash.clone(),
+                breaking_changes: breaking_findings,
+            }
+            .into());
+        }
+    }
+    for warning in &evidence.warnings {
+        eprintln!(
+            "WARNING: promote of branch '{branch_name}' has no passing test evidence: {warning}"
+        );
+        audit.push(test_audit(
+            AuditEventKind::TestEvidenceMissing,
+            warning.clone(),
+        ));
+    }
+
     // Discover targets + build SQL at plan time (dialect-quoted, deterministic).
     // The resolved pipeline name comes back too — never ambiguous, even when
     // `pipeline_name` was `None` on a single-pipeline config — and is
@@ -3734,6 +3980,7 @@ pub(crate) async fn build_promote_plan_inner(
         approvals_rejected,
         breaking_changes: breaking_findings,
         allow_breaking,
+        allow_failing_tests,
         targets: target_plans,
         plan_audit: audit,
         created_at,
@@ -5984,6 +6231,7 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
             approvals_rejected: vec![],
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![PromoteTargetPlan {
                 target: "cat.prod_schema.orders".to_string(),
                 source: "cat.branch__fix.orders".to_string(),

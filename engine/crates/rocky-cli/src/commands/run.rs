@@ -1698,6 +1698,10 @@ pub struct SkipRunOptions {
     /// one. The overlay travels to every `--dag` sub-run, which a forced run
     /// id would not.
     pub no_source_sync: bool,
+    /// `rocky run --tests <off|report|enforce>`. Wins over
+    /// `[run] tests_on_run` for this invocation; `None` keeps the config
+    /// value.
+    pub tests_on_run: Option<rocky_core::config::TestsOnRun>,
 }
 
 impl SkipRunOptions {
@@ -1742,6 +1746,12 @@ pub(crate) struct SkipGateConfig {
     /// threaded to `execute_models`; like `--force-rebuild` it turns the skip
     /// gate off.
     pub full_refresh: bool,
+    /// `--tests` over `[run] tests_on_run`: whether the run evaluates a built
+    /// model's `[[tests]]`, and whether a failing one fails the model. Rides
+    /// on this struct, as `full_refresh` does, because it is the run-scoped
+    /// decision already threaded to `execute_models`. It does not change what
+    /// the skip gate decides.
+    pub tests_on_run: rocky_core::config::TestsOnRun,
 }
 
 impl SkipGateConfig {
@@ -1759,6 +1769,7 @@ impl SkipGateConfig {
             lag_tolerance_seconds: run_config.lag_tolerance_seconds,
             shadow_or_branch,
             full_refresh: skip_opts.full_refresh,
+            tests_on_run: skip_opts.tests_on_run.unwrap_or(run_config.tests_on_run),
         }
     }
 
@@ -1782,6 +1793,7 @@ impl SkipGateConfig {
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: rocky_core::config::TestsOnRun::Off,
         }
     }
 }
@@ -15137,9 +15149,28 @@ async fn execute_models_phase(
                             output,
                         )
                         .await;
+                        // `[run] tests_on_run`: the model's `[[tests]]` run
+                        // against the table just written, before any
+                        // downstream layer starts. Under `enforce` an
+                        // error-severity failure is this model's failure, like
+                        // a volume breach. A model the volume check already
+                        // failed is not tested.
+                        let volume_failure = match volume_failure {
+                            Some(e) => Some(e),
+                            None => {
+                                super::run_tests::evaluate_model_tests(
+                                    skip_gate.tests_on_run,
+                                    warehouse,
+                                    matched[idx].2,
+                                    output,
+                                )
+                                .await
+                            }
+                        };
                         output.materializations.push(materialization);
                         // The success hook fires only when the volume check
-                        // passed: a breach fires `model_error` alone below.
+                        // and the tests passed: a breach fires `model_error`
+                        // alone below.
                         if volume_failure.is_none()
                             && let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name)
                         {
@@ -15880,11 +15911,28 @@ async fn execute_models_phase(
                     output.fail_fast_model = Some(model_name.to_string());
                     return Err(e);
                 }
-                // An `error` breach fails the model after its writes, as on
-                // the plain path: `model_error` fires, the success hook does
-                // not, and downstream is withheld (contained) or the run
-                // stops. The rows stay in the table. Only the breaching
-                // partitions were marked `Failed` above.
+                // `[run] tests_on_run`: the tests run once, over the table the
+                // partitions wrote, unless the run was cancelled or a breach
+                // already failed the model.
+                let volume_failure = match volume_failure {
+                    Some(e) => Some(e),
+                    None if cancel.is_cancelled() => None,
+                    None => {
+                        super::run_tests::evaluate_model_tests(
+                            skip_gate.tests_on_run,
+                            warehouse,
+                            model,
+                            output,
+                        )
+                        .await
+                    }
+                };
+                // An `error` breach or an enforced test failure fails the
+                // model after its writes, as on the plain path:
+                // `model_error` fires, the success hook does not, and
+                // downstream is withheld (contained) or the run stops. The
+                // rows stay in the table. Only the breaching partitions were
+                // marked `Failed` above.
                 if let Some(e) = volume_failure {
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                         let _ = reg
@@ -16001,9 +16049,23 @@ async fn execute_models_phase(
                         output,
                     )
                     .await;
+                    // `[run] tests_on_run`, as on the concurrent path above.
+                    let volume_failure = match volume_failure {
+                        Some(e) => Some(e),
+                        None => {
+                            super::run_tests::evaluate_model_tests(
+                                skip_gate.tests_on_run,
+                                warehouse,
+                                model,
+                                output,
+                            )
+                            .await
+                        }
+                    };
                     output.materializations.push(materialization);
-                    // The success hook fires only when the volume check
-                    // passed: a breach fires `model_error` alone below.
+                    // The success hook fires only when the volume check and
+                    // the tests passed: a breach fires `model_error` alone
+                    // below.
                     if volume_failure.is_none()
                         && let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name)
                     {
@@ -27851,6 +27913,8 @@ auto_create_schemas = true
             withheld_models: Default::default(),
             frozen_stop: false,
             retry_of: None,
+            test_failed_models: Default::default(),
+            test_results: Vec::new(),
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
@@ -44261,6 +44325,7 @@ auto_create_schemas = true
             lag_tolerance_seconds,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         }
     }
 
@@ -44858,6 +44923,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -44949,6 +45015,7 @@ auto_create_schemas = true
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         };
         let out2 = run_with_gate(
             &models_dir,
@@ -45234,6 +45301,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45311,6 +45379,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45368,6 +45437,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45497,6 +45567,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45570,6 +45641,7 @@ auto_create_schemas = true
                         lag_tolerance_seconds: 0,
                         shadow_or_branch: false,
                         full_refresh: false,
+                        tests_on_run: Default::default(),
                     },
                     false,
                     false,
@@ -45639,6 +45711,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45729,6 +45802,7 @@ auto_create_schemas = true
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
                 full_refresh: false,
+                tests_on_run: Default::default(),
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -45879,6 +45953,7 @@ auto_create_schemas = true
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         };
         let res = super::execute_models(
             &models_dir,
@@ -46010,6 +46085,7 @@ auto_create_schemas = true
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
                 full_refresh: false,
+                tests_on_run: Default::default(),
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -46176,6 +46252,7 @@ auto_create_schemas = true
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         };
         let resilience = rocky_core::config::ResilienceConfig {
             contain_failures: true,
@@ -47287,6 +47364,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47500,6 +47578,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47789,6 +47868,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -48790,6 +48870,7 @@ auto_create_schemas = true
                 verify_after_failed: false,
                 rocky_branch: None,
                 retry_of: None,
+                test_results: Vec::new(),
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
@@ -49109,6 +49190,7 @@ auto_create_schemas = true
                     verify_after_failed: false,
                     rocky_branch: None,
                     retry_of: None,
+                    test_results: Vec::new(),
                     run_scope: Some(rocky_core::state::RunScope::Production),
                     queued_ms: None,
                     source_volumes: Vec::new(),

@@ -180,6 +180,27 @@
           "type": "string"
         },
         {
+          "description": "Emitted when the branch's newest run recorded an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the run and the failing tests.",
+          "enum": [
+            "failing_tests_blocked"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emitted when the newest run recorded a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.",
+          "enum": [
+            "failing_tests_allowed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, or a model that declares error-severity tests was built with no recorded test result. A warning only: the promote proceeds. `reason` says which.",
+          "enum": [
+            "test_evidence_missing"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Emitted by `rocky plan promote` when the plan has been successfully written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an audit consumer can correlate plan creation to a subsequent `rocky apply` event without scanning the filesystem.",
           "enum": [
             "promote_plan_created"

@@ -3683,6 +3683,47 @@ pub struct RunConfig {
     /// `0`: any movement at all forces a rebuild.
     #[serde(default)]
     pub lag_tolerance_seconds: u64,
+
+    /// Run each model's sidecar `[[tests]]` against the table the run just
+    /// built (#2611).
+    ///
+    /// - `"off"` (default): no test query runs and the run output is
+    ///   unchanged. `rocky test --declarative` is then the only runner.
+    /// - `"report"`: after each successful build, and before the model's
+    ///   downstream builds, the model's tests run and their results are
+    ///   recorded on the run (`test_results`). A failing test never fails the
+    ///   model.
+    /// - `"enforce"`: as `report`, and an error-severity test that fails, or
+    ///   whose query cannot run, fails the model. Downstream models do not
+    ///   build, exactly as for a failed build. The table the model wrote stays
+    ///   in place: nothing is rolled back.
+    ///
+    /// A `severity = "warning"` test is reported in every mode and never
+    /// fails a model. `rocky run --tests <off|report|enforce>` overrides this
+    /// key for one invocation.
+    #[serde(default)]
+    pub tests_on_run: TestsOnRun,
+}
+
+/// `[run] tests_on_run` — whether a run evaluates the `[[tests]]` of the
+/// models it builds, and whether a failing one fails the model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TestsOnRun {
+    /// No test runs during `rocky run`. The default.
+    #[default]
+    Off,
+    /// Run the tests and record the results; never fail a model.
+    Report,
+    /// Run the tests; an error-severity failure fails the model.
+    Enforce,
+}
+
+impl TestsOnRun {
+    /// Whether any test query runs.
+    pub fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 /// `[reuse]` — auditable reuse for content-addressed models.
@@ -10090,6 +10131,24 @@ impl ReplicationPipelineConfig {
 
 #[cfg(test)]
 mod tests {
+    /// `[run] tests_on_run` defaults to `off`, parses its three values and
+    /// refuses anything else (#2611).
+    #[test]
+    fn tests_on_run_defaults_off_and_parses_three_modes() {
+        let run = |toml: &str| toml::from_str::<RunConfig>(toml);
+        assert_eq!(run("").unwrap().tests_on_run, TestsOnRun::Off);
+        assert!(!TestsOnRun::default().is_on());
+        for (word, mode) in [
+            ("off", TestsOnRun::Off),
+            ("report", TestsOnRun::Report),
+            ("enforce", TestsOnRun::Enforce),
+        ] {
+            let cfg = run(&format!("tests_on_run = \"{word}\"")).unwrap();
+            assert_eq!(cfg.tests_on_run, mode);
+        }
+        assert!(run("tests_on_run = \"always\"").is_err());
+    }
+
 
     /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).
     #[test]
