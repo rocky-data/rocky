@@ -179,7 +179,12 @@ fn enforce_by_default_fails_a_model_whose_test_fails() {
 #[test]
 fn off_runs_no_test_and_adds_no_output_field() {
     let tmp = tempfile::tempdir().unwrap();
-    project(tmp.path(), "\n[run]\ntests_on_run = \"off\"\n", FAN_OUT, UNIQUE_ERROR);
+    project(
+        tmp.path(),
+        "\n[run]\ntests_on_run = \"off\"\n",
+        FAN_OUT,
+        UNIQUE_ERROR,
+    );
     let out = rocky(tmp.path(), &["--output", "json", "run"]);
     assert!(out.status.success(), "{}", describe(&out));
     let v = json(&out);
@@ -355,13 +360,27 @@ fn refused_then_allowed(dir: &Path, needle: &str) {
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
     assert!(!out.status.success(), "{}", describe(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no passing test evidence"), "{}", describe(&out));
+    assert!(
+        stderr.contains("no passing test evidence"),
+        "{}",
+        describe(&out)
+    );
     assert!(stderr.contains(needle), "{}", describe(&out));
-    assert!(plan_texts(dir).is_empty(), "a refused promote writes no plan");
+    assert!(
+        plan_texts(dir).is_empty(),
+        "a refused promote writes no plan"
+    );
 
     let allowed = rocky(
         dir,
-        &["--output", "json", "plan", "promote", "pr1", "--allow-failing-tests"],
+        &[
+            "--output",
+            "json",
+            "plan",
+            "promote",
+            "pr1",
+            "--allow-failing-tests",
+        ],
     );
     assert!(allowed.status.success(), "{}", describe(&allowed));
     let plans = plan_texts(dir);
@@ -377,7 +396,9 @@ fn promote_refuses_when_the_newest_run_recorded_no_tests() {
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
     let run = rocky(
         dir,
-        &["--output", "json", "run", "--branch", "pr1", "--tests", "off"],
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "off",
+        ],
     );
     assert!(run.status.success(), "{}", describe(&run));
     refused_then_allowed(dir, "customer_orders (run ");
@@ -525,7 +546,9 @@ fn promote_names_an_untested_model_whose_table_has_another_name() {
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
     let run = rocky(
         dir,
-        &["--output", "json", "run", "--branch", "pr1", "--tests", "off"],
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "off",
+        ],
     );
     assert!(run.status.success(), "{}", describe(&run));
 
@@ -578,5 +601,9 @@ fn a_recreated_branch_does_not_inherit_the_old_branch_runs() {
     assert!(!out.status.success(), "{}", describe(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no recorded run"), "{}", describe(&out));
-    assert!(!stderr.contains("failing test(s) recorded"), "{}", describe(&out));
+    assert!(
+        !stderr.contains("failing test(s) recorded"),
+        "{}",
+        describe(&out)
+    );
 }

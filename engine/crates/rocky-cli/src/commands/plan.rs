@@ -3562,11 +3562,7 @@ impl std::fmt::Display for PromoteBlockedByFailingTests {
             )?;
         }
         if !self.gaps.is_empty() {
-            write!(
-                f,
-                " no passing test evidence: {}.",
-                self.gaps.join("; ")
-            )?;
+            write!(f, " no passing test evidence: {}.", self.gaps.join("; "))?;
         }
         write!(
             f,
