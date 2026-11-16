@@ -414,6 +414,27 @@ fn promote_refuses_when_the_branch_has_no_run() {
 }
 
 #[test]
+fn bare_branch_promote_refuses_a_branch_with_no_run_and_prints_the_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir, "", FAN_OUT, UNIQUE_ERROR);
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    let out = rocky(dir, &["--output", "json", "branch", "promote", "pr1"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(v["success"], false, "{}", describe(&out));
+    let blocked: Vec<&serde_json::Value> = v["audit"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no audit array\n{}", describe(&out)))
+        .iter()
+        .filter(|e| e["kind"] == "failing_tests_blocked")
+        .collect();
+    assert_eq!(blocked.len(), 1, "{}", describe(&out));
+    let reason = blocked[0]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("no recorded run"), "{}", describe(&out));
+}
+
+#[test]
 fn promote_refuses_when_the_newest_run_failed() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

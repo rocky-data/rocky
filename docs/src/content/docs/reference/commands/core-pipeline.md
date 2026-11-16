@@ -446,7 +446,7 @@ rocky plan promote <branch> [flags]
 |------|------|---------|-------------|
 | `--base <ref>` | `string` | `main` | Git ref the breaking-change gate diffs against. |
 | `--allow-breaking` | `bool` | `false` | Bypass the breaking-change gate. Always records a `BreakingChangesAllowed` audit event in the plan, so the override leaves a paper trail. |
-| `--allow-failing-tests` | `bool` | `false` | Bypass the failing-tests gate. Always records a `FailingTestsAllowed` audit event in the plan, and prints a warning. |
+| `--allow-failing-tests` | `bool` | `false` | Bypass the failing-tests gate, including a refusal for missing test evidence. Always records a `FailingTestsAllowed` audit event in the plan, and prints a warning. |
 | `--filter <key=value>` | `string` | | Filter the promote targets. A transformation pipeline supports the keys `table`, `model`, `catalog`, and `schema`. |
 | `--pipeline <NAME>` | `string` | | Pipeline to plan against. Required when `rocky.toml` defines more than one pipeline. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
@@ -682,7 +682,7 @@ rocky run [flags]
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
-| `--tests <MODE>` | `off`, `report`, `enforce` | config, else `off` | Evaluate each built model's `[[tests]]` after it builds. See [Tests during a run](#tests-during-a-run). |
+| `--tests <MODE>` | `off`, `report`, `enforce` | config, else `enforce` | Evaluate each built model's `[[tests]]` after it builds. See [Tests during a run](#tests-during-a-run). |
 | `--retry-failed [<RUN_ID>]` | `string` | | Rerun the failed and never-built models of a failed transformation run, and the models downstream of them. Without a value, the run is the latest production run of the pipeline (or of `--branch`). A model is not rerun when that run built it with the SQL it has now. Refuses when the run succeeded, is not found, is not a production run of this pipeline, nothing is left to retry, or `[state]` uses a remote backend. Rejected with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model`, `--select`, `--exclude`, `--shadow`, `--shadow-schema` and the `--defer` flags. See [Retrying a failed run](#retrying-a-failed-run). |
 | `--shadow` | `bool` | `false` | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
 | `--keep-shadow` | `bool` | `false` | Requires `--shadow` and conflicts with `--watch`. Keep shadow objects for a separate `rocky compare`. |
