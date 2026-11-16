@@ -503,7 +503,14 @@ fn a_scoped_deny_gates_exactly_the_selected_models() {
 #[test]
 fn deny_denies_a_multi_model_select_on_a_replication_project() {
     let tmp = tempfile::tempdir().unwrap();
-    replication_project(tmp.path(), DENY_POLICY);
+    // The replication tables are allowed, so a replication-shaped gate would
+    // pass: only gating the selected models refuses this run.
+    replication_project(
+        tmp.path(),
+        "\n[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n\n[[policy.rules]]\n\
+         principal = \"agent\"\ncapability = \"run\"\neffect = \"allow\"\n\
+         scope = { models = [\"orders\", \"returns\"] }\n",
+    );
     let models = tmp.path().join("models");
     fs::create_dir_all(&models).unwrap();
     for name in ["m1", "m2"] {
