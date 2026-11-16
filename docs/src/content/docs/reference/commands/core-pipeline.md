@@ -9,6 +9,17 @@ These commands cover a Rocky pipeline's whole life. You create the project, chec
 
 The two commands to know first are `rocky plan` and `rocky apply`. `rocky plan` prints the SQL it generates and writes a plan file with an id. For a `run` plan that file holds the settings the run needs, not the SQL. `rocky apply` reads the file and recompiles the project to run it. [`rocky run`](#rocky-run) fuses both into one step for local work.
 
+`rocky plan` needs a replication pipeline. A transformation project reviews its changes through a branch:
+
+```bash
+rocky branch create pr1
+rocky run --branch pr1          # builds into a branch schema, not production
+rocky plan promote pr1          # writes a promote plan and prints its plan_id
+rocky apply <plan-id>           # copies the reviewed branch tables to production
+```
+
+Add `--tests enforce` to the branch run to record each model's `[[tests]]`. [`rocky plan promote`](#the-failing-tests-gate) then refuses a branch with a recorded failing test.
+
 ## Global Flags
 
 The global flags (`--config`, `--output`, `--state-path`, `--state-namespace`, `--principal`, `--principal-id`, `--cache-ttl`) apply to every command. Put `--config`, `--state-path` and `--state-namespace` before the subcommand: `rocky --config prod.toml run`, not `rocky run --config prod.toml`. See [Global flags](/reference/cli/#global-flags) for the defaults.
