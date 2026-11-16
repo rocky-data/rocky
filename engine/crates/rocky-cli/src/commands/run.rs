@@ -13146,16 +13146,29 @@ fn adopt_contract_type_errors(
     executing: &mut rocky_compiler::compile::CompileResult,
     typed: rocky_compiler::compile::CompileResult,
 ) {
+    // `I003` and `E011` name the column in the same quoted form.
+    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
+    // Only an `E011` that replaces an `I003` of the executing compile crosses
+    // over. Any other `E011` the executing compile already has, or did not
+    // raise for a reason the describe does not settle; adopting it would
+    // duplicate an error or add one the run did not have (#2614).
+    let unchecked: BTreeSet<(String, Option<String>)> = executing
+        .contract_diagnostics
+        .iter()
+        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::I003)
+        .map(|d| (d.model.clone(), column_of(&d.message)))
+        .collect();
     let new_errors: Vec<rocky_compiler::diagnostic::Diagnostic> = typed
         .contract_diagnostics
         .into_iter()
-        .filter(|d| d.code.as_ref() == rocky_compiler::diagnostic::E011)
+        .filter(|d| {
+            d.code.as_ref() == rocky_compiler::diagnostic::E011
+                && unchecked.contains(&(d.model.clone(), column_of(&d.message)))
+        })
         .collect();
     if new_errors.is_empty() {
         return;
     }
-    // `I003` and `E011` name the column in the same quoted form.
-    let column_of = |message: &str| message.split('\'').nth(1).map(str::to_string);
     let resolved: BTreeSet<(String, Option<String>)> = new_errors
         .iter()
         .map(|d| (d.model.clone(), column_of(&d.message)))
@@ -13756,16 +13769,18 @@ async fn execute_models_phase(
     // contract types before any write. A governed apply replays its reviewed
     // source snapshot and never takes this path.
     //
-    // Only the second compile's `E011` (contract type mismatch) is kept. The
-    // first compile stays the one that executes, so the new source types
-    // cannot raise any other error and refuse a run that was valid before.
+    // Only the second compile's `E011` (contract type mismatch) for a type the
+    // first compile left unchecked (`I003`) is kept. The first compile stays
+    // the one that executes, so the new source types cannot raise any other
+    // error and refuse a run that was valid before.
     //
     // A `nullable = false` contract on a column read from such a source is
     // refused with `E012`, because a column of unknown origin is nullable.
     // Those sources are described too (#2614). The describe can only clear an
     // `E012`, never raise one: it is dropped when the second compile infers
     // the column as NOT NULL. Some adapters report every column as nullable;
-    // for them the `E012` stays, as it was.
+    // for them the `E012` stays, as it was. An adapter must report NOT NULL
+    // only where the warehouse enforces it on every row.
     let mut described_sources = std::collections::HashMap::new();
     if exec_fp_gate.is_none()
         && let Ok(first) = &mut compile
@@ -37881,6 +37896,74 @@ backend = "local"
             );
             assert!(output.materializations.is_empty(), "{contract_type:?}");
         }
+    }
+
+    /// #2614 red team: a NOT NULL contract on a model two hops from the
+    /// source (contract on `fct`, which reads model `stg`, which reads the
+    /// source) is resolved too. In a model with two contracted columns, only
+    /// the column the warehouse reports NOT NULL is cleared.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_resolves_e012_through_an_upstream_model_per_column() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "stg", "SELECT order_id, note FROM src.orders");
+        write_plain_model(&models, "fct", "SELECT order_id, note FROM stg");
+        std::fs::write(
+            contracts.join("fct.contract.toml"),
+            "[[columns]]\nname = \"order_id\"\nnullable = false\n\n\
+             [[columns]]\nname = \"note\"\nnullable = false\n",
+        )
+        .expect("contract");
+        let db_path = dir.path().join("t.duckdb");
+        {
+            let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+            conn.execute_sql("CREATE SCHEMA src").expect("schema");
+            conn.execute_sql("CREATE TABLE src.orders (order_id BIGINT NOT NULL, note VARCHAR)")
+                .expect("source");
+        }
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+        let e012: Vec<&String> = output
+            .errors
+            .iter()
+            .filter(|e| e.error.contains("E012"))
+            .map(|e| &e.error)
+            .collect();
+        assert_eq!(e012.len(), 1, "one E012 remains: {:?}", output.errors);
+        assert!(e012[0].contains("'note'"), "{e012:?}");
+    }
+
+    /// #2614 red team: an `E011` the run already has (a literal of the wrong
+    /// type, no source involved) is not adopted a second time when another
+    /// model's `E012` makes the run describe a source.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_describe_for_e012_does_not_duplicate_an_existing_e011() {
+        let (dir, models) = described_nullability_fixture(None, "NOT NULL");
+        write_plain_model(&models, "lit", "SELECT CAST(TRUE AS BOOLEAN) AS id");
+        std::fs::write(
+            dir.path().join("contracts").join("lit.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\n",
+        )
+        .expect("contract");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("the contract failure is carried in RunOutput");
+        let e011 = output
+            .errors
+            .iter()
+            .filter(|e| e.error.contains("E011"))
+            .count();
+        assert_eq!(e011, 1, "exactly one E011: {:?}", output.errors);
+        assert!(
+            !output.errors.iter().any(|e| e.error.contains("E012")),
+            "the described NOT NULL clears fct's E012: {:?}",
+            output.errors
+        );
     }
 
     /// A described NOT NULL source clears only the `E012`: a contract type

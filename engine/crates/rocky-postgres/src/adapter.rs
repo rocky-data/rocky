@@ -223,9 +223,17 @@ impl WarehouseAdapter for PostgresWarehouseAdapter {
                 // latter omits materialized views and splits type modifiers
                 // across columns. Relation kinds: table, partitioned table,
                 // view, materialized view, foreign table.
+                //
+                // NOT NULL is reported only where the server enforces it on
+                // every row (#2614): never on a foreign table, whose
+                // constraints are not checked, and never for a NOT NULL
+                // constraint that is still `NOT VALID` (PostgreSQL 18).
                 let sql = format!(
                     "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
-                     CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END \
+                     CASE WHEN a.attnotnull AND c.relkind <> 'f' AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid = c.oid \
+                     AND k.contype = 'n' AND NOT k.convalidated AND a.attnum = ANY(k.conkey)) \
+                     THEN 'NO' ELSE 'YES' END \
                      FROM pg_catalog.pg_attribute a \
                      JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \

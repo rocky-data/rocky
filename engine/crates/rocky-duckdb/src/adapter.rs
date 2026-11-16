@@ -566,7 +566,10 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
                     let nullable = row
                         .get(2)
                         .and_then(|v| v.as_str())
-                        .map(|v| v == "YES")
+                        // Only an explicit `NO` is NOT NULL: a value Rocky
+                        // does not recognise must not clear a contract's
+                        // nullability check (#2614).
+                        .map(|v| !v.eq_ignore_ascii_case("NO"))
                         .unwrap_or(true);
                     Some(ColumnInfo {
                         name,
