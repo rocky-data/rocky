@@ -455,7 +455,7 @@ On success the output is a `PlanOutput` with `plan_kind: "promote"` and the `pla
 
 #### The failing-tests gate
 
-After the breaking-change gate, Rocky reads the runs of the branch (`rocky run --branch <name>`) since the branch was created. Each model's own newest evidence decides: the newest run that recorded a test result for the model, or built it successfully. A newer run that did not touch a model, or failed to build it, leaves that model's evidence as it was.
+After the breaking-change gate, Rocky reads the runs of the branch (`rocky run --branch <name>`) since the branch was created. Each model's own newest evidence decides: a run that recorded a test result for the model, or a run in which every execution of the model succeeded. Evidence is ranked by when the run wrote the model, not by when the run started. A run that did not touch a model, or failed any part of its build (one failed partition is enough), leaves that model's evidence as it was.
 
 ```
 run 1  --tests enforce   orders FAILS a test

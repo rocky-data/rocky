@@ -1704,21 +1704,21 @@
             "type": "string"
           },
           {
-            "description": "Emitted when the branch's newest run recorded an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the run and the failing tests.",
+            "description": "Emitted when a model's newest test evidence on the branch holds an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the failing tests and the runs that recorded them.",
             "enum": [
               "failing_tests_blocked"
             ],
             "type": "string"
           },
           {
-            "description": "Emitted when the newest run recorded a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.",
+            "description": "Emitted when a model's newest test evidence holds a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.",
             "enum": [
               "failing_tests_allowed"
             ],
             "type": "string"
           },
           {
-            "description": "Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, or a model that declares error-severity tests was built with no recorded test result. A warning only: the promote proceeds. `reason` says which.",
+            "description": "Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. A warning only: the promote proceeds. `reason` says which.",
             "enum": [
               "test_evidence_missing"
             ],

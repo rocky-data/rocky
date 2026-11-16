@@ -517,3 +517,29 @@ fn a_test_that_cannot_run_fails_closed_under_enforce() {
     assert_eq!(test_result(&v, "customer_orders")["status"], "error", "{v}");
     assert_eq!(status_of(&v, "customer_orders"), "failed", "{v}");
 }
+
+#[test]
+fn a_recreated_branch_does_not_inherit_the_old_branch_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir, "", FAN_OUT, UNIQUE_ERROR);
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    let failing = rocky(
+        dir,
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "enforce",
+        ],
+    );
+    assert!(!failing.status.success(), "{}", describe(&failing));
+    let deleted = rocky(dir, &["branch", "delete", "pr1"]);
+    assert!(deleted.status.success(), "{}", describe(&deleted));
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+
+    let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no recorded run"),
+        "{}",
+        describe(&out)
+    );
+}

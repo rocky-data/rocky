@@ -65,7 +65,7 @@ class AuditEventKind14(StrEnum):
 
 class AuditEventKind15(StrEnum):
     """
-    Emitted when the branch's newest run recorded an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the run and the failing tests.
+    Emitted when a model's newest test evidence on the branch holds an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the failing tests and the runs that recorded them.
     """
 
     failing_tests_blocked = "failing_tests_blocked"
@@ -73,7 +73,7 @@ class AuditEventKind15(StrEnum):
 
 class AuditEventKind16(StrEnum):
     """
-    Emitted when the newest run recorded a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.
+    Emitted when a model's newest test evidence holds a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.
     """
 
     failing_tests_allowed = "failing_tests_allowed"
@@ -81,7 +81,7 @@ class AuditEventKind16(StrEnum):
 
 class AuditEventKind17(StrEnum):
     """
-    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, or a model that declares error-severity tests was built with no recorded test result. A warning only: the promote proceeds. `reason` says which.
+    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. A warning only: the promote proceeds. `reason` says which.
     """
 
     test_evidence_missing = "test_evidence_missing"

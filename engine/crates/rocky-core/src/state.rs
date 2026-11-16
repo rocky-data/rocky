@@ -4022,8 +4022,8 @@ pub struct RunRecord {
 
     /// The `[[tests]]` this run evaluated after building models
     /// (`[run] tests_on_run` / `rocky run --tests`), one entry per test.
-    /// `rocky plan promote` reads it to refuse a branch whose newest run
-    /// recorded a failing error-severity test (#2609).
+    /// `rocky plan promote` reads it to refuse a branch when a model's newest
+    /// test evidence holds a failing error-severity test (#2609).
     ///
     /// Serde-defaulted and omitted when empty, so a run that evaluated no test
     /// is byte-identical to an older record and an older record reads back

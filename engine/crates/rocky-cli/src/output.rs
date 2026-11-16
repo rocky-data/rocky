@@ -7023,15 +7023,16 @@ impl RunOutput {
             tracing::warn!("{summary}");
         }
 
-        // The Rocky model a materialization built. A transformation output
-        // carries its model in `output_target`; the asset key's last segment
-        // is the table name, which differs when `[target] table` is set.
-        fn mat_model(mat: &MaterializationOutput) -> &str {
-            mat.output_target.as_ref().map_or_else(
-                || mat.asset_key.last().map_or("<unknown>", String::as_str),
-                |target| target.model.as_str(),
-            )
-        }
+        // Whether `tests_on_run = "enforce"` failed the model this
+        // materialization built. Matched on the Rocky model in
+        // `output_target` only: every transformation output carries it, the
+        // asset key's last segment is the table name (which differs when
+        // `[target] table` is set), and a replication table never matches.
+        let test_failed = |mat: &MaterializationOutput| {
+            mat.output_target
+                .as_ref()
+                .is_some_and(|target| self.test_failed_models.contains(&target.model))
+        };
         // Models whose materialization below is recorded `failed`: an
         // `error` volume breach, or a failing test under `tests_on_run =
         // "enforce"`. Each execution is failed by its own check, so a
@@ -7043,13 +7044,17 @@ impl RunOutput {
         let failed_materialized: std::collections::BTreeSet<String> = self
             .materializations
             .iter()
-            .filter(|mat| {
-                mat.volume
-                    .as_ref()
-                    .is_some_and(VolumeCheckOutput::fails_the_build)
-                    || self.test_failed_models.contains(mat_model(mat))
+            .filter_map(|mat| {
+                if let Some(volume) = mat.volume.as_ref().filter(|v| v.fails_the_build()) {
+                    Some(volume.model.clone())
+                } else if test_failed(mat) {
+                    mat.output_target
+                        .as_ref()
+                        .map(|target| target.model.clone())
+                } else {
+                    None
+                }
             })
-            .map(|mat| mat_model(mat).to_string())
             .collect();
         let output_volumes: Vec<rocky_core::state::OutputVolumeRecord> = self
             .materializations
@@ -7087,7 +7092,7 @@ impl RunOutput {
                     .volume
                     .as_ref()
                     .is_some_and(VolumeCheckOutput::fails_the_build)
-                    || self.test_failed_models.contains(mat_model(mat))
+                    || test_failed(mat)
                 {
                     "failed".to_string()
                 } else {
@@ -9637,6 +9642,90 @@ mod run_record_tests {
         );
     }
 
+    fn record_of(out: &RunOutput) -> rocky_core::state::RunRecord {
+        let start = fixed_start();
+        out.to_run_record(
+            "run-tests",
+            start,
+            start + chrono::Duration::seconds(5),
+            "cfghash".to_string(),
+            RunTrigger::Manual,
+            RunStatus::Failure,
+            RunRecordAudit::test_sentinels(),
+        )
+    }
+
+    fn model_mat(model: &str, table: &str) -> MaterializationOutput {
+        let mut m = mat(&["s", table], 10, None, fixed_start());
+        m.output_target = Some(rocky_core::state::RecordedTarget {
+            model: model.to_string(),
+            catalog: "c".to_string(),
+            schema: "s".to_string(),
+            table: table.to_string(),
+        });
+        m
+    }
+
+    fn model_error(out: &mut RunOutput, model: &str) {
+        out.errors.push(TableErrorOutput {
+            asset_key: vec!["s".to_string(), model.to_string()],
+            error: "failed a test".to_string(),
+            failure_kind: FailureKind::default(),
+            cooldown_seconds: None,
+        });
+        out.error_models
+            .insert(out.errors.len() - 1, model.to_string());
+    }
+
+    /// An enforce failure with no materialization (a time-interval model that
+    /// wrote no partition) keeps its `errors` entry: one failed execution.
+    #[test]
+    fn a_test_failure_with_no_materialization_is_one_failed_execution() {
+        let mut out = RunOutput::new(String::new(), 5_000, 1);
+        out.test_failed_models.insert("daily".to_string());
+        model_error(&mut out, "daily");
+        let record = record_of(&out);
+        let daily: Vec<_> = record
+            .models_executed
+            .iter()
+            .filter(|e| e.model_name == "daily")
+            .collect();
+        assert_eq!(daily.len(), 1, "{:?}", record.models_executed);
+        assert_eq!(daily[0].status, "failed");
+    }
+
+    /// Every partition of a model that failed enforce is recorded failed,
+    /// matched by model name though the table is named otherwise, and the
+    /// `errors` entry is not recorded a second time. A replication table
+    /// of the model's name is not touched.
+    #[test]
+    fn a_test_failure_fails_every_partition_by_model_name_only() {
+        let mut out = RunOutput::new(String::new(), 5_000, 1);
+        out.test_failed_models.insert("daily".to_string());
+        for _ in 0..3 {
+            out.materializations.push(model_mat("daily", "daily_tbl"));
+        }
+        out.materializations
+            .push(mat(&["raw", "daily"], 10, None, fixed_start()));
+        model_error(&mut out, "daily");
+        let record = record_of(&out);
+        let statuses: Vec<(&str, &str)> = record
+            .models_executed
+            .iter()
+            .map(|e| (e.model_name.as_str(), e.status.as_str()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("daily_tbl", "failed"),
+                ("daily_tbl", "failed"),
+                ("daily_tbl", "failed"),
+                ("daily", "success"),
+            ],
+            "{statuses:?}"
+        );
+    }
+
     /// The content-addressed consumer baseline (`consumed_column_baseline`)
     /// must land on the persisted `ModelExecution.upstream_freshness` — the
     /// 🔴 The load-bearing identity invariant for classified retry, at the
@@ -10563,17 +10652,19 @@ pub enum AuditEventKind {
     /// Rocky version. Fail-open: the gate is skipped and the promote
     /// proceeds, but the reason is recorded so the bypass is auditable.
     BreakingChangesGateSkipped,
-    /// Emitted when the branch's newest run recorded an error-severity
-    /// `[[tests]]` failure and the promote was refused (#2609). `reason` names
-    /// the run and the failing tests.
+    /// Emitted when a model's newest test evidence on the branch holds an
+    /// error-severity `[[tests]]` failure and the promote was refused (#2609).
+    /// `reason` names the failing tests and the runs that recorded them.
     FailingTestsBlocked,
-    /// Emitted when the newest run recorded a failing error-severity test and
-    /// the operator overrode the refusal with `--allow-failing-tests`.
+    /// Emitted when a model's newest test evidence holds a failing
+    /// error-severity test and the operator overrode the refusal with
+    /// `--allow-failing-tests`.
     FailingTestsAllowed,
     /// Emitted when the promote has no passing test evidence to rely on: the
-    /// branch has no run, its newest run failed, or a model that declares
-    /// error-severity tests was built with no recorded test result. A warning
-    /// only: the promote proceeds. `reason` says which.
+    /// branch has no run, its newest run failed, a model that declares
+    /// error-severity tests was last built with no recorded test result, or
+    /// the models could not be loaded to tell. A warning only: the promote
+    /// proceeds. `reason` says which.
     TestEvidenceMissing,
     /// Emitted by `rocky plan promote` when the plan has been successfully
     /// written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an

@@ -939,6 +939,33 @@ mod unit_tests {
     /// other test here does — cannot tell a correct call site from one that
     /// hardcoded generic. `a->'k'` separates them: generic parses it as an
     /// operator, snowflake parses `->` as the lambda arrow and refuses it.
+    /// A dialect-rendered table reference is used verbatim: a quoted
+    /// Snowflake ref and a hyphenated BigQuery project, both of which the
+    /// dotted path refuses or misreads.
+    #[test]
+    fn a_dialect_rendered_table_ref_is_used_verbatim() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("id".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        for table_ref in [
+            "\"warehouse\".\"marts\".\"orders\"",
+            "`my-project`.`marts`.`orders`",
+        ] {
+            let sql = generate_test_sql_for_table_ref(&decl, table_ref, &SnowflakeNamed)
+                .expect("a rendered ref is accepted");
+            assert!(
+                sql.contains(&format!("FROM {table_ref} WHERE")),
+                "{table_ref}: {sql}"
+            );
+        }
+        // The dotted path still validates each part.
+        generate_test_sql(&decl, "my-project.marts.orders")
+            .expect_err("an unquoted hyphenated part is refused");
+    }
+
     #[test]
     fn the_tests_rs_routes_thread_their_own_dialect() {
         // The checks `filter` route.
