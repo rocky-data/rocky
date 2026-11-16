@@ -9656,6 +9656,22 @@ mod tests {
             .collect()
     }
 
+    /// A star modifier over a complete upstream model that names a column
+    /// the model does not output is E039, as a plain read of it is (#2624
+    /// red team, finding 2). A present name is clean.
+    #[test]
+    fn a_star_modifier_naming_a_column_a_complete_model_lacks_is_e039() {
+        let result = compile_typechecks(vec![
+            make_model("stg", "SELECT order_id, status FROM raw.orders"),
+            make_model("bad", "SELECT * EXCLUDE (statsu) FROM stg"),
+            make_model("good", "SELECT * EXCLUDE (status) FROM stg"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{e039:?}");
+        assert_eq!(e039[0].model, "bad");
+        assert!(e039[0].message.contains("'statsu'"), "{}", e039[0].message);
+    }
+
     #[test]
     fn known_missing_direct_projection_refuses() {
         let result = compile_typechecks(vec![
