@@ -7171,7 +7171,10 @@ impl RunOutput {
                     .cloned()
                     .unwrap_or_else(|| "<unknown>".to_string())
             });
-            if failed_materialized.contains(&model_name) {
+            // A failed replication copy (it carries its own attempts) is
+            // never the model's duplicate, even when it shares the name.
+            if failed_materialized.contains(&model_name) && !self.table_attempts.contains_key(&idx)
+            {
                 continue;
             }
             // The retry loop's measurement for this model, when it ran
@@ -9692,6 +9695,36 @@ mod run_record_tests {
             .collect();
         assert_eq!(daily.len(), 1, "{:?}", record.models_executed);
         assert_eq!(daily[0].status, "failed");
+    }
+
+    /// A failed replication copy of a table that shares a failed model's
+    /// name keeps its own failed execution.
+    #[test]
+    fn a_failed_same_named_replication_copy_keeps_its_execution() {
+        let mut out = RunOutput::new(String::new(), 5_000, 1);
+        out.test_failed_models.insert("daily".to_string());
+        out.materializations.push(model_mat("daily", "daily"));
+        out.errors.push(TableErrorOutput {
+            asset_key: vec!["raw".to_string(), "daily".to_string()],
+            error: "copy failed".to_string(),
+            failure_kind: FailureKind::default(),
+            cooldown_seconds: None,
+        });
+        out.error_models.insert(0, "daily".to_string());
+        out.table_attempts.insert(
+            0,
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms: 7,
+                attempts: Vec::new(),
+            },
+        );
+        let record = record_of(&out);
+        let failed = record
+            .models_executed
+            .iter()
+            .filter(|e| e.model_name == "daily" && e.status == "failed")
+            .count();
+        assert_eq!(failed, 2, "{:?}", record.models_executed);
     }
 
     /// Every partition of a model that failed enforce is recorded failed,

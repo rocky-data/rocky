@@ -3625,11 +3625,14 @@ pub(crate) struct PromoteTestEvidence {
 ///   partial build (a time-interval model with one failed partition) does
 ///   not hide an older recorded failure.
 ///
-/// The newest piece wins, ranked by when the model was written in that run
-/// (its executions' `finished_at`, else the run's), not by when the run
-/// started: a short run that started after a long one, but wrote the model
-/// first, does not hide the long run's failure. On a tie, tested evidence
-/// wins over untested.
+/// The newest piece wins, ranked by when it was made, not by when the run
+/// started: an untested build by when it wrote the model (its executions'
+/// `finished_at`), a test result by the end of its run (a result carries no
+/// time of its own and runs after the write). A short run that started after
+/// a long one, but wrote the model first, does not hide the long run's
+/// failure. On a tie, tested evidence wins over untested. A successful
+/// execution is a build only when it names the model in `output_target`, so a
+/// replication copy of a same-named table is not.
 ///
 /// A run that did not touch a model (another model, another pipeline)
 /// leaves that model's evidence as it was.
@@ -3683,24 +3686,28 @@ pub(crate) fn assess_branch_test_evidence(
             .collect();
         models.extend(run.test_results.iter().map(|t| t.model.as_str()));
         for model in models {
+            // A successful execution is a build of the model only when it
+            // names the model in `output_target`: a replication copy of a
+            // table that shares the model's name is not. A failed execution
+            // counts by name, which can only keep an older failure standing.
             let execs: Vec<_> = run
                 .models_executed
                 .iter()
                 .filter(|e| e.rocky_model_name() == model)
+                .filter(|e| e.status != "success" || e.output_target.is_some())
                 .collect();
-            let at = execs
-                .iter()
-                .map(|e| e.finished_at)
-                .max()
-                .unwrap_or(run.finished_at);
+            let written_at = execs.iter().map(|e| e.finished_at).max();
             let results: Vec<_> = run
                 .test_results
                 .iter()
                 .filter(|t| t.model == model)
                 .collect();
             let evidence = if !results.is_empty() {
+                // A result has no time of its own and is evaluated after the
+                // write, so it is ranked at the run's end: never earlier than
+                // a concurrent build its query may have read.
                 Evidence {
-                    at,
+                    at: written_at.map_or(run.finished_at, |w| w.max(run.finished_at)),
                     tested: true,
                     run_id: run.run_id.clone(),
                     failures: results
@@ -3712,7 +3719,9 @@ pub(crate) fn assess_branch_test_evidence(
                         })
                         .collect(),
                 }
-            } else if execs.iter().all(|e| e.status == "success") {
+            } else if let Some(at) = written_at
+                && execs.iter().all(|e| e.status == "success")
+            {
                 Evidence {
                     at,
                     tested: false,
@@ -3750,23 +3759,20 @@ pub(crate) fn assess_branch_test_evidence(
     PromoteTestEvidence { failures, warnings }
 }
 
-/// The models that declare at least one error-severity `[[tests]]` entry,
-/// across the project's transformation pipelines.
+/// The models that declare at least one error-severity `[[tests]]` entry:
+/// those of the project's transformation pipelines, plus those in promote's
+/// `--models` directory when it exists (a model leg run with `--models` or
+/// `--all` has no transformation pipeline of its own).
 ///
-/// When the pipelines' models cannot all be loaded from the config, the
-/// promote's `--models` directory is tried instead.
-///
-/// # Errors
-///
-/// A message when neither loads: a load error, or a pipeline whose models
-/// directory does not exist. The caller warns with it; it never refuses the
-/// promote and never reads as "no tested models".
+/// Returns the names and, when some models could not be loaded, a warning
+/// saying so. The caller warns with it; it never refuses the promote and never
+/// reads as "no tested models".
 fn models_with_error_tests(
     config_path: &Path,
     cfg: &rocky_core::config::RockyConfig,
     models_dir: &Path,
-) -> Result<std::collections::BTreeSet<String>, String> {
-    fn error_tested(models: Vec<rocky_core::models::Model>) -> std::collections::BTreeSet<String> {
+) -> (std::collections::BTreeSet<String>, Option<String>) {
+    fn error_tested(models: Vec<rocky_core::models::Model>) -> impl Iterator<Item = String> {
         models
             .into_iter()
             .filter(|m| {
@@ -3776,33 +3782,39 @@ fn models_with_error_tests(
                     .any(|t| matches!(t.severity, rocky_core::tests::TestSeverity::Error))
             })
             .map(|m| m.config.name)
-            .collect()
     }
-    let from_config = crate::models_loader::load_transformation_models(config_path, cfg)
-        .map_err(|e| format!("the models could not be loaded ({e:#})"))
-        .and_then(|loaded| match loaded.missing_roots.first() {
-            Some((pipeline, dir)) => Err(format!(
-                "the models directory of pipeline '{pipeline}' ({}) does not exist",
-                dir.display()
-            )),
-            None => Ok(crate::models_loader::union_by_model_name(
+    let mut names = std::collections::BTreeSet::new();
+    let mut problems = Vec::new();
+    match crate::models_loader::load_transformation_models(config_path, cfg) {
+        Ok(loaded) => {
+            for (pipeline, dir) in &loaded.missing_roots {
+                problems.push(format!(
+                    "the models directory of pipeline '{pipeline}' ({}) does not exist",
+                    dir.display()
+                ));
+            }
+            names.extend(error_tested(crate::models_loader::union_by_model_name(
                 &loaded.by_pipeline,
-            )),
-        });
-    match from_config {
-        Ok(models) => Ok(error_tested(models)),
-        Err(why) if models_dir.is_dir() => {
-            rocky_core::models::load_models_from_dir(models_dir, None)
-                .map(error_tested)
-                .map_err(|e| {
-                    format!(
-                        "{why}, and --models {} could not be loaded ({e})",
-                        models_dir.display()
-                    )
-                })
+            )));
         }
-        Err(why) => Err(why),
+        Err(e) => problems.push(format!("the models could not be loaded ({e:#})")),
     }
+    if models_dir.is_dir() {
+        match rocky_core::models::load_models_from_dir(models_dir, None) {
+            Ok(models) => names.extend(error_tested(models)),
+            Err(e) => problems.push(format!(
+                "--models {} could not be loaded ({e})",
+                models_dir.display()
+            )),
+        }
+    }
+    let warning = (!problems.is_empty()).then(|| {
+        format!(
+            "{}, so models built with no recorded test result may not all be named",
+            problems.join("; ")
+        )
+    });
+    (names, warning)
 }
 
 /// Build and persist a `PromotePlan` from the given parameters.
@@ -3975,23 +3987,21 @@ pub(crate) async fn build_promote_plan_inner(
             )
     })?;
     let (error_test_models, models_load_warning) =
-        match models_with_error_tests(config_path, &rocky_cfg, models_dir) {
-            Ok(models) => (models, None),
-            Err(why) => (
-                Default::default(),
-                Some(format!(
-                    "{why}, so models built with no recorded test result cannot be named"
-                )),
-            ),
-        };
-    let mut evidence = assess_branch_test_evidence(branch_name, &branch_runs, &error_test_models);
-    if branch_runs.is_empty() {
+        models_with_error_tests(config_path, &rocky_cfg, models_dir);
+    let mut evidence = if branch_runs.is_empty() {
         // Runs recorded in another state store (a remote backend, another
         // `--state-namespace`) are not seen here; name the one read.
-        for warning in &mut evidence.warnings {
-            warning.push_str(&format!(" in the state store {}", state_path.display()));
+        PromoteTestEvidence {
+            failures: Vec::new(),
+            warnings: vec![format!(
+                "branch '{branch_name}' has no recorded run in the state store {}, so there \
+                 is no test evidence for it",
+                state_path.display()
+            )],
         }
-    }
+    } else {
+        assess_branch_test_evidence(branch_name, &branch_runs, &error_test_models)
+    };
     evidence.warnings.extend(models_load_warning);
     let test_audit = |kind: AuditEventKind, reason: String| AuditEvent {
         kind,
@@ -6746,8 +6756,10 @@ mod promote_test_evidence_tests {
 
     /// A branch run built from JSON, so it does not track every
     /// `RunRecord` field. `run-N` started at minute N and wrote its models at
-    /// minute N; [`run_writing_at`] sets the write minute. `execs` are
-    /// `(model, status)`; `tests` are `(model, severity, status)`.
+    /// minute N; [`run_writing_at`] sets the write minute, and the run ends
+    /// at the later of the two. `execs` are `(model, status)`, where
+    /// `repl:<table>` is a replication copy; `tests` are
+    /// `(model, severity, status)`.
     fn run(
         id: &str,
         status: &str,
@@ -6770,10 +6782,21 @@ mod promote_test_evidence_tests {
         let models_executed: Vec<_> = execs
             .iter()
             .map(|(m, s)| {
+                // `repl:<table>` is a replication copy: no `output_target`.
+                let (name, target) = match m.strip_prefix("repl:") {
+                    Some(table) => (table, serde_json::Value::Null),
+                    None => (
+                        *m,
+                        serde_json::json!({
+                            "model": m, "catalog": "c", "schema": "s", "table": m,
+                        }),
+                    ),
+                };
                 serde_json::json!({
-                    "model_name": m, "started_at": at(minute),
+                    "model_name": name, "started_at": at(minute),
                     "finished_at": at(written_minute), "duration_ms": 1,
                     "rows_affected": null, "status": s, "sql_hash": "h",
+                    "output_target": target,
                 })
             })
             .collect();
@@ -6928,6 +6951,57 @@ mod promote_test_evidence_tests {
         let ev = assess_branch_test_evidence("b", &runs, &tested(&["daily"]));
         assert_eq!(ev.failures.len(), 1, "{ev:?}");
         assert_eq!(ev.failures[0].run_id, "run-1");
+    }
+
+    #[test]
+    fn a_same_named_replication_copy_is_not_a_rebuild_of_the_model() {
+        let runs = [
+            run("run-2", "Success", &[("repl:orders", "success")], &[]),
+            run(
+                "run-1",
+                "Failure",
+                &[("orders", "failed")],
+                &[("orders", "error", "fail")],
+            ),
+        ];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["orders"]));
+        assert_eq!(ev.failures.len(), 1, "{ev:?}");
+    }
+
+    #[test]
+    fn tested_evidence_wins_a_tie_with_an_untested_build() {
+        // Both pieces are at minute 20, and the untested one is read first:
+        // run-25 wrote `a` untested at minute 20; run-20 tested it, failing,
+        // and ended at minute 20.
+        let mut untested = run_writing_at("run-25", 20, "Success", &[("a", "success")], &[]);
+        untested.finished_at = "2026-11-16T00:20:00Z".parse().unwrap();
+        let runs = [
+            untested,
+            run_writing_at("run-20", 20, "Failure", &[], &[("a", "error", "fail")]),
+        ];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["a"]));
+        assert_eq!(ev.failures.len(), 1, "{ev:?}");
+    }
+
+    #[test]
+    fn a_test_is_ranked_at_its_run_end_not_at_the_write() {
+        // run-1 wrote `a` at minute 10 and its test, run at the end of the
+        // run (minute 25), failed. run-2 rebuilt `a` untested at minute 15.
+        // The failing test read a table at least as new as run-2's.
+        let mut long = run_writing_at(
+            "run-1",
+            10,
+            "Failure",
+            &[("a", "failed")],
+            &[("a", "error", "fail")],
+        );
+        long.finished_at = "2026-11-16T00:25:00Z".parse().unwrap();
+        let runs = [
+            run_writing_at("run-2", 15, "Success", &[("a", "success")], &[]),
+            long,
+        ];
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&["a"]));
+        assert_eq!(ev.failures.len(), 1, "{ev:?}");
     }
 
     #[test]
