@@ -329,6 +329,7 @@ fn load_doc_contracts(
                     required: c.rules.required,
                     protected: c.rules.protected,
                     no_new_nullable: c.rules.no_new_nullable,
+                    no_extra_columns: c.rules.no_extra_columns,
                 },
             )
         })

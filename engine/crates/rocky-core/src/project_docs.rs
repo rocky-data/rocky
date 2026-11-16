@@ -86,6 +86,10 @@ pub struct DocContract {
     pub protected: Vec<String>,
     /// Whether new nullable columns are refused.
     pub no_new_nullable: bool,
+    /// Whether an output column the contract does not name is refused
+    /// (`[rules] no_extra_columns`, `E063`).
+    #[serde(default)]
+    pub no_extra_columns: bool,
 }
 
 /// A declarative test, flattened for display and export.

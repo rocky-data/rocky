@@ -1497,6 +1497,9 @@ agent = "propose_only"
         let contract = String::from_utf8(render_contract(&parsed_d3())).expect("utf-8");
         for inert in [
             "no_new_nullable",
+            // Same unmade product decision as `no_new_nullable`: emitting it
+            // would make every undeclared column of a lowered model `E063`.
+            "no_extra_columns",
             "conditions",
             "models_dir",
             "contracts_dir",

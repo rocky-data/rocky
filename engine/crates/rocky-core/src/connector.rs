@@ -417,6 +417,11 @@ pub struct ConnectorManifest {
     /// Hosts the connector says it will call. Required: write `[]` for none.
     /// Rocky prints the list. It does not enforce it.
     pub egress_hosts: Vec<String>,
+    /// The connector's license, as an SPDX identifier or expression
+    /// (`MIT`, `Apache-2.0 OR MIT`). Optional. When set it must not be
+    /// empty. Rocky checks only that it is not blank, and otherwise ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
     /// Limits the author suggests. The user's limits can only lower them.
     #[serde(default, skip_serializing_if = "ConnectorLimitsConfig::is_unset")]
     pub limits: ConnectorLimitsConfig,
@@ -474,6 +479,13 @@ impl ConnectorManifest {
         }
         if self.command.is_empty() || self.command[0].trim().is_empty() {
             return Err("command must name a program".to_string());
+        }
+        if let Some(license) = &self.license
+            && license.trim().is_empty()
+        {
+            return Err(
+                "license must not be empty; leave it out or name an SPDX license".to_string(),
+            );
         }
         let zero = self.limits.zero_keys();
         if !zero.is_empty() {
@@ -800,6 +812,19 @@ name = "s2"
     }
 
     #[test]
+    fn license_is_optional_and_must_not_be_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = ConnectorManifest::load(&write_manifest(dir.path(), GOOD)).unwrap();
+        assert_eq!(none.license, None);
+        let body = format!("{GOOD}license = \"Apache-2.0 OR MIT\"\n");
+        let set = ConnectorManifest::load(&write_manifest(dir.path(), &body)).unwrap();
+        assert_eq!(set.license.as_deref(), Some("Apache-2.0 OR MIT"));
+        let blank = format!("{GOOD}license = \"  \"\n");
+        let err = ConnectorManifest::load(&write_manifest(dir.path(), &blank)).unwrap_err();
+        assert!(err.to_string().contains("license"), "{err}");
+    }
+
+    #[test]
     fn only_a_relative_path_with_a_slash_is_resolved() {
         let manifest = ConnectorManifest {
             protocol_version: 0,
@@ -807,6 +832,7 @@ name = "s2"
             command: vec!["./bin/run".into(), "main.py".into()],
             state_schema_version: 1,
             egress_hosts: vec![],
+            license: None,
             limits: ConnectorLimitsConfig::default(),
         };
         let argv = manifest.resolved_command(Path::new("/m"));

@@ -78,6 +78,7 @@ name                 = "stripe-charges"
 command              = ["./main.py"]
 state_schema_version = 1
 egress_hosts         = ["api.stripe.com"]
+license              = "Apache-2.0"
 
 [limits]
 wall_time_secs = 1800
@@ -87,6 +88,7 @@ wall_time_secs = 1800
 - `command` must not be empty. A first element with a slash and a relative path is relative to the directory of the manifest. A first element with no slash is looked up on `PATH`. Rocky does not change the other elements. The working directory of the program is its scratch directory, not the manifest directory.
 - `state_schema_version` is the version of the state shape the program reads and writes.
 - `egress_hosts` is required. Write `[]` for a program that calls no host.
+- `license` is optional. It is an SPDX identifier or expression, such as `MIT` or `Apache-2.0 OR MIT`. It must not be blank. Rocky checks only that it is not blank, and otherwise ignores it.
 
 A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
 

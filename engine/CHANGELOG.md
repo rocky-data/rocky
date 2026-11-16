@@ -11,15 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **An agent's `rocky run` is now gated by `[policy]` (#2610).** A run announced as an agent (`--principal agent` or `ROCKY_PRINCIPAL=agent`) in a project with a `[policy]` block is evaluated under the new `run` capability, per model and per replication table, before any write. A `deny` refuses the run with exit 1. Every verdict is recorded in the ledger under `run:<run_id>`, so `rocky audit` lists it. A scheduler started with `ROCKY_PRINCIPAL=agent` passes it to its runs, which are now gated too. `require_review` is recorded and warned about, but the run still proceeds. An `apply` rule does not match `run`: under `default_agent_effect = "deny"`, add a `run` rule for the agent runs you allow. A `rocky run --branch` is governed only by an explicit `run` rule. A human's run, and a project with no `[policy]`, are unchanged. An invalid `ROCKY_PRINCIPAL` value now fails `rocky run`, as it already failed `rocky apply`.
 
+### Changed
+
+- The nextest default profile now has a slow-timeout (60s period, killed after 10 periods), so a stuck test fails after 10 minutes instead of hanging the job. No test is skipped or quarantined.
+
 ### Added
 
 - `[policy]` rules can name the `run` capability (#2610). Only a rule naming `run` matches it. A `run` rule with `verify_after` is refused (V046), because a one-step run has no post-apply check.
+- `connector.toml` accepts an optional `license` key: an SPDX identifier or expression. A blank value is refused. Rocky checks only that it is not blank, and otherwise ignores it. A manifest with no `license` loads as before.
+
 
 ### Fixed
 
 - `rocky --principal agent run` under `default_agent_effect = "deny"` no longer writes production and leaves no decision (#2610). Every write path is gated: a plain run, `--model`, `--models`, `--all`, `--dag` (seeds included), `--watch` (each iteration), replication, and `--resume` / `--resume-latest`.
 - A model with a contract that repeats an output name the contract constrains is now the `E062` error (#2613). Before, `count(*) as orders, count(*) as orders` compiled with only `W002`, and the table gained an `orders_1` column the contract never checked. A repeat of a name the contract does not mention stays `W002` (or `E061`).
-- A new opt-in contract rule, `[rules] no_extra_columns = true`, refuses an output column the contract does not name in `[[columns]]`, `required` or `protected` (`E063`, #2613). It also refuses a model whose column list Rocky cannot prove, such as a `SELECT *`. It is off by default.
+- A new opt-in contract rule, `[rules] no_extra_columns = true`, refuses an output column the contract does not name in `[[columns]]`, `required` or `protected` (`E063`, #2613). It also refuses a model whose column list Rocky cannot prove, such as a `SELECT *`. It is off by default. `rocky docs` shows the rule on the model page and exports it to `contracts.parquet` as kind `no_extra_columns`.
 - A one-part read that is a near-miss of a model name (`FROM stg_ordrs` for model `stg_orders`) is now the `E064` error, naming the model (#2620). Before, it compiled clean and `rocky run` failed on a missing table. It fires only on a plain one-part read (not quoted, not a table function) that matches no model, no model's target table, no `WITH` name, no known source table and no seed, and is within two edits of a model name (one for names under 5 characters). To read a real warehouse table of such a name, qualify it (`main.stg_ordrs`).
 - `SELECT * EXCLUDE (...)` and `SELECT * REPLACE (... AS col)` now parse (#2618). Before, a DuckDB model that used either failed to parse and `rocky compile` refused the whole project. A project with `[portability] target_dialect` set gets a `P001` for `* EXCLUDE` on Databricks and BigQuery, and for `* REPLACE` on Databricks.
 - A star with `EXCEPT` or `EXCLUDE` no longer claims the columns it drops (#2618). Before, `SELECT * EXCEPT (status)` still listed `status` in the model's output, so a contract with `required = ["status"]` passed. It now fails with `E010`. A column a `* REPLACE` recomputes keeps its name and position but takes its type and nullability from the new expression, not the source column. A modifier on a qualified star (`t.* EXCEPT (n), u.*`) applies to that relation only. When an unqualified star sits beside another star and either carries a modifier, Rocky no longer lists the star's columns: they are unknown.
