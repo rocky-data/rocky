@@ -906,6 +906,7 @@ mod tests {
                 autonomy_budget: budget,
             }],
             tests: Vec::new(),
+            waive_default_posture: false,
         }
     }
 

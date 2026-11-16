@@ -242,6 +242,7 @@ fn default_sub_runner(
         None,
         None,
         rocky_core::run_vars::RunVars::new(),
+        None,
     )
 }
 
@@ -269,6 +270,10 @@ fn sub_runner_with_contracts(
     contracts_dir: Option<PathBuf>,
     project: Option<rocky_compiler::compile::ProjectContext>,
     run_vars: rocky_core::run_vars::RunVars,
+    // The direct-run policy gate (#2610), already evaluated over the graph's
+    // models, seeds and model-less writes; a replication sub-run still gates
+    // its discovered targets with it.
+    direct_gate: Option<super::run_policy_gate::DirectRunGate>,
 ) -> SubRunner {
     Arc::new(
         move |config_path: PathBuf,
@@ -283,8 +288,9 @@ fn sub_runner_with_contracts(
             let contracts_dir = contracts_dir.clone();
             let run_vars = run_vars.clone();
             let defer_opts = sub_run_defer_options(&external_dependencies, project.clone());
+            let direct_gate = direct_gate.clone();
             Box::pin(async move {
-                super::run::run_with_explicit_contracts(
+                super::run::run_with_direct_gate(
                     &config_path,
                     loaded,
                     None,
@@ -329,6 +335,7 @@ fn sub_runner_with_contracts(
                     &actor,
                     // No adapter registry override.
                     None,
+                    direct_gate.as_ref(),
                 )
                 .await
                 .map(|_| ())
@@ -411,6 +418,9 @@ pub async fn run_with_dag(
         actor,
         None,
         &rocky_core::run_vars::RunVars::new(),
+        // A governed `rocky apply` of a `--dag` plan and the tests: no
+        // direct-run gate (the apply gates its plan).
+        None,
     )
     .await
 }
@@ -432,6 +442,9 @@ pub async fn run_with_dag_and_contracts(
     // `--var name=value`. The graph builder and every sub-run read the same
     // map, so the edges and the SQL that runs cannot differ (#2379).
     run_vars: &rocky_core::run_vars::RunVars,
+    // The direct-run policy gate (#2610): `Some` for a CLI `rocky run --dag`.
+    // The whole graph is gated once before any node runs.
+    direct_gate: Option<&super::run_policy_gate::DirectRunGate>,
 ) -> Result<()> {
     // Seed nodes do not pass through run(), so reject broken Pipes before
     // the DAG can execute any node.
@@ -537,6 +550,25 @@ pub async fn run_with_dag_and_contracts(
         );
     }
 
+    // The direct-run policy gate (#2610), over every node that writes before
+    // discovery: transformation models, seeds (which never pass through
+    // `run()`) and model-less pipelines. One evaluation for the whole graph,
+    // before any node runs, so a deny writes nothing.
+    if let Some(gate) = direct_gate {
+        let dag_id = format!("dag-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+        super::run_policy_gate::gate_dag(
+            gate,
+            cfg,
+            config_path,
+            state_path,
+            &dag_id,
+            dag.nodes
+                .iter()
+                .map(|n| (n.kind, n.label.as_str(), n.pipeline.as_deref())),
+        )
+        .await?;
+    }
+
     info!(
         nodes = dag.node_count(),
         edges = dag.edge_count(),
@@ -588,6 +620,7 @@ pub async fn run_with_dag_and_contracts(
             contracts_dir.map(Path::to_path_buf),
             Some(project.clone()),
             run_vars.clone(),
+            direct_gate.map(super::run_policy_gate::DirectRunGate::pregated),
         ),
         state_turns: StateTurnstile::new(),
         cancel: cancel.clone(),
@@ -4013,6 +4046,7 @@ mod tests {
             &rocky_core::config::PrincipalRef::unnamed(),
             None,
             &vars,
+            None,
         )
         .await
         .expect("run --dag --var should succeed");

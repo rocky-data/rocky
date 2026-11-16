@@ -124,7 +124,7 @@ class BriefDecisionKind10(StrEnum):
     approval = "approval"
 
 
-class PolicyCapability13(StrEnum):
+class PolicyCapability14(StrEnum):
     """
     Read model output / metadata. Always allowed.
     """
@@ -132,7 +132,7 @@ class PolicyCapability13(StrEnum):
     read = "read"
 
 
-class PolicyCapability14(StrEnum):
+class PolicyCapability15(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -140,7 +140,7 @@ class PolicyCapability14(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability15(StrEnum):
+class PolicyCapability16(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -148,7 +148,7 @@ class PolicyCapability15(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability16(StrEnum):
+class PolicyCapability17(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -156,7 +156,7 @@ class PolicyCapability16(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability17(StrEnum):
+class PolicyCapability18(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -164,7 +164,7 @@ class PolicyCapability17(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability18(StrEnum):
+class PolicyCapability19(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -172,7 +172,7 @@ class PolicyCapability18(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability19(StrEnum):
+class PolicyCapability20(StrEnum):
     """
     Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).
     """
@@ -180,7 +180,7 @@ class PolicyCapability19(StrEnum):
     restore = "restore"
 
 
-class PolicyCapability20(StrEnum):
+class PolicyCapability21(StrEnum):
     """
     Retry a failed run.
     """
@@ -188,7 +188,15 @@ class PolicyCapability20(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability21(StrEnum):
+class PolicyCapability22(StrEnum):
+    """
+    Build models in one step with `rocky run` (plan and apply fused, no persisted plan). A sibling verb, not a refinement: only a rule naming `run` matches it, so an `apply` rule never grants a one-step write.
+    """
+
+    run = "run"
+
+
+class PolicyCapability23(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -196,7 +204,7 @@ class PolicyCapability21(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability22(StrEnum):
+class PolicyCapability24(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -204,7 +212,7 @@ class PolicyCapability22(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability23(StrEnum):
+class PolicyCapability25(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -212,7 +220,7 @@ class PolicyCapability23(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability24(StrEnum):
+class PolicyCapability26(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -433,8 +441,7 @@ class AuditDecisionEntry(BaseModel):
     The channel an approval came through (`cli`, `http_api`). Present only on an `approval` row whose channel this binary can read. An approval through `rocky mcp` reads `cli`.
     """
     capability: (
-        PolicyCapability13
-        | PolicyCapability14
+        PolicyCapability14
         | PolicyCapability15
         | PolicyCapability16
         | PolicyCapability17
@@ -445,6 +452,8 @@ class AuditDecisionEntry(BaseModel):
         | PolicyCapability22
         | PolicyCapability23
         | PolicyCapability24
+        | PolicyCapability25
+        | PolicyCapability26
     )
     """
     The capability that was evaluated.
@@ -513,8 +522,7 @@ class AuditPlanChange(BaseModel):
     """
 
     capability: (
-        PolicyCapability13
-        | PolicyCapability14
+        PolicyCapability14
         | PolicyCapability15
         | PolicyCapability16
         | PolicyCapability17
@@ -525,6 +533,8 @@ class AuditPlanChange(BaseModel):
         | PolicyCapability22
         | PolicyCapability23
         | PolicyCapability24
+        | PolicyCapability25
+        | PolicyCapability26
     )
     """
     The change class the plan recorded for this model (`schema_change.additive` / `schema_change.breaking` / `value_change` / a bare verb).

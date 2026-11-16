@@ -571,9 +571,9 @@ If you need timers on several hosts, give each host its own project and state fi
 
 ### Policy and freezes apply as they do to `rocky run`
 
-A scheduled run is a plain `rocky run --pipeline <name>` in a child process. The [`[policy]`](/reference/configuration/#policy) plane governs it exactly as it governs the same command typed by hand: the same freeze fence, the same drift auto-apply rules, the same cost `[budget]`. There is no separate `run` capability, so neither path evaluates one.
+A scheduled run is a plain `rocky run --pipeline <name>` in a child process. The [`[policy]`](/reference/configuration/#policy) plane governs it exactly as it governs the same command typed by hand: the same freeze fence, the same drift auto-apply rules, the same cost `[budget]`, and the same [`run` capability](/reference/configuration/#policy).
 
-The child sets only `ROCKY_RUN_TRIGGER`, `ROCKY_SUBMISSION_ID` and the trace context. It never passes `--principal`. `rocky run` reads no principal, so a `ROCKY_PRINCIPAL` the scheduler inherits changes nothing.
+The child sets only `ROCKY_RUN_TRIGGER`, `ROCKY_SUBMISSION_ID` and the trace context. It never passes `--principal`. It does inherit `ROCKY_PRINCIPAL`. A scheduler started with `ROCKY_PRINCIPAL=agent` runs its children as an agent: a `deny` that resolves for `run` refuses the scheduled run, and every verdict is recorded. Start the scheduler without `ROCKY_PRINCIPAL=agent` when it runs on a human's authority.
 
 A freeze that covers a scheduled pipeline does not skip the tick. The child starts, the freeze fence withholds its work, and the run records a failure. The run record and `rocky run --output json` also carry a `hold` that names the freeze (`kind`, `freeze_id`, `scope`, `reason`). The scheduler reads it:
 

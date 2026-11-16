@@ -389,6 +389,15 @@ pub fn evaluate(
                 matched_rule: None,
                 reason: "no rule matched; humans are not gated".to_string(),
             },
+            PolicyPrincipal::Agent if policy.waive_default_posture => PolicyDecision {
+                effect: PolicyEffect::Allow,
+                matched_rule: None,
+                reason: format!(
+                    "no rule matched; default_agent_effect = {} is not applied to a \
+                     branch-scoped run (only an explicit rule governs it)",
+                    effect_label(policy.default_agent_effect)
+                ),
+            },
             PolicyPrincipal::Agent => PolicyDecision {
                 effect: policy.default_agent_effect,
                 matched_rule: None,
@@ -936,6 +945,7 @@ mod tests {
             default_agent_effect: PolicyEffect::RequireReview,
             rules,
             tests: Vec::new(),
+            waive_default_posture: false,
         }
     }
 
@@ -1221,6 +1231,64 @@ mod tests {
             &p,
             PolicyPrincipal::Agent,
             PolicyCapability::Apply,
+            &contracted_model(),
+        );
+        assert_eq!(d.effect, PolicyEffect::Deny);
+        assert_eq!(d.matched_rule, None);
+    }
+
+    /// The `rocky run --branch` waiver (#2610) drops only the default
+    /// posture: an unmatched agent run is allowed, and an explicit `run`
+    /// rule still decides, deny included.
+    #[test]
+    fn waived_default_posture_allows_unmatched_and_keeps_explicit_rules() {
+        let mut p = policy(vec![]);
+        p.default_agent_effect = PolicyEffect::Deny;
+        p.waive_default_posture = true;
+        let d = evaluate(
+            &p,
+            PolicyPrincipal::Agent,
+            PolicyCapability::Run,
+            &contracted_model(),
+        );
+        assert_eq!(d.effect, PolicyEffect::Allow);
+        assert_eq!(d.matched_rule, None);
+        assert!(
+            d.reason.contains("not applied to a branch-scoped run"),
+            "{}",
+            d.reason
+        );
+
+        for effect in [PolicyEffect::Deny, PolicyEffect::RequireReview] {
+            let mut p = policy(vec![rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::Run,
+                any_scope(),
+                effect,
+            )]);
+            p.waive_default_posture = true;
+            let d = evaluate(
+                &p,
+                PolicyPrincipal::Agent,
+                PolicyCapability::Run,
+                &contracted_model(),
+            );
+            assert_eq!(d.effect, effect);
+            assert_eq!(d.matched_rule, Some(0));
+        }
+
+        // An `apply` rule never matches a `run` input, waived or not.
+        let mut p = policy(vec![rule(
+            PolicyPrincipal::Agent,
+            PolicyCapability::Apply,
+            any_scope(),
+            PolicyEffect::Allow,
+        )]);
+        p.default_agent_effect = PolicyEffect::Deny;
+        let d = evaluate(
+            &p,
+            PolicyPrincipal::Agent,
+            PolicyCapability::Run,
             &contracted_model(),
         );
         assert_eq!(d.effect, PolicyEffect::Deny);

@@ -151,8 +151,9 @@ struct Cli {
     /// Authoring principal for the agent-policy plane (`human` | `agent`).
     ///
     /// Stamped onto plans created by `rocky plan` as an advisory/display
-    /// record. Enforcement (`rocky apply`, and every `rocky branch promote`
-    /// entrypoint) does NOT key off that stored stamp: the gate evaluates the
+    /// record. Enforcement (`rocky apply`, every `rocky branch promote`
+    /// entrypoint, and an agent's `rocky run` under the `run` capability)
+    /// does NOT key off that stored stamp: the gate evaluates the
     /// most-restrictive of the *runtime* principal (this flag) and the plan's
     /// kind default, so an agent runner is always gated as agent — and all
     /// three promote entrypoints resolve and enforce this identity identically.
@@ -4863,6 +4864,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // Who is running (RV4-P1): stamped on the drift auto-apply
             // custody rows. Resolved here, once, for all three run shapes.
             let actor = resolve_cli_principal_id(cli.principal_id.as_deref(), None)?;
+            // The principal class the `[policy]` plane gates the run as
+            // (#2610): an agent is evaluated under the `run` capability. A
+            // human, or a project with no `[policy]`, is never gated.
+            let direct_gate = rocky_cli::commands::DirectRunGate::new(
+                resolve_cli_principal(cli.principal)?,
+                actor.clone(),
+            );
 
             if watch {
                 // `--watch` wraps the standard run path in a filesystem
@@ -4892,6 +4900,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     },
                     &run_vars,
                     &actor,
+                    Some(&direct_gate),
                 )
                 .await
             } else if dag {
@@ -4927,6 +4936,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &actor,
                     contracts.as_deref(),
                     &run_vars,
+                    Some(&direct_gate),
                 )
                 .await
             } else {
@@ -4967,6 +4977,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     run_contracts,
                     &actor,
                     refuse_hooks,
+                    direct_gate.principal,
                 )
                 .await
             }

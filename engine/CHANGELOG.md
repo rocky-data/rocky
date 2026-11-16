@@ -7,16 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **An agent's `rocky run` is now gated by `[policy]` (#2610).** A run announced as an agent (`--principal agent` or `ROCKY_PRINCIPAL=agent`) in a project with a `[policy]` block is evaluated under the new `run` capability, per model and per replication table, before any write. A `deny` refuses the run with exit 1. Every verdict is recorded in the ledger under `run:<run_id>`, so `rocky audit` lists it. A scheduler started with `ROCKY_PRINCIPAL=agent` passes it to its runs, which are now gated too. `require_review` is recorded and warned about, but the run still proceeds. An `apply` rule does not match `run`: under `default_agent_effect = "deny"`, add a `run` rule for the agent runs you allow. A `rocky run --branch` is governed only by an explicit `run` rule. A human's run, and a project with no `[policy]`, are unchanged. An invalid `ROCKY_PRINCIPAL` value now fails `rocky run`, as it already failed `rocky apply`.
+
 ### Changed
 
 - The nextest default profile now has a slow-timeout (60s period, killed after 10 periods), so a stuck test fails after 10 minutes instead of hanging the job. No test is skipped or quarantined.
 
 ### Added
 
+- `[policy]` rules can name the `run` capability (#2610). Only a rule naming `run` matches it. A `run` rule with `verify_after` is refused (V046), because a one-step run has no post-apply check.
 - `connector.toml` accepts an optional `license` key: an SPDX identifier or expression. A blank value is refused. Rocky checks only that it is not blank, and otherwise ignores it. A manifest with no `license` loads as before.
 
 ### Fixed
 
+- `rocky --principal agent run` under `default_agent_effect = "deny"` no longer writes production and leaves no decision (#2610). Every write path is gated: a plain run, `--model`, `--models`, `--all`, `--dag` (seeds included), `--watch` (each iteration), replication, and `--resume` / `--resume-latest`.
 - `rocky run --skip-unchanged` no longer skips a model whose source watermark advanced by less than one second. The gate compared the gap in whole seconds, rounded toward zero, so a sync that wrote new rows 500 ms after the previous `MAX(ts)` counted as unchanged even with `lag_tolerance_seconds = 0`. It now compares the exact gap. A `MAX(ts)` that went backwards (rows deleted, or the table reloaded) now forces a rebuild even when `lag_tolerance_seconds` is above `0`. Only wrong skips become builds; no default changes. The B3a study in `docs/records/b3a-skip-signal/REPORT.md` found it, and also shows that `MAX(ts)` and `COUNT(*)` miss in-place updates, deletes and late rows on a real workload, so the gate stays a heuristic.
 - A model with a contract that repeats an output name the contract constrains is now the `E062` error (#2613). Before, `count(*) as orders, count(*) as orders` compiled with only `W002`, and the table gained an `orders_1` column the contract never checked. A repeat of a name the contract does not mention stays `W002` (or `E061`).
 - A new opt-in contract rule, `[rules] no_extra_columns = true`, refuses an output column the contract does not name in `[[columns]]`, `required` or `protected` (`E063`, #2613). It also refuses a model whose column list Rocky cannot prove, such as a `SELECT *`. It is off by default. `rocky docs` shows the rule on the model page and exports it to `contracts.parquet` as kind `no_extra_columns`.

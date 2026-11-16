@@ -146,13 +146,21 @@ class PolicyCapability8(StrEnum):
 
 class PolicyCapability9(StrEnum):
     """
+    Build models in one step with `rocky run` (plan and apply fused, no persisted plan). A sibling verb, not a refinement: only a rule naming `run` matches it, so an `apply` rule never grants a one-step write.
+    """
+
+    run = "run"
+
+
+class PolicyCapability10(StrEnum):
+    """
     Quarantine a partition / model.
     """
 
     quarantine = "quarantine"
 
 
-class PolicyCapability10(StrEnum):
+class PolicyCapability11(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -160,7 +168,7 @@ class PolicyCapability10(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability11(StrEnum):
+class PolicyCapability12(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -168,7 +176,7 @@ class PolicyCapability11(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability12(StrEnum):
+class PolicyCapability13(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -304,6 +312,7 @@ class AuditDecisionEntry(BaseModel):
         | PolicyCapability10
         | PolicyCapability11
         | PolicyCapability12
+        | PolicyCapability13
     )
     """
     The capability that was evaluated.

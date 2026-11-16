@@ -16,7 +16,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability77(StrEnum):
+class PolicyCapability83(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -24,7 +24,7 @@ class PolicyCapability77(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability78(StrEnum):
+class PolicyCapability84(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -32,7 +32,7 @@ class PolicyCapability78(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability79(StrEnum):
+class PolicyCapability85(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -40,7 +40,7 @@ class PolicyCapability79(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability80(StrEnum):
+class PolicyCapability86(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -48,7 +48,7 @@ class PolicyCapability80(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability81(StrEnum):
+class PolicyCapability87(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -56,7 +56,7 @@ class PolicyCapability81(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability82(StrEnum):
+class PolicyCapability88(StrEnum):
     """
     Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).
     """
@@ -64,7 +64,7 @@ class PolicyCapability82(StrEnum):
     restore = "restore"
 
 
-class PolicyCapability83(StrEnum):
+class PolicyCapability89(StrEnum):
     """
     Retry a failed run.
     """
@@ -72,7 +72,15 @@ class PolicyCapability83(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability84(StrEnum):
+class PolicyCapability90(StrEnum):
+    """
+    Build models in one step with `rocky run` (plan and apply fused, no persisted plan). A sibling verb, not a refinement: only a rule naming `run` matches it, so an `apply` rule never grants a one-step write.
+    """
+
+    run = "run"
+
+
+class PolicyCapability91(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -80,7 +88,7 @@ class PolicyCapability84(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability85(StrEnum):
+class PolicyCapability92(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -88,7 +96,7 @@ class PolicyCapability85(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability86(StrEnum):
+class PolicyCapability93(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -96,7 +104,7 @@ class PolicyCapability86(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability87(StrEnum):
+class PolicyCapability94(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -135,17 +143,18 @@ class ReviewQueueEntry(BaseModel):
     """
     capability: (
         PolicyCapability
-        | PolicyCapability77
-        | PolicyCapability78
-        | PolicyCapability79
-        | PolicyCapability80
-        | PolicyCapability81
-        | PolicyCapability82
         | PolicyCapability83
         | PolicyCapability84
         | PolicyCapability85
         | PolicyCapability86
         | PolicyCapability87
+        | PolicyCapability88
+        | PolicyCapability89
+        | PolicyCapability90
+        | PolicyCapability91
+        | PolicyCapability92
+        | PolicyCapability93
+        | PolicyCapability94
     )
     """
     The capability that was evaluated (its `schema_change.*` refinement is the change class the ranking weighs).

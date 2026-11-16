@@ -923,7 +923,7 @@ pub(crate) fn pipeline_is_replication(
 /// write set, so it is [`EmptyTouched::Refuse`]. A quality pipeline without
 /// quarantine only reads (its run record is state, not a warehouse write), so
 /// its empty set is a genuine [`EmptyTouched::NoOp`].
-fn modelless_pipeline_writes(
+pub(crate) fn modelless_pipeline_writes(
     cfg: &rocky_core::config::RockyConfig,
     pipeline_name: Option<&str>,
 ) -> Option<(BTreeSet<String>, EmptyTouched)> {
@@ -3416,7 +3416,7 @@ pub(crate) fn plan_models_dir(root: &Path, dir: Option<&Path>) -> PathBuf {
 /// The plan's persisted `models` list is informational, so the gate recompiles
 /// the real execution selection. A compile failure yields an empty set because
 /// the apply's own recompile will fail identically and execute nothing.
-fn run_executable_models(
+pub(crate) fn run_executable_models(
     models_dir: &Path,
     models_glob: Option<&str>,
     run_plan: &RunPlan,
@@ -3960,7 +3960,9 @@ impl ExecFingerprintGate {
 ///
 /// `None` for bare `rocky run`, the DAG runner, inline execution, and every
 /// human apply (ungated in v0) → the gate does not run and behaviour is
-/// byte-identical.
+/// byte-identical. A bare `rocky run` by an agent is gated instead by the
+/// direct-run gate (`run_policy_gate`, the `run` capability, #2610); the two
+/// are never both set.
 ///
 /// NB: the gate/execute TOCTOU (a model's content changing between the
 /// plan-time authorization and execution) is NOT closed here — the round-3
@@ -6510,6 +6512,9 @@ pub async fn run_apply_inline_for_run(
     actor: &PrincipalRef,
     // `--refuse-hooks` (#2162): refuse a config that would fire hooks.
     refuse_hooks: bool,
+    // The runtime principal class (`--principal` / `ROCKY_PRINCIPAL`). An
+    // agent under `[policy]` is gated under the `run` capability (#2610).
+    principal: PolicyPrincipal,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -6523,8 +6528,10 @@ pub async fn run_apply_inline_for_run(
     if refuse_hooks {
         crate::commands::run::refuse_configured_side_effects(&loaded.config.hooks)?;
     }
-    // Thin passthrough — routes to the existing run implementation.
-    crate::commands::run::run_with_explicit_contracts(
+    // Thin passthrough — routes to the existing run implementation, with
+    // the direct-run policy gate (#2610).
+    let direct_gate = crate::commands::DirectRunGate::new(principal, actor.clone());
+    crate::commands::run::run_with_direct_gate(
         config_path,
         loaded,
         filter,
@@ -6548,7 +6555,8 @@ pub async fn run_apply_inline_for_run(
         // The inline `rocky run` path mints its own timestamp run_id; the
         // two-step apply's verify_after gate is the only override consumer.
         None,
-        // Inline `rocky run` is never a governed two-step apply — no gate.
+        // Inline `rocky run` is never a governed two-step apply: its gate is
+        // the direct-run gate below, not a plan gate.
         None,
         // `--assume-fresh-state` threads through from the CLI (main.rs
         // validated it against the configured `[state]` backend).
@@ -6557,6 +6565,7 @@ pub async fn run_apply_inline_for_run(
         contracts,
         actor,
         None,
+        Some(&direct_gate),
     )
     .await
     .map(|_| ())

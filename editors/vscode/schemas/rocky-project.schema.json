@@ -2856,6 +2856,13 @@
           "type": "string"
         },
         {
+          "description": "Build models in one step with `rocky run` (plan and apply fused, no persisted plan). A sibling verb, not a refinement: only a rule naming `run` matches it, so an `apply` rule never grants a one-step write.",
+          "enum": [
+            "run"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Quarantine a partition / model.",
           "enum": [
             "quarantine"
