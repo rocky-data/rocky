@@ -94,6 +94,14 @@ adapter = "default"
 [pipeline.p.target.governance]
 auto_create_schemas = true
 
+# These tests exercise the loop's own observation of a declared-test red
+# after apply. Under the `tests_on_run = "enforce"` default the apply step's
+# run would catch that red first and block the loop, so the fixture pins the
+# run to not evaluate tests. Whether a test-detectable red should block the
+# apply instead is an owner decision recorded on the PR that flips the default.
+[run]
+tests_on_run = "off"
+
 [policy]
 version = 1
 default_agent_effect = "require_review"
