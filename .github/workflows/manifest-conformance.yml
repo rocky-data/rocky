@@ -3,9 +3,10 @@ name: manifest-conformance
 # Drift tripwire between the rocky-manifest spec and the engine that produces
 # manifests. Builds the engine + the standalone rocky-verify, produces a
 # manifest from live engine output (the recipe-provenance POC), and proves
-# rocky-verify validates it against the published v0.1 schema offline — and
-# that a tampered manifest fails. Path-filtered tightly so it only runs when a
-# surface that could break the spec/implementation contract changes.
+# rocky-verify validates it against the published rocky-manifest v0.1 and v0.2
+# schemas offline — and that a tampered manifest fails. Path-filtered tightly
+# so it only runs when a surface that could break the spec/implementation
+# contract changes.
 
 on:
   push:
