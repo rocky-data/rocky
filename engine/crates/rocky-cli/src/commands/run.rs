@@ -1350,6 +1350,14 @@ pub struct DeferOptions {
     /// outside a project run: the compile then uses the warehouse the run
     /// executes on.
     pub target_dialects: Option<rocky_compiler::operand_check::TargetDialects>,
+    /// The pipeline a model-only run is recorded under. Set by `--retry-failed`
+    /// so the retry's run record joins the pipeline's history and the next
+    /// retry reads it. `None` for every other model-only run, whose record
+    /// names no pipeline.
+    pub record_pipeline: Option<String>,
+    /// The failed run a `--retry-failed` run retries. Stamped on the run
+    /// record as `retry_of`; `None` for every other run.
+    pub retry_of: Option<String>,
 }
 
 /// Remove the local-model E039 check only after `--defer` has successfully
@@ -4302,6 +4310,7 @@ pub(crate) async fn run_with_direct_gate(
             1, // concurrency
         );
         output.pipeline_type = Some("transformation".to_string());
+        output.retry_of = defer_opts.retry_of.clone();
         if let Some(ctx) = &idempotency_ctx {
             output.idempotency_key = Some(ctx.key.clone());
         }
@@ -4458,6 +4467,7 @@ pub(crate) async fn run_with_direct_gate(
             }
         }
 
+        output.roll_up_model_statuses();
         output.duration_ms = start.elapsed().as_millis() as u64;
 
         let adapter_type = rocky_cfg
@@ -4490,8 +4500,9 @@ pub(crate) async fn run_with_direct_gate(
             started_at,
             &config_hash,
             &audit,
-            // Model-only run — no single pipeline to attribute.
-            None,
+            // A model-only run names no pipeline, except a `--retry-failed`
+            // retry, which continues its pipeline's history.
+            defer_opts.record_pipeline.as_deref(),
             Some(config_path),
         ));
         finalize_idempotency(
@@ -4546,6 +4557,8 @@ pub(crate) async fn run_with_direct_gate(
         if output_json {
             print_json(&output)?;
             capture_run_output_for_test(&run_id, &output);
+        } else {
+            output.print_model_status_lines();
         }
         // An interrupted run (#1606) exits 130 even with a hard `[budget]`
         // breach: the cancel is what ended it.
@@ -14544,6 +14557,19 @@ async fn execute_models_phase(
             }
         }
     }
+    // The descendants of a model whose function failed were never run. Each
+    // one is withheld by the excluded models it reads directly.
+    for node in &compile_result.project.dag_nodes {
+        if newly_excluded.contains(&node.name) && !function_blocked.contains_key(&node.name) {
+            let blocked_by: Vec<String> = node
+                .depends_on
+                .iter()
+                .filter(|d| newly_excluded.contains(*d))
+                .cloned()
+                .collect();
+            output.withheld_models.insert(node.name.clone(), blocked_by);
+        }
+    }
     compile_excluded_models.extend(newly_excluded);
 
     // An open volume breach (#2581) holds its output failed. A run that does
@@ -14592,6 +14618,9 @@ async fn execute_models_phase(
             } else {
                 reasons.join(" ")
             };
+            output
+                .withheld_models
+                .insert(model.clone(), blocked_by.clone());
             output.tables_failed += 1;
             output.push_model_error(
                 crate::output::TableErrorOutput {
@@ -14802,6 +14831,33 @@ async fn execute_models_phase(
         None => &compile_result.project.layers,
     };
 
+    // The models this run was asked to build, for the `model_statuses`
+    // roll-up: the layer loop's own selection, with the asset key each one's
+    // materialization will carry (shadow routing is already applied).
+    output.execution_set = execution_layers
+        .iter()
+        .flatten()
+        .filter(|name| model_name_filter.is_none_or(|target| target == name.as_str()))
+        .filter(|name| model_set.is_none_or(|set| set.contains(name.as_str())))
+        .filter_map(|name| compile_result.project.model(name))
+        .filter(|m| {
+            !matches!(
+                m.config.strategy,
+                rocky_core::models::StrategyConfig::Ephemeral
+            )
+        })
+        .map(|m| {
+            (
+                m.config.name.clone(),
+                vec![
+                    m.config.target.catalog.clone(),
+                    m.config.target.schema.clone(),
+                    m.config.target.table.clone(),
+                ],
+            )
+        })
+        .collect();
+
     for layer in execution_layers {
         // Cancel (#1606): start no further layer. Layers already run keep
         // their results in `output`, which the caller persists.
@@ -14838,6 +14894,7 @@ async fn execute_models_phase(
                 .await
         {
             withhold.note_on(output);
+            output.frozen_stop = true;
             output.tables_failed += 1;
             output.errors.push(crate::output::TableErrorOutput {
                 asset_key: vec!["<freeze>".to_string()],
@@ -27861,11 +27918,17 @@ auto_create_schemas = true
             owned_shadow_objects: vec![],
             failed_attempts: Default::default(),
             fail_fast_model: None,
+            fail_fast_stopped_after: None,
+            execution_set: Vec::new(),
+            withheld_models: Default::default(),
+            frozen_stop: false,
+            retry_of: None,
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
+            model_statuses: vec![],
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],
@@ -45030,6 +45093,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47458,6 +47522,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47670,6 +47735,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47958,6 +48024,7 @@ auto_create_schemas = true
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -48958,6 +49025,7 @@ auto_create_schemas = true
                 check_gate_failed: false,
                 verify_after_failed: false,
                 rocky_branch: None,
+                retry_of: None,
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
@@ -49276,6 +49344,7 @@ auto_create_schemas = true
                     check_gate_failed: false,
                     verify_after_failed: false,
                     rocky_branch: None,
+                    retry_of: None,
                     run_scope: Some(rocky_core::state::RunScope::Production),
                     queued_ms: None,
                     source_volumes: Vec::new(),

@@ -135,6 +135,9 @@ it. That is the property to **preserve**, and it means the finding to look for i
   corrupt redb state. Every path that records no such checkpoint refuses the flags rather than running
   fresh — other pipeline types, `--all`/`--models`, `--model`, `--dag`, and non-authoritative remote
   state. A resume that silently becomes a fresh run is the #1543 defect, not a convenience.
+  `rocky run --retry-failed` is not a resume: it re-selects the failed and never-built models of a failed
+  transformation run by comparing each model's `sql_hash` with the run record, and it keeps no checkpoint.
+  Resume is still replication-only.
 - **Incremental-watermark soundness.** The runner reads the prior `MAX(ts)` from the redb state store,
   filters `WHERE ts > <watermark>`, then, for incremental and microbatch strategies, records `MAX(ts)` over the **target** as the next watermark
   (`run.rs::resolve_new_watermark`; reading the target closes a source-append race). For this

@@ -369,6 +369,78 @@ class ModelDecisionOutput(BaseModel):
     """
 
 
+class ModelRunStatus1(StrEnum):
+    """
+    The model was materialized this run.
+    """
+
+    built = "built"
+
+
+class ModelRunStatus2(StrEnum):
+    """
+    The model's build or a post-write check failed, or it failed to compile.
+    """
+
+    failed = "failed"
+
+
+class ModelRunStatus3(StrEnum):
+    """
+    The model was not built on purpose. `reason` says why.
+    """
+
+    skipped = "skipped"
+
+
+class ModelRunStatus4(StrEnum):
+    """
+    The run ended before the model started.
+    """
+
+    not_started = "not_started"
+
+
+class ModelRunStatusReason1(StrEnum):
+    """
+    The skip gate proved the model unchanged.
+    """
+
+    unchanged = "unchanged"
+
+
+class ModelRunStatusReason2(StrEnum):
+    """
+    A prior run's bytes were reused instead of running the SQL.
+    """
+
+    reused = "reused"
+
+
+class ModelRunStatusReason3(StrEnum):
+    """
+    An upstream model failed. `blocked_by` names it.
+    """
+
+    upstream_failed = "upstream_failed"
+
+
+class ModelRunStatusReason4(StrEnum):
+    """
+    The run stopped (a fail-fast stop, or an interrupt) before this model.
+    """
+
+    run_stopped = "run_stopped"
+
+
+class ModelRunStatusReason5(StrEnum):
+    """
+    A freeze on the model's scope held it back.
+    """
+
+    frozen = "frozen"
+
+
 class OverrideMatchCountOutput(BaseModel):
     """
     How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
@@ -1155,6 +1227,38 @@ class Diagnostic(BaseModel):
     """
 
 
+class ModelRunStatusOutput(BaseModel):
+    """
+    One per-model entry on [`RunOutput::model_statuses`].
+
+    A roll-up of the run's other fields. It never changes build behavior.
+    """
+
+    blocked_by: list[str] | None = None
+    """
+    For `upstream_failed`: the failed or withheld upstream models that reach this one. Omitted when empty.
+    """
+    model: str
+    """
+    The model's name (matches the model entry in the project DAG).
+    """
+    reason: (
+        ModelRunStatusReason1
+        | ModelRunStatusReason2
+        | ModelRunStatusReason3
+        | ModelRunStatusReason4
+        | ModelRunStatusReason5
+        | None
+    ) = None
+    """
+    Why the model was skipped or not started. Omitted for `built` and `failed`.
+    """
+    status: ModelRunStatus1 | ModelRunStatus2 | ModelRunStatus3 | ModelRunStatus4
+    """
+    What happened to the model.
+    """
+
+
 class ProductBudgetCheck(BaseModel):
     """
     One limit of a product budget, checked against the product's charge.
@@ -1506,6 +1610,10 @@ class RunOutput(BaseModel):
     model_decisions: list[ModelDecisionOutput] | None = None
     """
     Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.
+    """
+    model_statuses: list[ModelRunStatusOutput] | None = None
+    """
+    What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`) only: a replication run, with or without models, never has it.
     """
     override_match_counts: list[OverrideMatchCountOutput] | None = None
     """
