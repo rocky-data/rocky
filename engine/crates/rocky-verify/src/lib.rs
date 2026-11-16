@@ -1,4 +1,4 @@
-//! Standalone offline verifier for `rocky-manifest v0.1` attestations.
+//! Standalone offline verifier for `rocky-manifest` (v0.1 and v0.2) attestations.
 //!
 //! A rocky-manifest attests *which program, over which inputs, in which
 //! environment produced a table version*, in a vendor-neutral serialized form.
@@ -6,7 +6,8 @@
 //! engine installed:
 //!
 //! 1. **Is it well-formed?** — validate the document against the embedded
-//!    [`MANIFEST_SCHEMA_V0_1`] JSON Schema (required fields, hex-encoded hash
+//!    [`MANIFEST_SCHEMA_V0_1`] JSON Schema, or [`MANIFEST_SCHEMA_V0_2`] when the
+//!    document says `"manifest_version": "0.2"` (required fields, hex-encoded hash
 //!    shapes, the `inputs_hash` / `inputs_proof_class` coupling, enum values).
 //! 2. **Do the output bytes match?** — when the manifest carries content-
 //!    addressed `output_hashes`, hash the referenced artifact files with BLAKE3
@@ -30,7 +31,66 @@ pub const MANIFEST_SCHEMA_V0_1: &str = include_str!("../spec/rocky-manifest-v0.1
 /// The `$id` of the embedded schema, used as its resource URL when compiling.
 pub const MANIFEST_SCHEMA_ID: &str = "https://rocky-data.dev/spec/rocky-manifest-v0.1.schema.json";
 
-/// A typed view of a rocky-manifest v0.1 document.
+/// The canonical JSON Schema for `rocky-manifest v0.2`, embedded at build time.
+///
+/// v0.2 is v0.1 plus the optional, unsigned, producer-asserted `policy`,
+/// `checks` and `tests` objects.
+pub const MANIFEST_SCHEMA_V0_2: &str = include_str!("../spec/rocky-manifest-v0.2.schema.json");
+
+/// The `$id` of the embedded v0.2 schema, used as its resource URL when compiling.
+pub const MANIFEST_SCHEMA_V0_2_ID: &str =
+    "https://rocky-data.dev/spec/rocky-manifest-v0.2.schema.json";
+
+/// Which embedded manifest schema to validate against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaVersion {
+    /// `rocky-manifest v0.1`.
+    V0_1,
+    /// `rocky-manifest v0.2`.
+    V0_2,
+}
+
+impl SchemaVersion {
+    /// Pick the schema for a document: v0.2 only when its `manifest_version`
+    /// is the string `"0.2"`, otherwise v0.1 (so a missing or unknown version
+    /// is reported by the v0.1 `const` error).
+    #[must_use]
+    pub fn of_document(instance: &serde_json::Value) -> Self {
+        match instance.get("manifest_version").and_then(|v| v.as_str()) {
+            Some("0.2") => Self::V0_2,
+            _ => Self::V0_1,
+        }
+    }
+
+    /// The embedded schema source for this version.
+    #[must_use]
+    pub fn schema_source(self) -> &'static str {
+        match self {
+            Self::V0_1 => MANIFEST_SCHEMA_V0_1,
+            Self::V0_2 => MANIFEST_SCHEMA_V0_2,
+        }
+    }
+
+    /// The `$id` of this version's schema.
+    #[must_use]
+    pub fn schema_id(self) -> &'static str {
+        match self {
+            Self::V0_1 => MANIFEST_SCHEMA_ID,
+            Self::V0_2 => MANIFEST_SCHEMA_V0_2_ID,
+        }
+    }
+
+    /// A short label such as `"v0.1"`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::V0_1 => "v0.1",
+            Self::V0_2 => "v0.2",
+        }
+    }
+}
+
+/// A typed view of a rocky-manifest (v0.1 or v0.2) document.
 ///
 /// Deserializing into this type is lenient by construction (it mirrors the
 /// schema's optionality); it exists for ergonomic access to `output_hashes`
@@ -60,6 +120,52 @@ pub struct Manifest {
     /// addressed write path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_hashes: Option<Vec<OutputHash>>,
+    /// The policy decision the producer asserts let this run proceed (v0.2).
+    /// Unsigned and producer-asserted: a claim, not verified evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyClaim>,
+    /// Data-check counts the producer asserts (v0.2). Unsigned and
+    /// producer-asserted: a claim, not verified evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<CountsClaim>,
+    /// Model-test counts the producer asserts (v0.2). Unsigned and
+    /// producer-asserted: a claim, not verified evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<CountsClaim>,
+}
+
+/// An unsigned, producer-asserted policy decision (v0.2).
+///
+/// This is a claim the producer makes about itself. Nothing in it is
+/// byte-verifiable, so a verifier checks its shape only and never treats it as
+/// evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyClaim {
+    /// The decision: `"allow"` or `"require_review"`.
+    pub effect: String,
+    /// The kind of principal the decision was made for (`"human"` or `"agent"`).
+    pub principal: String,
+    /// Index of the matching policy rule; absent for the policy default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<u64>,
+    /// Where the producer recorded the full decision in its own ledger.
+    pub ledger_ref: String,
+}
+
+/// Unsigned, producer-asserted check or test counts (v0.2).
+///
+/// A claim, not verified evidence. The only property a verifier can check is
+/// that `passed + failed + not_evaluated == total`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountsClaim {
+    /// Number configured.
+    pub total: u64,
+    /// Number evaluated and passed.
+    pub passed: u64,
+    /// Number evaluated and failed.
+    pub failed: u64,
+    /// Number configured but not evaluated.
+    pub not_evaluated: u64,
 }
 
 /// Who produced a manifest — vendor-neutral name plus version.
@@ -136,7 +242,9 @@ pub struct ArtifactCheck {
 /// The full result of verifying a manifest.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
-    /// Whether the document validates against the embedded v0.1 schema.
+    /// Whether the document validates against the embedded schema for its
+    /// `manifest_version` (v0.2 for `"0.2"`, otherwise v0.1), including the
+    /// v0.2 count-sum check.
     pub schema_valid: bool,
     /// Human-readable schema violations (empty when [`Self::schema_valid`]).
     pub schema_errors: Vec<String>,
@@ -144,6 +252,8 @@ pub struct VerifyReport {
     /// requested (no artifact directory) or the manifest carries no
     /// `output_hashes`.
     pub artifact_checks: Vec<ArtifactCheck>,
+    /// The schema version the document was validated against.
+    pub schema_version: SchemaVersion,
 }
 
 impl VerifyReport {
@@ -166,7 +276,19 @@ impl VerifyReport {
 /// Returns [`VerifyError::Schema`] only if the *embedded* schema itself fails to
 /// compile, which is a bug in this crate rather than a property of the input.
 pub fn validate_schema(instance: &serde_json::Value) -> Result<Vec<String>, VerifyError> {
-    let (schemas, sch) = compile_schema()?;
+    validate_schema_for(SchemaVersion::V0_1, instance)
+}
+
+/// Validate a parsed manifest value against the embedded schema of `version`.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::Schema`] only if the embedded schema fails to compile.
+pub fn validate_schema_for(
+    version: SchemaVersion,
+    instance: &serde_json::Value,
+) -> Result<Vec<String>, VerifyError> {
+    let (schemas, sch) = compile_schema_for(version)?;
     Ok(collect_schema_errors(&schemas, sch, instance))
 }
 
@@ -177,15 +299,27 @@ pub fn validate_schema(instance: &serde_json::Value) -> Result<Vec<String>, Veri
 /// Returns [`VerifyError::Schema`] if the embedded schema JSON is malformed or
 /// rejected by the compiler — a bug in this crate, not the caller's input.
 pub fn compile_schema() -> Result<(boon::Schemas, boon::SchemaIndex), VerifyError> {
-    let schema_json: serde_json::Value = serde_json::from_str(MANIFEST_SCHEMA_V0_1)
+    compile_schema_for(SchemaVersion::V0_1)
+}
+
+/// Compile the embedded schema of `version`, returning the validator handle.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::Schema`] if the embedded schema JSON is malformed or
+/// rejected by the compiler — a bug in this crate, not the caller's input.
+pub fn compile_schema_for(
+    version: SchemaVersion,
+) -> Result<(boon::Schemas, boon::SchemaIndex), VerifyError> {
+    let schema_json: serde_json::Value = serde_json::from_str(version.schema_source())
         .map_err(|e| VerifyError::Schema(e.to_string()))?;
     let mut schemas = boon::Schemas::new();
     let mut compiler = boon::Compiler::new();
     compiler
-        .add_resource(MANIFEST_SCHEMA_ID, schema_json)
+        .add_resource(version.schema_id(), schema_json)
         .map_err(|e| VerifyError::Schema(e.to_string()))?;
     let sch = compiler
-        .compile(MANIFEST_SCHEMA_ID, &mut schemas)
+        .compile(version.schema_id(), &mut schemas)
         .map_err(|e| VerifyError::Schema(e.to_string()))?;
     Ok((schemas, sch))
 }
@@ -225,9 +359,45 @@ fn flatten(err: &boon::ValidationError, out: &mut Vec<String>) {
     }
 }
 
+/// Check `passed + failed + not_evaluated == total` for the v0.2 `checks` and
+/// `tests` objects, which JSON Schema cannot express. Assumes the document is
+/// already schema-valid. Overflow counts as a violation.
+fn count_sum_errors(instance: &serde_json::Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    for key in ["checks", "tests"] {
+        let Some(obj) = instance.get(key) else {
+            continue;
+        };
+        let field = |name: &str| obj.get(name).and_then(serde_json::Value::as_u64);
+        let (Some(total), Some(passed), Some(failed), Some(not_evaluated)) = (
+            field("total"),
+            field("passed"),
+            field("failed"),
+            field("not_evaluated"),
+        ) else {
+            errors.push(format!("{key}: counts must be unsigned integers"));
+            continue;
+        };
+        let sum = passed
+            .checked_add(failed)
+            .and_then(|s| s.checked_add(not_evaluated));
+        match sum {
+            Some(sum) if sum == total => {}
+            Some(sum) => errors.push(format!(
+                "{key}: passed + failed + not_evaluated ({sum}) does not equal total ({total})"
+            )),
+            None => errors.push(format!(
+                "{key}: passed + failed + not_evaluated overflows and does not equal total ({total})"
+            )),
+        }
+    }
+    errors
+}
+
 /// Verify a manifest document (already parsed) end to end.
 ///
-/// Runs schema validation, then — when `artifacts_dir` is `Some` and the
+/// Runs schema validation (v0.2 when `manifest_version` is `"0.2"`, otherwise
+/// v0.1), the v0.2 count-sum check, then — when `artifacts_dir` is `Some` and the
 /// manifest carries `output_hashes` — byte-verifies each referenced artifact by
 /// hashing it with BLAKE3 and comparing to the recorded hash.
 ///
@@ -238,7 +408,11 @@ pub fn verify_value(
     instance: &serde_json::Value,
     artifacts_dir: Option<&Path>,
 ) -> Result<VerifyReport, VerifyError> {
-    let schema_errors = validate_schema(instance)?;
+    let schema_version = SchemaVersion::of_document(instance);
+    let mut schema_errors = validate_schema_for(schema_version, instance)?;
+    if schema_errors.is_empty() && schema_version == SchemaVersion::V0_2 {
+        schema_errors = count_sum_errors(instance);
+    }
     let schema_valid = schema_errors.is_empty();
 
     let artifact_checks = match artifacts_dir {
@@ -256,6 +430,7 @@ pub fn verify_value(
         schema_valid,
         schema_errors,
         artifact_checks,
+        schema_version,
     })
 }
 
@@ -373,9 +548,107 @@ mod tests {
         })
     }
 
+    fn valid_v0_2() -> serde_json::Value {
+        let mut m = valid_manifest();
+        m["manifest_version"] = serde_json::json!("0.2");
+        m["policy"] = serde_json::json!({
+            "effect": "allow", "principal": "agent", "rule_id": 0, "ledger_ref": "run:r1"
+        });
+        m["checks"] = serde_json::json!(
+            { "total": 4, "passed": 3, "failed": 0, "not_evaluated": 1 });
+        m["tests"] = serde_json::json!(
+            { "total": 2, "passed": 2, "failed": 0, "not_evaluated": 0 });
+        m
+    }
+
+    fn v0_2_errors(m: &serde_json::Value) -> Vec<String> {
+        let report = verify_value(m, None).unwrap();
+        assert_eq!(report.schema_valid, report.schema_errors.is_empty());
+        report.schema_errors
+    }
+
+    #[test]
+    fn valid_v0_2_with_all_claims_passes() {
+        let errs = v0_2_errors(&valid_v0_2());
+        assert!(errs.is_empty(), "{errs:?}");
+        let typed: Manifest = serde_json::from_value(valid_v0_2()).unwrap();
+        assert_eq!(typed.checks.unwrap().total, 4);
+        assert_eq!(typed.policy.unwrap().rule_id, Some(0));
+    }
+
+    #[test]
+    fn v0_2_without_claims_is_valid() {
+        let mut m = valid_v0_2();
+        let obj = m.as_object_mut().unwrap();
+        obj.remove("policy");
+        obj.remove("checks");
+        obj.remove("tests");
+        assert!(v0_2_errors(&m).is_empty());
+    }
+
+    #[test]
+    fn v0_1_with_policy_fails() {
+        let mut m = valid_manifest();
+        m["policy"] = serde_json::json!(
+            { "effect": "allow", "principal": "agent", "ledger_ref": "run:r1" });
+        assert!(!v0_2_errors(&m).is_empty());
+    }
+
+    #[test]
+    fn v0_2_deny_effect_fails() {
+        let mut m = valid_v0_2();
+        m["policy"]["effect"] = serde_json::json!("deny");
+        assert!(!v0_2_errors(&m).is_empty());
+    }
+
+    #[test]
+    fn v0_2_negative_or_fractional_count_fails() {
+        let mut m = valid_v0_2();
+        m["checks"]["failed"] = serde_json::json!(-1);
+        assert!(!v0_2_errors(&m).is_empty());
+        let mut m = valid_v0_2();
+        m["checks"]["total"] = serde_json::json!(4.5);
+        assert!(!v0_2_errors(&m).is_empty());
+    }
+
+    #[test]
+    fn v0_2_counts_that_do_not_sum_fail() {
+        let mut m = valid_v0_2();
+        m["checks"]["total"] = serde_json::json!(6);
+        m["checks"]["passed"] = serde_json::json!(3);
+        m["checks"]["not_evaluated"] = serde_json::json!(2);
+        m["checks"]["failed"] = serde_json::json!(0);
+        let errs = v0_2_errors(&m);
+        assert_eq!(
+            errs,
+            vec!["checks: passed + failed + not_evaluated (5) does not equal total (6)"]
+        );
+        let mut m = valid_v0_2();
+        m["tests"]["total"] = serde_json::json!(u64::MAX);
+        m["tests"]["passed"] = serde_json::json!(u64::MAX);
+        m["tests"]["failed"] = serde_json::json!(1);
+        m["tests"]["not_evaluated"] = serde_json::json!(0);
+        assert!(v0_2_errors(&m).iter().any(|e| e.starts_with("tests:")));
+    }
+
+    #[test]
+    fn v0_2_unknown_key_in_policy_fails() {
+        let mut m = valid_v0_2();
+        m["policy"]["surprise"] = serde_json::json!(1);
+        assert!(!v0_2_errors(&m).is_empty());
+    }
+
+    #[test]
+    fn unknown_version_is_reported_by_the_v0_1_schema() {
+        let mut m = valid_v0_2();
+        m["manifest_version"] = serde_json::json!("0.3");
+        assert!(!v0_2_errors(&m).is_empty());
+    }
+
     #[test]
     fn embedded_schema_compiles() {
         compile_schema().expect("the embedded schema must compile");
+        compile_schema_for(SchemaVersion::V0_2).expect("the v0.2 schema must compile");
     }
 
     #[test]
