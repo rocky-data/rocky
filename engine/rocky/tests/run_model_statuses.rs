@@ -33,6 +33,8 @@ models = "models/**"
 auto_create_schemas = true
 "#;
 
+const FAIL_FAST: &str = "\n[resilience]\ncontain_failures = false\n";
+
 const CONTAIN: &str = "\n[resilience]\ncontain_failures = true\n";
 
 const BROKEN_STATUS_COUNTS: &str =
@@ -157,7 +159,7 @@ fn built(v: &serde_json::Value) -> Vec<String> {
 #[test]
 fn fail_fast_run_reports_failed_and_not_started_models() {
     let dir = tempfile::tempdir().unwrap();
-    project(dir.path(), "", BROKEN_STATUS_COUNTS);
+    project(dir.path(), FAIL_FAST, BROKEN_STATUS_COUNTS);
 
     let out = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(
@@ -225,7 +227,7 @@ fn retry_failed_reruns_only_failed_and_unbuilt_models() {
     let dir = tempfile::tempdir().unwrap();
     // `zz_counts` sorts after `stg_orders`, so layer 0 builds `stg_orders`
     // first and the run stops on `zz_counts` before layer 1.
-    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    project_with(dir.path(), FAIL_FAST, "zz_counts", BROKEN_STATUS_COUNTS);
     let first = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!first.status.success(), "{}", describe(&first));
     let first = json(&first);
@@ -396,7 +398,7 @@ fn contained_dependent_of_the_failing_model_is_skipped_upstream_failed() {
 #[test]
 fn production_retry_ignores_a_newer_failed_shadow_run() {
     let dir = tempfile::tempdir().unwrap();
-    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    project_with(dir.path(), FAIL_FAST, "zz_counts", BROKEN_STATUS_COUNTS);
     let prod = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!prod.status.success(), "{}", describe(&prod));
     assert_eq!(status_of(&json(&prod), "stg_orders"), "built");
