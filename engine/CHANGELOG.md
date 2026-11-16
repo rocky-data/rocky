@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rocky run --output json` now lists what happened to each model under `model_statuses` (#2616). Each entry has a `model`, a `status` (`built`, `failed`, `skipped` or `not_started`), a `reason` for skipped and not-started models (`unchanged`, `reused`, `upstream_failed`, `run_stopped`) and, for `upstream_failed`, the `blocked_by` models. It is a roll-up of `materializations`, `errors`, `model_decisions` and `contained`, which do not change. A run that built every model omits the field, so its JSON is unchanged. The text summary prints one line per model that did not build.
+- `rocky run --retry-failed [<RUN_ID>]` reruns the failed and never-built models of a failed transformation run (#2616). Without a run id it uses the latest run of the pipeline (and `--branch`). It skips a model the run built with the SQL the model has now. It refuses when that run succeeded, when no run is found, when the run belongs to another pipeline or branch, and when nothing is left to retry. It conflicts with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model` and `--select`. It is not a resume: it keeps no checkpoint, and `--resume` stays replication-only.
+- A fail-fast `rocky run` that stops with models not started now prints a hint in text mode: set `[resilience] contain_failures = true` to keep building models that do not depend on the failure (#2617). The default is unchanged: `contain_failures` stays `false`.
 - `[policy]` rules can name the `run` capability (#2610). Only a rule naming `run` matches it. A `run` rule with `verify_after` is refused (V046), because a one-step run has no post-apply check.
 
 ### Fixed

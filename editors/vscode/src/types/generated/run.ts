@@ -132,6 +132,14 @@ export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evalua
  */
 export type ModelDecision = "build" | "skip" | "reused";
 /**
+ * Why a model has status `skipped` or `not_started`.
+ */
+export type ModelRunStatusReason = "unchanged" | "reused" | "upstream_failed" | "run_stopped";
+/**
+ * What happened to one model in a transformation run.
+ */
+export type ModelRunStatus = "built" | "failed" | "skipped" | "not_started";
+/**
  * Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
  */
 export type ProductBudgetLimitType = "max_compute_hours" | "max_storage_gb_month" | "max_usd";
@@ -235,6 +243,10 @@ export interface RunOutput {
    * Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.
    */
   model_decisions?: ModelDecisionOutput[];
+  /**
+   * What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation runs only.
+   */
+  model_statuses?: ModelRunStatusOutput[];
   /**
    * How many discovered tables each `[[table_overrides]]` rule matches, one row per rule in declaration order. Counted after `--filter` and BEFORE the warehouse check that excludes tables missing from the source, by the same function `rocky plan` calls, so the two report the same numbers for the same project. Empty (and omitted) when no rules are declared.
    */
@@ -841,6 +853,30 @@ export interface ModelDecisionOutput {
    * Short human-readable justification reflecting the exact decision the gate made (e.g. "logic and upstream data unchanged since last build", "not skip-eligible", "upstream data may have changed", "reused prior run's bytes (strong proof)").
    */
   reason: string;
+  [k: string]: unknown;
+}
+/**
+ * One per-model entry on [`RunOutput::model_statuses`].
+ *
+ * A roll-up of the run's other fields. It never changes build behavior.
+ */
+export interface ModelRunStatusOutput {
+  /**
+   * For `upstream_failed`: the failed or withheld upstream models that reach this one. Omitted when empty.
+   */
+  blocked_by?: string[];
+  /**
+   * The model's name (matches the model entry in the project DAG).
+   */
+  model: string;
+  /**
+   * Why the model was skipped or not started. Omitted for `built` and `failed`.
+   */
+  reason?: ModelRunStatusReason | null;
+  /**
+   * What happened to the model.
+   */
+  status: ModelRunStatus;
   [k: string]: unknown;
 }
 /**

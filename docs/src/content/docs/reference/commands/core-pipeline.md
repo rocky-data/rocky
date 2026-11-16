@@ -659,6 +659,7 @@ rocky run [flags]
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--retry-failed [<RUN_ID>]` | `string` | | Rerun the failed and never-built models of a failed transformation run. Without a value, the run is the latest of the pipeline (and `--branch`). A model is not rerun when that run built it with the SQL it has now. Refuses when the run succeeded, is not found, belongs to another pipeline or branch, or nothing is left to retry. Rejected with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model` and `--select`. See [Retrying a failed run](#retrying-a-failed-run). |
 | `--shadow` | `bool` | `false` | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
 | `--keep-shadow` | `bool` | `false` | Requires `--shadow` and conflicts with `--watch`. Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
@@ -691,6 +692,30 @@ rocky run [flags]
 :::caution[`--defer` SQL-rewrite limitation]
 `--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support (`SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals) cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
 :::
+
+### Retrying a failed run
+
+`--retry-failed` reruns a failed transformation run. It picks the models again. It keeps no checkpoint, so it is not `--resume`, which stays replication-only.
+
+```bash
+rocky run --pipeline shop                 # status_counts fails, customer_orders never starts
+rocky run --pipeline shop --retry-failed  # reruns status_counts and customer_orders
+```
+
+A model stays out of the retry when the run holds a `success` row for it with the same `sql_hash` as the SQL the model generates now. A model whose SQL depends on the warehouse (an incremental model) or on `--var` is always rerun. The retry is recorded under the same pipeline, so a second `--retry-failed` after a good retry refuses.
+
+### Per-model status
+
+`--output json` carries `model_statuses` when at least one model did not build. It is a roll-up of `materializations`, `errors`, `model_decisions` and `contained`.
+
+| Field | Meaning |
+|---|---|
+| `model` | The model name. |
+| `status` | `built`, `failed`, `skipped` or `not_started`. |
+| `reason` | For `skipped` and `not_started`: `unchanged`, `reused`, `upstream_failed` or `run_stopped`. |
+| `blocked_by` | For `upstream_failed`: the failed upstream models. |
+
+A fail-fast run stops at the first failure. Models that had not started are `not_started` with reason `run_stopped`. The text summary lists them and hints at `[resilience] contain_failures = true`, which keeps building models that do not depend on the failure. That setting stays `false` by default.
 
 ### Recovering replication checkpoints
 

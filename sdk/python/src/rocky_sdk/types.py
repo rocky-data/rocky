@@ -476,6 +476,24 @@ class MetricsSnapshot(BaseModel):
     query_duration_max_ms: int
 
 
+class ModelRunStatus(BaseModel):
+    """What happened to one model in a transformation run.
+
+    Hand-written to match the engine's ``ModelRunStatusOutput``. Emitted on
+    :attr:`RunResult.model_statuses` only when at least one model did not build.
+    """
+
+    #: The model's name (matches the model entry in the project DAG).
+    model: str
+    #: ``built``, ``failed``, ``skipped`` or ``not_started``.
+    status: Literal["built", "failed", "skipped", "not_started"]
+    #: Why the model was skipped or not started: ``unchanged``, ``reused``,
+    #: ``upstream_failed`` or ``run_stopped``. Omitted for built and failed.
+    reason: Literal["unchanged", "reused", "upstream_failed", "run_stopped"] | None = None
+    #: For ``upstream_failed``: the failed or withheld upstream models.
+    blocked_by: list[str] = Field(default_factory=list)
+
+
 class ContainedModel(BaseModel):
     """A model Rocky withheld this run because an upstream failed.
 
@@ -615,6 +633,10 @@ class RunResult(BaseModel):
     #: ``RunOutput``), so a consumer mapping it — e.g. dagster-rocky surfacing
     #: the containment blast radius — would never see anything.
     contained: list[ContainedModel] = Field(default_factory=list)
+    #: Per-model outcome of a transformation run: built, failed, skipped or
+    #: not started. A roll-up of the other run fields. Empty and omitted on the
+    #: wire when every model was built.
+    model_statuses: list[ModelRunStatus] = Field(default_factory=list)
     #: Tables filtered out before execution because they don't exist in
     #: the source warehouse. Empty when nothing was excluded. The CLI
     #: skips serializing this field when empty, so it remains backwards

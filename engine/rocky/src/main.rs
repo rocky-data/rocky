@@ -1073,6 +1073,21 @@ enum Command {
         /// Resume the most recent failed replication run; mints a new `run_id` and records the prior one as `resumed_from`
         #[arg(long)]
         resume_latest: bool,
+        /// Rerun the failed and never-built models of a failed transformation
+        /// run. Without a value, the run is the latest of the pipeline (and
+        /// `--branch`) that did not succeed; with one, that run. A model is
+        /// not rerun when the run built it with the SQL it has now. Refuses
+        /// when the run succeeded or nothing is left to retry. Not `--resume`:
+        /// it re-selects models and keeps no checkpoint.
+        #[arg(
+            long,
+            value_name = "RUN_ID",
+            num_args = 0..=1,
+            conflicts_with_all = [
+                "resume", "resume_latest", "watch", "dag", "model", "select", "exclude",
+            ],
+        )]
+        retry_failed: Option<Option<String>>,
         /// Run in shadow mode: write to shadow targets instead of production
         #[arg(long)]
         shadow: bool,
@@ -4613,6 +4628,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             all: run_all,
             resume,
             resume_latest,
+            retry_failed,
             shadow,
             keep_shadow,
             shadow_suffix,
@@ -4651,7 +4667,43 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // SQL, with the same `--var` values the run itself uses (#2315).
             selection.run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (model, selected_models) = if selection.is_active() {
+            // `--retry-failed` resolves to a model selection and the pipeline it
+            // belongs to, then takes the same model-only path as `--select`.
+            let mut pipeline = pipeline;
+            let mut retry_pipeline: Option<String> = None;
+            let retry_selection = match retry_failed {
+                Some(run_id) => {
+                    anyhow::ensure!(
+                        filter.is_none() && !run_all,
+                        "--retry-failed reruns models of a transformation pipeline and cannot \
+                         be combined with --filter or --all"
+                    );
+                    Some(rocky_cli::commands::resolve_retry_failed(
+                        &cli.config,
+                        &state_path,
+                        pipeline.as_deref(),
+                        models_dir.as_deref(),
+                        run_id.as_deref(),
+                        branch.as_deref(),
+                    )?)
+                }
+                None => None,
+            };
+            let (model, selected_models) = if let Some(retry) = retry_selection {
+                tracing::info!(
+                    run_id = retry.run_id.as_str(),
+                    models = retry.models.len(),
+                    "retrying failed and unbuilt models"
+                );
+                pipeline = Some(retry.pipeline.clone());
+                retry_pipeline = Some(retry.pipeline);
+                let mut set = retry.models;
+                if set.len() == 1 {
+                    (set.pop_first(), None)
+                } else {
+                    (None, Some(set))
+                }
+            } else if selection.is_active() {
                 anyhow::ensure!(
                     !dag && !watch
                         && !run_all
@@ -4846,6 +4898,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     run_id: defer_run_id,
                 }),
                 selected_models,
+                record_pipeline: retry_pipeline,
                 ..Default::default()
             };
 

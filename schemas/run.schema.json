@@ -1050,6 +1050,112 @@
       ],
       "type": "object"
     },
+    "ModelRunStatus": {
+      "description": "What happened to one model in a transformation run.",
+      "oneOf": [
+        {
+          "description": "The model was materialized this run.",
+          "enum": [
+            "built"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The model's build or a post-write check failed, or it failed to compile.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The model was not built on purpose. `reason` says why.",
+          "enum": [
+            "skipped"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run ended before the model started.",
+          "enum": [
+            "not_started"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ModelRunStatusOutput": {
+      "description": "One per-model entry on [`RunOutput::model_statuses`].\n\nA roll-up of the run's other fields. It never changes build behavior.",
+      "properties": {
+        "blocked_by": {
+          "description": "For `upstream_failed`: the failed or withheld upstream models that reach this one. Omitted when empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "The model's name (matches the model entry in the project DAG).",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelRunStatusReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the model was skipped or not started. Omitted for `built` and `failed`."
+        },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelRunStatus"
+            }
+          ],
+          "description": "What happened to the model."
+        }
+      },
+      "required": [
+        "model",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ModelRunStatusReason": {
+      "description": "Why a model has status `skipped` or `not_started`.",
+      "oneOf": [
+        {
+          "description": "The skip gate proved the model unchanged.",
+          "enum": [
+            "unchanged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A prior run's bytes were reused instead of running the SQL.",
+          "enum": [
+            "reused"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An upstream model failed. `blocked_by` names it.",
+          "enum": [
+            "upstream_failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run stopped (a fail-fast stop, or an interrupt) before this model.",
+          "enum": [
+            "run_stopped"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "OverrideMatchCountOutput": {
       "description": "How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].",
       "properties": {
@@ -2302,6 +2408,13 @@
       "description": "Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.",
       "items": {
         "$ref": "#/definitions/ModelDecisionOutput"
+      },
+      "type": "array"
+    },
+    "model_statuses": {
+      "description": "What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation runs only.",
+      "items": {
+        "$ref": "#/definitions/ModelRunStatusOutput"
       },
       "type": "array"
     },

@@ -85,6 +85,7 @@ mod run_incremental;
 mod run_local;
 pub(crate) mod run_output_version;
 mod run_policy_gate;
+mod run_retry;
 mod run_source_sync;
 pub(crate) mod run_source_volume;
 pub(crate) mod run_stored_bytes;
@@ -245,6 +246,7 @@ pub use run::{
 };
 pub use run_dag_exec::{run_with_dag, run_with_dag_and_contracts};
 pub use run_policy_gate::DirectRunGate;
+pub use run_retry::{RetrySelection, resolve_retry_failed};
 pub use run_watch::run_watch as run_with_watch;
 pub use seed::run_seed;
 pub use serve::{resolve_serve_config_path, run_serve};

@@ -380,6 +380,20 @@ pub struct RunOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) fail_fast_model: Option<String>,
+    /// The model a fail-fast run stopped after, kept once
+    /// [`RunOutput::push_fail_fast_error`] has consumed `fail_fast_model`.
+    /// Read by the `model_statuses` roll-up. Not part of the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) fail_fast_stopped_after: Option<String>,
+    /// The models the transformation executor was asked to run, each with the
+    /// asset key its materialization carries, staged once the selection and
+    /// any shadow rewrite are settled. Read by the `model_statuses` roll-up.
+    /// Empty when the executor stopped before it had a selection. Not part of
+    /// the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) execution_set: Vec<(String, Vec<String>)>,
     /// `errors` index -> the model whose measurement in `failed_attempts`
     /// belongs to that entry. Matching by entry, never by name, so a
     /// replication table that shares a model's bare name gets nothing.
@@ -407,6 +421,13 @@ pub struct RunOutput {
     /// Empty (and omitted) when no model was withheld.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contained: Vec<ContainedModelOutput>,
+    /// What happened to each model this run was asked to build: built,
+    /// failed, skipped or never started. A roll-up of `materializations`,
+    /// `errors`, `model_decisions` and `contained`; it changes none of them.
+    /// Empty (and omitted) when every model was built, so a clean run is
+    /// unchanged on the wire. Transformation runs only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_statuses: Vec<ModelRunStatusOutput>,
     pub check_results: Vec<TableCheckOutput>,
     /// Row-quarantine outcomes — one entry per table the quality
     /// pipeline quarantined. Empty for runs that did not use
@@ -1935,6 +1956,53 @@ pub struct ModelDecisionOutput {
     /// "not skip-eligible", "upstream data may have changed", "reused prior
     /// run's bytes (strong proof)").
     pub reason: String,
+}
+
+/// What happened to one model in a transformation run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRunStatus {
+    /// The model was materialized this run.
+    Built,
+    /// The model's build or a post-write check failed, or it failed to compile.
+    Failed,
+    /// The model was not built on purpose. `reason` says why.
+    Skipped,
+    /// The run ended before the model started.
+    NotStarted,
+}
+
+/// Why a model has status `skipped` or `not_started`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRunStatusReason {
+    /// The skip gate proved the model unchanged.
+    Unchanged,
+    /// A prior run's bytes were reused instead of running the SQL.
+    Reused,
+    /// An upstream model failed. `blocked_by` names it.
+    UpstreamFailed,
+    /// The run stopped (a fail-fast stop, or an interrupt) before this model.
+    RunStopped,
+}
+
+/// One per-model entry on [`RunOutput::model_statuses`].
+///
+/// A roll-up of the run's other fields. It never changes build behavior.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModelRunStatusOutput {
+    /// The model's name (matches the model entry in the project DAG).
+    pub model: String,
+    /// What happened to the model.
+    pub status: ModelRunStatus,
+    /// Why the model was skipped or not started. Omitted for `built` and
+    /// `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ModelRunStatusReason>,
+    /// For `upstream_failed`: the failed or withheld upstream models that
+    /// reach this one. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 /// One model withheld from a run because an upstream failed (or was itself
@@ -6628,11 +6696,14 @@ impl RunOutput {
             owned_shadow_objects: vec![],
             failed_attempts: Default::default(),
             fail_fast_model: None,
+            fail_fast_stopped_after: None,
+            execution_set: Vec::new(),
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
             model_decisions: vec![],
             contained: vec![],
+            model_statuses: vec![],
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],
@@ -7163,8 +7234,149 @@ impl RunOutput {
     /// model it stands for.
     pub(crate) fn push_fail_fast_error(&mut self, err: TableErrorOutput) {
         match self.fail_fast_model.take() {
-            Some(model) => self.push_model_error(err, &model),
+            Some(model) => {
+                self.fail_fast_stopped_after = Some(model.clone());
+                self.push_model_error(err, &model);
+            }
             None => self.errors.push(err),
+        }
+    }
+
+    /// Roll the run's per-model outcomes up into [`Self::model_statuses`].
+    ///
+    /// Reads `execution_set` (the models the executor was asked to run) and
+    /// classifies each one, first match wins:
+    ///
+    /// ```text
+    ///   failed        in error_models, or a compile-error entry of its own
+    ///   skipped       in `contained`            (upstream_failed + blocked_by)
+    ///   skipped       decision Skip / Reused    (unchanged / reused)
+    ///   built         has a materialization
+    ///   not_started   none of the above, and the run stopped or failed
+    /// ```
+    ///
+    /// A model that matches nothing on a clean run is left out rather than
+    /// guessed. The list stays empty when every covered model was built.
+    pub(crate) fn roll_up_model_statuses(&mut self) {
+        self.model_statuses.clear();
+        if self.execution_set.is_empty() {
+            return;
+        }
+        let failed: std::collections::BTreeSet<&str> = self
+            .error_models
+            .values()
+            .map(String::as_str)
+            .chain(
+                self.errors
+                    .iter()
+                    .filter(|e| matches!(e.failure_kind, FailureKind::CompileError))
+                    .filter_map(|e| match e.asset_key.as_slice() {
+                        [model] => Some(model.as_str()),
+                        _ => None,
+                    }),
+            )
+            .collect();
+        let run_ended_early =
+            self.interrupted || self.fail_fast_stopped_after.is_some() || self.tables_failed > 0;
+        let mut statuses = Vec::with_capacity(self.execution_set.len());
+        for (model, asset_key) in &self.execution_set {
+            let contained = self.contained.iter().find(|c| &c.model == model);
+            let decision = self.model_decisions.iter().find(|d| &d.model == model);
+            let (status, reason, blocked_by) = if let Some(contained) =
+                contained.filter(|_| !failed.contains(model.as_str()))
+            {
+                (
+                    ModelRunStatus::Skipped,
+                    Some(ModelRunStatusReason::UpstreamFailed),
+                    contained.blocked_by.clone(),
+                )
+            } else if failed.contains(model.as_str()) {
+                (ModelRunStatus::Failed, None, Vec::new())
+            } else if let Some(decision) = decision
+                .filter(|d| matches!(d.decision, ModelDecision::Skip | ModelDecision::Reused))
+            {
+                let reason = match decision.decision {
+                    ModelDecision::Reused => ModelRunStatusReason::Reused,
+                    ModelDecision::Skip | ModelDecision::Build => ModelRunStatusReason::Unchanged,
+                };
+                (ModelRunStatus::Skipped, Some(reason), Vec::new())
+            } else if self
+                .materializations
+                .iter()
+                .any(|m| &m.asset_key == asset_key)
+            {
+                (ModelRunStatus::Built, None, Vec::new())
+            } else if run_ended_early {
+                (
+                    ModelRunStatus::NotStarted,
+                    Some(ModelRunStatusReason::RunStopped),
+                    Vec::new(),
+                )
+            } else {
+                continue;
+            };
+            statuses.push(ModelRunStatusOutput {
+                model: model.clone(),
+                status,
+                reason,
+                blocked_by,
+            });
+        }
+        if statuses.iter().any(|s| s.status != ModelRunStatus::Built) {
+            self.model_statuses = statuses;
+        }
+    }
+
+    /// The extra human-readable lines for a run with models that did not
+    /// build: one per such model, then a hint when a fail-fast run left
+    /// models unstarted. Empty when [`Self::model_statuses`] is empty.
+    pub(crate) fn model_status_lines(&self) -> Vec<String> {
+        let stopped_after = |this: &Self| match &this.fail_fast_stopped_after {
+            Some(model) => format!("run stopped after {model} failed"),
+            None if this.interrupted => "run interrupted".to_string(),
+            None => "run stopped".to_string(),
+        };
+        let mut lines = Vec::new();
+        let mut any_not_started = false;
+        for s in &self.model_statuses {
+            match s.status {
+                ModelRunStatus::Built => {}
+                ModelRunStatus::Failed => lines.push(format!("  failed: {}", s.model)),
+                ModelRunStatus::NotStarted => {
+                    any_not_started = true;
+                    lines.push(format!(
+                        "  not started: {} ({})",
+                        s.model,
+                        stopped_after(self)
+                    ));
+                }
+                ModelRunStatus::Skipped => {
+                    let why = match s.reason {
+                        Some(ModelRunStatusReason::Unchanged) => "unchanged".to_string(),
+                        Some(ModelRunStatusReason::Reused) => "reused".to_string(),
+                        Some(ModelRunStatusReason::UpstreamFailed) => {
+                            format!("upstream failed: {}", s.blocked_by.join(", "))
+                        }
+                        Some(ModelRunStatusReason::RunStopped) | None => stopped_after(self),
+                    };
+                    lines.push(format!("  skipped: {} ({why})", s.model));
+                }
+            }
+        }
+        if any_not_started && self.fail_fast_stopped_after.is_some() {
+            lines.push(
+                "  hint: run with `[resilience] contain_failures = true` to keep building \
+                 models that do not depend on the failure."
+                    .to_string(),
+            );
+        }
+        lines
+    }
+
+    /// Print [`Self::model_status_lines`] the way the run summary prints.
+    pub(crate) fn print_model_status_lines(&self) {
+        for line in self.model_status_lines() {
+            crate::status_line!("{line}");
         }
     }
 
