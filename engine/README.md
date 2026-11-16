@@ -241,7 +241,7 @@ per model with a `-- rocky-allow: <construct>` comment.
 | **Branches** | `rocky branch create`/`delete`/`list`/`show`/`compare`/`approve`/`promote`, `rocky run --branch`, `rocky replay <run-id>` |
 | **Agent governance** | `[policy]` rules (allow / require review / deny), `max_downstreams` blast-radius ceilings, `verify_after` gates, `autonomy_budget`, `rocky policy check` decision explainer, `rocky policy freeze`, `rocky policy test` scenario runner, decision ledger (`rocky audit`, `rocky brief`, `rocky review --queue`) |
 | **Reproducibility** | Content-addressed run records with recipe identity, `rocky replay --execute --verify` bit-exact re-execution, `rocky gc --derivable --dry-run` inventory of reclaimable artifacts (drop `--dry-run` and it writes a review-gated eviction plan instead), hash-verified `rocky restore` |
-| **Resilience** | Classified retry of transient failures, opt-in failure containment (`contain_failures`), review-gated `rocky backfill` plans |
+| **Resilience** | Classified retry of transient failures, failure containment on by default (`contain_failures`), review-gated `rocky backfill` plans |
 | **Cost** | Per-model cost attribution on every run, `[budget]` limits, `budget_breach` hook event, `rocky preview cost --name <branch>` reports a pull request's per-model cost delta against the base branch, plus the budget breaches it projects. It reads a branch that `rocky preview create` registered |
 | **Observability** | `rocky trace` Gantt output, structured JSON events, OpenTelemetry OTLP export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set |
 | **Portability** | Opt-in dialect-divergence lint targeting Databricks, Snowflake, BigQuery, or DuckDB |

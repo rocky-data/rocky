@@ -41,7 +41,7 @@ An entry whose `failure_kind` is `"compile-error"` is a compile-time failure tha
 
 An entry can also be a governance failure. Those classify as `failure_kind: "unknown"`, so check `permissions` before you treat one as an adapter failure. [Section 9](#9-governance-failures) covers it.
 
-Entries on `contained[*]` are not failures of their own. They name models Rocky withheld after an upstream compile failure, or during configured runtime containment. If `--model` selects a descendant withheld by a compile failure, it also gets a `compile-error` entry and increments `tables_failed`. See [Failure containment across the model graph](#failure-containment-across-the-model-graph).
+Entries on `contained[*]` are not failures of their own. They name models Rocky withheld after an upstream compile failure, or during runtime containment (on by default; `[resilience] contain_failures = false` turns it off). If `--model` selects a descendant withheld by a compile failure, it also gets a `compile-error` entry and increments `tables_failed`. See [Failure containment across the model graph](#failure-containment-across-the-model-graph).
 
 ## The nine categories
 
