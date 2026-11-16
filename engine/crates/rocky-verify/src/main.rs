@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use rocky_verify::{
-    CountsClaim, MANIFEST_SCHEMA_V0_1, MANIFEST_SCHEMA_V0_2, Manifest, PolicyClaim, VerifyError,
+    AssertedClaims, MANIFEST_SCHEMA_V0_1, MANIFEST_SCHEMA_V0_2, SchemaVersion, VerifyError,
     VerifyReport, verify_file,
 };
 
@@ -85,7 +85,7 @@ fn main() -> ExitCode {
                 if json {
                     print_json(&manifest, &report);
                 } else {
-                    print_human(&manifest, &report, &read_claims(&manifest));
+                    print_human(&manifest, &report);
                 }
                 if report.passed() {
                     ExitCode::SUCCESS
@@ -101,40 +101,32 @@ fn main() -> ExitCode {
     }
 }
 
-/// The producer-asserted v0.2 claims, when the document carries them.
-#[derive(Default)]
-struct Claims {
-    policy: Option<PolicyClaim>,
-    checks: Option<CountsClaim>,
-    tests: Option<CountsClaim>,
+const ASSERTED: &str = "(asserted by the producer, not verified)";
+
+/// Escape a claim string so no control character can reach the terminal.
+fn esc(s: &str) -> String {
+    s.escape_debug().to_string()
 }
 
-/// Re-read the manifest for its claims. Any failure yields no claims: the
-/// verification report already carries the real error.
-fn read_claims(manifest: &std::path::Path) -> Claims {
-    let Ok(bytes) = std::fs::read(manifest) else {
-        return Claims::default();
-    };
-    match serde_json::from_slice::<Manifest>(&bytes) {
-        Ok(m) => Claims {
-            policy: m.policy,
-            checks: m.checks,
-            tests: m.tests,
-        },
-        Err(_) => Claims::default(),
+/// The effect as shown to a person. `require_review` is not an approval.
+fn effect_label(effect: &str) -> String {
+    if effect == "require_review" {
+        "require_review (review was not enforced on this run)".to_string()
+    } else {
+        esc(effect)
     }
 }
 
-const ASSERTED: &str = "(asserted by the producer, not verified)";
-
-fn print_claims(claims: &Claims) {
+fn print_claims(claims: &AssertedClaims) {
     if let Some(p) = &claims.policy {
         let rule = p
             .rule_id
             .map_or_else(|| "default".to_string(), |r| r.to_string());
         println!(
             "  policy:  {} for {} (rule {rule}, ledger {}) {ASSERTED}",
-            p.effect, p.principal, p.ledger_ref
+            effect_label(&p.effect),
+            esc(&p.principal),
+            esc(&p.ledger_ref)
         );
     }
     for (label, c) in [("checks", &claims.checks), ("tests", &claims.tests)] {
@@ -155,7 +147,7 @@ fn report_error(e: &VerifyError) {
     eprintln!("rocky-verify: {e}");
 }
 
-fn print_human(manifest: &std::path::Path, report: &VerifyReport, claims: &Claims) {
+fn print_human(manifest: &std::path::Path, report: &VerifyReport) {
     println!("manifest: {}", manifest.display());
     if report.schema_valid {
         println!(
@@ -165,10 +157,15 @@ fn print_human(manifest: &std::path::Path, report: &VerifyReport, claims: &Claim
     } else {
         println!("  schema:  FAILED");
         for err in &report.schema_errors {
-            println!("    - {err}");
+            println!("    - {}", esc(err));
         }
     }
-    print_claims(claims);
+    if report.schema_valid
+        && report.schema_version == SchemaVersion::V0_2
+        && let Some(claims) = &report.claims
+    {
+        print_claims(claims);
+    }
     if report.artifact_checks.is_empty() {
         println!("  bytes:   (not checked — no output artifacts verified)");
     } else {
@@ -225,13 +222,20 @@ fn print_json(manifest: &std::path::Path, report: &VerifyReport) {
             })
         })
         .collect();
-    let out = serde_json::json!({
+    let mut out = serde_json::json!({
         "manifest": manifest.display().to_string(),
         "passed": report.passed(),
         "schema_valid": report.schema_valid,
         "schema_errors": report.schema_errors,
         "artifact_checks": artifacts,
+        "schema_version": report.schema_version.label().trim_start_matches('v'),
     });
+    if report.schema_valid
+        && let Some(claims) = &report.claims
+        && let Ok(v) = serde_json::to_value(claims)
+    {
+        out["asserted_claims"] = v;
+    }
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
 
@@ -258,6 +262,7 @@ mod tests {
             schema_errors: Vec::new(),
             artifact_checks: Vec::new(),
             schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(report.passed(), "JSON `passed` semantics must not change");
         assert_eq!(
@@ -273,6 +278,7 @@ mod tests {
             schema_errors: Vec::new(),
             artifact_checks: vec![matched_check()],
             schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(report.passed());
         assert_eq!(verdict_line(&report), "VERIFIED");
@@ -285,6 +291,7 @@ mod tests {
             schema_errors: vec!["<root>: missing program_hash".into()],
             artifact_checks: Vec::new(),
             schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(!report.passed());
         assert_eq!(verdict_line(&report), "NOT VERIFIED");
@@ -300,6 +307,7 @@ mod tests {
             schema_errors: Vec::new(),
             artifact_checks: vec![check],
             schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(!report.passed());
         assert_eq!(verdict_line(&report), "NOT VERIFIED");

@@ -152,9 +152,9 @@
           "minimum": 0
         },
         "ledger_ref": {
-          "description": "Where the producer recorded the full decision in its own ledger, e.g. \"run:<run_id>\".",
+          "description": "Where the producer recorded the full decision in its own ledger, e.g. \"run:<run_id>\". Printable ASCII with no spaces or control characters, at most 256 characters, so a verifier can print it safely.",
           "type": "string",
-          "minLength": 1
+          "pattern": "^[!-~]{1,256}$"
         }
       }
     },

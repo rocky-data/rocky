@@ -54,7 +54,7 @@ Every hash is lowercase hex over 32 BLAKE3 bytes, so each identity field is exac
 
 ## Versioning
 
-`manifest_version` is a constant `"0.1"` at this version. A consumer reads it first and refuses a version it does not understand. `hash_scheme` versions the hashing algorithm family independently of the document shape, so the two can evolve on their own schedules.
+`manifest_version` is `"0.1"` or `"0.2"`. A consumer reads it first and refuses a version it does not understand. `hash_scheme` versions the hashing algorithm family independently of the document shape, so the two can evolve on their own schedules.
 
 ## The document shape
 
@@ -163,10 +163,13 @@ The same manifest content can travel in more than one place:
 - These objects are unsigned. The producer asserts them. A verifier checks their shape and never treats them as evidence.
 - `rocky-verify` prints each claim marked "asserted by the producer, not verified".
 - A producer writes v0.1 when it has none of them. A v0.1 document that carries any of them fails.
-- `deny` never appears. A denied run writes no manifest.
+- `deny` never appears. Rocky writes no manifest for a denied run.
+- `require_review` means the policy asked for review and the run path did not enforce it. It is not an approval. `rocky-verify` prints it as `require_review (review was not enforced on this run)`.
+- Counts and `rule_id` must be written as plain integers, with no fraction or exponent (`4`, not `4.0`). `rocky-verify` rejects `4.0`, although the JSON Schema alone accepts it.
+- `rocky-verify` prints claims only for a document that passes verification and is v0.2. A failed document prints none. Every claim string is printed escaped. With `--json`, the report adds `schema_version` and, for a passing v0.2 document, the claims under `asserted_claims`.
 - `passed + failed + not_evaluated` must equal `total`. The verifier checks this sum.
 - The verifier picks the schema from `manifest_version`. Any value other than `"0.2"` is checked against v0.1.
-- A producer may flatten a manifest into string key/value pairs, for example Databricks table properties under `recipe_manifest.<path>`. It writes integer fields as base-10 strings. A consumer must turn them back into JSON integers before validating.
+- A producer may flatten a manifest into string key/value pairs, for example Databricks table properties under `recipe_manifest.<path>`. It writes integer fields as base-10 strings. A consumer must turn them back into JSON integers before validating. No code does this conversion yet.
 
 ## The reference verifier
 

@@ -1,7 +1,7 @@
 [package]
 name = "rocky-verify"
 version = "0.1.0"
-description = "Standalone offline verifier for rocky-manifest v0.1 attestations (no producing engine required)"
+description = "Standalone offline verifier for rocky-manifest v0.1 and v0.2 attestations (no producing engine required)"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

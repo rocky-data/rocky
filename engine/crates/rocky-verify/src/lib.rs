@@ -139,7 +139,7 @@ pub struct Manifest {
 /// This is a claim the producer makes about itself. Nothing in it is
 /// byte-verifiable, so a verifier checks its shape only and never treats it as
 /// evidence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyClaim {
     /// The decision: `"allow"` or `"require_review"`.
     pub effect: String,
@@ -156,7 +156,7 @@ pub struct PolicyClaim {
 ///
 /// A claim, not verified evidence. The only property a verifier can check is
 /// that `passed + failed + not_evaluated == total`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountsClaim {
     /// Number configured.
     pub total: u64,
@@ -166,6 +166,24 @@ pub struct CountsClaim {
     pub failed: u64,
     /// Number configured but not evaluated.
     pub not_evaluated: u64,
+}
+
+/// The producer-asserted v0.2 claims of a schema-valid v0.2 document.
+///
+/// Built from the same parsed value that was schema-validated, never from a
+/// second read of the file. Every field is unsigned and unverified: a claim,
+/// not evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssertedClaims {
+    /// The asserted policy decision, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyClaim>,
+    /// The asserted data-check counts, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<CountsClaim>,
+    /// The asserted model-test counts, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<CountsClaim>,
 }
 
 /// Who produced a manifest — vendor-neutral name plus version.
@@ -254,6 +272,9 @@ pub struct VerifyReport {
     pub artifact_checks: Vec<ArtifactCheck>,
     /// The schema version the document was validated against.
     pub schema_version: SchemaVersion,
+    /// The producer-asserted claims. `Some` only for a schema-valid v0.2
+    /// document; always `None` for v0.1 and for any failed document.
+    pub claims: Option<AssertedClaims>,
 }
 
 impl VerifyReport {
@@ -266,6 +287,12 @@ impl VerifyReport {
 }
 
 /// Validate a parsed manifest value against the embedded v0.1 schema.
+///
+/// This is the v0.1 function only: it rejects every v0.2 document, because
+/// the v0.1 schema requires `manifest_version` to be `"0.1"`. To validate a
+/// document of either version, pick the schema with
+/// [`SchemaVersion::of_document`] and call [`validate_schema_for`] (or use
+/// [`verify_value`] for the full verdict).
 ///
 /// Returns the list of human-readable violations — empty means valid. The
 /// embedded schema is compiled on each call; for a hot loop, compile once with
@@ -281,6 +308,11 @@ pub fn validate_schema(instance: &serde_json::Value) -> Result<Vec<String>, Veri
 
 /// Validate a parsed manifest value against the embedded schema of `version`.
 ///
+/// For [`SchemaVersion::V0_2`] this also runs the checks JSON Schema cannot
+/// express (counts written as plain integers, and
+/// `passed + failed + not_evaluated == total`), so the verdict matches the one
+/// [`verify_value`] reports.
+///
 /// # Errors
 ///
 /// Returns [`VerifyError::Schema`] only if the embedded schema fails to compile.
@@ -289,7 +321,21 @@ pub fn validate_schema_for(
     instance: &serde_json::Value,
 ) -> Result<Vec<String>, VerifyError> {
     let (schemas, sch) = compile_schema_for(version)?;
-    Ok(collect_schema_errors(&schemas, sch, instance))
+    Ok(schema_and_semantic_errors(version, &schemas, sch, instance))
+}
+
+/// Schema errors, then (for a schema-valid v0.2 document) the semantic errors.
+fn schema_and_semantic_errors(
+    version: SchemaVersion,
+    schemas: &boon::Schemas,
+    sch: boon::SchemaIndex,
+    instance: &serde_json::Value,
+) -> Vec<String> {
+    let mut errors = collect_schema_errors(schemas, sch, instance);
+    if errors.is_empty() && version == SchemaVersion::V0_2 {
+        errors = v0_2_semantic_errors(instance);
+    }
+    errors
 }
 
 /// Compile the embedded schema, returning the validator handle for reuse.
@@ -359,11 +405,24 @@ fn flatten(err: &boon::ValidationError, out: &mut Vec<String>) {
     }
 }
 
-/// Check `passed + failed + not_evaluated == total` for the v0.2 `checks` and
-/// `tests` objects, which JSON Schema cannot express. Assumes the document is
-/// already schema-valid. Overflow counts as a violation.
-fn count_sum_errors(instance: &serde_json::Value) -> Vec<String> {
+/// The v0.2 checks JSON Schema cannot express. Assumes the document is already
+/// schema-valid.
+///
+/// * `policy.rule_id` and every count must be a plain non-negative integer:
+///   `serde_json::Value::as_u64` accepts `4` but not `4.0` or `1e30`, although
+///   the schema's `integer` type accepts both.
+/// * `passed + failed + not_evaluated == total` for `checks` and `tests`
+///   (overflow counts as a violation).
+fn v0_2_semantic_errors(instance: &serde_json::Value) -> Vec<String> {
     let mut errors = Vec::new();
+    if let Some(rule_id) = instance.get("policy").and_then(|p| p.get("rule_id"))
+        && rule_id.as_u64().is_none()
+    {
+        errors.push(
+            "policy.rule_id must be a non-negative integer written without a fraction or exponent"
+                .to_string(),
+        );
+    }
     for key in ["checks", "tests"] {
         let Some(obj) = instance.get(key) else {
             continue;
@@ -375,7 +434,9 @@ fn count_sum_errors(instance: &serde_json::Value) -> Vec<String> {
             field("failed"),
             field("not_evaluated"),
         ) else {
-            errors.push(format!("{key}: counts must be unsigned integers"));
+            errors.push(format!(
+                "{key}: counts must be non-negative integers written without a fraction or exponent"
+            ));
             continue;
         };
         let sum = passed
@@ -394,6 +455,29 @@ fn count_sum_errors(instance: &serde_json::Value) -> Vec<String> {
     errors
 }
 
+/// Build the asserted claims from the validated value itself.
+///
+/// # Errors
+///
+/// Returns a message when a claim object cannot be converted; the caller turns
+/// that into a schema error so a claim can never be dropped silently.
+fn extract_claims(instance: &serde_json::Value) -> Result<AssertedClaims, String> {
+    fn take<T: serde::de::DeserializeOwned>(
+        instance: &serde_json::Value,
+        key: &str,
+    ) -> Result<Option<T>, String> {
+        instance
+            .get(key)
+            .map(|v| serde_json::from_value(v.clone()).map_err(|e| format!("{key}: {e}")))
+            .transpose()
+    }
+    Ok(AssertedClaims {
+        policy: take(instance, "policy")?,
+        checks: take(instance, "checks")?,
+        tests: take(instance, "tests")?,
+    })
+}
+
 /// Verify a manifest document (already parsed) end to end.
 ///
 /// Runs schema validation (v0.2 when `manifest_version` is `"0.2"`, otherwise
@@ -410,8 +494,12 @@ pub fn verify_value(
 ) -> Result<VerifyReport, VerifyError> {
     let schema_version = SchemaVersion::of_document(instance);
     let mut schema_errors = validate_schema_for(schema_version, instance)?;
+    let mut claims = None;
     if schema_errors.is_empty() && schema_version == SchemaVersion::V0_2 {
-        schema_errors = count_sum_errors(instance);
+        match extract_claims(instance) {
+            Ok(c) => claims = Some(c),
+            Err(e) => schema_errors.push(format!("could not read asserted claims: {e}")),
+        }
     }
     let schema_valid = schema_errors.is_empty();
 
@@ -421,16 +509,26 @@ pub fn verify_value(
         // noise on top of the real (structural) failure.
         Some(dir) if schema_valid => match serde_json::from_value::<Manifest>(instance.clone()) {
             Ok(manifest) => verify_artifacts(&manifest, dir),
-            Err(_) => Vec::new(),
+            // v0.1 keeps its original behaviour exactly: no artifact checks,
+            // no new error. A v0.2 document must not pass with its byte
+            // checks silently skipped.
+            Err(_) if schema_version == SchemaVersion::V0_1 => Vec::new(),
+            Err(e) => {
+                schema_errors.push(format!("could not read manifest: {e}"));
+                claims = None;
+                Vec::new()
+            }
         },
         _ => Vec::new(),
     };
+    let schema_valid = schema_valid && schema_errors.is_empty();
 
     Ok(VerifyReport {
         schema_valid,
         schema_errors,
         artifact_checks,
         schema_version,
+        claims,
     })
 }
 
@@ -793,5 +891,116 @@ mod tests {
             !errs.is_empty(),
             "additionalProperties:false must reject unknown fields"
         );
+    }
+
+    fn report_for(m: &serde_json::Value) -> VerifyReport {
+        verify_value(m, None).unwrap()
+    }
+
+    #[test]
+    fn v0_2_float_rule_id_fails() {
+        for bad in [serde_json::json!(1.0), serde_json::json!(1e30)] {
+            let mut m = valid_v0_2();
+            m["policy"]["rule_id"] = bad;
+            let r = report_for(&m);
+            assert!(!r.schema_valid && r.claims.is_none());
+            assert!(
+                r.schema_errors
+                    .iter()
+                    .any(|e| e.starts_with("policy.rule_id"))
+            );
+        }
+    }
+
+    #[test]
+    fn v0_2_float_count_fails() {
+        let mut m = valid_v0_2();
+        m["checks"] = serde_json::json!(
+            { "total": 4.0, "passed": 3, "failed": 0, "not_evaluated": 1 });
+        let r = report_for(&m);
+        assert!(!r.schema_valid);
+        assert!(r.schema_errors.iter().any(|e| e.starts_with("checks:")));
+    }
+
+    #[test]
+    fn validate_schema_for_v0_2_catches_a_bad_sum() {
+        let mut m = valid_v0_2();
+        m["checks"]["total"] = serde_json::json!(9);
+        let errs = validate_schema_for(SchemaVersion::V0_2, &m).unwrap();
+        assert_eq!(errs, report_for(&m).schema_errors);
+        assert!(!errs.is_empty());
+        let mut m = valid_v0_2();
+        m["policy"]["rule_id"] = serde_json::json!(1.0);
+        assert!(
+            !validate_schema_for(SchemaVersion::V0_2, &m)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn valid_v0_2_report_carries_the_documents_claims() {
+        let m = valid_v0_2();
+        let r = report_for(&m);
+        let claims = r.claims.expect("claims present");
+        assert_eq!(serde_json::to_value(&claims.policy).unwrap(), m["policy"]);
+        assert_eq!(serde_json::to_value(&claims.checks).unwrap(), m["checks"]);
+        assert_eq!(serde_json::to_value(&claims.tests).unwrap(), m["tests"]);
+    }
+
+    #[test]
+    fn failed_document_has_no_claims() {
+        let mut m = valid_v0_2();
+        m["checks"]["total"] = serde_json::json!(9);
+        assert!(report_for(&m).claims.is_none());
+        m = valid_v0_2();
+        m["policy"]["ledger_ref"] = serde_json::json!("a\nb");
+        let r = report_for(&m);
+        assert!(!r.schema_valid && r.claims.is_none());
+    }
+
+    /// Hex BLAKE3 of the published v0.1 schema. A change to the published v0.1
+    /// schema must be a deliberate new version, not an edit of this constant.
+    const V0_1_SCHEMA_BLAKE3: &str =
+        "2c3c96d14acbfda8eea2046a536d1e78d8778b7ad4824db00ed7be6a3c1b37ad";
+
+    #[test]
+    fn v0_1_verdicts_are_unchanged() {
+        assert_eq!(
+            blake3::hash(MANIFEST_SCHEMA_V0_1.as_bytes())
+                .to_hex()
+                .as_str(),
+            V0_1_SCHEMA_BLAKE3,
+            "the published v0.1 schema changed; that must be a new version"
+        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let mut seen = 0;
+        for dir in ["valid", "tampered"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|x| x != "json") {
+                    continue;
+                }
+                let Ok(value) =
+                    serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap())
+                else {
+                    continue;
+                };
+                if value["manifest_version"] == "0.2" {
+                    continue;
+                }
+                let original = validate_schema(&value).unwrap();
+                let r = verify_value(&value, None).unwrap();
+                assert_eq!(r.schema_valid, original.is_empty(), "{}", path.display());
+                assert_eq!(r.schema_errors, original, "{}", path.display());
+                assert!(
+                    r.claims.is_none(),
+                    "v0.1 shows no claims: {}",
+                    path.display()
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 5, "expected the v0.1 fixtures, saw {seen}");
     }
 }
