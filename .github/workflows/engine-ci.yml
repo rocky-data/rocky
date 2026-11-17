@@ -211,13 +211,36 @@ jobs:
       # examples — those carry no `#[test]` and are still type-checked by the
       # clippy job's `--all-targets`). Like the prior `cargo test --all-targets`
       # it does not run doctests; the workspace has none.
+      - name: Build tests (nextest)
+        timeout-minutes: 30
+        run: |
+          "$GITHUB_WORKSPACE"/.github/scripts/ci-memory-guard.sh &
+          guard=$!
+          trap 'kill "$guard" 2>/dev/null' EXIT
+          cargo nextest run --all-features --no-run
+          free -m
+          df -h /
       - name: Run tests (nextest)
         # --no-fail-fast: one flake used to cancel the remaining ~5000 tests,
         # so a red run reported a single failure and hid every unrelated one
         # behind "N tests were not run due to test failure" (#1405). Retries
         # are deliberately NOT added — they would bury a real intermittent
         # hang, which is the defect #1405 exists to keep visible.
-        run: cargo nextest run --all-features --no-fail-fast
+        #
+        # Build and run are separate steps (#2630). When the hosted runner
+        # dies, GitHub keeps no log, but the steps API still records which
+        # step was running. The memory guard prints memory, swap and load
+        # once a minute, and interrupts cargo before the runner runs out, so
+        # the step fails with its log kept.
+        timeout-minutes: 15
+        run: |
+          "$GITHUB_WORKSPACE"/.github/scripts/ci-memory-guard.sh &
+          guard=$!
+          trap 'kill "$guard" 2>/dev/null' EXIT
+          cargo nextest run --all-features --no-fail-fast
+      - name: Report kernel out-of-memory kills
+        if: failure()
+        run: sudo dmesg | grep -iE 'out of memory|oom-kill|killed process' || echo "no OOM kills in dmesg"
       # Without `ROCKY_TEST_VALKEY_URL` the live Valkey tests pass by skipping,
       # so the step above proves nothing about them. This step sets it and
       # runs only them (already built; nextest fails if the filter matches
