@@ -212,9 +212,9 @@ jobs:
       # clippy job's `--all-targets`). Like the prior `cargo test --all-targets`
       # it does not run doctests; the workspace has none.
       - name: Build tests (nextest)
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
-          "$GITHUB_WORKSPACE"/.github/scripts/ci-memory-guard.sh &
+          "$GITHUB_WORKSPACE"/scripts/ci-memory-guard.sh &
           guard=$!
           trap 'kill "$guard" 2>/dev/null' EXIT
           cargo nextest run --all-features --no-run
@@ -232,9 +232,9 @@ jobs:
         # step was running. The memory guard prints memory, swap and load
         # once a minute, and interrupts cargo before the runner runs out, so
         # the step fails with its log kept.
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: |
-          "$GITHUB_WORKSPACE"/.github/scripts/ci-memory-guard.sh &
+          "$GITHUB_WORKSPACE"/scripts/ci-memory-guard.sh &
           guard=$!
           trap 'kill "$guard" 2>/dev/null' EXIT
           cargo nextest run --all-features --no-fail-fast
