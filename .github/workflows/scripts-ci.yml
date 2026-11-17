@@ -50,6 +50,11 @@ jobs:
           persist-credentials: false
       - name: Run the verdict self-test
         run: python3 scripts/soak_verdict.py --self-test
+      - name: Soak scripts use no jq keyword the image's jq 1.6 rejects
+        # The soak image is debian:bookworm-slim (jq 1.6); this runner has jq
+        # 1.7, which accepts a keyword such as `$end` as a variable name. A
+        # `$end` made a clean 24 h soak on 1.93.0 report INCOMPLETE.
+        run: bash scripts/tests/soak-jq16-keywords.test.sh
 
   mutation-check-verdicts:
     name: Mutation-check verdicts
@@ -131,7 +136,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh scripts/soak-docker.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/attribution_gate.sh scripts/tests/attribution-gate.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/soak-docker.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/attribution_gate.sh scripts/tests/attribution-gate.test.sh scripts/tests/soak-jq16-keywords.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).
