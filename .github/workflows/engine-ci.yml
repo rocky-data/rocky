@@ -13,6 +13,10 @@ on:
       # run and the PR cannot merge at all (#1557).
       - '.claude/skills/rocky-ai-workflow/SKILL.md'
       - '.github/workflows/engine-ci.yml'
+      # The connectors the `connector-test` job runs: a change to one alone
+      # must still run that job.
+      - 'examples/playground/pocs/07-adapters/08-postgres-child-connector/**'
+      - 'examples/playground/pocs/07-adapters/12-meltano-connector-shim/**'
   # No `paths:` filter on pull_request — deliberately. Four required merge
   # contexts live in this workflow (Test, Clippy, Format, Adapter boundary).
   # A workflow-level path filter leaves those contexts ABSENT on a PR that
@@ -82,8 +86,9 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           # Mirrors the push trigger paths: engine/**, schemas/**, the skill
-          # compiled into the binary (#1557), and this workflow itself.
-          ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
+          # compiled into the binary (#1557), this workflow itself, and the
+          # two connector POCs the `connector-test` job runs.
+          ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$|examples/playground/pocs/07-adapters/(08-postgres-child-connector|12-meltano-connector-shim)/)
         run: |
           set -uo pipefail
           engine=true
@@ -436,8 +441,6 @@ jobs:
           test "$(curl -s -o /dev/null -w "%{http_code}" -H "Host: evil.example" http://127.0.0.1:18080/ui/)" = "421"
           kill "$server"
 
-  # The browser UI `rocky serve --ui` embeds: lint, typecheck, test, build,
-  # and hand `dist/` to the release-build smoke so the embedding compiles.
   # `rocky connector test` against the connectors that need no service and
   # no PyPI package: a fresh `rocky connector init` scaffold, the Postgres
   # reference connector in replay mode, and the Meltano shim against its
@@ -502,6 +505,8 @@ jobs:
         working-directory: examples/playground/pocs/07-adapters/12-meltano-connector-shim
         run: '"$GITHUB_WORKSPACE/engine/target/debug/rocky" -c rocky.toml connector test orders_tap --output table'
 
+  # The browser UI `rocky serve --ui` embeds: lint, typecheck, test, build,
+  # and hand `dist/` to the release-build smoke so the embedding compiles.
   ui:
     name: Browser UI
     needs: changes
