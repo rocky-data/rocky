@@ -644,7 +644,7 @@ rocky bench [group] [flags]
 | Argument or flag | Default | Description |
 |------|---------|-------------|
 | `group` | `all` | `compile`, `dag`, `sql_gen`, `startup` or `all`. `all` runs `compile`, `dag` and `sql_gen`, not `startup`. |
-| `--models <N>` | | Number of models to generate for the compile benchmarks. |
+| `--models <N>` | `100` | Number of models to generate for the compile benchmarks. |
 | `--format <FORMAT>` | `table` | `json` for machine-readable output. |
 | `--save <PATH>` | | Write the results to a JSON baseline file. |
 | `--compare <PATH>` | | Compare the results against a saved baseline file. |
@@ -653,6 +653,8 @@ rocky bench [group] [flags]
 rocky bench --save baseline.json
 rocky bench --compare baseline.json
 ```
+
+`rocky bench` refuses to report timings for a benchmark that fails. `compile` refuses when the generated project has a compile error. `startup` refuses when `cargo run -p rocky -- --version` fails. With `all`, the first refusal stops the run.
 
 ---
 
