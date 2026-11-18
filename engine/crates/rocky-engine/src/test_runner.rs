@@ -187,8 +187,26 @@ pub fn source_schemas_from_db(
                 nullable,
             });
     }
+    // DuckDB resolves a bare name (`FROM orders`) to its default schema,
+    // `main`, so a model that reads a seed table without a schema prefix is
+    // typed from it too (#2657). A table only in another schema gets no bare
+    // key: DuckDB would not resolve the bare name to it.
+    let bare: Vec<(String, Vec<TypedColumn>)> = by_table
+        .iter()
+        .filter_map(|(key, columns)| {
+            let table = key.strip_prefix(DUCKDB_DEFAULT_SCHEMA)?;
+            Some((table.to_string(), columns.clone()))
+        })
+        .collect();
+    for (table, columns) in bare {
+        by_table.entry(table).or_insert(columns);
+    }
     Ok(by_table)
 }
+
+/// The prefix of a key in DuckDB's default schema, which a bare table name
+/// resolves to.
+const DUCKDB_DEFAULT_SCHEMA: &str = "main.";
 
 /// Run tests on a project.
 ///
@@ -849,6 +867,32 @@ fn ordered_mismatches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2657: a table in DuckDB's default schema is also keyed by its bare
+    /// name, as DuckDB resolves `FROM orders`; one only in another schema is not.
+    #[test]
+    fn a_default_schema_table_is_also_keyed_by_its_bare_name() {
+        let db = DuckDbConnector::in_memory().expect("db");
+        db.execute_statement(
+            "CREATE TABLE orders (id INTEGER NOT NULL); \
+             CREATE SCHEMA raw; CREATE TABLE raw.orders (other VARCHAR); \
+             CREATE TABLE raw.events (id INTEGER)",
+        )
+        .expect("seed");
+        let schemas = source_schemas_from_db(&db).expect("schemas");
+        let bare = schemas.get("orders").expect("bare key for main.orders");
+        assert_eq!(
+            bare[0].name, "id",
+            "the bare name is main's table: {bare:?}"
+        );
+        assert!(!bare[0].nullable);
+        assert!(schemas.contains_key("main.orders"));
+        assert!(schemas.contains_key("raw.orders"));
+        assert!(
+            !schemas.contains_key("events"),
+            "raw.events gets no bare key"
+        );
+    }
 
     /// Test helper: [`run_tests_with`] on `models_dir` with default extension
     /// options. Lives here so production code cannot reach DuckDB's autoinstall.
