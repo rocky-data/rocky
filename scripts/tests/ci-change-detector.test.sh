@@ -303,7 +303,9 @@ run_suite() {
 }
 
 run_suite engine-ci.yml      ENGINE_PATHS_RE  engine  engine \
-    .claude/skills/rocky-ai-workflow/SKILL.md
+    .claude/skills/rocky-ai-workflow/SKILL.md \
+    examples/playground/pocs/07-adapters/08-postgres-child-connector/connector/main.py \
+    examples/playground/pocs/07-adapters/12-meltano-connector-shim/replay/replay-meltano.py
 # The four generator pins are listed explicitly: they are the paths #1587 was
 # filed about, and a regex that watches the generated OUTPUT but not the tool
 # that writes it reads as covered while a dependabot bump skips the check.
