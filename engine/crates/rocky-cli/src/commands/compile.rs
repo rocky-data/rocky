@@ -1581,6 +1581,19 @@ fn merge_default_seed_schemas(
                 if schemas.contains_key(&key) {
                     continue;
                 }
+                // A bare seed key stands for `main.<key>` (#2657). When a
+                // higher tier (the schema cache) already typed `main.<key>`,
+                // the bare read takes those types and that origin, so the two
+                // spellings of one table never disagree.
+                if !key.contains('.')
+                    && let Some(qualified) = schemas.get(&format!("main.{key}")).cloned()
+                {
+                    if let Some(origin) = provenance.origins.get(&format!("main.{key}")).cloned() {
+                        provenance.origins.insert(key.clone(), origin);
+                    }
+                    schemas.insert(key, qualified);
+                    continue;
+                }
                 provenance
                     .origins
                     .insert(key.clone(), SourceSchemaOrigin::Seed);
@@ -3673,6 +3686,36 @@ schema_template = "s"
             .map(|d| (d.model.as_str(), &*d.code))
             .collect();
         assert!(codes.is_empty(), "{:?}", whole.diagnostics);
+    }
+
+    /// #2657 red team: when the schema cache already typed `main.orders`, the
+    /// bare seed key `orders` takes the cache's columns and origin, not the
+    /// seed's, so `FROM orders` and `FROM main.orders` agree.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn a_bare_seed_key_follows_the_cached_qualified_table() {
+        let dir = TempDir::new().unwrap();
+        write_seed(
+            dir.path(),
+            "CREATE TABLE orders (order_id INTEGER NOT NULL);\n",
+        );
+        let cached = vec![TypedColumn {
+            name: "order_id".to_string(),
+            data_type: rocky_compiler::types::RockyType::Int32,
+            nullable: true,
+        }];
+        let mut schemas = HashMap::from([("main.orders".to_string(), cached.clone())]);
+        let origin = SourceSchemaOrigin::Cache {
+            cached_at: chrono::Utc::now(),
+            trusted: true,
+        };
+        let mut provenance = SourceProvenance::default();
+        provenance.origins.insert("main.orders".to_string(), origin);
+
+        merge_default_seed_schemas(dir.path(), None, &mut schemas, &mut provenance);
+
+        assert_eq!(schemas.get("orders"), Some(&cached), "{schemas:?}");
+        assert_eq!(provenance.origins.get("orders"), Some(&origin));
     }
 
     /// With no `--with-seed`, a project's `data/seed.sql` still types the
