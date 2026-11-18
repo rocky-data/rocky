@@ -128,12 +128,15 @@ pub enum ReadTarget {
 pub enum NamedRead {
     /// The read binds to the model of that name.
     ThatModel,
-    /// The read reaches a table of that name no model of the project is
-    /// bound to: the source table the model's name shadows.
+    /// The read binds to no model: it reaches the table of that name, typed
+    /// from the source schema the model's name shadows.
     Source,
-    /// The read binds to another model, one that writes a table of that
-    /// name. Its type is unknown until reads are typed through the model
-    /// they bind to.
+    /// `resolve.rs` binds the read to another model, one that writes a table
+    /// of that name. That binding ignores the schema, and the run reads the
+    /// connection's default schema: the read reaches that model's table if it
+    /// writes the default schema, and the source table otherwise. The
+    /// compiler cannot tell which, so the read's type is unknown (`D012`
+    /// names the read).
     OtherModel,
     /// A `WITH` name of the reader's query. A walker that matches `WITH`
     /// names in another case than lineage does can ask about one; it is not
@@ -474,6 +477,11 @@ pub fn build_semantic_graph(
 
     // Every model a bare read could bind to (#1354), for `reads` (#2674).
     let bare_reads = crate::resolve::BareReadIndex::new(&project.models);
+    let model_names: std::collections::HashSet<&str> = project
+        .models
+        .iter()
+        .map(|m| m.config.name.as_str())
+        .collect();
 
     // Process models in topological order
     for model_name in &project.execution_order {
@@ -543,6 +551,17 @@ pub fn build_semantic_graph(
                 .entry(rocky_core::physical_edges::fold_identifier(&cte.name))
                 .or_insert(ReadTarget::Local);
         }
+        // Whether this model's read of `name`, a model's name, binds to another
+        // model. Which table it reaches depends on the schema that model
+        // writes (see `NamedRead::OtherModel`), so a star over it stays
+        // unexpanded: neither that model's columns nor the source's (#2674).
+        let star_reads_other_model = |name: &str| {
+            model_names.contains(name)
+                && matches!(
+                    reads.get(&rocky_core::physical_edges::fold_identifier(name)),
+                    Some(ReadTarget::Model(m)) if m != name
+                )
+        };
         // Whether this model's star over `name` reads the model of that name.
         let star_reads_model = |name: &str| {
             reads.get(&rocky_core::physical_edges::fold_identifier(name))
@@ -705,7 +724,10 @@ pub fn build_semantic_graph(
                                 .iter()
                                 .map(|c| c.name.as_str())
                                 .collect()
-                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
+                        } else if let Some(source_cols) = source_schemas
+                            .get(inner_name.as_str())
+                            .filter(|_| !star_reads_other_model(inner_name))
+                        {
                             source_cols.iter().map(|c| c.name.as_str()).collect()
                         } else {
                             star_unresolved = true;
@@ -850,7 +872,10 @@ pub fn build_semantic_graph(
                                     });
                                 }
                             }
-                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
+                        } else if let Some(source_cols) = source_schemas
+                            .get(inner_name.as_str())
+                            .filter(|_| !star_reads_other_model(inner_name))
+                        {
                             for col in source_cols {
                                 if via.column(&col.name) == StarColumn::Excluded {
                                     continue;
@@ -863,7 +888,10 @@ pub fn build_semantic_graph(
                             }
                         }
                     }
-                } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
+                } else if let Some(source_cols) = source_schemas
+                    .get(table_name.as_str())
+                    .filter(|_| !star_reads_other_model(table_name))
+                {
                     // External source with known schema
                     for col in source_cols {
                         let effect = rel.column(&col.name);

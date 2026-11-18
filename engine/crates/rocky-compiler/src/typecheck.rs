@@ -196,8 +196,8 @@ impl<'a> Relations<'a> {
 
     /// The columns of upstream model `upstream` as `reader` reads it: the
     /// model's, unless `reader`'s bare read of that name reaches the source
-    /// table, or another model (then nothing). A declared model the SQL
-    /// never reads bare keeps its columns, as before.
+    /// table. A declared model the SQL never reads bare keeps its columns,
+    /// as before.
     pub(crate) fn upstream(&self, reader: &str, upstream: &str) -> Option<&'a [TypedColumn]> {
         let read = self
             .graph
@@ -4763,7 +4763,7 @@ pub(crate) fn infer_query_types(
 ) -> Result<SelectInference, String> {
     // Each CTE keeps which of its columns are exact, so an outer expression
     // over one is exact only when the CTE's expression is (#2320).
-    let mut ctes: HashMap<String, (Vec<TypedColumn>, HashSet<usize>)> = HashMap::new();
+    let mut ctes: WithNames<(Vec<TypedColumn>, HashSet<usize>)> = WithNames::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let inferred = {
@@ -4781,12 +4781,7 @@ pub(crate) fn infer_query_types(
             };
             let mut columns = inferred.columns;
             rename_relation_columns(&mut columns, &cte.alias);
-            // A `WITH` name hides a table in any case in its scope, as on
-            // DuckDB, and as lineage binds it (#2674).
-            ctes.insert(
-                rocky_core::physical_edges::fold_identifier(&cte.alias.name.value),
-                (columns, inferred.relation_inexact),
-            );
+            ctes.insert(&cte.alias.name, (columns, inferred.relation_inexact));
         }
     }
     let lookup = |name: &str| cte_relation(&ctes, name).or_else(|| (env.lookup)(name));
@@ -4800,14 +4795,56 @@ pub(crate) fn infer_query_types(
 }
 
 fn cte_relation<'c>(
-    ctes: &'c HashMap<String, (Vec<TypedColumn>, HashSet<usize>)>,
+    ctes: &'c WithNames<(Vec<TypedColumn>, HashSet<usize>)>,
     name: &str,
 ) -> Option<RelationRef<'c>> {
-    ctes.get(&rocky_core::physical_edges::fold_identifier(name))
-        .map(|(columns, inexact)| RelationRef {
-            columns,
-            inexact: Some(inexact),
-        })
+    ctes.get(name).map(|(columns, inexact)| RelationRef {
+        columns,
+        inexact: Some(inexact),
+    })
+}
+
+/// The `WITH` names in scope of one query, and what each holds (#2674).
+///
+/// A read matches a `WITH` name spelled exactly as written. It also matches
+/// one that differs only in case when both are unquoted: every warehouse
+/// folds two unquoted names the same way (DuckDB and PostgreSQL to lower
+/// case, Snowflake to upper case), so `WITH Orders AS (...) ... FROM orders`
+/// reads the CTE everywhere. A quoted name keeps its case on some warehouses
+/// and not on others, so it matches only exactly, as before (#2696).
+pub(crate) struct WithNames<V> {
+    entries: Vec<(String, bool, V)>,
+}
+
+impl<V> WithNames<V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Bring the `WITH` name `alias` into scope; a later one of the same
+    /// name hides an earlier one.
+    pub(crate) fn insert(&mut self, alias: &ast::Ident, value: V) {
+        self.entries
+            .push((alias.value.clone(), alias.quote_style.is_some(), value));
+    }
+
+    /// What the read spelled `name` (as SQL text) reaches among these
+    /// `WITH` names, if any.
+    pub(crate) fn get(&self, name: &str) -> Option<&V> {
+        if let Some((_, _, value)) = self.entries.iter().rev().find(|(n, ..)| n == name) {
+            return Some(value);
+        }
+        if name.starts_with(['"', '`', '[']) || name.contains('.') {
+            return None;
+        }
+        self.entries
+            .iter()
+            .rev()
+            .find(|(n, quoted, _)| !quoted && n.eq_ignore_ascii_case(name))
+            .map(|(_, _, value)| value)
+    }
 }
 
 /// Infer the output columns of one query body: a `SELECT`, a parenthesised

@@ -631,15 +631,12 @@ fn walk_query<'a>(
     lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
     ctx: &mut Ctx<'_>,
 ) {
-    let mut ctes: std::collections::HashMap<String, Vec<TypedColumn>> =
-        std::collections::HashMap::new();
+    let mut ctes: crate::typecheck::WithNames<Vec<TypedColumn>> =
+        crate::typecheck::WithNames::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let cte_lookup = |name: &str| {
-                ctes.get(&rocky_core::physical_edges::fold_identifier(name))
-                    .map(Vec::as_slice)
-                    .or_else(|| lookup(name))
-            };
+            let cte_lookup =
+                |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
             walk_query(&cte.query, &cte_lookup, ctx);
             let relation = |name: &str| cte_lookup(name).map(RelationRef::from);
             let env = InferEnv {
@@ -650,19 +647,10 @@ fn walk_query<'a>(
                 .unwrap_or_default()
                 .columns;
             rename_relation_columns(&mut columns, &cte.alias);
-            // A `WITH` name hides a table in any case in its scope, as on
-            // DuckDB, and as lineage binds it (#2674).
-            ctes.insert(
-                rocky_core::physical_edges::fold_identifier(&cte.alias.name.value),
-                columns,
-            );
+            ctes.insert(&cte.alias.name, columns);
         }
     }
-    let lookup = |name: &str| {
-        ctes.get(&rocky_core::physical_edges::fold_identifier(name))
-            .map(Vec::as_slice)
-            .or_else(|| lookup(name))
-    };
+    let lookup = |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
     walk_set_expr(&query.body, &lookup, ctx);
 }
 
@@ -1236,14 +1224,15 @@ mod tests {
     /// #2674: which relation a `WITH` name hides, case by case, as DuckDB
     /// binds it. The CTE's `status` is VARCHAR and the table's is BIGINT, so
     /// DuckDB refuses `SUM(status)` exactly when the read reaches the CTE.
-    /// Rocky refuses (`E042`) in the same cases.
+    /// With unquoted names, Rocky refuses (`E042`) in the same cases. With a
+    /// quoted name on either side, the match depends on the warehouse
+    /// (Snowflake keeps a quoted name's case), so Rocky matches it exactly,
+    /// as before #2674 (#2696).
     fn a_with_name_hides_the_table_exactly_where_duckdb_says() {
         const CTE: &str = "SELECT 'x' AS status";
         let cases = [
-            // In scope, any case and quoting: the CTE.
+            // In scope, unquoted, any case: the CTE.
             format!("WITH Orders AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
-            format!("WITH \"Orders\" AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
-            format!("WITH Orders AS ({CTE}) SELECT SUM(status) AS t FROM \"orders\""),
             format!(
                 "WITH a AS (SELECT status AS s FROM orders), Orders AS ({CTE}) \
                  SELECT SUM(o.status) AS t FROM a CROSS JOIN orders o"
@@ -1290,7 +1279,35 @@ mod tests {
             refused += usize::from(duckdb_refuses);
         }
         // Both outcomes are exercised.
-        assert_eq!(refused, 4);
+        assert_eq!(refused, 2);
+
+        // Quoted on one side: DuckDB reads the CTE, Snowflake the table.
+        // Rocky does not guess: the `WITH` name does not match, and the
+        // read binding lists the name as a `WITH` name, so the read is
+        // Unknown and nothing is refused.
+        for sql in [
+            format!("WITH \"Orders\" AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
+            format!("WITH Orders AS ({CTE}) SELECT SUM(status) AS t FROM \"orders\""),
+        ] {
+            assert!(conn.prepare(&sql).is_err(), "DuckDB reads the CTE: {sql}");
+            let mut source_schemas = sources();
+            source_schemas.insert("orders".to_string(), vec![col("status", RockyType::Int64)]);
+            let config = crate::compile::CompilerConfig {
+                source_schemas,
+                ..Default::default()
+            };
+            let result =
+                crate::compile::compile_preloaded_models(vec![model("reader", &sql)], &config)
+                    .expect("compile");
+            let diags = check_operand_types(
+                &result.project.models,
+                &result.semantic_graph,
+                &result.type_check.typed_models,
+                &result.type_check.shadowed_sources,
+                Some(OperandDialect::DuckDb),
+            );
+            assert!(!codes(&diags).contains(&"E042"), "{sql}: {diags:?}");
+        }
     }
 
     #[test]

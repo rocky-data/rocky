@@ -103,6 +103,7 @@ fn rocky_type(duckdb_type: &str) -> rocky_ir::RockyType {
         "BIGINT" => rocky_ir::RockyType::Int64,
         "INTEGER" => rocky_ir::RockyType::Int32,
         "VARCHAR" => rocky_ir::RockyType::String,
+        "DOUBLE" => rocky_ir::RockyType::Float64,
         other => panic!("unmapped DuckDB type {other}"),
     }
 }
@@ -190,6 +191,172 @@ fn a_read_of_a_shadowed_source_is_typed_as_the_run_builds_it() {
         if reader == "star" {
             let names: Vec<&str> = built.iter().map(|(c, ..)| c.as_str()).collect();
             assert_eq!(names, ["id", "extra"]);
+        }
+    }
+}
+
+/// Which schema model `w` writes the table `orders` to, if `w` exists.
+#[derive(Clone, Copy, Debug)]
+enum Writer {
+    None,
+    DefaultSchema,
+    OtherSchema,
+}
+
+/// #2674: the six cells of a bare `orders` read, against what DuckDB built.
+///
+/// Model `orders` writes `orders_v2`. Model `w` writes a table `orders` in
+/// the default schema `main`, in `staging`, or does not exist; a source table
+/// `main.orders` exists or does not. `rc` reads `SELECT id FROM orders` and
+/// `rs` reads `SELECT *`, both declaring `depends_on = ["orders"]`.
+///
+/// - No writer, source: the run reads the source, and Rocky types the reads
+///   from it (the #2674 bug: before, it took model `orders`' VARCHAR).
+/// - A writer: `resolve.rs` binds the read to `w` by table name, ignoring the
+///   schema. The run reads `w`'s table when `w` writes `main`, and the source
+///   when `w` writes `staging`. Rocky cannot tell which, so it claims no type
+///   and no star columns.
+/// - No source and no table in `main`: the run fails, and Rocky claims none.
+///
+/// In every cell, a type Rocky claims is the type DuckDB built.
+#[test]
+fn every_writer_and_source_cell_is_typed_as_the_run_builds_it_or_not_at_all() {
+    use rocky_ir::RockyType;
+    for writer in [Writer::None, Writer::DefaultSchema, Writer::OtherSchema] {
+        for source in [true, false] {
+            let cell = format!("writer={writer:?} source={source}");
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            fs::write(
+                root.join("rocky.toml"),
+                "[adapter.wh]\ntype = \"duckdb\"\npath = \"warehouse.duckdb\"\n\
+                 [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 [pipeline.main.target]\nadapter = \"wh\"\n\
+                 [pipeline.main.target.governance]\nauto_create_schemas = true\n",
+            )
+            .unwrap();
+            fs::create_dir_all(root.join("data")).unwrap();
+            let seed = if source {
+                SOURCE_DDL
+            } else {
+                "CREATE TABLE unrelated (x INTEGER);"
+            };
+            fs::write(root.join("data/seed.sql"), seed).unwrap();
+            let models = root.join("models");
+            fs::create_dir_all(&models).unwrap();
+            write_model(
+                &models,
+                "orders",
+                "SELECT CAST('x' AS VARCHAR) AS id",
+                "orders_v2",
+                "",
+            );
+            let schema = match writer {
+                Writer::None => None,
+                Writer::DefaultSchema => Some("main"),
+                Writer::OtherSchema => Some("staging"),
+            };
+            if let Some(schema) = schema {
+                fs::write(
+                    models.join("w.sql"),
+                    "SELECT CAST(2.5 AS DOUBLE) AS id, CAST('w' AS VARCHAR) AS wcol",
+                )
+                .unwrap();
+                fs::write(
+                    models.join("w.toml"),
+                    format!(
+                        "name = \"w\"\n[strategy]\ntype = \"full_refresh\"\n\
+                         [target]\ncatalog = \"warehouse\"\nschema = \"{schema}\"\n\
+                         table = \"orders\"\n"
+                    ),
+                )
+                .unwrap();
+            }
+            let depends = "depends_on = [\"orders\"]\n";
+            write_model(&models, "rc", "SELECT id FROM orders", "rc", depends);
+            write_model(&models, "rs", "SELECT * FROM orders", "rs", depends);
+            {
+                let conn = duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
+                if source {
+                    conn.execute_batch(&format!(
+                        "{SOURCE_DDL} INSERT INTO orders VALUES (1, 'e');"
+                    ))
+                    .unwrap();
+                }
+            }
+
+            let run = rocky(root, &["--output", "json", "run", "--pipeline", "main"]);
+            let publish = rocky(
+                root,
+                &[
+                    "publish-ir",
+                    "--models",
+                    "models",
+                    "--with-seed",
+                    "--out",
+                    "snapshot.json",
+                ],
+            );
+            assert!(publish.status.success(), "{cell}: {}", text(&publish));
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(root.join("snapshot.json")).unwrap())
+                    .unwrap();
+            let ir: rocky_ir::ProjectIr = serde_json::from_value(snapshot["ir"].clone()).unwrap();
+            let typed = |name: &str| {
+                ir.models
+                    .iter()
+                    .find(|m| &*m.name == name)
+                    .unwrap_or_else(|| panic!("{cell}: {name} is in the IR"))
+                    .typed_columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let (rc, rs) = (typed("rc"), typed("rs"));
+
+            // The table the run reads exists unless there is no source and
+            // no table `orders` in `main`.
+            let reachable = source || matches!(writer, Writer::DefaultSchema);
+            assert_eq!(run.status.success(), reachable, "{cell}: {}", text(&run));
+            if reachable {
+                let conn = duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
+                for (reader, claimed) in [("rc", &rc), ("rs", &rs)] {
+                    let built = describe(&conn, reader);
+                    for (column, rocky_ty) in claimed.iter() {
+                        if *rocky_ty == RockyType::Unknown {
+                            continue;
+                        }
+                        let (_, duckdb_ty, _) = built
+                            .iter()
+                            .find(|(c, ..)| c == column)
+                            .unwrap_or_else(|| panic!("{cell}: {reader}.{column} not built"));
+                        assert_eq!(
+                            *rocky_ty,
+                            rocky_type(duckdb_ty),
+                            "{cell}: {reader}.{column}"
+                        );
+                    }
+                }
+            }
+
+            let unknown_id = vec![("id".to_string(), RockyType::Unknown)];
+            match (writer, source) {
+                (Writer::None, true) => {
+                    assert_eq!(rc, vec![("id".to_string(), RockyType::Int64)], "{cell}");
+                    assert_eq!(
+                        rs,
+                        vec![
+                            ("id".to_string(), RockyType::Int64),
+                            ("extra".to_string(), RockyType::String),
+                        ],
+                        "{cell}"
+                    );
+                }
+                _ => {
+                    assert_eq!(rc, unknown_id, "{cell}");
+                    assert!(rs.is_empty(), "{cell}: {rs:?}");
+                }
+            }
         }
     }
 }
