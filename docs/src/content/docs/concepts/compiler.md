@@ -272,15 +272,34 @@ SELECT coalesce(order_date, status) AS d FROM orders
 
 - `E068` checks the number of arguments of a DuckDB built-in.
 - `E069` checks a column argument against the types each position of the
-  function takes. Only a column whose type Rocky read from the SQL is checked.
-  A literal, `NULL` or computed argument is not, because DuckDB converts
-  literals. Aggregates that `E042` checks are left to it.
+  function takes. A literal, `NULL` or computed argument is not checked,
+  because DuckDB converts literals. Aggregates that `E042` checks are left to
+  it.
 - `E070` checks `CASE` and `COALESCE` when every branch is a column or `NULL`.
   Numbers and booleans form one group, text another, and dates and timestamps
   a third. Two branches from different groups are refused. A literal or
   computed branch can change the type DuckDB picks, so a list with one is not
   checked. Within a group, DuckDB's result can depend on the branch order, so
   that is not checked either.
+
+`E069` and `E070` judge a column only when a source schema gives its type:
+a column of a source table, or a CTE or derived-table column that passes one
+through unchanged or casts it. A column of another model in the project is
+not judged. Its type is Rocky's own inference, not DuckDB's answer.
+
+Whether the finding is an error depends on where the source schema came
+from:
+
+| Source schema | Finding |
+|---|---|
+| The seed file (`data/seed.sql`, run in DuckDB) | `E069` / `E070` (error) |
+| Read from the warehouse during this run | `E069` / `E070` (error) |
+| A schema-cache entry younger than `[cache.schemas] trusted_max_age_seconds` | `E069` / `E070` (error) |
+| An older cache entry, or a schema of unknown origin | `W069` / `W070` (warning) |
+
+The cache test is the one `E041` uses. The editor reads only the schema
+cache with no record of its age, so it shows the warnings. A model that reads
+several sources gets the warning when any one of them is not current.
 
 Rocky does not guess these rules. A test probes the bundled DuckDB 2.0 and
 writes them to `engine/crates/rocky-compiler/src/data/duckdb_signatures.txt`.
@@ -298,9 +317,10 @@ These are not reported:
 
 - The same calls as for `E057`: schema-qualified, quoted, declared in
   `functions/`, or a rewritten form.
-- A call to a macro or function the project's `data/seed.sql` creates
-  (`CREATE [OR REPLACE] [TEMP] MACRO` or `FUNCTION`), even when it reuses a
-  built-in name. `E057` skips these too.
+- A call to a macro or function the project's `data/seed.sql` creates, even
+  when it reuses a built-in name. Rocky reads the names from the DuckDB that
+  ran the seed (`duckdb_functions()`), not from the seed's text. `E057` skips
+  these too, but only on DuckDB: the seed does not run on other warehouses.
 - A call with named arguments (`name := value` too), `*`, `DISTINCT`,
   `ORDER BY` inside the parentheses, a lambda, an argument that expands to
   several (`UNPACK(COLUMNS(...))`), `FILTER`, `WITHIN GROUP` or `OVER`.
@@ -310,10 +330,8 @@ These are not reported:
   list has `* REPLACE (...)` or `COLUMNS(...)`, no bare name in `HAVING` is
   checked, since either can give a column's name to another expression.
 - A column whose type is a guess: `AVG` over a column of a table with no
-  known schema is typed `DOUBLE` only so a contract on it is checked. This
-  holds in a CTE and in a downstream model.
-- A top-n `max(x, n)` or `min(x, n)`, which returns a list. Its column is
-  typed `Unknown`.
+  known schema is typed `DOUBLE` only so a contract on it is checked.
+- A top-n `max(x, n)` or `min(x, n)`, which returns a list.
 - A `CASE` whose text literal fails to convert only for some rows, as in
   `CASE WHEN qty > 1 THEN 'many' ELSE qty END`. DuckDB accepts this query and
   fails only when a row reaches the text branch.
@@ -737,6 +755,8 @@ span, and sometimes a suggested fix.
 | `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
+| `W069` | `E069`'s finding when the column's source schema is a schema-cache entry older than `[cache.schemas] trusted_max_age_seconds`, or of unknown origin. See [Calls and branches DuckDB refuses](#calls-and-branches-duckdb-refuses) |
+| `W070` | `E070`'s finding on the same terms as `W069` |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |

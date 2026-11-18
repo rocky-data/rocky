@@ -290,31 +290,10 @@ pub fn check_unknown_functions(
     check_unknown_functions_with(models, registry, &HashSet::new(), target_for, written_for)
 }
 
-/// The lower-case names of the macros and functions a DuckDB seed file
-/// creates: `CREATE [OR REPLACE] [TEMP | TEMPORARY] MACRO | FUNCTION [IF NOT
-/// EXISTS] [schema.]name`. Comments are skipped. A call to one of these is
-/// the project's own function, not the built-in it may shadow.
-pub fn seed_function_names(seed_sql: &str) -> HashSet<String> {
-    static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r#"(?i)\bcreate\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:macro|function)\s+(?:if\s+not\s+exists\s+)?((?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)*(?:"[^"]+"|[a-z_][a-z0-9_$]*))"#,
-        )
-        .expect("valid regex")
-    });
-    static COMMENT: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?s)--[^\n]*|/\*.*?\*/").expect("valid regex"));
-    let text = COMMENT.replace_all(seed_sql, " ");
-    CREATE
-        .captures_iter(&text)
-        .filter_map(|c| c.get(1))
-        .filter_map(|m| m.as_str().rsplit('.').next().map(str::trim))
-        .map(|name| name.trim_matches('"').to_ascii_lowercase())
-        .collect()
-}
-
-/// [`check_unknown_functions`], skipping calls to `seed_names`: the
-/// functions and macros the project's seed file creates
-/// ([`seed_function_names`]).
+/// [`check_unknown_functions`], skipping DuckDB's verdict on calls to
+/// `seed_names`: the lower-case names of the functions and macros the
+/// project's seed file creates. The seed runs only in DuckDB, so another
+/// warehouse still judges the call.
 pub fn check_unknown_functions_with(
     models: &[rocky_core::models::Model],
     registry: &FunctionRegistry,
@@ -366,7 +345,6 @@ fn check_model(
     };
     let mut visitor = Calls {
         registry,
-        seed_names,
         found: Vec::new(),
     };
     let _ = statements.visit(&mut visitor);
@@ -390,6 +368,9 @@ fn check_model(
         let mut seen = HashSet::new();
         for (name, line, col, count) in &visitor.found {
             let lower = name.to_ascii_lowercase();
+            if dialect == FunctionDialect::DuckDb && seed_names.contains(&lower) {
+                continue;
+            }
             if dialect.knows(&lower) {
                 if dialect == FunctionDialect::DuckDb
                     && let Some(count) = *count
@@ -514,8 +495,6 @@ fn suggestion(name: &str, dialect: FunctionDialect) -> String {
 
 struct Calls<'r> {
     registry: &'r FunctionRegistry,
-    /// Functions and macros the project's seed file creates.
-    seed_names: &'r HashSet<String>,
     /// Unqualified, unquoted calls the project does not declare:
     /// `(name as written, line, column, argument count)`. The count is
     /// `None` when the call's arguments are not a plain list
@@ -572,7 +551,6 @@ impl Visitor for Calls<'_> {
             && let [ast::ObjectNamePart::Identifier(ident)] = function.name.0.as_slice()
             && ident.quote_style.is_none()
             && !self.registry.declares(&ident.value.to_ascii_lowercase())
-            && !self.seed_names.contains(&ident.value.to_ascii_lowercase())
         {
             let span = expr.span();
             self.found.push((
@@ -734,34 +712,28 @@ mod tests {
     /// project's: a call to one is not judged against DuckDB's built-ins.
     #[test]
     fn a_seed_file_macro_is_not_judged() {
-        let seed = "-- set up\n\
-                    CREATE MACRO lower(a, b) AS concat(a, b);\n\
-                    create or replace temp macro my_macro(x) as x + 1;\n\
-                    CREATE TEMPORARY FUNCTION main.\"Shout\"(s) AS upper(s);\n\
-                    CREATE MACRO IF NOT EXISTS keep(x) AS x;\n\
-                    /* CREATE MACRO abs(a, b) AS a */\n\
-                    CREATE TABLE t (a INT);";
-        let names = seed_function_names(seed);
-        let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
-        sorted.sort_unstable();
-        assert_eq!(sorted, ["keep", "lower", "my_macro", "shout"]);
-        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
+        let names: HashSet<String> = ["lower", "my_macro"].map(String::from).into();
         let registry = FunctionRegistry::default();
-        let judged = |sql: &str| {
+        let judged = |sql: &str, dialect: OperandDialect| {
+            let target = OperandTarget::from(Some(dialect));
             check_unknown_functions_with(
                 &[model("m", sql)],
                 &registry,
                 &names,
-                &|_| duckdb.clone(),
+                &|_| target.clone(),
                 None,
             )
         };
-        assert!(judged("select lower(a, b) from t").is_empty());
-        assert!(judged("select my_macro(a) from t").is_empty());
+        let duckdb = OperandDialect::DuckDb;
+        assert!(judged("select lower(a, b) from t", duckdb).is_empty());
+        assert!(judged("select my_macro(a) from t", duckdb).is_empty());
         // A name the seed does not create is still judged.
-        assert_eq!(judged("select upper(a, b) from t").len(), 1);
-        // The commented-out macro creates nothing.
-        assert_eq!(judged("select abs(a, b) from t").len(), 1);
+        assert_eq!(judged("select upper(a, b) from t", duckdb).len(), 1);
+        // The seed runs only in DuckDB: another warehouse still judges it.
+        assert_eq!(
+            judged("select my_macro(a) from t", OperandDialect::Snowflake).len(),
+            1
+        );
     }
 
     fn registry_with(name: &str) -> FunctionRegistry {

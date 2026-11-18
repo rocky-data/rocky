@@ -123,9 +123,12 @@ use indexmap::IndexMap;
 use sqlparser::ast::{self, Expr, SetExpr, Spanned, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E042, E043, E069, E070, SourceSpan, W042, W043};
+use crate::diagnostic::{
+    Diagnostic, E042, E043, E069, E070, Severity, SourceSpan, W042, W043, W069, W070,
+};
 use crate::duckdb_signatures::{self, ArgClass};
 use crate::semantic::SemanticGraph;
+use crate::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use crate::typecheck::{
     InferEnv, RelationRef, TypeScope, has_exact_type, infer_expr_type, infer_query_types,
     rename_relation_columns, select_type_scope,
@@ -487,43 +490,101 @@ pub fn check_operand_types_per_model(
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
     target_for: &dyn Fn(&str) -> OperandTarget,
 ) -> Vec<Diagnostic> {
-    check_operand_types_with(models, graph, typed_models, &HashSet::new(), target_for)
+    check_operand_types_with(
+        models,
+        graph,
+        typed_models,
+        &SourceProvenance::default(),
+        &HashSet::new(),
+        target_for,
+    )
 }
 
-/// [`check_operand_types_per_model`], with the functions and macros the
-/// project's seed file creates: a call to one is not judged against DuckDB's
-/// built-ins (E069).
+/// [`check_operand_types_per_model`], with what proves a column's type to
+/// E069 / E070.
+///
+/// Only a source schema does. A project model's columns are Rocky's own
+/// inference, which is not DuckDB's answer, so they are never judged. A
+/// source type gives the error only when `provenance` says it is current: a
+/// seed, a live read, or a schema-cache entry within `[cache.schemas]
+/// trusted_max_age_seconds` (the staleness test E041 uses). Otherwise a model
+/// gets W069 / W070. `seed_names` are the functions and macros the project's
+/// seed file creates: a call to one is not judged against DuckDB's built-ins.
 pub fn check_operand_types_with(
     models: &[rocky_core::models::Model],
     graph: &SemanticGraph,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    provenance: &SourceProvenance,
     seed_names: &HashSet<String>,
     target_for: &dyn Fn(&str) -> OperandTarget,
 ) -> Vec<Diagnostic> {
+    // Every column of a project model is a guess to E069 / E070.
+    let model_columns: std::collections::HashMap<&str, HashSet<usize>> = models
+        .iter()
+        .filter_map(|model| {
+            let name = model.config.name.as_str();
+            let columns = typed_models.get(name)?;
+            Some((name, (0..columns.len()).collect()))
+        })
+        .collect();
+    let evidence = Evidence {
+        typed_models,
+        model_columns: &model_columns,
+        provenance,
+    };
     let mut diagnostics = Vec::new();
-    let guesses = model_guesses(models, typed_models, target_for);
     for model in models {
         let target = target_for(&model.config.name);
-        diagnostics.extend(check_model(
-            model,
-            graph,
-            typed_models,
-            &guesses,
-            seed_names,
-            target,
-        ));
+        diagnostics.extend(check_model(model, graph, &evidence, seed_names, target));
     }
     diagnostics
+}
+
+/// What [`check_model`] reads a relation's columns from, and what proves
+/// their types.
+struct Evidence<'e> {
+    typed_models: &'e IndexMap<String, Vec<TypedColumn>>,
+    model_columns: &'e std::collections::HashMap<&'e str, HashSet<usize>>,
+    provenance: &'e SourceProvenance,
+}
+
+/// Whether a source schema of this origin is current enough to make E069 /
+/// E070 an error: a seed is DuckDB's own answer, a live read is the
+/// warehouse's, and a cache entry must pass the E041 staleness test.
+fn proves_types(origin: &SourceSchemaOrigin) -> bool {
+    match origin {
+        SourceSchemaOrigin::Seed | SourceSchemaOrigin::Live => true,
+        SourceSchemaOrigin::Cache { trusted, .. } => *trusted,
+    }
+}
+
+/// The warning form of an E069 / E070, for a model that reads a source
+/// whose schema is not known to be current.
+fn demote(diag: Diagnostic) -> Diagnostic {
+    let code = match &*diag.code {
+        c if c == E069 => W069,
+        c if c == E070 => W070,
+        _ => return diag,
+    };
+    Diagnostic {
+        severity: Severity::Warning,
+        code: std::sync::Arc::from(code),
+        message: std::sync::Arc::from(format!(
+            "{} (a warning: Rocky cannot confirm this source's schema is current)",
+            diag.message
+        )),
+        ..diag
+    }
 }
 
 fn check_model(
     model: &rocky_core::models::Model,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    guesses: &std::collections::HashMap<String, HashSet<usize>>,
+    evidence: &Evidence<'_>,
     seed_names: &HashSet<String>,
     target: OperandTarget,
 ) -> Vec<Diagnostic> {
+    let typed_models = evidence.typed_models;
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
     else {
         return Vec::new();
@@ -551,13 +612,34 @@ fn check_model(
         seen: HashSet::new(),
         out: Vec::new(),
     };
+    // Set when the model reads a source whose schema is not known to be
+    // current: its E069 / E070 become warnings.
+    let unproven = std::cell::Cell::new(false);
     let lookup = |name: &str| {
-        typed_models.get(name).map(|columns| RelationRef {
+        let columns = typed_models.get(name)?;
+        if let Some(all) = evidence.model_columns.get(name) {
+            return Some(RelationRef {
+                columns,
+                inexact: Some(all),
+            });
+        }
+        if !evidence
+            .provenance
+            .origins
+            .get(name)
+            .is_some_and(proves_types)
+        {
+            unproven.set(true);
+        }
+        Some(RelationRef {
             columns,
-            inexact: guesses.get(name),
+            inexact: None,
         })
     };
     walk_query(query, &lookup, &mut ctx);
+    if unproven.get() {
+        return ctx.out.into_iter().map(demote).collect();
+    }
     ctx.out
 }
 
@@ -706,68 +788,6 @@ fn guessed_outputs(inferred: &crate::typecheck::SelectInference) -> HashSet<usiz
             !inferred.exact_type_outputs.contains(i) || inferred.relation_inexact.contains(i)
         })
         .collect()
-}
-
-/// For each model, the output positions whose type is a guess (#2659 red
-/// team): `AVG` over a column of a table with no known schema is typed
-/// `Float64` only so a contract on it is checked. The type checker treats a
-/// model's columns as exact; E069 / E070 must not. A guess carries through
-/// pass-through models, so this repeats until nothing changes. A model whose
-/// SQL Rocky cannot infer, or whose inferred columns do not line up with its
-/// typed ones, has every column a guess.
-fn model_guesses(
-    models: &[rocky_core::models::Model],
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    target_for: &dyn Fn(&str) -> OperandTarget,
-) -> std::collections::HashMap<String, HashSet<usize>> {
-    let mut guesses: std::collections::HashMap<String, HashSet<usize>> =
-        std::collections::HashMap::new();
-    for _ in 0..=models.len() {
-        let mut changed = false;
-        for model in models {
-            let name = &model.config.name;
-            let Some(typed) = typed_models.get(name) else {
-                continue;
-            };
-            let all = || (0..typed.len()).collect::<HashSet<usize>>();
-            let inferred = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
-                .ok()
-                .and_then(|statements| match statements.as_slice() {
-                    [Statement::Query(query)] => {
-                        let lookup = |n: &str| {
-                            typed_models.get(n).map(|columns| RelationRef {
-                                columns,
-                                inexact: guesses.get(n),
-                            })
-                        };
-                        let target = target_for(name);
-                        infer_query_types(
-                            query,
-                            InferEnv {
-                                lookup: &lookup,
-                                target: &target,
-                            },
-                        )
-                        .ok()
-                    }
-                    _ => None,
-                });
-            let guessed = match inferred {
-                Some(inferred) if inferred.columns.len() == typed.len() => {
-                    guessed_outputs(&inferred)
-                }
-                _ => all(),
-            };
-            if guesses.get(name) != Some(&guessed) {
-                guesses.insert(name.clone(), guessed);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    guesses
 }
 
 fn walk_set_expr<'a>(
@@ -1516,12 +1536,20 @@ mod tests {
             ..Default::default()
         };
         let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
-        check_operand_types(
+        let target = OperandTarget::from(dialect);
+        check_operand_types_with(
             &result.project.models,
             &result.semantic_graph,
             &result.type_check.typed_models,
-            dialect,
+            &seed_proven(),
+            &HashSet::new(),
+            &|_| target.clone(),
         )
+    }
+
+    /// Every test source schema recorded as read from a seed file.
+    fn seed_proven() -> SourceProvenance {
+        SourceProvenance::uniform(sources().keys(), &SourceSchemaOrigin::Seed)
     }
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
@@ -1591,20 +1619,14 @@ mod tests {
     /// column built from one is not a scalar of the argument's type.
     #[test]
     fn a_top_n_min_max_column_is_not_judged_as_a_scalar() {
-        let diags = run(
-            &[
-                (
-                    "up",
-                    "SELECT max(status, 2) AS m, min(qty, 3) AS n FROM raw.orders",
-                ),
-                (
-                    "down",
-                    "SELECT array_length(m) AS a, list_sort(n) AS b FROM up",
-                ),
-            ],
-            Some(OperandDialect::DuckDb),
+        assert!(
+            codes_on(
+                "SELECT array_length(m) AS a, list_sort(n) AS b FROM \
+                 (SELECT max(status, 2) AS m, min(qty, 3) AS n FROM raw.orders) t",
+                Some(OperandDialect::DuckDb)
+            )
+            .is_empty()
         );
-        assert!(diags.is_empty(), "{diags:?}");
         assert!(
             codes_on(
                 "WITH c AS (SELECT max(status, 2) AS m FROM raw.orders) \
@@ -1624,29 +1646,21 @@ mod tests {
 
     /// `AVG` over a column of a table with no known schema is typed `Float64`
     /// only so a contract on it is checked; DuckDB may return a timestamp. A
-    /// column built from that guess is not judged, in a CTE or downstream.
+    /// column built from that guess is not judged, in a CTE or a derived
+    /// table.
     #[test]
     fn a_guessed_avg_column_is_not_judged() {
         let duckdb = Some(OperandDialect::DuckDb);
-        let diags = run(
-            &[
-                // Downstream first: the guess must reach `d4` whatever the
-                // order models are listed in.
-                ("d4", "SELECT year(a) AS y FROM mid"),
-                ("mid", "SELECT a FROM a_avg"),
-                ("a_avg", "SELECT avg(ts) AS a FROM ext.events"),
-                ("d1", "SELECT year(a) AS y FROM a_avg"),
-                (
-                    "d2",
-                    "SELECT coalesce(a, o.order_date) AS x FROM a_avg, raw.orders o",
-                ),
-            ],
-            duckdb,
-        );
-        assert!(diags.is_empty(), "{diags:?}");
         assert!(
             codes_on(
                 "WITH c AS (SELECT avg(ts) AS a FROM ext.events) SELECT year(a) AS y FROM c",
+                duckdb
+            )
+            .is_empty()
+        );
+        assert!(
+            codes_on(
+                "SELECT year(a) AS y FROM (SELECT avg(ts) AS a FROM ext.events) t",
                 duckdb
             )
             .is_empty()
@@ -1659,14 +1673,6 @@ mod tests {
             ),
             ["E069"]
         );
-        let diags = run(
-            &[
-                ("k_avg", "SELECT avg(qty) AS a FROM raw.orders"),
-                ("d3", "SELECT lower(a) AS y FROM k_avg"),
-            ],
-            duckdb,
-        );
-        assert_eq!(codes(&diags), vec!["E069"], "{diags:?}");
     }
 
     /// A seed-file macro reusing a built-in name is the project's to judge.
@@ -1684,6 +1690,7 @@ mod tests {
                 &result.project.models,
                 &result.semantic_graph,
                 &result.type_check.typed_models,
+                &seed_proven(),
                 seed,
                 &|_| target.clone(),
             )
@@ -1692,18 +1699,108 @@ mod tests {
         assert!(judge(&HashSet::from(["lower".to_string()])).is_empty());
     }
 
-    /// The column of an upstream model is judged by its type, too.
+    /// Only a source schema proves a column's type to E069 / E070. A model's
+    /// columns are Rocky's own inference, which has guessed wrong before
+    /// (#2659 red team): they are not judged, however they are read.
     #[test]
-    fn an_upstream_model_column_argument_is_judged() {
+    fn no_upstream_model_column_is_judged() {
+        let up = (
+            "up",
+            "SELECT qty AS n, order_date AS d, avg(qty) AS a FROM raw.orders GROUP BY qty, order_date",
+        );
+        for down in [
+            "SELECT lower(n) AS x FROM up",
+            "SELECT lower(u.n) AS x FROM up u",
+            "SELECT lower(n) AS x FROM main.up",
+            "SELECT lower(n) AS x FROM (SELECT * FROM up) t",
+            "SELECT lower(n) AS x FROM (SELECT n FROM up) t",
+            "WITH c AS (SELECT n FROM up) SELECT lower(n) AS x FROM c",
+            "WITH c AS (SELECT * FROM up) SELECT lower(c.n) AS x FROM c",
+            "SELECT lower(a) AS x FROM up",
+            "SELECT coalesce(n, d) AS x FROM up",
+            "SELECT CASE WHEN n > 1 THEN d ELSE n END AS x FROM up",
+            "SELECT coalesce(u.n, o.order_date) AS x FROM up u, raw.orders o",
+        ] {
+            let diags = run(&[up, ("down", down)], Some(OperandDialect::DuckDb));
+            assert!(diags.is_empty(), "{down}: {diags:?}");
+        }
+        // Through a pass-through model read by its qualified name.
         let diags = run(
             &[
-                ("up", "SELECT qty AS n FROM raw.orders"),
-                ("down", "SELECT lower(n) AS x FROM up"),
+                up,
+                ("mid", "SELECT n, d FROM main.up"),
+                ("down", "SELECT lower(n) AS x FROM mid"),
             ],
             Some(OperandDialect::DuckDb),
         );
-        assert_eq!(codes(&diags), vec!["E069"], "{diags:?}");
-        assert!(diags[0].message.contains("lower"), "{diags:?}");
+        assert!(diags.is_empty(), "{diags:?}");
+        // E042 still judges a model column: only E069 / E070 need a source.
+        assert_eq!(
+            codes(&run(
+                &[
+                    ("up_s", "SELECT status AS s FROM raw.orders"),
+                    ("down", "SELECT SUM(s) AS x FROM up_s"),
+                ],
+                Some(OperandDialect::DuckDb)
+            )),
+            vec!["E042"]
+        );
+        // The same read from the source table is judged.
+        assert_eq!(
+            codes(&run(
+                &[("down", "SELECT lower(qty) AS x FROM raw.orders")],
+                Some(OperandDialect::DuckDb)
+            )),
+            vec!["E069"]
+        );
+    }
+
+    /// A source type is an error's proof only when it is current: a seed
+    /// (DuckDB's own answer), a live read, or a schema-cache entry that
+    /// passes the E041 staleness test. A stale entry, or a schema of unknown
+    /// origin, gives the warning form.
+    #[test]
+    fn a_stale_source_type_gives_a_warning() {
+        let models = vec![
+            model("a", "SELECT lower(qty) AS x FROM raw.orders"),
+            model("b", "SELECT coalesce(qty, status) AS x FROM raw.orders"),
+        ];
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources(),
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
+        let target = OperandTarget::from(Some(OperandDialect::DuckDb));
+        let judge = |provenance: &SourceProvenance| {
+            let diags = check_operand_types_with(
+                &result.project.models,
+                &result.semantic_graph,
+                &result.type_check.typed_models,
+                provenance,
+                &HashSet::new(),
+                &|_| target.clone(),
+            );
+            diags
+                .iter()
+                .map(|d| format!("{}:{:?}", d.code, d.severity))
+                .collect::<Vec<_>>()
+        };
+        let cached = |trusted| SourceSchemaOrigin::Cache {
+            cached_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            trusted,
+        };
+        let errors = vec!["E069:Error", "E070:Error"];
+        let warnings = vec!["W069:Warning", "W070:Warning"];
+        for (origin, want) in [
+            (SourceSchemaOrigin::Seed, &errors),
+            (SourceSchemaOrigin::Live, &errors),
+            (cached(true), &errors),
+            (cached(false), &warnings),
+        ] {
+            let provenance = SourceProvenance::uniform(sources().keys(), &origin);
+            assert_eq!(&judge(&provenance), want, "{origin:?}");
+        }
+        assert_eq!(judge(&SourceProvenance::default()), warnings);
     }
 
     /// E070: `CASE` / `COALESCE` branches DuckDB has no common type for

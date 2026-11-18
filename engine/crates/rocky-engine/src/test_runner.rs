@@ -204,6 +204,31 @@ pub fn source_schemas_from_db(
     Ok(by_table)
 }
 
+/// The lower-case names of the functions and macros a seed created in `db`.
+///
+/// Read from DuckDB's own catalog (`duckdb_functions()`, the entries that are
+/// not internal), not from the seed's text, so a name inside a string literal
+/// or a comment is never taken for one (#2659). Built-ins and the functions
+/// of loaded extensions are internal.
+///
+/// # Errors
+///
+/// Returns an error when the catalog query fails.
+pub fn seed_function_names_from_db(
+    db: &DuckDbConnector,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let result = db
+        .execute_sql("SELECT function_name FROM duckdb_functions() WHERE NOT internal")
+        .map_err(|e| anyhow::anyhow!("duckdb_functions() query failed: {e}"))?;
+    Ok(result
+        .rows
+        .iter()
+        // Lower-cased here, not in SQL: a seed macro named `lower` would
+        // shadow the built-in in the query.
+        .filter_map(|row| row.first()?.as_str().map(str::to_ascii_lowercase))
+        .collect())
+}
+
 /// The prefix of a key in DuckDB's default schema, which a bare table name
 /// resolves to.
 const DUCKDB_DEFAULT_SCHEMA: &str = "main.";
@@ -257,15 +282,18 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
     };
     // A failure to read the seeded schemas is reported like a seed that
     // failed, not as an error of the whole run.
-    let (source_schemas, seed_error) = match (seeded, seed_error) {
-        (true, None) => match source_schemas_from_db(&db) {
-            Ok(schemas) => (schemas, None),
+    let (source_schemas, seed_function_names, seed_error) = match (seeded, seed_error) {
+        (true, None) => match source_schemas_from_db(&db)
+            .and_then(|schemas| Ok((schemas, seed_function_names_from_db(&db)?)))
+        {
+            Ok((schemas, names)) => (schemas, names, None),
             Err(e) => (
                 HashMap::new(),
+                std::collections::HashSet::new(),
                 Some(format!("failed to read the seeded tables: {e:#}")),
             ),
         },
-        (_, error) => (HashMap::new(), error),
+        (_, error) => (HashMap::new(), std::collections::HashSet::new(), error),
     };
     let source_provenance =
         SourceProvenance::uniform(source_schemas.keys(), &SourceSchemaOrigin::Seed);
@@ -302,6 +330,9 @@ pub fn run_tests_with(inputs: TestRunInputs<'_>) -> anyhow::Result<TestResult> {
             None => return Err(error.into()),
         },
     };
+    // The seed that typed the compile created these; the gates read them
+    // from the result.
+    compile_result.seed_function_names = seed_function_names;
     if let Some(gates) = gates {
         gates(&mut compile_result);
         compile_result.has_errors |= compile_result
@@ -868,6 +899,31 @@ fn ordered_mismatches(
 mod tests {
     use super::*;
 
+    /// The seed's function and macro names come from DuckDB's catalog, so a
+    /// comment marker or a `CREATE MACRO` inside a string literal neither
+    /// hides a real one nor makes a false one (#2659 red team).
+    #[test]
+    fn seed_function_names_are_read_from_duckdb() {
+        let db = DuckDbConnector::in_memory().expect("db");
+        db.execute_statement(
+            "CREATE TABLE paths AS SELECT 'raw/orders/*.csv' AS p, 'a--b' AS q; \
+             CREATE MACRO lower(a, b) AS a || b; \
+             SELECT 'raw/events/*/part.parquet', 'CREATE MACRO fake(x) AS x'; \
+             CREATE OR REPLACE TEMP MACRO My_Macro(x) AS x + 1; \
+             CREATE SCHEMA util; CREATE FUNCTION util.\"Shout\"(s) AS upper(s); \
+             CREATE MACRO rows_of() AS TABLE SELECT 1 AS one; \
+             -- CREATE MACRO commented(x) AS x\n\
+             /* CREATE MACRO also_commented(x) AS x */ SELECT 1",
+        )
+        .expect("seed");
+        let mut names: Vec<String> = seed_function_names_from_db(&db)
+            .expect("names")
+            .into_iter()
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["lower", "my_macro", "rows_of", "shout"]);
+    }
+
     /// #2657: a table in DuckDB's default schema is also keyed by its bare
     /// name, as DuckDB resolves `FROM orders`; one only in another schema is not.
     #[test]
@@ -880,6 +936,10 @@ mod tests {
         )
         .expect("seed");
         let schemas = source_schemas_from_db(&db).expect("schemas");
+        assert!(
+            seed_function_names_from_db(&db).expect("names").is_empty(),
+            "a seed with no macros creates no names"
+        );
         let bare = schemas.get("orders").expect("bare key for main.orders");
         assert_eq!(
             bare[0].name, "id",
