@@ -49,11 +49,15 @@ Rocky writes the directory `connectors/orders/` and prints the next steps:
 | `connector-test.toml` | The runs for `rocky connector test`. |
 | `.gitignore` | Ignores `__pycache__/`. |
 
-The scaffold works as written. Its `fetch()` returns example rows, so you can run every step below before you change it. Use `--dir <path>` to put the connector in another directory.
+The scaffold works as written. Its `fetch()` returns example rows, so `rocky connector test orders` passes before you change anything. Use `--dir <path>` to put the connector in another directory.
+
+:::caution[Do not run rocky load before fetch() reads your source]
+`rocky load` saves the connector's cursor and creates the table with the columns of the rows it loads. A load of the scaffold's example rows saves cursor 5 and makes a table with the columns `id` and `name`. The next load of your real source then skips every order up to id 5, without a warning. Rocky has no command that resets one connector's state. Use `rocky connector test` until Step 6: it saves no state and loads nothing.
+:::
 
 ## Step 2: Add the connector to rocky.toml
 
-Add the block that `rocky connector init` printed to `rocky.toml`. Set the target catalog and schema. For a DuckDB warehouse, the catalog is the database name: the file name of `path` without `.duckdb`.
+Add the block that `rocky connector init` printed to `rocky.toml`, then add the `secrets` line and the `[connector.orders.options]` table shown below. Set the target catalog and schema. For a DuckDB warehouse, the catalog is the database name: the file name of `path` without `.duckdb`.
 
 ```toml
 [connector.orders]
@@ -151,11 +155,14 @@ Rocky saves the state as JSON, up to 1 MiB. If you change its shape, raise `stat
 
 ## Step 4: Finish the manifest
 
-Open `connectors/orders/connector.toml` and set two keys.
+Open `connectors/orders/connector.toml` and change two lines. Replace the existing `egress_hosts = []` line, and uncomment the `license` line. Both stay above the `[limits]` table: a key below `[limits]` belongs to that table, and Rocky refuses it.
 
 ```toml
 egress_hosts         = ["shop.example.com"]
 license              = "MIT"
+
+[limits]
+wall_time_secs = 600
 ```
 
 - `egress_hosts` lists the hosts the program calls. Rocky prints the list in its output and logs. It does not enforce it.
@@ -163,16 +170,31 @@ license              = "MIT"
 
 ## Step 5: Test it against recorded input
 
-`rocky connector test` runs the program once per `[[run]]` in `connector-test.toml`. It checks the rows and the state of each run, and loads nothing. Record what the API returns, and save it beside `main.py`:
+`rocky connector test` runs the program once per `[[run]]` in `connector-test.toml`. It checks the rows and the state of each run, and loads nothing. Record what the API returns, and save it in a `replay` directory beside `main.py`:
 
-- `connectors/orders/replay/orders-1.json`: orders 1 to 3.
-- `connectors/orders/replay/orders-2.json`: orders 1 to 5, as the API returns them later.
+```bash
+mkdir connectors/orders/replay
+```
 
-Each file is a JSON list of orders:
+`connectors/orders/replay/orders-1.json` holds orders 1 to 3, as the API returned them first:
 
 ```json
 [
-  {"id": 1, "customer": "c1", "amount_cents": 250, "created_at": "2026-11-02T10:00:00"}
+  {"id": 1, "customer": "ada", "amount_cents": 250, "created_at": "2026-11-01T10:00:00"},
+  {"id": 2, "customer": "grace", "amount_cents": 500, "created_at": "2026-11-02T10:00:00"},
+  {"id": 3, "customer": "ada", "amount_cents": 750, "created_at": "2026-11-03T10:00:00"}
+]
+```
+
+`connectors/orders/replay/orders-2.json` holds orders 1 to 5, as the API returned them later:
+
+```json
+[
+  {"id": 1, "customer": "ada", "amount_cents": 250, "created_at": "2026-11-01T10:00:00"},
+  {"id": 2, "customer": "grace", "amount_cents": 500, "created_at": "2026-11-02T10:00:00"},
+  {"id": 3, "customer": "ada", "amount_cents": 750, "created_at": "2026-11-03T10:00:00"},
+  {"id": 4, "customer": "linus", "amount_cents": 1000, "created_at": "2026-11-04T10:00:00"},
+  {"id": 5, "customer": "grace", "amount_cents": 1250, "created_at": "2026-11-05T10:00:00"}
 ]
 ```
 
@@ -198,7 +220,7 @@ state   = "unchanged"
 Each run gets the state the run before it returned. Run 2 writes 2 rows only if the cursor from run 1 reached it. Run 3 checks that a load with nothing new keeps the cursor.
 
 ```bash
-rocky connector test orders
+rocky connector test orders --output table
 ```
 
 ```
@@ -212,11 +234,11 @@ The command also checks that every Parquet file has the same column names and ty
 
 ## Step 6: Load the live source
 
-Set the secret in the environment, then load.
+Set the secret in the environment, then load. Use your real token: a wrong one fails the run.
 
 ```bash
-export SHOP_API_TOKEN=...
-rocky load --connector orders
+export SHOP_API_TOKEN="<your token>"
+rocky load --connector orders --output table
 ```
 
 ```
@@ -231,9 +253,17 @@ Connector `orders` loaded 1 file(s), 2 rows, 669 bytes (1 attempt(s), commit 1 -
 
 A load with no new orders loads no file and still saves the state. Each line shows the commit number moving forward: Rocky saved the state of that load. To run the connector on a schedule, run the same command from your scheduler.
 
+Check the rows in the table:
+
+```bash
+duckdb shop.duckdb "SELECT * FROM main.orders ORDER BY id"
+```
+
+The examples on this page use `--output table`. Without it, Rocky prints JSON when its output is not a terminal, as in a script or in CI.
+
 ## When a step fails
 
-The program's stderr appears in Rocky's log, one line per line. These are the common failures:
+The program's stderr appears in Rocky's log, one line per line. When the program fails, its own error is the last stderr line before Rocky's error. Rocky starts a failed program again, up to `retries` times (default 1), so the same error can appear twice. These are the common failures:
 
 | Message | Cause | Fix |
 |---|---|---|
@@ -242,6 +272,7 @@ The program's stderr appears in Rocky's log, one line per line. These are the co
 | `the saved state has schema version 1, but this connector reads 2` | `STATE_SCHEMA_VERSION` changed and the saved state is older. | Go back to the old version. The helper refuses a state of another version before `fetch()` runs, and Rocky has no command that resets a connector's state. |
 | `the run wrote 3 rows, but the spec expects 2` | A `[[run]]` in `connector-test.toml` saw other rows than it declares. Often the cursor did not reach the run. | Check the state the program passes to `run.finish()`. |
 | `the connector exited with code 1` | The program failed. | Read the program's own error line just above it in the log. |
+| `could not start the connector: Permission denied (os error 13)` | `main.py` is not executable. A new copy of the file loses the mode `rocky connector init` set. | Run `chmod +x connectors/orders/main.py`. |
 
 ## Keep the connector tested
 
