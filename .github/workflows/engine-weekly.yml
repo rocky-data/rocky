@@ -472,6 +472,27 @@ jobs:
           REQUIRE_DOCKER: "1"
         run: bash examples/playground/pocs/07-adapters/08-postgres-child-connector/run.sh
 
+      # The Airbyte connector shim with no Docker: the POC's own declarative
+      # manifest run through airbyte-cdk against a local stub. PR CI cannot
+      # run it: it needs airbyte-cdk from PyPI. Every package comes from
+      # cdk/requirements.lock, the whole dependency tree pinned by hash.
+      # airbyte-cdk 7.48.0 needs Python 3.11 to 3.14. REQUIRE_AIRBYTE_CDK=1
+      # makes a missing install a failure, not a skip.
+      - name: Airbyte connector shim, manifest mode (real airbyte-cdk, hash-pinned)
+        if: ${{ !cancelled() }}
+        working-directory: ${{ github.workspace }}/examples/playground/pocs/07-adapters/11-airbyte-connector-shim
+        timeout-minutes: 10
+        env:
+          REQUIRE_AIRBYTE_CDK: "1"
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert (3, 11) <= sys.version_info[:2] <= (3, 14), sys.version'
+          rm -rf cdk/.venv
+          python3 -m venv cdk/.venv
+          cdk/.venv/bin/python -m pip install --quiet --require-hashes --no-deps -r cdk/requirements.lock
+          cdk/.venv/bin/python -m pip check
+          bash run-cdk.sh
+
       # The open-stack acceptance journey: the same connector in one project
       # with a product deadline, volume ranges, a monthly cost split, a
       # budget breach and the HTTP API, every step's JSON asserted. About 4
