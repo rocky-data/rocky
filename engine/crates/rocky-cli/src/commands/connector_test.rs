@@ -9,8 +9,8 @@
 //!   a temporary landing directory, with no secrets;
 //! - feeds each run the state the run before it returned;
 //! - checks the row count, the declared state check, and that every Parquet
-//!   file of every run has the same column names and types (the Arrow types
-//!   Parquet's logical types map to, so `BIGINT` and `TIMESTAMP` differ).
+//!   file of every run has the same column names and logical types, so
+//!   `BIGINT` and `TIMESTAMP` differ.
 //!
 //! It takes no claim, opens no state store and loads nothing into the
 //! warehouse. The child gets no secrets, but Rocky does not block the
@@ -83,8 +83,16 @@ impl ConnectorTestSpec {
 /// The helper version a copy of `rocky_connector.py` declares.
 fn helper_version(text: &str) -> Option<u32> {
     text.lines()
-        .find_map(|line| line.strip_prefix("HELPER_VERSION = "))
-        .and_then(|v| v.trim().parse().ok())
+        .find_map(|line| {
+            line.strip_prefix("HELPER_VERSION")?
+                .trim_start()
+                .strip_prefix('=')
+        })
+        .and_then(|v| {
+            let v = v.trim_start();
+            let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+            v[..end].parse().ok()
+        })
 }
 
 /// A warning when the manifest directory holds an older helper copy.
@@ -275,13 +283,19 @@ async fn run_one(
     Ok(batch.state)
 }
 
-/// The column names and Arrow types of two Parquet files match. The Arrow
-/// type carries the Parquet logical type, which the physical type does not:
-/// `TIMESTAMP` and `BIGINT` are both INT64. Nullability is not compared.
+/// The column names and logical types of two Parquet files match. The
+/// physical type alone does not tell `TIMESTAMP` from `BIGINT`: both are
+/// INT64. The types are read from the Parquet schema alone, without the
+/// `ARROW:schema` hint pyarrow writes, so `string` and `large_string`, a
+/// dictionary's index width, or a timestamp's zone name do not count.
+/// Top-level nullability is not compared.
 fn same_arrow_schema(first: &Path, other: &Path) -> Result<()> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
     let columns = |path: &Path| -> Result<Vec<(String, String)>> {
-        let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            std::fs::File::open(path)?,
+            ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+        )?;
         Ok(builder
             .schema()
             .fields()
@@ -420,6 +434,8 @@ mod tests {
         std::fs::write(dir.path().join(HELPER_FILE_NAME), old).unwrap();
         let warning = stale_helper_warning(dir.path()).unwrap();
         assert!(warning.contains("helper version 0"), "{warning}");
+        assert_eq!(helper_version("HELPER_VERSION=3  # note\n"), Some(3));
+        assert_eq!(helper_version("HELPER_VERSION = 4\n"), Some(4));
         let unversioned = HELPER_PY.replace("HELPER_VERSION = ", "VERSION = ");
         std::fs::write(dir.path().join(HELPER_FILE_NAME), unversioned).unwrap();
         let warning = stale_helper_warning(dir.path()).unwrap();

@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -62,6 +62,24 @@ fn names(path: &Path) {
     w.close().unwrap();
 }
 
+/// `names`, but as `LargeUtf8`, as pyarrow's `large_string` writes it. The
+/// Parquet type is the same; only the embedded `ARROW:schema` hint differs.
+fn large_names(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::LargeUtf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(LargeStringArray::from(vec!["b", "c"]))],
+    )
+    .unwrap();
+    let mut w = ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+}
+
 /// INT64 like `ids`, but a TIMESTAMP: the same physical type, another
 /// logical type.
 fn stamps(path: &Path, rows: i64) {
@@ -102,6 +120,7 @@ async fn run_with(
     ids(&dir.join("two.parquet"), 2);
     names(&dir.join("text.parquet"));
     stamps(&dir.join("stamps.parquet"), 2);
+    large_names(&dir.join("large.parquet"));
     std::fs::write(
         dir.join("connector.toml"),
         "protocol_version = 0\nname = \"demo\"\ncommand = [\"./child.py\"]\n\
@@ -318,4 +337,14 @@ async fn a_failed_check_is_an_error_from_the_command_and_a_pass_is_not() {
     let (out, exited) = run_with(GOOD, true).await.unwrap();
     assert!(out.passed);
     exited.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn files_of_one_logical_type_pass_whatever_arrow_hint_they_carry() {
+    // Run 1 writes Utf8 (non-null), run 2 LargeUtf8 (nullable): the same
+    // Parquet string column, which `rocky load` accepts.
+    let spec = "[[run]]\noptions = { file = \"text.parquet\", rows = 1, state = { c = 1 } }\nrows = 1\n\n\
+                [[run]]\noptions = { file = \"large.parquet\", rows = 2, state = { c = 2 } }\nrows = 2\n";
+    let out = run(spec).await.unwrap();
+    assert!(out.passed, "{out:?}");
 }

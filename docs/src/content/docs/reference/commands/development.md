@@ -681,7 +681,7 @@ Each run starts the program through the same runner and checks as `rocky load --
 - the result file and every Parquet file pass the load checks;
 - the run writes exactly `rows` rows;
 - the state the run returns is `unchanged` or `advanced` from the state it was given, when `state` is set (a cursor can move on a run with no rows, so there is no default). The first run is given no state, which counts as `null`: returning `null` there is `unchanged`, not `advanced`;
-- every Parquet file of every run has the same column names and types. Types are compared as Parquet logical types, so `BIGINT` and `TIMESTAMP` differ. Nullability is not compared.
+- every Parquet file of every run has the same column names and types. Types are read from the Parquet schema, so `BIGINT` and `TIMESTAMP` differ. The `ARROW:schema` hint pyarrow writes is ignored, so `string` and `large_string` match. Nullability is not compared for a top-level column. It is compared inside a list or a struct.
 
 Each run gets the state the run before it returned. The first failed run stops the test. The command exits non-zero when any check fails.
 
