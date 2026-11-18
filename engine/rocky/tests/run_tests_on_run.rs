@@ -105,6 +105,16 @@ fn rocky(dir: &Path, args: &[&str]) -> Output {
         .current_dir(dir)
         .env("RUST_LOG", "error")
         .env_remove("ROCKY_PRINCIPAL")
+        // Promote resolves its actor from git. Give it a fixed identity and
+        // ignore the machine's git config, so the test runs the same on a CI
+        // runner with no `user.email` as on a developer's machine.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "user.email")
+        .env("GIT_CONFIG_VALUE_0", "test@rocky.invalid")
+        .env("GIT_CONFIG_KEY_1", "user.name")
+        .env("GIT_CONFIG_VALUE_1", "rocky-test")
         .output()
         .expect("spawn rocky")
 }

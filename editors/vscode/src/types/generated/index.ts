@@ -452,6 +452,7 @@ export type { GcPlanOutput } from "./gc_plan";
 export type {
   ConnectorLoadInfo,
   ConnectorLoadStatus,
+  ConnectorSupportTier,
   ContractResult,
   LoadFileOutput,
   LoadOutput,
