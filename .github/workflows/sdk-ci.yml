@@ -54,8 +54,39 @@ jobs:
       - name: Install the rocky binary (latest engine release)
         # The unit tests mock the binary; this job drives the SDK against a real
         # rocky to catch breakage the mocks can't (argv, exit codes, JSON shapes).
+        #
+        # Resolve the version here, not in install.sh: install.sh asks the
+        # GitHub REST API, and shared runners can exhaust its anonymous rate
+        # limit, which can fail this job with a 403 (#2684). `git ls-remote`
+        # reads tags over git, not the REST API, and needs no token. A tag can
+        # exist without release assets (a draft release, or a deleted one), so
+        # take the newest tag whose Linux archive answers 200. Only a 404 skips
+        # a tag; any other status fails the job, so a transient error never
+        # installs an older engine.
         run: |
-          bash "$GITHUB_WORKSPACE/engine/install.sh"
+          tag=""
+          for candidate in $(git ls-remote --tags --refs https://github.com/rocky-data/rocky 'engine-v*' \
+              | sed 's#.*refs/tags/##' \
+              | grep -E '^engine-v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V -r \
+              | head -5); do
+            status="$(curl -sIL --retry 3 -o /dev/null -w '%{http_code}' \
+              "https://github.com/rocky-data/rocky/releases/download/${candidate}/rocky-x86_64-unknown-linux-gnu.tar.gz" || true)"
+            if [[ "${status}" == "200" ]]; then
+              tag="${candidate}"
+              break
+            fi
+            if [[ "${status}" != "404" ]]; then
+              echo "checking ${candidate} returned HTTP ${status:-none}; refusing to fall back to an older engine" >&2
+              exit 1
+            fi
+            echo "skipping ${candidate}: no release assets (HTTP 404)" >&2
+          done
+          if [[ -z "${tag}" ]]; then
+            echo "no engine release with assets among the five newest engine-v* tags" >&2
+            exit 1
+          fi
+          ROCKY_VERSION="${tag}" bash "$GITHUB_WORKSPACE/engine/install.sh"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: uv sync
       - name: Run the SDK quickstart against a generated playground

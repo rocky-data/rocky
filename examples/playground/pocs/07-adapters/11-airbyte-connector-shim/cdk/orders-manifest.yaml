@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A declarative Airbyte source written for this POC, not taken from Airbyte.
+# It reads `orders` from the local stub in stub.py, incrementally on
+# `updated_at`. run-cdk.sh runs it through airbyte-cdk's
+# `source-declarative-manifest`, with no Docker.
+#
+# rocky.toml pins this file by SHA-256 (options.manifest_sha256). Change the
+# file and the shim refuses it until the hash is updated.
+version: 6.0.0
+type: DeclarativeSource
+check:
+  type: CheckStream
+  stream_names:
+    - orders
+spec:
+  type: Spec
+  connection_specification:
+    type: object
+    required:
+      - base_url
+      - start_date
+      - end_date
+    properties:
+      base_url:
+        type: string
+      start_date:
+        type: string
+      end_date:
+        type: string
+streams:
+  - type: DeclarativeStream
+    name: orders
+    primary_key:
+      - id
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "{{ config['base_url'] }}"
+        path: /orders
+        http_method: GET
+        request_parameters:
+          updated_since: "{{ stream_interval.start_time }}"
+          updated_until: "{{ stream_interval.end_time }}"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path:
+            - orders
+    incremental_sync:
+      type: DatetimeBasedCursor
+      cursor_field: updated_at
+      datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+      cursor_granularity: PT1S
+      start_datetime:
+        type: MinMaxDatetime
+        datetime: "{{ config['start_date'] }}"
+        datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+      end_datetime:
+        type: MinMaxDatetime
+        datetime: "{{ config['end_date'] }}"
+        datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+      step: P1Y
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        $schema: http://json-schema.org/draft-07/schema#
+        additionalProperties: true
+        properties:
+          id:
+            type: integer
+          amount_cents:
+            type:
+              - "null"
+              - integer
+          updated_at:
+            type: string
+            format: date-time
