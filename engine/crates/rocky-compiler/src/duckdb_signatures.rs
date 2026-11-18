@@ -7,13 +7,17 @@
 //! it. Every line is one call shape that DuckDB refused with `No function
 //! matches the given name and argument types`:
 //!
-//! - `arity <name> <k>`: `name` with `k` arguments, every argument `NULL`.
+//! - `arity <name> <k>`: `name` with `k` arguments, every argument `NULL`,
+//!   and again with every argument a column, for one column type of each
+//!   class. A call such as `struct_pack(x)` binds a column but not `NULL`.
 //! - `above <name> <n>`: every count above `n`. Written only when the
 //!   function has no variadic overload and `n + 1` to `n + 3` were refused.
 //! - `arg <name> <k> <p> <class>`: `name` with `k` arguments, a column of
-//!   every DuckDB type in `class` at position `p` (0-based), `NULL` at the
-//!   others. A `NULL` binds to any parameter type, so a refusal here is a
-//!   refusal for any other argument.
+//!   every DuckDB type in `class` at position `p` (0-based), and at the
+//!   other positions `NULL`, then a column of one type of each class.
+//!
+//! A name for which a `NULL` argument binds differently from a column
+//! (`struct_pack` names its fields after its arguments) is left out.
 //!
 //! A class is refused only when every DuckDB type in it is refused, so a
 //! column Rocky types `Int32` is judged the same whether DuckDB stores it as
@@ -175,10 +179,22 @@ pub fn refuses_argument(name: &str, count: usize, position: usize, class: ArgCla
         .contains(&(name.to_string(), count, position, class))
 }
 
-/// The argument counts DuckDB accepts for `name`, up to `limit`, for the
-/// message.
-pub fn accepted_counts(name: &str, limit: usize) -> Vec<usize> {
-    (0..=limit).filter(|k| !refuses_count(name, *k)).collect()
+/// The argument counts the data shows DuckDB accepts for `name`, for the
+/// message, and whether every count above them is refused. Only counts up
+/// to the highest one probed are listed.
+pub fn accepted_counts(name: &str) -> (Vec<usize>, bool) {
+    let sigs = &*SIGNATURES;
+    let above = sigs.above.get(name).copied();
+    let probed = sigs
+        .arity
+        .iter()
+        .filter(|(n, _)| n == name)
+        .map(|(_, k)| *k)
+        .chain(above)
+        .max()
+        .unwrap_or(0);
+    let accepted = (0..=probed).filter(|k| !refuses_count(name, *k)).collect();
+    (accepted, above.is_some())
 }
 
 /// The classes DuckDB accepts at `position` of `name` with `count`
@@ -243,6 +259,52 @@ mod tests {
         }
     }
 
+    /// One DuckDB type of each class, plus `DOUBLE`: the fillers the probes
+    /// put in the other argument positions.
+    fn fillers() -> Vec<String> {
+        let mut out = vec!["NULL".to_string()];
+        for class in ArgClass::ALL {
+            out.push(column_name(class.duckdb_types()[0]));
+        }
+        out.push(column_name("DOUBLE"));
+        out
+    }
+
+    /// Whether every probe of `name` with `k` arguments is refused: all
+    /// `NULL`, and all one column, for each filler.
+    fn refuses_every_count_probe(conn: &duckdb::Connection, name: &str, k: usize) -> bool {
+        fillers()
+            .iter()
+            .all(|f| no_match(conn, name, &vec![f.clone(); k]))
+    }
+
+    /// Whether `name` with `k` arguments is refused when position `p` is a
+    /// column of type `ty`, for every filler in the other positions.
+    fn refuses_argument_probe(
+        conn: &duckdb::Connection,
+        name: &str,
+        k: usize,
+        p: usize,
+        ty: &str,
+    ) -> bool {
+        fillers().iter().all(|f| {
+            let mut args = vec![f.clone(); k];
+            args[p] = column_name(ty);
+            no_match(conn, name, &args)
+        })
+    }
+
+    /// Whether a `NULL` argument binds differently from a column for `name`:
+    /// some count is refused with all `NULL` but accepted with columns
+    /// (`struct_pack` names its fields after its arguments). Such a name is
+    /// left out, since the probes assume `NULL` binds to anything.
+    fn null_sensitive(conn: &duckdb::Connection, name: &str, max: usize) -> bool {
+        (1..=max + 3).any(|k| {
+            no_match(conn, name, &vec!["NULL".to_string(); k])
+                && !refuses_every_count_probe(conn, name, k)
+        })
+    }
+
     fn version(conn: &duckdb::Connection) -> String {
         conn.query_row("SELECT version()", [], |r| r.get(0))
             .unwrap()
@@ -281,11 +343,13 @@ mod tests {
             version(conn)
         )
         .unwrap();
-        let nulls = |k: usize| vec!["NULL".to_string(); k];
         for (name, max, varargs) in checked_names(conn) {
+            if null_sensitive(conn, &name, max) {
+                continue;
+            }
             let mut accepted = Vec::new();
             for k in 0..=max + 3 {
-                if no_match(conn, &name, &nulls(k)) {
+                if refuses_every_count_probe(conn, &name, k) {
                     writeln!(out, "arity {name} {k}").unwrap();
                 } else {
                     accepted.push(k);
@@ -297,11 +361,10 @@ mod tests {
             for k in accepted.into_iter().filter(|k| *k >= 1) {
                 for p in 0..k {
                     for class in ArgClass::ALL {
-                        let refused = class.duckdb_types().iter().all(|ty| {
-                            let mut args = nulls(k);
-                            args[p] = column_name(ty);
-                            no_match(conn, &name, &args)
-                        });
+                        let refused = class
+                            .duckdb_types()
+                            .iter()
+                            .all(|ty| refuses_argument_probe(conn, &name, k, p, ty));
                         if refused {
                             writeln!(out, "arg {name} {k} {p} {}", class.name()).unwrap();
                         }
@@ -362,26 +425,23 @@ mod tests {
         assert!(sigs.arg.len() > 1000, "arg lines: {}", sigs.arg.len());
         for (name, k) in &sigs.arity {
             assert!(
-                no_match(&conn, name, &vec!["NULL".to_string(); *k]),
+                refuses_every_count_probe(&conn, name, *k),
                 "DuckDB accepts {name} with {k} arguments"
             );
         }
         for (name, n) in &sigs.above {
             for k in n + 1..=n + 3 {
                 assert!(
-                    no_match(&conn, name, &vec!["NULL".to_string(); k]),
+                    refuses_every_count_probe(&conn, name, k),
                     "DuckDB accepts {name} with {k} arguments"
                 );
             }
         }
         for (name, k, p, class) in &sigs.arg {
             for ty in class.duckdb_types() {
-                let mut args = vec!["NULL".to_string(); *k];
-                args[*p] = column_name(ty);
                 assert!(
-                    no_match(&conn, name, &args),
-                    "DuckDB accepts {name}({}) ",
-                    args.join(", ")
+                    refuses_argument_probe(&conn, name, *k, *p, ty),
+                    "DuckDB accepts {name} with {k} arguments, a {ty} column at {p}"
                 );
             }
         }

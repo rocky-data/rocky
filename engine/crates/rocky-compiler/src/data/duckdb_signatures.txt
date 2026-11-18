@@ -8056,9 +8056,6 @@ arity struct_keys 2
 arity struct_keys 3
 arity struct_keys 4
 above struct_keys 4
-arity struct_pack 1
-arity struct_pack 2
-arity struct_pack 3
 arity struct_position 0
 arity struct_position 1
 arity struct_position 3

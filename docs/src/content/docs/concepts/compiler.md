@@ -275,25 +275,36 @@ SELECT coalesce(order_date, status) AS d FROM orders
   function takes. Only a column whose type Rocky read from the SQL is checked.
   A literal, `NULL` or computed argument is not, because DuckDB converts
   literals. Aggregates that `E042` checks are left to it.
-- `E070` checks `CASE` and `COALESCE` branches that are columns. Numbers and
-  booleans form one group, text another, and dates and timestamps a third.
-  Two branches from different groups are refused. Within a group, DuckDB's
-  result can depend on the branch order, so that is not checked.
+- `E070` checks `CASE` and `COALESCE` when every branch is a column or `NULL`.
+  Numbers and booleans form one group, text another, and dates and timestamps
+  a third. Two branches from different groups are refused. A literal or
+  computed branch can change the type DuckDB picks, so a list with one is not
+  checked. Within a group, DuckDB's result can depend on the branch order, so
+  that is not checked either.
 
 Rocky does not guess these rules. A test probes the bundled DuckDB 2.0 and
 writes them to `engine/crates/rocky-compiler/src/data/duckdb_signatures.txt`.
-Another test fails if DuckDB accepts any call the file says it refuses, or if
-the bundled version changes. The checks run only when DuckDB is one of the
-model's targets; other warehouses are not checked.
+Each probe fills the other arguments with `NULL` and with columns of each
+type group. Another test replays every probe and fails if DuckDB accepts one,
+or if the bundled version changes.
+
+The checks run when DuckDB is one of the warehouses Rocky resolves for the
+model, as for `E042`: `--target-dialect`, then the adapters of the pipelines
+that run the model. A model no pipeline lists is judged against every
+pipeline's adapter. Other warehouses are not checked.
 
 These are not reported:
 
 - The same calls as for `E057`: schema-qualified, quoted, declared in
   `functions/`, or a rewritten form.
-- A call with named arguments, `*`, `DISTINCT`, `ORDER BY` inside the
-  parentheses, a lambda, `FILTER`, `WITHIN GROUP` or `OVER`.
-- A DuckDB macro created outside Rocky that reuses a built-in name. Call it
-  schema-qualified.
+- A call with named arguments (`name := value` too), `*`, `DISTINCT`,
+  `ORDER BY` inside the parentheses, a lambda, an argument that expands to
+  several (`UNPACK(COLUMNS(...))`), `FILTER`, `WITHIN GROUP` or `OVER`.
+- A function such as `struct_pack`, which treats a `NULL` argument
+  differently from a column.
+- In `HAVING`, a bare name that is also a select-list alias.
+- A DuckDB macro that reuses a built-in name, created outside Rocky or by the
+  project's seed file. Call it schema-qualified.
 - A `CASE` whose text literal fails to convert only for some rows, as in
   `CASE WHEN qty > 1 THEN 'many' ELSE qty END`. DuckDB accepts this query and
   fails only when a row reaches the text branch.

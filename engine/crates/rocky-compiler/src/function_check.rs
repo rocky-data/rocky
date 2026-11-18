@@ -410,14 +410,13 @@ fn count_diagnostic(
     line: usize,
     col: usize,
 ) -> Diagnostic {
-    let accepted: Vec<String> = crate::duckdb_signatures::accepted_counts(lower, 8)
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+    let (accepted, bounded) = crate::duckdb_signatures::accepted_counts(lower);
+    let accepted: Vec<String> = accepted.iter().map(ToString::to_string).collect();
+    let more = if bounded { "" } else { ", or more" };
     let takes = if accepted.is_empty() {
         String::new()
     } else {
-        format!(" It takes {} argument(s).", accepted.join(", "))
+        format!(" It takes {} argument(s){more}.", accepted.join(", "))
     };
     let plural = if count == 1 { "" } else { "s" };
     Diagnostic::error(
@@ -489,7 +488,9 @@ struct Calls<'r> {
 /// expressions, the shape the DuckDB count data was probed with. `None` for
 /// a call with no parentheses, a subquery argument, a named or `*`
 /// argument, a lambda, `DISTINCT` / `ALL`, a clause inside the parentheses
-/// (`ORDER BY`, `SEPARATOR`, ...), `WITHIN GROUP`, `FILTER` or `OVER`.
+/// (`ORDER BY`, `SEPARATOR`, ...), `WITHIN GROUP`, `FILTER` or `OVER`, an
+/// `name := value` argument, and an argument that expands to several
+/// (`UNPACK(COLUMNS(...))`).
 pub(crate) fn plain_argument_count(function: &ast::Function) -> Option<usize> {
     let ast::FunctionArguments::List(list) = &function.args else {
         return None;
@@ -503,13 +504,22 @@ pub(crate) fn plain_argument_count(function: &ast::Function) -> Option<usize> {
     {
         return None;
     }
+    // `name := value` parses as an expression, not a named argument, and an
+    // `UNPACK(COLUMNS(...))` argument expands to several.
     list.args
         .iter()
         .all(|arg| {
             matches!(
                 arg,
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
-                    if !matches!(e, Expr::Lambda(_))
+                    if !matches!(
+                        e,
+                        Expr::Lambda(_)
+                            | Expr::BinaryOp {
+                                op: ast::BinaryOperator::Assignment,
+                                ..
+                            }
+                    ) && !crate::set_operation::expands_to_columns(e)
             )
         })
         .then_some(list.args.len())
@@ -649,6 +659,13 @@ mod tests {
             "select string_agg(a, ',' order by a) from t",
             "select count(distinct a, b) from t",
             "select coalesce(a, b, c) from t",
+            // Red team, #2659: name-bound calls and expanded arguments.
+            "select struct_pack(a := qty) from t",
+            "select struct_pack(qty, status) from t",
+            "select struct_insert(payload, extra := qty) from t",
+            "select union_value(k := qty) from t",
+            "select date_diff(unpack(columns(['a', 'b', 'c']))) from t",
+            "select lower(columns('n.*')) from t",
         ] {
             assert!(count_codes(sql, &duckdb).is_empty(), "{sql}");
         }

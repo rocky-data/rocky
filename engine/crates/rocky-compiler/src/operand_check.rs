@@ -522,6 +522,7 @@ fn check_model(
         target,
         functions: graph.functions(),
         join_key_columns: join_key_checked_columns(&model.config.name, graph, typed_models),
+        having_aliases: HashSet::new(),
         seen: HashSet::new(),
         out: Vec::new(),
     };
@@ -575,6 +576,8 @@ struct Ctx<'m> {
     /// judged against DuckDB's built-ins.
     functions: &'m crate::udf::FunctionRegistry,
     join_key_columns: HashSet<String>,
+    /// Lower-case select-list aliases while `HAVING` is checked, else empty.
+    having_aliases: HashSet<String>,
     /// `(code, line, col, message)` already emitted — CTE bodies are typed
     /// twice by construction, never reported twice.
     seen: HashSet<(String, usize, usize, String)>,
@@ -751,10 +754,24 @@ fn walk_select<'a>(
     for expr in on_exprs
         .iter()
         .chain(select.selection.as_ref())
-        .chain(select.having.as_ref())
         .chain(select.qualify.as_ref())
     {
         check_expr(expr, &scope, lookup, ctx);
+    }
+    if let Some(having) = &select.having {
+        let aliases: HashSet<String> = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                ast::SelectItem::ExprWithAlias { alias, .. } => {
+                    Some(alias.value.to_ascii_lowercase())
+                }
+                _ => None,
+            })
+            .collect();
+        let outer = std::mem::replace(&mut ctx.having_aliases, aliases);
+        check_expr(having, &scope, lookup, ctx);
+        ctx.having_aliases = outer;
     }
 }
 
@@ -1032,10 +1049,21 @@ fn runs_on_duckdb(target: &OperandTarget) -> bool {
 /// from the SQL, not a guess. A literal, `NULL`, a computed expression and an
 /// unresolved column give `None`: DuckDB coerces literals, and a computed
 /// type can be a guess.
-fn exact_column_class(expr: &Expr, scope: &TypeScope) -> Option<(ArgClass, RockyType)> {
+fn exact_column_class(
+    expr: &Expr,
+    scope: &TypeScope,
+    aliases: &HashSet<String>,
+) -> Option<(ArgClass, RockyType)> {
     let mut inner = expr;
     while let Expr::Nested(e) = inner {
         inner = e;
+    }
+    // In `HAVING`, DuckDB reads a bare name that is a select-list alias as
+    // the aliased expression, not the source column.
+    if let Expr::Identifier(ident) = inner
+        && aliases.contains(&ident.value.to_ascii_lowercase())
+    {
+        return None;
     }
     if !matches!(inner, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
         || scope.is_unresolved_column(inner)
@@ -1082,7 +1110,7 @@ fn check_duckdb_call(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &m
         let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg else {
             continue;
         };
-        let Some((class, ty)) = exact_column_class(arg, scope) else {
+        let Some((class, ty)) = exact_column_class(arg, scope, &ctx.having_aliases) else {
             continue;
         };
         if !duckdb_signatures::refuses_argument(&lower, count, position, class) {
@@ -1149,10 +1177,19 @@ fn check_branch_types(
     if !runs_on_duckdb(&ctx.target) {
         return;
     }
-    let typed: Vec<(&Expr, ArgClass, RockyType)> = branches
-        .iter()
-        .filter_map(|b| exact_column_class(b, scope).map(|(c, t)| (*b, c, t)))
-        .collect();
+    // Every branch must be a classed column or `NULL`: any other branch (a
+    // literal, a computed value, a JSON column) can change the type DuckDB
+    // unifies to, so the list is then not judged.
+    let mut typed: Vec<(&Expr, ArgClass, RockyType)> = Vec::new();
+    for branch in branches {
+        if matches!(branch, Expr::Value(v) if v.value == ast::Value::Null) {
+            continue;
+        }
+        let Some((class, ty)) = exact_column_class(branch, scope, &ctx.having_aliases) else {
+            return;
+        };
+        typed.push((branch, class, ty));
+    }
     let Some((first, first_class, first_ty)) = typed.first() else {
         return;
     };
@@ -1387,6 +1424,9 @@ mod tests {
             "SELECT lower(CAST(qty AS VARCHAR)) AS x FROM raw.orders",
             "SELECT lower(missing_col) AS x FROM raw.orders",
             "SELECT lower(q) AS x FROM (SELECT qty + 1 AS q FROM raw.orders) s",
+            // Red team: in HAVING a bare name can be a select-list alias.
+            "SELECT CAST(qty AS VARCHAR) AS qty, count(*) AS n FROM raw.orders GROUP BY ALL \
+             HAVING lower(qty) = '2'",
         ] {
             assert!(codes_on(sql, duckdb).is_empty(), "{sql}");
         }
@@ -1442,6 +1482,13 @@ mod tests {
             "SELECT CASE WHEN qty > 1 THEN 'many' ELSE qty END AS x FROM raw.orders",
             "SELECT CASE WHEN is_paid THEN qty ELSE CAST(status AS INT) END AS x \
              FROM raw.orders",
+            // Red team: a branch Rocky does not class can change DuckDB's
+            // result type (JSON here), so the list is not judged.
+            "SELECT coalesce(qty, CAST(status AS JSON), status) AS x FROM raw.orders",
+            "SELECT coalesce(qty, upper(status), status) AS x FROM raw.orders",
+            "SELECT coalesce(qty, '1', status) AS x FROM raw.orders",
+            "SELECT CAST(order_date AS VARCHAR) AS order_date, max(status) AS status \
+             FROM raw.orders GROUP BY ALL HAVING coalesce(order_date, status) = 's'",
         ] {
             assert!(codes_on(sql, duckdb).is_empty(), "{sql}");
         }
@@ -1496,7 +1543,12 @@ mod tests {
                 let whens: Vec<String> = init.iter().map(|n| format!("WHEN b THEN {n}")).collect();
                 let case = format!("SELECT CASE {} ELSE {last} END FROM t", whens.join(" "));
                 for sql in [coalesce, case] {
-                    assert!(conn.prepare(&sql).is_err(), "DuckDB accepts {sql}");
+                    let err = conn.prepare(&sql).err().map(|e| e.to_string());
+                    assert!(
+                        err.as_deref()
+                            .is_some_and(|e| e.contains("Cannot mix values of type")),
+                        "DuckDB does not refuse {sql} for its branch types: {err:?}"
+                    );
                     checked += 1;
                 }
             }

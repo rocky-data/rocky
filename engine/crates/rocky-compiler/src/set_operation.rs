@@ -74,7 +74,7 @@ fn report(body: &SetExpr, model_name: &str, out: &mut Vec<Diagnostic>) {
                 model_name,
                 format!(
                     "the branches of this {op} return different numbers of columns: {l} on the \
-                     left, {r} on the right. Every warehouse refuses this"
+                     left, {r} on the right. SQL requires the same number in every branch"
                 ),
             )
             .with_suggestion(
@@ -122,7 +122,11 @@ fn width(body: &SetExpr) -> Option<usize> {
             if by_name(set_quantifier) {
                 return None;
             }
-            width(left).or_else(|| width(right))
+            match (width(left), width(right)) {
+                // A mismatch inside is reported there, once.
+                (Some(l), Some(r)) if l != r => None,
+                (l, r) => l.or(r),
+            }
         }
         SetExpr::Values(values) => {
             let first = values.rows.first()?.len();
@@ -138,7 +142,7 @@ fn width(body: &SetExpr) -> Option<usize> {
 
 /// Whether `expr` holds, at any depth, a call that can return more than one
 /// column.
-fn expands_to_columns(expr: &Expr) -> bool {
+pub(crate) fn expands_to_columns(expr: &Expr) -> bool {
     struct Finder(bool);
     impl Visitor for Finder {
         type Break = ();
@@ -174,6 +178,7 @@ const EXPANDERS: &[&str] = &[
     "json_tuple",
     "unpack",
     "struct_unpack",
+    "untuple",
 ];
 
 #[cfg(test)]
@@ -202,6 +207,15 @@ mod tests {
         }
     }
 
+    /// A chain with one mismatch is reported once.
+    #[test]
+    fn a_chain_reports_one_mismatch_once() {
+        assert_eq!(
+            codes("select a, b from t union all select a from u union all select a from v"),
+            1
+        );
+    }
+
     #[test]
     fn an_unknown_or_matching_width_is_clean() {
         for sql in [
@@ -218,6 +232,7 @@ mod tests {
             "select a, b from t union by name select a from u",
             "select a from t union all values (1), (2)",
             "select a, b from t",
+            "select a, b from t union all select untuple(p) from u",
         ] {
             assert_eq!(codes(sql), 0, "{sql}");
         }
@@ -240,7 +255,12 @@ mod tests {
             "(select a, b from t) union all (select a from u)",
         ] {
             assert_eq!(codes(sql), 1, "{sql}");
-            assert!(conn.prepare(sql).is_err(), "DuckDB accepts {sql}");
+            let err = conn.prepare(sql).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref()
+                    .is_some_and(|e| e.contains("same number of result columns")),
+                "DuckDB does not refuse {sql} for its column count: {err:?}"
+            );
         }
     }
 }
