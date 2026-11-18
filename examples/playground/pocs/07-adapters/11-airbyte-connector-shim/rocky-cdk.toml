@@ -1,0 +1,88 @@
+# The Airbyte shim with no Docker: a declarative source manifest run through
+# airbyte-cdk's `source-declarative-manifest`. run-cdk.sh runs these.
+#
+# Every manifest here is this POC's own (Apache-2.0). Most Airbyte source
+# manifests are Elastic License 2.0: none is shipped or vendored here. Fetch
+# one yourself, read it, and pin its SHA-256 in `manifest_sha256`.
+
+[adapter]
+type = "duckdb"
+path = "poc_cdk.duckdb"
+
+[connector.orders_cdk]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/orders_cdk"
+target     = { catalog = "poc_cdk", schema = "main", table = "orders" }
+retries    = 0
+
+[connector.orders_cdk.options]
+# Paths are relative to connector/main.py.
+manifest        = "../cdk/orders-manifest.yaml"
+# `shasum -a 256 cdk/orders-manifest.yaml`. The manifest decides which hosts
+# receive the config, secrets from config_env included, so the shim runs only
+# the manifest this hash names.
+manifest_sha256 = "74549563107108832a0bf4fc00caf1ae4569a9aceac8a7e6104002473945b136"
+# A pinned airbyte-cdk in cdk/.venv (run-cdk.sh installs it).
+cdk_bin         = "../cdk/.venv/bin/source-declarative-manifest"
+stream          = "orders"
+
+[connector.orders_cdk.options.config]
+base_url   = "http://127.0.0.1:18766"
+start_date = "2026-11-01T00:00:00Z"
+end_date   = "2026-12-31T00:00:00Z"
+
+# The same manifest with a wrong hash: the run fails before airbyte-cdk starts.
+[connector.orders_cdk_bad_hash]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/orders_cdk_bad_hash"
+target     = { catalog = "poc_cdk", schema = "main", table = "bad_hash" }
+retries    = 0
+
+[connector.orders_cdk_bad_hash.options]
+manifest        = "../cdk/orders-manifest.yaml"
+manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+cdk_bin         = "../cdk/.venv/bin/source-declarative-manifest"
+stream          = "orders"
+
+[connector.orders_cdk_bad_hash.options.config]
+base_url   = "http://127.0.0.1:18766"
+start_date = "2026-11-01T00:00:00Z"
+end_date   = "2026-12-31T00:00:00Z"
+
+# A manifest that names a custom Python component: the run must fail.
+[connector.orders_cdk_custom_component]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/orders_cdk_custom_component"
+target     = { catalog = "poc_cdk", schema = "main", table = "custom_component" }
+retries    = 0
+
+[connector.orders_cdk_custom_component.options]
+manifest        = "../cdk/probe-custom-component.yaml"
+manifest_sha256 = "0e563c38898cae91c726b2affc8e3453f5871e5794379fd4ee4666d44ec564e8"
+cdk_bin         = "../cdk/.venv/bin/source-declarative-manifest"
+stream          = "orders"
+
+[connector.orders_cdk_custom_component.options.config]
+base_url   = "http://127.0.0.1:18766"
+start_date = "2026-11-01T00:00:00Z"
+end_date   = "2026-12-31T00:00:00Z"
+
+# The pinned manifest, with AIRBYTE_ENABLE_UNSAFE_CODE handed to the shim:
+# the shim refuses it before airbyte-cdk starts.
+[connector.orders_cdk_unsafe_code]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/orders_cdk_unsafe_code"
+target     = { catalog = "poc_cdk", schema = "main", table = "unsafe_code" }
+secrets    = ["AIRBYTE_ENABLE_UNSAFE_CODE"]
+retries    = 0
+
+[connector.orders_cdk_unsafe_code.options]
+manifest        = "../cdk/orders-manifest.yaml"
+manifest_sha256 = "74549563107108832a0bf4fc00caf1ae4569a9aceac8a7e6104002473945b136"
+cdk_bin         = "../cdk/.venv/bin/source-declarative-manifest"
+stream          = "orders"
+
+[connector.orders_cdk_unsafe_code.options.config]
+base_url   = "http://127.0.0.1:18766"
+start_date = "2026-11-01T00:00:00Z"
+end_date   = "2026-12-31T00:00:00Z"
