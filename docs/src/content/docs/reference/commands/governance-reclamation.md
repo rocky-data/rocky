@@ -157,7 +157,7 @@ rocky policy unfreeze --principal agent --scope 'model=fct_*'
 | `freeze`, `unfreeze` | `--scope <SCOPE>` | `string` | `any` | `any`, `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`. `unfreeze` must match the freeze's scope. |
 | `freeze`, `unfreeze` | `--reason <TEXT>` | `string` | a generated description | Reason recorded on the ledger row and the durable marker. |
 
-The capabilities are `read`, `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, `schema_change.additive`, `schema_change.breaking` and `value_change`. A `[[policy.rules]]` rule and a `[[policy.tests]]` scenario accept all of them. `check --capability` does not accept `run` yet ([#2651](https://github.com/rocky-data/rocky/issues/2651)). `test` and `show` take no flags.
+The capabilities are `read`, `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, `schema_change.additive`, `schema_change.breaking` and `value_change`. `check --capability`, a `[[policy.rules]]` rule and a `[[policy.tests]]` scenario accept all of them. `test` and `show` take no flags.
 
 `check --capability run` answers for an agent's `rocky run` of one model, without `--branch`, in a project with a `[policy]` block. Two cases differ from what the run gate does. A project with no `[policy]` block reports the default posture, but `rocky run` is not gated there. A `rocky run --branch` waives the default posture, so only an explicit `run` rule decides it, and `check` does not model that. The run gate also decides replication tables and model-less writes, which `check` cannot name.
 
