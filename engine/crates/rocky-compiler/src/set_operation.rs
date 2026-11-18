@@ -6,12 +6,15 @@
 //! up on the model's columns, so the model compiled clean and failed at run
 //! time.
 //!
-//! Outside any CTE body the finding is the error `E071`: every warehouse
-//! binds the whole main query, a subquery that never runs included. Inside
-//! a CTE body or a named `WINDOW` definition it is the warning `W071`, since
-//! DuckDB never binds a CTE nothing reads or a window nothing uses, and
-//! telling which are used needs name resolution.
-//! The check itself needs none: it compares the widths the syntax states.
+//! The finding is the error `E071` only where DuckDB is shown to bind the
+//! query: the model's query, its set-operation branches, derived tables in
+//! `FROM`, and subqueries in the select list, `WHERE`, `HAVING` and a join's
+//! `ON`, nested any number of times, even a subquery that never runs
+//! ([`bound_subqueries`]). Everywhere else, a CTE body, a named `WINDOW`, an
+//! `ORDER BY` or any place not on that list, it is the warning `W071`:
+//! DuckDB skips a CTE nothing reads or a window nothing uses, and an
+//! unlisted place may be skipped too. The check needs no name resolution:
+//! it compares the widths the syntax states.
 //!
 //! A branch's width is counted only when the SQL states it: a `*`, a
 //! `t.*`, a multi-alias item, and a call that expands to several columns
@@ -21,7 +24,10 @@
 
 use std::collections::HashSet;
 
-use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, SetQuantifier, Statement, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, JoinConstraint, JoinOperator, Query, SelectItem, SetExpr, SetQuantifier, Statement,
+    TableFactor, TableWithJoins, Visit, Visitor,
+};
 use sqlparser::parser::Parser;
 
 use crate::diagnostic::{Diagnostic, E071, W071};
@@ -32,94 +38,178 @@ pub fn check_set_operation_widths(model_name: &str, sql: &str) -> Vec<Diagnostic
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return Vec::new();
     };
-    let [Statement::Query(_)] = statements.as_slice() else {
+    let [Statement::Query(query)] = statements.as_slice() else {
         return Vec::new();
     };
-    let mut visitor = Queries {
+    let mut places = Places {
         model_name,
-        skippable: HashSet::new(),
-        in_skippable: 0,
+        root: std::ptr::from_ref(&**query),
+        bound: HashSet::new(),
         out: Vec::new(),
     };
-    let _ = statements.visit(&mut visitor);
-    visitor.out
+    let _ = query.visit(&mut places);
+    places.out
 }
 
-struct Queries<'m> {
+/// Where a set operation sits, which sets the finding's severity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Reached from the model's query only through places DuckDB is shown to
+    /// bind ([`bound_subqueries`]), so the warehouse refuses it: `E071`.
+    Bound,
+    /// Anywhere else: a CTE body, a named window, an `ORDER BY`, a lambda,
+    /// or any place not on that list. The warehouse may skip it: `W071`.
+    MaybeSkipped,
+}
+
+/// Reports each query's set operations at its [`Place`]. The model's query
+/// is bound. Entering a bound query records the queries directly in it at a
+/// listed place ([`bound_subqueries`]), before the visitor reaches them; a
+/// query not recorded, a CTE body or one in an unlisted place, is
+/// [`Place::MaybeSkipped`], and so is everything inside it. A place nobody
+/// listed can only give a warning.
+struct Places<'m> {
     model_name: &'m str,
-    /// Every query a warehouse may skip: CTE bodies and the subqueries of
-    /// named window definitions. They are added when the visitor enters the
-    /// query that holds them, so each is here before the visitor reaches it.
-    skippable: HashSet<*const Query>,
-    /// How many skippable queries the visitor is inside.
-    in_skippable: usize,
+    root: *const Query,
+    bound: HashSet<*const Query>,
     out: Vec<Diagnostic>,
 }
 
-impl Visitor for Queries<'_> {
+impl Visitor for Places<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        if self.skippable.contains(&std::ptr::from_ref(query)) {
-            self.in_skippable += 1;
-        }
-        if let Some(with) = &query.with {
-            self.skippable.extend(
-                with.cte_tables
-                    .iter()
-                    .map(|cte| std::ptr::from_ref(&*cte.query)),
-            );
-        }
-        named_window_queries(&query.body, &mut self.skippable);
-        let place = if self.in_skippable == 0 {
-            Place::MainQuery
+        let this = std::ptr::from_ref(query);
+        let place = if this == self.root || self.bound.contains(&this) {
+            Place::Bound
         } else {
-            Place::CteBody
+            Place::MaybeSkipped
         };
-        report(&query.body, self.model_name, place, &mut self.out);
-        std::ops::ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        if self.skippable.contains(&std::ptr::from_ref(query)) {
-            self.in_skippable -= 1;
+        if place == Place::Bound {
+            bound_subqueries(&query.body, &mut self.bound);
         }
+        report(&query.body, self.model_name, place, &mut self.out);
         std::ops::ControlFlow::Continue(())
     }
 }
 
-/// Add the subqueries of every named `WINDOW` definition in `body`'s
-/// selects to `out`. A parenthesised query in `body` is its own query and is
-/// handled when the visitor enters it.
-fn named_window_queries(body: &SetExpr, out: &mut HashSet<*const Query>) {
-    struct Subqueries<'o>(&'o mut HashSet<*const Query>);
-    impl Visitor for Subqueries<'_> {
-        type Break = ();
-        fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-            self.0.insert(std::ptr::from_ref(query));
-            std::ops::ControlFlow::Continue(())
-        }
-    }
+/// Add to `out` the queries directly in `body` at a place DuckDB binds
+/// whenever it binds `body`, a subquery that never runs included (each is
+/// covered by `duckdb_binds_every_listed_place`):
+/// - a branch of a set operation, or the body in parentheses;
+/// - a derived table in `FROM` or a join, `LATERAL` included;
+/// - a subquery in the select list, `WHERE`, `HAVING` or a join's `ON`,
+///   unless it sits inside a lambda.
+fn bound_subqueries(body: &SetExpr, out: &mut HashSet<*const Query>) {
     match body {
         SetExpr::Select(select) => {
-            let _ = select.named_window.visit(&mut Subqueries(out));
+            for item in &select.projection {
+                let _ = item.visit(&mut ExprSubqueries(out, 0, 0));
+            }
+            for expr in select.selection.iter().chain(&select.having) {
+                let _ = expr.visit(&mut ExprSubqueries(out, 0, 0));
+            }
+            for from in &select.from {
+                bound_in_from(from, out);
+            }
         }
         SetExpr::SetOperation { left, right, .. } => {
-            named_window_queries(left, out);
-            named_window_queries(right, out);
+            bound_subqueries(left, out);
+            bound_subqueries(right, out);
         }
+        SetExpr::Query(query) => {
+            out.insert(std::ptr::from_ref(&**query));
+        }
+        // Not on the list: `VALUES`, `TABLE`, `FROM`-first and the rest.
         _ => {}
     }
 }
 
-/// Where a set operation sits, which sets the finding's severity.
-#[derive(Clone, Copy)]
-enum Place {
-    /// Outside every CTE body: always bound, so an error (`E071`).
-    MainQuery,
-    /// Inside a CTE body or a named window definition, at any depth: bound
-    /// only if it is used, so a warning (`W071`).
-    CteBody,
+fn bound_in_from(from: &TableWithJoins, out: &mut HashSet<*const Query>) {
+    bound_in_factor(&from.relation, out);
+    for join in &from.joins {
+        bound_in_factor(&join.relation, out);
+        if let Some(JoinConstraint::On(on)) = on_constraint(&join.join_operator) {
+            let _ = on.visit(&mut ExprSubqueries(out, 0, 0));
+        }
+    }
+}
+
+fn bound_in_factor(factor: &TableFactor, out: &mut HashSet<*const Query>) {
+    match factor {
+        TableFactor::Derived { subquery, .. } => {
+            out.insert(std::ptr::from_ref(&**subquery));
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => bound_in_from(table_with_joins, out),
+        // Not on the list: table functions, `UNNEST`, `PIVOT` and the rest.
+        _ => {}
+    }
+}
+
+/// The constraint of an ordinary inner or outer join. Other joins are not
+/// on the list.
+fn on_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
+    match operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// A lambda, which the parser reads as `Expr::Lambda` or, for `x -> body`,
+/// as an `->` operator. `->` is also DuckDB's JSON lookup; counting that as a
+/// lambda only turns an error into a warning.
+fn is_lambda(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Lambda(_)
+            | Expr::BinaryOp {
+                op: sqlparser::ast::BinaryOperator::Arrow,
+                ..
+            }
+    )
+}
+
+/// Collects the outermost queries in an expression that are not inside a
+/// lambda. Fields: output, query depth, lambda depth.
+struct ExprSubqueries<'o>(&'o mut HashSet<*const Query>, usize, usize);
+
+impl Visitor for ExprSubqueries<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+        if self.1 == 0 && self.2 == 0 {
+            self.0.insert(std::ptr::from_ref(query));
+        }
+        self.1 += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<()> {
+        self.1 -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+        if is_lambda(expr) {
+            self.2 += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+        if is_lambda(expr) {
+            self.2 -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 /// Check the set operations of one query body. A parenthesised query inside
@@ -147,13 +237,13 @@ fn report(body: &SetExpr, model_name: &str, place: Place, out: &mut Vec<Diagnost
              left, {r} on the right. SQL requires the same number in every branch"
         );
         let diagnostic = match place {
-            Place::MainQuery => Diagnostic::error(E071, model_name, message),
-            Place::CteBody => Diagnostic::warning(
+            Place::Bound => Diagnostic::error(E071, model_name, message),
+            Place::MaybeSkipped => Diagnostic::warning(
                 W071,
                 model_name,
                 format!(
-                    "{message}. It is inside a CTE or a named window, which the warehouse may \
-                     skip if nothing uses it"
+                    "{message}. It is in a place the warehouse may skip, such as a CTE or a \
+                     named window nothing uses"
                 ),
             ),
         };
@@ -441,6 +531,72 @@ mod tests {
             format!("SELECT * FROM (WITH c AS (SELECT 1 a) {bad}) d"),
         ] {
             assert_eq!(severities(&sql), ["E071"], "{sql}");
+        }
+    }
+
+    /// Every place on the bound list gives `E071`, and DuckDB refuses each
+    /// one, also nested and also where the subquery never runs.
+    #[test]
+    fn duckdb_binds_every_listed_place() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a INTEGER, s VARCHAR); CREATE TABLE u (a INTEGER, b INTEGER)",
+        )
+        .unwrap();
+        let bad = "SELECT a FROM u UNION ALL SELECT a, b FROM u";
+        for sql in [
+            // The model's query, and a branch in parentheses.
+            bad.to_string(),
+            format!("SELECT a FROM t UNION ALL ({bad})"),
+            format!("({bad})"),
+            // Derived tables, LATERAL and nested joins included.
+            format!("SELECT * FROM ({bad}) d"),
+            format!("SELECT * FROM t JOIN ({bad}) d ON true"),
+            format!("SELECT * FROM t, LATERAL ({bad}) d"),
+            format!("SELECT * FROM (t JOIN ({bad}) d ON true)"),
+            // Expression subqueries, never run included.
+            format!("SELECT ({bad}) FROM t"),
+            format!("SELECT CASE WHEN false THEN ({bad}) END FROM t"),
+            format!("SELECT a FROM t WHERE false AND a IN ({bad})"),
+            format!("SELECT a FROM t WHERE EXISTS ({bad})"),
+            format!("SELECT a FROM t GROUP BY a HAVING false AND a IN ({bad})"),
+            format!("SELECT * FROM t JOIN u ON false AND t.a IN ({bad})"),
+            format!("SELECT * FROM t LEFT JOIN u ON t.a IN ({bad})"),
+            // Nested through listed places.
+            format!("SELECT * FROM (SELECT a FROM t WHERE a IN ({bad})) d"),
+            format!("SELECT a FROM t WHERE a IN (SELECT a FROM ({bad}) d)"),
+            format!("SELECT a FROM t WHERE a IN ({bad}) UNION ALL SELECT a FROM t"),
+        ] {
+            assert_eq!(severities(&sql), ["E071"], "{sql}");
+            let err = conn.prepare(&sql).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref()
+                    .is_some_and(|e| e.contains("same number of result columns")),
+                "DuckDB does not refuse {sql} for its column count: {err:?}"
+            );
+        }
+    }
+
+    /// A place not on the bound list is `W071`, and so is a listed place
+    /// inside it.
+    #[test]
+    fn an_unlisted_place_is_a_warning() {
+        let bad = "SELECT a FROM u UNION ALL SELECT a, b FROM u";
+        for sql in [
+            format!("WITH c AS ({bad}) SELECT * FROM c"),
+            format!("SELECT a FROM t ORDER BY (SELECT count(*) FROM ({bad}) d)"),
+            format!("SELECT a FROM t GROUP BY a, (SELECT 1 FROM ({bad}) d)"),
+            format!("SELECT a FROM t QUALIFY a IN ({bad})"),
+            format!("SELECT a FROM t LIMIT (SELECT count(*) FROM ({bad}) d)"),
+            format!("SELECT list_transform([1], x -> (SELECT count(*) FROM ({bad}) d))"),
+            format!("SELECT * FROM t SEMI JOIN u ON t.a IN ({bad})"),
+            format!("SELECT * FROM range((SELECT count(*) FROM ({bad}) d))"),
+            format!("SELECT a FROM t UNION ALL SELECT a FROM t ORDER BY (SELECT 1 FROM ({bad}) d)"),
+            format!("SELECT a FROM t WINDOW w AS (ORDER BY ({bad}))"),
+            format!("WITH c AS (SELECT * FROM ({bad}) d) SELECT 1"),
+            format!("SELECT (WITH c AS ({bad}) SELECT 1) FROM t"),
+        ] {
+            assert_eq!(severities(&sql), ["W071"], "{sql}");
         }
     }
 

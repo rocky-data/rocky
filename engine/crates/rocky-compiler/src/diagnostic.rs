@@ -269,12 +269,11 @@ pub const E064: &str = "E064";
 /// numbers of columns (#2661). SQL requires the same number in every branch,
 /// so it is checked whatever the warehouse. Emitted by
 /// `rocky compile` from [`crate::set_operation`] when both counts are known
-/// from the SQL, outside every CTE body and named window; `BY NAME` is not
-/// checked.
+/// from the SQL, in a place DuckDB always binds; `BY NAME` is not checked.
 pub const E071: &str = "E071";
-/// The warning form of [`E071`], for a mismatch inside a CTE body or a named
-/// `WINDOW` definition. A warehouse may skip one nothing uses (DuckDB never
-/// binds it), so it never fails a compile on its own.
+/// The warning form of [`E071`], for a mismatch in a place the warehouse may
+/// skip: a CTE body, a named `WINDOW` or any place not on the bound list in
+/// [`crate::set_operation`]. It never fails a compile on its own.
 pub const W071: &str = "W071";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
