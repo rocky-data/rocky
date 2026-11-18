@@ -1368,7 +1368,7 @@ With no `[policy]` block, the gate returns `NotConfigured` and allows the action
 
 **Principals.** `"human"` is a person. `"agent"` is a non-human caller. In this version you supply the principal explicitly, for example `rocky policy check --principal agent`.
 
-**Capabilities.** `read` (always allowed), `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `quarantine`, plus three refinements of apply and promote: `schema_change.additive`, `schema_change.breaking`, and `value_change`. A rule naming `apply` or `promote` also matches those three refinements. Every other capability matches only itself, and a rule naming a refinement matches only that refinement.
+**Capabilities.** `read` (always allowed), `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, plus three refinements of apply and promote: `schema_change.additive`, `schema_change.breaking`, and `value_change`. A rule naming `apply` or `promote` also matches those three refinements. Every other capability matches only itself, and a rule naming a refinement matches only that refinement.
 
 **The `run` capability.** An agent's `rocky run` is evaluated under `run`, one decision per model it builds and per replication table it copies, recorded under the ledger id `run:<run_id>`. Only a rule naming `run` matches it: an `apply` rule was written for the reviewed two-step path and never allows a one-step run. A human's run, or a project with no `[policy]` block, is not evaluated.
 

@@ -159,6 +159,8 @@ rocky policy unfreeze --principal agent --scope 'model=fct_*'
 
 The capabilities are `read`, `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, `schema_change.additive`, `schema_change.breaking` and `value_change`. `test` and `show` take no flags.
 
+`check --capability run` answers for an agent's `rocky run` of one model, without `--branch`, in a project with a `[policy]` block. Two cases differ from what the run gate does. A project with no `[policy]` block reports the default posture, but `rocky run` is not gated there. A `rocky run --branch` waives the default posture, so only an explicit `run` rule decides it, and `check` does not model that. The run gate also decides replication tables and model-less writes, which `check` cannot name.
+
 Policy can only tighten at runtime: freeze and the autonomy-budget degradation move effects toward `require_review` / `deny`, never toward `allow`.
 
 Two things `show` reports rather than hides.
