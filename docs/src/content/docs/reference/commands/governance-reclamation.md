@@ -157,7 +157,7 @@ rocky policy unfreeze --principal agent --scope 'model=fct_*'
 | `freeze`, `unfreeze` | `--scope <SCOPE>` | `string` | `any` | `any`, `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`. `unfreeze` must match the freeze's scope. |
 | `freeze`, `unfreeze` | `--reason <TEXT>` | `string` | a generated description | Reason recorded on the ledger row and the durable marker. |
 
-The capabilities are `read`, `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, `schema_change.additive`, `schema_change.breaking` and `value_change`. A `[[policy.rules]]` rule and a `[[policy.tests]]` scenario accept all of them. `check --capability` accepts all of them except `run`. `test` and `show` take no flags.
+The capabilities are `read`, `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, `schema_change.additive`, `schema_change.breaking` and `value_change`. A `[[policy.rules]]` rule and a `[[policy.tests]]` scenario accept all of them. `check --capability` does not accept `run` yet ([#2651](https://github.com/rocky-data/rocky/issues/2651)). `test` and `show` take no flags.
 
 Policy can only tighten at runtime: freeze and the autonomy-budget degradation move effects toward `require_review` / `deny`, never toward `allow`.
 
