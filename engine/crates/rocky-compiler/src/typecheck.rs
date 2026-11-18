@@ -126,7 +126,7 @@ impl TypeScope {
     /// Whether a column reference names no column in scope at all, as when
     /// its source schema is missing. A column that is in scope with a type
     /// Rocky does not model (`INTERVAL`, `TIME`) is resolved.
-    fn is_unresolved_column(&self, expr: &Expr) -> bool {
+    pub(crate) fn is_unresolved_column(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Identifier(ident) => !self.columns.contains_key(CiStr::new(&ident.value)),
             Expr::CompoundIdentifier(parts) if parts.len() >= 2 => !self
@@ -878,6 +878,10 @@ fn compute_model_typecheck(
             model_name,
             &model.sql,
             &relation_columns,
+        ));
+        // E071: set-operation branches with different column counts.
+        diagnostics.extend(crate::set_operation::check_set_operation_widths(
+            model_name, &model.sql,
         ));
         // E029: a bare column name two joined relations both provably have.
         diagnostics.extend(crate::ambiguous::check_ambiguous_columns(
@@ -4383,7 +4387,7 @@ fn function_name(expr: &Expr) -> Option<String> {
 /// (`LENGTH`), a numeric literal, `COALESCE` over a literal that changes the
 /// type — is not exact, so a nested expression built from it stays `Unknown`
 /// (#2295).
-fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
+pub(crate) fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
         // A column of a CTE or derived table is exact only when the
         // expression that built it is (#2320).

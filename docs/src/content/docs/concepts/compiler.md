@@ -256,6 +256,64 @@ These calls are never reported:
 - A form the SQL parser or the warehouse rewrites, such as `COALESCE`, `IF` or
   `IFNULL`.
 
+#### Calls and branches DuckDB refuses
+
+When a model runs on DuckDB, Rocky also reports calls and branches that
+DuckDB refuses before it reads any data:
+
+```sql
+-- E068: DuckDB has no `lower` that takes 2 arguments
+SELECT lower(customer_name, 'x') AS n FROM customers
+-- E069: DuckDB has no `lower` that takes a number at argument 1 of 1
+SELECT lower(amount) AS n FROM orders
+-- E070: COALESCE mixes `order_date` (DATE) and `status` (STRING)
+SELECT coalesce(order_date, status) AS d FROM orders
+```
+
+- `E068` checks the number of arguments of a DuckDB built-in.
+- `E069` checks a column argument against the types each position of the
+  function takes. Only a column whose type Rocky read from the SQL is checked.
+  A literal, `NULL` or computed argument is not, because DuckDB converts
+  literals. Aggregates that `E042` checks are left to it.
+- `E070` checks `CASE` and `COALESCE` branches that are columns. Numbers and
+  booleans form one group, text another, and dates and timestamps a third.
+  Two branches from different groups are refused. Within a group, DuckDB's
+  result can depend on the branch order, so that is not checked.
+
+Rocky does not guess these rules. A test probes the bundled DuckDB 2.0 and
+writes them to `engine/crates/rocky-compiler/src/data/duckdb_signatures.txt`.
+Another test fails if DuckDB accepts any call the file says it refuses, or if
+the bundled version changes. The checks run only when DuckDB is one of the
+model's targets; other warehouses are not checked.
+
+These are not reported:
+
+- The same calls as for `E057`: schema-qualified, quoted, declared in
+  `functions/`, or a rewritten form.
+- A call with named arguments, `*`, `DISTINCT`, `ORDER BY` inside the
+  parentheses, a lambda, `FILTER`, `WITHIN GROUP` or `OVER`.
+- A DuckDB macro created outside Rocky that reuses a built-in name. Call it
+  schema-qualified.
+- A `CASE` whose text literal fails to convert only for some rows, as in
+  `CASE WHEN qty > 1 THEN 'many' ELSE qty END`. DuckDB accepts this query and
+  fails only when a row reaches the text branch.
+
+#### Set operations with different column counts (`E071`)
+
+`E071` reports a `UNION`, `INTERSECT` or `EXCEPT` whose branches return
+different numbers of columns, on every warehouse:
+
+```sql
+-- E071: the branches of this UNION return different numbers of columns: 2 on the left, 1 on the right
+SELECT order_id, status FROM orders UNION ALL SELECT order_id FROM returns
+```
+
+A branch is counted only when its select list states its width. A `*`, a
+`t.*`, or a call that returns several columns (`COLUMNS(...)`, `UNNEST`,
+`EXPLODE`) is not counted. `UNION BY NAME` is not checked. Rocky does not
+check whether the column types match across branches: DuckDB accepts every
+type mix, and the other warehouses are not checked yet.
+
 ### 5. Validate contracts
 
 Rocky loads the `.contract.toml` files and checks resolvable facts against
@@ -625,6 +683,10 @@ span, and sometimes a suggested fix.
 | `E062` | A model with a contract repeats an output name the contract constrains (`[[columns]]`, `required` or `protected`). The contract checks one column of that name; the warehouse writes the other under another name. Alias the repeat. Names match as for `E061` |
 | `E063` | `[rules] no_extra_columns = true` and the model outputs a column the contract does not name in `[[columns]]`, `required` or `protected`, or Rocky cannot prove the column list (a `SELECT *`, an unaliased expression). Declare the column, drop it, or list the columns explicitly |
 | `E064` | A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no known source table, and is one or two edits from a model name (one edit for names under 5 characters). The message names the model. If it is a real warehouse table, qualify it with its schema (`main.stg_ordrs`) |
+| `E068` | A call to a DuckDB built-in passes a number of arguments it does not take. Only when the model runs on DuckDB. See [Calls and branches DuckDB refuses](#calls-and-branches-duckdb-refuses) |
+| `E069` | A column argument to a DuckDB built-in has a type no overload of the function takes at that position, as in `lower(amount)`. Only when the model runs on DuckDB |
+| `E070` | `CASE` or `COALESCE` branches are columns of types DuckDB has no common type for, as in `COALESCE(order_date, status)`. Only when the model runs on DuckDB |
+| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns. Every warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |

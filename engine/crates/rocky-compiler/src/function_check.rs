@@ -57,7 +57,7 @@ use std::sync::LazyLock;
 use sqlparser::ast::{self, Expr, Spanned, Statement, Visit, Visitor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E057, SourceSpan, W057};
+use crate::diagnostic::{Diagnostic, E057, E068, SourceSpan, W057};
 use crate::operand_check::{OperandDialect, OperandTarget};
 use crate::udf::FunctionRegistry;
 
@@ -268,6 +268,12 @@ const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 /// dialect's list already holds it.
 const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try", "date"];
 
+/// Whether `lower_name` is a call-position form the parser or the warehouse
+/// rewrites ([`SPECIAL_FORMS`]) or one only DuckDB's grammar has.
+pub(crate) fn is_special_form(lower_name: &str) -> bool {
+    SPECIAL_FORMS.contains(&lower_name) || DUCKDB_ONLY_FORMS.contains(&lower_name)
+}
+
 /// Report calls to functions the target dialect does not have.
 ///
 /// `target_for` maps a model name to the warehouses it runs on, as for the
@@ -336,18 +342,33 @@ fn check_model(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"));
     let file = model.file_path.display().to_string();
     let mut diagnostics = Vec::new();
+    let at = |line: usize, col: usize| {
+        if precise_spans && line > 0 {
+            (line, col)
+        } else {
+            (1, 1)
+        }
+    };
     for &dialect in dialects {
         let mut seen = HashSet::new();
-        for (name, line, col) in &visitor.found {
+        for (name, line, col, count) in &visitor.found {
             let lower = name.to_ascii_lowercase();
-            if dialect.knows(&lower) || !seen.insert(lower) {
+            if dialect.knows(&lower) {
+                if dialect == FunctionDialect::DuckDb
+                    && let Some(count) = *count
+                    && crate::duckdb_signatures::refuses_count(&lower, count)
+                {
+                    let (line, col) = at(*line, *col);
+                    diagnostics.push(count_diagnostic(
+                        model, name, &lower, count, &file, line, col,
+                    ));
+                }
                 continue;
             }
-            let (line, col) = if precise_spans && *line > 0 {
-                (*line, *col)
-            } else {
-                (1, 1)
-            };
+            if !seen.insert(lower) {
+                continue;
+            }
+            let (line, col) = at(*line, *col);
             let (code, constructor, phrase): (_, fn(&str, &str, String) -> Diagnostic, _) =
                 match dialect.tier() {
                     Tier::Verified => (E057, Diagnostic::error, "does not exist in"),
@@ -377,6 +398,45 @@ fn check_model(
         }
     }
     diagnostics
+}
+
+/// E068: DuckDB has no overload of `name` that takes `count` arguments.
+fn count_diagnostic(
+    model: &rocky_core::models::Model,
+    name: &str,
+    lower: &str,
+    count: usize,
+    file: &str,
+    line: usize,
+    col: usize,
+) -> Diagnostic {
+    let accepted: Vec<String> = crate::duckdb_signatures::accepted_counts(lower, 8)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let takes = if accepted.is_empty() {
+        String::new()
+    } else {
+        format!(" It takes {} argument(s).", accepted.join(", "))
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    Diagnostic::error(
+        E068,
+        &model.config.name,
+        format!(
+            "DuckDB has no `{name}` that takes {count} argument{plural}, so DuckDB refuses the \
+             query before it reads any data.{takes}"
+        ),
+    )
+    .with_suggestion(format!(
+        "pass the number of arguments `{name}` takes. If `{name}` is a macro created outside \
+         Rocky, call it schema-qualified (`main.{name}(...)`), which Rocky does not check"
+    ))
+    .with_span(SourceSpan {
+        file: file.to_string(),
+        line,
+        col,
+    })
 }
 
 /// "did you mean …" from edit distance, plus the escape hatch.
@@ -419,8 +479,40 @@ fn suggestion(name: &str, dialect: FunctionDialect) -> String {
 struct Calls<'r> {
     registry: &'r FunctionRegistry,
     /// Unqualified, unquoted calls the project does not declare:
-    /// `(name as written, line, column)`.
-    found: Vec<(String, usize, usize)>,
+    /// `(name as written, line, column, argument count)`. The count is
+    /// `None` when the call's arguments are not a plain list
+    /// ([`plain_argument_count`]).
+    found: Vec<(String, usize, usize, Option<usize>)>,
+}
+
+/// The argument count of a call whose arguments are a plain list of
+/// expressions, the shape the DuckDB count data was probed with. `None` for
+/// a call with no parentheses, a subquery argument, a named or `*`
+/// argument, a lambda, `DISTINCT` / `ALL`, a clause inside the parentheses
+/// (`ORDER BY`, `SEPARATOR`, ...), `WITHIN GROUP`, `FILTER` or `OVER`.
+pub(crate) fn plain_argument_count(function: &ast::Function) -> Option<usize> {
+    let ast::FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    if list.duplicate_treatment.is_some()
+        || !list.clauses.is_empty()
+        || !function.within_group.is_empty()
+        || function.filter.is_some()
+        || function.over.is_some()
+        || !matches!(function.parameters, ast::FunctionArguments::None)
+    {
+        return None;
+    }
+    list.args
+        .iter()
+        .all(|arg| {
+            matches!(
+                arg,
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                    if !matches!(e, Expr::Lambda(_))
+            )
+        })
+        .then_some(list.args.len())
 }
 
 impl Visitor for Calls<'_> {
@@ -437,6 +529,7 @@ impl Visitor for Calls<'_> {
                 ident.value.clone(),
                 span.start.line as usize,
                 span.start.column as usize,
+                plain_argument_count(function),
             ));
         }
         std::ops::ControlFlow::Continue(())
@@ -522,6 +615,62 @@ mod tests {
 
     fn run(sql: &str, target: &OperandTarget, registry: &FunctionRegistry) -> Vec<Diagnostic> {
         check_unknown_functions(&[model("m", sql)], registry, &|_| target.clone(), None)
+    }
+
+    fn count_codes(sql: &str, target: &OperandTarget) -> Vec<String> {
+        run(sql, target, &FunctionRegistry::default())
+            .into_iter()
+            .map(|d| d.code.to_string())
+            .collect()
+    }
+
+    /// E068: a DuckDB built-in called with a number of arguments it does not
+    /// take (#2659).
+    #[test]
+    fn a_wrong_argument_count_is_refused_on_duckdb() {
+        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
+        for sql in [
+            "select lower(name, 'x') from t",
+            "select lower() from t",
+            "select round(price, 1, 2) from t",
+            "select md5(a, b) from t",
+            "select upper(lower(a, b)) from t",
+        ] {
+            assert_eq!(count_codes(sql, &duckdb), ["E068"], "{sql}");
+        }
+        for sql in [
+            "select lower(name) from t",
+            "select round(price) from t",
+            "select round(price, 2) from t",
+            "select concat(a, b, c, d, e, f, g) from t",
+            "select count(*) from t",
+            "select main.lower(a, b) from t",
+            "select \"lower\"(a, b) from t",
+            "select string_agg(a, ',' order by a) from t",
+            "select count(distinct a, b) from t",
+            "select coalesce(a, b, c) from t",
+        ] {
+            assert!(count_codes(sql, &duckdb).is_empty(), "{sql}");
+        }
+        // Only DuckDB's counts are known.
+        let snowflake = OperandTarget::from(Some(OperandDialect::Snowflake));
+        assert!(count_codes("select lower(name, 'x') from t", &snowflake).is_empty());
+        assert!(
+            count_codes(
+                "select lower(name, 'x') from t",
+                &OperandTarget::Unconfigured
+            )
+            .is_empty()
+        );
+        // A model that also runs on DuckDB is refused.
+        let both = OperandTarget::Targets {
+            dialects: vec![OperandDialect::Snowflake, OperandDialect::DuckDb],
+            unruled: Vec::new(),
+        };
+        assert_eq!(
+            count_codes("select lower(name, 'x') from t", &both),
+            ["E068"]
+        );
     }
 
     fn registry_with(name: &str) -> FunctionRegistry {
