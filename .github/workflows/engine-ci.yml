@@ -13,10 +13,6 @@ on:
       # run and the PR cannot merge at all (#1557).
       - '.claude/skills/rocky-ai-workflow/SKILL.md'
       - '.github/workflows/engine-ci.yml'
-      # The connectors the `connector-test` job runs: a change to one alone
-      # must still run that job.
-      - 'examples/playground/pocs/07-adapters/08-postgres-child-connector/**'
-      - 'examples/playground/pocs/07-adapters/12-meltano-connector-shim/**'
   # No `paths:` filter on pull_request — deliberately. Four required merge
   # contexts live in this workflow (Test, Clippy, Format, Adapter boundary).
   # A workflow-level path filter leaves those contexts ABSENT on a PR that
@@ -74,6 +70,7 @@ jobs:
       # Exactly one of the two steps runs per event; a skipped step's output
       # is empty, and `||` picks the one that wrote.
       engine: ${{ steps.diff.outputs.engine || steps.trigger.outputs.engine }}
+      connectors: ${{ steps.diff.outputs.connectors || steps.trigger.outputs.connectors }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
@@ -86,12 +83,17 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           # Mirrors the push trigger paths: engine/**, schemas/**, the skill
-          # compiled into the binary (#1557), this workflow itself, and the
-          # two connector POCs the `connector-test` job runs.
-          ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$|examples/playground/pocs/07-adapters/08-postgres-child-connector/|examples/playground/pocs/07-adapters/12-meltano-connector-shim/)
+          # compiled into the binary (#1557), and this workflow itself.
+          ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
+          # Only the `connector-test` job reads this: the connector code it
+          # runs (the manifest, the runner and verifier, and the `rocky
+          # connector` commands), this workflow, and the two connector POCs it
+          # tests. A change to a POC alone runs that job and no other.
+          CONNECTOR_PATHS_RE: ^(engine/crates/rocky-core/src/connector\.rs$|engine/crates/rocky-cli/src/connector/|engine/crates/rocky-cli/src/commands/connector_|\.github/workflows/engine-ci\.yml$|examples/playground/pocs/07-adapters/08-postgres-child-connector/|examples/playground/pocs/07-adapters/12-meltano-connector-shim/)
         run: |
           set -uo pipefail
           engine=true
+          connectors=true
           files=$(mktemp)
           # --no-renames: a rename lists BOTH its old and its new path. Plain
           # `git diff` folds a rename into the destination alone, so a file
@@ -115,11 +117,21 @@ jobs:
               1) engine=false ;;
               *) echo "::warning::grep exited $status while matching the changed paths; running engine CI to fail closed" ;;
             esac
+            # The same listing, matched again for the connector-test job.
+            status=0
+            grep -zqE "$CONNECTOR_PATHS_RE" "$files" || status=$?
+            case "$status" in
+              0) connectors=true ;;
+              1) connectors=false ;;
+              *) echo "::warning::grep exited $status while matching the connector paths; running the connector test to fail closed" ;;
+            esac
           else
             echo "::warning::could not diff the merge commit; running engine CI to fail closed"
           fi
           echo "engine=$engine" >> "$GITHUB_OUTPUT"
+          echo "connectors=$connectors" >> "$GITHUB_OUTPUT"
           echo "engine=$engine"
+          echo "connectors=$connectors"
       - name: Trust the trigger's own paths filter
         id: trigger
         if: github.event_name != 'pull_request'
@@ -128,6 +140,7 @@ jobs:
         working-directory: .
         run: |
           echo "engine=true" >> "$GITHUB_OUTPUT"
+          echo "connectors=true" >> "$GITHUB_OUTPUT"
           echo "engine=true"
 
   test:
@@ -446,11 +459,13 @@ jobs:
   # reference connector in replay mode, and the Meltano shim against its
   # replay stand-in. All three write Parquet through the real duckdb CLI.
   # The dlt shim needs dlt from PyPI, so only engine-weekly runs it. A job of
-  # its own, away from Test, and not a required check.
+  # its own, away from Test, and not a required check. It builds rocky a
+  # second time, so on a pull request it runs only when the connector code or
+  # those POCs change (`connectors`); every push to main runs it.
   connector-test:
     name: Connector test
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.connectors != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
