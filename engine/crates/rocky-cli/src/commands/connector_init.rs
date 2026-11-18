@@ -44,14 +44,27 @@ pub fn scaffold_connector(name: &str, dir: Option<&Path>, lang: ConnectorLang) -
             dir.display()
         );
     }
-    match lang {
-        ConnectorLang::Python => write_python(name, &dir)?,
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    // `create_dir`, not `create_dir_all`: it fails if another process made
+    // the directory since the check, so the cleanup below only ever removes
+    // a directory this call created.
+    std::fs::create_dir(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let written = match lang {
+        ConnectorLang::Python => write_python(name, &dir),
+    };
+    if let Err(e) = written {
+        // A partial scaffold would make the rerun refuse with "already
+        // exists".
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
     }
     Ok(dir)
 }
 
 fn write_python(name: &str, dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let write = |file: &str, body: &str| -> Result<()> {
         let path = dir.join(file);
         std::fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))
@@ -59,6 +72,8 @@ fn write_python(name: &str, dir: &Path) -> Result<()> {
     write("connector.toml", &MANIFEST_TOML.replace("__NAME__", name))?;
     write("main.py", &MAIN_PY.replace("__NAME__", name))?;
     write(HELPER_FILE_NAME, HELPER_PY)?;
+    // Python writes `__pycache__/` beside the helper on each load.
+    write(".gitignore", "__pycache__/\n")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -72,10 +87,10 @@ fn write_python(name: &str, dir: &Path) -> Result<()> {
 /// The `[connector.<name>]` block to paste into `rocky.toml`.
 pub(crate) fn config_block(name: &str, dir: &Path) -> String {
     let manifest = dir.join("connector.toml");
-    let manifest = manifest.to_string_lossy().replace('\\', "/");
+    let manifest = toml::Value::String(manifest.to_string_lossy().replace('\\', "/"));
     format!(
         "[connector.{name}]\n\
-         manifest   = \"{manifest}\"\n\
+         manifest   = {manifest}\n\
          output_uri = \"file://./.rocky/landing/{name}\"\n\
          target     = {{ catalog = \"<catalog>\", schema = \"<schema>\", table = \"{name}\" }}\n"
     )
@@ -93,7 +108,8 @@ pub fn run_connector_init(name: &str, dir: Option<&Path>, lang: ConnectorLang) -
         println!("Created connector `{name}` in {}", dir.display());
         println!();
         println!("Next steps:");
-        println!("  1. Add this block to rocky.toml, with your target catalog and schema:");
+        println!("  1. Add this block to rocky.toml, with your target catalog and schema.");
+        println!("     `manifest` is relative to the directory that holds rocky.toml:");
         println!();
         for line in block.lines() {
             println!("     {line}");
@@ -107,6 +123,12 @@ pub fn run_connector_init(name: &str, dir: Option<&Path>, lang: ConnectorLang) -
         println!("  4. Run: rocky load --connector {name}");
         println!();
         println!("The connector needs python3 (3.8 or newer) and the duckdb CLI on PATH.");
+        if cfg!(not(unix)) {
+            println!(
+                "On this system `./main.py` does not start through its `#!` line: set \
+                 `command` in connector.toml to a program that runs it."
+            );
+        }
     }
     Ok(())
 }
@@ -136,8 +158,9 @@ mod tests {
             python_constant("RESULT_FILE"),
             format!("\"{RESULT_FILE_NAME}\"")
         );
-        let version: u32 = python_constant("HELPER_VERSION").parse().unwrap();
-        assert!(version >= 1);
+        // Raise this, and the constant, when the helper changes in a way a
+        // copy in a user's repository should be told about.
+        assert_eq!(python_constant("HELPER_VERSION"), "1");
     }
 
     #[test]
@@ -153,6 +176,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join(HELPER_FILE_NAME)).unwrap(),
             HELPER_PY
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+            "__pycache__/\n"
         );
         let main = std::fs::read_to_string(dir.join("main.py")).unwrap();
         assert!(!main.contains("__NAME__"));
@@ -191,6 +218,16 @@ mod tests {
             );
             assert!(!dir.exists(), "{name}");
         }
+    }
+
+    #[test]
+    fn a_directory_with_a_quote_still_prints_valid_toml() {
+        let block = config_block("demo", Path::new("odd\"dir"));
+        let value: toml::Value = toml::from_str(&block).unwrap();
+        assert_eq!(
+            value["connector"]["demo"]["manifest"].as_str(),
+            Some("odd\"dir/connector.toml")
+        );
     }
 
     #[test]

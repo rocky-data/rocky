@@ -35,6 +35,8 @@ def main():
     cursor = run.state.get("cursor") if run.state else None
     rows = fetch(run.options, cursor)
     if rows:
+        # One DuckDB type per column. Keep it in step with the keys fetch()
+        # returns: a row with a key not listed here stops the run.
         run.write(rows, columns={"id": "BIGINT", "name": "VARCHAR"})
         cursor = max(row["id"] for row in rows)
     run.finish({"cursor": cursor})

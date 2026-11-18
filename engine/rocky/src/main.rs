@@ -1438,7 +1438,7 @@ enum Command {
         connector: Option<String>,
     },
 
-    /// Scaffold and check child connectors.
+    /// Scaffold child connectors.
     ///
     /// A child connector is a program `rocky load --connector <name>` runs.
     /// It writes Parquet files and a result file; Rocky loads the files and
@@ -6844,6 +6844,21 @@ mod tests {
                 .join()
                 .expect("parser thread panicked")
         })
+    }
+
+    #[test]
+    fn connector_init_parses_its_name_dir_and_language() {
+        let cli =
+            try_parse_with_big_stack(&["rocky", "connector", "init", "orders", "--dir", "c/o"]);
+        let Command::Connector {
+            subcommand: ConnectorSubcommand::Init { name, dir, lang },
+        } = cli.command
+        else {
+            panic!("`rocky connector init` parsed as another command");
+        };
+        assert_eq!(name, "orders");
+        assert_eq!(dir, Some(PathBuf::from("c/o")));
+        assert_eq!(lang, rocky_cli::commands::ConnectorLang::Python);
     }
 
     /// Same overflow, same fix, for building the `clap::Command` graph

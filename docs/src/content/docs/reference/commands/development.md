@@ -632,13 +632,18 @@ rocky connector init orders
 Created connector `orders` in connectors/orders
 ```
 
-The directory holds three files:
+The directory holds four files:
 
 - `connector.toml`: the manifest. `license` is left out, as a commented line: set it to the license of your code. Until you do, `rocky validate` warns V068 and `rocky load` reports `unknown`.
 - `main.py`: the program. Its `fetch()` returns a fixed list of 5 rows and keeps the largest `id` as its cursor, so a second load reads 0 rows. Replace `fetch()` with code that reads your source.
-- `rocky_connector.py`: the helper. It reads the request, the options and the saved state, writes Parquet through the `duckdb` CLI, and writes the result file. It uses the Python standard library only. Do not edit it: a newer Rocky may ship a newer copy.
+- `rocky_connector.py`: the helper. It reads the request, the options and the saved state, writes Parquet through the `duckdb` CLI, and writes the result file. It uses the Python standard library only. Do not edit it: a newer Rocky may ship a newer copy, with a higher `HELPER_VERSION`.
+- `.gitignore`: ignores the `__pycache__/` directory Python writes on each load.
 
-The command then prints the `[connector.<name>]` block to add to `rocky.toml`. The connector needs `python3` (3.8 or newer) and the `duckdb` CLI on `PATH`.
+`run.write(rows, columns=...)` takes a list of dicts and one DuckDB type per column. Every row must have exactly the keys of `columns`: a missing or extra key stops the run, so no column is dropped. Without `columns`, DuckDB infers each type from the rows, and the type can change from one run to the next (for example, a column that is NULL in every row). Rocky then refuses the load when the change is not a safe widening. Pass `columns` for a connector you run more than once. `bytes` values are refused. The rows are staged as JSON in the output directory while DuckDB converts them, and that file counts toward the connector's `output_bytes` limit.
+
+The command then prints the `[connector.<name>]` block to add to `rocky.toml`. Its `manifest` path is relative to the directory that holds `rocky.toml`, so run the command there or edit the path. The connector needs `python3` (3.8 or newer) and the `duckdb` CLI on `PATH`.
+
+The scaffold runs on Linux and macOS. Its manifest starts `./main.py` through the file's `#!` line, which Windows does not use. On Windows, set `command` in `connector.toml` to a program that starts `main.py`.
 
 ### Related Commands
 
