@@ -9,12 +9,18 @@
 //! `rocky publish-ir` reports agree. Before the fix, the later-layer and
 //! declared readers were typed from the model (`id VARCHAR`) while DuckDB
 //! built them from the source table (`id BIGINT`).
+//!
+//! The everyday shape rides along: model `ord` writes `ord_t`, and the
+//! warehouse already has a stale `ord_t` (in the seed too). A star over
+//! `ord_t` under a `required` contract reads `ord`'s output, and compiles
+//! clean.
 
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-const SOURCE_DDL: &str = "CREATE TABLE orders (id BIGINT NOT NULL, extra VARCHAR);";
+const SOURCE_DDL: &str = "CREATE TABLE orders (id BIGINT NOT NULL, extra VARCHAR); \
+                          CREATE TABLE ord_t (gone VARCHAR);";
 
 fn write_model(models: &Path, name: &str, sql: &str, table: &str, extra: &str) {
     fs::write(models.join(format!("{name}.sql")), sql).unwrap();
@@ -73,10 +79,27 @@ fn project(root: &Path) {
         "depends_on = [\"orders\"]\n",
     );
 
+    // A model read by its target table's name, the everyday #1354 shape.
+    write_model(
+        &models,
+        "ord",
+        "SELECT CAST(o.id AS BIGINT) AS k FROM orders o",
+        "ord_t",
+        "",
+    );
+    write_model(&models, "t_star", "SELECT * FROM ord_t", "t_star", "");
+    fs::write(
+        models.join("t_star.contract.toml"),
+        "[rules]\nrequired = [\"k\"]\n",
+    )
+    .unwrap();
+
     // The source table the bare reads reach.
     let conn = duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
-    conn.execute_batch(&format!("{SOURCE_DDL} INSERT INTO orders VALUES (1, 'e');"))
-        .unwrap();
+    conn.execute_batch(&format!(
+        "{SOURCE_DDL} INSERT INTO orders VALUES (1, 'e'); INSERT INTO ord_t VALUES ('g');"
+    ))
+    .unwrap();
 }
 
 fn rocky(root: &Path, args: &[&str]) -> Output {
@@ -152,7 +175,7 @@ fn a_read_of_a_shadowed_source_is_typed_as_the_run_builds_it() {
     let conn = duckdb::Connection::open(tmp.path().join("warehouse.duckdb")).unwrap();
     // The source table's own nullability: what a direct read carries.
     let source: Vec<(String, String, bool)> = describe(&conn, "orders");
-    for reader in ["later_layer", "reader", "star"] {
+    for reader in ["later_layer", "reader", "star", "t_star"] {
         let built = describe(&conn, reader);
         let model = ir
             .models
@@ -186,10 +209,20 @@ fn a_read_of_a_shadowed_source_is_typed_as_the_run_builds_it() {
                 );
             }
         }
-        // The star expands the table the run read, not the model.
-        if reader == "star" {
-            let names: Vec<&str> = built.iter().map(|(c, ..)| c.as_str()).collect();
-            assert_eq!(names, ["id", "extra"]);
+        // Rocky claims exactly the columns the run built, no more. A star
+        // expands the table the run read: the source for `star`, the
+        // model `ord` for `t_star`.
+        let built_names: Vec<&str> = built.iter().map(|(c, ..)| c.as_str()).collect();
+        let typed_names: Vec<&str> = model
+            .typed_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(typed_names, built_names, "{reader}");
+        match reader {
+            "star" => assert_eq!(built_names, ["id", "extra"]),
+            "t_star" => assert_eq!(built_names, ["k"]),
+            _ => {}
         }
     }
 }
