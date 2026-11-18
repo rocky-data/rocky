@@ -9024,6 +9024,7 @@ effect = "deny"
             approvals_rejected: Vec::new(),
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![crate::output::PromoteTargetPlan {
                 target: format!("warehouse.main.{table}"),
                 source: "warehouse.branch_src.source".to_string(),
@@ -9992,6 +9993,7 @@ effect = "allow"
             approvals_rejected: vec![],
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![crate::output::PromoteTargetPlan {
                 target: "cat.prod.orders".to_string(),
                 source: "cat.branch.orders".to_string(),
@@ -10043,6 +10045,7 @@ effect = "allow"
                 severity: BreakingSeverity::Breaking,
             }]),
             allow_breaking: true,
+            allow_failing_tests: false,
             targets: vec![],
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
@@ -10072,6 +10075,7 @@ effect = "allow"
             approvals_rejected: vec![],
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![],
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
@@ -10112,6 +10116,7 @@ effect = "allow"
                 severity: BreakingSeverity::Breaking,
             }]),
             allow_breaking: true,
+            allow_failing_tests: false,
             // … but BOTH targets execute.
             targets: vec![
                 crate::output::PromoteTargetPlan {
@@ -10177,6 +10182,7 @@ effect = "allow"
             approvals_rejected: vec![],
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![crate::output::PromoteTargetPlan {
                 target: "c.s.orders".to_string(),
                 source: "c.b.orders".to_string(),
@@ -10238,6 +10244,7 @@ effect = "allow"
             approvals_rejected: vec![],
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![
                 // Mappable: the model `orders` targets it.
                 crate::output::PromoteTargetPlan {
@@ -14644,6 +14651,7 @@ schema_template = "s__{source}"
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
