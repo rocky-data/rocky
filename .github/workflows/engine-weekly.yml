@@ -489,6 +489,9 @@ jobs:
           rm -rf .venv
           python3 -m venv .venv
           .venv/bin/python -m pip install --quiet --require-hashes --no-deps -r requirements.lock
+          # Fail here if the hashed install is not enough, so run.sh never
+          # falls back to installing the unhashed requirements.txt.
+          .venv/bin/python -c "import dlt; print('dlt', dlt.__version__)"
           bash run.sh
           rocky -c rocky.toml connector test shop_orders --output table
 
