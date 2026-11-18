@@ -99,7 +99,7 @@ Rocky contains that failure at the table boundary instead of passing over the mo
 
 **Definition.** A model's output schema does not match its data contract (`<model>.contract.toml`). The contract declares required columns, protected columns, and the expected types and nullability. Rocky checks it at compile time, before any warehouse work.
 
-**Detection signal.** Diagnostic codes `E010`–`E014`:
+**Detection signal.** Diagnostic codes `E010`–`E014`, `E062` and `E063`:
 
 | Code | Severity | Meaning |
 |---|---|---|
@@ -108,6 +108,8 @@ Rocky contains that failure at the table boundary instead of passing over the mo
 | `E012` | Error | Nullability violation (contract says non-nullable, model says nullable) |
 | `E013` | Error | Protected column has been removed |
 | `E014` | Error | A nullable column the contract does not declare, under `[rules] no_new_nullable` |
+| `E062` | Error | The model output repeats a name the contract constrains |
+| `E063` | Error | An output column the contract does not declare, or a column list Rocky cannot prove, under `[rules] no_extra_columns` |
 
 **Recovery playbook.**
 
@@ -369,6 +371,7 @@ Permissions and masking apply *after* a successful materialisation. So a governa
 - [Troubleshooting](/advanced/troubleshooting/): symptom-first lookup ("I got error X")
 - [`rocky doctor`](/reference/commands/development/#rocky-doctor): aggregate health check across config, state, adapters, pipelines
 - [`rocky plan --resume-latest`](/reference/commands/core-pipeline/#rocky-plan): resume a failed run from its checkpoint (canonical, auditable form; the single-step `rocky run --resume-latest` alias does the same in one invocation)
+- [`rocky run --retry-failed`](/reference/commands/core-pipeline/#retrying-a-failed-run): rerun the failed and never-built models of a failed transformation run. `--resume` is for replication runs only.
 - [Schema drift](/concepts/schema-drift/): graduated drift handling deep dive
 - [Data quality checks](/concepts/data-quality-checks/): inline check authoring + result shape
 - [Governance guide](/guides/governance/): permissions, classification, masking, retention

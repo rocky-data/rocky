@@ -167,7 +167,10 @@ A `.contract.toml` declares what a model must produce. The compiler checks the
 model's inferred schema against it. `E010` to `E014` cover a missing required
 column, a type mismatch, a nullability violation, a removed protected column,
 and an undeclared nullable column. The last applies only while `[rules]
-no_new_nullable` is on, which is off by default. Any of them fails compilation,
+no_new_nullable` is on, which is off by default. `E062` covers an output that
+repeats a name the contract constrains. `E063` covers an undeclared output
+column while `[rules] no_extra_columns` is on, which is also off by default.
+Any of them fails compilation,
 so a broken contract is a red CI check rather than a production surprise. The
 [Checks and Tests](/concepts/data-quality-checks/#data-contracts) page has the
 format and every code.

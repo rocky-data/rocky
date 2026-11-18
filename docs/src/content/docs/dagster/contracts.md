@@ -66,7 +66,13 @@ kinds the contract declares:
 
 - `contract_required_columns`: passes when there are no E010 diagnostics
 - `contract_protected_columns`: passes when there are no E013 diagnostics
-- `contract_column_constraints`: passes when there are no E011/E012/E014/W010 diagnostics
+- `contract_column_constraints`: passes when there are no E011/E012/E014/E059/E063/W010 diagnostics.
+  It appears when a `[[columns]]` entry sets `type` or `nullable`, or when `[rules]` sets
+  `no_new_nullable` or `no_extra_columns`.
+
+An `E062` fails one of the declared checks. It fails `contract_column_constraints`
+when that check is declared. If it is not, it fails `contract_required_columns`,
+then `contract_protected_columns`.
 
 ## Diagnostic code mapping
 
@@ -80,6 +86,9 @@ Rocky's compiler emits a stable code for each kind of contract violation.
 | E012 | ERROR | Column nullability violated | `contract_column_constraints` |
 | E013 | ERROR | Protected column removed | `contract_protected_columns` |
 | E014 | ERROR | Under `[rules] no_new_nullable`: a nullable column the contract does not declare, or the contract declaring no `[[columns]]` at all, which leaves no baseline for what counts as new | `contract_column_constraints` |
+| E059 | ERROR | Under `--strict-contracts` or `[contracts] strict`: a declared type Rocky cannot check | `contract_column_constraints` |
+| E062 | ERROR | The model output repeats a name the contract constrains | The first declared check: `contract_column_constraints`, then `contract_required_columns`, then `contract_protected_columns` |
+| E063 | ERROR | Under `[rules] no_extra_columns`: an output column the contract does not declare, or a column list Rocky cannot prove | `contract_column_constraints` |
 | W010 | WARN | Contract column not in model output | `contract_column_constraints` |
 
 When a check fails, the `AssetCheckResult` includes:

@@ -1,12 +1,12 @@
 ---
-title: "rocky-manifest v0.1"
+title: "rocky-manifest"
 description: An open, offline-verifiable format for attesting which program, over which inputs, in which environment produced a table version
 sidebar:
   order: 12
 ---
 
 :::caution[Draft / experimental]
-`rocky-manifest v0.1` is a draft. The field names and shape may change before a stable release. This is published as an open format with a reference verifier so it can be reviewed and used early, not as a finished standard. Feedback is welcome.
+`rocky-manifest` is a draft. The field names and shape may change before a stable release. This is published as an open format with a reference verifier so it can be reviewed and used early, not as a finished standard. Feedback is welcome.
 :::
 
 ## What this is
@@ -100,7 +100,7 @@ On a content-addressed write path, the manifest also carries the output byte-has
 
 | Field | Required | Meaning |
 |---|---|---|
-| `manifest_version` | yes | The spec version this document conforms to. `"0.1"`. |
+| `manifest_version` | yes | The spec version this document conforms to: `"0.1"` or `"0.2"`. The v0.2 additions are under [v0.2: asserted claims](#v02-asserted-claims). |
 | `hash_scheme` | yes | The hashing-algorithm-family tag in force. `"v1"`. |
 | `producer.name` | yes | The producing tool's name, for example `"rocky"`. |
 | `producer.version` | yes | The producing tool's version string. |
@@ -114,7 +114,7 @@ On a content-addressed write path, the manifest also carries the output byte-has
 | `env_hash` | yes | The environment key (64-hex BLAKE3). |
 | `output_hashes` | no | Byte-hashes of output artifact files, recorded on a content-addressed write path. |
 
-The canonical machine-readable definition is the JSON Schema (draft 2020-12) at `engine/crates/rocky-verify/spec/rocky-manifest-v0.1.schema.json`. It is a standalone schema, deliberately kept out of the CLI's JSON-output schema set: it describes the open format, not a command's wire output. Print it with `rocky-verify schema`.
+The canonical machine-readable definition is the JSON Schema (draft 2020-12) at `engine/crates/rocky-verify/spec/rocky-manifest-v0.1.schema.json`. It is a standalone schema, deliberately kept out of the CLI's JSON-output schema set: it describes the open format, not a command's wire output. Print it with `rocky-verify schema`. That command prints the v0.1 schema. Add `--version 0.2` to print the v0.2 schema.
 
 ### The honesty invariant
 
@@ -176,13 +176,13 @@ The same manifest content can travel in more than one place:
 `rocky-verify` is a standalone tool that verifies a manifest with no Rocky engine installed. It does two independent things:
 
 ```bash
-# Structure only: validate against the v0.1 schema.
+# Structure only: validate against the schema that `manifest_version` names.
 rocky-verify verify manifest.json
 
 # Structure plus bytes: also hash any output artifacts and compare.
 rocky-verify verify manifest.json --artifacts-dir ./artifacts
 
-# Print the embedded schema.
+# Print the embedded v0.1 schema. Add --version 0.2 for v0.2.
 rocky-verify schema
 ```
 

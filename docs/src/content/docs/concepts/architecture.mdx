@@ -184,7 +184,7 @@ per-warehouse SQL that Rocky *writes* comes from each adapter crate's own
 `SqlDialect` implementation.
 
 - **parser.rs**: wraps sqlparser-rs with typed extensions for Rocky's needs
-- **dialect.rs**: the one `sqlparser-rs` dialect Rocky parses every model with, whatever warehouse that model targets. It follows Databricks SQL syntax and accepts `SELECT * EXCEPT (...)`.
+- **dialect.rs**: the one `sqlparser-rs` dialect Rocky parses every model with, whatever warehouse that model targets. It follows Databricks SQL syntax and accepts `SELECT * EXCEPT (...)`, `* EXCLUDE (...)` and `* REPLACE (... AS col)`. The `P001` portability check flags the forms a target warehouse does not support.
 - **validation.rs**: SQL identifier validation using strict regex patterns. All identifiers must pass through this module before being interpolated into SQL. This prevents SQL injection by rejecting anything that doesn't match `^[a-zA-Z0-9_]+$`.
 
 ### rocky-databricks
