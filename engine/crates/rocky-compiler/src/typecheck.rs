@@ -13839,4 +13839,38 @@ mod tests {
             assert_eq!(found, [code], "{sql}");
         }
     }
+
+    /// #2658: a cast over a grouped `SUM`. Only `CAST(SUM(int) AS BIGINT)`
+    /// is NOT NULL, on a known warehouse that names `BIGINT` (#2333): the
+    /// sum of an integer is a `BIGINT` on Databricks and Spark, so the cast
+    /// is a no-op there, and on DuckDB a `HUGEINT` cast overflow is an
+    /// error, not NULL. Every cast that can narrow stays nullable on every
+    /// target, and a Spark or unknown target types none of them.
+    #[test]
+    fn a_cast_over_a_grouped_sum_is_not_null_only_when_it_cannot_fail() {
+        let casts = [
+            "select n, cast(sum(x) as bigint) as c from t group by n",
+            "select n, cast(sum(x) as int) as c from t group by n",
+            "select n, cast(sum(d) as bigint) as c from t group by n",
+            "select n, cast(sum(d) as decimal(12,2)) as c from t group by n",
+            "select n, cast(sum(f) as bigint) as c from t group by n",
+        ];
+        let spark = OperandTarget::Targets {
+            dialects: Vec::new(),
+            unruled: vec!["spark".to_string()],
+        };
+        for (label, target, bigint_of_int_nullable) in [
+            ("duckdb", duckdb(), false),
+            ("databricks", Some(OperandDialect::Databricks).into(), false),
+            ("spark", spark, true),
+            ("unconfigured", OperandTarget::Unconfigured, true),
+        ] {
+            let rows: Vec<(&str, bool)> = casts
+                .iter()
+                .enumerate()
+                .map(|(i, sql)| (*sql, if i == 0 { bigint_of_int_nullable } else { true }))
+                .collect();
+            assert_not_null_contract(&rows, &target, label);
+        }
+    }
 }
