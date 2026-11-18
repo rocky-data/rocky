@@ -44,6 +44,8 @@ P001 rejects a SQL construct that does not exist on the warehouse dialect you ch
 | `DATE_FORMAT` | Databricks, DuckDB |
 | `QUALIFY` | Snowflake, Databricks, BigQuery |
 | `ILIKE` | Snowflake, Databricks, DuckDB |
+| `SELECT * EXCLUDE (...)` | DuckDB, Snowflake |
+| `SELECT * REPLACE (... AS col)` | DuckDB, Snowflake, BigQuery |
 | `FLATTEN` | Snowflake |
 
 The catalog is deliberately conservative. Anything not in it is assumed portable. Expect the odd non-portable construct to slip through. Do not expect portable SQL to be flagged.
