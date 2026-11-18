@@ -2262,8 +2262,10 @@ mod tests {
         }
     }
 
+    /// A cast over `SUM` is NOT NULL under a plain `GROUP BY` and nullable
+    /// without one (#2295, #2658).
     #[test]
-    fn cast_over_grouped_aggregate_is_nullable_under_outer_join_propagation() {
+    fn cast_over_a_sum_is_not_null_only_under_a_plain_group_by() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("totals.toml"),
@@ -2291,32 +2293,48 @@ mod tests {
             ),
             ..Default::default()
         };
-        for join in ["", "LEFT JOIN raw.orders r ON o.id = r.id"] {
+        // Before #2295 lineage labelled `CAST(SUM(...))` a plain cast of
+        // `o.id`, which also made a global `CAST(SUM(x) AS BIGINT)` over an
+        // empty table NOT NULL: unsound. A cast takes its operand's
+        // nullability. With a plain `GROUP BY` every group has a row, so
+        // `SUM` over the NOT NULL `o.id` is NOT NULL (#2658); the `LEFT JOIN`
+        // null-extends `r`, not `o`. Without `GROUP BY` an empty input gives
+        // one row whose `SUM` is NULL, and the contract is refused.
+        for (from, group_by, refused) in [
+            ("raw.orders o", "GROUP BY o.id", false),
+            (
+                "raw.orders o LEFT JOIN raw.orders r ON o.id = r.id",
+                "GROUP BY o.id",
+                false,
+            ),
+            ("raw.orders o", "", true),
+        ] {
+            let id = if group_by.is_empty() {
+                "MIN(o.id) AS id"
+            } else {
+                "o.id"
+            };
             std::fs::write(
                 dir.path().join("totals.sql"),
-                format!(
-                    "SELECT o.id, CAST(SUM(o.id) AS BIGINT) AS total \
-                     FROM raw.orders o {join} GROUP BY o.id"
-                ),
+                format!("SELECT {id}, CAST(SUM(o.id) AS BIGINT) AS total FROM {from} {group_by}"),
             )
             .unwrap();
             let result = compile(&config).unwrap();
-            // This test used to assert `total` NOT NULL with no errors. That
-            // answer came from lineage labelling `CAST(SUM(...))` as a plain
-            // cast of `o.id`, which also made a global `CAST(SUM(x) AS BIGINT)`
-            // over an empty table NOT NULL — unsound (#2295). A cast takes its
-            // operand's nullability, and `SUM` is nullable, like a bare
-            // `SUM(o.id)` already was. The NOT NULL contract is now refused.
             let errors: Vec<_> = result
                 .diagnostics
                 .iter()
                 .filter(|d| d.is_error())
                 .map(|d| (&*d.code, d.model.as_str()))
                 .collect();
-            assert_eq!(errors, vec![("E012", "totals")], "{join}");
+            let expected = if refused {
+                vec![("E012", "totals")]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(errors, expected, "{from} {group_by}");
             let total = &result.type_check.typed_models["totals"][1];
             assert_eq!(total.data_type, RockyType::Int64);
-            assert!(total.nullable, "{join}");
+            assert_eq!(total.nullable, refused, "{from} {group_by}");
         }
     }
 

@@ -148,7 +148,11 @@ A cast keeps its operand's nullability only when the operand is a column and the
 A cast that can fail is nullable even over a `NOT NULL` input, because some warehouses return `NULL` for a value that does not convert (Spark and Databricks with ANSI mode off). These casts can fail: text or an unknown type to a number, boolean, date or timestamp; a number to a narrower number (`BIGINT` to `INT`, anything to `SMALLINT` or `TINYINT`, a number to a `DECIMAL` that may not hold it); a `DOUBLE` to `FLOAT`. These casts cannot fail and keep the operand's nullability: the same type, `INT` to `BIGINT`, a number to `DOUBLE` or `FLOAT`, anything to text, `DATE` to `TIMESTAMP`, and an integer literal that fits the target (`CAST(0 AS DECIMAL(18,2))`). `TRY_CAST` and `SAFE_CAST` are always nullable.
 A `nullable = false` contract over `CAST(text_col AS INT)` therefore fails `E012`. Use `COALESCE` or a source that is already numeric.
 A cast of a computed value takes that value's nullability: `CAST(MAX(x) AS BIGINT)` and `CAST(NULLIF(x, 0) AS INT)` are nullable even when `x` is not.
-An aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo and any function Rocky does not model are nullable.
+These are nullable: an aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo, and any function Rocky does not model.
+Two exceptions are non-null over `NOT NULL` inputs:
+
+- `+`, `-` and `*` over columns of a known integer, float or sized `DECIMAL` type, and over integer literals: `qty * amount` is non-null. Its type can still be `Unknown`. A `NULL`, a cast, a function call, a division or a non-integer literal anywhere in the expression keeps it nullable. So does a result over 38 digits, which Databricks with ANSI mode off writes as `NULL`.
+- `SUM(x)` in a query with a plain `GROUP BY` key list, because every group has a row. It stays nullable with no `GROUP BY`, with `GROUP BY ALL`, `ROLLUP`, `CUBE`, `GROUPING SETS` or `GROUP BY ()`, with `FILTER`, and with `OVER`. Each of these can sum no rows. A `DECIMAL` sum is non-null only when every warehouse the model runs on is known and none is Databricks. Spark and Databricks with ANSI mode off write `NULL` when a decimal sum overflows.
 `COUNT(...)`, including `COUNT(*)`, is a non-null `Int64`.
 A `UNION`, `INTERSECT` or `EXCEPT` is typed from all its branches, paired by position. The column name comes from the first branch. A column is non-null only if it is non-null in every branch, and its type is the common supertype of the branches (`Unknown` if there is none). If Rocky cannot type the query (for example branches with different column counts, or a `VALUES` branch), every column is nullable and computed columns are `Unknown`.
 A cast of a column Rocky can type is the cast's target type: `CAST(o.quantity * p.price AS DECIMAL(12, 2))` is `Decimal(12, 2)`. A cast of a column Rocky cannot type takes its target type only for `BOOLEAN`, `DOUBLE` (`DOUBLE PRECISION`, `FLOAT64`), `DATE`, text types (`VARCHAR`, `CHAR`, `TEXT`, `STRING`), binary types (`BINARY`, `VARBINARY`, `BLOB`), and `DECIMAL` or `NUMERIC` with digits (`DECIMAL(p)` or `DECIMAL(p, s)`, `1 <= p <= 38`, `0 <= s <= p`); the column stays nullable. A bare `DECIMAL` or `NUMERIC` is a decimal whose digits Rocky does not claim, because they differ by warehouse: a bare `Decimal` contract over it passes, and a `Decimal(p, s)` one is not checked. `DECIMAL` digits out of that range stay `Unknown`.
@@ -466,6 +470,28 @@ These shapes stay silent:
 
 Each subquery and CTE is checked as its own query.
 
+### Aggregates and windows in WHERE, and GROUP BY positions
+
+Every warehouse refuses these shapes before it reads any data:
+
+```sql
+-- E065: WHERE filters rows before they are grouped
+SELECT customer_id FROM main.orders WHERE SUM(amount) > 1 GROUP BY customer_id
+-- E066: window functions run after WHERE
+SELECT order_id FROM main.orders WHERE ROW_NUMBER() OVER (ORDER BY order_id) = 1
+-- E067: the select list has 2 columns
+SELECT customer_id, COUNT(*) AS n FROM main.orders GROUP BY 3
+```
+
+Move an aggregate condition to `HAVING`, and a window condition to `QUALIFY`.
+
+These checks fire only when Rocky is certain:
+
+- `E065` counts `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` as aggregates, and any call with `FILTER` or `WITHIN GROUP`. Other aggregate names may belong to a user function.
+- An aggregate or window inside a subquery belongs to that subquery, so `WHERE amount > (SELECT AVG(amount) FROM orders)` is valid.
+- The `WHERE` of a scalar, `IN` or `EXISTS` subquery or a `LATERAL` table is not checked. There an aggregate over outer columns belongs to the outer query.
+- `E067` checks plain integer positions only, outside `ROLLUP`, `CUBE` and `GROUPING SETS`. A select list with `*`, `t.*` or `COLUMNS(...)` has no known length, so it is not checked.
+
 ### Ambiguous column names (`E029`)
 
 Rocky reports `E029` when a bare column name could come from two relations in
@@ -625,6 +651,9 @@ span, and sometimes a suggested fix.
 | `E062` | A model with a contract repeats an output name the contract constrains (`[[columns]]`, `required` or `protected`). The contract checks one column of that name; the warehouse writes the other under another name. Alias the repeat. Names match as for `E061` |
 | `E063` | `[rules] no_extra_columns = true` and the model outputs a column the contract does not name in `[[columns]]`, `required` or `protected`, or Rocky cannot prove the column list (a `SELECT *`, an unaliased expression). Declare the column, drop it, or list the columns explicitly |
 | `E064` | A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no known source table, and is one or two edits from a model name (one edit for names under 5 characters). The message names the model. If it is a real warehouse table, qualify it with its schema (`main.stg_ordrs`) |
+| `E065` | A `WHERE` clause contains an aggregate (`WHERE SUM(amount) > 1`). Move the condition to `HAVING` |
+| `E066` | A `WHERE` clause contains a window function, a call with `OVER`. Filter on it with `QUALIFY`, or in a subquery |
+| `E067` | A `GROUP BY` position names no output column (`GROUP BY 3` over two columns, or `GROUP BY 0`) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |

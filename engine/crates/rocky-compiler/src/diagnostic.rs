@@ -265,6 +265,21 @@ pub const E063: &str = "E063";
 /// [`crate::unknown_relations`]; a two-part read (`main.stg_ordrs`) is never
 /// checked.
 pub const E064: &str = "E064";
+/// A `WHERE` clause contains an aggregate (`WHERE SUM(amount) > 1`). Every
+/// warehouse refuses it: `WHERE` filters rows before they are grouped
+/// (#2660). Emitted by `rocky compile` from [`crate::clause_placement`],
+/// which lists what counts as an aggregate and which scopes it checks.
+pub const E065: &str = "E065";
+/// A `WHERE` clause contains a window function, a call with `OVER`
+/// (`WHERE ROW_NUMBER() OVER (ORDER BY id) = 1`). Every warehouse refuses
+/// it: window functions run after `WHERE` (#2660). Emitted by
+/// `rocky compile` from [`crate::clause_placement`].
+pub const E066: &str = "E066";
+/// A `GROUP BY` position names no output column: `GROUP BY 3` over a
+/// two-column select list, or `GROUP BY 0` (#2660). Checked only where the
+/// select list has a known length. Emitted by `rocky compile` from
+/// [`crate::clause_placement`].
+pub const E067: &str = "E067";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
