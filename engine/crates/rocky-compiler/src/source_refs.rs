@@ -755,11 +755,20 @@ impl<'s, 'a> Binder<'s, 'a> {
                         && qualifier.quote_style.is_none()
                     {
                         let qualifier = qualifier.value.to_lowercase();
-                        let bound: Vec<&Rel<'s, 'a>> = scope
-                            .rels
-                            .iter()
-                            .filter(|rel| rel.binding.as_deref() == Some(qualifier.as_str()))
-                            .collect();
+                        // `payload.*` over a struct column `payload` expands
+                        // the struct, on a warehouse that reads it so (#2653).
+                        let bound: Vec<&Rel<'s, 'a>> =
+                            if qualifier_may_be_a_column(&full, &qualifier) {
+                                Vec::new()
+                            } else {
+                                scope
+                                    .rels
+                                    .iter()
+                                    .filter(|rel| {
+                                        rel.binding.as_deref() == Some(qualifier.as_str())
+                                    })
+                                    .collect()
+                            };
                         if bound.len() == 1 {
                             self.check_star_options(options, &bound);
                         }
@@ -1184,6 +1193,20 @@ fn resolve_unqualified<'s, 'a>(chain: &[Scope<'s, 'a>], name: &str) -> Resolutio
     }
 }
 
+/// Whether `qualifier` (lower-cased) in `qualifier.x` or `qualifier.*` may
+/// name a column or alias rather than a relation: a struct whose field `x` is
+/// read, or whose fields `*` expands. If any relation in reach could carry such
+/// a column, the reading is ambiguous and nothing is proved.
+fn qualifier_may_be_a_column(chain: &[Scope<'_, '_>], qualifier: &str) -> bool {
+    chain.iter().any(|scope| {
+        scope.aliases.contains(qualifier)
+            || scope.rels.iter().any(|rel| match rel.kind {
+                RelKind::Opaque => true,
+                RelKind::Source(source) => source.has(qualifier),
+            })
+    })
+}
+
 fn resolve_qualified<'s, 'a>(
     chain: &[Scope<'s, 'a>],
     qualifier: &str,
@@ -1194,21 +1217,8 @@ fn resolve_qualified<'s, 'a>(
     if is_relation_free_name(&qualifier) || is_relation_free_name(&column) {
         return Resolution::Resolved;
     }
-    // `a.b` may be a field access on a column or alias named `a`. If any
-    // relation in reach could carry such a column, the reading is ambiguous.
-    for scope in chain {
-        if scope.aliases.contains(&qualifier) {
-            return Resolution::Unprovable;
-        }
-        for rel in &scope.rels {
-            match rel.kind {
-                RelKind::Opaque => return Resolution::Unprovable,
-                RelKind::Source(source) if source.has(&qualifier) => {
-                    return Resolution::Unprovable;
-                }
-                RelKind::Source(_) => {}
-            }
-        }
+    if qualifier_may_be_a_column(chain, &qualifier) {
+        return Resolution::Unprovable;
     }
     for scope in chain.iter().rev() {
         let mut bound = scope
@@ -1613,6 +1623,26 @@ mod tests {
             let diagnostics = check(sql);
             assert!(diagnostics.is_empty(), "{sql}: {diagnostics:?}");
         }
+    }
+
+    /// #2653: `payload.*` where `payload` is also a column in reach may expand
+    /// a struct, not the relation, so its modifier names are not checked, as a
+    /// plain `payload.x` read is not. A qualifier that is no column is still
+    /// checked.
+    #[test]
+    fn a_star_qualifier_that_may_be_a_struct_column_is_not_checked() {
+        for sql in [
+            // `raw.customers` has a column `payload`, aliased `payload` too.
+            "SELECT payload.* EXCEPT (legacy_field) FROM raw.customers payload",
+            // `customer_id` is a column of `o`, and also the alias of `c`.
+            "SELECT customer_id.* EXCLUDE (nope) FROM raw.orders o \
+             JOIN raw.customers customer_id ON o.customer_id = customer_id.customer_id",
+        ] {
+            let diagnostics = check(sql);
+            assert!(diagnostics.is_empty(), "{sql}: {diagnostics:?}");
+        }
+        let diagnostics = check("SELECT o.* EXCLUDE (statsu) FROM raw.orders o");
+        assert_eq!(codes(&diagnostics), ["E041"], "{diagnostics:?}");
     }
 
     /// A lateral alias does not satisfy a star name: the star expands only
