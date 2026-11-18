@@ -146,7 +146,8 @@ async fn fct_exists(root: &Path) -> bool {
 /// was saved and the agent's apply wrote the model.
 ///
 /// The control: a matching `type = "Int64"` contract on the same described
-/// source is planned, so the describe refuses only a mismatch.
+/// source is planned and the agent's apply writes it, so the describe refuses
+/// only a mismatch.
 ///
 /// One test, because the plan is written under the current directory and
 /// `cargo test` runs the tests of a file as threads of one process.
@@ -188,9 +189,9 @@ async fn the_plan_reaches_runs_contract_type_verdict() -> anyhow::Result<()> {
         refusal.contains("E011"),
         "the plan must refuse with E011, as `rocky run` does: {refusal}"
     );
-    assert!(!fct_exists(&root).await, "nothing is written");
+    assert!(!fct_exists(&root).await, "the plan writes nothing");
 
-    // Matching type: planned.
+    // Matching type: planned and applied.
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
     std::env::set_current_dir(&root)?;
@@ -200,8 +201,22 @@ async fn the_plan_reaches_runs_contract_type_verdict() -> anyhow::Result<()> {
     )
     .await;
     let state = root.join("state.redb");
-    agent_plan(&config, &models, &state)
+    let plan_id = agent_plan(&config, &models, &state)
         .await
         .map_err(|e| anyhow::anyhow!("a matching contract type must be planned: {e:#}"))?;
+    rocky_cli::commands::apply::run_apply(
+        &config,
+        &plan_id,
+        &state,
+        PolicyPrincipal::Agent,
+        &PrincipalRef::unnamed(),
+        None,
+        true,
+    )
+    .await?;
+    assert!(
+        fct_exists(&root).await,
+        "the agent's apply writes the planned model"
+    );
     Ok(())
 }
