@@ -137,65 +137,43 @@ async fn fct_exists(root: &Path) -> bool {
     rows.rows[0][0].as_i64() == Some(1) || rows.rows[0][0].as_str() == Some("1")
 }
 
-/// A `nullable = false` contract on a column the warehouse reports NOT NULL.
-/// `rocky run` passes it (#2614), so the plan must too, and the agent's apply
-/// must write the model.
-#[tokio::test]
-async fn a_not_null_contract_run_passes_is_planned_and_applied() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let root = dir.path().canonicalize()?;
-    std::env::set_current_dir(&root)?;
-    let (config, models) = project(
-        &root,
-        "[[columns]]\nname = \"customer_id\"\nnullable = false\n",
-    )
-    .await;
-    let state = root.join("state.redb");
-    let plan_id = agent_plan(&config, &models, &state).await.map_err(|e| {
-        anyhow::anyhow!("the plan must not refuse a contract `rocky run` passes: {e:#}")
-    })?;
-    rocky_cli::commands::apply::run_apply(
-        &config,
-        &plan_id,
-        &state,
-        PolicyPrincipal::Agent,
-        &PrincipalRef::unnamed(),
-        None,
-        true,
-    )
-    .await?;
-    assert!(fct_exists(&root).await, "the governed apply must write fct");
-    Ok(())
-}
-
 /// A `type = "String"` contract on a BIGINT column. `rocky run` refuses it
-/// with `E011` and writes nothing, so the agent's apply must not write it
-/// either: at worst the plan refuses, at best the apply does.
+/// with `E011` and writes nothing. The plan must refuse it with the same
+/// `E011`, so no plan exists for an agent to apply.
 #[tokio::test]
-async fn a_wrong_type_contract_run_refuses_is_not_applied() -> anyhow::Result<()> {
+async fn a_wrong_type_contract_run_refuses_is_refused_by_the_plan() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
     std::env::set_current_dir(&root)?;
     let (config, models) = project(&root, "[[columns]]\nname = \"customer_id\"\ntype = \"String\"\n")
         .await;
     let state = root.join("state.redb");
-    if let Ok(plan_id) = agent_plan(&config, &models, &state).await {
-        // The apply may return Ok with the failure carried in its output, or
-        // Err: either way the table must not be written.
-        let _ = rocky_cli::commands::apply::run_apply(
-            &config,
-            &plan_id,
-            &state,
-            PolicyPrincipal::Agent,
-            &PrincipalRef::unnamed(),
-            None,
-            true,
-        )
-        .await;
-    }
+    let refusal = match agent_plan(&config, &models, &state).await {
+        Ok(plan_id) => {
+            // Before the fix the plan is saved, and the agent's apply writes
+            // the model. Show that, so the failure names the hole.
+            let applied = rocky_cli::commands::apply::run_apply(
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                &PrincipalRef::unnamed(),
+                None,
+                true,
+            )
+            .await;
+            panic!(
+                "the plan must refuse a contract type `rocky run` refuses (E011); it was saved \
+                 as {plan_id}, the agent's apply returned {applied:?}, and fct exists: {}",
+                fct_exists(&root).await
+            );
+        }
+        Err(e) => format!("{e:#}"),
+    };
     assert!(
-        !fct_exists(&root).await,
-        "a governed apply must not write a model whose contract type `rocky run` refuses (E011)"
+        refusal.contains("E011"),
+        "the plan must refuse with E011, as `rocky run` does: {refusal}"
     );
+    assert!(!fct_exists(&root).await, "nothing is written");
     Ok(())
 }
