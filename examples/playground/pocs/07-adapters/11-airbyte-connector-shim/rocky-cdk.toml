@@ -86,3 +86,22 @@ stream          = "orders"
 base_url   = "http://127.0.0.1:18766"
 start_date = "2026-11-01T00:00:00Z"
 end_date   = "2026-12-31T00:00:00Z"
+
+# The pinned manifest, with a PYTHON* variable handed to the shim: refused.
+[connector.orders_cdk_python_var]
+manifest   = "connector/connector.toml"
+output_uri = "file://./.rocky/landing/orders_cdk_python_var"
+target     = { catalog = "poc_cdk", schema = "main", table = "python_var" }
+secrets    = ["PYTHONDONTWRITEBYTECODE"]
+retries    = 0
+
+[connector.orders_cdk_python_var.options]
+manifest        = "../cdk/orders-manifest.yaml"
+manifest_sha256 = "74549563107108832a0bf4fc00caf1ae4569a9aceac8a7e6104002473945b136"
+cdk_bin         = "../cdk/.venv/bin/source-declarative-manifest"
+stream          = "orders"
+
+[connector.orders_cdk_python_var.options.config]
+base_url   = "http://127.0.0.1:18766"
+start_date = "2026-11-01T00:00:00Z"
+end_date   = "2026-12-31T00:00:00Z"

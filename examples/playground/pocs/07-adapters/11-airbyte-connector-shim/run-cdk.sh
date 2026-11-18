@@ -18,9 +18,9 @@
 # every load. The target only appends, so that row is a duplicate. This is at-least-once delivery: deduplicate
 # downstream on a key (here `id`).
 #
-# Then three failures: a manifest whose SHA-256 is not the pinned one, a
+# Then four failures: a manifest whose SHA-256 is not the pinned one, a
 # manifest that names a custom Python component, and AIRBYTE_ENABLE_UNSAFE_CODE
-# handed to the shim.
+# or a PYTHON* variable handed to the shim.
 #
 # No airbyte-cdk and it cannot be installed here: `rocky validate` only, then
 # exit 0 with a SKIP message. Set REQUIRE_AIRBYTE_CDK=1 to fail instead.
@@ -207,6 +207,10 @@ fails orders_cdk_custom_component "Custom connector code is not permitted"
 echo
 echo "=== the shim refuses AIRBYTE_ENABLE_UNSAFE_CODE, which would let it run ==="
 AIRBYTE_ENABLE_UNSAFE_CODE=true fails orders_cdk_unsafe_code "AIRBYTE_ENABLE_UNSAFE_CODE is set"
+
+echo
+echo "=== the shim refuses a PYTHON* variable, which would load code the hash does not cover ==="
+PYTHONDONTWRITEBYTECODE=1 fails orders_cdk_python_var "PYTHONDONTWRITEBYTECODE is set"
 
 echo
 echo "POC complete: 3 loads (4, 4, 1 rows) with no Docker, the Airbyte cursor carried in Rocky state."

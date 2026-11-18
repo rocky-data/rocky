@@ -75,7 +75,7 @@ stream          = "items"
 | No custom code runs. | The shim never passes `--components-path`, and `airbyte-cdk` 7.48.0 or newer refuses any custom class (`class_name`) in a manifest it did not ship. The shim refuses an older `airbyte-cdk`. It also refuses to run when `AIRBYTE_ENABLE_UNSAFE_CODE` or any `PYTHON*` variable is set, or when `/airbyte/integration_code/source_declarative_manifest/manifest.yaml` exists (`airbyte-cdk` would run that file instead, with custom code trusted). A manifest that needs custom components does not work in this mode: use its image. |
 | The row at the cursor can load again on every load. | `airbyte-cdk` starts the next read at the saved cursor, not after it. When the API's lower bound is inclusive, as in this POC's stub, the row at the cursor comes back. The target only appends, so that row is a duplicate. Deduplicate downstream on a key. |
 | A lookback window loads its rows again. | Some manifests set `lookback_window`: each read starts that far before the cursor. For example, a manifest with `lookback_window: P31D` reads the last 31 days on every load. Every row in that window lands again as a duplicate. |
-| `airbyte-cdk` needs Python 3.11 to 3.14. | Install it in its own venv, pinned. The shim itself still runs on Python 3.8 or newer. `cdk/requirements.lock` pins the whole dependency tree by hash. |
+| `airbyte-cdk` needs Python 3.11 to 3.14. | Install it in its own venv, pinned. The shim itself still runs on Python 3.8 or newer. `cdk/requirements.lock` pins the whole dependency tree by hash, for Python 3.12 on Linux x86_64 only; elsewhere, install from `cdk/requirements.txt`. |
 | A rotated OAuth refresh token is lost. | Some sources get a new refresh token on each run and update their config. The shim does not save it, in either mode. A source with single-use refresh tokens fails on the next run. |
 | `spec` is skipped. | In this mode `spec` returns a generic spec, not the source's. |
 | Egress: `connector.toml` says `[]`. | The manifest's hosts are the egress. List them in your own manifest for the connector. This POC calls only its local stub, `127.0.0.1`. |
@@ -86,7 +86,7 @@ Run it:
 ./run-cdk.sh
 ```
 
-`run-cdk.sh` installs `airbyte-cdk` into `cdk/.venv` when it can, starts the stub API in `cdk/stub.py`, and loads three times (4, 4 and 1 rows). The stub's log shows that load 2 asked only for orders from the cursor on. Then it checks three failures: a wrong hash, a manifest with a custom component, and `AIRBYTE_ENABLE_UNSAFE_CODE`. With no `airbyte-cdk` and no way to install it, the script runs `rocky validate` and exits 0 with a SKIP message. Set `REQUIRE_AIRBYTE_CDK=1` to make that a failure. The weekly CI runs it with `REQUIRE_AIRBYTE_CDK=1`. PR CI does not run it, because it needs `airbyte-cdk` from PyPI.
+`run-cdk.sh` installs `airbyte-cdk` into `cdk/.venv` when it can, starts the stub API in `cdk/stub.py`, and loads three times (4, 4 and 1 rows). The stub's log shows that load 2 asked only for orders from the cursor on. Then it checks four failures: a wrong hash, a manifest with a custom component, `AIRBYTE_ENABLE_UNSAFE_CODE`, and a `PYTHON*` variable. With no `airbyte-cdk` and no way to install it, the script runs `rocky validate` and exits 0 with a SKIP message. Set `REQUIRE_AIRBYTE_CDK=1` to make that a failure. The weekly CI runs it with `REQUIRE_AIRBYTE_CDK=1`. PR CI does not run it, because it needs `airbyte-cdk` from PyPI.
 
 ## Credentials in a real deployment
 

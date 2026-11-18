@@ -173,34 +173,39 @@ def load_options(request):
 def check_cdk_version(options):
     """Fail unless cdk_bin belongs to airbyte-cdk MIN_CDK_VERSION or newer.
 
-    A venv puts its `python` beside its scripts; that interpreter is asked.
-    Otherwise the script's `#!` line names it. (pip writes a `#!/bin/sh`
-    launcher when the interpreter path is long, so the sibling comes first.)
+    The interpreter asked is the one the script's `#!` line names. pip writes
+    a `#!/bin/sh` launcher when that path is long; then the `python` beside
+    the real (symlink-resolved) script is asked. `-I` keeps the current
+    directory off the import path, so a planted package cannot answer.
     """
-    sibling = os.path.join(os.path.dirname(options["cdk_bin"]), "python")
-    if os.path.isfile(sibling):
+    real = os.path.realpath(options["cdk_bin"])
+    try:
+        with open(real, "rb") as handle:
+            first = handle.readline().decode("utf-8", "replace").strip()
+    except OSError as error:
+        fail("cannot read %s: %s" % (options["cdk_bin"], error))
+    if not first.startswith("#!"):
+        fail("cdk_bin must be the source-declarative-manifest script of an airbyte-cdk install")
+    interpreter = first[2:].split()
+    if interpreter and os.path.basename(interpreter[0]) == "sh":
+        sibling = os.path.join(os.path.dirname(real), "python")
+        if not os.path.isfile(sibling):
+            fail("cannot find the interpreter of %s" % options["cdk_bin"])
         interpreter = [sibling]
-    else:
-        try:
-            with open(options["cdk_bin"], "rb") as handle:
-                first = handle.readline().decode("utf-8", "replace").strip()
-        except OSError as error:
-            fail("cannot read %s: %s" % (options["cdk_bin"], error))
-        if not first.startswith("#!"):
-            fail("cdk_bin must be the source-declarative-manifest script of an airbyte-cdk install")
-        interpreter = first[2:].split()
     script = "import importlib.metadata as m; print(m.version('airbyte-cdk'))"
     try:
         done = subprocess.run(
-            interpreter + ["-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            interpreter + ["-I", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True, check=False,
         )
     except OSError as error:
         fail("cannot start the interpreter of %s: %s" % (options["cdk_bin"], error))
     version = done.stdout.strip()
-    parts = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+    # A final release only: 7.48.0rc1 sorts before 7.48.0.
+    parts = re.match(r"^(\d+)\.(\d+)\.(\d+)$", version)
     if done.returncode != 0 or not parts:
-        fail("cannot read the airbyte-cdk version beside %s" % options["cdk_bin"])
+        fail("cannot read a released airbyte-cdk version beside %s (got %r)"
+             % (options["cdk_bin"], version))
     if tuple(int(p) for p in parts.groups()) < MIN_CDK_VERSION:
         fail("airbyte-cdk %s is older than %s, the oldest this shim runs"
              % (version, ".".join(str(p) for p in MIN_CDK_VERSION)))
@@ -283,7 +288,8 @@ def on_sigterm(signum, frame):
     for child in list(CHILDREN):
         try:
             child.terminate()
-            child.wait(timeout=10)
+            # Under Rocky's 5 s grace before its SIGKILL.
+            child.wait(timeout=3)
         except subprocess.TimeoutExpired:
             child.kill()
         except OSError:
@@ -336,19 +342,25 @@ def cdk_run(options, work_dir, args, step, capture_to=None):
     command = [options["cdk_bin"]] + args + ["--manifest-path", options["manifest_copy"]]
     out = open(capture_to, "w", encoding="utf-8") if capture_to else subprocess.PIPE
     # Hold SIGTERM and SIGINT until the child is in CHILDREN, so the handler
-    # always sees it.
+    # always sees it. The child inherits the mask, so it unblocks them first
+    # (preexec_fn is safe here: the shim runs no threads).
     held = (signal.SIGTERM, signal.SIGINT)
     signal.pthread_sigmask(signal.SIG_BLOCK, held)
     try:
         child = subprocess.Popen(
             command, stdout=out, stderr=subprocess.PIPE, cwd=work_dir,
             universal_newlines=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, held),
         )
         CHILDREN.append(child)
     except OSError as error:
+        start_error = error
+    else:
+        start_error = None
+    finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
-        fail("cannot start %s: %s" % (options["cdk_bin"], error))
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+    if start_error is not None:
+        fail("cannot start %s: %s" % (options["cdk_bin"], start_error))
     try:
         stdout, stderr = child.communicate()
     finally:
