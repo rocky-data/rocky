@@ -6283,8 +6283,9 @@ pub enum ConnectorLoadStatus {
 }
 
 /// Who supports a child connector, as its manifest declares: `reference`
-/// (maintained and tested by the Rocky project), `community` (maintained by
-/// someone else) or `unknown` (the manifest does not say).
+/// (the author says the Rocky project maintains and tests it), `community`
+/// (not tested in CI by the Rocky project) or `unknown` (the manifest does
+/// not say). The author declares it. Rocky does not verify it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorSupportTier {

@@ -349,7 +349,8 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
 /// does not exist. Later arguments and secrets are not checked. Offline: nothing is
 /// started. The block's own fields are checked when the config loads.
 ///
-/// **V068** — a `warn` when a readable manifest declares no `license`.
+/// **V068** — a `warn` when a valid manifest, whose program exists, declares
+/// no `license`.
 fn validate_connectors(
     cfg: &rocky_core::config::RockyConfig,
     config_path: &Path,

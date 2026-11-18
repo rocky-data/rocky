@@ -10,6 +10,8 @@ egress_hosts         = ["extensions.duckdb.org"]
 
 # The license of the code in this directory.
 license              = "Apache-2.0"
+# No support_tier yet: this connector is still a POC. A copy of it would
+# inherit any tier written here.
 
 [limits]
 wall_time_secs = 120

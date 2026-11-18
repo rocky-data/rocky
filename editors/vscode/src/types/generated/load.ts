@@ -10,7 +10,7 @@
  */
 export type ConnectorLoadStatus = "loaded" | "skipped" | "failed";
 /**
- * Who supports a child connector, as its manifest declares: `reference` (maintained and tested by the Rocky project), `community` (maintained by someone else) or `unknown` (the manifest does not say).
+ * Who supports a child connector, as its manifest declares: `reference` (the author says the Rocky project maintains and tests it), `community` (not tested in CI by the Rocky project) or `unknown` (the manifest does not say). The author declares it. Rocky does not verify it.
  */
 export type ConnectorSupportTier = "reference" | "community" | "unknown";
 

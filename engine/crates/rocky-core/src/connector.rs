@@ -433,14 +433,16 @@ pub struct ConnectorManifest {
     pub limits: ConnectorLimitsConfig,
 }
 
-/// `support_tier` in `connector.toml`: who supports the connector.
+/// `support_tier` in `connector.toml`: who supports the connector. The
+/// author declares it. Rocky does not verify it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportTier {
-    /// Maintained and tested in CI by the Rocky project.
+    /// The author says the Rocky project maintains it and tests it in CI.
     Reference,
-    /// Maintained by someone else. Rocky supports the protocol, the state
-    /// and the load. A bug in the connector itself goes to its author.
+    /// Not tested in CI by the Rocky project. Rocky supports the protocol,
+    /// the state and the load. A bug in the program a connector runs goes
+    /// to that program's authors.
     Community,
 }
 
