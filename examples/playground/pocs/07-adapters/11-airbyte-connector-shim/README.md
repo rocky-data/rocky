@@ -7,11 +7,13 @@
 
 ## Feature
 
-A thin shim, `connector/main.py`, that runs one open-source Airbyte source image under `rocky load --connector`. It builds a configured catalog for one stream, runs `read`, converts the records to Parquet, and keeps the last Airbyte STATE message in Rocky state.
+A thin shim, `connector/main.py`, that runs one Airbyte source image under `rocky load --connector`. It builds a configured catalog for one stream, runs `read`, converts the records to Parquet, and keeps the last Airbyte STATE message in Rocky state.
 
 ## Why it's distinctive
 
 Rocky ships no extractors and no catalog. The image is Airbyte's. The shim only adapts the Airbyte protocol to the connector protocol.
+
+The Airbyte protocol is MIT. Each source image has its own license, often Elastic License 2.0 (ELv2), which is not open source. `airbyte/source-faker`, used here, is ELv2. Check an image's `metadata.yaml` before you use it. The shim's own code is Apache-2.0.
 
 The Airbyte state lives in Rocky state, not in an Airbyte database. Rocky's commit fence governs it. A crash before the state commit replays the batch. It never skips one.
 

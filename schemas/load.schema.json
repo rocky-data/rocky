@@ -40,12 +40,24 @@
             "null"
           ]
         },
+        "license": {
+          "description": "The `license` the manifest declares, or `unknown` when it declares none. Declared, not checked.",
+          "type": "string"
+        },
         "name": {
           "description": "The `[connector.<name>]` key.",
           "type": "string"
         },
         "status": {
           "$ref": "#/definitions/ConnectorLoadStatus"
+        },
+        "support_tier": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectorSupportTier"
+            }
+          ],
+          "description": "The `support_tier` the manifest declares, or `unknown`."
         }
       },
       "required": [
@@ -54,8 +66,10 @@
         "commit_seq_after",
         "commit_seq_before",
         "egress_hosts",
+        "license",
         "name",
-        "status"
+        "status",
+        "support_tier"
       ],
       "type": "object"
     },
@@ -65,6 +79,15 @@
         "loaded",
         "skipped",
         "failed"
+      ],
+      "type": "string"
+    },
+    "ConnectorSupportTier": {
+      "description": "Who supports a child connector, as its manifest declares: `reference` (maintained and tested by the Rocky project), `community` (maintained by someone else) or `unknown` (the manifest does not say).",
+      "enum": [
+        "reference",
+        "community",
+        "unknown"
       ],
       "type": "string"
     },

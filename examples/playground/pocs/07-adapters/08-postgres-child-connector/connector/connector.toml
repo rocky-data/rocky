@@ -8,5 +8,8 @@ state_schema_version = 1
 # Declared, not enforced. The real egress also includes your Postgres host.
 egress_hosts         = ["extensions.duckdb.org"]
 
+# The license of the code in this directory.
+license              = "Apache-2.0"
+
 [limits]
 wall_time_secs = 120

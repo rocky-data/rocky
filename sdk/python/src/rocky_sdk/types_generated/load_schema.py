@@ -18,6 +18,16 @@ class ConnectorLoadStatus(StrEnum):
     failed = "failed"
 
 
+class ConnectorSupportTier(StrEnum):
+    """
+    Who supports a child connector, as its manifest declares: `reference` (maintained and tested by the Rocky project), `community` (maintained by someone else) or `unknown` (the manifest does not say).
+    """
+
+    reference = "reference"
+    community = "community"
+    unknown = "unknown"
+
+
 class ContractViolation(BaseModel):
     """
     A single contract rule violation with the rule name, affected column, and message.
@@ -57,11 +67,19 @@ class ConnectorLoadInfo(BaseModel):
     """
     Why the run failed. Present only when `status` is `failed`.
     """
+    license: str
+    """
+    The `license` the manifest declares, or `unknown` when it declares none. Declared, not checked.
+    """
     name: str
     """
     The `[connector.<name>]` key.
     """
     status: ConnectorLoadStatus
+    support_tier: ConnectorSupportTier
+    """
+    The `support_tier` the manifest declares, or `unknown`.
+    """
 
 
 class ContractResult(BaseModel):

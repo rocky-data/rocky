@@ -419,12 +419,39 @@ pub struct ConnectorManifest {
     pub egress_hosts: Vec<String>,
     /// The connector's license, as an SPDX identifier or expression
     /// (`MIT`, `Apache-2.0 OR MIT`). Optional. When set it must not be
-    /// empty. Rocky checks only that it is not blank, and otherwise ignores it.
+    /// empty. Rocky does not check the name against the SPDX list. It
+    /// reports the value in the `rocky load` output, and `unknown` when it
+    /// is not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
+    /// Who supports the connector. Optional. Rocky reports it in the
+    /// `rocky load` output, and `unknown` when it is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_tier: Option<SupportTier>,
     /// Limits the author suggests. The user's limits can only lower them.
     #[serde(default, skip_serializing_if = "ConnectorLimitsConfig::is_unset")]
     pub limits: ConnectorLimitsConfig,
+}
+
+/// `support_tier` in `connector.toml`: who supports the connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportTier {
+    /// Maintained and tested in CI by the Rocky project.
+    Reference,
+    /// Maintained by someone else. Rocky supports the protocol, the state
+    /// and the load. A bug in the connector itself goes to its author.
+    Community,
+}
+
+impl SupportTier {
+    /// The tier as `connector.toml` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Community => "community",
+        }
+    }
 }
 
 /// Why a manifest was refused.
@@ -825,6 +852,25 @@ name = "s2"
     }
 
     #[test]
+    fn support_tier_is_optional_and_takes_only_known_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = ConnectorManifest::load(&write_manifest(dir.path(), GOOD)).unwrap();
+        assert_eq!(none.support_tier, None);
+        for (text, tier) in [
+            ("reference", SupportTier::Reference),
+            ("community", SupportTier::Community),
+        ] {
+            let body = format!("{GOOD}support_tier = \"{text}\"\n");
+            let set = ConnectorManifest::load(&write_manifest(dir.path(), &body)).unwrap();
+            assert_eq!(set.support_tier, Some(tier));
+            assert_eq!(tier.as_str(), text);
+        }
+        let bad = format!("{GOOD}support_tier = \"gold\"\n");
+        let err = ConnectorManifest::load(&write_manifest(dir.path(), &bad)).unwrap_err();
+        assert!(err.to_string().contains("gold"), "{err}");
+    }
+
+    #[test]
     fn only_a_relative_path_with_a_slash_is_resolved() {
         let manifest = ConnectorManifest {
             protocol_version: 0,
@@ -833,6 +879,7 @@ name = "s2"
             state_schema_version: 1,
             egress_hosts: vec![],
             license: None,
+            support_tier: None,
             limits: ConnectorLimitsConfig::default(),
         };
         let argv = manifest.resolved_command(Path::new("/m"));
