@@ -479,6 +479,10 @@ jobs:
       # The lock is compiled for Python 3.12 on Linux x86_64, so the step
       # checks for 3.12 first. REQUIRE_AIRBYTE_CDK=1 makes a missing install
       # a failure, not a skip.
+      # Known risk: when ubuntu-latest moves to an image with another Python,
+      # this assert fails every week until cdk/requirements.lock is
+      # recompiled for that Python. That is the intended failure. There is no
+      # setup-python step: a new action pin needs the allow-list first.
       - name: Airbyte connector shim, manifest mode (real airbyte-cdk, hash-pinned)
         if: ${{ !cancelled() }}
         working-directory: ${{ github.workspace }}/examples/playground/pocs/07-adapters/11-airbyte-connector-shim
