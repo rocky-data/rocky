@@ -47,6 +47,12 @@ rocky connector init orders
 
 It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
 
+## Test a connector
+
+`rocky connector test <name>` runs the connector once per `[[run]]` in `connector-test.toml`, beside the manifest. Each run sets options that point the connector at recorded input, and says how many rows it must write. Each run gets the state the run before it returned. Rocky checks the rows, the state (when the run declares `state = "advanced"` or `"unchanged"`) and that every Parquet file has one schema. It loads nothing, saves no state and passes no secrets. See [`rocky connector test`](/reference/commands/development/#rocky-connector-test).
+
+The spec lives in its own file because test fixtures do not belong in the manifest a connector ships.
+
 ## Configure a connector
 
 Add a `[connector.<name>]` block to `rocky.toml`.
@@ -304,6 +310,8 @@ The limits of this design:
 - Delivery is at least once, as for every child connector.
 - Each run scans the whole source table.
 
+**Replay mode.** With `replay_fixture` set in the options (a SQL file, relative to `main.py`), the connector builds a local DuckDB catalog named `pg` from that file instead of attaching Postgres. It runs the same two queries, skips the `postgres` extension and reads no `PG*` variable. A missing fixture fails the run; it never falls back to Postgres. The log says the run is a replay. `rocky connector test pg_events` uses it: its `connector-test.toml` replays the three loads below (19, 5 and 0 rows) with no Docker.
+
 The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file. The weekly CI runs it as a gate: a failure turns the weekly job red.
 
 The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the same connector inside a full project, with a data product, a deadline, volume ranges, a monthly cost and a budget.
@@ -316,7 +324,7 @@ Three POCs show how to run a third-party extraction tool as a child connector. E
 |---|---|---|
 | dlt | [`07-adapters/10-dlt-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-dlt-connector-shim) | A dlt source, named by module and function, with the `filesystem` destination writing Parquet. |
 | Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An Airbyte source image with `docker run`: `spec`, `discover`, then `read`. The Airbyte protocol is MIT. Each source image has its own license, often Elastic License 2.0 (ELv2), which is not open source: check the image's `metadata.yaml` first. |
-| Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. |
+| Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. Its `connector-test.toml` points `meltano_bin` at a replay stand-in for Meltano and the tap, so `rocky connector test orders_tap` needs no PyPI package. |
 
 All three follow the same rules.
 
