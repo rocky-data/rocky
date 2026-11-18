@@ -552,6 +552,7 @@ fn compile_inner(
         project_config.as_ref(),
         model_targets.as_ref(),
         target_dialect,
+        Some(project_root),
     );
 
     // Compute DAG-propagated cost estimates for all models.
@@ -826,7 +827,13 @@ pub fn apply_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_path.parent(),
+    );
     apply_inlined_sql_gates(result, &targets);
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
@@ -842,7 +849,13 @@ pub fn apply_authored_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_path.parent(),
+    );
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
 
@@ -894,13 +907,22 @@ fn apply_operand_gates(
     project_config: Option<&rocky_config::RockyConfig>,
     targets: Option<&ModelTargets<'_>>,
     target_dialect: Option<Dialect>,
+    project_root: Option<&Path>,
 ) {
+    // Macros and functions the project's `data/seed.sql` creates are the
+    // project's own: a call to one is not judged against DuckDB's built-ins
+    // (E057, E068, E069).
+    let seed_names = project_root
+        .and_then(|root| std::fs::read_to_string(seed_file(root)).ok())
+        .map(|sql| rocky_compiler::function_check::seed_function_names(&sql))
+        .unwrap_or_default();
     let target_for =
         |model: &str| operand_target_for(target_dialect, project_config, targets, model);
-    let mut operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
+    let mut operand_diags = rocky_compiler::operand_check::check_operand_types_with(
         &result.project.models,
         &result.semantic_graph,
         &result.type_check.typed_models,
+        &seed_names,
         &target_for,
     );
     // Calls to functions the target warehouse does not have: E057 on the
@@ -910,12 +932,15 @@ fn apply_operand_gates(
     let written_for = project_config
         .and_then(|c| c.portability.target_dialect)
         .map(rocky_compiler::operand_check::OperandDialect::from);
-    operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
-        &result.project.models,
-        result.semantic_graph.functions(),
-        &target_for,
-        written_for,
-    ));
+    operand_diags.extend(
+        rocky_compiler::function_check::check_unknown_functions_with(
+            &result.project.models,
+            result.semantic_graph.functions(),
+            &seed_names,
+            &target_for,
+            written_for,
+        ),
+    );
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
     }

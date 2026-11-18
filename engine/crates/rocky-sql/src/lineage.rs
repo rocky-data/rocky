@@ -4066,6 +4066,28 @@ mod tests {
             .collect()
     }
 
+    /// DuckDB's top-n `max(x, n)` / `min(x, n)` returns a list: an
+    /// expression over `x`, not an aggregate of its type.
+    #[test]
+    fn a_top_n_min_max_is_an_expression() {
+        assert_eq!(
+            amount_kinds("SELECT max(x, 2) AS m FROM t"),
+            vec![TransformKind::Expression]
+        );
+        assert_eq!(
+            amount_kinds("SELECT min(x, 3) AS m FROM t"),
+            vec![TransformKind::Expression]
+        );
+        assert_eq!(
+            amount_kinds("SELECT max(x) AS m FROM t"),
+            vec![TransformKind::Aggregation("MAX".into())]
+        );
+        assert_eq!(
+            amount_kinds("SELECT sum(x) AS m FROM t"),
+            vec![TransformKind::Aggregation("SUM".into())]
+        );
+    }
+
     #[test]
     fn an_outer_function_or_cast_over_a_cte_expression_is_an_expression() {
         let cte = "WITH c AS (SELECT x * 1.5 AS amt FROM t) ";

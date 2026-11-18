@@ -487,10 +487,31 @@ pub fn check_operand_types_per_model(
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
     target_for: &dyn Fn(&str) -> OperandTarget,
 ) -> Vec<Diagnostic> {
+    check_operand_types_with(models, graph, typed_models, &HashSet::new(), target_for)
+}
+
+/// [`check_operand_types_per_model`], with the functions and macros the
+/// project's seed file creates: a call to one is not judged against DuckDB's
+/// built-ins (E069).
+pub fn check_operand_types_with(
+    models: &[rocky_core::models::Model],
+    graph: &SemanticGraph,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    seed_names: &HashSet<String>,
+    target_for: &dyn Fn(&str) -> OperandTarget,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+    let guesses = model_guesses(models, typed_models, target_for);
     for model in models {
         let target = target_for(&model.config.name);
-        diagnostics.extend(check_model(model, graph, typed_models, target));
+        diagnostics.extend(check_model(
+            model,
+            graph,
+            typed_models,
+            &guesses,
+            seed_names,
+            target,
+        ));
     }
     diagnostics
 }
@@ -499,6 +520,8 @@ fn check_model(
     model: &rocky_core::models::Model,
     graph: &SemanticGraph,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    guesses: &std::collections::HashMap<String, HashSet<usize>>,
+    seed_names: &HashSet<String>,
     target: OperandTarget,
 ) -> Vec<Diagnostic> {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
@@ -521,13 +544,19 @@ fn check_model(
         precise_spans,
         target,
         functions: graph.functions(),
+        seed_names,
         join_key_columns: join_key_checked_columns(&model.config.name, graph, typed_models),
         having_aliases: HashSet::new(),
         having_opaque: false,
         seen: HashSet::new(),
         out: Vec::new(),
     };
-    let lookup = |name: &str| typed_models.get(name).map(Vec::as_slice);
+    let lookup = |name: &str| {
+        typed_models.get(name).map(|columns| RelationRef {
+            columns,
+            inexact: guesses.get(name),
+        })
+    };
     walk_query(query, &lookup, &mut ctx);
     ctx.out
 }
@@ -576,6 +605,8 @@ struct Ctx<'m> {
     /// Functions the project declares in `functions/`: a call to one is not
     /// judged against DuckDB's built-ins.
     functions: &'m crate::udf::FunctionRegistry,
+    /// Functions and macros the project's seed file creates.
+    seed_names: &'m HashSet<String>,
     join_key_columns: HashSet<String>,
     /// Lower-case select-list aliases while `HAVING` is checked, else empty.
     having_aliases: HashSet<String>,
@@ -627,35 +658,121 @@ impl Ctx<'_> {
 
 fn walk_query<'a>(
     query: &ast::Query,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
     ctx: &mut Ctx<'_>,
 ) {
-    let mut ctes: std::collections::HashMap<String, Vec<TypedColumn>> =
+    // Each CTE keeps which of its columns are a guess, as inference does
+    // (#2320), so a guessed column is not judged by E069 / E070.
+    let mut ctes: std::collections::HashMap<String, (Vec<TypedColumn>, HashSet<usize>)> =
         std::collections::HashMap::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let cte_lookup =
-                |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
+            let cte_lookup = |name: &str| cte_ref(&ctes, name).or_else(|| lookup(name));
             walk_query(&cte.query, &cte_lookup, ctx);
-            let relation = |name: &str| cte_lookup(name).map(RelationRef::from);
             let env = InferEnv {
-                lookup: &relation,
+                lookup: &cte_lookup,
                 target: &ctx.target,
             };
-            let mut columns = infer_query_types(&cte.query, env)
-                .unwrap_or_default()
-                .columns;
+            let (mut columns, inexact) = match infer_query_types(&cte.query, env) {
+                Ok(inferred) => {
+                    let inexact = guessed_outputs(&inferred);
+                    (inferred.columns, inexact)
+                }
+                Err(_) => (Vec::new(), HashSet::new()),
+            };
             rename_relation_columns(&mut columns, &cte.alias);
-            ctes.insert(cte.alias.name.value.clone(), columns);
+            ctes.insert(cte.alias.name.value.clone(), (columns, inexact));
         }
     }
-    let lookup = |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
+    let lookup = |name: &str| cte_ref(&ctes, name).or_else(|| lookup(name));
     walk_set_expr(&query.body, &lookup, ctx);
+}
+
+fn cte_ref<'c>(
+    ctes: &'c std::collections::HashMap<String, (Vec<TypedColumn>, HashSet<usize>)>,
+    name: &str,
+) -> Option<RelationRef<'c>> {
+    ctes.get(name).map(|(columns, inexact)| RelationRef {
+        columns,
+        inexact: Some(inexact),
+    })
+}
+
+/// The output positions of an inferred query whose type is a guess: not
+/// exact per `has_exact_type`, or a guess where a `*` read it from.
+fn guessed_outputs(inferred: &crate::typecheck::SelectInference) -> HashSet<usize> {
+    (0..inferred.columns.len())
+        .filter(|i| {
+            !inferred.exact_type_outputs.contains(i) || inferred.relation_inexact.contains(i)
+        })
+        .collect()
+}
+
+/// For each model, the output positions whose type is a guess (#2659 red
+/// team): `AVG` over a column of a table with no known schema is typed
+/// `Float64` only so a contract on it is checked. The type checker treats a
+/// model's columns as exact; E069 / E070 must not. A guess carries through
+/// pass-through models, so this repeats until nothing changes. A model whose
+/// SQL Rocky cannot infer, or whose inferred columns do not line up with its
+/// typed ones, has every column a guess.
+fn model_guesses(
+    models: &[rocky_core::models::Model],
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    target_for: &dyn Fn(&str) -> OperandTarget,
+) -> std::collections::HashMap<String, HashSet<usize>> {
+    let mut guesses: std::collections::HashMap<String, HashSet<usize>> =
+        std::collections::HashMap::new();
+    for _ in 0..=models.len() {
+        let mut changed = false;
+        for model in models {
+            let name = &model.config.name;
+            let Some(typed) = typed_models.get(name) else {
+                continue;
+            };
+            let all = || (0..typed.len()).collect::<HashSet<usize>>();
+            let inferred = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
+                .ok()
+                .and_then(|statements| match statements.as_slice() {
+                    [Statement::Query(query)] => {
+                        let lookup = |n: &str| {
+                            typed_models.get(n).map(|columns| RelationRef {
+                                columns,
+                                inexact: guesses.get(n),
+                            })
+                        };
+                        let target = target_for(name);
+                        infer_query_types(
+                            query,
+                            InferEnv {
+                                lookup: &lookup,
+                                target: &target,
+                            },
+                        )
+                        .ok()
+                    }
+                    _ => None,
+                });
+            let guessed = match inferred {
+                Some(inferred) if inferred.columns.len() == typed.len() => {
+                    guessed_outputs(&inferred)
+                }
+                _ => all(),
+            };
+            if guesses.get(name) != Some(&guessed) {
+                guesses.insert(name.clone(), guessed);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    guesses
 }
 
 fn walk_set_expr<'a>(
     body: &SetExpr,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
     ctx: &mut Ctx<'_>,
 ) {
     match body {
@@ -671,7 +788,7 @@ fn walk_set_expr<'a>(
 
 fn walk_table_factor<'a>(
     factor: &TableFactor,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
     ctx: &mut Ctx<'_>,
 ) {
     match factor {
@@ -727,7 +844,7 @@ fn join_on_constraints(from: &ast::TableWithJoins, out: &mut Vec<Expr>) {
 
 fn walk_select<'a>(
     select: &ast::Select,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
     ctx: &mut Ctx<'_>,
 ) {
     let mut on_exprs = Vec::new();
@@ -738,9 +855,8 @@ fn walk_select<'a>(
         }
         join_on_constraints(from, &mut on_exprs);
     }
-    let relation = |name: &str| lookup(name).map(RelationRef::from);
     let env = InferEnv {
-        lookup: &relation,
+        lookup,
         target: &ctx.target,
     };
     let (_, scope) = select_type_scope(select, env);
@@ -800,7 +916,7 @@ fn walk_select<'a>(
 fn check_expr<'a>(
     expr: &Expr,
     scope: &TypeScope,
-    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
     ctx: &mut Ctx<'_>,
 ) {
     match expr {
@@ -1113,6 +1229,7 @@ fn check_duckdb_call(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &m
     if aggregate_kind(&lower.to_ascii_uppercase()).is_some()
         || crate::function_check::is_special_form(&lower)
         || ctx.functions.declares(&lower)
+        || ctx.seed_names.contains(&lower)
     {
         return;
     }
@@ -1503,6 +1620,76 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// `AVG` over a column of a table with no known schema is typed `Float64`
+    /// only so a contract on it is checked; DuckDB may return a timestamp. A
+    /// column built from that guess is not judged, in a CTE or downstream.
+    #[test]
+    fn a_guessed_avg_column_is_not_judged() {
+        let duckdb = Some(OperandDialect::DuckDb);
+        let diags = run(
+            &[
+                // Downstream first: the guess must reach `d4` whatever the
+                // order models are listed in.
+                ("d4", "SELECT year(a) AS y FROM mid"),
+                ("mid", "SELECT a FROM a_avg"),
+                ("a_avg", "SELECT avg(ts) AS a FROM ext.events"),
+                ("d1", "SELECT year(a) AS y FROM a_avg"),
+                (
+                    "d2",
+                    "SELECT coalesce(a, o.order_date) AS x FROM a_avg, raw.orders o",
+                ),
+            ],
+            duckdb,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            codes_on(
+                "WITH c AS (SELECT avg(ts) AS a FROM ext.events) SELECT year(a) AS y FROM c",
+                duckdb
+            )
+            .is_empty()
+        );
+        // A known AVG is still judged: AVG over a number is a DOUBLE.
+        assert_eq!(
+            codes_on(
+                "WITH c AS (SELECT avg(qty) AS a FROM raw.orders) SELECT lower(a) AS y FROM c",
+                duckdb
+            ),
+            ["E069"]
+        );
+        let diags = run(
+            &[
+                ("k_avg", "SELECT avg(qty) AS a FROM raw.orders"),
+                ("d3", "SELECT lower(a) AS y FROM k_avg"),
+            ],
+            duckdb,
+        );
+        assert_eq!(codes(&diags), vec!["E069"], "{diags:?}");
+    }
+
+    /// A seed-file macro reusing a built-in name is the project's to judge.
+    #[test]
+    fn a_seed_file_macro_argument_is_not_judged() {
+        let models = vec![model("m", "SELECT lower(qty) AS x FROM raw.orders")];
+        let config = crate::compile::CompilerConfig {
+            source_schemas: sources(),
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
+        let target = OperandTarget::from(Some(OperandDialect::DuckDb));
+        let judge = |seed: &HashSet<String>| {
+            check_operand_types_with(
+                &result.project.models,
+                &result.semantic_graph,
+                &result.type_check.typed_models,
+                seed,
+                &|_| target.clone(),
+            )
+        };
+        assert_eq!(codes(&judge(&HashSet::new())), vec!["E069"]);
+        assert!(judge(&HashSet::from(["lower".to_string()])).is_empty());
     }
 
     /// The column of an upstream model is judged by its type, too.

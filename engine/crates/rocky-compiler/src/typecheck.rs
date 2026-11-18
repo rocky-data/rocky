@@ -4239,12 +4239,12 @@ pub(crate) struct SelectInference {
     // Projection indexes keep metadata aligned with duplicate wildcard names.
     /// Outputs whose inferred type comes straight from the SQL — see
     /// [`has_exact_type`].
-    exact_type_outputs: HashSet<usize>,
+    pub(crate) exact_type_outputs: HashSet<usize>,
     /// Outputs whose type is a guess for a query that reads this one as a
     /// relation (a CTE or derived table): an expression that is not exact,
     /// or a `*` column that was not exact where it came from. An outer
     /// expression over such a column is not exact either (#2320).
-    relation_inexact: HashSet<usize>,
+    pub(crate) relation_inexact: HashSet<usize>,
     /// Outputs that are a `COUNT(...)` call.
     count_outputs: HashSet<usize>,
     /// Outputs whose projection is itself a cast (`CAST`, `TRY_CAST`,
@@ -4380,6 +4380,11 @@ fn function_name(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Whether `func` is called with exactly one argument.
+fn has_one_argument(func: &ast::Function) -> bool {
+    matches!(&func.args, ast::FunctionArguments::List(list) if list.args.len() == 1)
+}
+
 /// Whether [`infer_expr_type`] reads this expression's type from the SQL
 /// itself rather than from a guess: a column (of a CTE or derived table,
 /// only when the expression that built it is exact — #2320), a cast (its
@@ -4390,11 +4395,6 @@ fn function_name(expr: &Expr) -> Option<String> {
 /// (`LENGTH`), a numeric literal, `COALESCE` over a literal that changes the
 /// type — is not exact, so a nested expression built from it stays `Unknown`
 /// (#2295).
-/// Whether `func` is called with exactly one argument.
-fn has_one_argument(func: &ast::Function) -> bool {
-    matches!(&func.args, ast::FunctionArguments::List(list) if list.args.len() == 1)
-}
-
 pub(crate) fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
         // A column of a CTE or derived table is exact only when the

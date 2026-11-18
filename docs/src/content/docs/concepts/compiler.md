@@ -298,22 +298,29 @@ These are not reported:
 
 - The same calls as for `E057`: schema-qualified, quoted, declared in
   `functions/`, or a rewritten form.
+- A call to a macro or function the project's `data/seed.sql` creates
+  (`CREATE [OR REPLACE] [TEMP] MACRO` or `FUNCTION`), even when it reuses a
+  built-in name. `E057` skips these too.
 - A call with named arguments (`name := value` too), `*`, `DISTINCT`,
   `ORDER BY` inside the parentheses, a lambda, an argument that expands to
   several (`UNPACK(COLUMNS(...))`), `FILTER`, `WITHIN GROUP` or `OVER`.
 - A function such as `struct_pack`, which treats a `NULL` argument
   differently from a column.
-- In `HAVING`, a bare name that is also a select-list alias.
+- In `HAVING`, a bare name that is also a select-list alias. When the select
+  list has `* REPLACE (...)` or `COLUMNS(...)`, no bare name in `HAVING` is
+  checked, since either can give a column's name to another expression.
+- A column whose type is a guess: `AVG` over a column of a table with no
+  known schema is typed `DOUBLE` only so a contract on it is checked. This
+  holds in a CTE and in a downstream model.
 - A top-n `max(x, n)` or `min(x, n)`, which returns a list. Its column is
   typed `Unknown`.
-
-A DuckDB macro that reuses a built-in name is a known false refusal. Rocky
-checks the call against the built-in even when the macro is created outside
-Rocky or by the project's seed file. Call the macro schema-qualified
-(`main.lower(...)`), which Rocky does not check.
 - A `CASE` whose text literal fails to convert only for some rows, as in
   `CASE WHEN qty > 1 THEN 'many' ELSE qty END`. DuckDB accepts this query and
   fails only when a row reaches the text branch.
+
+A DuckDB macro created outside the project that reuses a built-in name is a
+known false refusal: Rocky checks the call against the built-in. Call the
+macro schema-qualified (`main.lower(...)`), which Rocky does not check.
 
 #### Set operations with different column counts (`E071`)
 
