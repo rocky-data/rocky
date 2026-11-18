@@ -842,6 +842,24 @@ mod tests {
         }
     }
 
+    /// DuckDB binds every subquery of the main query, even one that never
+    /// runs, so `E068` there is an error DuckDB also raises.
+    #[test]
+    fn a_never_evaluated_subquery_is_still_judged() {
+        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (s VARCHAR)").unwrap();
+        for sql in [
+            "SELECT CASE WHEN false THEN (SELECT lower(s, 'x') FROM t) ELSE 1 END FROM t",
+            "SELECT 1 FROM t WHERE false AND EXISTS (SELECT lower(s, 'x') FROM t)",
+            "SELECT * FROM (SELECT lower(s, 'x') FROM t) d WHERE false",
+            "SELECT CASE WHEN false THEN lower(s, 'x') END FROM t",
+        ] {
+            assert_eq!(count_codes(sql, &duckdb), ["E068"], "{sql}");
+            assert!(conn.prepare(sql).is_err(), "DuckDB binds {sql}");
+        }
+    }
+
     /// Round-7 red team, #2659: a CTE counts as read only when a reached
     /// reader names it in scope. DuckDB binds every query here.
     #[test]

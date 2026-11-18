@@ -427,6 +427,21 @@ mod tests {
         );
     }
 
+    /// DuckDB binds a set operation in a subquery that never runs.
+    #[test]
+    fn a_never_evaluated_subquery_is_still_checked() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (s VARCHAR); CREATE TABLE u (a INTEGER); \
+             CREATE TABLE v (a INTEGER, b INTEGER)",
+        )
+        .unwrap();
+        let sql = "SELECT 1 FROM t WHERE false AND s IN \
+                   (SELECT a FROM u UNION ALL SELECT a, b FROM v)";
+        assert_eq!(codes(sql), 1);
+        assert!(conn.prepare(sql).is_err());
+    }
+
     /// Round-7 red team, #2661: CTE reads follow DuckDB's scoping.
     #[test]
     fn a_shadowed_or_forward_cte_is_not_checked() {
