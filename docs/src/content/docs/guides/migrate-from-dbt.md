@@ -316,6 +316,20 @@ A selective compile leaves unselected models without that evidence. Compile with
 A custom macro can hide the `is_incremental()` call. Rocky's first run then fails or omits old rows.
 :::
 
+### Snapshots: use the model strategy
+
+Rocky has two snapshot (SCD Type 2) forms. A dbt snapshot maps to the model form. The importer emits that form, and you should use it when you port a snapshot by hand.
+
+| | Snapshot model | Snapshot pipeline |
+|---|---|---|
+| Declared as | `[strategy] type = "snapshot"` in a model sidecar | `[pipeline.<name>] type = "snapshot"` in `rocky.toml` |
+| Runs with | `rocky run`, with your other models | `rocky snapshot`, which refuses any other pipeline type |
+| Reads | the model's SQL | one source table named in the pipeline |
+| History columns | `valid_from`, `valid_to`, `is_current`, `snapshot_id` by default | `valid_from`, `valid_to`, `is_current`, `snapshot_id` |
+| dbt's column names | `snapshot_meta_column_names` renames them, and `is_current = false` drops the flag column | not configurable |
+
+To continue a snapshot table that dbt built, keep dbt's names (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`). The [Snapshot](/reference/model-format/#snapshot) reference shows the settings.
+
 ## 1. Import the dbt Project
 
 Point `rocky import-dbt` at your dbt project directory:
