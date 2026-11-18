@@ -64,8 +64,8 @@ After you deploy, each matching asset shows up to three contract checks on its
 asset detail page. Which of the three appear depends on the rule
 kinds the contract declares:
 
-- `contract_required_columns`: passes when there are no E010 diagnostics
-- `contract_protected_columns`: passes when there are no E013 diagnostics
+- `contract_required_columns`: passes when there are no E010 diagnostics (or E062, see below)
+- `contract_protected_columns`: passes when there are no E013 diagnostics (or E062, see below)
 - `contract_column_constraints`: passes when there are no E011/E012/E014/E059/E063/W010 diagnostics.
   It appears when a `[[columns]]` entry sets `type` or `nullable`, or when `[rules]` sets
   `no_new_nullable` or `no_extra_columns`.

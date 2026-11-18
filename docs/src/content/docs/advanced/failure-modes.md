@@ -20,7 +20,7 @@ Read whichever signal you already have. Then follow the branch to a section.
  ─────────────────────────────────    ────────────────    ─────────────────
 
  Rocky never called the warehouse
-   ├─ code E010–E014                  2. Contracts        the contract file
+   ├─ E010–E014, E062, E063           2. Contracts        the contract file
    └─ any other error code            1. Compile-time     rocky compile
 
  The run printed JSON: which block is populated?
@@ -48,7 +48,7 @@ Entries on `contained[*]` are not failures of their own. They name models Rocky 
 | Category | Detection signal | Surface |
 |---|---|---|
 | [Compile-time](#1-compile-time-failures) | `severity: Error` diagnostic with code `E001`, `E020`–`E028` | `rocky compile`, `rocky ci`, LSP red squiggles |
-| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E014` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
+| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E014`, `E062`, `E063` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
 | [Schema drift](#3-schema-drift) | `drift.actions_taken[].action` on `rocky run` / `rocky apply` output | `rocky run`, `rocky apply` drift block |
 | [Quality check failures](#4-quality-check-failures) | `check_results[].checks[].passed == false` | `rocky run` / `rocky apply --output json` |
 | [Adapter / runtime failures](#5-adapter--runtime-failures) | Non-zero `rocky apply` exit + entry on `errors[*]` with typed `failure_kind` | `rocky apply`, `rocky doctor` |
@@ -76,9 +76,9 @@ Every finding is a [diagnostic](/reference/glossary/#diagnostic-code): a stable 
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
 
-This table is not exhaustive. The compiler also emits `E010`–`E014` and `E029`–`E061`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all.
+This table is not exhaustive. The compiler also emits `E010`–`E014`, `E029`–`E061`, `E062`, `E063` and `E064`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all.
 
-Codes `E010`–`E014` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
+Codes `E010`–`E014`, `E062` and `E063` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
 
 **Recovery playbook.**
 

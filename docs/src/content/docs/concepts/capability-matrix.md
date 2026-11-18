@@ -39,7 +39,7 @@ Four more words appear across the rows, always with the same meaning:
 
 | Capability | Who enforces it |
 |---|---|
-| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E014) and on every `rocky run` route, `--dag` included: a model with a contract error is not written. |
+| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E014, E062, E063) and on every `rocky run` route, `--dag` included: a model with a contract error is not written. |
 | [Classification tag completeness](#classification-tag-completeness) | Not enforced: Rocky warns (W004). Nothing blocks. |
 | [Masking application](#masking-application) | Adapter-dependent: Databricks only, attempted |
 | [Freshness](#freshness) | Declared metadata, not enforced. One opt-in run-time check, replication pipelines only. |
@@ -242,9 +242,9 @@ three gates".
 ## Audit ledger
 
 **Rocky recording: attempted for ordinary rules, durable for the two gating kinds.**
-Policy-decision recording is best-effort for ordinary rules. At a mutating seam
-— `rocky apply`, promote and an agent's `rocky run`, plus the `draft_*` and `propose` tools, which run
-the same evaluator into the same sink — Rocky writes each evaluated decision to
+Policy-decision recording is best-effort for ordinary rules. The mutating seams are `rocky apply`, promote, an agent's `rocky run`, and the
+`draft_*` and `propose` tools, which run the same evaluator into the same sink.
+At each seam, Rocky writes each evaluated decision to
 a `policy_decisions` table in the embedded redb state store, and when that write
 fails it warns and continues. Some refusals never reach the table at all,
 because the gate can return a verdict before any rule is evaluated. Decisions

@@ -108,7 +108,7 @@ Map each variant to one of four actions:
 
 "Retry with backoff" needs one qualification. The run loop already retries proven-transient failures itself, on by default. See [Classified retry](/advanced/failure-modes/#classified-retry) and `[resilience] transient_max_retries`, which defaults to 2.
 
-So a `transient` entry that reaches your `errors[*]` has already exhausted its in-run retry budget. At the orchestrator level, retry means a *delayed* re-run or `--resume-latest`. It does not mean a tight-loop retry, which only doubles the engine's own attempts. `--resume-latest` resumes a replication run. For a transformation run, `rocky run --retry-failed` reruns only the failed and never-built models and their downstream models.
+So a `transient` entry that reaches your `errors[*]` has already exhausted its in-run retry budget. At the orchestrator level, retry means a *delayed* re-run or `--resume-latest`. It does not mean a tight-loop retry, which only doubles the engine's own attempts. `--resume-latest` resumes a replication run. For a transformation run, `rocky run --retry-failed` reruns the failed and never-built models and their downstream models. It also rebuilds a model when it cannot prove the model is still current.
 
 Treat `connection-failed` as retry-safe even though the warehouse never saw the request. `reqwest::is_connect()` is the primary signal, and it fires on real TCP, TLS, and DNS failures. Other non-timeout transport errors also classify as `connection-failed`. A timeout classifies as `transient` instead. A credential problem lands on `auth-failed`, via the typed `Auth` variant or a 401 or 403, and never here.
 

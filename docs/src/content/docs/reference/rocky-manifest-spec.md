@@ -114,7 +114,7 @@ On a content-addressed write path, the manifest also carries the output byte-has
 | `env_hash` | yes | The environment key (64-hex BLAKE3). |
 | `output_hashes` | no | Byte-hashes of output artifact files, recorded on a content-addressed write path. |
 
-The canonical machine-readable definition is the JSON Schema (draft 2020-12) at `engine/crates/rocky-verify/spec/rocky-manifest-v0.1.schema.json`. It is a standalone schema, deliberately kept out of the CLI's JSON-output schema set: it describes the open format, not a command's wire output. Print it with `rocky-verify schema`. That command prints the v0.1 schema. Add `--version 0.2` to print the v0.2 schema.
+The canonical machine-readable definitions are the JSON Schemas (draft 2020-12) at `engine/crates/rocky-verify/spec/rocky-manifest-v0.1.schema.json` and `engine/crates/rocky-verify/spec/rocky-manifest-v0.2.schema.json`. Each is a standalone schema, deliberately kept out of the CLI's JSON-output schema set: each describes the open format, not a command's wire output. `rocky-verify schema` prints the v0.1 schema. Add `--version 0.2` to print the v0.2 schema.
 
 ### The honesty invariant
 
@@ -176,7 +176,7 @@ The same manifest content can travel in more than one place:
 `rocky-verify` is a standalone tool that verifies a manifest with no Rocky engine installed. It does two independent things:
 
 ```bash
-# Structure only: validate against the schema that `manifest_version` names.
+# Structure only: a "0.2" manifest is checked against the v0.2 schema, any other against v0.1.
 rocky-verify verify manifest.json
 
 # Structure plus bytes: also hash any output artifacts and compare.
