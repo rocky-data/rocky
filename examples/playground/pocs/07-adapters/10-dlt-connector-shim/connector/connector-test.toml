@@ -1,0 +1,18 @@
+# `rocky connector test shop_orders`: three runs over recorded orders in
+# ../shop_src/replay/. The shim runs the real dlt (installed in ../.venv), so
+# this test needs dlt from PyPI: the engine-weekly job runs it, not PR CI.
+
+[[run]]
+options = { source_args = { data_dir = "replay/run-1" } }
+rows    = 5   # orders 1 to 5
+state   = "advanced"
+
+[[run]]
+options = { source_args = { data_dir = "replay/run-2" } }
+rows    = 3   # only orders 6 to 8: dlt's incremental cursor came back as state
+state   = "advanced"
+
+[[run]]
+options = { source_args = { data_dir = "replay/run-2" } }
+rows    = 0   # nothing new
+state   = "unchanged"
