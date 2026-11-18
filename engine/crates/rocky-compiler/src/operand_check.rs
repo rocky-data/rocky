@@ -635,8 +635,11 @@ fn walk_query<'a>(
         std::collections::HashMap::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let cte_lookup =
-                |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
+            let cte_lookup = |name: &str| {
+                ctes.get(&rocky_core::physical_edges::fold_identifier(name))
+                    .map(Vec::as_slice)
+                    .or_else(|| lookup(name))
+            };
             walk_query(&cte.query, &cte_lookup, ctx);
             let relation = |name: &str| cte_lookup(name).map(RelationRef::from);
             let env = InferEnv {
@@ -647,10 +650,19 @@ fn walk_query<'a>(
                 .unwrap_or_default()
                 .columns;
             rename_relation_columns(&mut columns, &cte.alias);
-            ctes.insert(cte.alias.name.value.clone(), columns);
+            // A `WITH` name hides a table in any case in its scope, as on
+            // DuckDB, and as lineage binds it (#2674).
+            ctes.insert(
+                rocky_core::physical_edges::fold_identifier(&cte.alias.name.value),
+                columns,
+            );
         }
     }
-    let lookup = |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
+    let lookup = |name: &str| {
+        ctes.get(&rocky_core::physical_edges::fold_identifier(name))
+            .map(Vec::as_slice)
+            .or_else(|| lookup(name))
+    };
     walk_set_expr(&query.body, &lookup, ctx);
 }
 
@@ -1190,6 +1202,96 @@ mod tests {
         "SELECT customer_id, SUM(customer_name) AS s FROM raw.customers GROUP BY customer_id";
     const D5: &str = "SELECT o.order_id, c.customer_name FROM raw.orders o \
                       JOIN raw.customers c ON o.customer_id = c.customer_name";
+
+    #[test]
+    /// #2674: an unquoted `WITH` name hides a table of the same name in any
+    /// case, in the query's scope, as on DuckDB 2.0 (a CTE defined before it
+    /// still reads the table). `o` is the CTE's VARCHAR `status`, so DuckDB
+    /// refuses `SUM(o.status)`; the table's BIGINT `status` would pass.
+    fn a_with_name_in_another_case_hides_the_table_in_its_scope() {
+        let reader = model(
+            "reader",
+            "WITH a AS (SELECT status AS s FROM orders), Orders AS (SELECT 'x' AS status) \
+             SELECT SUM(o.status) AS t FROM a CROSS JOIN orders o",
+        );
+        let mut source_schemas = sources();
+        source_schemas.insert("orders".to_string(), vec![col("status", RockyType::Int64)]);
+        let config = crate::compile::CompilerConfig {
+            source_schemas,
+            ..Default::default()
+        };
+        let result =
+            crate::compile::compile_preloaded_models(vec![reader], &config).expect("compile");
+        let diags = check_operand_types(
+            &result.project.models,
+            &result.semantic_graph,
+            &result.type_check.typed_models,
+            &result.type_check.shadowed_sources,
+            Some(OperandDialect::DuckDb),
+        );
+        assert_eq!(codes(&diags), vec!["E042"], "{diags:?}");
+    }
+
+    #[test]
+    /// #2674: which relation a `WITH` name hides, case by case, as DuckDB
+    /// binds it. The CTE's `status` is VARCHAR and the table's is BIGINT, so
+    /// DuckDB refuses `SUM(status)` exactly when the read reaches the CTE.
+    /// Rocky refuses (`E042`) in the same cases.
+    fn a_with_name_hides_the_table_exactly_where_duckdb_says() {
+        const CTE: &str = "SELECT 'x' AS status";
+        let cases = [
+            // In scope, any case and quoting: the CTE.
+            format!("WITH Orders AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
+            format!("WITH \"Orders\" AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
+            format!("WITH Orders AS ({CTE}) SELECT SUM(status) AS t FROM \"orders\""),
+            format!(
+                "WITH a AS (SELECT status AS s FROM orders), Orders AS ({CTE}) \
+                 SELECT SUM(o.status) AS t FROM a CROSS JOIN orders o"
+            ),
+            // A CTE defined before it reads the table.
+            format!(
+                "WITH a AS (SELECT SUM(status) AS t FROM orders), Orders AS ({CTE}) \
+                 SELECT t FROM a"
+            ),
+            // Its own body reads the table.
+            "WITH Orders AS (SELECT SUM(status) AS status FROM orders) \
+             SELECT status FROM orders"
+                .to_string(),
+            // Outside the WITH, the table.
+            format!(
+                "SELECT (SELECT SUM(status) FROM orders) AS t, y.status \
+                 FROM (WITH Orders AS ({CTE}) SELECT status FROM orders) AS y"
+            ),
+        ];
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE orders AS SELECT 1::BIGINT AS status")
+            .unwrap();
+        let mut refused = 0;
+        for sql in &cases {
+            let duckdb_refuses = conn.prepare(sql).is_err();
+            let mut source_schemas = sources();
+            source_schemas.insert("orders".to_string(), vec![col("status", RockyType::Int64)]);
+            let config = crate::compile::CompilerConfig {
+                source_schemas,
+                ..Default::default()
+            };
+            let result =
+                crate::compile::compile_preloaded_models(vec![model("reader", sql)], &config)
+                    .expect("compile");
+            let diags = check_operand_types(
+                &result.project.models,
+                &result.semantic_graph,
+                &result.type_check.typed_models,
+                &result.type_check.shadowed_sources,
+                Some(OperandDialect::DuckDb),
+            );
+            let rocky_refuses = codes(&diags).contains(&"E042");
+            assert_eq!(rocky_refuses, duckdb_refuses, "{sql}: {diags:?}");
+            refused += usize::from(duckdb_refuses);
+        }
+        // Both outcomes are exercised.
+        assert_eq!(refused, 4);
+    }
 
     #[test]
     /// #2674: a reader that declares model `orders`, which writes

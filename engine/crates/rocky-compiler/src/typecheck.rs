@@ -4773,8 +4773,10 @@ pub(crate) fn infer_query_types(
             };
             let mut columns = inferred.columns;
             rename_relation_columns(&mut columns, &cte.alias);
+            // A `WITH` name hides a table in any case in its scope, as on
+            // DuckDB, and as lineage binds it (#2674).
             ctes.insert(
-                cte.alias.name.value.clone(),
+                rocky_core::physical_edges::fold_identifier(&cte.alias.name.value),
                 (columns, inferred.relation_inexact),
             );
         }
@@ -4793,10 +4795,11 @@ fn cte_relation<'c>(
     ctes: &'c HashMap<String, (Vec<TypedColumn>, HashSet<usize>)>,
     name: &str,
 ) -> Option<RelationRef<'c>> {
-    ctes.get(name).map(|(columns, inexact)| RelationRef {
-        columns,
-        inexact: Some(inexact),
-    })
+    ctes.get(&rocky_core::physical_edges::fold_identifier(name))
+        .map(|(columns, inexact)| RelationRef {
+            columns,
+            inexact: Some(inexact),
+        })
 }
 
 /// Infer the output columns of one query body: a `SELECT`, a parenthesised

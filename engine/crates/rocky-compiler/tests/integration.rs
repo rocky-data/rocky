@@ -2093,6 +2093,15 @@ fn a_read_is_typed_from_what_it_reaches_at_run_time() {
     // A `WITH` name in another case still hides the table: unquoted names
     // fold. The type checker's inference matches `WITH` names exactly, so it
     // asks about `orders`; that read is the CTE, not the model.
+    // DuckDB 2.0: a CTE defined before `Orders` reads the TABLE `orders`;
+    // the outer `orders` is the CTE `Orders`.
+    write(
+        "cte_mixed",
+        "WITH a AS (SELECT id AS a_id FROM orders), \
+         Orders AS (SELECT CAST(1.5 AS DOUBLE) AS id) \
+         SELECT a.a_id, o.id, o.id * 2 AS n FROM a CROSS JOIN orders o",
+        "depends_on = [\"orders\"]\n",
+    );
     write(
         "cte_case",
         "WITH Orders AS (SELECT CAST(1.5 AS DOUBLE) AS id) SELECT id FROM orders",
@@ -2177,7 +2186,7 @@ fn a_read_is_typed_from_what_it_reaches_at_run_time() {
     assert_eq!(id("derived").0, RockyType::Unknown);
     assert_eq!(id("reads_x").0, RockyType::Unknown, "no model writes `x`");
     // A CTE named `orders` hides both the model and the source table.
-    for reader in ["cte_shadow", "cte_case"] {
+    for reader in ["cte_shadow", "cte_case", "cte_mixed"] {
         let cte = id(reader).0;
         assert!(
             cte != model_id.0 && cte != source_id.0,
