@@ -149,25 +149,13 @@ impl<'a> Relations<'a> {
         }
         // A model's read of its own name (the table its last run built, as
         // the schema cache has it) is typed as before #2674.
-        if read == reader {
+        if read == reader || !self.graph.models.contains_key(read) {
             return Reach::Typed(read.to_string());
         }
-        let named = reader_schema.map_or(NamedRead::NotComputed, |s| s.named_read(read));
-        // A read bound to a model reads the table that model writes, so it
-        // takes that model's output, by the model's name or its target
-        // table's (#1354). The model is upstream, so it is typed by now; a
-        // source schema of the read's name is not used.
-        if let NamedRead::Model(model) = named {
-            return Reach::Typed(model.to_string());
-        }
-        if !self.graph.models.contains_key(read) {
-            return Reach::Typed(read.to_string());
-        }
-        match named {
-            NamedRead::NotComputed => Reach::Typed(read.to_string()),
-            NamedRead::Model(model) => Reach::Typed(model.to_string()),
+        match reader_schema.map_or(NamedRead::NotComputed, |s| s.named_read(read)) {
+            NamedRead::ThatModel | NamedRead::NotComputed => Reach::Typed(read.to_string()),
             NamedRead::Source => Reach::Shadowed,
-            NamedRead::Local => Reach::Unknown,
+            NamedRead::OtherModel | NamedRead::Local => Reach::Unknown,
             NamedRead::Unlisted => {
                 debug_assert!(
                     false,
@@ -208,8 +196,8 @@ impl<'a> Relations<'a> {
 
     /// The columns of upstream model `upstream` as `reader` reads it: the
     /// model's, unless `reader`'s bare read of that name reaches the source
-    /// table, or another model's output when the read binds to that model. A
-    /// declared model the SQL never reads bare keeps its columns, as before.
+    /// table, or another model (then nothing). A declared model the SQL
+    /// never reads bare keeps its columns, as before.
     pub(crate) fn upstream(&self, reader: &str, upstream: &str) -> Option<&'a [TypedColumn]> {
         let read = self
             .graph
@@ -217,10 +205,14 @@ impl<'a> Relations<'a> {
             .map(|s| s.named_read(upstream));
         match read {
             Some(NamedRead::Source) => self.shadowed.get(upstream).map(Vec::as_slice),
-            Some(NamedRead::Model(model)) => self.typed.get(model).map(Vec::as_slice),
-            Some(NamedRead::Local | NamedRead::Unlisted | NamedRead::NotComputed) | None => {
-                self.typed.get(upstream).map(Vec::as_slice)
-            }
+            Some(NamedRead::OtherModel) => None,
+            Some(
+                NamedRead::ThatModel
+                | NamedRead::Local
+                | NamedRead::Unlisted
+                | NamedRead::NotComputed,
+            )
+            | None => self.typed.get(upstream).map(Vec::as_slice),
         }
     }
 

@@ -97,72 +97,16 @@ pub struct ModelSchema {
     /// Natural language intent (from model config).
     pub intent: Option<String>,
     /// What each bare table read in this model's SQL reaches when it runs
-    /// (#2674), by the rule `resolve.rs` derives the DAG edge with (#1354).
-    /// A `WITH` name the query reads is listed too, as
-    /// [`ReadTarget::Local`], unless a table of that name is also read.
+    /// (#2674), keyed by the read folded with
+    /// [`rocky_core::physical_edges::fold_identifier`], with the rule
+    /// `resolve.rs` derives the DAG edge with (#1354). A `WITH` name the
+    /// query reads is listed too, as [`ReadTarget::Local`], unless a table of
+    /// that name is also read.
     ///
     /// `None` for a schema built without the project's SQL, such as a
     /// hand-built graph: read it through [`Self::named_read`]. Not serialized.
     #[serde(skip)]
-    pub reads: Option<ReadBindings>,
-}
-
-/// The bare reads of one model's SQL and what each reaches (#2674).
-///
-/// Keyed by the spelling as read, and by that spelling folded with
-/// [`rocky_core::physical_edges::fold_identifier`]. A lookup tries the exact
-/// spelling first: two models whose names differ only in case (an ephemeral
-/// model is inlined by its exact name) are two relations. The folded key
-/// serves a walker that spells a read differently (lineage lowercases a
-/// nested read). For one key, a binding to a model wins over one that missed
-/// it, since a nested spelling can miss an ephemeral model's exact name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReadBindings {
-    exact: HashMap<String, ReadTarget>,
-    folded: HashMap<String, ReadTarget>,
-}
-
-impl ReadBindings {
-    /// What the read spelled `name` reaches, if the bindings list it.
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<&ReadTarget> {
-        self.exact.get(name).or_else(|| {
-            self.folded
-                .get(&rocky_core::physical_edges::fold_identifier(name))
-        })
-    }
-
-    /// Record that the read spelled `name` reaches `target`.
-    fn insert(&mut self, name: &str, target: ReadTarget) {
-        fn keep(map: &mut HashMap<String, ReadTarget>, key: String, target: ReadTarget) {
-            match map.entry(key) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(target);
-                }
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    if *slot.get() == ReadTarget::Table {
-                        slot.insert(target);
-                    }
-                }
-            }
-        }
-        keep(
-            &mut self.folded,
-            rocky_core::physical_edges::fold_identifier(name),
-            target.clone(),
-        );
-        keep(&mut self.exact, name.to_string(), target);
-    }
-
-    /// Record a `WITH` name, unless a table read is listed under it.
-    fn insert_local(&mut self, name: &str) {
-        self.folded
-            .entry(rocky_core::physical_edges::fold_identifier(name))
-            .or_insert(ReadTarget::Local);
-        self.exact
-            .entry(name.to_string())
-            .or_insert(ReadTarget::Local);
-    }
+    pub reads: Option<HashMap<String, ReadTarget>>,
 }
 
 /// What a bare name read in a model's SQL reaches when it runs (#2674).
@@ -178,17 +122,19 @@ pub enum ReadTarget {
     Local,
 }
 
-/// What a bare read reaches, for the reader (#2674). See
-/// [`ModelSchema::named_read`].
+/// What a read spelled with a model's exact name reaches, for the reader
+/// (#2674). See [`ModelSchema::named_read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NamedRead<'a> {
-    /// The read binds to this model, the one that writes the table it
-    /// reads: the model of the read's name, or another model whose target
-    /// table has that name.
-    Model(&'a str),
-    /// The read reaches a table no model of the project is bound to. For a
-    /// model's name, the source table that name shadows.
+pub enum NamedRead {
+    /// The read binds to the model of that name.
+    ThatModel,
+    /// The read reaches a table of that name no model of the project is
+    /// bound to: the source table the model's name shadows.
     Source,
+    /// The read binds to another model, one that writes a table of that
+    /// name. Its type is unknown until reads are typed through the model
+    /// they bind to.
+    OtherModel,
     /// A `WITH` name of the reader's query. A walker that matches `WITH`
     /// names in another case than lineage does can ask about one; it is not
     /// a table, so its type is unknown.
@@ -229,26 +175,27 @@ impl ModelSchema {
         !self.has_star && self.unresolved_projections == 0
     }
 
-    /// What this model's bare read of `name` reaches when the SQL runs
-    /// (#2674). A bare read is resolved by the table a model WRITES, not by
-    /// its name (#1354), and `depends_on` orders a run without rewriting a
-    /// read, so the name alone never says.
+    /// Whether this model's lineage may be missing edges: a known gap, or
+    /// gaps that were never computed (`None`). Only `Some(vec![])` is
+    /// complete.
+    /// What this model's bare read of `name`, a model's exact name, reaches
+    /// when the SQL runs (#2674). A bare read is resolved by the table a
+    /// model WRITES, not by its name (#1354), and `depends_on` orders a run
+    /// without rewriting a read, so the name alone never says.
     #[must_use]
-    pub fn named_read(&self, name: &str) -> NamedRead<'_> {
+    pub fn named_read(&self, name: &str) -> NamedRead {
         let Some(reads) = &self.reads else {
             return NamedRead::NotComputed;
         };
-        match reads.get(name) {
-            Some(ReadTarget::Model(model)) => NamedRead::Model(model),
+        match reads.get(&rocky_core::physical_edges::fold_identifier(name)) {
+            Some(ReadTarget::Model(model)) if model == name => NamedRead::ThatModel,
+            Some(ReadTarget::Model(_)) => NamedRead::OtherModel,
             Some(ReadTarget::Table) => NamedRead::Source,
             Some(ReadTarget::Local) => NamedRead::Local,
             None => NamedRead::Unlisted,
         }
     }
 
-    /// Whether this model's lineage may be missing edges: a known gap, or
-    /// gaps that were never computed (`None`). Only `Some(vec![])` is
-    /// complete.
     #[must_use]
     pub fn lineage_is_incomplete(&self) -> bool {
         self.lineage_gaps
@@ -552,39 +499,64 @@ pub fn build_semantic_graph(
             .get(model_name.as_str())
             .copied()
             .unwrap_or_default();
-        let mut reads = ReadBindings::default();
-        for name in lineage_result
+        let mut reads: HashMap<String, ReadTarget> = HashMap::new();
+        let bound = lineage_result
             .source_tables
             .iter()
             .filter(|t| t.binding == lineage::TableBinding::Physical)
             .map(|t| &t.name)
             .chain(lineage_result.nested_sources.iter())
             .filter(|name| !name.contains('.'))
-        {
-            let target = match bare_reads.bind(name, model) {
-                crate::resolve::BareBinding::Model(m) if reader_upstream.contains(&m) => {
-                    ReadTarget::Model(m)
+            .map(|name| {
+                let target = match bare_reads.bind(name, model) {
+                    crate::resolve::BareBinding::Model(m) if reader_upstream.contains(&m) => {
+                        ReadTarget::Model(m)
+                    }
+                    crate::resolve::BareBinding::Model(_)
+                    | crate::resolve::BareBinding::External
+                    | crate::resolve::BareBinding::Ambiguous(_) => ReadTarget::Table,
+                };
+                (rocky_core::physical_edges::fold_identifier(name), target)
+            });
+        // Two spellings of one name fold to one key, and they reach one
+        // table. `bind` matches an ephemeral model's name exactly, and lineage
+        // lowercases a nested read, so a binding to a model wins over a
+        // spelling that missed it.
+        for (key, target) in bound {
+            match reads.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(target);
                 }
-                crate::resolve::BareBinding::Model(_)
-                | crate::resolve::BareBinding::External
-                | crate::resolve::BareBinding::Ambiguous(_) => ReadTarget::Table,
-            };
-            reads.insert(name, target);
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if *slot.get() == ReadTarget::Table {
+                        slot.insert(target);
+                    }
+                }
+            }
         }
         for cte in lineage_result
             .source_tables
             .iter()
             .filter(|t| t.binding == lineage::TableBinding::Cte)
         {
-            reads.insert_local(&cte.name);
+            reads
+                .entry(rocky_core::physical_edges::fold_identifier(&cte.name))
+                .or_insert(ReadTarget::Local);
         }
-        // The model a star over the bare read `name` expands: the one the
-        // read binds to, which writes the table the run reads (#1354, #2674).
-        // A source schema of the read's name is never used for a read bound
-        // to a model: that model replaced the table.
-        let star_model = |name: &str| match reads.get(name) {
-            Some(ReadTarget::Model(m)) => Some(m.clone()),
-            Some(ReadTarget::Table | ReadTarget::Local) | None => None,
+        // Whether this model's bare read of `name` binds to a model other
+        // than one of that name. That model replaced the table of that name,
+        // so a source schema of the name is stale: a star over it stays
+        // unexpanded rather than claim columns the run may not have (#2674).
+        let star_reads_other_model = |name: &str| {
+            matches!(
+                reads.get(&rocky_core::physical_edges::fold_identifier(name)),
+                Some(ReadTarget::Model(m)) if m != name
+            )
+        };
+        // Whether this model's star over `name` reads the model of that name.
+        let star_reads_model = |name: &str| {
+            reads.get(&rocky_core::physical_edges::fold_identifier(name))
+                == Some(&ReadTarget::Model(name.to_string()))
         };
 
         // Build table alias → resolved name map for this model's SQL
@@ -733,9 +705,10 @@ pub fn build_semantic_graph(
                     for inner_name in &table_ref.derived_sources {
                         // Same rule as a direct star: a model's columns only
                         // when the read reaches that model (#1631, #2674).
-                        let bound = star_model(inner_name);
-                        let inner_columns: Vec<&str> = if let Some(upstream_schema) =
-                            bound.as_deref().and_then(|m| models.get(m))
+                        let reader_depends_on_it = star_reads_model(inner_name);
+                        let inner_columns: Vec<&str> = if let Some(upstream_schema) = models
+                            .get(inner_name.as_str())
+                            .filter(|_| reader_depends_on_it)
                         {
                             upstream_schema
                                 .columns
@@ -744,7 +717,7 @@ pub fn build_semantic_graph(
                                 .collect()
                         } else if let Some(source_cols) = source_schemas
                             .get(inner_name.as_str())
-                            .filter(|_| star_model(inner_name).is_none())
+                            .filter(|_| !star_reads_other_model(inner_name))
                         {
                             source_cols.iter().map(|c| c.name.as_str()).collect()
                         } else {
@@ -811,8 +784,11 @@ pub fn build_semantic_graph(
                 // `orders_v2`, still reads a table called `orders`. The
                 // star takes the model's columns only when the read binds to
                 // it.
-                let bound = star_model(table_name);
-                if let Some(upstream_schema) = bound.as_deref().and_then(|m| models.get(m)) {
+                let reader_depends_on_it = star_reads_model(table_name);
+                if let Some(upstream_schema) = models
+                    .get(table_name.as_str())
+                    .filter(|_| reader_depends_on_it)
+                {
                     for col in &upstream_schema.columns {
                         let effect = rel.column(&col.name);
                         if effect == StarColumn::Excluded {
@@ -873,8 +849,9 @@ pub fn build_semantic_graph(
                             break;
                         }
                         let via = through.for_relation(&source_names(inner_name));
-                        if let Some(upstream_schema) =
-                            star_model(inner_name).and_then(|m| models.get(m.as_str()))
+                        if let Some(upstream_schema) = models
+                            .get(inner_name.as_str())
+                            .filter(|_| star_reads_model(inner_name))
                         {
                             for col in &upstream_schema.columns {
                                 if via.column(&col.name) == StarColumn::Excluded {
@@ -888,7 +865,7 @@ pub fn build_semantic_graph(
                             }
                         } else if let Some(source_cols) = source_schemas
                             .get(inner_name.as_str())
-                            .filter(|_| star_model(inner_name).is_none())
+                            .filter(|_| !star_reads_other_model(inner_name))
                         {
                             for col in source_cols {
                                 if via.column(&col.name) == StarColumn::Excluded {
@@ -904,7 +881,7 @@ pub fn build_semantic_graph(
                     }
                 } else if let Some(source_cols) = source_schemas
                     .get(table_name.as_str())
-                    .filter(|_| bound.is_none())
+                    .filter(|_| !star_reads_other_model(table_name))
                 {
                     // External source with known schema
                     for col in source_cols {
