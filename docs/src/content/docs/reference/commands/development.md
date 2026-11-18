@@ -610,6 +610,43 @@ The command then prints the next steps: add the crate to the workspace, choose `
 
 ---
 
+## `rocky connector init`
+
+Scaffold a child connector: a program that `rocky load --connector <name>` runs. It refuses when the directory already exists. See [Child connectors](/guides/child-connectors/) for the protocol.
+
+```bash
+rocky connector init <name> [--dir <path>] [--lang python]
+```
+
+| Argument / flag | Type | Default | Description |
+|----------|------|---------|-------------|
+| `name` | `string` | **(required)** | Connector name: letters, digits and underscores. It is also the `[connector.<name>]` key. |
+| `--dir` | `path` | `connectors/<name>` | Directory to create. It must not exist. |
+| `--lang` | `python` | `python` | Language of the scaffold. Python is the only one. |
+
+```bash
+rocky connector init orders
+```
+
+```
+Created connector `orders` in connectors/orders
+```
+
+The directory holds three files:
+
+- `connector.toml`: the manifest. `license` is left out, as a commented line: set it to the license of your code. Until you do, `rocky validate` warns V068 and `rocky load` reports `unknown`.
+- `main.py`: the program. Its `fetch()` returns a fixed list of 5 rows and keeps the largest `id` as its cursor, so a second load reads 0 rows. Replace `fetch()` with code that reads your source.
+- `rocky_connector.py`: the helper. It reads the request, the options and the saved state, writes Parquet through the `duckdb` CLI, and writes the result file. It uses the Python standard library only. Do not edit it: a newer Rocky may ship a newer copy.
+
+The command then prints the `[connector.<name>]` block to add to `rocky.toml`. The connector needs `python3` (3.8 or newer) and the `duckdb` CLI on `PATH`.
+
+### Related Commands
+
+- [`rocky load --connector`](/guides/child-connectors/) -- run the connector and load its files
+- [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- check the manifest (V067, V068)
+
+---
+
 ## `rocky hooks`
 
 List the lifecycle hooks configured in `rocky.toml`, or fire a test event at them.

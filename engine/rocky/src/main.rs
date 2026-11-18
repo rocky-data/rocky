@@ -1438,6 +1438,16 @@ enum Command {
         connector: Option<String>,
     },
 
+    /// Scaffold and check child connectors.
+    ///
+    /// A child connector is a program `rocky load --connector <name>` runs.
+    /// It writes Parquet files and a result file; Rocky loads the files and
+    /// saves the connector's state.
+    Connector {
+        #[command(subcommand)]
+        subcommand: ConnectorSubcommand,
+    },
+
     /// Load CSV seed files into the warehouse
     Seed {
         /// Seeds directory (default: seeds/)
@@ -3032,6 +3042,26 @@ enum ProductSubcommand {
     },
 }
 
+/// Subcommands under `rocky connector`.
+#[derive(Subcommand)]
+enum ConnectorSubcommand {
+    /// Write a new child connector: a manifest, a program and a helper.
+    ///
+    /// The scaffold reads a fixed list of rows and keeps a cursor, so it
+    /// loads as written. Replace its `fetch()` with code that reads your
+    /// source. Prints the `[connector.<name>]` block to add to rocky.toml.
+    Init {
+        /// Connector name: letters, digits and underscores.
+        name: String,
+        /// Directory to create (default: `connectors/<name>`). Must not exist.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Language of the scaffold.
+        #[arg(long, value_enum, default_value_t = rocky_cli::commands::ConnectorLang::Python)]
+        lang: rocky_cli::commands::ConnectorLang,
+    },
+}
+
 /// Subcommands under `rocky policy`.
 #[derive(Subcommand)]
 enum PolicySubcommand {
@@ -3757,7 +3787,10 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "publish-ir",
         ],
     ),
-    ("Data loading", &["load", "seed", "snapshot", "backfill"]),
+    (
+        "Data loading",
+        &["load", "connector", "seed", "snapshot", "backfill"],
+    ),
     (
         "Governance",
         &[
@@ -5710,6 +5743,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::ci_diff_mode(working_tree),
         ),
         Command::InitAdapter { name } => rocky_cli::commands::run_init_adapter(&name),
+        Command::Connector { subcommand } => match subcommand {
+            ConnectorSubcommand::Init { name, dir, lang } => {
+                rocky_cli::commands::run_connector_init(&name, dir.as_deref(), lang)
+            }
+        },
         Command::TestAdapter {
             adapter,
             command,
