@@ -7,8 +7,9 @@
 //!
 //! The `write()` tests run the helper straight from `python3`, with a fake
 //! `duckdb` first on PATH. The fake records the SQL it gets, keeps a copy of
-//! the staged rows, and writes an empty target file. These tests check what
-//! the helper sends and refuses; they do not check DuckDB's Parquet.
+//! the staged rows, writes an empty target file, and answers the type and
+//! row-count queries. These tests check what the helper sends and refuses;
+//! they do not check DuckDB's Parquet or its SQL dialect.
 //!
 //! Unix only: `main.py` runs through its `#!` line, and the fake is a shell
 //! script.
@@ -129,14 +130,24 @@ async fn a_state_schema_version_the_program_does_not_read_fails_the_run() {
 
 // --- write() with a fake duckdb ----------------------------------------------
 
-const FAKE_DUCKDB: &str = r#"#!/bin/sh
-sql=$(cat)
-printf '%s\n' "$sql" >> "$FAKE_DUCKDB_LOG"
-target=$(printf '%s\n' "$sql" | sed -n "s/.*) TO '\(.*\)' (FORMAT parquet);/\1/p")
-staging=$(printf '%s\n' "$sql" | sed -n "s/.*read_json('\([^']*\)'.*/\1/p")
-cp "$staging" "$FAKE_DUCKDB_ROWS"
-: > "$target"
-printf '[{"n":"%s"}]\n' "$(wc -l < "$staging" | tr -d ' ')"
+const FAKE_DUCKDB: &str = r#"#!/usr/bin/env python3
+import json, os, re, shutil, sys
+sql = sys.stdin.read()
+with open(os.environ["FAKE_DUCKDB_LOG"], "a") as log:
+    log.write(sql)
+target = re.search(r"\) TO '((?:[^']|'')*)' \(FORMAT parquet\)", sql).group(1).replace("''", "'")
+staging = re.search(r"read_json\('((?:[^']|'')*)'", sql).group(1).replace("''", "'")
+shutil.copy(staging, os.environ["FAKE_DUCKDB_ROWS"])
+open(target, "w").close()
+lines = open(staging).read().splitlines()
+if "DESCRIBE" in sql:
+    kinds = {bool: "BOOLEAN", int: "BIGINT", float: "DOUBLE", str: "VARCHAR"}
+    first = json.loads(lines[0])
+    print(json.dumps([
+        {"column_name": k, "column_type": kinds.get(type(v), "VARCHAR")}
+        for k, v in first.items()
+    ]))
+print(json.dumps([{"n": str(len(lines))}]))
 "#;
 
 /// The helper's `write()` and `finish()`, driven by a short Python program.
@@ -149,8 +160,8 @@ struct Outcome {
     stderr: String,
     /// The SQL the fake got, empty when it was never called.
     sql: String,
-    /// The staged rows the fake saw, one JSON object per line.
-    rows: Vec<serde_json::Value>,
+    /// The staged rows the fake saw last, one JSON object per line, as text.
+    rows: Vec<String>,
     /// Every file left in the output directory, sorted.
     left: Vec<String>,
     result: Option<serde_json::Value>,
@@ -234,7 +245,7 @@ impl Helper {
             sql: read(&self.path("sql.log")),
             rows: read(&self.path("rows.jsonl"))
                 .lines()
-                .map(|l| serde_json::from_str(l).unwrap())
+                .map(str::to_string)
                 .collect(),
             left,
             result,
@@ -262,12 +273,11 @@ fn write_stages_rows_in_one_column_order_and_reports_the_file() {
         "{}",
         out.sql
     );
-    let keys: Vec<Vec<&str>> = out
-        .rows
-        .iter()
-        .map(|r| r.as_object().unwrap().keys().map(String::as_str).collect())
-        .collect();
-    assert_eq!(keys, vec![vec!["id", "name"], vec!["id", "name"]]);
+    // Text, not parsed JSON: the key order on the line is what is checked.
+    assert_eq!(
+        out.rows,
+        vec![r#"{"id": 1, "name": "a"}"#, r#"{"id": 2, "name": "b"}"#]
+    );
     // The staging file is gone; only the batch and the result remain.
     assert_eq!(out.left, vec!["_rocky_result.json", "batch-0.parquet"]);
     assert_eq!(
@@ -285,7 +295,11 @@ fn a_row_key_outside_columns_stops_the_run_before_duckdb() {
     let h = Helper::new();
     let out = h.run("run.write([{\"id\": 1, \"extra\": \"x\"}], columns={\"id\": \"BIGINT\"})");
     assert!(!out.ok);
-    assert!(out.stderr.contains("extra ['extra']"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("not in columns: ['extra']"),
+        "{}",
+        out.stderr
+    );
     assert!(out.sql.is_empty(), "duckdb ran: {}", out.sql);
     assert!(out.left.is_empty(), "{:?}", out.left);
 }
@@ -296,26 +310,91 @@ fn a_column_in_columns_that_no_row_has_stops_the_run() {
     let out =
         h.run("run.write([{\"id\": 1}], columns={\"id\": \"BIGINT\", \"typo\": \"VARCHAR\"})");
     assert!(!out.ok);
-    assert!(out.stderr.contains("missing ['typo']"), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("no row in this batch has the columns ['typo']"),
+        "{}",
+        out.stderr
+    );
     assert!(out.left.is_empty(), "{:?}", out.left);
 }
 
 #[test]
-fn rows_with_different_keys_stop_the_run() {
+fn with_columns_a_row_may_leave_out_a_column_and_it_is_written_as_null() {
+    let h = Helper::new();
+    let out = h.run(
+        "run.write([{\"id\": 1, \"v\": \"x\"}, {\"id\": 2}], \
+         columns={\"id\": \"BIGINT\", \"v\": \"VARCHAR\"})",
+    );
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(
+        out.rows,
+        vec![r#"{"id": 1, "v": "x"}"#, r#"{"id": 2, "v": null}"#]
+    );
+}
+
+#[test]
+fn without_columns_rows_with_different_keys_stop_the_run() {
     let h = Helper::new();
     let out = h.run("run.write([{\"id\": 1}, {\"id\": 2, \"late\": 3}])");
     assert!(!out.ok);
-    assert!(out.stderr.contains("row 1"), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("row 1 does not have the columns of row 0"),
+        "{}",
+        out.stderr
+    );
     assert!(out.left.is_empty(), "{:?}", out.left);
+}
+
+#[test]
+fn without_columns_a_column_null_in_every_row_stops_the_run() {
+    let h = Helper::new();
+    let out = h.run("run.write([{\"id\": 1, \"v\": None}, {\"id\": 2, \"v\": None}])");
+    assert!(!out.ok);
+    assert!(out.stderr.contains("NULL in every row"), "{}", out.stderr);
+    assert!(out.sql.is_empty(), "duckdb ran: {}", out.sql);
 }
 
 #[test]
 fn a_second_write_with_other_columns_stops_the_run() {
     let h = Helper::new();
-    let out = h.run("run.write([{\"id\": 1}])\nrun.write([{\"other\": 2}])");
+    let out = h.run(
+        "run.write([{\"id\": 1}], columns={\"id\": \"BIGINT\"})\n\
+         run.write([{\"id\": 2}], columns={\"id\": \"VARCHAR\"})",
+    );
     assert!(!out.ok);
     assert!(out.stderr.contains("an earlier write()"), "{}", out.stderr);
     assert!(out.result.is_none());
+
+    // Without columns, the second call keeps the first call's columns, so a
+    // new key is refused.
+    let h = Helper::new();
+    let out = h.run("run.write([{\"id\": 1}])\nrun.write([{\"other\": 2}])");
+    assert!(!out.ok);
+    assert!(
+        out.stderr.contains("not in columns: ['other']"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.result.is_none());
+}
+
+#[test]
+fn a_second_write_reuses_the_types_the_first_one_got() {
+    let h = Helper::new();
+    let out = h.run("run.write([{\"a\": 1, \"b\": \"x\"}])\nrun.write([{\"b\": \"y\", \"a\": 2}])");
+    assert!(out.ok, "{}", out.stderr);
+    let copies: Vec<&str> = out.sql.lines().filter(|l| l.starts_with("COPY")).collect();
+    assert_eq!(copies.len(), 2, "{}", out.sql);
+    // The first call infers and reads the types back; the second sends them.
+    assert!(!copies[0].contains("columns ="), "{}", copies[0]);
+    assert!(
+        copies[1].contains("columns = {'a': 'BIGINT', 'b': 'VARCHAR'}"),
+        "{}",
+        copies[1]
+    );
+    assert_eq!(out.sql.matches("DESCRIBE").count(), 1, "{}", out.sql);
 }
 
 #[test]
@@ -351,7 +430,7 @@ fn bytes_are_refused_and_dates_are_written_as_iso_text() {
     assert!(out.ok, "{}", out.stderr);
     assert_eq!(
         out.rows,
-        vec![json!({"at": "2026-01-02T03:04:05", "amount": "1.50"})]
+        vec![r#"{"at": "2026-01-02T03:04:05", "amount": "1.50"}"#]
     );
 }
 

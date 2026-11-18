@@ -87,7 +87,7 @@ class Run:
         self.options = self._read_options()
         self.state = self._read_state()
         self._files = []
-        self._keys = None
+        self._columns = None
 
     def _read_options(self):
         # Rocky writes [connector.<name>.options] from rocky.toml to a JSON
@@ -121,24 +121,30 @@ class Run:
     def write(self, rows, columns=None):
         """Write `rows` (a list of dicts) as one Parquet file.
 
-        Every row must have the same keys, and every call in one run must use
-        the same keys, so the files share one column order. A row with a
-        missing or extra key stops the run.
+        `columns` is a dict of column name to DuckDB type, such as
+        {"id": "BIGINT", "updated_at": "TIMESTAMP"}. With it, a row may leave
+        out a column (it is written as NULL), but a row with a key that is not
+        in `columns` stops the run, and so does a column no row in the batch
+        has (usually a typo).
 
-        `columns` is optional: a dict of column name to DuckDB type, such as
-        {"id": "BIGINT", "updated_at": "TIMESTAMP"}. Its keys must be the row
-        keys. Without it, DuckDB infers each type from the rows themselves:
-        a column that is NULL in every row, or text that looks like a date
-        or a UUID, can get a different type in another run, and Rocky then
-        refuses the load when the change is not a safe widening. Pass
-        `columns` for a connector you run more than once.
+        Without `columns`, every row must have the same keys, and DuckDB
+        infers each type from the rows. A column that is NULL in every row
+        stops the run, because its type cannot be inferred. Inferred types
+        depend on the data: text that looks like a date or a UUID can get
+        another type in another run, and Rocky then refuses the load when
+        the change is not a safe widening. Pass `columns` for a connector
+        you run more than once.
+
+        Every call in one run writes the columns and types of the first
+        call, so the files share one schema. A later call that passes other
+        `columns` stops the run.
 
         Values must be str, int, float, bool, None, lists or dicts.
         datetime, date and time values are written as ISO 8601 text and
         Decimal values as text; give their column a type in `columns`.
-        bytes are refused. The rows are staged as JSON in `output_dir`
-        while DuckDB converts them, and that file counts toward the
-        connector's `output_bytes` limit. Write large sources in several
+        bytes and NaN are refused. The rows are staged as JSON in
+        `output_dir` while DuckDB converts them, and that file counts toward
+        the connector's `output_bytes` limit. Write large sources in several
         calls.
 
         Returns the file name. An empty `rows` writes nothing and returns
@@ -146,65 +152,100 @@ class Run:
         """
         if not rows:
             return None
-        keys = list(columns) if columns else list(rows[0])
-        if self._keys is not None and set(keys) != set(self._keys):
-            fail(
-                "write() got the columns %s, but an earlier write() in this run "
-                "got %s" % (sorted(keys), sorted(self._keys))
-            )
-        if self._keys is not None:
-            keys = self._keys
-        if not keys:
-            fail("write() got rows with no columns")
-        expected = set(keys)
         for number, row in enumerate(rows):
             if not isinstance(row, dict):
                 fail("row %d is a %s, not a dict" % (number, type(row).__name__))
-            if set(row) != expected:
-                missing = sorted(expected - set(row))
-                extra = sorted(set(row) - expected)
+        if columns:
+            for column, kind in columns.items():
+                if not isinstance(kind, str) or not _TYPE_PATTERN.match(kind):
+                    fail("the type %r of column %r is not a plain DuckDB type" % (kind, column))
+            columns = dict((str(column), kind) for column, kind in columns.items())
+            if self._columns is not None and columns != self._columns:
                 fail(
-                    "row %d does not have the columns of the batch: missing %s, extra %s"
-                    % (number, missing, extra)
+                    "write() got the columns %r, but an earlier write() in this run "
+                    "wrote %r" % (columns, self._columns)
                 )
-        fields = []
-        for column, kind in (columns or {}).items():
-            if not isinstance(kind, str) or not _TYPE_PATTERN.match(kind):
-                fail("the type %r of column %r is not a plain DuckDB type" % (kind, column))
-            fields.append("%s: %s" % (_literal(str(column)), _literal(kind)))
+        typed = columns or self._columns
+        if typed:
+            keys = list(typed)
+            expected = set(keys)
+            seen = set()
+            for number, row in enumerate(rows):
+                extra = sorted(set(row) - expected)
+                if extra:
+                    fail("row %d has columns that are not in columns: %s" % (number, extra))
+                seen.update(row)
+            unseen = sorted(expected - seen)
+            if unseen:
+                fail("no row in this batch has the columns %s" % unseen)
+        else:
+            keys = list(rows[0])
+            if not keys:
+                fail("write() got rows with no columns")
+            expected = set(keys)
+            for number, row in enumerate(rows):
+                if set(row) != expected:
+                    fail(
+                        "row %d does not have the columns of row 0: missing %s, extra %s "
+                        "(pass columns to allow missing values)"
+                        % (number, sorted(expected - set(row)), sorted(set(row) - expected))
+                    )
+            all_null = [key for key in keys if all(row[key] is None for row in rows)]
+            if all_null:
+                fail(
+                    "the columns %s are NULL in every row, so their type cannot be "
+                    "inferred; pass their types in columns" % all_null
+                )
         index = len(self._files)
         name = "batch-%d.parquet" % index
         staging = os.path.join(self.output_dir, ".rows-%d.jsonl" % index)
         target = os.path.join(self.output_dir, name)
         reader = "read_json(%s, format = 'newline_delimited'" % _literal(staging)
-        if fields:
-            reader += ", columns = {%s}" % ", ".join(fields)
+        if typed:
+            fields = ", ".join(
+                "%s: %s" % (_literal(column), _literal(kind)) for column, kind in typed.items()
+            )
+            reader += ", columns = {%s}" % fields
         reader += ")"
-        select = ", ".join(_ident(str(key)) for key in keys)
+        select = ", ".join(_ident(key) for key in keys)
         try:
             with open(staging, "w", encoding="utf-8") as handle:
                 for row in rows:
-                    ordered = dict((key, row[key]) for key in keys)
-                    handle.write(json.dumps(ordered, default=_json_value))
+                    ordered = dict((key, row.get(key)) for key in keys)
+                    handle.write(json.dumps(ordered, default=_json_value, allow_nan=False))
                     handle.write("\n")
-        except TypeError as error:
+        except (TypeError, ValueError) as error:
             os.remove(staging)
             fail(str(error))
-        sql = (
-            "SET TimeZone = 'UTC';\n"
-            "COPY (SELECT %s FROM %s) TO %s (FORMAT parquet);\n"
-            "SELECT CAST(count(*) AS VARCHAR) AS n FROM read_parquet(%s);\n"
-            % (select, reader, _literal(target), _literal(target))
+        sql = "SET TimeZone = 'UTC';\nCOPY (SELECT %s FROM %s) TO %s (FORMAT parquet);\n" % (
+            select,
+            reader,
+            _literal(target),
         )
+        if not typed:
+            # Read back the types DuckDB chose, so later calls write the same.
+            sql += (
+                "SELECT column_name, column_type FROM "
+                "(DESCRIBE SELECT * FROM read_parquet(%s));\n" % _literal(target)
+            )
+        sql += "SELECT CAST(count(*) AS VARCHAR) AS n FROM read_parquet(%s);\n" % _literal(target)
         try:
-            rows_written = int(_duckdb(sql)[-1][-1]["n"])
+            results = _duckdb(sql)
         finally:
             # Remove the staging file whether or not the write worked.
             if os.path.exists(staging):
                 os.remove(staging)
+        rows_written = int(results[-1][-1]["n"])
         if rows_written != len(rows):
             fail("wrote %d rows to %s, expected %d" % (rows_written, name, len(rows)))
-        self._keys = keys
+        if typed:
+            self._columns = dict(typed)
+        else:
+            if len(results) < 2:
+                fail("duckdb did not report the column types of %s" % name)
+            self._columns = dict((c["column_name"], c["column_type"]) for c in results[-2])
+            if list(self._columns) != keys:
+                fail("duckdb wrote the columns %s, expected %s" % (list(self._columns), keys))
         self._files.append(
             {"path": name, "bytes": os.path.getsize(target), "rows": rows_written}
         )
