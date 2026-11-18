@@ -483,7 +483,6 @@ fn a_mixed_case_model_name_is_typed_as_before() {
         serde_json::from_str(&fs::read_to_string(root.join("snapshot.json")).unwrap()).unwrap();
     let ir: rocky_ir::ProjectIr = serde_json::from_value(snapshot["ir"].clone()).unwrap();
     let conn = duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
-    let mut claimed = 0;
     for (reader, _) in readers {
         let built = describe(&conn, reader);
         let model = ir.models.iter().find(|m| &*m.name == reader).unwrap();
@@ -501,9 +500,16 @@ fn a_mixed_case_model_name_is_typed_as_before() {
                 "{reader}.{}: DuckDB built {duckdb_type}",
                 column.name
             );
-            claimed += 1;
         }
     }
-    // `rd_top.status` at least is typed (the model's DOUBLE).
-    assert!(claimed >= 1);
+    // The top-level read is typed: the model's DOUBLE, as the run built it.
+    let rd_top = ir.models.iter().find(|m| &*m.name == "rd_top").unwrap();
+    assert_eq!(
+        rd_top
+            .typed_columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.data_type.clone()))
+            .collect::<Vec<_>>(),
+        [("status", rocky_ir::RockyType::Float64)]
+    );
 }
