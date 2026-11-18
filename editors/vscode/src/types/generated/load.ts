@@ -9,6 +9,10 @@
  * How a `rocky load --connector` run ended: `loaded` (the batch is in the target table and the connector state is saved), `skipped` (another run holds the claim for this batch, so nothing ran) or `failed` (see `error`).
  */
 export type ConnectorLoadStatus = "loaded" | "skipped" | "failed";
+/**
+ * Who supports a child connector, as its manifest declares: `reference` (the author says the Rocky project maintains and tests it), `community` (not tested in CI by the Rocky project) or `unknown` (the manifest does not say). The author declares it. Rocky does not verify it.
+ */
+export type ConnectorSupportTier = "reference" | "community" | "unknown";
 
 /**
  * JSON output for `rocky load`.
@@ -59,10 +63,18 @@ export interface ConnectorLoadInfo {
    */
   error?: string | null;
   /**
+   * The `license` the manifest declares, or `unknown` when it declares none. Declared, not checked.
+   */
+  license: string;
+  /**
    * The `[connector.<name>]` key.
    */
   name: string;
   status: ConnectorLoadStatus;
+  /**
+   * The `support_tier` the manifest declares, or `unknown`.
+   */
+  support_tier: ConnectorSupportTier;
   [k: string]: unknown;
 }
 /**

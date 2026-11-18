@@ -292,6 +292,32 @@ fn standard_batches(project: &Project) {
     );
 }
 
+/// The load output reports the manifest's `license` and `support_tier`, and
+/// `unknown` for each one the manifest leaves out.
+#[tokio::test]
+async fn the_output_reports_the_declared_license_and_tier_or_unknown() {
+    use rocky_cli::output::ConnectorSupportTier;
+
+    let project = Project::new("");
+    standard_batches(&project);
+    let outcome = project.run().await;
+    outcome.result.as_ref().expect("the run succeeds");
+    assert_eq!(info(&outcome).license, "unknown");
+    assert_eq!(info(&outcome).support_tier, ConnectorSupportTier::Unknown);
+
+    std::fs::write(
+        project.path().join("connector/connector.toml"),
+        "protocol_version = 0\nname = \"demo\"\ncommand = [\"./run.sh\"]\n\
+         state_schema_version = 1\negress_hosts = []\n\
+         license = \"Apache-2.0 OR MIT\"\nsupport_tier = \"community\"\n",
+    )
+    .unwrap();
+    let outcome = project.run().await;
+    outcome.result.as_ref().expect("the run succeeds");
+    assert_eq!(info(&outcome).license, "Apache-2.0 OR MIT");
+    assert_eq!(info(&outcome).support_tier, ConnectorSupportTier::Community);
+}
+
 #[tokio::test]
 async fn three_runs_append_two_rows_each_and_advance_the_cursor() {
     let project = Project::new("");

@@ -158,6 +158,13 @@ fn prepare<'a>(config_path: &Path, loaded: &'a LoadedConfig, name: &str) -> Resu
         )
     })?;
     let manifest = ConnectorManifest::load(&manifest_path)?;
+    if manifest.license.is_none() {
+        warn!(
+            connector = name,
+            manifest = %manifest_path.display(),
+            "the connector manifest declares no license; the load output reports `unknown`"
+        );
+    }
     let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
     let argv = manifest.resolved_command(manifest_dir);
     let limits = ConnectorLimitsConfig::effective(&manifest.limits, &config.limits);
@@ -313,6 +320,12 @@ pub async fn execute_connector_load(params: &ConnectorLoadParams<'_>) -> Connect
             commit_seq_after: commit_seq_before,
             adopted_expired_claim: false,
             egress_hosts: prepared.manifest.egress_hosts.clone(),
+            license: prepared
+                .manifest
+                .license
+                .clone()
+                .unwrap_or_else(|| crate::output::UNKNOWN_CONNECTOR_LICENSE.to_string()),
+            support_tier: prepared.manifest.support_tier.into(),
             error: None,
         },
         files: Vec::new(),

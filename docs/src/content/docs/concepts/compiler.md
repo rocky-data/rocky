@@ -335,6 +335,13 @@ The binding rules are the ones for external sources below. A CTE, derived
 table, unknown relation, `SELECT` alias, struct field read, quoted name or
 warehouse metadata column keeps the name `Unknown`.
 
+A star modifier counts as a read. A name in a star's `EXCEPT`, `EXCLUDE` or
+`REPLACE` that the star's relation does not output is `E039`. The same name on
+an external source is `E041` or `W041`. Rocky checks it only when it knows every
+column of every relation the star covers. It does not check a star over a
+top-level `USING` or `NATURAL` join, or a star with `ILIKE` or `RENAME`. It does
+not check a quoted name, a `_`-prefixed name or a qualified `EXCLUDE` name.
+
 ### Missing columns in external sources (`E041` / `W041`)
 
 An external source is a table such as `raw.orders` that Rocky reads but does
@@ -551,6 +558,14 @@ c.id → b.id → a.id → source.raw.users.id
 **Star expansion.** When a model uses `SELECT *`, the compiler expands it against
 the upstream model's inferred schema, or against a known source schema. That is
 why downstream models still see the full column list through a star select.
+A star can carry `EXCEPT (...)`, `EXCLUDE (...)` or `REPLACE (expr AS col)`.
+`EXCEPT` and `EXCLUDE` remove the named columns from the output. `REPLACE`
+keeps the column's name and position. The column takes its type and
+nullability from the new expression. A modifier on a qualified star, as in
+`t.* EXCEPT (n), u.*`, applies to that relation only. When an unqualified star
+sits beside another star and either has a modifier, the star's columns are
+unknown. A star with `ILIKE`, `RENAME`, an alias or a qualified `EXCLUDE` name
+leaves the columns of the whole query unknown.
 
 **Intent propagation.** Rocky stores each model's `intent` field, from its TOML
 config, in the semantic graph. The AI features (`ai-sync`, `ai-explain`) read it
