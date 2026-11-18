@@ -6296,13 +6296,13 @@ pub struct ConnectorTestRunOutput {
     pub error: Option<String>,
 }
 
-/// A state check a `[[run]]` in `connector-test.toml` declares.
+/// A state check a `[[run]]` in `connector-test.toml` declares:
+/// `unchanged` (the run must return the state it was given) or `advanced`
+/// (the run must return another state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorTestStateCheck {
-    /// The run must return the state it was given.
     Unchanged,
-    /// The run must return a state other than the one it was given.
     Advanced,
 }
 

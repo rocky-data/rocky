@@ -6184,6 +6184,121 @@
         ],
         "type": "object"
       },
+      "ConnectorTestOutput": {
+        "description": "JSON output for `rocky connector test <name>`.\n\nThe command runs the connector once per `[[run]]` in its `connector-test.toml`, feeding each run the state the run before it returned. It loads nothing and saves no state.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "connector": {
+            "description": "The `[connector.<name>]` key.",
+            "type": "string"
+          },
+          "passed": {
+            "description": "`true` when every run passed every check.",
+            "type": "boolean"
+          },
+          "runs": {
+            "description": "One entry per run that started, in order. A failed run stops the test, so later runs are not listed.",
+            "items": {
+              "$ref": "#/components/schemas/ConnectorTestRunOutput"
+            },
+            "type": "array"
+          },
+          "spec": {
+            "description": "The test spec that was read.",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "warnings": {
+            "description": "Problems that do not fail the test, such as a stale helper copy.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "command",
+          "connector",
+          "passed",
+          "runs",
+          "spec",
+          "version",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "ConnectorTestRunOutput": {
+        "description": "One run of `rocky connector test`.",
+        "properties": {
+          "error": {
+            "description": "Why the run failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_rows": {
+            "description": "The rows the spec expects.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "files": {
+            "description": "Parquet files the run wrote.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "rows": {
+            "description": "The rows the connector wrote; absent when the run failed before its result was verified.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "run": {
+            "description": "1 for the first run.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "state_check": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectorTestStateCheck"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The state check the spec declares for this run, if any."
+          }
+        },
+        "required": [
+          "expected_rows",
+          "files",
+          "passed",
+          "run"
+        ],
+        "type": "object"
+      },
+      "ConnectorTestStateCheck": {
+        "description": "A state check a `[[run]]` in `connector-test.toml` declares: `unchanged` (the run must return the state it was given) or `advanced` (the run must return another state).",
+        "enum": [
+          "unchanged",
+          "advanced"
+        ],
+        "type": "string"
+      },
       "ConsumerImpactStatus": {
         "description": "What happened to a consumer of a removed column.",
         "oneOf": [

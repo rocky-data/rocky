@@ -457,6 +457,11 @@ export type {
   LoadFileOutput,
   LoadOutput,
 } from "./load";
+export type {
+  ConnectorTestOutput,
+  ConnectorTestRunOutput,
+  ConnectorTestStateCheck,
+} from "./connector_test";
 export type { PolicyCheckOutput } from "./policy_check";
 export type { PolicyFreezeOutput } from "./policy_freeze";
 export type { PolicyTestOutput, PolicyTestResult } from "./policy_test";
