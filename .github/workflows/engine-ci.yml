@@ -461,7 +461,9 @@ jobs:
   # The dlt shim needs dlt from PyPI, so only engine-weekly runs it. A job of
   # its own, away from Test, and not a required check. It builds rocky a
   # second time, so on a pull request it runs only when the connector code or
-  # those POCs change (`connectors`); every push to main runs it.
+  # those POCs change (`connectors`); every push to main runs it. A push to
+  # main that touches only those POCs does not start this workflow at all:
+  # the push `paths:` are the engine's, so the PR run is what covers it.
   connector-test:
     name: Connector test
     needs: changes
