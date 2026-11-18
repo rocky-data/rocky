@@ -1631,7 +1631,7 @@ pub(crate) fn fill_from_default_seed(
         }
         Err(e) => tracing::warn!(
             error = %format!("{e:#}"),
-            "the seed file did not run; compiling without its source schemas"
+            "the seed file did not run; continuing without its source schemas"
         ),
     }
     added
@@ -2782,6 +2782,44 @@ schema_template = "s"
         let data_dir = project_dir.join("data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(data_dir.join("seed.sql"), sql).unwrap();
+    }
+
+    /// A schema-cache entry describes the warehouse, so it wins over a seed
+    /// table of the same name (#2663).
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn the_default_seed_fills_only_what_the_cache_lacks() {
+        let dir = TempDir::new().unwrap();
+        write_seed(
+            dir.path(),
+            "CREATE SCHEMA raw;\n\
+             CREATE TABLE raw.orders (id BIGINT, amount DECIMAL(10, 2));\n\
+             CREATE TABLE raw.customers (id BIGINT);\n",
+        );
+        let mut seeded = HashMap::new();
+        let mut keys = fill_from_default_seed(dir.path(), None, &mut seeded);
+        keys.sort();
+        assert_eq!(keys.len(), 2, "the seed must add both tables, got {keys:?}");
+        let orders_key = keys
+            .iter()
+            .find(|k| k.contains("orders"))
+            .expect("an orders key")
+            .clone();
+
+        let cached = vec![TypedColumn {
+            name: "from_cache".into(),
+            data_type: rocky_compiler::types::RockyType::String,
+            nullable: true,
+        }];
+        let mut schemas = HashMap::from([(orders_key.clone(), cached.clone())]);
+        let added = fill_from_default_seed(dir.path(), None, &mut schemas);
+        assert_eq!(
+            added.len(),
+            1,
+            "only the table the cache lacks, got {added:?}"
+        );
+        assert!(!added.contains(&orders_key));
+        assert_eq!(schemas[&orders_key], cached, "the cache entry must be kept");
     }
 
     #[test]
