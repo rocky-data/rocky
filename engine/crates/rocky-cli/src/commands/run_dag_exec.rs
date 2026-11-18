@@ -1518,6 +1518,7 @@ mod run_opts_threading_tests {
             full_refresh: false,
             no_sync_trigger: false,
             no_source_sync: false,
+            tests_on_run: None,
         };
         let partition_opts = PartitionRunOptions {
             partition: Some("2020-01-02".into()),

@@ -2182,6 +2182,7 @@ mod tests {
             full_refresh: false,
             no_sync_trigger: false,
             no_source_sync: false,
+            tests_on_run: None,
         };
         super::super::run::run(
             config_path,

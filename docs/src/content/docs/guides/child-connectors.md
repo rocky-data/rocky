@@ -315,7 +315,7 @@ Three POCs show how to run a third-party extraction tool as a child connector. E
 | Tool | POC | What the shim runs |
 |---|---|---|
 | dlt | [`07-adapters/10-dlt-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-dlt-connector-shim) | A dlt source, named by module and function, with the `filesystem` destination writing Parquet. |
-| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An Airbyte source image with `docker run`: `spec`, `discover`, then `read`. The Airbyte protocol is MIT. Each source image has its own license, often Elastic License 2.0 (ELv2), which is not open source: check the image's `metadata.yaml` first. |
+| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An Airbyte source image with `docker run`: `spec`, `discover`, then `read`. Or, with no Docker, a declarative source manifest through `airbyte-cdk`'s `source-declarative-manifest`. The Airbyte protocol and `airbyte-cdk` are MIT. Each source image and manifest has its own license, often Elastic License 2.0 (ELv2), which is not open source: check its `metadata.yaml` first. |
 | Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. |
 
 All three follow the same rules.
@@ -326,6 +326,13 @@ All three follow the same rules.
 - **No catalog.** Rocky does not discover or list sources. The options name the module, the image or the tap.
 - **Credentials go under `secrets`.** Each tool reads its credentials from the environment. Declare the variable names under `secrets`. Never put a credential under `options`.
 - **The tool, not Rocky, calls the network.** The manifest `egress_hosts` lists the hosts the tool calls. Rocky does not enforce the list.
+
+The Airbyte shim's no-Docker mode has rules of its own:
+
+- **The manifest is pinned by hash.** Set `manifest_sha256`. The shim never downloads a manifest, and a file with another hash fails the run. The hash is required because the manifest decides which hosts receive the source config, secrets included.
+- **No custom code runs.** The shim never passes `--components-path`. It needs `airbyte-cdk` 7.48.0 or newer, which refuses custom classes in a manifest it did not ship. It refuses to run when `AIRBYTE_ENABLE_UNSAFE_CODE` or any `PYTHON*` variable is set. A manifest that needs custom Python components does not work in this mode.
+- **Rows can load again at the cursor.** `airbyte-cdk` starts each read at the saved cursor, not after it. When the API's lower bound is inclusive, the row at the cursor loads again. A manifest with a `lookback_window` loads the whole window again. The target only appends, so those rows are duplicates: deduplicate downstream on a key.
+- **Rocky ships no Airbyte manifest.** The POC uses its own Apache-2.0 manifest against a local stub.
 
 The POCs run offline once the tool is installed. Each skips with exit 0 when its tool is missing. Set `REQUIRE_DLT=1`, `REQUIRE_DOCKER=1` or `REQUIRE_MELTANO=1` to make that a failure.
 

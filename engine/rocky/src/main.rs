@@ -263,6 +263,25 @@ enum OutputFormat {
     Md,
 }
 
+/// `--tests` mode for `rocky run`. Mirrors `[run] tests_on_run`, kept here so
+/// `clap::ValueEnum` does not need to leak into `rocky-core`.
+#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq, Debug)]
+enum TestsModeArg {
+    Off,
+    Report,
+    Enforce,
+}
+
+impl From<TestsModeArg> for rocky_core::config::TestsOnRun {
+    fn from(arg: TestsModeArg) -> Self {
+        match arg {
+            TestsModeArg::Off => Self::Off,
+            TestsModeArg::Report => Self::Report,
+            TestsModeArg::Enforce => Self::Enforce,
+        }
+    }
+}
+
 /// `--since` window for `rocky brief`.
 #[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq, Debug)]
 enum BriefSinceArg {
@@ -1312,6 +1331,16 @@ enum Command {
         /// redefinition or a session-setting change).
         #[arg(long)]
         force_rebuild: bool,
+
+        /// Evaluate each built model's `[[tests]]` against the table the run
+        /// just wrote, before its downstream models build. `off` runs no
+        /// test. `report` records the results in `test_results` and never
+        /// fails a model. `enforce` also fails the model on an error-severity
+        /// test that fails or cannot run, so its downstream does not build;
+        /// the table it wrote stays in place. A warning-severity test never
+        /// fails a model. Overrides `[run] tests_on_run` for this invocation.
+        #[arg(long, value_enum, value_name = "MODE")]
+        tests: Option<TestsModeArg>,
 
         /// Disable content-addressed reuse for this invocation, even when
         /// `[reuse]` is enabled in config.
@@ -2530,8 +2559,6 @@ enum Command {
     /// * `preview diff` produces a structural + sampled row-level diff
     ///   between branch and base;
     /// * `preview cost` produces a per-model bytes/duration/USD delta.
-    ///
-    /// See `plans/rocky-pr-preview-and-data-diff.md` for the design.
     Preview {
         #[command(subcommand)]
         action: PreviewAction,
@@ -3171,6 +3198,12 @@ enum PlanSubcommand {
         /// override is auditable.
         #[arg(long)]
         allow_breaking: bool,
+        /// Bypass the failing-tests gate. `promote` refuses a branch when a
+        /// model's newest test evidence on it holds an error-severity
+        /// `[[tests]]` failure (see `rocky run --tests`). An override of a
+        /// real refusal records a `FailingTestsAllowed` audit event.
+        #[arg(long)]
+        allow_failing_tests: bool,
         /// Filter sources by component value (e.g., --filter client=acme).
         /// On transformation pipelines, supported keys are
         /// `table`, `model`, `catalog`, `schema`.
@@ -3282,6 +3315,12 @@ enum BranchAction {
         /// paper trail.
         #[arg(long)]
         allow_breaking: bool,
+        /// Bypass the failing-tests gate. `promote` refuses a branch when a
+        /// model's newest test evidence on it holds an error-severity
+        /// `[[tests]]` failure (see `rocky run --tests`). An override of a
+        /// real refusal records a `FailingTestsAllowed` audit event.
+        #[arg(long)]
+        allow_failing_tests: bool,
         /// Git ref to diff against for the breaking-change gate.
         #[arg(long, default_value = "main")]
         base_ref: String,
@@ -4633,6 +4672,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     name,
                     base,
                     allow_breaking,
+                    allow_failing_tests,
                     filter: promote_filter,
                     pipeline: promote_pipeline,
                     models,
@@ -4648,6 +4688,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         promote_filter.as_deref(),
                         promote_pipeline.as_deref(),
                         allow_breaking,
+                        allow_failing_tests,
                         &state_path,
                         resolve_cli_principal(cli.principal)?,
                         json,
@@ -4690,6 +4731,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             defer_run_id,
             skip_unchanged,
             force_rebuild,
+            tests,
             no_reuse,
             no_prune,
             no_sync_trigger,
@@ -4953,6 +4995,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 full_refresh,
                 no_sync_trigger,
                 no_source_sync: false,
+                tests_on_run: tests.map(Into::into),
             };
             // Who is running (RV4-P1): stamped on the drift auto-apply
             // custody rows. Resolved here, once, for all three run shapes.
@@ -5961,6 +6004,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 pipeline,
                 skip_approval,
                 allow_breaking,
+                allow_failing_tests,
                 base_ref,
                 models,
             } => {
@@ -6019,6 +6063,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         pipeline.as_deref(),
                         skip_approval,
                         allow_breaking,
+                        allow_failing_tests,
                         runtime_principal,
                         &actor,
                         json,
