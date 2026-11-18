@@ -283,7 +283,8 @@ pub const E069: &str = "E069";
 /// [`crate::operand_check`] when the model runs on DuckDB.
 pub const E070: &str = "E070";
 /// The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different
-/// numbers of columns (#2661). Every warehouse refuses this. Emitted by
+/// numbers of columns (#2661). SQL requires the same number in every branch,
+/// so it is checked whatever the warehouse. Emitted by
 /// `rocky compile` from [`crate::set_operation`] when both counts are known
 /// from the SQL; `BY NAME` is not checked.
 pub const E071: &str = "E071";

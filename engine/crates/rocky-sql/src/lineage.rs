@@ -1923,7 +1923,12 @@ fn extract_expr_lineage(
                 }
             }
             let mut sources = dedup_sources(sources);
+            // DuckDB's `max(x, n)` / `min(x, n)` is a top-n aggregate that
+            // returns a list: not an aggregate of `x`'s type.
+            let top_n = matches!(func_name.as_str(), "MIN" | "MAX")
+                && !matches!(&func.args, FunctionArguments::List(list) if list.args.len() == 1);
             match sources.as_mut_slice() {
+                [only] if top_n => only.transform = TransformKind::Expression,
                 [only] => only.transform = compose_function_transform(&func_name, &only.transform),
                 many => {
                     for lineage in many {

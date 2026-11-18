@@ -162,8 +162,8 @@ fn parse(text: &str) -> Signatures {
     out
 }
 
-/// Whether DuckDB refuses `name` (lower case) called with `count` arguments,
-/// whatever they are.
+/// Whether DuckDB refused `name` (lower case) called with `count` arguments
+/// in every probe: all `NULL`, and all one column, for each filler type.
 pub fn refuses_count(name: &str, count: usize) -> bool {
     let sigs = &*SIGNATURES;
     sigs.arity.contains(&(name.to_string(), count))

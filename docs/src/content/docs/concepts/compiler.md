@@ -290,8 +290,9 @@ or if the bundled version changes.
 
 The checks run when DuckDB is one of the warehouses Rocky resolves for the
 model, as for `E042`: `--target-dialect`, then the adapters of the pipelines
-that run the model. A model no pipeline lists is judged against every
-pipeline's adapter. Other warehouses are not checked.
+that run the model, then `[portability] target_dialect` when no adapter has
+operand rules. A model no pipeline lists is judged against every pipeline's
+adapter. Other warehouses are not checked.
 
 These are not reported:
 
@@ -303,8 +304,13 @@ These are not reported:
 - A function such as `struct_pack`, which treats a `NULL` argument
   differently from a column.
 - In `HAVING`, a bare name that is also a select-list alias.
-- A DuckDB macro that reuses a built-in name, created outside Rocky or by the
-  project's seed file. Call it schema-qualified.
+- A top-n `max(x, n)` or `min(x, n)`, which returns a list. Its column is
+  typed `Unknown`.
+
+A DuckDB macro that reuses a built-in name is a known false refusal. Rocky
+checks the call against the built-in even when the macro is created outside
+Rocky or by the project's seed file. Call the macro schema-qualified
+(`main.lower(...)`), which Rocky does not check.
 - A `CASE` whose text literal fails to convert only for some rows, as in
   `CASE WHEN qty > 1 THEN 'many' ELSE qty END`. DuckDB accepts this query and
   fails only when a row reaches the text branch.
@@ -697,7 +703,7 @@ span, and sometimes a suggested fix.
 | `E068` | A call to a DuckDB built-in passes a number of arguments it does not take. Only when the model runs on DuckDB. See [Calls and branches DuckDB refuses](#calls-and-branches-duckdb-refuses) |
 | `E069` | A column argument to a DuckDB built-in has a type no overload of the function takes at that position, as in `lower(amount)`. Only when the model runs on DuckDB |
 | `E070` | `CASE` or `COALESCE` branches are columns of types DuckDB has no common type for, as in `COALESCE(order_date, status)`. Only when the model runs on DuckDB |
-| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns. Every warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071) |
+| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |

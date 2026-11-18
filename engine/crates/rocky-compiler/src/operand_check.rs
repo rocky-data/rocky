@@ -523,6 +523,7 @@ fn check_model(
         functions: graph.functions(),
         join_key_columns: join_key_checked_columns(&model.config.name, graph, typed_models),
         having_aliases: HashSet::new(),
+        having_opaque: false,
         seen: HashSet::new(),
         out: Vec::new(),
     };
@@ -578,6 +579,9 @@ struct Ctx<'m> {
     join_key_columns: HashSet<String>,
     /// Lower-case select-list aliases while `HAVING` is checked, else empty.
     having_aliases: HashSet<String>,
+    /// While `HAVING` is checked: the select list can rename columns in a
+    /// way the aliases do not show, so no bare name is judged.
+    having_opaque: bool,
     /// `(code, line, col, message)` already emitted — CTE bodies are typed
     /// twice by construction, never reported twice.
     seen: HashSet<(String, usize, usize, String)>,
@@ -759,6 +763,19 @@ fn walk_select<'a>(
         check_expr(expr, &scope, lookup, ctx);
     }
     if let Some(having) = &select.having {
+        // A `* REPLACE (...)`, `* RENAME (...)` or `COLUMNS(...)` item can
+        // give a source column's name to another expression, and the names
+        // are not spelled out here. Then no bare name in `HAVING` is judged.
+        let opaque = select.projection.iter().any(|item| match item {
+            ast::SelectItem::Wildcard(opts) | ast::SelectItem::QualifiedWildcard(_, opts) => {
+                opts.opt_replace.is_some() || opts.opt_rename.is_some()
+            }
+            ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                crate::set_operation::expands_to_columns(expr)
+            }
+            ast::SelectItem::ExprWithAliases { .. } => true,
+        });
+        let outer_opaque = std::mem::replace(&mut ctx.having_opaque, opaque);
         let aliases: HashSet<String> = select
             .projection
             .iter()
@@ -772,6 +789,7 @@ fn walk_select<'a>(
         let outer = std::mem::replace(&mut ctx.having_aliases, aliases);
         check_expr(having, &scope, lookup, ctx);
         ctx.having_aliases = outer;
+        ctx.having_opaque = outer_opaque;
     }
 }
 
@@ -1053,6 +1071,7 @@ fn exact_column_class(
     expr: &Expr,
     scope: &TypeScope,
     aliases: &HashSet<String>,
+    opaque: bool,
 ) -> Option<(ArgClass, RockyType)> {
     let mut inner = expr;
     while let Expr::Nested(e) = inner {
@@ -1061,7 +1080,7 @@ fn exact_column_class(
     // In `HAVING`, DuckDB reads a bare name that is a select-list alias as
     // the aliased expression, not the source column.
     if let Expr::Identifier(ident) = inner
-        && aliases.contains(&ident.value.to_ascii_lowercase())
+        && (opaque || aliases.contains(&ident.value.to_ascii_lowercase()))
     {
         return None;
     }
@@ -1110,7 +1129,9 @@ fn check_duckdb_call(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &m
         let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg else {
             continue;
         };
-        let Some((class, ty)) = exact_column_class(arg, scope, &ctx.having_aliases) else {
+        let Some((class, ty)) =
+            exact_column_class(arg, scope, &ctx.having_aliases, ctx.having_opaque)
+        else {
             continue;
         };
         if !duckdb_signatures::refuses_argument(&lower, count, position, class) {
@@ -1185,7 +1206,9 @@ fn check_branch_types(
         if matches!(branch, Expr::Value(v) if v.value == ast::Value::Null) {
             continue;
         }
-        let Some((class, ty)) = exact_column_class(branch, scope, &ctx.having_aliases) else {
+        let Some((class, ty)) =
+            exact_column_class(branch, scope, &ctx.having_aliases, ctx.having_opaque)
+        else {
             return;
         };
         typed.push((branch, class, ty));
@@ -1427,6 +1450,12 @@ mod tests {
             // Red team: in HAVING a bare name can be a select-list alias.
             "SELECT CAST(qty AS VARCHAR) AS qty, count(*) AS n FROM raw.orders GROUP BY ALL \
              HAVING lower(qty) = '2'",
+            "SELECT * REPLACE (CAST(qty AS VARCHAR) AS qty) FROM raw.orders GROUP BY ALL \
+             HAVING lower(qty) = '2'",
+            "SELECT o.* REPLACE (CAST(qty AS VARCHAR) AS qty) FROM raw.orders o GROUP BY ALL \
+             HAVING lower(qty) = '2'",
+            "SELECT CAST(COLUMNS('^qty$') AS VARCHAR), count(*) AS n FROM raw.orders \
+             GROUP BY ALL HAVING lower(qty) = '2'",
         ] {
             assert!(codes_on(sql, duckdb).is_empty(), "{sql}");
         }
@@ -1439,6 +1468,41 @@ mod tests {
         for dialect in [Some(OperandDialect::Snowflake), None] {
             assert!(codes_on("SELECT lower(qty) AS x FROM raw.orders", dialect).is_empty());
         }
+    }
+
+    /// DuckDB's top-n `max(col, n)` / `min(col, n)` returns a list, so a
+    /// column built from one is not a scalar of the argument's type.
+    #[test]
+    fn a_top_n_min_max_column_is_not_judged_as_a_scalar() {
+        let diags = run(
+            &[
+                (
+                    "up",
+                    "SELECT max(status, 2) AS m, min(qty, 3) AS n FROM raw.orders",
+                ),
+                (
+                    "down",
+                    "SELECT array_length(m) AS a, list_sort(n) AS b FROM up",
+                ),
+            ],
+            Some(OperandDialect::DuckDb),
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            codes_on(
+                "WITH c AS (SELECT max(status, 2) AS m FROM raw.orders) \
+                 SELECT array_length(m) AS a FROM c",
+                Some(OperandDialect::DuckDb)
+            )
+            .is_empty()
+        );
+        assert!(
+            codes_on(
+                "SELECT len(max(order_date, 2)) AS x FROM raw.orders",
+                Some(OperandDialect::DuckDb)
+            )
+            .is_empty()
+        );
     }
 
     /// The column of an upstream model is judged by its type, too.

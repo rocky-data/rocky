@@ -3613,6 +3613,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             };
             infer_aggregation_type("AVG", &arg_type, resolution, &scope.target)
         }
+        // DuckDB's `max(x, n)` / `min(x, n)` is a top-n aggregate that
+        // returns a list, not a value of `x`'s type.
+        "MIN" | "MAX" if !has_one_argument(func) => (RockyType::Unknown, true),
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
             (arg_type, true)
@@ -4387,6 +4390,11 @@ fn function_name(expr: &Expr) -> Option<String> {
 /// (`LENGTH`), a numeric literal, `COALESCE` over a literal that changes the
 /// type — is not exact, so a nested expression built from it stays `Unknown`
 /// (#2295).
+/// Whether `func` is called with exactly one argument.
+fn has_one_argument(func: &ast::Function) -> bool {
+    matches!(&func.args, ast::FunctionArguments::List(list) if list.args.len() == 1)
+}
+
 pub(crate) fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
         // A column of a CTE or derived table is exact only when the
