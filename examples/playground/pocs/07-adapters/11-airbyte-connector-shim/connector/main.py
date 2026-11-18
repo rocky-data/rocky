@@ -2,8 +2,12 @@
 """Connector shim: an Airbyte source image -> Parquet, state kept by Rocky.
 
 `rocky load --connector <name>` starts this program once. It reads the request
-JSON from stdin, runs one open-source Airbyte source image with docker, and
+JSON from stdin, runs one Airbyte source image with docker, and
 writes the records of ONE stream to one Parquet file.
+
+The Airbyte protocol is MIT. Each source image has its own license, often
+Elastic License 2.0 (ELv2), which is not open source. `airbyte/source-faker`,
+used by this POC, is ELv2. Check an image's `metadata.yaml` before you use it.
 
 Rocky ships no extractors and no catalog. This file only adapts the Airbyte
 protocol to the Rocky child connector protocol:
