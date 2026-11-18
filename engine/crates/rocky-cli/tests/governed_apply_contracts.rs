@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use rocky_cli::commands::plan::PlanRunOptions;
 use rocky_cli::commands::plan_cost::CostEstimateMode;
-use rocky_core::config::PrincipalRef;
 use rocky_core::config::PolicyPrincipal;
+use rocky_core::config::PrincipalRef;
 use rocky_core::traits::WarehouseAdapter;
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
@@ -77,8 +77,11 @@ column_match = false
     .expect("config");
     let models = root.join("models");
     std::fs::create_dir_all(&models).expect("models dir");
-    std::fs::write(models.join("fct.sql"), "SELECT customer_id FROM ext.customers\n")
-        .expect("model sql");
+    std::fs::write(
+        models.join("fct.sql"),
+        "SELECT customer_id FROM ext.customers\n",
+    )
+    .expect("model sql");
     std::fs::write(
         models.join("fct.toml"),
         "name = \"fct\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
@@ -139,19 +142,30 @@ async fn fct_exists(root: &Path) -> bool {
 
 /// A `type = "String"` contract on a BIGINT column. `rocky run` refuses it
 /// with `E011` and writes nothing. The plan must refuse it with the same
-/// `E011`, so no plan exists for an agent to apply.
+/// `E011`, so no plan exists for an agent to apply. Before the fix the plan
+/// was saved and the agent's apply wrote the model.
+///
+/// The control: a matching `type = "Int64"` contract on the same described
+/// source is planned, so the describe refuses only a mismatch.
+///
+/// One test, because the plan is written under the current directory and
+/// `cargo test` runs the tests of a file as threads of one process.
 #[tokio::test]
-async fn a_wrong_type_contract_run_refuses_is_refused_by_the_plan() -> anyhow::Result<()> {
+async fn the_plan_reaches_runs_contract_type_verdict() -> anyhow::Result<()> {
+    // Wrong type: refused with E011, nothing written.
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
     std::env::set_current_dir(&root)?;
-    let (config, models) = project(&root, "[[columns]]\nname = \"customer_id\"\ntype = \"String\"\n")
-        .await;
+    let (config, models) = project(
+        &root,
+        "[[columns]]\nname = \"customer_id\"\ntype = \"String\"\n",
+    )
+    .await;
     let state = root.join("state.redb");
     let refusal = match agent_plan(&config, &models, &state).await {
         Ok(plan_id) => {
-            // Before the fix the plan is saved, and the agent's apply writes
-            // the model. Show that, so the failure names the hole.
+            // Show what the agent's apply does with the saved plan, so the
+            // failure names the hole.
             let applied = rocky_cli::commands::apply::run_apply(
                 &config,
                 &plan_id,
@@ -175,5 +189,19 @@ async fn a_wrong_type_contract_run_refuses_is_refused_by_the_plan() -> anyhow::R
         "the plan must refuse with E011, as `rocky run` does: {refusal}"
     );
     assert!(!fct_exists(&root).await, "nothing is written");
+
+    // Matching type: planned.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    std::env::set_current_dir(&root)?;
+    let (config, models) = project(
+        &root,
+        "[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\n",
+    )
+    .await;
+    let state = root.join("state.redb");
+    agent_plan(&config, &models, &state)
+        .await
+        .map_err(|e| anyhow::anyhow!("a matching contract type must be planned: {e:#}"))?;
     Ok(())
 }

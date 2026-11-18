@@ -582,7 +582,10 @@ pub async fn plan(
             run_options,
             base_ref,
             state_path,
-        ) {
+            warehouse_adapter.as_ref(),
+        )
+        .await
+        {
             Ok(Some(RunPlanBuild::Persisted(PersistedRunPlan {
                 run_plan,
                 plan_id,
@@ -1772,8 +1775,16 @@ fn run_plan_refusals(
 /// Captures the full `rocky run` flag surface from `run_options` so apply-time
 /// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
 /// as booleans; the actual state-store lookup happens at apply time.
+///
+/// The compile that decides a refusal reads the same cached source schemas the
+/// plan's reviewed snapshot captures, which is what an agent's apply compiles
+/// from. A contract type that compile cannot check (`I003`) is checked as
+/// `rocky run` checks it (#2614): the external sources behind it are described
+/// on `warehouse`, and an `E011` from a compile over them refuses the plan
+/// (#2635). Without that, an agent's apply of the plan wrote a model whose
+/// contract type `rocky run` refuses.
 #[allow(clippy::too_many_arguments)]
-fn build_and_persist_run_plan(
+async fn build_and_persist_run_plan(
     config_path: &Path,
     models_dir: &Path,
     filter: Option<&str>,
@@ -1782,6 +1793,7 @@ fn build_and_persist_run_plan(
     run_options: &PlanRunOptions,
     base_ref: &str,
     state_path: &Path,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
 ) -> Result<Option<RunPlanBuild>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -1795,7 +1807,15 @@ fn build_and_persist_run_plan(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         required_explicit_contract_model: None,
-        source_schemas: std::collections::HashMap::new(),
+        // Loaded as `capabilities_and_fill_previews` loads the reviewed
+        // snapshot, so the verdict and the snapshot read the same schemas.
+        source_schemas: match project_config.as_ref() {
+            Some(cfg) => crate::source_schemas::load_cached_source_schemas(
+                &cfg.cache.schemas.clone().with_ttl_override(None),
+                state_path,
+            ),
+            None => std::collections::HashMap::new(),
+        },
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness: Default::default(),
@@ -1806,7 +1826,23 @@ fn build_and_persist_run_plan(
         project: None,
     };
 
-    let result = compile::compile(&config).context("failed to compile models for run plan")?;
+    let mut result = compile::compile(&config).context("failed to compile models for run plan")?;
+    // Only an `E011` that replaces an `I003` crosses over, as in `rocky run`:
+    // the described types cannot raise any other error.
+    let described = super::run::describe_sources_for_unchecked_contract_types(
+        &result,
+        &config.source_schemas,
+        &config.external_dependencies,
+        warehouse,
+    )
+    .await;
+    if !described.is_empty() {
+        let mut typed_config = config.clone();
+        typed_config.source_schemas.extend(described);
+        if let Ok(typed) = compile::compile(&typed_config) {
+            super::run::adopt_contract_type_errors(&mut result, typed);
+        }
+    }
 
     if result.project.models.is_empty() {
         // No models compiled — this is a replication-only project even
