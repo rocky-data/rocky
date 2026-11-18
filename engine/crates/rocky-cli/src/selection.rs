@@ -353,6 +353,7 @@ fn compute_ci_diff_state(
         // file selection and the compiled models agree (G7). With
         // `--state-working-tree`, the working tree for both.
         crate::commands::ci_diff_mode(working_tree),
+        false,
     )
     .with_context(|| format!("failed to compute `state:` selection against '{state_ref}'"))?;
     let mut state = StateSets::default();

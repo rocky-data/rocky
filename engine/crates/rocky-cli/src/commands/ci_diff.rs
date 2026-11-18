@@ -1532,6 +1532,11 @@ pub(crate) fn diff_incomplete_lineage(
 
 /// Compute the CI diff between `base_ref` and HEAD without printing.
 ///
+/// `with_seed` also types sources from the project's `data/seed.sql`, as
+/// `rocky compile` does by default (#2663). `rocky ci-diff` and
+/// `rocky lineage-diff` pass `true`. `state:` selection passes `false`: it
+/// reads only model statuses, so it never runs project SQL.
+///
 /// Shared between `run_ci_diff` and `run_lineage_diff` so the lineage-diff
 /// command can enrich the per-column diff with downstream traces from
 /// HEAD's `semantic_graph` without rerunning git or the compiler.
@@ -1542,6 +1547,7 @@ pub(crate) fn compute_ci_diff(
     models_dir: &Path,
     cache_ttl_override: Option<u64>,
     mode: CiDiffMode,
+    with_seed: bool,
 ) -> Result<CiDiffData> {
     compute_ci_diff_in(
         config_path,
@@ -1550,12 +1556,14 @@ pub(crate) fn compute_ci_diff(
         models_dir,
         cache_ttl_override,
         mode,
+        with_seed,
         None,
     )
 }
 
 /// [`compute_ci_diff`], with the git invocations optionally rooted at an
 /// explicit repository directory rather than the process cwd. See [`git_in`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_ci_diff_in(
     config_path: &Path,
     state_path: &Path,
@@ -1563,6 +1571,7 @@ pub(crate) fn compute_ci_diff_in(
     models_dir: &Path,
     cache_ttl_override: Option<u64>,
     mode: CiDiffMode,
+    with_seed: bool,
     repo_dir: Option<&Path>,
 ) -> Result<CiDiffData> {
     validate_base_ref(base_ref)?;
@@ -1571,16 +1580,16 @@ pub(crate) fn compute_ci_diff_in(
     // tree + base ref) with the same map so the resulting per-model
     // type diffs measure real schema drift rather than
     // `Unknown`-vs-`Unknown` noise. Degrades to empty when the cache is
-    // cold or `[cache.schemas] enabled = false`.
+    // cold or `[cache.schemas] enabled = false`; with `with_seed`, the
+    // project's seed then fills it just before the compiles (#2663).
     // Present-but-unloadable `rocky.toml` refuses (#1625): a cold map turns
     // real type diffs into `Unknown`-vs-`Unknown` noise, which is the opposite
     // of what this command is for.
-    let source_schemas = crate::source_schemas::load_project_source_schemas(
+    let mut source_schemas = crate::source_schemas::load_project_source_schemas(
         config_path,
         state_path,
         cache_ttl_override,
     )?;
-
     // Both selection and the base compile read the same commit: the merge
     // base `base...HEAD` diffs against. Without one (shallow clone), both
     // fall back to `base_ref` itself.
@@ -1644,6 +1653,29 @@ pub(crate) fn compute_ci_diff_in(
             mode,
             base_commit,
         });
+    }
+
+    // `rocky compile`'s default seed tier (#2663): with `with_seed`, the
+    // project's `data/seed.sql`, beside the `--config` file, fills every
+    // source the cache does not hold. Without it a playground-style project,
+    // whose sources are known only from the seed, diffs every source-derived
+    // column as `Unknown` although `rocky compile` types it. The seed comes
+    // from the working tree and feeds both compiles, as the cache does: a
+    // change to the seed alone shows no type change. It runs here, after the
+    // early returns, so a diff that compiles nothing never runs project SQL.
+    // `state:` selection passes `false`: it reads only model statuses, which
+    // come from changed files, never from types. `load_project_source_schemas`
+    // has already refused an unloadable config, so a failure here is absent.
+    if with_seed {
+        let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+            .ok()
+            .flatten();
+        let project_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+        super::compile::fill_from_default_seed(
+            project_root,
+            project_config.as_ref(),
+            &mut source_schemas,
+        );
     }
 
     // Compile the head side: keep the full result so callers can reach into
@@ -1796,6 +1828,7 @@ pub fn run_ci_diff(
         models_dir,
         cache_ttl_override,
         mode,
+        true,
     )?;
     let mode = data.mode;
     let header = format!("Rocky CI Diff ({base_ref}...{})\n", mode.head_label());
@@ -3698,6 +3731,7 @@ mod tests {
             models_dir,
             None,
             CiDiffMode::Head,
+            true,
             Some(dir),
         )
         .expect("compute_ci_diff must succeed")
@@ -3711,6 +3745,7 @@ mod tests {
             models_dir,
             None,
             mode,
+            true,
             Some(dir),
         )
         .expect("compute_ci_diff must succeed")
@@ -4316,6 +4351,7 @@ mod tests {
             &models_dir,
             None,
             CiDiffMode::Head,
+            true,
         ) else {
             panic!("a present but unloadable rocky.toml must refuse the ci diff");
         };
@@ -4324,5 +4360,92 @@ mod tests {
             rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
             "the refusal must name the config file, got: {rendered}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2663: the diff types source-derived columns from the project's seed,
+    // as `rocky compile` does by default.
+    // -----------------------------------------------------------------------
+
+    /// A repo whose one model reads `raw.orders`, then a commit that adds
+    /// `amount` to it. Returns the type the diff reports for `amount`.
+    fn added_amount_type(seed: Option<&str>, with_seed: bool) -> Option<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("orders.sql", "SELECT id FROM raw.orders\n"),
+                ("orders.toml", &inferred_sidecar("main")),
+            ],
+        );
+        if let Some(seed) = seed {
+            fs::create_dir_all(dir.join("data")).unwrap();
+            fs::write(dir.join("data").join("seed.sql"), seed).unwrap();
+        }
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT id, amount FROM raw.orders\n",
+        )
+        .unwrap();
+        run_git(dir, &["commit", "-q", "-am", "add amount"]);
+
+        let data = compute_ci_diff_in(
+            &dir.join("rocky.toml"),
+            &dir.join("state.redb"),
+            "HEAD~1",
+            &models_dir,
+            None,
+            CiDiffMode::Head,
+            with_seed,
+            Some(dir),
+        )
+        .expect("compute_ci_diff must succeed");
+        let result = data
+            .results
+            .iter()
+            .find(|r| r.model_name == "orders")
+            .expect("orders must be in the diff");
+        let change = result
+            .column_changes
+            .iter()
+            .find(|c| c.column_name == "amount")
+            .expect("amount must be an added column");
+        assert_eq!(change.change_type, ColumnChangeType::Added);
+        change.new_type.clone()
+    }
+
+    const ORDERS_SEED: &str = "CREATE SCHEMA raw;\n\
+        CREATE TABLE raw.orders (id INTEGER NOT NULL, amount DECIMAL(10, 2));\n";
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_seed_types_the_columns_the_diff_reports() {
+        let new_type = added_amount_type(Some(ORDERS_SEED), true);
+        assert_eq!(
+            new_type.as_deref(),
+            Some("Decimal { precision: 10, scale: 2 }"),
+            "with data/seed.sql the diff must type `amount` from the seed's DECIMAL(10, 2)"
+        );
+    }
+
+    #[test]
+    fn without_a_seed_the_diff_still_reports_unknown() {
+        let new_type = added_amount_type(None, true);
+        assert_eq!(new_type.as_deref(), Some("Unknown"));
+    }
+
+    #[test]
+    fn a_seed_that_does_not_run_leaves_the_diff_unknown_and_does_not_fail_it() {
+        let new_type = added_amount_type(Some("THIS IS NOT SQL;\n"), true);
+        assert_eq!(new_type.as_deref(), Some("Unknown"));
+    }
+
+    /// `state:` selection passes `with_seed = false`: it never runs the
+    /// project's seed, so the same repo diffs `amount` as `Unknown`.
+    #[test]
+    fn without_with_seed_the_seed_is_not_read() {
+        let new_type = added_amount_type(Some(ORDERS_SEED), false);
+        assert_eq!(new_type.as_deref(), Some("Unknown"));
     }
 }
