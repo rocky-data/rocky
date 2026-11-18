@@ -3686,6 +3686,22 @@ fn grouping_key_reads_a_column(key: &Expr, select: &ast::Select) -> bool {
             _ => false,
         };
     }
+    // A bare key that names a select-list alias may mean the aliased
+    // expression (DuckDB, Databricks, Snowflake, BigQuery): `SELECT 'a' AS k
+    // ... GROUP BY k` groups by a constant. The aliased expression decides.
+    if let Expr::Identifier(ident) = strip_nested(key) {
+        let aliased = select.projection.iter().find_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias }
+                if alias.value.eq_ignore_ascii_case(&ident.value) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        });
+        if let Some(expr) = aliased {
+            return reads_column(expr);
+        }
+    }
     reads_column(key)
 }
 
@@ -13864,6 +13880,9 @@ mod tests {
                     true,
                 ),
                 ("select 'k' as k, sum(x) as c from t group by 1", true),
+                ("select 'k' as k, sum(x) as c from t group by k", true),
+                // An alias of a column still reads it.
+                ("select upper(n) as k, sum(x) as c from t group by k", false),
                 // A constant beside a column is still plain.
                 ("select n, sum(x) as c from t group by 'a', n", false),
                 // A tuple key may be the empty set; it is kept nullable.
