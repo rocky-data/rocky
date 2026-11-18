@@ -3634,6 +3634,47 @@ schema_template = "s"
         );
     }
 
+    /// #2657: a model that reads a seed table by its bare name (`FROM
+    /// orders`, which DuckDB resolves to `main.orders`) is typed from the seed,
+    /// as the schema-qualified read is. Before, a NOT NULL contract on it was
+    /// `I003` and `E012`.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn a_bare_seed_table_name_is_typed_from_the_seed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n\n\
+             [pipeline.transform]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.transform.target]\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        fs::create_dir_all(&models).unwrap();
+        write_model(&models, "bare", "SELECT order_id FROM orders");
+        write_model(&models, "qualified", "SELECT order_id FROM main.orders");
+        write_seed(root, "CREATE TABLE orders (order_id INTEGER NOT NULL);\n");
+        let contracts = root.join("contracts");
+        fs::create_dir_all(&contracts).unwrap();
+        for model in ["bare", "qualified"] {
+            fs::write(
+                contracts.join(format!("{model}.contract.toml")),
+                "[[columns]]\nname = \"order_id\"\ntype = \"Int32\"\nnullable = false\n",
+            )
+            .unwrap();
+        }
+
+        let whole = compile_scoped(root, &models, ModelScope::WholeProject, SeedUse::IfPresent);
+        let codes: Vec<(&str, &str)> = whole
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(&*d.code, "I003" | "E011" | "E012"))
+            .map(|d| (d.model.as_str(), &*d.code))
+            .collect();
+        assert!(codes.is_empty(), "{:?}", whole.diagnostics);
+    }
+
     /// With no `--with-seed`, a project's `data/seed.sql` still types the
     /// compile: a column the seed table lacks is W041.
     #[test]
