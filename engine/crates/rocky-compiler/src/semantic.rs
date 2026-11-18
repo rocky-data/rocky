@@ -543,16 +543,6 @@ pub fn build_semantic_graph(
                 .entry(rocky_core::physical_edges::fold_identifier(&cte.name))
                 .or_insert(ReadTarget::Local);
         }
-        // Whether this model's bare read of `name` binds to a model other
-        // than one of that name. That model replaced the table of that name,
-        // so a source schema of the name is stale: a star over it stays
-        // unexpanded rather than claim columns the run may not have (#2674).
-        let star_reads_other_model = |name: &str| {
-            matches!(
-                reads.get(&rocky_core::physical_edges::fold_identifier(name)),
-                Some(ReadTarget::Model(m)) if m != name
-            )
-        };
         // Whether this model's star over `name` reads the model of that name.
         let star_reads_model = |name: &str| {
             reads.get(&rocky_core::physical_edges::fold_identifier(name))
@@ -715,10 +705,7 @@ pub fn build_semantic_graph(
                                 .iter()
                                 .map(|c| c.name.as_str())
                                 .collect()
-                        } else if let Some(source_cols) = source_schemas
-                            .get(inner_name.as_str())
-                            .filter(|_| !star_reads_other_model(inner_name))
-                        {
+                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
                             source_cols.iter().map(|c| c.name.as_str()).collect()
                         } else {
                             star_unresolved = true;
@@ -863,10 +850,7 @@ pub fn build_semantic_graph(
                                     });
                                 }
                             }
-                        } else if let Some(source_cols) = source_schemas
-                            .get(inner_name.as_str())
-                            .filter(|_| !star_reads_other_model(inner_name))
-                        {
+                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
                             for col in source_cols {
                                 if via.column(&col.name) == StarColumn::Excluded {
                                     continue;
@@ -879,10 +863,7 @@ pub fn build_semantic_graph(
                             }
                         }
                     }
-                } else if let Some(source_cols) = source_schemas
-                    .get(table_name.as_str())
-                    .filter(|_| !star_reads_other_model(table_name))
-                {
+                } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
                     // External source with known schema
                     for col in source_cols {
                         let effect = rel.column(&col.name);
