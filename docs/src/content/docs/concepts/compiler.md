@@ -270,13 +270,15 @@ A branch is counted only when its select list states its width. A `*`, a
 `t.*`, or a call that returns several columns (`COLUMNS(...)`, `UNNEST`,
 `EXPLODE`) is not counted. `UNION BY NAME` is not checked.
 
-Inside a CTE body the same finding is the warning `W071`. A warehouse can
-skip a CTE that nothing reads (DuckDB never checks one), so the model may
-still run. Everywhere else in the query, a subquery that never runs
+Inside a CTE body or a named `WINDOW` definition, the same finding is the
+warning `W071`. A warehouse can skip a CTE nothing reads or a window nothing
+uses (DuckDB never checks one), so the model may still run. Everywhere else in the query, a subquery that never runs
 included, it is the error `E071`.
 
-Rocky does not check whether the column types match across branches:
-DuckDB accepts every type mix, and the other warehouses are not checked yet.
+Rocky does not check whether the column types match across branches.
+DuckDB accepts every type mix when it checks the query, though a mix can
+still fail on real rows (`Conversion Error`). The other warehouses are not
+checked yet.
 
 ### 5. Validate contracts
 
@@ -647,7 +649,7 @@ span, and sometimes a suggested fix.
 | `E062` | A model with a contract repeats an output name the contract constrains (`[[columns]]`, `required` or `protected`). The contract checks one column of that name; the warehouse writes the other under another name. Alias the repeat. Names match as for `E061` |
 | `E063` | `[rules] no_extra_columns = true` and the model outputs a column the contract does not name in `[[columns]]`, `required` or `protected`, or Rocky cannot prove the column list (a `SELECT *`, an unaliased expression). Declare the column, drop it, or list the columns explicitly |
 | `E064` | A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no known source table, and is one or two edits from a model name (one edit for names under 5 characters). The message names the model. If it is a real warehouse table, qualify it with its schema (`main.stg_ordrs`) |
-| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, outside any CTE body. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
+| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, outside any CTE body or named window. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -675,7 +677,7 @@ span, and sometimes a suggested fix.
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
-| `W071` | The warning form of `E071`, for a set-operation mismatch inside a CTE body: a warehouse can skip a CTE nothing reads, so the model may still run. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
+| `W071` | The warning form of `E071`, for a set-operation mismatch inside a CTE body or a named `WINDOW` definition: a warehouse can skip one nothing uses, so the model may still run. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

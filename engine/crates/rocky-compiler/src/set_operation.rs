@@ -8,8 +8,9 @@
 //!
 //! Outside any CTE body the finding is the error `E071`: every warehouse
 //! binds the whole main query, a subquery that never runs included. Inside
-//! a CTE body it is the warning `W071`, since DuckDB never binds a CTE
-//! nothing reads, and telling which CTEs are read needs name resolution.
+//! a CTE body or a named `WINDOW` definition it is the warning `W071`, since
+//! DuckDB never binds a CTE nothing reads or a window nothing uses, and
+//! telling which are used needs name resolution.
 //! The check itself needs none: it compares the widths the syntax states.
 //!
 //! A branch's width is counted only when the SQL states it: a `*`, a
@@ -36,8 +37,8 @@ pub fn check_set_operation_widths(model_name: &str, sql: &str) -> Vec<Diagnostic
     };
     let mut visitor = Queries {
         model_name,
-        cte_bodies: HashSet::new(),
-        in_cte: 0,
+        skippable: HashSet::new(),
+        in_skippable: 0,
         out: Vec::new(),
     };
     let _ = statements.visit(&mut visitor);
@@ -46,11 +47,12 @@ pub fn check_set_operation_widths(model_name: &str, sql: &str) -> Vec<Diagnostic
 
 struct Queries<'m> {
     model_name: &'m str,
-    /// The body of every CTE seen so far. A query's `WITH` is visited before
-    /// its CTE bodies, so each body is here when the visitor reaches it.
-    cte_bodies: HashSet<*const Query>,
-    /// How many CTE bodies the visitor is inside.
-    in_cte: usize,
+    /// Every query a warehouse may skip: CTE bodies and the subqueries of
+    /// named window definitions. They are added when the visitor enters the
+    /// query that holds them, so each is here before the visitor reaches it.
+    skippable: HashSet<*const Query>,
+    /// How many skippable queries the visitor is inside.
+    in_skippable: usize,
     out: Vec<Diagnostic>,
 }
 
@@ -58,17 +60,18 @@ impl Visitor for Queries<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        if self.cte_bodies.contains(&std::ptr::from_ref(query)) {
-            self.in_cte += 1;
+        if self.skippable.contains(&std::ptr::from_ref(query)) {
+            self.in_skippable += 1;
         }
         if let Some(with) = &query.with {
-            self.cte_bodies.extend(
+            self.skippable.extend(
                 with.cte_tables
                     .iter()
                     .map(|cte| std::ptr::from_ref(&*cte.query)),
             );
         }
-        let place = if self.in_cte == 0 {
+        named_window_queries(&query.body, &mut self.skippable);
+        let place = if self.in_skippable == 0 {
             Place::MainQuery
         } else {
             Place::CteBody
@@ -78,10 +81,34 @@ impl Visitor for Queries<'_> {
     }
 
     fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        if self.cte_bodies.contains(&std::ptr::from_ref(query)) {
-            self.in_cte -= 1;
+        if self.skippable.contains(&std::ptr::from_ref(query)) {
+            self.in_skippable -= 1;
         }
         std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Add the subqueries of every named `WINDOW` definition in `body`'s
+/// selects to `out`. A parenthesised query in `body` is its own query and is
+/// handled when the visitor enters it.
+fn named_window_queries(body: &SetExpr, out: &mut HashSet<*const Query>) {
+    struct Subqueries<'o>(&'o mut HashSet<*const Query>);
+    impl Visitor for Subqueries<'_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+            self.0.insert(std::ptr::from_ref(query));
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    match body {
+        SetExpr::Select(select) => {
+            let _ = select.named_window.visit(&mut Subqueries(out));
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            named_window_queries(left, out);
+            named_window_queries(right, out);
+        }
+        _ => {}
     }
 }
 
@@ -90,8 +117,8 @@ impl Visitor for Queries<'_> {
 enum Place {
     /// Outside every CTE body: always bound, so an error (`E071`).
     MainQuery,
-    /// Inside a CTE body, at any depth: bound only if the CTE is read, so a
-    /// warning (`W071`).
+    /// Inside a CTE body or a named window definition, at any depth: bound
+    /// only if it is used, so a warning (`W071`).
     CteBody,
 }
 
@@ -125,8 +152,8 @@ fn report(body: &SetExpr, model_name: &str, place: Place, out: &mut Vec<Diagnost
                 W071,
                 model_name,
                 format!(
-                    "{message}. It is inside a CTE, which the warehouse may skip if nothing \
-                     reads it"
+                    "{message}. It is inside a CTE or a named window, which the warehouse may \
+                     skip if nothing uses it"
                 ),
             ),
         };
@@ -279,10 +306,10 @@ mod tests {
             "select t.* from t union all select a, b from u",
             "select a, * from t union all select a from u",
             "select a from t union all select * exclude (b), c from u",
-            "select columns('x_.*') from t union all select a from u",
-            "select unnest(s) from t union all select a from u",
-            "select explode(arr) from t union all select a from u",
-            "select stack(2, a, b) from t union all select a from u",
+            "select columns('x_.*') from t union all select a, b, c from u",
+            "select unnest(s) from t union all select a, b, c from u",
+            "select explode(arr) from t union all select a, b, c from u",
+            "select stack(2, a, b) from t union all select a, b, c from u",
             "select a, b from t union all by name select a from u",
             "select a, b from t union by name select a from u",
             "select a from t union all values (1), (2)",
@@ -291,6 +318,62 @@ mod tests {
         ] {
             assert_eq!(codes(sql), 0, "{sql}");
         }
+    }
+
+    /// Each call that can return several columns makes its branch's width
+    /// unknown, against a branch of any width.
+    #[test]
+    fn every_expander_makes_the_width_unknown() {
+        // Listed here, not read from `EXPANDERS`, so dropping a name fails.
+        for name in [
+            "columns",
+            "unnest",
+            "explode",
+            "explode_outer",
+            "posexplode",
+            "posexplode_outer",
+            "inline",
+            "inline_outer",
+            "stack",
+            "json_tuple",
+            "unpack",
+            "struct_unpack",
+            "untuple",
+            "UNNEST",
+        ] {
+            let sql = format!("select {name}(x) from t union all select a, b, c from u");
+            assert_eq!(codes(&sql), 0, "{sql}");
+        }
+        assert_eq!(
+            codes("select lower(x) from t union all select a, b, c from u"),
+            1
+        );
+    }
+
+    /// A named window nothing uses is never bound by DuckDB, like an unread
+    /// CTE, so a mismatch in a window definition is `W071` (round-9 red
+    /// team, #2661).
+    #[test]
+    fn a_mismatch_in_a_named_window_is_a_warning() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER); CREATE TABLE u (a INTEGER, b INTEGER)")
+            .unwrap();
+        let bad = "(SELECT a FROM u UNION ALL SELECT a, b FROM u)";
+        for sql in [
+            format!("SELECT a FROM t WINDOW w AS (ORDER BY {bad})"),
+            format!("SELECT a FROM t WINDOW w AS (ORDER BY {bad}) UNION ALL SELECT a FROM t"),
+            format!("SELECT a FROM t UNION ALL SELECT a FROM t WINDOW w AS (ORDER BY {bad})"),
+            format!("SELECT sum(a) OVER w FROM t WINDOW w AS (ORDER BY a), w2 AS (ORDER BY {bad})"),
+        ] {
+            assert_eq!(severities(&sql), ["W071"], "{sql}");
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
+        }
+        // An inline window is always used: still an error.
+        assert_eq!(
+            severities(&format!("SELECT sum(a) OVER (ORDER BY {bad}) FROM t")),
+            ["E071"]
+        );
     }
 
     /// DuckDB binds a set operation in a subquery that never runs.
