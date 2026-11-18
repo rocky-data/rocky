@@ -2081,6 +2081,9 @@ fn plan_transformation_from_models(
 /// `allow_breaking = true` bypasses the breaking-change gate (analogous to
 /// `--skip-approval` for the approval gate). The bypass is always recorded
 /// as a `BreakingChangesAllowed` audit event.
+///
+/// `allow_failing_tests = true` bypasses the failing-tests gate (#2609),
+/// recorded as a `FailingTestsAllowed` audit event.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_branch_promote(
     root: &Path,
@@ -2093,6 +2096,7 @@ pub async fn run_branch_promote(
     pipeline_name: Option<&str>,
     skip_approval_flag: bool,
     allow_breaking: bool,
+    allow_failing_tests: bool,
     runtime_principal: rocky_core::config::PolicyPrincipal,
     actor: &rocky_core::config::PrincipalRef,
     json: bool,
@@ -2126,6 +2130,7 @@ pub async fn run_branch_promote(
         pipeline_name,
         skip_approval_flag,
         allow_breaking,
+        allow_failing_tests,
         state_path,
         runtime_principal,
     )
@@ -2149,6 +2154,17 @@ pub async fn run_branch_promote(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&breaking_block_output(branch_name, block))?
+                );
+            }
+            // Same contract for a failing-tests block (#2609): the block JSON
+            // on stdout, then the non-zero exit.
+            if let Some(block) =
+                err.downcast_ref::<crate::commands::plan::PromoteBlockedByFailingTests>()
+                && json
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&failing_tests_block_output(branch_name, block))?
                 );
             }
             return Err(err);
@@ -2287,6 +2303,27 @@ fn breaking_block_output(
         approvals_used: block.approvals_used.clone(),
         approvals_rejected: block.approvals_rejected.clone(),
         breaking_changes: Some(block.findings.clone()),
+        targets: Vec::new(),
+        audit: block.audit.clone(),
+        success: false,
+    }
+}
+
+/// The bare-verb `BranchPromoteOutput` for a failing-tests block (#2609): the
+/// same shape as [`breaking_block_output`], with the leading
+/// `FailingTestsBlocked` audit event naming the run and the failing tests.
+fn failing_tests_block_output(
+    branch: &str,
+    block: &crate::commands::plan::PromoteBlockedByFailingTests,
+) -> BranchPromoteOutput {
+    BranchPromoteOutput {
+        version: VERSION.to_string(),
+        command: "branch promote".to_string(),
+        branch: branch.to_string(),
+        branch_state_hash: block.branch_state_hash.clone(),
+        approvals_used: block.approvals_used.clone(),
+        approvals_rejected: block.approvals_rejected.clone(),
+        breaking_changes: block.breaking_changes.clone(),
         targets: Vec::new(),
         audit: block.audit.clone(),
         success: false,
@@ -5108,6 +5145,7 @@ adapter = "default"
             approvals_rejected: Vec::new(),
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![crate::output::PromoteTargetPlan {
                 target: "a.main.promoted".to_string(),
                 source: "a.branch_src.promoted".to_string(),
@@ -5955,6 +5993,7 @@ adapter = "default"
             Some("demo"),
             false,
             false,
+            false, // allow_failing_tests
             rocky_core::config::PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
@@ -6578,6 +6617,7 @@ auto_create_schemas = true
             None,
             false,
             true,
+            false,
             &state_path,
             rocky_core::config::PolicyPrincipal::Human,
         )
@@ -6686,6 +6726,7 @@ auto_create_schemas = true
             None,  // pipeline — only one pipeline, no need to disambiguate
             false, // skip_approval_flag
             true,  // allow_breaking — irrelevant here; gate skips fail-open anyway
+            false, // allow_failing_tests
             rocky_core::config::PolicyPrincipal::Human, // human runtime — no [policy], ungated
             &rocky_core::config::PrincipalRef::unnamed(),
             false, // json — suppress pretty stdout in tests
@@ -6809,6 +6850,7 @@ auto_create_schemas = true
             None,  // pipeline
             false, // skip_approval_flag
             true,  // allow_breaking — irrelevant; gate skips fail-open anyway
+            false, // allow_failing_tests
             &state_path,
             rocky_core::config::PolicyPrincipal::Agent, // the agent-invoked promote
         )
@@ -6926,6 +6968,7 @@ effect = "deny"
             None,
             false, // skip_approval_flag
             true,  // allow_breaking
+            false, // allow_failing_tests
             &state_path,
             rocky_core::config::PolicyPrincipal::Agent,
         )
@@ -7088,6 +7131,7 @@ effect = "deny"
             None,
             false, // skip_approval_flag
             true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            false, // allow_failing_tests
             &state_path,
             PolicyPrincipal::Agent,
         )
@@ -7132,6 +7176,7 @@ effect = "deny"
             None,
             false, // skip_approval_flag
             true,  // allow_breaking
+            false, // allow_failing_tests
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
@@ -7202,6 +7247,7 @@ effect = "deny"
             None,
             false,
             true,
+            false, // allow_failing_tests
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
@@ -7335,6 +7381,7 @@ adapter = "default"
             Some("marts"),
             false,
             true,
+            false, // allow_failing_tests
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
@@ -7353,6 +7400,7 @@ adapter = "default"
             None,
             false,
             true,
+            false, // allow_failing_tests
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
@@ -7517,6 +7565,7 @@ adapter = "default"
             Some("marts"),
             false, // skip_approval_flag
             true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            false, // allow_failing_tests
             &state_path,
             PolicyPrincipal::Human,
         )
@@ -7687,6 +7736,7 @@ adapter = "default"
             Some("marts"),
             false, // skip_approval_flag
             true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            false, // allow_failing_tests
             &state_path,
             PolicyPrincipal::Human,
         )
@@ -7913,6 +7963,7 @@ auto_create_schemas = true
             None,
             false,
             false, // allow_breaking — the gate must fire
+            false, // allow_failing_tests
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true, // json — the block JSON is emitted to stdout

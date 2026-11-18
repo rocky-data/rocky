@@ -346,7 +346,9 @@ date_key = "DATE"
 
 ### `rocky snapshot`
 
-Run an SCD Type 2 snapshot pipeline. Rocky generates and runs `MERGE` SQL that keeps the history of a source table. The target table gets `valid_from`, `valid_to`, `is_current` and `snapshot_id` columns.
+Run an SCD Type 2 snapshot pipeline. Rocky generates and runs `MERGE` SQL that keeps the history of a source table. The target table gets `valid_from`, `valid_to`, `is_current` and `snapshot_id` columns. The column names are fixed.
+
+`rocky snapshot` runs only a pipeline with `type = "snapshot"`. `rocky run --pipeline <name>` runs the same pipeline too. To keep history inside a transformation pipeline, or to use dbt's column names, use a model with [`[strategy] type = "snapshot"`](/reference/model-format/#snapshot) instead. It runs in the model DAG of `rocky run`. See [Snapshots in the dbt migration guide](/guides/migrate-from-dbt/#snapshots-use-the-model-strategy).
 
 ```bash
 rocky snapshot [flags]
@@ -642,7 +644,7 @@ rocky bench [group] [flags]
 | Argument or flag | Default | Description |
 |------|---------|-------------|
 | `group` | `all` | `compile`, `dag`, `sql_gen`, `startup` or `all`. `all` runs `compile`, `dag` and `sql_gen`, not `startup`. |
-| `--models <N>` | | Number of models to generate for the compile benchmarks. |
+| `--models <N>` | `100` | Number of models to generate for the compile benchmarks. |
 | `--format <FORMAT>` | `table` | `json` for machine-readable output. |
 | `--save <PATH>` | | Write the results to a JSON baseline file. |
 | `--compare <PATH>` | | Compare the results against a saved baseline file. |
@@ -651,6 +653,8 @@ rocky bench [group] [flags]
 rocky bench --save baseline.json
 rocky bench --compare baseline.json
 ```
+
+`rocky bench` refuses to report timings for a benchmark that fails. `compile` refuses when the generated project has a compile error. `startup` refuses when `cargo run -p rocky -- --version` fails. With `all`, the first refusal stops the run.
 
 ---
 
