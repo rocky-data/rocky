@@ -19,6 +19,9 @@ You keep your warehouse and your SQL. Rocky runs on Databricks, Snowflake, BigQu
    rocky compile ............... type and contract errors, before SQL runs anywhere
       │
       ▼
+   rocky branch create pr1 ..... once per branch
+      │
+      ▼
    rocky run --branch pr1 ...... build into a branch schema, not production
       │
       ▼
@@ -28,7 +31,7 @@ You keep your warehouse and your SQL. Rocky runs on Databricks, Snowflake, BigQu
    rocky apply <plan-id> ....... the reviewed change reaches the warehouse
 ```
 
-Create the branch once with `rocky branch create pr1`. Add `--tests enforce` to the branch run to run each model's `[[tests]]` there: `rocky plan promote` then refuses a branch with a recorded failing test.
+Add `--tests enforce` to the branch run to run each model's `[[tests]]` there. `rocky plan promote` then refuses a branch with a recorded failing test.
 
 A clean compile finds the problems that your SQL, schemas and config make visible. It does not prove that every query runs or returns correct values.
 
@@ -73,7 +76,7 @@ With a read-only token, the page cannot run or approve anything. Plain `rocky se
 |---|---|---|
 | Catch a broken model before it runs | `rocky compile`: types, references and contracts, checked offline | [Compiler](https://rocky-data.dev/concepts/compiler/) |
 | See what a change breaks downstream | `rocky lineage-diff main`: affected tables and columns, as PR-ready Markdown | [Lineage diff](https://rocky-data.dev/reference/commands/modeling/#rocky-lineage-diff) |
-| Review before you write | `rocky plan promote <branch>` saves a branch's change for review. `rocky apply <plan-id>` runs it. A replication pipeline uses `rocky plan` the same way. | [Core pipeline](https://rocky-data.dev/reference/commands/core-pipeline/) |
+| Review before you write | `rocky plan promote <branch>` saves a branch's change for review. `rocky apply <plan-id>` runs it. A replication pipeline plans its run with `rocky plan`. | [Core pipeline](https://rocky-data.dev/reference/commands/core-pipeline/) |
 | Try a change safely | Named branches and `rocky replay` | [Branches](https://rocky-data.dev/reference/commands/core-pipeline/#rocky-branch) |
 | Load only new rows | `strategy = "incremental"` | [Incremental](https://rocky-data.dev/concepts/incremental/) |
 | Test data | Checks and declarative `[[tests]]` | [Checks and tests](https://rocky-data.dev/concepts/data-quality-checks/) |

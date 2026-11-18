@@ -7,7 +7,7 @@ sidebar:
 
 These commands cover a Rocky pipeline's whole life. You create the project, check the config, and see what the source holds. Then you plan the SQL, apply the plan, and read back what ran.
 
-The two commands to know first are `rocky plan` and `rocky apply`. `rocky plan` prints the SQL it generates and writes a plan file with an id. For a `run` plan that file holds the settings the run needs, not the SQL. `rocky apply` reads the file and recompiles the project to run it. [`rocky run`](#rocky-run) fuses both into one step for local work.
+The two commands to know first are a plan command and `rocky apply`. A replication pipeline plans with `rocky plan`; a transformation project plans a branch with `rocky plan promote`, shown below. `rocky plan` prints the SQL it generates and writes a plan file with an id. For a `run` plan that file holds the settings the run needs, not the SQL. `rocky apply` reads the file and recompiles the project to run it. [`rocky run`](#rocky-run) fuses both into one step for local work.
 
 `rocky plan` needs a replication pipeline. A transformation project reviews its changes through a branch:
 
@@ -18,7 +18,7 @@ rocky plan promote pr1          # writes a promote plan and prints its plan_id
 rocky apply <plan-id>           # copies the reviewed branch tables to production
 ```
 
-Add `--tests enforce` to the branch run to record each model's `[[tests]]`. [`rocky plan promote`](#the-failing-tests-gate) then refuses a branch with a recorded failing test.
+Add `--tests enforce` to the branch run to run each model's `[[tests]]` there. [`rocky plan promote`](#the-failing-tests-gate) then refuses a branch with a recorded failing test.
 
 ## Global Flags
 
