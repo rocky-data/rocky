@@ -1575,11 +1575,28 @@ pub(crate) fn compute_ci_diff_in(
     // Present-but-unloadable `rocky.toml` refuses (#1625): a cold map turns
     // real type diffs into `Unknown`-vs-`Unknown` noise, which is the opposite
     // of what this command is for.
-    let source_schemas = crate::source_schemas::load_project_source_schemas(
+    let mut source_schemas = crate::source_schemas::load_project_source_schemas(
         config_path,
         state_path,
         cache_ttl_override,
     )?;
+    // `rocky compile`'s default seed tier (#2663): the project's
+    // `data/seed.sql`, beside `rocky.toml`, fills every source the cache
+    // does not hold. Without it a playground-style project, whose sources are
+    // known only from the seed, diffs every source-derived column as
+    // `Unknown` although `rocky compile` types it. The seed comes from the
+    // working tree and feeds both compiles, as the cache does: a change to
+    // the seed alone shows no type change. `load_project_source_schemas`
+    // has already refused an unloadable config, so a failure here is absent.
+    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .ok()
+        .flatten();
+    let project_root = config_path.parent().unwrap_or_else(|| Path::new("."));
+    super::compile::fill_from_default_seed(
+        project_root,
+        project_config.as_ref(),
+        &mut source_schemas,
+    );
 
     // Both selection and the base compile read the same commit: the merge
     // base `base...HEAD` diffs against. Without one (shallow clone), both
@@ -4324,5 +4341,73 @@ mod tests {
             rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
             "the refusal must name the config file, got: {rendered}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2663: the diff types source-derived columns from the project's seed,
+    // as `rocky compile` does by default.
+    // -----------------------------------------------------------------------
+
+    /// A repo whose one model reads `raw.orders`, then a commit that adds
+    /// `amount` to it. Returns the type the diff reports for `amount`.
+    fn added_amount_type(seed: Option<&str>) -> Option<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                ("orders.sql", "SELECT id FROM raw.orders\n"),
+                ("orders.toml", &inferred_sidecar("main")),
+            ],
+        );
+        if let Some(seed) = seed {
+            fs::create_dir_all(dir.join("data")).unwrap();
+            fs::write(dir.join("data").join("seed.sql"), seed).unwrap();
+        }
+        fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT id, amount FROM raw.orders\n",
+        )
+        .unwrap();
+        run_git(dir, &["commit", "-q", "-am", "add amount"]);
+
+        let data = compute_in(dir, &models_dir);
+        let result = data
+            .results
+            .iter()
+            .find(|r| r.model_name == "orders")
+            .expect("orders must be in the diff");
+        let change = result
+            .column_changes
+            .iter()
+            .find(|c| c.column_name == "amount")
+            .expect("amount must be an added column");
+        assert_eq!(change.change_type, ColumnChangeType::Added);
+        change.new_type.clone()
+    }
+
+    const ORDERS_SEED: &str = "CREATE SCHEMA raw;\n\
+        CREATE TABLE raw.orders (id INTEGER NOT NULL, amount DECIMAL(10, 2));\n";
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_seed_types_the_columns_the_diff_reports() {
+        let new_type = added_amount_type(Some(ORDERS_SEED));
+        assert!(
+            new_type.as_deref().is_some_and(|t| t != "Unknown"),
+            "with data/seed.sql the diff must type `amount` as compile does, got {new_type:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_seed_the_diff_still_reports_unknown() {
+        let new_type = added_amount_type(None);
+        assert_eq!(new_type.as_deref(), Some("Unknown"));
+    }
+
+    #[test]
+    fn a_seed_that_does_not_run_leaves_the_diff_unknown_and_does_not_fail_it() {
+        let new_type = added_amount_type(Some("THIS IS NOT SQL;\n"));
+        assert_eq!(new_type.as_deref(), Some("Unknown"));
     }
 }
