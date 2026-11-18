@@ -269,7 +269,8 @@ pub const E064: &str = "E064";
 /// numbers of columns (#2661). SQL requires the same number in every branch,
 /// so it is checked whatever the warehouse. Emitted by
 /// `rocky compile` from [`crate::set_operation`] when both counts are known
-/// from the SQL, in a place DuckDB always binds; `BY NAME` is not checked.
+/// from the SQL, in a place on the bound list in [`crate::set_operation`],
+/// where tests show DuckDB binds the query; `BY NAME` is not checked.
 pub const E071: &str = "E071";
 /// The warning form of [`E071`], for a mismatch in a place the warehouse may
 /// skip: a CTE body, a named `WINDOW` or any place not on the bound list in

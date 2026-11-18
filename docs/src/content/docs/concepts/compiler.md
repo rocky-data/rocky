@@ -270,19 +270,23 @@ A branch is counted only when its select list states its width. A `*`, a
 `t.*`, or a call that returns several columns (`COLUMNS(...)`, `UNNEST`,
 `EXPLODE`) is not counted. `UNION BY NAME` is not checked.
 
-It is the error `E071` only where DuckDB always checks the query, even a
-subquery that never runs:
+It is the error `E071` only in places where tests show DuckDB checks the
+query, even a subquery that never runs:
 
-- the model's query and each branch of a set operation;
-- a derived table in `FROM` or a join, `LATERAL` included;
+- the model's query, the query in parentheses, and each branch of a set
+  operation;
+- a derived table in `FROM` or a join, `LATERAL` and parenthesised joins
+  included;
 - a subquery in the select list, `WHERE`, `HAVING` or a join's `ON` (an
-  inner, left, right or full join), unless it is inside a lambda.
+  inner, left, right or full join), unless it is inside a function call's
+  arguments or a lambda.
 
 These places nest: a subquery in the `WHERE` of a derived table counts.
 Anywhere else, the same finding is the warning `W071`. That covers a CTE
-body, a named `WINDOW`, `ORDER BY`, `GROUP BY`, `QUALIFY`, `LIMIT`, a table
-function's arguments and a lambda. A warehouse can skip a CTE nothing reads
-or a window nothing uses, so the model may still run.
+body, a named `WINDOW`, `ORDER BY`, `GROUP BY`, `QUALIFY`, `LIMIT`, any
+function call's arguments and a lambda. A warehouse can skip a CTE nothing
+reads or a window nothing uses, and a DuckDB macro drops an argument its body
+does not use, so the model may still run.
 
 Rocky does not check whether the column types match across branches.
 DuckDB accepts every type mix when it checks the query, though a mix can
@@ -658,7 +662,7 @@ span, and sometimes a suggested fix.
 | `E062` | A model with a contract repeats an output name the contract constrains (`[[columns]]`, `required` or `protected`). The contract checks one column of that name; the warehouse writes the other under another name. Alias the repeat. Names match as for `E061` |
 | `E063` | `[rules] no_extra_columns = true` and the model outputs a column the contract does not name in `[[columns]]`, `required` or `protected`, or Rocky cannot prove the column list (a `SELECT *`, an unaliased expression). Declare the column, drop it, or list the columns explicitly |
 | `E064` | A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no known source table, and is one or two edits from a model name (one edit for names under 5 characters). The message names the model. If it is a real warehouse table, qualify it with its schema (`main.stg_ordrs`) |
-| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, in a place DuckDB always checks. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
+| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, in a place tests show DuckDB checks. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |

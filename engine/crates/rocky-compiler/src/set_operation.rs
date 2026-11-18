@@ -99,7 +99,8 @@ impl Visitor for Places<'_> {
 /// - a branch of a set operation, or the body in parentheses;
 /// - a derived table in `FROM` or a join, `LATERAL` included;
 /// - a subquery in the select list, `WHERE`, `HAVING` or a join's `ON`,
-///   unless it sits inside a lambda.
+///   unless it sits inside a function call's arguments or a lambda
+///   ([`hides_binding`]).
 fn bound_subqueries(body: &SetExpr, out: &mut HashSet<*const Query>) {
     match body {
         SetExpr::Select(select) => {
@@ -163,13 +164,19 @@ fn on_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
     }
 }
 
-/// A lambda, which the parser reads as `Expr::Lambda` or, for `x -> body`,
-/// as an `->` operator. `->` is also DuckDB's JSON lookup; counting that as a
-/// lambda only turns an error into a warning.
-fn is_lambda(expr: &Expr) -> bool {
+/// An expression whose operands DuckDB may drop before binding them:
+/// - a function call, since a macro drops an argument its body does not use
+///   (`has_table_privilege` and the other built-in macros, and the macros
+///   Rocky makes from `functions/`), and a name alone does not say whether a
+///   call is a macro;
+/// - a lambda, which the parser reads as `Expr::Lambda` or, for
+///   `x -> body`, as an `->` operator. `->` is also DuckDB's JSON lookup;
+///   counting that here only turns an error into a warning.
+fn hides_binding(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::Lambda(_)
+        Expr::Function(_)
+            | Expr::Lambda(_)
             | Expr::BinaryOp {
                 op: sqlparser::ast::BinaryOperator::Arrow,
                 ..
@@ -178,7 +185,8 @@ fn is_lambda(expr: &Expr) -> bool {
 }
 
 /// Collects the outermost queries in an expression that are not inside a
-/// lambda. Fields: output, query depth, lambda depth.
+/// function call or a lambda ([`hides_binding`]). Fields: output, query
+/// depth, depth of such expressions.
 struct ExprSubqueries<'o>(&'o mut HashSet<*const Query>, usize, usize);
 
 impl Visitor for ExprSubqueries<'_> {
@@ -198,14 +206,14 @@ impl Visitor for ExprSubqueries<'_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
-        if is_lambda(expr) {
+        if hides_binding(expr) {
             self.2 += 1;
         }
         std::ops::ControlFlow::Continue(())
     }
 
     fn post_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
-        if is_lambda(expr) {
+        if hides_binding(expr) {
             self.2 -= 1;
         }
         std::ops::ControlFlow::Continue(())
@@ -459,10 +467,11 @@ mod tests {
             conn.prepare(&sql)
                 .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
         }
-        // An inline window is always used: still an error.
+        // An inline window belongs to a function call, whose arguments are
+        // not on the bound list: a warning too.
         assert_eq!(
             severities(&format!("SELECT sum(a) OVER (ORDER BY {bad}) FROM t")),
-            ["E071"]
+            ["W071"]
         );
     }
 
@@ -574,6 +583,30 @@ mod tests {
                     .is_some_and(|e| e.contains("same number of result columns")),
                 "DuckDB does not refuse {sql} for its column count: {err:?}"
             );
+        }
+    }
+
+    /// A DuckDB macro drops an argument its body does not use before
+    /// binding, so a subquery passed to any function call is `W071`
+    /// (round-10 red team, #2661). DuckDB runs every query here.
+    #[test]
+    fn a_function_argument_is_a_warning() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a INTEGER); CREATE TABLE u (a INTEGER, b INTEGER); \
+             CREATE MACRO pick(x, fallback) AS CAST((x) AS BIGINT);",
+        )
+        .unwrap();
+        let bad = "SELECT a FROM u UNION ALL SELECT a, b FROM u";
+        for sql in [
+            format!("SELECT has_table_privilege(({bad}), 'select')"),
+            format!("SELECT a FROM t WHERE has_column_privilege('t', ({bad}), 'select')"),
+            format!("SELECT * FROM (SELECT a, pg_table_is_visible(({bad})) v FROM t) d"),
+            format!("SELECT pick(a, ({bad})) FROM t"),
+        ] {
+            assert_eq!(severities(&sql), ["W071"], "{sql}");
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
         }
     }
 
