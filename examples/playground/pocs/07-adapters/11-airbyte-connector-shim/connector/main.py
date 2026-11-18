@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Connector shim: an Airbyte source image -> Parquet, state kept by Rocky.
+"""Connector shim: an Airbyte source -> Parquet, state kept by Rocky.
 
 `rocky load --connector <name>` starts this program once. It reads the request
-JSON from stdin, runs one Airbyte source image with docker, and
-writes the records of ONE stream to one Parquet file.
+JSON from stdin, runs one Airbyte source, and writes the records of ONE stream
+to one Parquet file. The source runs in one of two modes:
+
+  image     an Airbyte source image, with docker.
+  manifest  a declarative (YAML) source manifest, with airbyte-cdk's
+            `source-declarative-manifest` and no docker.
 
 The Airbyte protocol is MIT. Each source image has its own license, often
 Elastic License 2.0 (ELv2), which is not open source. `airbyte/source-faker`,
@@ -12,7 +16,8 @@ used by this POC, is ELv2. Check an image's `metadata.yaml` before you use it.
 Rocky ships no extractors and no catalog. This file only adapts the Airbyte
 protocol to the Rocky child connector protocol:
 
-  1. `spec`      logs the connector name and whether it supports incremental.
+  1. `spec`      logs whether the source supports incremental (image mode
+                 only: in manifest mode `spec` returns a generic spec).
   2. `discover`  lists the streams. The stream named in the options must be
                  one of them, or the run fails and lists the choices.
   3. The shim builds a configured catalog with that one stream:
@@ -25,7 +30,18 @@ protocol to the Rocky child connector protocol:
      ERROR, or a non-zero exit, fails the run and the state does not move.
 
 Options (`[connector.<name>.options]`, read from options.json):
-    image            Docker image with a pinned tag (required)
+    image            image mode: Docker image with a pinned tag
+    manifest         manifest mode: path of a declarative manifest YAML file,
+                     relative to this file. Set exactly one of image and
+                     manifest.
+    manifest_sha256  manifest mode, required: the SHA-256 of the manifest
+                     file, in hex. A file with another hash fails the run.
+                     The manifest decides which hosts receive the config,
+                     secrets included, so a manifest change must be a
+                     reviewed hash change.
+    cdk_bin          manifest mode, required: path of the
+                     `source-declarative-manifest` program of a pinned
+                     airbyte-cdk install, relative to this file. No arguments.
     stream           the one stream to load (required)
     config           table: the source's connection config (no secrets)
     config_env       table: config key -> NAME of an environment variable.
@@ -33,8 +49,8 @@ Options (`[connector.<name>.options]`, read from options.json):
                      Use it for tokens and passwords.
     namespace        optional; the stream's namespace, when two streams share a name
     sync_mode        "auto" (default) or "full_refresh"
-    docker_network   passed to `docker run --network`. Omit for docker's
-                     default. "none" cuts the container off (offline sources).
+    docker_network   image mode: passed to `docker run --network`. Omit for
+                     docker's default. "none" cuts the container off.
 
 State (schema version 1):
     {"state_type": "STREAM" | "GLOBAL" | "LEGACY", "message": <Airbyte state>}
@@ -43,10 +59,15 @@ State (schema version 1):
 the shape the source expects: a one-element list for STREAM and GLOBAL, the
 bare `data` object for LEGACY.
 
-The shim never pulls an image (`docker run --pull never`): pull it yourself.
-Python 3.8 or newer, standard library only, plus the docker and duckdb CLIs.
+The shim never pulls an image (`docker run --pull never`) and never downloads
+a manifest: fetch either yourself. It never passes `--components-path`, so a
+manifest that needs custom Python components fails; airbyte-cdk also treats
+the custom components of a caller-supplied manifest as untrusted.
+Python 3.8 or newer, standard library only, plus the duckdb CLI and either
+the docker CLI or an airbyte-cdk install (which needs Python 3.11 to 3.14).
 """
 
+import hashlib
 import json
 import os
 import re
@@ -62,8 +83,19 @@ RESULT_FILE = "_rocky_result.json"
 BATCH_FILE = "batch-0.parquet"
 MOUNT = "/rocky_airbyte"
 MAX_STATE_BYTES = 900 * 1024
+HERE = os.path.dirname(os.path.abspath(__file__))
+# The oldest airbyte-cdk this shim runs. In 7.48.0 a manifest the caller
+# supplies may not name any custom class (`class_name`) unless
+# AIRBYTE_ENABLE_UNSAFE_CODE is set. The shim relies on that, so it refuses
+# an older airbyte-cdk rather than guess what that version gates.
+MIN_CDK_VERSION = (7, 48, 0)
+# airbyte-cdk runs a manifest found here instead of --manifest-path, with its
+# custom components trusted.
+CDK_LOCAL_MANIFEST = "/airbyte/integration_code/source_declarative_manifest/manifest.yaml"
 # Names of the containers this run started. They are removed when the run ends.
 CONTAINERS = []
+# The airbyte-cdk processes running now. SIGTERM stops them.
+CHILDREN = []
 CONTAINER_PREFIX = "rocky-airbyte"
 
 
@@ -89,9 +121,13 @@ def load_options(request):
             options = json.load(handle)
     except (OSError, ValueError) as error:
         fail("cannot read %s: %s" % (path, error))
-    for key in ("image", "stream"):
-        if not isinstance(options.get(key), str) or not options[key]:
-            fail("[connector.<name>.options] needs a non-empty string %r" % key)
+    if not isinstance(options.get("stream"), str) or not options["stream"]:
+        fail("[connector.<name>.options] needs a non-empty string 'stream'")
+    if ("image" in options) == ("manifest" in options):
+        fail("set exactly one of options.image (docker) and options.manifest (airbyte-cdk)")
+    mode_key = "image" if "image" in options else "manifest"
+    if not isinstance(options[mode_key], str) or not options[mode_key]:
+        fail("options.%s must be a non-empty string" % mode_key)
     options.setdefault("config", {})
     options.setdefault("config_env", {})
     if not isinstance(options["config"], dict) or not isinstance(options["config_env"], dict):
@@ -99,9 +135,105 @@ def load_options(request):
     options.setdefault("sync_mode", "auto")
     if options["sync_mode"] not in ("auto", "full_refresh"):
         fail("sync_mode must be 'auto' or 'full_refresh'")
-    if ":" not in options["image"].rsplit("/", 1)[-1] and "@" not in options["image"]:
-        fail("pin the image tag or digest, for example 'airbyte/source-faker:6.2.21'")
+    if mode_key == "image":
+        if ":" not in options["image"].rsplit("/", 1)[-1] and "@" not in options["image"]:
+            fail("pin the image tag or digest, for example 'airbyte/source-faker:6.2.21'")
+        for key in ("manifest_sha256", "cdk_bin"):
+            if key in options:
+                fail("options.%s is for manifest mode; this connector sets options.image" % key)
+        return options
+    if "docker_network" in options:
+        fail("options.docker_network is for image mode; this connector sets options.manifest")
+    if "AIRBYTE_ENABLE_UNSAFE_CODE" in os.environ:
+        # airbyte-cdk runs a manifest's custom Python components when this is
+        # set. Rocky hands the shim only the variables under `secrets`.
+        fail("AIRBYTE_ENABLE_UNSAFE_CODE is set; the shim runs no custom connector code. "
+             "Remove it from secrets")
+    python_vars = sorted(k for k in os.environ if k.startswith("PYTHON"))
+    if python_vars:
+        # PYTHONPATH, PYTHONSTARTUP and the like make the airbyte-cdk
+        # interpreter load code the manifest hash does not cover.
+        fail("%s is set; the shim runs airbyte-cdk with no PYTHON* variable. "
+             "Remove it from secrets" % ", ".join(python_vars))
+    if os.path.exists(CDK_LOCAL_MANIFEST):
+        fail("%s exists, and airbyte-cdk would run it instead of the pinned manifest, "
+             "with custom components trusted" % CDK_LOCAL_MANIFEST)
+    digest = options.get("manifest_sha256")
+    if not isinstance(digest, str) or not re.match(r"^[0-9a-f]{64}$", digest):
+        fail("manifest mode needs options.manifest_sha256: the SHA-256 of the manifest, 64 lowercase hex")
+    for key in ("manifest", "cdk_bin"):
+        if not isinstance(options.get(key), str) or not options[key]:
+            fail("manifest mode needs a non-empty string options.%s" % key)
+        options[key] = os.path.join(HERE, options[key])
+        if not os.path.isfile(options[key]):
+            fail("options.%s %s is not a file" % (key, options[key]))
     return options
+
+
+def check_cdk_version(options):
+    """Fail unless cdk_bin belongs to airbyte-cdk MIN_CDK_VERSION or newer.
+
+    The interpreter asked is the one the script's `#!` line names. pip writes
+    a `#!/bin/sh` launcher when that path is long; then the `python` beside
+    the real (symlink-resolved) script is asked. `-I` keeps the current
+    directory off the import path, so a planted package cannot answer.
+    """
+    real = os.path.realpath(options["cdk_bin"])
+    try:
+        with open(real, "rb") as handle:
+            first = handle.readline().decode("utf-8", "replace").strip()
+    except OSError as error:
+        fail("cannot read %s: %s" % (options["cdk_bin"], error))
+    if not first.startswith("#!"):
+        fail("cdk_bin must be the source-declarative-manifest script of an airbyte-cdk install")
+    interpreter = first[2:].split()
+    if interpreter and os.path.basename(interpreter[0]) == "sh":
+        sibling = os.path.join(os.path.dirname(real), "python")
+        if not os.path.isfile(sibling):
+            fail("cannot find the interpreter of %s" % options["cdk_bin"])
+        interpreter = [sibling]
+    script = "import importlib.metadata as m; print(m.version('airbyte-cdk'))"
+    try:
+        done = subprocess.run(
+            interpreter + ["-I", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, check=False,
+        )
+    except OSError as error:
+        fail("cannot start the interpreter of %s: %s" % (options["cdk_bin"], error))
+    version = done.stdout.strip()
+    # A final release only: 7.48.0rc1 sorts before 7.48.0.
+    parts = re.match(r"^(\d+)\.(\d+)\.(\d+)$", version)
+    if done.returncode != 0 or not parts:
+        fail("cannot read a released airbyte-cdk version beside %s (got %r)"
+             % (options["cdk_bin"], version))
+    if tuple(int(p) for p in parts.groups()) < MIN_CDK_VERSION:
+        fail("airbyte-cdk %s is older than %s, the oldest this shim runs"
+             % (version, ".".join(str(p) for p in MIN_CDK_VERSION)))
+    log("airbyte-cdk %s" % version)
+
+
+def copy_manifest(options, work_dir):
+    """Copy the manifest into work_dir if its hash matches. Returns the copy.
+
+    airbyte-cdk reads the copy, so the bytes it runs are the bytes checked.
+    """
+    with open(options["manifest"], "rb") as handle:
+        data = handle.read()
+    found = hashlib.sha256(data).hexdigest()
+    if found != options["manifest_sha256"]:
+        fail(
+            "the manifest %s has SHA-256 %s, but options.manifest_sha256 is %s. "
+            "Review the manifest, then update the hash."
+            % (options["manifest"], found, options["manifest_sha256"])
+        )
+    # Not named manifest.yaml: airbyte-cdk must read it through
+    # --manifest-path, never by finding a file of that name.
+    path = os.path.join(work_dir, "pinned-manifest.yaml")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    log("manifest %s, SHA-256 checked" % os.path.basename(options["manifest"]))
+    return path
 
 
 def build_config(options):
@@ -153,6 +285,15 @@ def on_sigterm(signum, frame):
     # caught: after a SIGKILL the container (named rocky-<run>-<attempt>-<step>)
     # can outlive the run until it ends by itself.
     remove_containers()
+    for child in list(CHILDREN):
+        try:
+            child.terminate()
+            # Under Rocky's 5 s grace before its SIGKILL.
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+        except OSError:
+            pass
     sys.exit(128 + signum)
 
 
@@ -193,6 +334,58 @@ def docker_run(options, work_dir, args, step, capture_to=None):
         fail("the docker CLI is not on PATH")
 
 
+def cdk_run(options, work_dir, args, step, capture_to=None):
+    """Run airbyte-cdk with `args`. Returns (exit code, stdout lines or None).
+
+    The program runs in work_dir with the environment Rocky gave this shim.
+    """
+    command = [options["cdk_bin"]] + args + ["--manifest-path", options["manifest_copy"]]
+    out = open(capture_to, "w", encoding="utf-8") if capture_to else subprocess.PIPE
+    # Hold SIGTERM and SIGINT until the child is in CHILDREN, so the handler
+    # always sees it. The child inherits the mask, so it unblocks them first
+    # (preexec_fn is safe here: the shim runs no threads).
+    held = (signal.SIGTERM, signal.SIGINT)
+    signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    try:
+        child = subprocess.Popen(
+            command, stdout=out, stderr=subprocess.PIPE, cwd=work_dir,
+            universal_newlines=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, held),
+        )
+        CHILDREN.append(child)
+    except OSError as error:
+        start_error = error
+    else:
+        start_error = None
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+    if start_error is not None:
+        fail("cannot start %s: %s" % (options["cdk_bin"], start_error))
+    try:
+        stdout, stderr = child.communicate()
+    finally:
+        CHILDREN.remove(child)
+        if capture_to:
+            out.close()
+    for line in stderr.splitlines():
+        log("airbyte-cdk %s: %s" % (step, line))
+    return child.returncode, None if capture_to else stdout.splitlines()
+
+
+def run_step(options, work_dir, args, step, capture_to=None):
+    """Run one Airbyte command in the connector's mode."""
+    if "image" in options:
+        return docker_run(options, work_dir, args, step, capture_to)
+    return cdk_run(options, work_dir, args, step, capture_to)
+
+
+def inner(options, work_dir, name):
+    """The path of work_dir/name as the source sees it."""
+    if "image" in options:
+        return MOUNT + "/" + name
+    return os.path.join(work_dir, name)
+
+
 def messages(lines):
     for line in lines:
         line = line.strip()
@@ -217,6 +410,10 @@ def check_trace_errors(message):
 
 
 def run_spec(options, work_dir):
+    if "image" not in options:
+        # In manifest mode `spec` returns airbyte-cdk's generic spec, not the
+        # source's, so it says nothing about this source.
+        return None
     code, lines = docker_run(options, work_dir, ["spec"], "spec")
     if code != 0:
         fail("`spec` exited with code %d" % code)
@@ -230,7 +427,9 @@ def run_spec(options, work_dir):
 
 
 def run_discover(options, work_dir):
-    code, lines = docker_run(options, work_dir, ["discover", "--config", MOUNT + "/config.json"], "discover")
+    code, lines = run_step(
+        options, work_dir, ["discover", "--config", inner(options, work_dir, "config.json")], "discover"
+    )
     streams = None
     for message in messages(lines):
         check_trace_errors(message)
@@ -362,16 +561,23 @@ def main():
     signal.signal(signal.SIGINT, on_sigterm)
     try:
         write_private(os.path.join(work_dir, "config.json"), config)
+        if "manifest" in options:
+            check_cdk_version(options)
+            options["manifest_copy"] = copy_manifest(options, work_dir)
         run_spec(options, work_dir)
         streams = run_discover(options, work_dir)
         catalog, mode, namespace = configured_catalog(options, streams)
         write_private(os.path.join(work_dir, "catalog.json"), catalog)
 
-        args = ["read", "--config", MOUNT + "/config.json", "--catalog", MOUNT + "/catalog.json"]
+        args = [
+            "read",
+            "--config", inner(options, work_dir, "config.json"),
+            "--catalog", inner(options, work_dir, "catalog.json"),
+        ]
         if saved is not None and mode == "incremental":
             state_type, message = saved
             write_private(os.path.join(work_dir, "state.json"), state_file_value(state_type, message))
-            args += ["--state", MOUNT + "/state.json"]
+            args += ["--state", inner(options, work_dir, "state.json")]
             log("resuming from saved %s state" % state_type)
         elif saved is not None:
             log("full refresh: the saved state is carried but not passed to the source")
@@ -379,7 +585,7 @@ def main():
             log("no saved state; first run")
 
         raw_path = os.path.join(work_dir, "stdout.jsonl")
-        code, _ = docker_run(options, work_dir, args, "read", capture_to=raw_path)
+        code, _ = run_step(options, work_dir, args, "read", capture_to=raw_path)
 
         records_path = os.path.join(output_dir, "records.jsonl")
         records = 0
