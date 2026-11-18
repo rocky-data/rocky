@@ -286,12 +286,17 @@ These are not reported:
   when it reuses a built-in name. Rocky takes the names from the DuckDB that
   ran the seed and from a scan of the seed's text, so a seed that does not run
   still counts. `E057` skips these names too, but only on DuckDB: the seed
-  does not run on other warehouses.
+  does not run on other warehouses. A macro the seed brings in with `ATTACH`
+  or `IMPORT DATABASE` is found only when the seed runs.
 - A call with named arguments (`name := value` too), `*`, `DISTINCT`,
   `ORDER BY` inside the parentheses, a lambda, an argument that expands to
   several (`UNPACK(COLUMNS(...))`), `FILTER`, `WITHIN GROUP` or `OVER`.
 - A function such as `struct_pack`, which treats a `NULL` argument
   differently from a column.
+- A call in a dot-call chain, as in `upper(status).lower()`: the value
+  before the dot is the call's first argument.
+- A call in a CTE that nothing in the query reads, since DuckDB never binds
+  it.
 
 A DuckDB macro created outside the project that reuses a built-in name is a
 known false refusal: Rocky checks the call against the built-in. Call the
@@ -311,7 +316,8 @@ SELECT order_id, status FROM orders UNION ALL SELECT order_id FROM returns
 
 A branch is counted only when its select list states its width. A `*`, a
 `t.*`, or a call that returns several columns (`COLUMNS(...)`, `UNNEST`,
-`EXPLODE`) is not counted. `UNION BY NAME` is not checked. Rocky does not
+`EXPLODE`) is not counted. `UNION BY NAME` is not checked, and neither is a
+CTE that nothing in the query reads, since DuckDB never binds it. Rocky does not
 check whether the column types match across branches: DuckDB accepts every
 type mix, and the other warehouses are not checked yet.
 

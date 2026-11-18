@@ -6,13 +6,20 @@
 //! up on the model's columns, so the model compiled clean and failed at run
 //! time.
 //!
+//! A CTE nothing reads, directly or through another CTE, is not checked:
+//! DuckDB never binds it.
+//!
 //! A branch's width is counted only when the SQL states it: a `*`, a
 //! `t.*`, a multi-alias item, and a call that expands to several columns
 //! (`COLUMNS(...)`, `UNNEST`, `EXPLODE`, ...) make it unknown, and an
 //! unknown width is never a mismatch. `UNION BY NAME` matches columns by
 //! name, not position, and is not checked.
 
-use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, SetQuantifier, Statement, Visit, Visitor};
+use std::collections::{HashMap, HashSet};
+
+use sqlparser::ast::{
+    Expr, ObjectName, Query, SelectItem, SetExpr, SetQuantifier, Statement, Visit, Visitor,
+};
 use sqlparser::parser::Parser;
 
 use crate::diagnostic::{Diagnostic, E071};
@@ -28,6 +35,8 @@ pub fn check_set_operation_widths(model_name: &str, sql: &str) -> Vec<Diagnostic
     };
     let mut visitor = Queries {
         model_name,
+        unreferenced: unreferenced_cte_bodies(&statements),
+        skipping: 0,
         out: Vec::new(),
     };
     let _ = statements.visit(&mut visitor);
@@ -36,6 +45,10 @@ pub fn check_set_operation_widths(model_name: &str, sql: &str) -> Vec<Diagnostic
 
 struct Queries<'m> {
     model_name: &'m str,
+    /// The bodies of CTEs nothing reads ([`unreferenced_cte_bodies`]).
+    unreferenced: HashSet<*const Query>,
+    /// How many unreferenced CTE bodies the visitor is inside.
+    skipping: usize,
     out: Vec<Diagnostic>,
 }
 
@@ -43,9 +56,90 @@ impl Visitor for Queries<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        report(&query.body, self.model_name, &mut self.out);
+        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
+            self.skipping += 1;
+        }
+        if self.skipping == 0 {
+            report(&query.body, self.model_name, &mut self.out);
+        }
         std::ops::ControlFlow::Continue(())
     }
+
+    fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
+            self.skipping -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// The bodies of the CTEs in `statements` that nothing reads: no table
+/// reference in the query's body names them, directly or through another
+/// CTE it reads. DuckDB never binds such a CTE, so a check that reports
+/// what DuckDB refuses at bind time skips it.
+///
+/// A reference only from the query's `ORDER BY` or `LIMIT`, or one a nested
+/// `WITH` shadows, is not followed: the CTE is then taken as unread, which
+/// can only skip a check, never add a refusal.
+pub(crate) fn unreferenced_cte_bodies(statements: &[Statement]) -> HashSet<*const Query> {
+    struct Withs(HashSet<*const Query>);
+    impl Visitor for Withs {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+            let Some(with) = &query.with else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            let ctes: HashMap<String, (&Query, HashSet<String>)> = with
+                .cte_tables
+                .iter()
+                .map(|cte| {
+                    (
+                        cte.alias.name.value.to_lowercase(),
+                        (&*cte.query, relation_names(&*cte.query)),
+                    )
+                })
+                .collect();
+            let mut read: HashSet<String> = HashSet::new();
+            let mut pending: Vec<String> = relation_names(&*query.body).into_iter().collect();
+            while let Some(name) = pending.pop() {
+                if let Some((_, refs)) = ctes.get(&name)
+                    && read.insert(name)
+                {
+                    pending.extend(refs.iter().cloned());
+                }
+            }
+            for (name, (body, _)) in &ctes {
+                if !read.contains(name) {
+                    self.0.insert(std::ptr::from_ref(*body));
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let mut withs = Withs(HashSet::new());
+    for statement in statements {
+        let _ = statement.visit(&mut withs);
+    }
+    withs.0
+}
+
+/// The lower-case one-part table names `node` reads.
+fn relation_names<V: Visit + ?Sized>(node: &V) -> HashSet<String> {
+    struct Relations(HashSet<String>);
+    impl Visitor for Relations {
+        type Break = ();
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<()> {
+            if let [part] = relation.0.as_slice()
+                && let Some(ident) = part.as_ident()
+            {
+                self.0.insert(ident.value.to_lowercase());
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let mut relations = Relations(HashSet::new());
+    let _ = node.visit(&mut relations);
+    relations.0
 }
 
 /// Check the set operations of one query body. A parenthesised query inside
@@ -84,11 +178,14 @@ fn report(body: &SetExpr, model_name: &str, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Whether the set operation matches columns by name, not position. Every
+/// quantifier is named, so a new one fails to compile here rather than being
+/// checked as positional.
 fn by_name(quantifier: &SetQuantifier) -> bool {
-    matches!(
-        quantifier,
-        SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
-    )
+    match quantifier {
+        SetQuantifier::All | SetQuantifier::Distinct | SetQuantifier::None => false,
+        SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName => true,
+    }
 }
 
 /// The number of columns `body` returns, when the SQL states it.
@@ -236,6 +333,31 @@ mod tests {
         ] {
             assert_eq!(codes(sql), 0, "{sql}");
         }
+    }
+
+    /// A CTE nothing reads is never bound by DuckDB, so its mismatch is not
+    /// reported (red team, #2661). One the query reads still is.
+    #[test]
+    fn an_unreferenced_cte_is_not_checked() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE u (a INTEGER); CREATE TABLE v (a INTEGER, b INTEGER)")
+            .unwrap();
+        for sql in [
+            "with x as (select a from u union all select a, b from v) select a, b from v",
+            "with x as (select a from u union all select a, b from v), \
+             y as (select * from x) select a from u",
+        ] {
+            assert_eq!(codes(sql), 0, "{sql}");
+            conn.prepare(sql)
+                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
+        }
+        assert_eq!(
+            codes(
+                "with x as (select a from u union all select a, b from v), \
+                   y as (select * from x) select * from y"
+            ),
+            1
+        );
     }
 
     /// The bundled DuckDB refuses every mismatch this check reports.

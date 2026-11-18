@@ -293,16 +293,26 @@ pub fn check_unknown_functions(
 
 /// The lower-case names a seed file's text may create as functions or
 /// macros: every `CREATE [OR REPLACE] [TEMP | TEMPORARY] MACRO | FUNCTION
-/// [IF NOT EXISTS] [schema.]name`, case-insensitive.
+/// [IF NOT EXISTS] [schema.]name`, case-insensitive, with any whitespace or
+/// comments between the words and Unicode letters in names.
 ///
 /// Comments and string literals are not skipped. A name found inside one
 /// only turns a check off for that name, while a real one the scan dropped
 /// would be refused, so the scan errs toward finding more.
 pub fn seed_function_names_in_text(seed_sql: &str) -> HashSet<String> {
     static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r#"(?i)\bcreate\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:macro|function)\s+(?:if\s+not\s+exists\s+)?((?:(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)\s*\.\s*)*(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*))"#,
-        )
+        // Whitespace or a comment between two words.
+        let gap = r"(?:\s|--[^\n]*|/\*(?s:.*?)\*/)";
+        let name = r#"(?:"(?:[^"]|"")+"|[\p{L}_][\p{L}\p{N}_$]*)"#;
+        regex::Regex::new(&format!(
+            concat!(
+                r"(?i)\bcreate{gap}+(?:or{gap}+replace{gap}+)?(?:temp(?:orary)?{gap}+)?",
+                r"(?:macro|function){gap}+(?:if{gap}+not{gap}+exists{gap}+)?",
+                r"((?:{name}{gap}*\.{gap}*)*{name})",
+            ),
+            gap = gap,
+            name = name,
+        ))
         .expect("valid regex")
     });
     CREATE
@@ -316,7 +326,7 @@ pub fn seed_function_names_in_text(seed_sql: &str) -> HashSet<String> {
 /// and unquoted.
 fn last_name_part(qualified: &str) -> Option<String> {
     static LAST: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)(?:"((?:[^"]|"")+)"|([a-z_][a-z0-9_$]*))\s*$"#)
+        regex::Regex::new(r#"(?i)(?:"((?:[^"]|"")+)"|([\p{L}_][\p{L}\p{N}_$]*))\s*$"#)
             .expect("valid regex")
     });
     let captures = LAST.captures(qualified)?;
@@ -383,6 +393,9 @@ fn check_model(
     };
     let mut visitor = Calls {
         registry,
+        unreferenced: crate::set_operation::unreferenced_cte_bodies(&statements),
+        skipping: 0,
+        chained: HashSet::new(),
         found: Vec::new(),
     };
     let _ = statements.visit(&mut visitor);
@@ -533,6 +546,12 @@ fn suggestion(name: &str, dialect: FunctionDialect) -> String {
 
 struct Calls<'r> {
     registry: &'r FunctionRegistry,
+    /// The bodies of CTEs nothing reads.
+    unreferenced: HashSet<*const ast::Query>,
+    /// How many unreferenced CTE bodies the visitor is inside.
+    skipping: usize,
+    /// Calls that are a link of a dot-call chain (`(x).lower()`).
+    chained: HashSet<*const ast::Function>,
     /// Unqualified, unquoted calls the project does not declare:
     /// `(name as written, line, column, argument count)`. The count is
     /// `None` when the call's arguments are not a plain list
@@ -584,7 +603,31 @@ pub(crate) fn plain_argument_count(function: &ast::Function) -> Option<usize> {
 impl Visitor for Calls<'_> {
     type Break = ();
 
+    fn pre_visit_query(&mut self, query: &ast::Query) -> std::ops::ControlFlow<()> {
+        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
+            self.skipping += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &ast::Query) -> std::ops::ControlFlow<()> {
+        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
+            self.skipping -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+        // `x.lower()` with `x` not a bare name parses as a field access whose
+        // chain holds the call. Its receiver is the call's first argument,
+        // which the call's own list does not hold, so it is not counted.
+        if let Expr::CompoundFieldAccess { access_chain, .. } = expr {
+            for access in access_chain {
+                if let ast::AccessExpr::Dot(Expr::Function(function)) = access {
+                    self.chained.insert(std::ptr::from_ref(function));
+                }
+            }
+        }
         if let Expr::Function(function) = expr
             && let [ast::ObjectNamePart::Identifier(ident)] = function.name.0.as_slice()
             && ident.quote_style.is_none()
@@ -595,7 +638,12 @@ impl Visitor for Calls<'_> {
                 ident.value.clone(),
                 span.start.line as usize,
                 span.start.column as usize,
-                plain_argument_count(function),
+                // A call in a CTE nothing reads, which DuckDB never binds,
+                // or in a dot-call chain is not counted (E068), but is still
+                // a name E057 judges.
+                (self.skipping == 0 && !self.chained.contains(&std::ptr::from_ref(function)))
+                    .then(|| plain_argument_count(function))
+                    .flatten(),
             ));
         }
         std::ops::ControlFlow::Continue(())
@@ -693,6 +741,50 @@ mod tests {
     /// E068: a DuckDB built-in called with a number of arguments it does not
     /// take (#2659).
     #[test]
+    fn dot_call_chains_and_unreferenced_ctes_are_not_counted() {
+        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (status VARCHAR, amount DOUBLE, created_at TIMESTAMP, \
+             tags VARCHAR[], qty INTEGER)",
+        )
+        .unwrap();
+        // Red team, #2659: in a dot-call chain the receiver is the first
+        // argument, which the call's own list does not hold. A CTE nothing
+        // reads is never bound by DuckDB.
+        for sql in [
+            "select status.upper().lower() from t",
+            "select (status).lower() from t",
+            "select upper(status).lower() from t",
+            "select amount.round(1).abs() from t",
+            "select (amount + 1).round() from t",
+            "select created_at.strftime('%Y').upper() from t",
+            "select 'a,b'.split(',').len() from t",
+            "select (created_at).year() from t",
+            "select (status || 'x').md5() from t",
+            "select ('abc').upper() from t",
+            "select tags[1].upper() from t",
+            "with x as (select lower(status, 'x') as l from t) select qty from t",
+            "with x as (select lower(status, 'x') as l from t), \
+             y as (select l from x) select qty from t",
+        ] {
+            assert!(count_codes(sql, &duckdb).is_empty(), "{sql}");
+            conn.prepare(sql)
+                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
+        }
+        // A CTE the query reads, directly or through another, is still
+        // judged, and so is a call the chain only receives.
+        for sql in [
+            "with x as (select lower(status, 'x') as l from t) select l from x",
+            "with x as (select lower(status, 'x') as l from t), \
+             y as (select l from x) select l from y",
+            "select lower(status, 'x').upper() from t",
+        ] {
+            assert_eq!(count_codes(sql, &duckdb), ["E068"], "{sql}");
+        }
+    }
+
+    #[test]
     fn a_wrong_argument_count_is_refused_on_duckdb() {
         let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
         for sql in [
@@ -787,12 +879,27 @@ mod tests {
                     CREATE TEMPORARY FUNCTION util.\"Shout\"(s) AS upper(s);\n\
                     CREATE MACRO IF NOT EXISTS keep(x) AS x;\n\
                     CREATE FUNCTION \"we\"\"ird\"(x) AS x;\n\
-                    -- CREATE MACRO commented(x) AS x\n";
+                    -- CREATE MACRO commented(x) AS x\n\
+                    CREATE /* util */ MACRO round(a, b, c) AS a;\n\
+                    CREATE OR REPLACE -- note\n MACRO\n\tabs(a, b) AS a;\n\
+                    CREATE MACRO café(x) AS x;\n\
+                    CREATE MACRO s . \"Dotted.Name\" (x) AS x;\n";
         let mut names: Vec<String> = seed_function_names_in_text(seed).into_iter().collect();
         names.sort_unstable();
         assert_eq!(
             names,
-            ["commented", "keep", "lower", "my_macro", "shout", "we\"ird"]
+            [
+                "abs",
+                "café",
+                "commented",
+                "dotted.name",
+                "keep",
+                "lower",
+                "my_macro",
+                "round",
+                "shout",
+                "we\"ird"
+            ]
         );
     }
 
