@@ -308,6 +308,10 @@ export interface RunOutput {
   tables_failed: number;
   tables_skipped?: number;
   /**
+   * The `[[tests]]` this run evaluated after building models, one entry per test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run --tests`). Omitted when no test ran, so a default run is unchanged on the wire. The same list is persisted on the run record, where `rocky plan promote` reads it.
+   */
+  test_results?: RunTestResultOutput[];
+  /**
    * `true` when this run auto-applied additive schema drift whose post-apply `verify_after` gate did not confirm it.
    *
    * The gate runs after the run record exists, because it reads that record's check outcomes. It yields `Err` when a required check failed **or did not run at all** — a required check that is absent from `RunRecord::check_outcomes` fails it closed. There is no rollback substrate on a plain warehouse target, so the migration stands until a human reverts it.
@@ -1198,5 +1202,35 @@ export interface SourceVolumeCheckOutput {
    * `in_range`, `below_min`, `above_max`, or `not_evaluated`. At `error`, an out-of-range count and a count that could not be taken both refuse the output model; a cancelled run refuses nothing.
    */
   verdict: VolumeVerdict;
+  [k: string]: unknown;
+}
+/**
+ * One `[[tests]]` outcome on [`RunOutput::test_results`].
+ */
+export interface RunTestResultOutput {
+  /**
+   * The column the test checks, when it checks one.
+   */
+  column?: string | null;
+  /**
+   * What the test found, or why it could not run.
+   */
+  detail?: string | null;
+  /**
+   * The model the test belongs to.
+   */
+  model: string;
+  /**
+   * `error` or `warning`. Only `error` can fail a model.
+   */
+  severity: string;
+  /**
+   * `pass`, `fail`, or `error` (the test query could not run).
+   */
+  status: string;
+  /**
+   * The test type (`not_null`, `unique`, `accepted_values`, ...).
+   */
+  test_type: string;
   [k: string]: unknown;
 }

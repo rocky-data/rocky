@@ -784,6 +784,7 @@ mod tests {
             // independent fields (#2032).
             rocky_branch: Some("pr-preview-governance".to_string()),
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Branch {
                 name: "pr-preview-governance".to_string(),
             }),
@@ -926,6 +927,7 @@ mod tests {
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
