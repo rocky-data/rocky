@@ -407,6 +407,21 @@ pub fn generate_test_sql_with_dialect(
     generate_test_sql_inner(test, table, Some(dialect))
 }
 
+/// Like [`generate_test_sql_with_dialect`], for a table reference the dialect
+/// already rendered with [`crate::traits::SqlDialect::format_table_ref`].
+///
+/// That reference is quoted and validated as the warehouse writes it, so it
+/// is used verbatim and not split on `.`. Use this to test the exact table a
+/// run wrote: on a dialect that quotes (Snowflake), an unquoted
+/// `catalog.schema.table` names a different object.
+pub fn generate_test_sql_for_table_ref(
+    test: &TestDecl,
+    table_ref: &str,
+    dialect: &dyn crate::traits::SqlDialect,
+) -> Result<String, TestGenError> {
+    generate_test_sql_unchecked_table(test, table_ref, Some(dialect))
+}
+
 fn generate_test_sql_inner(
     test: &TestDecl,
     table: &str,
@@ -418,7 +433,16 @@ fn generate_test_sql_inner(
     for part in table.split('.') {
         validation::validate_identifier(part)?;
     }
+    generate_test_sql_unchecked_table(test, table, dialect)
+}
 
+/// The generator body. `table` is trusted: the caller validated it (see
+/// [`generate_test_sql_inner`]) or a dialect rendered it.
+fn generate_test_sql_unchecked_table(
+    test: &TestDecl,
+    table: &str,
+    dialect: Option<&dyn crate::traits::SqlDialect>,
+) -> Result<String, TestGenError> {
     // Optional per-check `filter` applies to every kind by prefixing the
     // row-level WHERE clause. Unique / Relationships / RowCountRange
     // weave it in differently (see each arm).
@@ -915,6 +939,33 @@ mod unit_tests {
     /// other test here does — cannot tell a correct call site from one that
     /// hardcoded generic. `a->'k'` separates them: generic parses it as an
     /// operator, snowflake parses `->` as the lambda arrow and refuses it.
+    /// A dialect-rendered table reference is used verbatim: a quoted
+    /// Snowflake ref and a hyphenated BigQuery project, both of which the
+    /// dotted path refuses or misreads.
+    #[test]
+    fn a_dialect_rendered_table_ref_is_used_verbatim() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("id".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        for table_ref in [
+            "\"warehouse\".\"marts\".\"orders\"",
+            "`my-project`.`marts`.`orders`",
+        ] {
+            let sql = generate_test_sql_for_table_ref(&decl, table_ref, &SnowflakeNamed)
+                .expect("a rendered ref is accepted");
+            assert!(
+                sql.contains(&format!("FROM {table_ref} WHERE")),
+                "{table_ref}: {sql}"
+            );
+        }
+        // The dotted path still validates each part.
+        generate_test_sql(&decl, "my-project.marts.orders")
+            .expect_err("an unquoted hyphenated part is refused");
+    }
+
     #[test]
     fn the_tests_rs_routes_thread_their_own_dialect() {
         // The checks `filter` route.

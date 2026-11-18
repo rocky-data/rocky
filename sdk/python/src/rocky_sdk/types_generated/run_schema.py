@@ -671,6 +671,37 @@ class RunStatus3(StrEnum):
     SkippedInFlight = "SkippedInFlight"
 
 
+class RunTestResultOutput(BaseModel):
+    """
+    One `[[tests]]` outcome on [`RunOutput::test_results`].
+    """
+
+    column: str | None = None
+    """
+    The column the test checks, when it checks one.
+    """
+    detail: str | None = None
+    """
+    What the test found, or why it could not run.
+    """
+    model: str
+    """
+    The model the test belongs to.
+    """
+    severity: str
+    """
+    `error` or `warning`. Only `error` can fail a model.
+    """
+    status: str
+    """
+    `pass`, `fail`, or `error` (the test query could not run).
+    """
+    test_type: str
+    """
+    The test type (`not_null`, `unique`, `accepted_values`, ...).
+    """
+
+
 class Severity(StrEnum):
     """
     Severity level of a diagnostic.
@@ -1675,6 +1706,10 @@ class RunOutput(BaseModel):
     Total number of failed tables/models for the run, **including** pre-execution compile failures: a model that fails to type-check is counted here even though it never reached the execution phase. This is the authoritative failure count — consumers should key overall pass/fail on the top-level `tables_failed` / `status` / `errors`, not on `execution.tables_failed`, which counts only execution-phase (copy / runtime) failures and excludes models excluded before execution.
     """
     tables_skipped: conint(ge=0) | None = None
+    test_results: list[RunTestResultOutput] | None = None
+    """
+    The `[[tests]]` this run evaluated after building models, one entry per test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run --tests`). Omitted when no test ran, so a default run is unchanged on the wire. The same list is persisted on the run record, where `rocky plan promote` reads it.
+    """
     verify_after_failed: bool | None = None
     """
     `true` when this run auto-applied additive schema drift whose post-apply `verify_after` gate did not confirm it.
