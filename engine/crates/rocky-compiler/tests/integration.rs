@@ -2090,6 +2090,14 @@ fn a_read_is_typed_from_what_it_reaches_at_run_time() {
         "",
     );
     write("reads_eph", "SELECT id FROM eph", "");
+    // A `WITH` name in another case still hides the table: unquoted names
+    // fold. The type checker's inference matches `WITH` names exactly, so it
+    // asks about `orders`; that read is the CTE, not the model.
+    write(
+        "cte_case",
+        "WITH Orders AS (SELECT CAST(1.5 AS DOUBLE) AS id) SELECT id FROM orders",
+        "depends_on = [\"orders\"]\n",
+    );
     let config = CompilerConfig {
         models_dir: models,
         source_schemas: HashMap::from([(
@@ -2169,11 +2177,13 @@ fn a_read_is_typed_from_what_it_reaches_at_run_time() {
     assert_eq!(id("derived").0, RockyType::Unknown);
     assert_eq!(id("reads_x").0, RockyType::Unknown, "no model writes `x`");
     // A CTE named `orders` hides both the model and the source table.
-    let cte = id("cte_shadow").0;
-    assert!(
-        cte != model_id.0 && cte != source_id.0,
-        "the CTE's column, not `orders`: {cte:?}"
-    );
+    for reader in ["cte_shadow", "cte_case"] {
+        let cte = id(reader).0;
+        assert!(
+            cte != model_id.0 && cte != source_id.0,
+            "{reader}: the CTE's column, not `orders`: {cte:?}"
+        );
+    }
     assert_eq!(id("reads_eph").0, RockyType::Date, "the inlined model");
 
     // The incremental path reaches the same answer: re-typechecking only the

@@ -98,15 +98,28 @@ pub struct ModelSchema {
     pub intent: Option<String>,
     /// What each bare table read in this model's SQL reaches when it runs
     /// (#2674), keyed by the read folded with
-    /// [`rocky_core::physical_edges::fold_identifier`]. The value is the
-    /// model the read binds to by the rule `resolve.rs` derives the DAG edge
-    /// with (#1354), when that edge survived; `None` when the read reaches
-    /// an external table (or is ambiguous, or its edge was dropped).
+    /// [`rocky_core::physical_edges::fold_identifier`], with the rule
+    /// `resolve.rs` derives the DAG edge with (#1354). A `WITH` name the
+    /// query reads is listed too, as [`ReadTarget::Local`], unless a table of
+    /// that name is also read.
     ///
     /// `None` for a schema built without the project's SQL, such as a
     /// hand-built graph: read it through [`Self::named_read`]. Not serialized.
     #[serde(skip)]
-    pub reads: Option<HashMap<String, Option<String>>>,
+    pub reads: Option<HashMap<String, ReadTarget>>,
+}
+
+/// What a bare name read in a model's SQL reaches when it runs (#2674).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadTarget {
+    /// The output of this model: the read binds to it and its DAG edge
+    /// survived (a binding that would close a cycle is dropped, `D013`).
+    Model(String),
+    /// A table no model of the project is bound to: external, ambiguous
+    /// (`E056`), or a binding whose edge was dropped.
+    Table,
+    /// A `WITH` name of the query, not a table.
+    Local,
 }
 
 /// What a read spelled with a model's exact name reaches, for the reader
@@ -118,6 +131,10 @@ pub enum NamedRead {
     /// The read reaches something else: a table of that name that no model
     /// writes, or another model's table.
     Elsewhere,
+    /// A `WITH` name of the reader's query. A walker that matches `WITH`
+    /// names in another case than lineage does can ask about one; it is not
+    /// a table, so its type is unknown.
+    Local,
     /// The reader's SQL has no bare read of that name the bindings list.
     /// Asking about it is a walker mismatch; the type is unknown.
     Unlisted,
@@ -167,8 +184,9 @@ impl ModelSchema {
             return NamedRead::NotComputed;
         };
         match reads.get(&rocky_core::physical_edges::fold_identifier(name)) {
-            Some(Some(model)) if model == name => NamedRead::ThatModel,
-            Some(_) => NamedRead::Elsewhere,
+            Some(ReadTarget::Model(model)) if model == name => NamedRead::ThatModel,
+            Some(ReadTarget::Model(_) | ReadTarget::Table) => NamedRead::Elsewhere,
+            Some(ReadTarget::Local) => NamedRead::Local,
             None => NamedRead::Unlisted,
         }
     }
@@ -476,7 +494,7 @@ pub fn build_semantic_graph(
             .get(model_name.as_str())
             .copied()
             .unwrap_or_default();
-        let reads: HashMap<String, Option<String>> = lineage_result
+        let mut reads: HashMap<String, ReadTarget> = lineage_result
             .source_tables
             .iter()
             .filter(|t| t.binding == lineage::TableBinding::Physical)
@@ -484,20 +502,30 @@ pub fn build_semantic_graph(
             .chain(lineage_result.nested_sources.iter())
             .filter(|name| !name.contains('.'))
             .map(|name| {
-                let bound = match bare_reads.bind(name, model) {
-                    crate::resolve::BareBinding::Model(m) => {
-                        reader_upstream.contains(&m).then_some(m)
+                let target = match bare_reads.bind(name, model) {
+                    crate::resolve::BareBinding::Model(m) if reader_upstream.contains(&m) => {
+                        ReadTarget::Model(m)
                     }
-                    crate::resolve::BareBinding::External
-                    | crate::resolve::BareBinding::Ambiguous(_) => None,
+                    crate::resolve::BareBinding::Model(_)
+                    | crate::resolve::BareBinding::External
+                    | crate::resolve::BareBinding::Ambiguous(_) => ReadTarget::Table,
                 };
-                (rocky_core::physical_edges::fold_identifier(name), bound)
+                (rocky_core::physical_edges::fold_identifier(name), target)
             })
             .collect();
+        for cte in lineage_result
+            .source_tables
+            .iter()
+            .filter(|t| t.binding == lineage::TableBinding::Cte)
+        {
+            reads
+                .entry(rocky_core::physical_edges::fold_identifier(&cte.name))
+                .or_insert(ReadTarget::Local);
+        }
         // Whether this model's star over `name` reads the model of that name.
         let star_reads_model = |name: &str| {
             reads.get(&rocky_core::physical_edges::fold_identifier(name))
-                == Some(&Some(name.to_string()))
+                == Some(&ReadTarget::Model(name.to_string()))
         };
 
         // Build table alias → resolved name map for this model's SQL

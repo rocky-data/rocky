@@ -153,6 +153,7 @@ impl<'a> Relations<'a> {
         match reader_schema.map_or(NamedRead::NotComputed, |s| s.named_read(read)) {
             NamedRead::ThatModel | NamedRead::NotComputed => Reach::Typed(read.to_string()),
             NamedRead::Elsewhere => Reach::Shadowed,
+            NamedRead::Local => Reach::Unknown,
             NamedRead::Unlisted => {
                 debug_assert!(
                     false,
