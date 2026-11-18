@@ -484,8 +484,14 @@ jobs:
         timeout-minutes: 10
         env:
           REQUIRE_DLT: "1"
+        # requirements.lock is compiled for Python 3.12 on Linux x86_64.
+        # Known risk: when ubuntu-latest moves to an image with another Python,
+        # the version check below fails every week until the lock is
+        # recompiled for that Python. That is the intended failure. There is no
+        # setup-python step: a new action pin needs the allow-list first.
         run: |
           set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), "requirements.lock is for Python 3.12, not " + sys.version'
           rm -rf .venv
           python3 -m venv .venv
           .venv/bin/python -m pip install --quiet --require-hashes --no-deps -r requirements.lock
