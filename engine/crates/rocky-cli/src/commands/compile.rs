@@ -2797,7 +2797,10 @@ schema_template = "s"
              CREATE TABLE raw.customers (id BIGINT);\n",
         );
         let mut seeded = HashMap::new();
-        let mut keys = fill_from_default_seed(dir.path(), None, &mut seeded);
+        let mut keys: Vec<String> = fill_from_default_seed(dir.path(), None, &mut seeded)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
         keys.sort();
         assert_eq!(keys.len(), 2, "the seed must add both tables, got {keys:?}");
         let orders_key = keys
@@ -2812,7 +2815,10 @@ schema_template = "s"
             nullable: true,
         }];
         let mut schemas = HashMap::from([(orders_key.clone(), cached.clone())]);
-        let added = fill_from_default_seed(dir.path(), None, &mut schemas);
+        let added: Vec<String> = fill_from_default_seed(dir.path(), None, &mut schemas)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
         assert_eq!(
             added.len(),
             1,
