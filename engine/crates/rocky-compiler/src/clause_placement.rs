@@ -30,8 +30,12 @@
 //! - A `GROUP BY` position is checked only at the top level of the clause,
 //!   not inside `ROLLUP`, `CUBE` or `GROUPING SETS`. It must be a plain
 //!   integer, and the select list must have a known length: no `*`, no
-//!   `t.*`, no `expr AS (a, b)`, no DuckDB `COLUMNS(...)`. `GROUP BY ALL` is
-//!   not checked.
+//!   `t.*`, no `expr AS (a, b)`, and no call, at any depth, to a function
+//!   that can output several columns (DuckDB `COLUMNS` and `UNNEST`, the
+//!   Spark generators `EXPLODE`, `POSEXPLODE`, `INLINE`, `STACK`,
+//!   `JSON_TUPLE`). `GROUP BY ALL` is not checked.
+//! - ClickHouse with `enable_positional_arguments = 0` also reads a position
+//!   as a constant. It is on by default; Rocky does not model it.
 //! - Spark's `spark.sql.groupByOrdinal = false` reads `GROUP BY 3` as the
 //!   constant 3. It is `true` by default, and Rocky does not model it.
 
@@ -208,9 +212,9 @@ fn projection_width(select: &Select) -> Option<usize> {
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                if let Expr::Function(function) = expr
-                    && function_name(function).as_deref() == Some("COLUMNS")
-                {
+                if contains_call(expr, |function| {
+                    function_name(function).is_some_and(|name| expands_to_columns(&name))
+                }) {
                     return None;
                 }
             }
@@ -220,6 +224,25 @@ fn projection_width(select: &Select) -> Option<usize> {
         }
     }
     Some(select.projection.len())
+}
+
+/// A function that can turn one select item into several output columns:
+/// DuckDB `COLUMNS(...)` and `UNNEST` of a struct, and the Spark generators.
+/// Matched at any depth (`COLUMNS('a.*')::INT` expands too).
+fn expands_to_columns(name: &str) -> bool {
+    matches!(
+        name,
+        "COLUMNS"
+            | "UNNEST"
+            | "EXPLODE"
+            | "EXPLODE_OUTER"
+            | "POSEXPLODE"
+            | "POSEXPLODE_OUTER"
+            | "INLINE"
+            | "INLINE_OUTER"
+            | "STACK"
+            | "JSON_TUPLE"
+    )
 }
 
 fn function_name(function: &ast::Function) -> Option<String> {
@@ -363,6 +386,45 @@ mod tests {
             codes("select k from t where my_agg(x) filter (where x > 0) > 1 group by k"),
             ["E065"]
         );
+    }
+
+    #[test]
+    fn more_aggregate_shapes_and_scopes() {
+        for sql in [
+            "select k from t where avg(x) > 1 group by k",
+            "select k from t where min(x) > 1 group by k",
+            "select k from t where percentile_cont(0.5) within group (order by x) > 1 group by k",
+        ] {
+            assert_eq!(codes(sql), ["E065"], "{sql}");
+        }
+        for sql in [
+            // A LATERAL table and a join condition may read outer columns.
+            "select t.k from t, lateral (select 1 as one from u where sum(t.x) > 0) l",
+            "select t.k from t join u on u.k = (select 1 from v where count(t.x) > 0)",
+        ] {
+            assert_eq!(codes(sql), Vec::<String>::new(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_position_is_checked_in_every_scope() {
+        for sql in [
+            "with c as (select a from t group by 2) select a from c",
+            "select a from (select a from t group by 2) d",
+            "select a from t union all select a from u group by 2",
+        ] {
+            assert_eq!(codes(sql), ["E067"], "{sql}");
+        }
+        for sql in [
+            // A select list whose width Rocky cannot read.
+            "select x as (a, b) from t group by 2",
+            "select unnest(s) from t group by 2",
+            "select columns('a.*')::int from t group by 2",
+            "select posexplode(arr) from t group by 2",
+            "select stack(2, a, b, c, d) from t group by 2",
+        ] {
+            assert_eq!(codes(sql), Vec::<String>::new(), "{sql}");
+        }
     }
 
     #[test]
