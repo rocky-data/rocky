@@ -9,11 +9,14 @@
 //!   a temporary landing directory, with no secrets;
 //! - feeds each run the state the run before it returned;
 //! - checks the row count, the declared state check, and that every Parquet
-//!   file of every run has the same schema.
+//!   file of every run has the same column names and types (the Arrow types
+//!   Parquet's logical types map to, so `BIGINT` and `TIMESTAMP` differ).
 //!
 //! It takes no claim, opens no state store and loads nothing into the
-//! warehouse. Rocky does not block the network: a connector that ignores its
-//! replay option fails because it gets no secrets, not because it is cut off.
+//! warehouse. The child gets no secrets, but Rocky does not block the
+//! network: a connector that ignores its replay option and can reach its
+//! source without credentials runs against live data, and nothing here can
+//! tell.
 
 use std::path::{Path, PathBuf};
 
@@ -89,7 +92,14 @@ fn stale_helper_warning(manifest_dir: &Path) -> Option<String> {
     let path = manifest_dir.join(HELPER_FILE_NAME);
     let copy = std::fs::read_to_string(&path).ok()?;
     let shipped = helper_version(HELPER_PY)?;
-    let found = helper_version(&copy)?;
+    let Some(found) = helper_version(&copy) else {
+        return Some(format!(
+            "{} declares no HELPER_VERSION, so it may be older than the helper this \
+             Rocky ships (version {shipped}); copy the new one from a fresh \
+             `rocky connector init`",
+            path.display()
+        ));
+    };
     (found < shipped).then(|| {
         format!(
             "{} is helper version {found}, but this Rocky ships version {shipped}; \
@@ -233,24 +243,28 @@ async fn run_one(
     for file in &batch.files {
         match first_file {
             None => *first_file = Some(file.path.clone()),
-            Some(first) => same_parquet_schema(first, &file.path).with_context(|| {
-                format!(
-                    "{} does not have the schema of the first file",
-                    file.relative
-                )
-            })?,
+            Some(first) => same_parquet_schema(first, &file.path)
+                .and_then(|()| same_arrow_schema(first, &file.path))
+                .with_context(|| {
+                    format!(
+                        "{} does not have the schema of the first file",
+                        file.relative
+                    )
+                })?,
         }
     }
-    let given = state.map(|s| &s.value);
+    // No state (the first run) counts as a JSON null: a connector that
+    // returns null has not advanced, and one that keeps null is unchanged.
+    let null = serde_json::Value::Null;
+    let given = state.map_or(&null, |s| &s.value);
     match run.state {
-        Some(ConnectorTestStateCheck::Unchanged) if given != Some(&batch.state.value) => {
+        Some(ConnectorTestStateCheck::Unchanged) if given != &batch.state.value => {
             bail!(
-                "the spec expects the state unchanged, but the run returned {} for {}",
+                "the spec expects the state unchanged, but the run returned {} for {given}",
                 batch.state.value,
-                given.map_or_else(|| "no state".to_string(), ToString::to_string)
             );
         }
-        Some(ConnectorTestStateCheck::Advanced) if given == Some(&batch.state.value) => {
+        Some(ConnectorTestStateCheck::Advanced) if given == &batch.state.value => {
             bail!(
                 "the spec expects the state to advance, but the run returned it unchanged ({})",
                 batch.state.value
@@ -259,6 +273,27 @@ async fn run_one(
         _ => {}
     }
     Ok(batch.state)
+}
+
+/// The column names and Arrow types of two Parquet files match. The Arrow
+/// type carries the Parquet logical type, which the physical type does not:
+/// `TIMESTAMP` and `BIGINT` are both INT64. Nullability is not compared.
+fn same_arrow_schema(first: &Path, other: &Path) -> Result<()> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let columns = |path: &Path| -> Result<Vec<(String, String)>> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+        Ok(builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().to_string()))
+            .collect())
+    };
+    let (a, b) = (columns(first)?, columns(other)?);
+    if a != b {
+        bail!("expected {a:?}, found {b:?}");
+    }
+    Ok(())
 }
 
 fn print_text(output: &ConnectorTestOutput) {
@@ -272,14 +307,21 @@ fn print_text(output: &ConnectorTestOutput) {
             Some(e) => println!("run {}: FAILED: {e}", run.run),
         }
     }
-    let verdict = if output.passed { "passed" } else { "FAILED" };
-    println!(
-        "Connector `{}` {verdict} {} of {} run(s) in {}",
-        output.connector,
-        output.runs.iter().filter(|r| r.passed).count(),
-        output.runs.len().max(1),
-        output.spec
-    );
+    if output.passed {
+        println!(
+            "Connector `{}` passed all {} run(s) in {}",
+            output.connector,
+            output.runs.len(),
+            output.spec
+        );
+    } else {
+        println!(
+            "Connector `{}` FAILED at run {} in {}; later runs did not start",
+            output.connector,
+            output.runs.len(),
+            output.spec
+        );
+    }
 }
 
 /// `rocky connector test <name>`. Exits non-zero when a check fails.
@@ -356,6 +398,16 @@ mod tests {
     }
 
     #[test]
+    fn a_run_table_option_replaces_the_config_table_whole() {
+        let base: ConnectorOptions = toml::from_str("nested = { a = 1, b = 2 }\n").unwrap();
+        let run: ConnectorTestRun =
+            toml::from_str("rows = 0\noptions = { nested = { a = 9 } }\n").unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_slice(&merged_options(&base, &run).unwrap()).unwrap();
+        assert_eq!(merged, serde_json::json!({"nested": {"a": 9}}));
+    }
+
+    #[test]
     fn an_older_helper_copy_is_reported_and_a_current_one_is_not() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(stale_helper_warning(dir.path()), None);
@@ -368,5 +420,9 @@ mod tests {
         std::fs::write(dir.path().join(HELPER_FILE_NAME), old).unwrap();
         let warning = stale_helper_warning(dir.path()).unwrap();
         assert!(warning.contains("helper version 0"), "{warning}");
+        let unversioned = HELPER_PY.replace("HELPER_VERSION = ", "VERSION = ");
+        std::fs::write(dir.path().join(HELPER_FILE_NAME), unversioned).unwrap();
+        let warning = stale_helper_warning(dir.path()).unwrap();
+        assert!(warning.contains("declares no HELPER_VERSION"), "{warning}");
     }
 }

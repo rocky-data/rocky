@@ -49,7 +49,7 @@ It creates `connectors/orders/` with a manifest, a `main.py` program and the `ro
 
 ## Test a connector
 
-`rocky connector test <name>` runs the connector once per `[[run]]` in `connector-test.toml`, beside the manifest. Each run sets options that point the connector at recorded input, and says how many rows it must write. Each run gets the state the run before it returned. Rocky checks the rows, the state (when the run declares `state = "advanced"` or `"unchanged"`) and that every Parquet file has one schema. It loads nothing, saves no state and passes no secrets. See [`rocky connector test`](/reference/commands/development/#rocky-connector-test).
+`rocky connector test <name>` runs the connector once per `[[run]]` in `connector-test.toml`, beside the manifest. Each run sets options that point the connector at recorded input, and says how many rows it must write. Each run gets the state the run before it returned. Rocky checks the rows, the state (when the run declares `state = "advanced"` or `"unchanged"`) and that every Parquet file has the same column names and types. It loads nothing, saves no state and passes no secrets. It does not block the network, so it cannot prove a run used its recorded input. See [`rocky connector test`](/reference/commands/development/#rocky-connector-test).
 
 The spec lives in its own file because test fixtures do not belong in the manifest a connector ships.
 

@@ -667,11 +667,11 @@ rocky connector test <name> [--spec <path>]
 | `name` | `string` | **(required)** | The `[connector.<name>]` key in `rocky.toml`. |
 | `--spec` | `path` | `connector-test.toml` beside the manifest | The test spec. |
 
-The spec lists one `[[run]]` per run. Unknown keys are refused.
+The spec lists one `[[run]]` per run. Unknown keys are refused. Each key in a run's `options` replaces the key of the same name in `[connector.<name>.options]`. A table replaces the whole table: it is not merged key by key.
 
 ```toml
 [[run]]
-options = { replay_fixture = "replay/events-1.sql" }  # merged over [connector.<name>.options]
+options = { replay_fixture = "replay/events-1.sql" }  # set over [connector.<name>.options]
 rows    = 19                                           # rows the run must write
 state   = "advanced"                                   # optional: "advanced" or "unchanged"
 ```
@@ -680,12 +680,12 @@ Each run starts the program through the same runner and checks as `rocky load --
 
 - the result file and every Parquet file pass the load checks;
 - the run writes exactly `rows` rows;
-- the state the run returns is `unchanged` or `advanced` from the state it was given, when `state` is set (a cursor can move on a run with no rows, so there is no default);
-- every Parquet file of every run has the same columns and types.
+- the state the run returns is `unchanged` or `advanced` from the state it was given, when `state` is set (a cursor can move on a run with no rows, so there is no default). The first run is given no state, which counts as `null`: returning `null` there is `unchanged`, not `advanced`;
+- every Parquet file of every run has the same column names and types. Types are compared as Parquet logical types, so `BIGINT` and `TIMESTAMP` differ. Nullability is not compared.
 
 Each run gets the state the run before it returned. The first failed run stops the test. The command exits non-zero when any check fails.
 
-The program gets no secrets. A connector reads its recorded input through an option, such as `replay_fixture` for the [reference Postgres connector](/guides/child-connectors/#reference-connector). A run that calls its live source without credentials fails. Rocky does not block the network.
+The program gets no secrets. A connector reads its recorded input through an option, such as `replay_fixture` for the [reference Postgres connector](/guides/child-connectors/#reference-connector). Rocky does not block the network, and it cannot tell a replay from a live run. A connector that ignores its replay option and can reach its source without credentials, such as a public API, runs against live data and can still pass. Make the replay option fail the run when its input is missing, as `replay_fixture` does.
 
 The command warns when the connector directory holds a `rocky_connector.py` older than the one this Rocky ships.
 

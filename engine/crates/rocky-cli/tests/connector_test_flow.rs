@@ -11,11 +11,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use rocky_cli::commands::execute_connector_test;
+use rocky_cli::commands::{execute_connector_test, run_connector_test};
 use rocky_cli::output::ConnectorTestOutput;
 
 const CHILD: &str = r#"#!/usr/bin/env python3
@@ -62,8 +62,37 @@ fn names(path: &Path) {
     w.close().unwrap();
 }
 
+/// INT64 like `ids`, but a TIMESTAMP: the same physical type, another
+/// logical type.
+fn stamps(path: &Path, rows: i64) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(TimestampMicrosecondArray::from_iter_values(
+            0..rows,
+        ))],
+    )
+    .unwrap();
+    let mut w = ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+}
+
 /// A project with connector `demo` and the given spec; returns the output.
 async fn run(spec: &str) -> anyhow::Result<ConnectorTestOutput> {
+    run_with(spec, false).await.map(|(out, _)| out)
+}
+
+/// `run`, and with `exit` also the result of `run_connector_test`, the
+/// function the binary calls, whose error is the non-zero exit.
+async fn run_with(
+    spec: &str,
+    exit: bool,
+) -> anyhow::Result<(ConnectorTestOutput, Option<anyhow::Result<()>>)> {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("conn");
     std::fs::create_dir(&dir).unwrap();
@@ -72,6 +101,7 @@ async fn run(spec: &str) -> anyhow::Result<ConnectorTestOutput> {
     ids(&dir.join("three.parquet"), 3);
     ids(&dir.join("two.parquet"), 2);
     names(&dir.join("text.parquet"));
+    stamps(&dir.join("stamps.parquet"), 2);
     std::fs::write(
         dir.join("connector.toml"),
         "protocol_version = 0\nname = \"demo\"\ncommand = [\"./child.py\"]\n\
@@ -91,6 +121,11 @@ async fn run(spec: &str) -> anyhow::Result<ConnectorTestOutput> {
     .unwrap();
     let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config).unwrap();
     let out = execute_connector_test(&config, &loaded, "demo", None).await;
+    let exited = if exit {
+        Some(run_connector_test(&config, &loaded, "demo", None, true).await)
+    } else {
+        None
+    };
     // Nothing is written beside rocky.toml: no landing, no state, no database.
     let mut left: Vec<String> = std::fs::read_dir(root.path())
         .unwrap()
@@ -99,7 +134,7 @@ async fn run(spec: &str) -> anyhow::Result<ConnectorTestOutput> {
         .collect();
     left.sort();
     assert_eq!(left, vec!["conn", "rocky.toml"]);
-    out
+    out.map(|o| (o, exited))
 }
 
 fn error_of(out: &ConnectorTestOutput) -> String {
@@ -233,4 +268,54 @@ async fn config_options_reach_the_child_under_the_run_options() {
 async fn an_unknown_key_in_the_spec_is_an_error() {
     let err = run("[[run]]\nrows = 0\nrow = 1\n").await.unwrap_err();
     assert!(format!("{err:#}").contains("unknown field"), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_logical_type_change_with_the_same_physical_type_fails_the_run() {
+    // BIGINT and TIMESTAMP are both INT64 in Parquet.
+    let spec = GOOD.replace("file = \"two.parquet\"", "file = \"stamps.parquet\"");
+    let out = run(&spec).await.unwrap();
+    assert!(!out.passed);
+    assert!(
+        error_of(&out).contains("does not have the schema of the first file"),
+        "{}",
+        error_of(&out)
+    );
+}
+
+#[tokio::test]
+async fn a_null_state_on_the_first_run_has_not_advanced() {
+    let out = run("[[run]]\noptions = { state = \"echo\" }\nrows = 0\nstate = \"advanced\"\n")
+        .await
+        .unwrap();
+    assert!(!out.passed);
+    assert!(
+        error_of(&out).contains("expects the state to advance"),
+        "{}",
+        error_of(&out)
+    );
+}
+
+#[tokio::test]
+async fn a_null_state_on_the_first_run_is_unchanged() {
+    let out = run("[[run]]\noptions = { state = \"echo\" }\nrows = 0\nstate = \"unchanged\"\n")
+        .await
+        .unwrap();
+    assert!(out.passed, "{out:?}");
+}
+
+#[tokio::test]
+async fn a_failed_check_is_an_error_from_the_command_and_a_pass_is_not() {
+    let (out, exited) = run_with(
+        "[[run]]\noptions = { file = \"three.parquet\", rows = 3 }\nrows = 4\n",
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(!out.passed);
+    let err = exited.unwrap().unwrap_err();
+    assert!(format!("{err:#}").contains("failed its test"), "{err:#}");
+    let (out, exited) = run_with(GOOD, true).await.unwrap();
+    assert!(out.passed);
+    exited.unwrap().unwrap();
 }

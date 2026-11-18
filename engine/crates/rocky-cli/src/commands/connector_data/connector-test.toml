@@ -1,10 +1,12 @@
 # Read only by `rocky connector test __NAME__`. Each [[run]] runs the
-# connector once, with these options merged over [connector.__NAME__.options]
-# in rocky.toml, and gives it the state the run before it returned.
+# connector once, with these options set over [connector.__NAME__.options]
+# in rocky.toml (a table replaces the whole table), and gives it the state the
+# run before it returned.
 #
 # The scaffold's example source has `example_rows` rows. Point the options at
-# recorded input when you replace fetch(): `rocky connector test` passes no
-# secrets, so a run that calls the live source fails.
+# recorded input when you replace fetch(). `rocky connector test` passes no
+# secrets but does not block the network, so make the replay option fail the
+# run when its input is missing, or a run can pass against the live source.
 
 [[run]]
 options = { example_rows = 3 }
