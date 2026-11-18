@@ -3634,7 +3634,9 @@ fn has_plain_group_by(select: &ast::Select) -> bool {
 }
 
 /// Whether a `GROUP BY` key is one Rocky recognises as a single key: a
-/// column, a position, a literal, a cast, an operator or a call that is not
+/// column, a position, a literal, a cast, an operator, a `CASE`, one of the
+/// functions sqlparser gives its own shape (`EXTRACT`, `FLOOR`, `CEIL`,
+/// `SUBSTRING`, `TRIM`, `POSITION`), `IS [NOT] NULL`, or a call that is not
 /// `ROLLUP` / `CUBE` / `GROUPING SETS`. A parenthesised `(ROLLUP(n))` parses
 /// as a call named `ROLLUP`, not as [`Expr::Rollup`] (#2566), so a call is
 /// checked by name. Any other shape (a tuple, which may be the empty set, a
@@ -3647,7 +3649,16 @@ fn is_plain_grouping_key(key: &Expr) -> bool {
         | Expr::Value(_)
         | Expr::Cast { .. }
         | Expr::BinaryOp { .. }
-        | Expr::UnaryOp { .. } => true,
+        | Expr::UnaryOp { .. }
+        | Expr::Case { .. }
+        | Expr::Extract { .. }
+        | Expr::Floor { .. }
+        | Expr::Ceil { .. }
+        | Expr::Substring { .. }
+        | Expr::Trim { .. }
+        | Expr::Position { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_) => true,
         Expr::Function(_) => !is_grouping_construct_call(key),
         _ => false,
     }
@@ -4723,7 +4734,7 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
 
 /// Whether the branches of a `CASE` or `COALESCE` fix its type `result`:
 /// every branch is exact (see [`has_exact_type`]), a text or boolean literal,
-/// an integer literal, or `NULL`; at least one branch is neither `NULL` nor a
+/// an integer literal that fits in 64 bits, or `NULL`; at least one branch is neither `NULL` nor a
 /// number; and every branch that is neither infers to `result` exactly.
 ///
 /// An integer literal takes its type from the context in DuckDB
@@ -4740,7 +4751,12 @@ fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> 
         if let Expr::Value(value) = branch {
             match &value.value {
                 ast::Value::Null => continue,
-                ast::Value::Number(text, _) if text.bytes().all(|b| b.is_ascii_digit()) => {
+                // Only a literal that fits in a `BIGINT`: a larger one is a
+                // `DECIMAL(38,0)` on Databricks and Spark, not an integer
+                // (#2658 red team).
+                ast::Value::Number(text, _)
+                    if text.bytes().all(|b| b.is_ascii_digit()) && text.parse::<i64>().is_ok() =>
+                {
                     continue;
                 }
                 // A double-quoted value is an identifier in DuckDB and
@@ -13613,8 +13629,8 @@ mod tests {
     /// Typecheck `sql` as model `m` on `target` and return output `c`'s
     /// nullable bit, and whether a `nullable = false` contract on `c` gives
     /// `E012`. Sources: `t` (`x INT`, `n STRING`, `f DOUBLE`,
-    /// `d DECIMAL(10,2)`, `big DECIMAL(38,2)`, all NOT NULL, and a nullable
-    /// `y INT`) and `u` (`k INT`, `v INT`, NOT NULL).
+    /// `d DECIMAL(10,2)`, `big DECIMAL(38,2)`, `p DECIMAL(9,0)`, `b BIGINT`,
+    /// all NOT NULL, and a nullable `y INT`) and `u` (`k INT`, `v INT`, NOT NULL).
     fn not_null_contract_on_c(sql: &str, target: OperandTarget) -> (bool, bool) {
         let dec = |precision, scale| RockyType::Decimal { precision, scale };
         let sources = HashMap::from([
@@ -13627,6 +13643,7 @@ mod tests {
                     ("d", dec(10, 2), false),
                     ("big", dec(38, 2), false),
                     ("p", dec(9, 0), false),
+                    ("b", RockyType::Int64, false),
                     ("y", RockyType::Int32, true),
                 ]),
             ),
@@ -13718,6 +13735,37 @@ mod tests {
                 ("select n, sum(x) as c from t group by (rollup(n))", true),
                 ("select n, sum(x) as c from t group by (cube(n))", true),
                 ("select n, sum(x) as c from t group by n, (rollup(x))", true),
+                // Plain keys of every shape.
+                (
+                    "select sum(x) as c from t group by cast(n as string)",
+                    false,
+                ),
+                ("select sum(x) as c from t group by x + 1", false),
+                ("select sum(x) as c from t group by -x", false),
+                (
+                    "select sum(x) as c from t group by case when x > 0 then 1 else 0 end",
+                    false,
+                ),
+                ("select sum(x) as c from t group by floor(f)", false),
+                (
+                    "select sum(x) as c from t group by substring(n, 1, 2)",
+                    false,
+                ),
+                ("select sum(x) as c from t group by n is null", false),
+                // Accepted arithmetic as the argument.
+                ("select n, sum(x * x) as c from t group by n", false),
+                // A literal above the BIGINT range is a decimal on Databricks
+                // and Spark, not an integer (red team).
+                (
+                    "select n, sum(case when b > 0 then b \
+                     else 99999999999999999999999999999999999999 end) as c from t group by n",
+                    true,
+                ),
+                (
+                    "select n, sum(coalesce(y, 99999999999999999999999999999999999999)) as c \
+                     from t group by n",
+                    true,
+                ),
                 // A tuple key may be the empty set; it is kept nullable.
                 ("select n, sum(x) as c from t group by (n, x)", true),
                 // GROUP BY ALL with no plain output groups nothing.
@@ -13802,6 +13850,14 @@ mod tests {
         for target in [Some(OperandDialect::Databricks).into(), duckdb()] {
             assert_not_null_contract(&[(guessed, true)], &target, "guessed argument");
         }
+        // Accepted arithmetic over a decimal is a decimal sum.
+        let product = "select n, sum(x * d) as c from t group by n";
+        assert_not_null_contract(&[(product, false)], &duckdb(), "duckdb product");
+        assert_not_null_contract(
+            &[(product, true)],
+            &Some(OperandDialect::Databricks).into(),
+            "databricks product",
+        );
         for (label, target, decimal_nullable) in [
             ("duckdb", duckdb(), false),
             ("trino", Some(OperandDialect::Trino).into(), false),
@@ -13876,6 +13932,14 @@ mod tests {
             ),
             (
                 "with s as (select d * 1000000000000000000.5 as a, p from t) select a * p as c from s",
+                true,
+            ),
+            // A CASE with a literal above the BIGINT range is not an exact
+            // BIGINT (red team).
+            (
+                "with s as (select case when b > 0 then b \
+                 else 99999999999999999999999999999999999999 end as a, p from t) \
+                 select a * p as c from s",
                 true,
             ),
             // An exact derived column keeps the rule.

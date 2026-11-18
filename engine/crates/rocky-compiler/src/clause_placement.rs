@@ -213,7 +213,7 @@ fn projection_width(select: &Select) -> Option<usize> {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 if contains_call(expr, |function| {
-                    function_name(function).is_some_and(|name| expands_to_columns(&name))
+                    last_name_part(function).is_some_and(|name| expands_to_columns(&name))
                 }) {
                     return None;
                 }
@@ -243,6 +243,17 @@ fn expands_to_columns(name: &str) -> bool {
             | "STACK"
             | "JSON_TUPLE"
     )
+}
+
+/// The last part of a call's name, upper-cased: `POSEXPLODE` for
+/// `builtin.posexplode(arr)`.
+fn last_name_part(function: &ast::Function) -> Option<String> {
+    function
+        .name
+        .0
+        .last()
+        .and_then(ast::ObjectNamePart::as_ident)
+        .map(|ident| ident.value.to_uppercase())
 }
 
 fn function_name(function: &ast::Function) -> Option<String> {
@@ -421,10 +432,32 @@ mod tests {
             "select unnest(s) from t group by 2",
             "select columns('a.*')::int from t group by 2",
             "select posexplode(arr) from t group by 2",
+            "select builtin.posexplode(arr) from t group by 2",
             "select stack(2, a, b, c, d) from t group by 2",
         ] {
             assert_eq!(codes(sql), Vec::<String>::new(), "{sql}");
         }
+    }
+
+    #[test]
+    fn every_column_expanding_function_skips_the_position_check() {
+        for name in [
+            "columns",
+            "unnest",
+            "explode",
+            "explode_outer",
+            "posexplode",
+            "posexplode_outer",
+            "inline",
+            "inline_outer",
+            "stack",
+            "json_tuple",
+        ] {
+            let sql = format!("select {name}(a) from t group by 2");
+            assert_eq!(codes(&sql), Vec::<String>::new(), "{sql}");
+        }
+        // Without one, the same width is checked.
+        assert_eq!(codes("select upper(a) from t group by 2"), ["E067"]);
     }
 
     #[test]
