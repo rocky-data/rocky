@@ -438,6 +438,70 @@ jobs:
 
   # The browser UI `rocky serve --ui` embeds: lint, typecheck, test, build,
   # and hand `dist/` to the release-build smoke so the embedding compiles.
+  # `rocky connector test` against the connectors that need no service and
+  # no PyPI package: a fresh `rocky connector init` scaffold, the Postgres
+  # reference connector in replay mode, and the Meltano shim against its
+  # replay stand-in. All three write Parquet through the real duckdb CLI.
+  # The dlt shim needs dlt from PyPI, so only engine-weekly runs it. A job of
+  # its own, away from Test, and not a required check.
+  connector-test:
+    name: Connector test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: engine
+          # Save only from main; see the note on the Clippy job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # See the Clippy job: a restored cache breaks libduckdb-sys's build.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
+      - name: Install cmake
+        run: |
+          command -v cmake >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      # The same pinned, checksum-verified CLI as the engine-weekly POC job.
+      - name: Install the duckdb CLI
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz -o /tmp/duckdb.tar.gz
+          echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  /tmp/duckdb.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/duckdb.tar.gz -C /usr/local/bin duckdb
+          sudo chmod +x /usr/local/bin/duckdb
+          duckdb --version
+      - name: Build rocky
+        run: cargo build -p rocky
+      - name: Test a fresh connector scaffold
+        run: |
+          set -euo pipefail
+          rocky="$GITHUB_WORKSPACE/engine/target/debug/rocky"
+          dir="$(mktemp -d)"
+          cd "$dir"
+          "$rocky" connector init demo
+          printf '[adapter]\ntype = "duckdb"\npath = "poc.duckdb"\n\n[connector.demo]\nmanifest = "connectors/demo/connector.toml"\noutput_uri = "file://./.rocky/landing/demo"\ntarget = { catalog = "poc", schema = "main", table = "demo" }\n' > rocky.toml
+          "$rocky" -c rocky.toml connector test demo --output table
+      - name: Test the Postgres reference connector (replay)
+        working-directory: examples/playground/pocs/07-adapters/08-postgres-child-connector
+        run: '"$GITHUB_WORKSPACE/engine/target/debug/rocky" -c rocky.toml connector test pg_events --output table'
+      - name: Test the Meltano shim (replay)
+        working-directory: examples/playground/pocs/07-adapters/12-meltano-connector-shim
+        run: '"$GITHUB_WORKSPACE/engine/target/debug/rocky" -c rocky.toml connector test orders_tap --output table'
+
   ui:
     name: Browser UI
     needs: changes
