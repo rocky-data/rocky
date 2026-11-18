@@ -285,8 +285,8 @@ query, even a subquery that never runs:
 These places nest: a subquery in the `WHERE` of a derived table counts.
 Anywhere else, the same finding is the warning `W071`. That covers a CTE
 body, a named `WINDOW`, `ORDER BY`, `GROUP BY`, `QUALIFY`, `LIMIT`, any
-function call's arguments, a lambda, and an operand of any other operator,
-such as `+`, `||` or `LIKE`. A warehouse can skip a CTE nothing reads or a
+function call's arguments, a lambda, a wildcard's `REPLACE`, and an operand
+of any other operator, such as `+`, `||` or `LIKE`. A warehouse can skip a CTE nothing reads or a
 window nothing uses. A DuckDB macro drops an argument its body does not use,
 and DuckDB turns many operators into function calls a macro can replace. So
 the model may still run.

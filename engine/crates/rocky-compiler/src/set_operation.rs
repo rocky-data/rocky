@@ -15,8 +15,9 @@
 //! `ORDER BY`, a function argument, an operand of an operator a macro can
 //! shadow, or any place not on that list, it is the warning `W071`: DuckDB
 //! skips a CTE nothing reads or a window nothing uses, a macro drops an
-//! argument its body does not use, and an unlisted place may be skipped too. The check needs no name resolution:
-//! it compares the widths the syntax states.
+//! argument its body does not use, and an unlisted place may be skipped too.
+//! A wildcard's `REPLACE` is not on the list either. The check needs no name
+//! resolution: it compares the widths the syntax states.
 //!
 //! A branch's width is counted only when the SQL states it: a `*`, a
 //! `t.*`, a multi-alias item, and a call that expands to several columns
@@ -106,8 +107,12 @@ impl Visitor for Places<'_> {
 fn bound_subqueries(body: &SetExpr, out: &mut HashSet<*const Query>) {
     match body {
         SetExpr::Select(select) => {
+            // A wildcard's `REPLACE` and `EXCLUDE` are not on the list.
             for item in &select.projection {
-                let _ = item.visit(&mut ExprSubqueries(out, 0, 0));
+                if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item
+                {
+                    let _ = expr.visit(&mut ExprSubqueries(out, 0, 0));
+                }
             }
             for expr in select.selection.iter().chain(&select.having) {
                 let _ = expr.visit(&mut ExprSubqueries(out, 0, 0));
@@ -565,6 +570,17 @@ mod tests {
             "CREATE TABLE t (a INTEGER, s VARCHAR); CREATE TABLE u (a INTEGER, b INTEGER)",
         )
         .unwrap();
+        // A macro named after each listed form, dropping its operands: none
+        // of them is used, so the forms stay bound (round-12 red team).
+        for name in [
+            "=", "<>", "!=", "<", "<=", ">", ">=", "and", "or", "not", "in", "between", "cast",
+            "try_cast", "case", "exists", "coalesce", "contains",
+        ] {
+            conn.execute_batch(&format!(
+                "CREATE MACRO \"{name}\"(x) AS true, (x, y) AS true;"
+            ))
+            .unwrap_or_else(|e| panic!("macro {name}: {e}"));
+        }
         let bad = "SELECT a FROM u UNION ALL SELECT a, b FROM u";
         for sql in [
             // The model's query, and a branch in parentheses.
@@ -683,6 +699,7 @@ mod tests {
             format!("SELECT a FROM t WINDOW w AS (ORDER BY ({bad}))"),
             format!("WITH c AS (SELECT * FROM ({bad}) d) SELECT 1"),
             format!("SELECT (WITH c AS ({bad}) SELECT 1) FROM t"),
+            format!("SELECT * REPLACE (({bad}) AS a) FROM t"),
         ] {
             assert_eq!(severities(&sql), ["W071"], "{sql}");
         }
