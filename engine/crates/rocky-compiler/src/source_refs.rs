@@ -713,6 +713,16 @@ impl<'s, 'a> Binder<'s, 'a> {
 
         let mut full = chain.to_vec();
         full.push(scope);
+        // A top-level `USING` or `NATURAL` join merges key columns, which the
+        // binder does not model; a star over such a scope is not checked. (A
+        // join nested in parentheses is checked: merging never removes a
+        // name, so presence is still provable.)
+        let merged_join = select.from.iter().flat_map(|t| &t.joins).any(|join| {
+            matches!(
+                join_constraint(&join.join_operator),
+                Some(JoinConstraint::Using(_) | JoinConstraint::Natural)
+            )
+        });
 
         for condition in join_conditions {
             self.check_expr(condition, &full, ctes);
@@ -725,6 +735,39 @@ impl<'s, 'a> Binder<'s, 'a> {
                 SelectItem::UnnamedExpr(expr)
                 | SelectItem::ExprWithAlias { expr, .. }
                 | SelectItem::ExprWithAliases { expr, .. } => self.check_expr(expr, &full, ctes),
+                SelectItem::Wildcard(options) => {
+                    if let Some(scope) = full.last().filter(|_| !merged_join) {
+                        self.check_star_options(options, &scope.rels.iter().collect::<Vec<_>>());
+                    }
+                    for (_, expr) in star_replace_exprs(options) {
+                        self.check_expr(expr, &full, ctes);
+                    }
+                }
+                SelectItem::QualifiedWildcard(
+                    ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                    options,
+                ) => {
+                    // `t.*` with a one-part qualifier names one relation of
+                    // this scope; anything else is not checked.
+                    if let (Some(scope), [part]) =
+                        (full.last().filter(|_| !merged_join), name.0.as_slice())
+                        && let Some(qualifier) = part.as_ident()
+                        && qualifier.quote_style.is_none()
+                    {
+                        let qualifier = qualifier.value.to_lowercase();
+                        let bound: Vec<&Rel<'s, 'a>> = scope
+                            .rels
+                            .iter()
+                            .filter(|rel| rel.binding.as_deref() == Some(qualifier.as_str()))
+                            .collect();
+                        if bound.len() == 1 {
+                            self.check_star_options(options, &bound);
+                        }
+                    }
+                    for (_, expr) in star_replace_exprs(options) {
+                        self.check_expr(expr, &full, ctes);
+                    }
+                }
                 _ => {}
             }
         }
@@ -755,24 +798,7 @@ impl<'s, 'a> Binder<'s, 'a> {
         self.add_factor(&table.relation, scope, chain, ctes, join_conditions);
         for join in &table.joins {
             self.add_factor(&join.relation, scope, chain, ctes, join_conditions);
-            let constraint = match &join.join_operator {
-                JoinOperator::Join(c)
-                | JoinOperator::Inner(c)
-                | JoinOperator::Left(c)
-                | JoinOperator::LeftOuter(c)
-                | JoinOperator::Right(c)
-                | JoinOperator::RightOuter(c)
-                | JoinOperator::FullOuter(c)
-                | JoinOperator::CrossJoin(c)
-                | JoinOperator::Semi(c)
-                | JoinOperator::LeftSemi(c)
-                | JoinOperator::RightSemi(c)
-                | JoinOperator::Anti(c)
-                | JoinOperator::LeftAnti(c)
-                | JoinOperator::RightAnti(c)
-                | JoinOperator::StraightJoin(c) => Some(c),
-                _ => None,
-            };
+            let constraint = join_constraint(&join.join_operator);
             if let Some(JoinConstraint::On(expr)) = constraint {
                 join_conditions.push(expr);
             }
@@ -1020,6 +1046,43 @@ impl<'s, 'a> Binder<'s, 'a> {
         }
     }
 
+    /// A star's `EXCEPT`, `EXCLUDE` and `REPLACE` names must be columns of the
+    /// relations the star expands: the warehouse rejects the query otherwise.
+    /// A name is reported only when every one of `rels` is a known relation
+    /// and none has it. An opaque relation, a quoted name or a qualified
+    /// `EXCLUDE` name is never reported. A lateral alias or an outer scope
+    /// does not satisfy a star name: the star reads only its own relations.
+    fn check_star_options(
+        &mut self,
+        options: &ast::WildcardAdditionalOptions,
+        rels: &[&Rel<'s, 'a>],
+    ) {
+        // `ILIKE` and `RENAME` change what the star expands to; not modelled.
+        if options.opt_ilike.is_some() || options.opt_rename.is_some() {
+            return;
+        }
+        let mut known = Vec::with_capacity(rels.len());
+        for rel in rels {
+            match rel.kind {
+                RelKind::Source(source) => known.push(source),
+                RelKind::Opaque => return,
+            }
+        }
+        if known.is_empty() {
+            return;
+        }
+        for ident in star_option_names(options) {
+            // Quoted and `_`-prefixed names are never reported, as elsewhere.
+            if ident.quote_style.is_some() || ident.value.starts_with('_') {
+                continue;
+            }
+            let lower = ident.value.to_lowercase();
+            if !known.iter().any(|source| source.has(&lower)) {
+                self.record(ident, &ident.value, known.clone());
+            }
+        }
+    }
+
     fn record(&mut self, at: &Ident, column: &str, sources: Vec<&'s KnownSource<'a>>) {
         self.findings.push(Finding {
             column: column.to_string(),
@@ -1028,6 +1091,66 @@ impl<'s, 'a> Binder<'s, 'a> {
             col: at.span.start.column,
         });
     }
+}
+
+/// The constraint of a join that has one.
+fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
+    match operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// The column names a star's options name: `EXCEPT`, one-part `EXCLUDE` and
+/// `REPLACE` targets. A qualified `EXCLUDE` name is left out.
+fn star_option_names(options: &ast::WildcardAdditionalOptions) -> Vec<&Ident> {
+    let mut names = Vec::new();
+    if let Some(exclude) = &options.opt_exclude {
+        let items = match exclude {
+            ast::ExcludeSelectItem::Single(name) => std::slice::from_ref(name),
+            ast::ExcludeSelectItem::Multiple(names) => names.as_slice(),
+        };
+        for item in items {
+            if let [part] = item.0.as_slice()
+                && let Some(ident) = part.as_ident()
+            {
+                names.push(ident);
+            }
+        }
+    }
+    if let Some(except) = &options.opt_except {
+        names.push(&except.first_element);
+        names.extend(except.additional_elements.iter());
+    }
+    if let Some(replace) = &options.opt_replace {
+        names.extend(replace.items.iter().map(|item| &item.column_name));
+    }
+    names
+}
+
+/// The `REPLACE (expr AS col)` expressions of a star. Their column reads are
+/// checked like any projection expression.
+fn star_replace_exprs(options: &ast::WildcardAdditionalOptions) -> Vec<(&Ident, &Expr)> {
+    options
+        .opt_replace
+        .iter()
+        .flat_map(|replace| replace.items.iter())
+        .map(|item| (&item.column_name, &item.expr))
+        .collect()
 }
 
 fn resolve_unqualified<'s, 'a>(chain: &[Scope<'s, 'a>], name: &str) -> Resolution<'s, 'a> {
@@ -1403,6 +1526,110 @@ mod tests {
     }
 
     const D1: &str = "SELECT order_id, customer_id, order_total FROM raw.orders";
+
+    /// Red-team finding 2 on #2624: a star modifier that names a column the
+    /// star's relation lacks is reported like any missing column reference.
+    #[test]
+    fn a_star_modifier_naming_a_missing_column_is_reported() {
+        for sql in [
+            "SELECT * EXCLUDE (statsu) FROM raw.orders",
+            "SELECT * EXCLUDE statsu FROM raw.orders",
+            "SELECT * EXCEPT (statsu) FROM raw.orders",
+            "SELECT * REPLACE (1 AS statsu) FROM raw.orders",
+            "SELECT o.* EXCLUDE (statsu) FROM raw.orders o",
+            "SELECT o.* EXCLUDE (statsu), c.email FROM raw.orders o JOIN raw.customers c ON o.customer_id = c.customer_id",
+        ] {
+            let diagnostics = check(sql);
+            assert_eq!(codes(&diagnostics), ["E041"], "{sql}: {diagnostics:?}");
+            assert!(diagnostics[0].message.contains("'statsu'"), "{sql}");
+            let suggestion = diagnostics[0].suggestion.as_deref().unwrap();
+            assert!(suggestion.contains("'status'"), "{sql}: {suggestion}");
+        }
+        // Severity follows the schema's provenance, as for a plain read.
+        let seed = check_with(
+            SourceSchemaOrigin::Seed,
+            false,
+            "SELECT * EXCLUDE (statsu) FROM raw.orders",
+        );
+        assert_eq!(codes(&seed), ["W041"], "{seed:?}");
+    }
+
+    /// Controls: a present name, any case, passes; so does every shape the
+    /// check cannot prove.
+    #[test]
+    fn a_star_modifier_stays_silent_when_absence_is_not_provable() {
+        for sql in [
+            // Present, in any case.
+            "SELECT * EXCLUDE (status, AMOUNT) FROM raw.orders",
+            "SELECT * REPLACE (upper(status) AS status) FROM raw.orders",
+            // Present in one of the joined relations.
+            "SELECT * EXCLUDE (email) FROM raw.orders o JOIN raw.customers c ON o.customer_id = c.customer_id",
+            // A qualified star reads only its own relation, but `c.*` is fine.
+            "SELECT o.*, c.* EXCLUDE (email) FROM raw.orders o JOIN raw.customers c ON o.customer_id = c.customer_id",
+            // An unknown relation makes the star's columns unknown.
+            "SELECT * EXCLUDE (nope) FROM raw.unknown_table",
+            "SELECT * EXCLUDE (nope) FROM raw.orders o JOIN raw.unknown_table u ON o.order_id = u.id",
+            // CTE and derived table: opaque here.
+            "WITH x AS (SELECT order_id FROM raw.orders) SELECT * EXCLUDE (nope) FROM x",
+            "SELECT * EXCLUDE (nope) FROM (SELECT order_id FROM raw.orders) d",
+            // USING / NATURAL joins merge keys; not modelled.
+            "SELECT * EXCLUDE (nope) FROM raw.orders JOIN raw.customers USING (customer_id)",
+            "SELECT * EXCLUDE (nope) FROM raw.orders NATURAL JOIN raw.customers",
+            // Quoted, `_`-prefixed and qualified names.
+            "SELECT * EXCLUDE (\"nope\") FROM raw.orders",
+            "SELECT * EXCLUDE (_fivetran_synced) FROM raw.orders",
+            "SELECT * EXCLUDE (orders.nope) FROM raw.orders",
+            // A select alias or an outer relation never satisfies a star
+            // name, but they do not make it reportable either when unknown.
+            "SELECT * EXCLUDE (nope) FROM raw.orders, LATERAL (SELECT 1) t",
+        ] {
+            let diagnostics = check(sql);
+            assert!(diagnostics.is_empty(), "{sql}: {diagnostics:?}");
+        }
+    }
+
+    /// #2624 follow-up red team: a qualified star reads only its own
+    /// relation, its qualifier matches in any case, an ambiguous qualifier
+    /// is not checked, and every name of a list is checked.
+    #[test]
+    fn a_star_modifier_scopes_and_lists_are_checked_precisely() {
+        let join = "FROM raw.orders o JOIN raw.customers c ON o.customer_id = c.customer_id";
+        for sql in [
+            // `email` is in `c`, not in `o`.
+            format!("SELECT o.* EXCLUDE (email) {join}"),
+            "SELECT O.* EXCLUDE (statsu) FROM raw.orders o".to_string(),
+            "SELECT * EXCEPT (status, statsu) FROM raw.orders".to_string(),
+            "SELECT * EXCLUDE (status, statsu) FROM raw.orders".to_string(),
+        ] {
+            let diagnostics = check(&sql);
+            assert_eq!(codes(&diagnostics), ["E041"], "{sql}: {diagnostics:?}");
+        }
+        for sql in [
+            // Two relations bound to the same qualifier: not checked.
+            "SELECT a.* EXCLUDE (nope) FROM raw.orders a JOIN raw.customers a ON a.order_id = a.customer_id",
+            // `ILIKE` changes what the star expands to: not checked.
+            "SELECT * ILIKE '%id%' FROM raw.orders",
+        ] {
+            let diagnostics = check(sql);
+            assert!(diagnostics.is_empty(), "{sql}: {diagnostics:?}");
+        }
+    }
+
+    /// A lateral alias does not satisfy a star name: the star expands only
+    /// its own relations.
+    #[test]
+    fn a_select_alias_does_not_satisfy_a_star_modifier() {
+        let diagnostics = check("SELECT * EXCLUDE (total), amount AS total FROM raw.orders");
+        assert_eq!(codes(&diagnostics), ["E041"], "{diagnostics:?}");
+    }
+
+    /// The expression of a `REPLACE` item is checked like any projection.
+    #[test]
+    fn a_star_replace_expression_reads_are_checked() {
+        let diagnostics = check("SELECT * REPLACE (amout * 2 AS amount) FROM raw.orders");
+        assert_eq!(codes(&diagnostics), ["E041"], "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("'amout'"));
+    }
 
     #[test]
     fn d1_live_schema_is_e041_naming_column_and_source() {

@@ -39,7 +39,7 @@ Four more words appear across the rows, always with the same meaning:
 
 | Capability | Who enforces it |
 |---|---|
-| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E014) and on every `rocky run` route, `--dag` included: a model with a contract error is not written. |
+| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E014, E062, E063) and on every `rocky run` route, `--dag` included: a model with a contract error is not written. |
 | [Classification tag completeness](#classification-tag-completeness) | Not enforced: Rocky warns (W004). Nothing blocks. |
 | [Masking application](#masking-application) | Adapter-dependent: Databricks only, attempted |
 | [Freshness](#freshness) | Declared metadata, not enforced. One opt-in run-time check, replication pipelines only. |
@@ -61,6 +61,10 @@ runs, and fails on any of these errors:
 - `E013`: a protected column was removed.
 - `E014`: the output holds a nullable column the contract does not declare.
   This check runs only when the contract sets `[rules] no_new_nullable = true`.
+- `E062`: the output repeats a name the contract constrains.
+- `E063`: the output holds a column the contract does not declare, or a column
+  list Rocky cannot prove. This check runs only when the contract sets
+  `[rules] no_extra_columns = true`.
 
 Every `rocky run` reads the project `contracts/` directory and checks each contract in the compile that supplies the model SQL. A contract error keeps that model's existing table and withholds its downstream models. `rocky run --pipeline <NAME> --model <NAME> --contracts <DIR>` also requires the selected model to have a contract. A failed run can still record state and history.
 
@@ -91,6 +95,11 @@ Two limits, stated plainly:
   give the compiler source schemas, or cast the column to one of those targets
   in the SELECT. `rocky run` first describes the sources in the
   warehouse, so it refuses only what stays unknown after that.
+- `rocky compile` reads a source column as nullable when no source schema
+  says otherwise, so a `nullable = false` contract on it is `E012`. Before any
+  write, `rocky run` also describes each source behind an `E012`. It drops the
+  `E012` when the warehouse reports the column as NOT NULL. A nullable column
+  keeps the `E012`.
 - A bare `Decimal` in a contract matches any precision and scale. A contract
   that names the digits — `Decimal(18,2)` — must match the inferred precision
   and scale exactly.
@@ -233,9 +242,9 @@ three gates".
 ## Audit ledger
 
 **Rocky recording: attempted for ordinary rules, durable for the two gating kinds.**
-Policy-decision recording is best-effort for ordinary rules. At a mutating seam
-— `rocky apply` and promote, plus the `draft_*` and `propose` tools, which run
-the same evaluator into the same sink — Rocky writes each evaluated decision to
+Policy-decision recording is best-effort for ordinary rules. The mutating seams are `rocky apply`, promote, an agent's `rocky run`, and the
+`draft_*` and `propose` tools, which run the same evaluator into the same sink.
+At each seam, Rocky writes each evaluated decision to
 a `policy_decisions` table in the embedded redb state store, and when that write
 fails it warns and continues. Some refusals never reach the table at all,
 because the gate can return a verdict before any rule is evaluated. Decisions

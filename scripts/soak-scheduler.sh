@@ -273,9 +273,12 @@ harvest_from_state() { # -> same harvest.jsonl shape as harvest()
 write_done() { # END_EPOCH COMPLETE(true|false) REASON
   local planned_end
   planned_end=$(jq -r '.planned_end // 0' "$OUT/meta.json" 2>/dev/null || echo 0)
-  write_atomic "$OUT/DONE" "$(jq -cn --argjson end "$1" --argjson complete "$2" \
+  # `end` is a jq keyword: jq 1.6 (the soak image's jq) rejects `$end` as a
+  # variable name, so it is `$end_epoch`. scripts/tests/soak-jq16-keywords.test.sh
+  # guards the whole class, because CI's jq 1.7 accepts it.
+  write_atomic "$OUT/DONE" "$(jq -cn --argjson end_epoch "$1" --argjson complete "$2" \
     --arg reason "$3" --argjson planned_end "${planned_end:-0}" \
-    '{end:$end, complete:$complete, reason:$reason, planned_end:$planned_end}')"
+    '{"end":$end_epoch, complete:$complete, reason:$reason, planned_end:$planned_end}')"
 }
 
 if [[ "$MODE" == finish ]]; then

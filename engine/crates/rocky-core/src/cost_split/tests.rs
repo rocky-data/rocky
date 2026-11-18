@@ -132,6 +132,7 @@ fn run(
         verify_after_failed: false,
         rocky_branch: None,
         retry_of: None,
+        test_results: Vec::new(),
         run_scope: scope,
         queued_ms: None,
         source_volumes: Vec::new(),
