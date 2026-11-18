@@ -464,6 +464,10 @@ jobs:
   # those POCs change (`connectors`); every push to main runs it. A push to
   # main that touches only those POCs does not start this workflow at all:
   # the push `paths:` are the engine's, so the PR run is what covers it.
+  # And code outside `connectors` that the connector path calls, such as the
+  # `[connector.*]` config parsing in rocky-core/src/config.rs, does not run
+  # this job on a pull request; the next push to main does, so a regression
+  # shows within one merge.
   connector-test:
     name: Connector test
     needs: changes
