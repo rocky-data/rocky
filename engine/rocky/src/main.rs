@@ -409,6 +409,7 @@ enum PolicyCapabilityArg {
     Gc,
     Restore,
     Retry,
+    Run,
     Quarantine,
     #[value(name = "schema_change.additive")]
     SchemaChangeAdditive,
@@ -430,6 +431,7 @@ impl From<PolicyCapabilityArg> for rocky_core::config::PolicyCapability {
             PolicyCapabilityArg::Gc => C::Gc,
             PolicyCapabilityArg::Restore => C::Restore,
             PolicyCapabilityArg::Retry => C::Retry,
+            PolicyCapabilityArg::Run => C::Run,
             PolicyCapabilityArg::Quarantine => C::Quarantine,
             PolicyCapabilityArg::SchemaChangeAdditive => C::SchemaChangeAdditive,
             PolicyCapabilityArg::SchemaChangeBreaking => C::SchemaChangeBreaking,
@@ -6425,6 +6427,44 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::sync::Mutex;
+
+    /// Every policy capability is a `--capability` value (#2651). The match
+    /// is exhaustive over the core enum, so a new capability does not compile
+    /// until it has a CLI value, and the round trip proves each value maps
+    /// back to the capability it names.
+    #[test]
+    fn every_policy_capability_is_a_cli_value() {
+        use clap::ValueEnum;
+        use rocky_core::config::PolicyCapability as C;
+        fn arg_for(c: C) -> PolicyCapabilityArg {
+            match c {
+                C::Read => PolicyCapabilityArg::Read,
+                C::Propose => PolicyCapabilityArg::Propose,
+                C::Apply => PolicyCapabilityArg::Apply,
+                C::Promote => PolicyCapabilityArg::Promote,
+                C::Backfill => PolicyCapabilityArg::Backfill,
+                C::Gc => PolicyCapabilityArg::Gc,
+                C::Restore => PolicyCapabilityArg::Restore,
+                C::Retry => PolicyCapabilityArg::Retry,
+                C::Run => PolicyCapabilityArg::Run,
+                C::Quarantine => PolicyCapabilityArg::Quarantine,
+                C::SchemaChangeAdditive => PolicyCapabilityArg::SchemaChangeAdditive,
+                C::SchemaChangeBreaking => PolicyCapabilityArg::SchemaChangeBreaking,
+                C::ValueChange => PolicyCapabilityArg::ValueChange,
+            }
+        }
+        for arg in PolicyCapabilityArg::value_variants() {
+            let core = C::from(*arg);
+            let wire = serde_json::to_value(core).unwrap();
+            let name = arg.to_possible_value().unwrap();
+            assert_eq!(wire, name.get_name(), "the CLI value is the wire name");
+            assert_eq!(C::from(arg_for(core)), core);
+        }
+        assert!(
+            PolicyCapabilityArg::from_str("run", false).is_ok(),
+            "`run` is accepted"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // resolve_output — `--output` default resolution
