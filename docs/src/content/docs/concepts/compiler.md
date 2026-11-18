@@ -340,7 +340,10 @@ A star modifier counts as a read. A name in a star's `EXCEPT`, `EXCLUDE` or
 an external source is `E041` or `W041`. Rocky checks it only when it knows every
 column of every relation the star covers. It does not check a star over a
 top-level `USING` or `NATURAL` join, or a star with `ILIKE` or `RENAME`. It does
-not check a quoted name, a `_`-prefixed name or a qualified `EXCLUDE` name.
+not check a quoted name, a `_`-prefixed name or a qualified `EXCLUDE` name. It
+does not check a qualified star such as `t.*` when `t` may also be a column or a
+`SELECT` alias in the star's own `FROM` scope: `t.*` may then expand a struct.
+A CTE, derived table or unknown relation in that scope counts as such a column.
 
 ### Missing columns in external sources (`E041` / `W041`)
 

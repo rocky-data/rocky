@@ -37,7 +37,9 @@
 //!    relation whose columns Rocky cannot enumerate makes the name
 //!    unprovable, and it stays `Unknown`. A qualified `a.b` is reported only
 //!    when `a` names exactly one source binding and cannot also be a column
-//!    (a struct field access such as `payload.field`).
+//!    (a struct field access such as `payload.field`). A qualified star
+//!    `a.* EXCLUDE (..)` follows the same rule, asked of the star's own
+//!    scope only (#2653).
 //!
 //! Quoted names are never reported: this dialect parses `"shipped"` as an
 //! identifier, but BigQuery (and Databricks by default) read it as a string.
@@ -757,8 +759,10 @@ impl<'s, 'a> Binder<'s, 'a> {
                         let qualifier = qualifier.value.to_lowercase();
                         // `payload.*` over a struct column `payload` expands
                         // the struct, on a warehouse that reads it so (#2653).
+                        // Only the star's own scope is asked: a relation bound
+                        // there shadows an outer column of the same name.
                         let bound: Vec<&Rel<'s, 'a>> =
-                            if qualifier_may_be_a_column(&full, &qualifier) {
+                            if qualifier_may_be_a_column(std::slice::from_ref(scope), &qualifier) {
                                 Vec::new()
                             } else {
                                 scope
@@ -1625,24 +1629,38 @@ mod tests {
         }
     }
 
-    /// #2653: `payload.*` where `payload` is also a column in reach may expand
-    /// a struct, not the relation, so its modifier names are not checked, as a
-    /// plain `payload.x` read is not. A qualifier that is no column is still
-    /// checked.
+    /// #2653: `payload.*` where `payload` is also a column or alias of the
+    /// star's own scope may expand a struct, not the relation, so its modifier
+    /// names are not checked, as a plain `payload.x` read is not. Only that
+    /// scope is asked: an outer relation cannot supply the struct, because the
+    /// relation bound in the star's scope shadows it.
     #[test]
     fn a_star_qualifier_that_may_be_a_struct_column_is_not_checked() {
         for sql in [
-            // `raw.customers` has a column `payload`, aliased `payload` too.
+            // The qualifier's own relation has a column `payload`.
             "SELECT payload.* EXCEPT (legacy_field) FROM raw.customers payload",
-            // `customer_id` is a column of `o`, and also the alias of `c`.
-            "SELECT customer_id.* EXCLUDE (nope) FROM raw.orders o \
-             JOIN raw.customers customer_id ON o.customer_id = customer_id.customer_id",
+            // A sibling relation has a column `amount`; the qualifier's own
+            // relation (`raw.customers`) does not.
+            "SELECT amount.* EXCLUDE (nope) FROM raw.orders o \
+             JOIN raw.customers amount ON o.customer_id = amount.customer_id",
+            // A select alias named like the qualifier.
+            "SELECT 1 AS o, o.* EXCLUDE (statsu) FROM raw.orders o",
+            // An opaque relation (a CTE) in the star's own scope may carry
+            // such a column, so the star is not checked.
+            "WITH s AS (SELECT order_id FROM raw.orders) \
+             SELECT o.* EXCLUDE (statsu) FROM raw.orders o JOIN s ON o.order_id = s.order_id",
         ] {
             let diagnostics = check(sql);
             assert!(diagnostics.is_empty(), "{sql}: {diagnostics:?}");
         }
-        let diagnostics = check("SELECT o.* EXCLUDE (statsu) FROM raw.orders o");
-        assert_eq!(codes(&diagnostics), ["E041"], "{diagnostics:?}");
+        for sql in [
+            "SELECT o.* EXCLUDE (statsu) FROM raw.orders o",
+            // An opaque relation in an OUTER scope does not silence the star.
+            "SELECT * FROM stg_x WHERE EXISTS (SELECT o.* EXCLUDE (statsu) FROM raw.orders o)",
+        ] {
+            let diagnostics = check(sql);
+            assert_eq!(codes(&diagnostics), ["E041"], "{sql}: {diagnostics:?}");
+        }
     }
 
     /// A lateral alias does not satisfy a star name: the star expands only
