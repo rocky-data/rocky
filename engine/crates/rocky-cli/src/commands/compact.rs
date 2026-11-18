@@ -1,8 +1,8 @@
 //! `rocky compact` — generate OPTIMIZE/VACUUM SQL for storage compaction.
 //!
 //! Also hosts `rocky compact --measure-dedup` — the Layer 0 cross-table
-//! dedup-measurement experiment (`run_measure_dedup`). See
-//! `plans/rocky-storage-layer-0.md` for the scope + decision gate.
+//! dedup-measurement experiment (`run_measure_dedup`). Its decision gate
+//! is [`verdict_for_semantic`].
 //!
 //! ## Plan persistence (`compact apply`)
 //!
@@ -326,7 +326,7 @@ fn default_metadata_columns() -> Vec<String> {
 /// Hashes every user table in the warehouse twice (raw = `HASH(*)`,
 /// semantic = `HASH(...non-metadata columns...)`) and reports a
 /// partition-level **lower bound** on cross-table byte dedup, plus a
-/// decision-gate verdict per `plans/rocky-storage-layer-0.md` §6.
+/// decision-gate verdict from [`verdict_for_semantic`].
 ///
 /// ## Scope (Layer 0 Step 4)
 ///
@@ -1017,7 +1017,7 @@ fn render_measure_dedup_human(output: &CompactDedupOutput) {
     }
 
     let (verdict, message) = verdict_for_semantic(output.semantic.dedup_ratio);
-    println!("Decision gate (see plans/rocky-storage-layer-0.md §6):");
+    println!("Decision gate:");
     println!(
         "  Semantic partition dedup {:.1}% → {}",
         output.semantic.dedup_ratio * 100.0,
@@ -1048,7 +1048,8 @@ fn print_summary(summary: &DedupSummary, indent: &str) {
     );
 }
 
-/// Decision-gate thresholds from `plans/rocky-storage-layer-0.md` §6.
+/// Decision-gate thresholds: above 30% semantic partition dedup is GREEN,
+/// 10% to 30% is YELLOW, below 10% is INCONCLUSIVE.
 ///
 /// The partition-level number is a **lower bound** on byte-level dedup,
 /// so a low result isn't a kill shot on its own — it triggers the
@@ -1070,7 +1071,7 @@ fn verdict_for_semantic(semantic_ratio: f64) -> (&'static str, &'static str) {
         (
             "INCONCLUSIVE",
             "Low partition-level result; re-run with --calibrate-bytes for a \
-             byte-level sample before killing the vision (see §6).",
+             byte-level sample before killing the vision.",
         )
     }
 }

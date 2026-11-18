@@ -79,6 +79,7 @@ command              = ["./main.py"]
 state_schema_version = 1
 egress_hosts         = ["api.stripe.com"]
 license              = "Apache-2.0"
+support_tier         = "community"
 
 [limits]
 wall_time_secs = 1800
@@ -88,7 +89,10 @@ wall_time_secs = 1800
 - `command` must not be empty. A first element with a slash and a relative path is relative to the directory of the manifest. A first element with no slash is looked up on `PATH`. Rocky does not change the other elements. The working directory of the program is its scratch directory, not the manifest directory.
 - `state_schema_version` is the version of the state shape the program reads and writes.
 - `egress_hosts` is required. Write `[]` for a program that calls no host.
-- `license` is optional. It is an SPDX identifier or expression, such as `MIT` or `Apache-2.0 OR MIT`. It must not be blank. Rocky checks only that it is not blank, and otherwise ignores it.
+- `license` is optional. It is an SPDX identifier or expression, such as `MIT` or `Apache-2.0 OR MIT`. It must not be blank. Rocky does not check the name against the SPDX list. `rocky load` reports it, and reports `unknown` when it is not set. `rocky validate` warns (**V068**) when it is not set.
+- `support_tier` is optional. It says who supports the connector: `reference` (maintained by the Rocky project and tested in its CI) or `community` (not tested in CI by the Rocky project; Rocky supports the protocol, the state and the load, and a bug in the program the connector runs goes to that program's authors). `rocky load` reports it, and reports `unknown` when it is not set.
+- Both keys are the author's own statement. Rocky does not verify them.
+- Rocky 1.93.0 and older refuse a manifest that sets `license` or `support_tier`, because they refuse unknown keys. Leave both out if the manifest must load on those versions.
 
 A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
 
@@ -257,6 +261,8 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 | `commit_seq_before`, `commit_seq_after` | The commit sequence before and after the run. |
 | `adopted_expired_claim` | `true` when the run took over an expired in-flight claim. |
 | `egress_hosts` | The hosts the manifest declares. |
+| `license` | The `license` the manifest declares, or `unknown`. |
+| `support_tier` | `reference`, `community`, or `unknown` when the manifest does not say. |
 | `error` | Why the run failed. Present only on failure. |
 
 ## Reference connector
@@ -299,7 +305,7 @@ Three POCs show how to run a third-party extraction tool as a child connector. E
 | Tool | POC | What the shim runs |
 |---|---|---|
 | dlt | [`07-adapters/10-dlt-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-dlt-connector-shim) | A dlt source, named by module and function, with the `filesystem` destination writing Parquet. |
-| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An open-source Airbyte source image with `docker run`: `spec`, `discover`, then `read`. |
+| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An Airbyte source image with `docker run`: `spec`, `discover`, then `read`. Or, with no Docker, a declarative source manifest through `airbyte-cdk`'s `source-declarative-manifest`. The Airbyte protocol and `airbyte-cdk` are MIT. Each source image and manifest has its own license, often Elastic License 2.0 (ELv2), which is not open source: check its `metadata.yaml` first. |
 | Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. |
 
 All three follow the same rules.
@@ -310,6 +316,13 @@ All three follow the same rules.
 - **No catalog.** Rocky does not discover or list sources. The options name the module, the image or the tap.
 - **Credentials go under `secrets`.** Each tool reads its credentials from the environment. Declare the variable names under `secrets`. Never put a credential under `options`.
 - **The tool, not Rocky, calls the network.** The manifest `egress_hosts` lists the hosts the tool calls. Rocky does not enforce the list.
+
+The Airbyte shim's no-Docker mode has rules of its own:
+
+- **The manifest is pinned by hash.** Set `manifest_sha256`. The shim never downloads a manifest, and a file with another hash fails the run. The hash is required because the manifest decides which hosts receive the source config, secrets included.
+- **No custom code runs.** The shim never passes `--components-path`. It needs `airbyte-cdk` 7.48.0 or newer, which refuses custom classes in a manifest it did not ship. It refuses to run when `AIRBYTE_ENABLE_UNSAFE_CODE` or any `PYTHON*` variable is set. A manifest that needs custom Python components does not work in this mode.
+- **Rows can load again at the cursor.** `airbyte-cdk` starts each read at the saved cursor, not after it. When the API's lower bound is inclusive, the row at the cursor loads again. A manifest with a `lookback_window` loads the whole window again. The target only appends, so those rows are duplicates: deduplicate downstream on a key.
+- **Rocky ships no Airbyte manifest.** The POC uses its own Apache-2.0 manifest against a local stub.
 
 The POCs run offline once the tool is installed. Each skips with exit 0 when its tool is missing. Set `REQUIRE_DLT=1`, `REQUIRE_DOCKER=1` or `REQUIRE_MELTANO=1` to make that a failure.
 

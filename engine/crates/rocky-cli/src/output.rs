@@ -6282,6 +6282,32 @@ pub enum ConnectorLoadStatus {
     Failed,
 }
 
+/// Who supports a child connector, as its manifest declares: `reference`
+/// (the author says the Rocky project maintains and tests it), `community`
+/// (not tested in CI by the Rocky project) or `unknown` (the manifest does
+/// not say). The author declares it. Rocky does not verify it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorSupportTier {
+    Reference,
+    Community,
+    Unknown,
+}
+
+impl From<Option<rocky_core::connector::SupportTier>> for ConnectorSupportTier {
+    fn from(tier: Option<rocky_core::connector::SupportTier>) -> Self {
+        use rocky_core::connector::SupportTier;
+        match tier {
+            Some(SupportTier::Reference) => Self::Reference,
+            Some(SupportTier::Community) => Self::Community,
+            None => Self::Unknown,
+        }
+    }
+}
+
+/// The license a `rocky load` output reports when the manifest declares none.
+pub const UNKNOWN_CONNECTOR_LICENSE: &str = "unknown";
+
 /// The child connector part of a `rocky load --connector` result.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConnectorLoadInfo {
@@ -6301,6 +6327,11 @@ pub struct ConnectorLoadInfo {
     pub adopted_expired_claim: bool,
     /// The hosts the manifest declares. Declared, not enforced.
     pub egress_hosts: Vec<String>,
+    /// The `license` the manifest declares, or `unknown` when it declares
+    /// none. Declared, not checked.
+    pub license: String,
+    /// The `support_tier` the manifest declares, or `unknown`.
+    pub support_tier: ConnectorSupportTier,
     /// Why the run failed. Present only when `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

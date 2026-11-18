@@ -10,5 +10,9 @@ state_schema_version = 1
 # here, as a statement of intent.
 egress_hosts         = []
 
+# Rocky supports the shim, the state and the load. A bug in the tool it
+# runs goes to that tool's authors.
+support_tier         = "community"
+
 [limits]
 wall_time_secs = 600
