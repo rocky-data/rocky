@@ -1704,6 +1704,27 @@
             "type": "string"
           },
           {
+            "description": "Emitted when a model's newest test evidence on the branch holds an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the failing tests and the runs that recorded them.",
+            "enum": [
+              "failing_tests_blocked"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Emitted when a model's newest test evidence holds a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.",
+            "enum": [
+              "failing_tests_allowed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. A warning only: the promote proceeds. `reason` says which.",
+            "enum": [
+              "test_evidence_missing"
+            ],
+            "type": "string"
+          },
+          {
             "description": "Emitted by `rocky plan promote` when the plan has been successfully written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an audit consumer can correlate plan creation to a subsequent `rocky apply` event without scanning the filesystem.",
             "enum": [
               "promote_plan_created"
@@ -20365,6 +20386,11 @@
             "description": "Whether `--allow-breaking` was set at plan time.",
             "type": "boolean"
           },
+          "allow_failing_tests": {
+            "default": false,
+            "description": "Whether `--allow-failing-tests` was set at plan time.",
+            "type": "boolean"
+          },
           "approvals_rejected": {
             "description": "Approval artifacts loaded from disk that failed verification at plan time.",
             "items": {
@@ -23101,7 +23127,8 @@
               "lag_tolerance_seconds": 0,
               "skip_rowcount_fallback": false,
               "skip_unchanged": false,
-              "strict_scheduling": false
+              "strict_scheduling": false,
+              "tests_on_run": "off"
             },
             "description": "Opt-in run-execution tuning for the `--skip-unchanged` model-skip gate. Default-OFF: an absent `[run]` block (or one that leaves every field at its default) keeps `rocky run`'s behavior byte-identical to before the gate existed. See [`RunConfig`]."
           },
@@ -23499,6 +23526,15 @@
             "default": false,
             "description": "Turn physical-read scheduling warnings into a run refusal.\n\n`false` (default) keeps today's behaviour: #1352 derives ordering edges from physical `schema.table` reads and reports what it could NOT safely resolve — contradicting bare-read pairs, models whose reference extraction failed, colliding targets — as advisory warnings, and the run still exits 0. A consumer that ignores them can read a stale physical target and report success.\n\n`true` refuses instead, for estates that want fail-closed ordering. Opt in rather than default, because making warnings fatal changes run semantics for every existing project (#1355).\n\nLives on `[run]` rather than `[execution]` deliberately: `[execution]` is per-pipeline, and `rocky run --dag` derives ordering ACROSS pipelines, so a per-pipeline switch would have no single answer on the path that most needs one.",
             "type": "boolean"
+          },
+          "tests_on_run": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TestsOnRun"
+              }
+            ],
+            "default": "off",
+            "description": "Run each model's sidecar `[[tests]]` against the table the run just built (#2611).\n\n- `\"off\"` (default): no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `\"report\"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `\"enforce\"`: as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.\n\nA `severity = \"warning\"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation."
           }
         },
         "type": "object"
@@ -24023,6 +24059,13 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "test_results": {
+            "description": "The `[[tests]]` this run evaluated after building models, one entry per test (`[run] tests_on_run = \"report\" | \"enforce\"`, or `rocky run --tests`). Omitted when no test ran, so a default run is unchanged on the wire. The same list is persisted on the run record, where `rocky plan promote` reads it.",
+            "items": {
+              "$ref": "#/components/schemas/RunTestResultOutput"
+            },
+            "type": "array"
+          },
           "verify_after_failed": {
             "description": "`true` when this run auto-applied additive schema drift whose post-apply `verify_after` gate did not confirm it.\n\nThe gate runs after the run record exists, because it reads that record's check outcomes. It yields `Err` when a required check failed **or did not run at all** — a required check that is absent from `RunRecord::check_outcomes` fails it closed. There is no rollback substrate on a plain warehouse target, so the migration stands until a human reverts it.\n\n# Why this is its own field and not `check_gate_failed`\n\nThe two verdicts do not imply one another, and the absent-check case is exactly where they diverge:\n\n```text a required check is ABSENT      -> verify_after fails closed -> nothing failed, so the check gate has nothing to gate on: false fail_on_error = false           -> every check is advisory, so the check gate is always false, while verify_after can still fail ```\n\nIn both, `check_gate_failed` is `false` while an auto-applied migration stands unverified. Deriving one from the other would fail open on the two shapes that matter most (#1732).\n\n# What reads it\n\n[`crate::commands::run`]'s resume gate, beside `check_gate_failed`. A run that copied every table it planned and could not verify its own migration has no copy work left for a resume to do, but it does carry a synthetic `<verify_after>` entry in `models_executed` — and the resume gate admits a run \"because a model failed, and the model phase re-runs\". That entry is not a model, nothing re-runs, and the resume recorded `Success` over an unconfirmed migration.\n\nLike `check_gate_failed`, an admitted resume inherits it: the resume re-runs `verify_after` only for drift IT auto-applies, so an earlier unverified migration is never re-examined. Omitted from the JSON when `false`, so a run that verified cleanly is unchanged on the wire.",
             "type": "boolean"
@@ -24168,6 +24211,48 @@
             "type": "string"
           }
         ]
+      },
+      "RunTestResultOutput": {
+        "description": "One `[[tests]]` outcome on [`RunOutput::test_results`].",
+        "properties": {
+          "column": {
+            "description": "The column the test checks, when it checks one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "What the test found, or why it could not run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "The model the test belongs to.",
+            "type": "string"
+          },
+          "severity": {
+            "description": "`error` or `warning`. Only `error` can fail a model.",
+            "type": "string"
+          },
+          "status": {
+            "description": "`pass`, `fail`, or `error` (the test query could not run).",
+            "type": "string"
+          },
+          "test_type": {
+            "description": "The test type (`not_null`, `unique`, `accepted_values`, ...).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "severity",
+          "status",
+          "test_type"
+        ],
+        "type": "object"
       },
       "S3UrlStyle": {
         "description": "S3 addressing style.",
@@ -27543,6 +27628,32 @@
             "description": "Test failure is a warning — pipeline continues.",
             "enum": [
               "warning"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "TestsOnRun": {
+        "description": "`[run] tests_on_run` — whether a run evaluates the `[[tests]]` of the models it builds, and whether a failing one fails the model.",
+        "oneOf": [
+          {
+            "description": "No test runs during `rocky run`. The default.",
+            "enum": [
+              "off"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Run the tests and record the results; never fail a model.",
+            "enum": [
+              "report"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Run the tests; an error-severity failure fails the model.",
+            "enum": [
+              "enforce"
             ],
             "type": "string"
           }

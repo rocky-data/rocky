@@ -1571,9 +1571,41 @@ fn merge_default_seed_schemas(
     schemas: &mut HashMap<String, Vec<TypedColumn>>,
     provenance: &mut SourceProvenance,
 ) {
+    for (key, inherited_from) in fill_from_default_seed(project_root, config, schemas) {
+        match inherited_from {
+            // The bare key took a higher tier's `main.<key>` types, so it
+            // takes that tier's origin too (#2657).
+            Some(qualified) => {
+                if let Some(origin) = provenance.origins.get(&qualified).copied() {
+                    provenance.origins.insert(key, origin);
+                }
+            }
+            None => {
+                provenance.origins.insert(key, SourceSchemaOrigin::Seed);
+            }
+        }
+    }
+}
+
+/// The default seed tier of [`merge_default_seed_schemas`], without the
+/// provenance: fill `schemas` with the seed's tables it does not already
+/// hold, and return the keys it added. A bare key that took the types of an
+/// existing `main.<key>` entry comes back with that qualified key, so the
+/// caller can copy its origin.
+///
+/// Shared with `rocky ci-diff` and `rocky lineage-diff` (#2663), so a diff
+/// types its models from the same sources `rocky compile` does. A cache
+/// entry wins over a seed table of the same name. A seed that does not run
+/// is logged and skipped. A build without DuckDB adds nothing.
+pub(crate) fn fill_from_default_seed(
+    project_root: &Path,
+    config: Option<&rocky_config::RockyConfig>,
+    schemas: &mut HashMap<String, Vec<TypedColumn>>,
+) -> Vec<(String, Option<String>)> {
+    let mut added = Vec::new();
     // A build without DuckDB cannot run a seed; the default tier is silent.
     if cfg!(not(feature = "duckdb")) || !seed_file(project_root).is_file() {
-        return;
+        return added;
     }
     match load_source_schemas_from_seed_at(project_root, config) {
         Ok(seed) => {
@@ -1585,26 +1617,24 @@ fn merge_default_seed_schemas(
                 // higher tier (the schema cache) already typed `main.<key>`,
                 // the bare read takes those types and that origin, so the two
                 // spellings of one table never disagree.
-                if !key.contains('.')
-                    && let Some(qualified) = schemas.get(&format!("main.{key}")).cloned()
-                {
-                    if let Some(origin) = provenance.origins.get(&format!("main.{key}")).copied() {
-                        provenance.origins.insert(key.clone(), origin);
+                if !key.contains('.') {
+                    let qualified_key = format!("main.{key}");
+                    if let Some(qualified) = schemas.get(&qualified_key).cloned() {
+                        added.push((key.clone(), Some(qualified_key)));
+                        schemas.insert(key, qualified);
+                        continue;
                     }
-                    schemas.insert(key, qualified);
-                    continue;
                 }
-                provenance
-                    .origins
-                    .insert(key.clone(), SourceSchemaOrigin::Seed);
+                added.push((key.clone(), None));
                 schemas.insert(key, columns);
             }
         }
         Err(e) => tracing::warn!(
             error = %format!("{e:#}"),
-            "the seed file did not run; compiling without its source schemas"
+            "the seed file did not run; continuing without its source schemas"
         ),
     }
+    added
 }
 
 fn seed_file(project_root: &Path) -> std::path::PathBuf {
@@ -2752,6 +2782,50 @@ schema_template = "s"
         let data_dir = project_dir.join("data");
         fs::create_dir_all(&data_dir).unwrap();
         fs::write(data_dir.join("seed.sql"), sql).unwrap();
+    }
+
+    /// A schema-cache entry describes the warehouse, so it wins over a seed
+    /// table of the same name (#2663).
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn the_default_seed_fills_only_what_the_cache_lacks() {
+        let dir = TempDir::new().unwrap();
+        write_seed(
+            dir.path(),
+            "CREATE SCHEMA raw;\n\
+             CREATE TABLE raw.orders (id BIGINT, amount DECIMAL(10, 2));\n\
+             CREATE TABLE raw.customers (id BIGINT);\n",
+        );
+        let mut seeded = HashMap::new();
+        let mut keys: Vec<String> = fill_from_default_seed(dir.path(), None, &mut seeded)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        keys.sort();
+        assert_eq!(keys.len(), 2, "the seed must add both tables, got {keys:?}");
+        let orders_key = keys
+            .iter()
+            .find(|k| k.contains("orders"))
+            .expect("an orders key")
+            .clone();
+
+        let cached = vec![TypedColumn {
+            name: "from_cache".into(),
+            data_type: rocky_compiler::types::RockyType::String,
+            nullable: true,
+        }];
+        let mut schemas = HashMap::from([(orders_key.clone(), cached.clone())]);
+        let added: Vec<String> = fill_from_default_seed(dir.path(), None, &mut schemas)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "only the table the cache lacks, got {added:?}"
+        );
+        assert!(!added.contains(&orders_key));
+        assert_eq!(schemas[&orders_key], cached, "the cache entry must be kept");
     }
 
     #[test]
