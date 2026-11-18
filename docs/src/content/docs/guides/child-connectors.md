@@ -45,7 +45,7 @@ The steps, in order:
 rocky connector init orders
 ```
 
-It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
+It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init). [Write a Connector](/guides/write-a-connector/) walks through a whole connector, from the scaffold to the first load.
 
 ## Test a connector
 
