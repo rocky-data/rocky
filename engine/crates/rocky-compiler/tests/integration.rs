@@ -2292,13 +2292,17 @@ fn a_time_column_read_from_a_shadowed_source_is_checked_against_the_source() {
     assert!(fct.contains(&"E022"), "{:?}", result.diagnostics);
 }
 
-/// #2674: the checks that read upstream relations by name (ambiguous
-/// columns, join keys, a star through a derived table) see the source table
-/// a reader of a shadowed name reaches. Model `orders` writes `orders_v2`
-/// with one column `id`; the source table `orders` has `k DATE` and
-/// `extra`; model `b` has `k BOOLEAN`. Every reader declares `orders`.
+/// #2674: a star through a derived table or a CTE over a shadowed name
+/// expands the source table the read reaches. Model `orders` writes
+/// `orders_v2` with one column `id`; the source table `orders` has `k DATE`
+/// and `extra`. Every reader declares `orders`.
+///
+/// The checks that walk a reader's upstream models (ambiguous columns
+/// `E029`, join keys `E001`) still take the model's columns, as before
+/// #2674: that walk is keyed by model, not by read, so it cannot tell a bare
+/// read of `orders` from a read of `orders_v2` (per-read upstream: #2695).
 #[test]
-fn upstream_checks_see_the_shadowed_source_a_read_reaches() {
+fn a_star_over_a_shadowed_name_expands_the_source_table() {
     use rocky_compiler::types::TypedColumn;
     use rocky_ir::RockyType;
 
@@ -2369,10 +2373,9 @@ fn upstream_checks_see_the_shadowed_source_a_read_reaches() {
             .map(|d| d.code.to_string())
             .collect()
     };
-    // Both relations the SQL reads have `k`: the source table and `b`.
-    assert!(codes("ambiguous").contains(&"E029".to_string()));
-    // `o.k` is the source's DATE, `b.k` is BOOLEAN.
-    assert!(codes("joined").contains(&"E001".to_string()));
+    // As before #2674 (see above).
+    assert!(!codes("ambiguous").contains(&"E029".to_string()));
+    assert!(!codes("joined").contains(&"E001".to_string()));
     for model in ["derived_star", "cte_star"] {
         let star: Vec<String> = result
             .semantic_graph
@@ -2774,4 +2777,187 @@ fn full_incremental_and_scoped_compiles_agree_on_a_shadowed_source_read() {
         assert_eq!(columns(&incremental, "rc"), rc, "incremental: {path:?}");
         assert_eq!(columns(&incremental, "rs"), rs, "incremental: {path:?}");
     }
+}
+
+/// #2674 red team: a reader that joins model `orders` through its target
+/// table `orders_v2`, and also reads the bare name `orders` (the source
+/// table), joins the model's VARCHAR `id`. DuckDB runs it. The join-key
+/// check must not take the source's BIGINT for the model's columns.
+#[test]
+fn a_join_through_the_target_table_keeps_the_models_columns() {
+    use rocky_ir::RockyType;
+    let result = compile_2674(
+        &[
+            (
+                "orders",
+                "SELECT CAST('x' AS VARCHAR) AS id",
+                "",
+                "orders_v2",
+            ),
+            ("c", "SELECT CAST('x' AS VARCHAR) AS id, 1 AS n", "", "c"),
+            (
+                "r",
+                "SELECT b.id, c.n FROM orders_v2 b JOIN c ON b.id = c.id \
+                 WHERE EXISTS (SELECT 1 FROM orders)",
+                "",
+                "r",
+            ),
+        ],
+        &[(
+            "orders",
+            &[
+                ("id", RockyType::Int64, false),
+                ("extra", RockyType::String, true),
+            ],
+        )],
+    );
+    let errors: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.model == "r" && d.severity == rocky_compiler::diagnostic::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// #2674 red team: lineage lowercases a nested read, so a nested read of the
+/// mixed-case ephemeral model `Eph` does not bind to it. A mixed-case model
+/// name keeps the typing it had before #2674: the run inlines the ephemeral
+/// model (BIGINT), not the source table `Eph` (VARCHAR), so `SUM` is fine.
+#[test]
+fn a_nested_read_of_a_mixed_case_model_is_typed_as_before() {
+    use rocky_ir::RockyType;
+    let result = compile_2674(
+        &[
+            (
+                "Eph",
+                "SELECT CAST(1.5 AS DOUBLE) AS status",
+                "[strategy]\ntype = \"ephemeral\"\n",
+                "Eph",
+            ),
+            (
+                "rd_sum",
+                "SELECT SUM(x.status) AS s FROM (SELECT status FROM Eph) x",
+                "",
+                "rd_sum",
+            ),
+            (
+                "rd_cte",
+                "WITH c AS (SELECT status FROM Eph) SELECT SUM(status) AS s FROM c",
+                "",
+                "rd_cte",
+            ),
+            ("rd_top", "SELECT status FROM Eph", "", "rd_top"),
+        ],
+        &[("Eph", &[("status", RockyType::String, false)])],
+    );
+    let operands = rocky_compiler::operand_check::check_operand_types(
+        &result.project.models,
+        &result.semantic_graph,
+        &result.type_check.typed_models,
+        &result.type_check.shadowed_sources,
+        Some(rocky_compiler::operand_check::OperandDialect::DuckDb),
+    );
+    let e042: Vec<_> = result
+        .diagnostics
+        .iter()
+        .chain(&operands)
+        .filter(|d| &*d.code == "E042")
+        .collect();
+    assert!(e042.is_empty(), "{e042:?}");
+
+    assert_eq!(
+        columns_2674(&result, "rd_top"),
+        vec![("status".to_string(), RockyType::Float64)]
+    );
+}
+
+/// #2674: one model reads the ephemeral model `orders` both as `Orders` (top
+/// level) and as `orders` (nested). The inliner matches the exact name, so
+/// on DuckDB the nested `orders` is the ephemeral model (`m DOUBLE`) and the
+/// top-level `Orders` is the source table (`status VARCHAR`). (A derived
+/// table's columns are not inferred yet, so the nested read is a CTE body.) Both fold to
+/// one binding key; the model binding wins over the top-level miss.
+#[test]
+fn a_nested_exact_read_of_an_ephemeral_model_keeps_its_binding() {
+    use rocky_ir::RockyType;
+    let result = compile_2674(
+        &[
+            (
+                "orders",
+                "SELECT CAST(1.5 AS DOUBLE) AS status",
+                "[strategy]\ntype = \"ephemeral\"\n",
+                "orders_t",
+            ),
+            (
+                "r3",
+                "WITH c AS (SELECT status FROM orders) SELECT c.status AS m, o.status FROM c CROSS JOIN Orders o",
+                "",
+                "r3",
+            ),
+        ],
+        &[("orders", &[("status", RockyType::String, false)])],
+    );
+    let columns = columns_2674(&result, "r3");
+    assert_eq!(
+        columns[0],
+        ("m".to_string(), RockyType::Float64),
+        "{columns:?}"
+    );
+    // A claim about `o.status` must be the source's VARCHAR.
+    assert!(
+        matches!(columns[1].1, RockyType::String | RockyType::Unknown),
+        "{columns:?}"
+    );
+}
+
+/// #2674: the D012 note goes only on an `E012` whose column is `Unknown`. A
+/// typed nullable column in the same model gets the plain message.
+#[test]
+fn the_d012_note_is_only_on_an_unknown_column() {
+    use rocky_ir::RockyType;
+    let result = compile_2674_with_contracts(
+        &[
+            (
+                "customers",
+                "SELECT CAST('x' AS VARCHAR) AS id",
+                "",
+                "customers_v2",
+            ),
+            (
+                "dim_customers",
+                "SELECT CAST(1.5 AS DOUBLE) AS id",
+                "",
+                "customers",
+            ),
+            (
+                "late",
+                "SELECT c.id, b.v FROM customers c CROSS JOIN b",
+                "",
+                "late",
+            ),
+            ("b", "SELECT v FROM raw.bsrc", "", "b"),
+        ],
+        &[
+            ("customers", &[("id", RockyType::Int64, false)]),
+            ("raw.bsrc", &[("v", RockyType::String, true)]),
+        ],
+        &[(
+            "late",
+            "[[columns]]\nname = \"id\"\nnullable = false\n\
+             [[columns]]\nname = \"v\"\ntype = \"String\"\nnullable = false\n",
+        )],
+    );
+    let e012 = |column: &str| {
+        result
+            .diagnostics
+            .iter()
+            .find(|d| {
+                &*d.code == "E012"
+                    && d.model == "late"
+                    && d.message.contains(&format!("'{column}'"))
+            })
+            .unwrap_or_else(|| panic!("E012 on {column}: {:?}", result.diagnostics))
+    };
+    assert!(e012("id").message.contains("see D012"), "{:?}", e012("id"));
+    assert!(!e012("v").message.contains("see D012"), "{:?}", e012("v"));
 }

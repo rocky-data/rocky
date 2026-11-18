@@ -149,6 +149,17 @@ pub enum NamedRead {
     NotComputed,
 }
 
+/// Whether the read binding decides what a bare read spelled with model
+/// `name` reaches (#2674). Only for a name with no upper-case letter: lineage
+/// lowercases a nested read, so a mixed-case name's nested reads bind under
+/// another spelling, and an exact-name binding (such as an ephemeral model's)
+/// can be missed. A read of a mixed-case model name is typed as before #2674:
+/// from the model, and a star expands it when the reader depends on it.
+#[must_use]
+pub fn binding_decides(name: &str) -> bool {
+    !name.bytes().any(|b| b.is_ascii_uppercase())
+}
+
 impl ModelSchema {
     /// Whether [`Self::columns`] is provably the model's **entire** output
     /// schema, so that "column X is absent" is a fact rather than a gap in
@@ -187,6 +198,9 @@ impl ModelSchema {
     /// without rewriting a read, so the name alone never says.
     #[must_use]
     pub fn named_read(&self, name: &str) -> NamedRead {
+        if !binding_decides(name) {
+            return NamedRead::ThatModel;
+        }
         let Some(reads) = &self.reads else {
             return NamedRead::NotComputed;
         };
@@ -556,16 +570,25 @@ pub fn build_semantic_graph(
         // writes (see `NamedRead::OtherModel`), so a star over it stays
         // unexpanded: neither that model's columns nor the source's (#2674).
         let star_reads_other_model = |name: &str| {
-            model_names.contains(name)
+            binding_decides(name)
+                && model_names.contains(name)
                 && matches!(
                     reads.get(&rocky_core::physical_edges::fold_identifier(name)),
                     Some(ReadTarget::Model(m)) if m != name
                 )
         };
         // Whether this model's star over `name` reads the model of that name.
+        // For a mixed-case name, the rule before #2674: the reader depends on
+        // the model.
         let star_reads_model = |name: &str| {
-            reads.get(&rocky_core::physical_edges::fold_identifier(name))
-                == Some(&ReadTarget::Model(name.to_string()))
+            if binding_decides(name) {
+                reads.get(&rocky_core::physical_edges::fold_identifier(name))
+                    == Some(&ReadTarget::Model(name.to_string()))
+            } else {
+                upstream_map
+                    .get(model_name.as_str())
+                    .is_some_and(|deps| deps.iter().any(|dep| dep == name))
+            }
         };
 
         // Build table alias → resolved name map for this model's SQL
@@ -858,9 +881,10 @@ pub fn build_semantic_graph(
                             break;
                         }
                         let via = through.for_relation(&source_names(inner_name));
-                        if let Some(upstream_schema) = models
-                            .get(inner_name.as_str())
-                            .filter(|_| star_reads_model(inner_name))
+                        if let Some(upstream_schema) =
+                            models.get(inner_name.as_str()).filter(|_| {
+                                !binding_decides(inner_name) || star_reads_model(inner_name)
+                            })
                         {
                             for col in &upstream_schema.columns {
                                 if via.column(&col.name) == StarColumn::Excluded {

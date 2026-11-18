@@ -214,9 +214,12 @@ enum Writer {
 ///   from it (the #2674 bug: before, it took model `orders`' VARCHAR).
 /// - A writer: `resolve.rs` binds the read to `w` by table name, ignoring the
 ///   schema. The run reads `w`'s table when `w` writes `main`, and the source
-///   when `w` writes `staging`. Rocky cannot tell which, so it claims no type
-///   and no star columns.
-/// - No source and no table in `main`: the run fails, and Rocky claims none.
+///   when `w` writes `staging`. Rocky cannot tell which, so the read itself is
+///   Unknown. The upstream-model check still compares model `orders`'s
+///   VARCHAR with `w`'s DOUBLE and refuses the compile (`E001`), as before
+///   #2674: that walk is keyed by model, not by read (#2695). This test pins
+///   that refusal, so the fix for #2695 must update it.
+/// - No source and no writer: the run fails, and Rocky claims no type.
 ///
 /// In every cell, a type Rocky claims is the type DuckDB built.
 #[test]
@@ -285,6 +288,37 @@ fn every_writer_and_source_cell_is_typed_as_the_run_builds_it_or_not_at_all() {
                 }
             }
 
+            if schema.is_some() {
+                let compile = rocky(root, &["compile", "--with-seed", "--output", "json"]);
+                let doc: serde_json::Value = serde_json::from_slice(&compile.stdout)
+                    .unwrap_or_else(|e| panic!("{cell}: {e}: {}", text(&compile)));
+                let mut errors: Vec<(String, String)> = doc["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|d| {
+                        d["severity"]
+                            .as_str()
+                            .is_some_and(|s| s.eq_ignore_ascii_case("error"))
+                    })
+                    .map(|d| {
+                        (
+                            d["code"].as_str().unwrap().to_string(),
+                            d["model"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect();
+                errors.sort();
+                assert_eq!(
+                    errors,
+                    [
+                        ("E001".to_string(), "rc".to_string()),
+                        ("E001".to_string(), "rs".to_string()),
+                    ],
+                    "{cell}"
+                );
+                continue;
+            }
             let run = rocky(root, &["--output", "json", "run", "--pipeline", "main"]);
             let publish = rocky(
                 root,
@@ -316,7 +350,7 @@ fn every_writer_and_source_cell_is_typed_as_the_run_builds_it_or_not_at_all() {
 
             // The table the run reads exists unless there is no source and
             // no table `orders` in `main`.
-            let reachable = source || matches!(writer, Writer::DefaultSchema);
+            let reachable = source;
             assert_eq!(run.status.success(), reachable, "{cell}: {}", text(&run));
             if reachable {
                 let conn = duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
@@ -359,4 +393,117 @@ fn every_writer_and_source_cell_is_typed_as_the_run_builds_it_or_not_at_all() {
             }
         }
     }
+}
+
+/// #2674: a mixed-case model name keeps the typing it had before #2674.
+///
+/// Lineage lowercases a nested read, so the read binding cannot tell a
+/// nested `Eph` from a table `eph`. The ephemeral model `Eph` (DOUBLE) and a
+/// source table `"Eph"` (VARCHAR) share the name; the run inlines the
+/// ephemeral model wherever the SQL spells `Eph`, so every reader here reads
+/// DOUBLE. Rocky must not take the source's VARCHAR: no `SUM(VARCHAR)`
+/// error (`E042`), and every type it claims is the one DuckDB built.
+#[test]
+fn a_mixed_case_model_name_is_typed_as_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(
+        root.join("rocky.toml"),
+        "[adapter.wh]\ntype = \"duckdb\"\npath = \"warehouse.duckdb\"\n\
+         [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+         [pipeline.main.target]\nadapter = \"wh\"\n",
+    )
+    .unwrap();
+    let source = "CREATE TABLE \"Eph\" (status VARCHAR NOT NULL);";
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(root.join("data/seed.sql"), source).unwrap();
+    let models = root.join("models");
+    fs::create_dir_all(&models).unwrap();
+    fs::write(
+        models.join("e_upper.sql"),
+        "SELECT CAST(1.5 AS DOUBLE) AS status",
+    )
+    .unwrap();
+    fs::write(
+        models.join("e_upper.toml"),
+        "name = \"Eph\"\n[strategy]\ntype = \"ephemeral\"\n\
+         [target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"Eph\"\n",
+    )
+    .unwrap();
+    let readers = [
+        (
+            "rd_sum",
+            "SELECT SUM(x.status) AS s FROM (SELECT status FROM Eph) x",
+        ),
+        (
+            "rd_cte_sum",
+            "WITH c AS (SELECT status FROM Eph) SELECT SUM(status) AS s FROM c",
+        ),
+        ("rd_top", "SELECT status FROM Eph"),
+    ];
+    for (name, sql) in readers {
+        write_model(&models, name, sql, name, "");
+    }
+    {
+        let conn = duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
+        conn.execute_batch(&format!("{source} INSERT INTO \"Eph\" VALUES ('x');"))
+            .unwrap();
+    }
+
+    let compile = rocky(root, &["compile", "--with-seed", "--output", "json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&compile.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", text(&compile)));
+    let errors: Vec<&serde_json::Value> = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| {
+            d["severity"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("error"))
+        })
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let run = rocky(root, &["--output", "json", "run", "--pipeline", "main"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let publish = rocky(
+        root,
+        &[
+            "publish-ir",
+            "--models",
+            "models",
+            "--with-seed",
+            "--out",
+            "snapshot.json",
+        ],
+    );
+    assert!(publish.status.success(), "{}", text(&publish));
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("snapshot.json")).unwrap()).unwrap();
+    let ir: rocky_ir::ProjectIr = serde_json::from_value(snapshot["ir"].clone()).unwrap();
+    let conn = duckdb::Connection::open(root.join("warehouse.duckdb")).unwrap();
+    let mut claimed = 0;
+    for (reader, _) in readers {
+        let built = describe(&conn, reader);
+        let model = ir.models.iter().find(|m| &*m.name == reader).unwrap();
+        for column in &model.typed_columns {
+            if column.data_type == rocky_ir::RockyType::Unknown {
+                continue;
+            }
+            let (_, duckdb_type, _) = built
+                .iter()
+                .find(|(c, ..)| c == &column.name)
+                .unwrap_or_else(|| panic!("{reader}.{} not built", column.name));
+            assert_eq!(
+                column.data_type,
+                rocky_type(duckdb_type),
+                "{reader}.{}: DuckDB built {duckdb_type}",
+                column.name
+            );
+            claimed += 1;
+        }
+    }
+    // `rd_top.status` at least is typed (the model's DOUBLE).
+    assert!(claimed >= 1);
 }

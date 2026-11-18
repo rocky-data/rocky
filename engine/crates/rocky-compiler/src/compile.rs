@@ -1253,7 +1253,9 @@ fn ambiguous_model_reads(graph: &SemanticGraph, model_name: &str) -> Vec<(String
                 .models
                 .keys()
                 .find(|name| {
-                    *name != writer && rocky_core::physical_edges::fold_identifier(name) == *key
+                    crate::semantic::binding_decides(name)
+                        && *name != writer
+                        && rocky_core::physical_edges::fold_identifier(name) == *key
                 })
                 .map(|name| (name.clone(), writer.clone()))
         })

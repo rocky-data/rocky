@@ -194,26 +194,13 @@ impl<'a> Relations<'a> {
         }
     }
 
-    /// The columns of upstream model `upstream` as `reader` reads it: the
-    /// model's, unless `reader`'s bare read of that name reaches the source
-    /// table. A declared model the SQL never reads bare keeps its columns,
-    /// as before.
-    pub(crate) fn upstream(&self, reader: &str, upstream: &str) -> Option<&'a [TypedColumn]> {
-        let read = self
-            .graph
-            .model_schema(reader)
-            .map(|s| s.named_read(upstream));
-        match read {
-            Some(NamedRead::Source) => self.shadowed.get(upstream).map(Vec::as_slice),
-            Some(NamedRead::OtherModel) => None,
-            Some(
-                NamedRead::ThatModel
-                | NamedRead::Local
-                | NamedRead::Unlisted
-                | NamedRead::NotComputed,
-            )
-            | None => self.typed.get(upstream).map(Vec::as_slice),
-        }
+    /// The columns of upstream model `upstream`, for checks that walk a
+    /// reader's upstream models (join keys, `E001`): the model's own, as
+    /// before #2674. The walk is keyed by model, not by read, so it cannot
+    /// tell a bare read of the model's name from a read of its target table
+    /// (per-read upstream: #2695).
+    pub(crate) fn upstream(&self, _reader: &str, upstream: &str) -> Option<&'a [TypedColumn]> {
+        self.typed.get(upstream).map(Vec::as_slice)
     }
 
     /// Whether `reader`'s read spelled `read` reaches a project model's

@@ -1282,23 +1282,34 @@ mod tests {
         assert_eq!(refused, 2);
 
         // Quoted on one side: DuckDB reads the CTE, Snowflake the table.
-        // Rocky does not guess: the `WITH` name does not match, and the
-        // read binding lists the name as a `WITH` name, so the read is
-        // Unknown and nothing is refused.
+        // Rocky does not guess. Here the CTE's `status` is DOUBLE and the
+        // source table's is VARCHAR, with a model `orders` (writing
+        // `orders_v2`) in the project: DuckDB runs `SUM`, and a Rocky that
+        // took the table's VARCHAR would refuse it. The read binding lists
+        // the name as a `WITH` name, so the read is Unknown and nothing is
+        // refused.
+        let double_cte = "SELECT CAST(1.5 AS DOUBLE) AS status";
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE orders AS SELECT 'x'::VARCHAR AS status")
+            .unwrap();
         for sql in [
-            format!("WITH \"Orders\" AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
-            format!("WITH Orders AS ({CTE}) SELECT SUM(status) AS t FROM \"orders\""),
+            format!("WITH \"Orders\" AS ({double_cte}) SELECT SUM(status) AS t FROM orders"),
+            format!("WITH Orders AS ({double_cte}) SELECT SUM(status) AS t FROM \"orders\""),
         ] {
-            assert!(conn.prepare(&sql).is_err(), "DuckDB reads the CTE: {sql}");
+            assert!(conn.prepare(&sql).is_ok(), "DuckDB reads the CTE: {sql}");
             let mut source_schemas = sources();
-            source_schemas.insert("orders".to_string(), vec![col("status", RockyType::Int64)]);
+            source_schemas.insert("orders".to_string(), vec![col("status", RockyType::String)]);
             let config = crate::compile::CompilerConfig {
                 source_schemas,
                 ..Default::default()
             };
-            let result =
-                crate::compile::compile_preloaded_models(vec![model("reader", &sql)], &config)
-                    .expect("compile");
+            let mut orders = model("orders", "SELECT CAST(1 AS INTEGER) AS status");
+            orders.config.target.table = "orders_v2".to_string();
+            let result = crate::compile::compile_preloaded_models(
+                vec![orders, model("reader", &sql)],
+                &config,
+            )
+            .expect("compile");
             let diags = check_operand_types(
                 &result.project.models,
                 &result.semantic_graph,
