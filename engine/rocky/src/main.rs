@@ -2549,8 +2549,6 @@ enum Command {
     /// * `preview diff` produces a structural + sampled row-level diff
     ///   between branch and base;
     /// * `preview cost` produces a per-model bytes/duration/USD delta.
-    ///
-    /// See `plans/rocky-pr-preview-and-data-diff.md` for the design.
     Preview {
         #[command(subcommand)]
         action: PreviewAction,
