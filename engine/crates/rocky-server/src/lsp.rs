@@ -8617,6 +8617,7 @@ adapter = "db"
                 upstream: vec![],
                 downstream: vec!["staging".to_string()],
                 intent: None,
+                reads: None,
             },
         );
         models.insert(
@@ -8636,6 +8637,7 @@ adapter = "db"
                 upstream: vec!["source_table".to_string()],
                 downstream: vec!["mart".to_string()],
                 intent: None,
+                reads: None,
             },
         );
         models.insert(
@@ -8650,6 +8652,7 @@ adapter = "db"
                 upstream: vec!["staging".to_string()],
                 downstream: vec![],
                 intent: None,
+                reads: None,
             },
         );
 

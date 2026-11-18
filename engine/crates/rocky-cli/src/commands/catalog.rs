@@ -1079,6 +1079,7 @@ mod tests {
                 upstream: vec!["upstream".into()],
                 downstream: vec![],
                 intent: None,
+                reads: None,
             },
         );
         models.insert(
@@ -1091,6 +1092,7 @@ mod tests {
                 upstream: vec!["upstream".into()],
                 downstream: vec![],
                 intent: None,
+                reads: None,
             },
         );
         let graph = SemanticGraph::new(models, Vec::new());

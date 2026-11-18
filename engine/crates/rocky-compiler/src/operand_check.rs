@@ -126,8 +126,8 @@ use sqlparser::parser::Parser;
 use crate::diagnostic::{Diagnostic, E042, E043, SourceSpan, W042, W043};
 use crate::semantic::SemanticGraph;
 use crate::typecheck::{
-    InferEnv, RelationRef, TypeScope, infer_expr_type, infer_query_types, rename_relation_columns,
-    select_type_scope,
+    InferEnv, RelationRef, Relations, TypeScope, infer_expr_type, infer_query_types,
+    rename_relation_columns, select_type_scope,
 };
 use crate::types::{RockyType, TypedColumn};
 
@@ -468,14 +468,23 @@ fn dialects_with(f: impl Fn(OperandDialect) -> Verdict, verdict: Verdict) -> Str
 /// already covers.
 ///
 /// [`check_join_keys`]: crate::typecheck
+///
+/// `shadowed_sources` is [`TypeCheckResult::shadowed_sources`]: a read of a
+/// model's name that does not bind to the model reaches the source table
+/// (#2674).
+///
+/// [`TypeCheckResult::shadowed_sources`]: crate::typecheck::TypeCheckResult::shadowed_sources
 pub fn check_operand_types(
     models: &[rocky_core::models::Model],
     graph: &SemanticGraph,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    shadowed_sources: &std::collections::HashMap<String, Vec<TypedColumn>>,
     dialect: Option<OperandDialect>,
 ) -> Vec<Diagnostic> {
     let target = OperandTarget::from(dialect);
-    check_operand_types_per_model(models, graph, typed_models, &|_| target.clone())
+    check_operand_types_per_model(models, graph, typed_models, shadowed_sources, &|_| {
+        target.clone()
+    })
 }
 
 /// [`check_operand_types`] with a target per model: `target_for` maps a model
@@ -484,12 +493,15 @@ pub fn check_operand_types_per_model(
     models: &[rocky_core::models::Model],
     graph: &SemanticGraph,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    shadowed_sources: &std::collections::HashMap<String, Vec<TypedColumn>>,
     target_for: &dyn Fn(&str) -> OperandTarget,
 ) -> Vec<Diagnostic> {
+    // A qualified read is looked up as spelled here, so no model map.
+    let relations = Relations::new(graph, typed_models, None, shadowed_sources, None);
     let mut diagnostics = Vec::new();
     for model in models {
         let target = target_for(&model.config.name);
-        diagnostics.extend(check_model(model, graph, typed_models, target));
+        diagnostics.extend(check_model(model, graph, relations, target));
     }
     diagnostics
 }
@@ -497,7 +509,7 @@ pub fn check_operand_types_per_model(
 fn check_model(
     model: &rocky_core::models::Model,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    relations: Relations<'_>,
     target: OperandTarget,
 ) -> Vec<Diagnostic> {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
@@ -519,11 +531,12 @@ fn check_model(
         file,
         precise_spans,
         target,
-        join_key_columns: join_key_checked_columns(&model.config.name, graph, typed_models),
+        join_key_columns: join_key_checked_columns(&model.config.name, graph, relations),
         seen: HashSet::new(),
         out: Vec::new(),
     };
-    let lookup = |name: &str| typed_models.get(name).map(Vec::as_slice);
+    let reader = model.config.name.as_str();
+    let lookup = |name: &str| relations.get(reader, name);
     walk_query(query, &lookup, &mut ctx);
     ctx.out
 }
@@ -535,7 +548,7 @@ fn check_model(
 fn join_key_checked_columns(
     model: &str,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    relations: Relations<'_>,
 ) -> HashSet<String> {
     let mut covered = HashSet::new();
     let Some(schema) = graph.model_schema(model) else {
@@ -547,7 +560,7 @@ fn join_key_checked_columns(
     let mut types: std::collections::HashMap<&str, Vec<&RockyType>> =
         std::collections::HashMap::new();
     for upstream in &schema.upstream {
-        for col in typed_models.get(upstream.as_str()).into_iter().flatten() {
+        for col in relations.upstream(model, upstream).into_iter().flatten() {
             if col.data_type != RockyType::Unknown {
                 types
                     .entry(col.name.as_str())
@@ -1164,6 +1177,7 @@ mod tests {
             &result.project.models,
             &result.semantic_graph,
             &result.type_check.typed_models,
+            &result.type_check.shadowed_sources,
             dialect,
         )
     }
@@ -1176,6 +1190,34 @@ mod tests {
         "SELECT customer_id, SUM(customer_name) AS s FROM raw.customers GROUP BY customer_id";
     const D5: &str = "SELECT o.order_id, c.customer_name FROM raw.orders o \
                       JOIN raw.customers c ON o.customer_id = c.customer_name";
+
+    #[test]
+    /// #2674: a reader that declares model `orders`, which writes
+    /// `orders_v2`, still reads the table called `orders` when it runs, so
+    /// its operands take that table's types. Before, the reader ran a layer
+    /// after the model and took the model's `status INTEGER`.
+    fn an_operand_read_of_a_shadowed_source_takes_the_sources_type() {
+        let mut orders = model("orders", "SELECT CAST(1 AS INTEGER) AS status");
+        orders.config.target.table = "orders_v2".to_string();
+        let mut reader = model("reader", "SELECT SUM(status) AS s FROM orders");
+        reader.config.depends_on = vec!["orders".to_string()];
+        let mut source_schemas = sources();
+        source_schemas.insert("orders".to_string(), vec![col("status", RockyType::String)]);
+        let config = crate::compile::CompilerConfig {
+            source_schemas,
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(vec![orders, reader], &config)
+            .expect("compile");
+        let diags = check_operand_types(
+            &result.project.models,
+            &result.semantic_graph,
+            &result.type_check.typed_models,
+            &result.type_check.shadowed_sources,
+            Some(OperandDialect::DuckDb),
+        );
+        assert_eq!(codes(&diags), vec!["E042"], "{diags:?}");
+    }
 
     #[test]
     fn d2_sum_over_varchar_is_refused_on_duckdb() {
@@ -1458,6 +1500,7 @@ mod tests {
             &result.project.models,
             &result.semantic_graph,
             &result.type_check.typed_models,
+            &result.type_check.shadowed_sources,
             &|_| target.clone(),
         )
     }

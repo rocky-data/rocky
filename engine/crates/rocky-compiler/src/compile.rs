@@ -3537,6 +3537,7 @@ mod tests {
                 diagnostics: Vec::new(),
                 reference_map: Default::default(),
                 model_typecheck_ms: HashMap::new(),
+                shadowed_sources: HashMap::new(),
             };
             let result = typecheck::typecheck_project_incremental(
                 &graph,

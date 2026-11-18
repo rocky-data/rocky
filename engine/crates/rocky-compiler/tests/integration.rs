@@ -2001,3 +2001,368 @@ fn a_scoped_compile_judges_consumers_against_the_whole_project() {
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(messages[0].contains("`nowhere`"), "{}", messages[0]);
 }
+
+/// #2674: a read is typed from what it reaches when the SQL runs, the
+/// binding `resolve.rs` derives the DAG edge from (#1354), never by name and
+/// never by DAG layer.
+///
+/// Model `orders` writes `orders_v2` and outputs `id` as a string. A source
+/// table `orders` has `id BIGINT NOT NULL` and `extra VARCHAR`. A bare
+/// `orders` reads that source table in every layer, even for a reader that
+/// declares `depends_on = ["orders"]`: `depends_on` orders the run, it does
+/// not rewrite the read. A bare `orders_v2` reads the model, but no model is
+/// named `orders_v2`, so that read stays Unknown.
+#[test]
+fn a_read_is_typed_from_what_it_reaches_at_run_time() {
+    use rocky_compiler::types::TypedColumn;
+    use rocky_ir::RockyType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    let write = |name: &str, sql: &str, extra: &str| {
+        let table = match name {
+            "orders" => "orders_v2",
+            "x" => "x_v2",
+            _ => name,
+        };
+        std::fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+        std::fs::write(
+            models.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n{extra}\n[target]\ncatalog = \"cat\"\n\
+                 schema = \"sch\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    write("orders", "SELECT CAST('x' AS VARCHAR) AS id", "");
+    write("x", "SELECT CAST(1 AS INTEGER) AS id", "");
+    write("a", "SELECT 1 AS k", "");
+    write("b", "SELECT k FROM a", "");
+    write(
+        "eph",
+        "SELECT CAST('2024-01-01' AS DATE) AS id",
+        "[strategy]\ntype = \"ephemeral\"\n",
+    );
+    // A reader in the model's layer, one in a later layer, and one that
+    // declares the model.
+    write("same_layer", "SELECT id FROM orders", "");
+    write(
+        "later_layer",
+        "SELECT o.id, b.k FROM orders o CROSS JOIN b",
+        "",
+    );
+    write(
+        "reader",
+        "SELECT id FROM orders",
+        "depends_on = [\"orders\"]\n",
+    );
+    write("later_star", "SELECT * FROM orders CROSS JOIN b", "");
+    write(
+        "declared_star",
+        "SELECT * FROM orders",
+        "depends_on = [\"orders\"]\n",
+    );
+    // The model's own table, spelled as written and in another case.
+    write("reads_target", "SELECT id FROM orders_v2 CROSS JOIN b", "");
+    write(
+        "reads_target_upper",
+        "SELECT id FROM ORDERS_V2 CROSS JOIN b",
+        "",
+    );
+    // A model-only name whose target is spelled differently: external.
+    write("reads_x", "SELECT id FROM x CROSS JOIN b", "");
+    // A CTE, a derived table and an ephemeral model.
+    write(
+        "cte_shadow",
+        "WITH orders AS (SELECT CAST(1.5 AS DOUBLE) AS id) SELECT id FROM orders",
+        "",
+    );
+    write(
+        "cte_through",
+        "WITH c AS (SELECT id FROM orders) SELECT c.id FROM c CROSS JOIN b",
+        "",
+    );
+    write(
+        "derived",
+        "SELECT d.id FROM (SELECT id FROM orders) d CROSS JOIN b",
+        "",
+    );
+    write("reads_eph", "SELECT id FROM eph", "");
+    let config = CompilerConfig {
+        models_dir: models,
+        source_schemas: HashMap::from([(
+            "orders".to_string(),
+            vec![
+                TypedColumn {
+                    name: "id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                },
+                TypedColumn {
+                    name: "extra".to_string(),
+                    data_type: RockyType::String,
+                    nullable: true,
+                },
+            ],
+        )]),
+        ..Default::default()
+    };
+    let result = compile(&config).expect("compile");
+    let deps = |m: &str| {
+        result
+            .project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == m)
+            .map(|n| n.depends_on.clone())
+            .unwrap()
+    };
+    // The DAG the test relies on: only a declaration or the target table
+    // makes an edge to `orders`.
+    assert_eq!(deps("same_layer"), Vec::<String>::new());
+    assert_eq!(deps("later_layer"), vec!["b".to_string()]);
+    assert_eq!(deps("reader"), vec!["orders".to_string()]);
+    assert!(deps("reads_target").contains(&"orders".to_string()));
+    assert!(deps("reads_target_upper").contains(&"orders".to_string()));
+    assert!(!deps("reads_x").contains(&"x".to_string()));
+    assert!(deps("reads_eph").contains(&"eph".to_string()));
+
+    let columns = |model: &str| -> Vec<(String, RockyType, bool)> {
+        result.type_check.typed_models[model]
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect()
+    };
+    let id = |model: &str| {
+        columns(model)
+            .into_iter()
+            .find(|(name, ..)| name == "id")
+            .map(|(_, ty, nullable)| (ty, nullable))
+            .unwrap_or_else(|| panic!("{model} has no id column"))
+    };
+    let source_id = (RockyType::Int64, false);
+    let model_id = id("orders");
+    assert_eq!(model_id.0, RockyType::String);
+    for reader in ["same_layer", "later_layer", "reader", "cte_through"] {
+        assert_eq!(id(reader), source_id, "{reader} reads the source table");
+    }
+    for star in ["later_star", "declared_star"] {
+        let cols = columns(star);
+        assert_eq!(
+            cols[..2],
+            [
+                ("id".to_string(), RockyType::Int64, false),
+                ("extra".to_string(), RockyType::String, true),
+            ],
+            "{star} expands the source table"
+        );
+    }
+    // A read of the model's table under another spelling reaches the model,
+    // but is still typed by name, so it stays Unknown. Typing it from the
+    // binding adds precision, not soundness, and is a separate change.
+    assert_eq!(id("reads_target").0, RockyType::Unknown);
+    assert_eq!(id("reads_target_upper").0, RockyType::Unknown);
+    // A derived table's column carries no edge to the table, so it is
+    // Unknown, but never the model's type.
+    assert_eq!(id("derived").0, RockyType::Unknown);
+    assert_eq!(id("reads_x").0, RockyType::Unknown, "no model writes `x`");
+    // A CTE named `orders` hides both the model and the source table.
+    let cte = id("cte_shadow").0;
+    assert!(
+        cte != model_id.0 && cte != source_id.0,
+        "the CTE's column, not `orders`: {cte:?}"
+    );
+    assert_eq!(id("reads_eph").0, RockyType::Date, "the inlined model");
+
+    // The incremental path reaches the same answer: re-typechecking only the
+    // readers, seeded with the full result, reproduces it.
+    let readers: std::collections::HashSet<String> = [
+        "same_layer",
+        "later_layer",
+        "reader",
+        "later_star",
+        "declared_star",
+        "cte_through",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let incremental = rocky_compiler::typecheck::typecheck_project_incremental(
+        &result.semantic_graph,
+        &config.source_schemas,
+        &result.project.models,
+        &readers,
+        &result.type_check,
+        None,
+        &Default::default(),
+    );
+    for reader in &readers {
+        assert_eq!(
+            incremental.typed_models[reader.as_str()],
+            result.type_check.typed_models[reader.as_str()],
+            "{reader}"
+        );
+    }
+}
+
+/// #2674: the nullable bit of a column read from a shadowed source rests on
+/// that source's type, not on the same-named model's edges. Model `events`
+/// writes `events_v2` with an edgeless `d`; the source table `events` has a
+/// nullable `d DATE`. A time-interval reader that declares the model reads
+/// the source, so its time column is provably nullable: `E022`. Before, the
+/// read reached the model's edgeless `d`, so the bit was not proven and
+/// `E022` was dropped.
+#[test]
+fn a_time_column_read_from_a_shadowed_source_is_checked_against_the_source() {
+    use rocky_compiler::types::TypedColumn;
+    use rocky_ir::RockyType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(
+        models.join("events.sql"),
+        "SELECT CAST('2024-01-01' AS DATE) AS d",
+    )
+    .unwrap();
+    std::fs::write(
+        models.join("events.toml"),
+        "name = \"events\"\n\n[target]\ncatalog = \"cat\"\nschema = \"sch\"\ntable = \"events_v2\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        models.join("fct.sql"),
+        "SELECT d FROM events WHERE ts >= @start_date AND ts < @end_date",
+    )
+    .unwrap();
+    std::fs::write(
+        models.join("fct.toml"),
+        "name = \"fct\"\ndepends_on = [\"events\"]\n\n[strategy]\ntype = \"time_interval\"\n\
+         time_column = \"d\"\ngranularity = \"day\"\n\n[target]\ncatalog = \"cat\"\n\
+         schema = \"sch\"\ntable = \"fct\"\n",
+    )
+    .unwrap();
+    let config = CompilerConfig {
+        models_dir: models,
+        source_schemas: HashMap::from([(
+            "events".to_string(),
+            vec![
+                TypedColumn {
+                    name: "d".to_string(),
+                    data_type: RockyType::Date,
+                    nullable: true,
+                },
+                TypedColumn {
+                    name: "ts".to_string(),
+                    data_type: RockyType::Date,
+                    nullable: false,
+                },
+            ],
+        )]),
+        ..Default::default()
+    };
+    let result = compile(&config).expect("compile");
+    let fct: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.model == "fct")
+        .map(|d| &*d.code)
+        .collect();
+    assert!(fct.contains(&"E022"), "{:?}", result.diagnostics);
+}
+
+/// #2674: the checks that read upstream relations by name (ambiguous
+/// columns, join keys, a star through a derived table) see the source table
+/// a reader of a shadowed name reaches. Model `orders` writes `orders_v2`
+/// with one column `id`; the source table `orders` has `k DATE` and
+/// `extra`; model `b` has `k BOOLEAN`. Every reader declares `orders`.
+#[test]
+fn upstream_checks_see_the_shadowed_source_a_read_reaches() {
+    use rocky_compiler::types::TypedColumn;
+    use rocky_ir::RockyType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    let write = |name: &str, sql: &str| {
+        let (table, deps) = match name {
+            "orders" => ("orders_v2", ""),
+            "a" | "b" => (name, ""),
+            _ => (name, "depends_on = [\"orders\"]\n"),
+        };
+        std::fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+        std::fs::write(
+            models.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n{deps}\n[target]\ncatalog = \"cat\"\n\
+                 schema = \"sch\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    write("orders", "SELECT CAST(1 AS INTEGER) AS id");
+    write("a", "SELECT 1 AS z");
+    write("b", "SELECT k FROM raw.bsrc");
+    write("ambiguous", "SELECT k FROM orders CROSS JOIN b");
+    write("joined", "SELECT o.extra FROM orders o JOIN b ON o.k = b.k");
+    write("derived_star", "SELECT * FROM (SELECT * FROM orders) x");
+    write(
+        "cte_star",
+        "WITH c AS (SELECT * FROM orders) SELECT * FROM c",
+    );
+    let config = CompilerConfig {
+        models_dir: models,
+        source_schemas: HashMap::from([
+            (
+                "raw.bsrc".to_string(),
+                vec![TypedColumn {
+                    name: "k".to_string(),
+                    data_type: RockyType::Boolean,
+                    nullable: true,
+                }],
+            ),
+            (
+                "orders".to_string(),
+                vec![
+                    TypedColumn {
+                        name: "k".to_string(),
+                        data_type: RockyType::Date,
+                        nullable: true,
+                    },
+                    TypedColumn {
+                        name: "extra".to_string(),
+                        data_type: RockyType::String,
+                        nullable: true,
+                    },
+                ],
+            ),
+        ]),
+        ..Default::default()
+    };
+    let result = compile(&config).expect("compile");
+    let codes = |model: &str| -> Vec<String> {
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.model == model)
+            .map(|d| d.code.to_string())
+            .collect()
+    };
+    // Both relations the SQL reads have `k`: the source table and `b`.
+    assert!(codes("ambiguous").contains(&"E029".to_string()));
+    // `o.k` is the source's DATE, `b.k` is BOOLEAN.
+    assert!(codes("joined").contains(&"E001".to_string()));
+    for model in ["derived_star", "cte_star"] {
+        let star: Vec<String> = result
+            .semantic_graph
+            .model_schema(model)
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(star, ["k", "extra"], "{model}: the source table's columns");
+    }
+}
