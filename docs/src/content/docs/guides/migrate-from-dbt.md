@@ -323,12 +323,12 @@ Rocky has two snapshot (SCD Type 2) forms. A dbt snapshot maps to the model form
 | | Snapshot model | Snapshot pipeline |
 |---|---|---|
 | Declared as | `[strategy] type = "snapshot"` in a model sidecar | `[pipeline.<name>] type = "snapshot"` in `rocky.toml` |
-| Runs with | `rocky run`, with your other models | `rocky snapshot`, which refuses any other pipeline type |
+| Runs with | `rocky run`, in the model DAG of a transformation pipeline | `rocky snapshot` or `rocky run --pipeline <name>`. `rocky snapshot` refuses any other pipeline type |
 | Reads | the model's SQL | one source table named in the pipeline |
-| History columns | `valid_from`, `valid_to`, `is_current`, `snapshot_id` by default | `valid_from`, `valid_to`, `is_current`, `snapshot_id` |
+| History columns | `valid_from`, `valid_to`, `is_current`, `snapshot_id` by default. `snapshot_id` is unique per version | `valid_from`, `valid_to`, `is_current`, `snapshot_id`. `snapshot_id` is shared by the rows of one run |
 | dbt's column names | `snapshot_meta_column_names` renames them, and `is_current = false` drops the flag column | not configurable |
 
-To continue a snapshot table that dbt built, keep dbt's names (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`). The [Snapshot](/reference/model-format/#snapshot) reference shows the settings.
+To continue a snapshot table that dbt built, keep dbt's names (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`) and set `is_current = false`. Without it, Rocky looks for an `is_current` column that dbt never wrote, and the run fails. Add `dbt_is_deleted` when you use `hard_deletes = "new_record"`. The [Snapshot](/reference/model-format/#snapshot) reference shows the settings.
 
 ## 1. Import the dbt Project
 

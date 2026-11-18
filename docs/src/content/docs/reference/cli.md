@@ -348,7 +348,7 @@ date_key = "DATE"
 
 Run an SCD Type 2 snapshot pipeline. Rocky generates and runs `MERGE` SQL that keeps the history of a source table. The target table gets `valid_from`, `valid_to`, `is_current` and `snapshot_id` columns. The column names are fixed.
 
-`rocky snapshot` runs only a pipeline with `type = "snapshot"`. To keep history inside a transformation pipeline, or to use dbt's column names, use a model with [`[strategy] type = "snapshot"`](/reference/model-format/#snapshot) instead. It runs in `rocky run`. See [Snapshots in the dbt migration guide](/guides/migrate-from-dbt/#snapshots-use-the-model-strategy).
+`rocky snapshot` runs only a pipeline with `type = "snapshot"`. `rocky run --pipeline <name>` runs the same pipeline too. To keep history inside a transformation pipeline, or to use dbt's column names, use a model with [`[strategy] type = "snapshot"`](/reference/model-format/#snapshot) instead. It runs in the model DAG of `rocky run`. See [Snapshots in the dbt migration guide](/guides/migrate-from-dbt/#snapshots-use-the-model-strategy).
 
 ```bash
 rocky snapshot [flags]
