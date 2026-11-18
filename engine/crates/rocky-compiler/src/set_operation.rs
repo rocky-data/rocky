@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{
-    Expr, ObjectName, Query, SelectItem, SetExpr, SetQuantifier, Statement, Visit, Visitor,
+    Expr, Query, SelectItem, SetExpr, SetQuantifier, Statement, TableFactor, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
 
@@ -73,73 +73,140 @@ impl Visitor for Queries<'_> {
     }
 }
 
-/// The bodies of the CTEs in `statements` that nothing reads: no table
-/// reference in the query's body names them, directly or through another
-/// CTE it reads. DuckDB never binds such a CTE, so a check that reports
-/// what DuckDB refuses at bind time skips it.
+/// The bodies of the CTEs in `statements` that nothing reads. DuckDB never
+/// binds such a CTE, so a check that reports what DuckDB refuses at bind
+/// time skips it.
 ///
-/// A reference only from the query's `ORDER BY` or `LIMIT`, or one a nested
-/// `WITH` shadows, is not followed: the CTE is then taken as unread, which
-/// can only skip a check, never add a refusal.
+/// A table reference reads a CTE when it names one in scope the way DuckDB
+/// resolves it: a CTE sees only the CTEs before it (and itself under
+/// `RECURSIVE`), the query's body sees all of them, and a nested `WITH`
+/// hides an outer CTE of the same name. A table function call
+/// (`range(3)`) reads none. A CTE counts as read only when the main query
+/// reaches it, directly or through CTEs that are read. A reference
+/// through text, as in `query_table('x')`, is not followed, so that CTE is
+/// skipped: a miss, never a refusal.
 pub(crate) fn unreferenced_cte_bodies(statements: &[Statement]) -> HashSet<*const Query> {
-    struct Withs(HashSet<*const Query>);
-    impl Visitor for Withs {
-        type Break = ();
-        fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-            let Some(with) = &query.with else {
-                return std::ops::ControlFlow::Continue(());
-            };
-            let ctes: HashMap<String, (&Query, HashSet<String>)> = with
-                .cte_tables
-                .iter()
-                .map(|cte| {
-                    (
-                        cte.alias.name.value.to_lowercase(),
-                        (&*cte.query, relation_names(&*cte.query)),
-                    )
-                })
-                .collect();
-            let mut read: HashSet<String> = HashSet::new();
-            let mut pending: Vec<String> = relation_names(&*query.body).into_iter().collect();
-            while let Some(name) = pending.pop() {
-                if let Some((_, refs)) = ctes.get(&name)
-                    && read.insert(name)
-                {
-                    pending.extend(refs.iter().cloned());
-                }
-            }
-            for (name, (body, _)) in &ctes {
-                if !read.contains(name) {
-                    self.0.insert(std::ptr::from_ref(*body));
-                }
-            }
-            std::ops::ControlFlow::Continue(())
+    let mut reads = CteReads::default();
+    for statement in statements {
+        let _ = statement.visit(&mut reads);
+    }
+    let mut reached = HashSet::new();
+    let mut pending: Vec<usize> = reads.edges.get(&None).cloned().unwrap_or_default();
+    while let Some(id) = pending.pop() {
+        if reached.insert(id) {
+            pending.extend(reads.edges.get(&Some(id)).into_iter().flatten().copied());
         }
     }
-    let mut withs = Withs(HashSet::new());
-    for statement in statements {
-        let _ = statement.visit(&mut withs);
-    }
-    withs.0
+    reads
+        .bodies
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| !reached.contains(id))
+        .map(|(_, body)| *body)
+        .collect()
 }
 
-/// The lower-case one-part table names `node` reads.
-fn relation_names<V: Visit + ?Sized>(node: &V) -> HashSet<String> {
-    struct Relations(HashSet<String>);
-    impl Visitor for Relations {
-        type Break = ();
-        fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<()> {
-            if let [part] = relation.0.as_slice()
-                && let Some(ident) = part.as_ident()
-            {
-                self.0.insert(ident.value.to_lowercase());
-            }
-            std::ops::ControlFlow::Continue(())
-        }
+/// One `WITH` clause being visited.
+struct Frame {
+    query: *const Query,
+    /// Lower-case CTE names and their ids, in order.
+    ctes: Vec<(String, usize)>,
+    /// How many of `ctes` the reference being visited can see.
+    visible: usize,
+    recursive: bool,
+}
+
+/// Which CTE reads which, resolved in scope. A read made outside any CTE
+/// body is the main query's (`None`).
+#[derive(Default)]
+struct CteReads {
+    /// CTE id -> its body.
+    bodies: Vec<*const Query>,
+    /// CTE body -> (the query whose `WITH` defines it, its index there).
+    defined_by: HashMap<*const Query, (*const Query, usize)>,
+    frames: Vec<Frame>,
+    /// The CTE bodies being visited, innermost last.
+    readers: Vec<usize>,
+    edges: HashMap<Option<usize>, Vec<usize>>,
+}
+
+impl CteReads {
+    fn frame_of(&mut self, query: *const Query) -> Option<&mut Frame> {
+        self.frames.iter_mut().rev().find(|f| f.query == query)
     }
-    let mut relations = Relations(HashSet::new());
-    let _ = node.visit(&mut relations);
-    relations.0
+}
+
+impl Visitor for CteReads {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+        let this = std::ptr::from_ref(query);
+        if let Some(&(owner, index)) = self.defined_by.get(&this)
+            && let Some(frame) = self.frame_of(owner)
+        {
+            frame.visible = index + usize::from(frame.recursive);
+            let id = frame.ctes[index].1;
+            self.readers.push(id);
+        }
+        if let Some(with) = &query.with {
+            let mut ctes = Vec::new();
+            for (index, cte) in with.cte_tables.iter().enumerate() {
+                let body = std::ptr::from_ref(&*cte.query);
+                let id = self.bodies.len();
+                self.bodies.push(body);
+                self.defined_by.insert(body, (this, index));
+                ctes.push((cte.alias.name.value.to_lowercase(), id));
+            }
+            self.frames.push(Frame {
+                query: this,
+                ctes,
+                visible: 0,
+                recursive: with.recursive,
+            });
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+        let this = std::ptr::from_ref(query);
+        if query.with.is_some() {
+            self.frames.pop();
+        }
+        if let Some(&(owner, index)) = self.defined_by.get(&this)
+            && let Some(frame) = self.frame_of(owner)
+        {
+            frame.visible = index + 1;
+            self.readers.pop();
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> std::ops::ControlFlow<()> {
+        let TableFactor::Table {
+            name, args: None, ..
+        } = factor
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let [part] = name.0.as_slice() else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(ident) = part.as_ident() else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let wanted = ident.value.to_lowercase();
+        let found = self.frames.iter().rev().find_map(|frame| {
+            frame.ctes[..frame.visible]
+                .iter()
+                .find(|(name, _)| *name == wanted)
+                .map(|(_, id)| *id)
+        });
+        if let Some(id) = found {
+            let reader = self.readers.last().copied();
+            self.edges.entry(reader).or_default().push(id);
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 /// Check the set operations of one query body. A parenthesised query inside
@@ -358,6 +425,25 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// Round-7 red team, #2661: CTE reads follow DuckDB's scoping.
+    #[test]
+    fn a_shadowed_or_forward_cte_is_not_checked() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE u1 (a INTEGER); CREATE TABLE v (a INTEGER, b INTEGER)")
+            .unwrap();
+        let bad = "SELECT a FROM u1 UNION ALL SELECT a, b FROM v";
+        for sql in [
+            format!("WITH x AS ({bad}) SELECT * FROM (WITH x AS (SELECT 1 a) SELECT * FROM x) s"),
+            format!("WITH x AS ({bad}) SELECT * FROM (WITH y AS (SELECT * FROM x) SELECT 1 a) s"),
+            format!("WITH x AS (SELECT * FROM v), v AS ({bad}) SELECT * FROM x"),
+        ] {
+            assert_eq!(codes(&sql), 0, "{sql}");
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
+        }
+        assert_eq!(codes(&format!("WITH x AS ({bad}) SELECT * FROM x")), 1);
     }
 
     /// The bundled DuckDB refuses every mismatch this check reports.

@@ -293,33 +293,91 @@ pub fn check_unknown_functions(
 
 /// The lower-case names a seed file's text may create as functions or
 /// macros: every `CREATE [OR REPLACE] [TEMP | TEMPORARY] MACRO | FUNCTION
-/// [IF NOT EXISTS] [schema.]name`, case-insensitive, with any whitespace or
-/// comments between the words and Unicode letters in names.
+/// [IF NOT EXISTS] [schema.]name`, case-insensitive, with Unicode letters in
+/// names.
 ///
-/// Comments and string literals are not skipped. A name found inside one
-/// only turns a check off for that name, while a real one the scan dropped
-/// would be refused, so the scan errs toward finding more.
+/// The text is scanned twice, raw and with its comments removed
+/// ([`without_comments`]), and the names are the union. The raw scan finds a
+/// name a misread string literal would hide from the second; the second
+/// finds a name with comments between the words. A name found inside a
+/// comment or literal only turns a check off for that name, while a real
+/// one the scan dropped would be refused, so the scan errs toward finding
+/// more. Both scans take time linear in the text.
 pub fn seed_function_names_in_text(seed_sql: &str) -> HashSet<String> {
     static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        // Whitespace or a comment between two words.
-        let gap = r"(?:\s|--[^\n]*|/\*(?s:.*?)\*/)";
         let name = r#"(?:"(?:[^"]|"")+"|[\p{L}_][\p{L}\p{N}_$]*)"#;
         regex::Regex::new(&format!(
             concat!(
-                r"(?i)\bcreate{gap}+(?:or{gap}+replace{gap}+)?(?:temp(?:orary)?{gap}+)?",
-                r"(?:macro|function){gap}+(?:if{gap}+not{gap}+exists{gap}+)?",
-                r"((?:{name}{gap}*\.{gap}*)*{name})",
+                r"(?i)\bcreate\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?",
+                r"(?:macro|function)\s+(?:if\s+not\s+exists\s+)?",
+                r"((?:{name}\s*\.\s*)*{name})",
             ),
-            gap = gap,
             name = name,
         ))
         .expect("valid regex")
     });
-    CREATE
-        .captures_iter(seed_sql)
+    let stripped = without_comments(seed_sql);
+    [seed_sql, stripped.as_str()]
+        .into_iter()
+        .flat_map(|text| CREATE.captures_iter(text))
         .filter_map(|c| c.get(1))
         .filter_map(|m| last_name_part(m.as_str()))
         .collect()
+}
+
+/// `sql` with each `--` and (nested) `/* */` comment replaced by a space.
+/// Single-quoted strings and double-quoted names are kept whole, with `''`
+/// and `""` as escapes. One pass, so linear in the text.
+fn without_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                out.push(c);
+                while let Some(d) = chars.next() {
+                    out.push(d);
+                    if d == c {
+                        if chars.peek() == Some(&c) {
+                            out.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for d in chars.by_ref() {
+                    if d == '\n' {
+                        break;
+                    }
+                }
+                out.push('\n');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match chars.next() {
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            depth -= 1;
+                        }
+                        Some('/') if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            depth += 1;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The last part of a possibly qualified, possibly quoted name, lower-cased
@@ -782,6 +840,91 @@ mod tests {
         ] {
             assert_eq!(count_codes(sql, &duckdb), ["E068"], "{sql}");
         }
+    }
+
+    /// Round-7 red team, #2659: a CTE counts as read only when a reached
+    /// reader names it in scope. DuckDB binds every query here.
+    #[test]
+    fn cte_reads_follow_duckdb_scoping() {
+        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE orders (status VARCHAR, qty INTEGER); \
+             CREATE TABLE v (a INTEGER, b INTEGER);",
+        )
+        .unwrap();
+        let bad = "SELECT lower(status, 'x') l FROM orders";
+        for sql in [
+            // A nested WITH hides the outer name.
+            format!("WITH x AS ({bad}) SELECT * FROM (WITH x AS (SELECT 1 a) SELECT * FROM x) s"),
+            format!(
+                "WITH x AS ({bad}) SELECT qty FROM orders WHERE qty IN (WITH x AS (SELECT 1 a) SELECT a FROM x)"
+            ),
+            format!(
+                "WITH x AS ({bad}), y AS (WITH x AS (SELECT 1 a) SELECT * FROM x) SELECT * FROM y"
+            ),
+            // The only reader is itself unread.
+            format!("WITH x AS ({bad}) SELECT * FROM (WITH y AS (SELECT * FROM x) SELECT 1 a) s"),
+            format!(
+                "WITH x AS ({bad}), y AS (SELECT * FROM (WITH z AS (SELECT * FROM x) SELECT 1 a) s) SELECT * FROM y"
+            ),
+            format!("WITH x AS ({bad}), y AS (SELECT * FROM x) SELECT 1"),
+            // A table function is not a CTE read.
+            format!("WITH range AS ({bad}) SELECT * FROM range(3)"),
+            format!("WITH unnest AS ({bad}) SELECT * FROM unnest([1, 2])"),
+            // A CTE sees only earlier CTEs: `v` here is the table.
+            format!("WITH x AS (SELECT * FROM v), v AS ({bad}) SELECT * FROM x"),
+            format!("WITH v AS (SELECT * FROM v), w AS ({bad}) SELECT * FROM v"),
+            // An alias is not a CTE read.
+            format!("WITH x AS ({bad}) SELECT x.qty FROM orders AS x"),
+        ] {
+            assert!(count_codes(&sql, &duckdb).is_empty(), "{sql}");
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
+        }
+        // A reached read in scope is still judged.
+        for sql in [
+            format!("WITH x AS ({bad}) SELECT qty FROM orders WHERE EXISTS (SELECT 1 FROM x)"),
+            format!("WITH x AS ({bad}) SELECT qty FROM orders ORDER BY (SELECT count(*) FROM x)"),
+            format!("WITH \"X\" AS ({bad}) SELECT * FROM x"),
+            format!("WITH x AS ({bad}), y AS (SELECT * FROM x) SELECT * FROM y"),
+            format!(
+                "WITH x AS ({bad}) SELECT * FROM (WITH y AS (SELECT * FROM x) SELECT * FROM y) s"
+            ),
+            format!("WITH RECURSIVE x AS ({bad}) SELECT * FROM x"),
+        ] {
+            assert_eq!(count_codes(&sql, &duckdb), ["E068"], "{sql}");
+        }
+    }
+
+    /// Round-7 red team: a `.` inside a comment after the name, or a nested
+    /// comment, does not lose the name; an unclosed `/*` does not make the
+    /// scan slow.
+    #[test]
+    fn the_seed_text_scan_survives_comments_after_the_name() {
+        let names = seed_function_names_in_text(
+            "CREATE MACRO lower -- see docs.md\n(a, b) AS a;\n\
+             CREATE MACRO upper /* a /* b */ . c */ (a, b) AS a;\n",
+        );
+        assert!(
+            names.contains("lower") && names.contains("upper"),
+            "{names:?}"
+        );
+        // DuckDB nests block comments; only the comment-free pass sees `g`.
+        // A `$$` string the comment pass misreads: only the raw pass sees `f`.
+        let names = seed_function_names_in_text(
+            "CREATE /* a /* b */ c */ MACRO g(x) AS x;\n\
+             SELECT $$--$$ AS d; CREATE MACRO f(x) AS x;\n",
+        );
+        assert!(names.contains("g") && names.contains("f"), "{names:?}");
+        let seed = "-- CREATE MACRO a /* x\n".repeat(40_000);
+        let start = std::time::Instant::now();
+        let _ = seed_function_names_in_text(&seed);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
