@@ -1588,7 +1588,7 @@ fn merge_default_seed_schemas(
                 if !key.contains('.')
                     && let Some(qualified) = schemas.get(&format!("main.{key}")).cloned()
                 {
-                    if let Some(origin) = provenance.origins.get(&format!("main.{key}")).cloned() {
+                    if let Some(origin) = provenance.origins.get(&format!("main.{key}")).copied() {
                         provenance.origins.insert(key.clone(), origin);
                     }
                     schemas.insert(key, qualified);
