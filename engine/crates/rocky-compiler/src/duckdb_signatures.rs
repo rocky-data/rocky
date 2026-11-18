@@ -1,6 +1,5 @@
-//! What the bundled DuckDB refuses at bind time, for the call checks
-//! [`E068`](crate::diagnostic::E068) (argument count) and
-//! [`E069`](crate::diagnostic::E069) (argument type) (#2659).
+//! What the bundled DuckDB refuses at bind time, for the argument-count
+//! check [`E068`](crate::diagnostic::E068) (#2659).
 //!
 //! The data is `data/duckdb_signatures.txt`. It is not written by hand: the
 //! ignored test `bless_duckdb_signatures` probes the live engine and writes
@@ -12,17 +11,11 @@
 //!   class. A call such as `struct_pack(x)` binds a column but not `NULL`.
 //! - `above <name> <n>`: every count above `n`. Written only when the
 //!   function has no variadic overload and `n + 1` to `n + 3` were refused.
-//! - `arg <name> <k> <p> <class>`: `name` with `k` arguments, a column of
-//!   every DuckDB type in `class` at position `p` (0-based), and at the
-//!   other positions `NULL`, then a column of one type of each class.
 //!
-//! A name for which a `NULL` argument binds differently from a column
-//! (`struct_pack` names its fields after its arguments) is left out.
-//!
-//! A class is refused only when every DuckDB type in it is refused, so a
-//! column Rocky types `Int32` is judged the same whether DuckDB stores it as
-//! `TINYINT` or `INTEGER`. The DuckDB types each class stands for are
-//! [`ArgClass::duckdb_types`].
+//! The column types probed are one of each family DuckDB binds alike
+//! (number, text, boolean, date, timestamp), plus `DOUBLE`. A name for which
+//! a `NULL` argument binds differently from a column (`struct_pack` names
+//! its fields after its arguments) is left out.
 //!
 //! Names are left out (never checked) when DuckDB also has a macro, window
 //! or table function by that name, when the name is not `[a-z0-9_]+`, and
@@ -36,99 +29,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use crate::types::RockyType;
-
 /// The DuckDB version the data was generated from. A different bundled
 /// version fails `the_signature_file_matches_the_bundled_duckdb`.
 pub const DUCKDB_VERSION: &str = "v2.0.0";
-
-/// A family of column types that DuckDB binds alike for these checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ArgClass {
-    Numeric,
-    Text,
-    Boolean,
-    Date,
-    Timestamp,
-}
-
-impl ArgClass {
-    pub const ALL: [ArgClass; 5] = [
-        ArgClass::Numeric,
-        ArgClass::Text,
-        ArgClass::Boolean,
-        ArgClass::Date,
-        ArgClass::Timestamp,
-    ];
-
-    /// The name the data file uses.
-    pub fn name(self) -> &'static str {
-        match self {
-            ArgClass::Numeric => "numeric",
-            ArgClass::Text => "text",
-            ArgClass::Boolean => "boolean",
-            ArgClass::Date => "date",
-            ArgClass::Timestamp => "timestamp",
-        }
-    }
-
-    fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|c| c.name() == name)
-    }
-
-    /// Every DuckDB type a column of this class can be. A class is refused
-    /// only when each of these is.
-    pub fn duckdb_types(self) -> &'static [&'static str] {
-        match self {
-            ArgClass::Numeric => &[
-                "TINYINT",
-                "SMALLINT",
-                "INTEGER",
-                "BIGINT",
-                "HUGEINT",
-                "FLOAT",
-                "DOUBLE",
-                "DECIMAL(4,1)",
-                "DECIMAL(18,2)",
-                "DECIMAL(38,2)",
-            ],
-            ArgClass::Text => &["VARCHAR"],
-            ArgClass::Boolean => &["BOOLEAN"],
-            ArgClass::Date => &["DATE"],
-            ArgClass::Timestamp => &["TIMESTAMP", "TIMESTAMPTZ"],
-        }
-    }
-
-    /// The class of a Rocky type, when DuckDB binds it alike. Every other
-    /// type is not checked.
-    pub fn of(ty: &RockyType) -> Option<Self> {
-        match ty {
-            RockyType::Int32
-            | RockyType::Int64
-            | RockyType::Float32
-            | RockyType::Float64
-            | RockyType::Decimal { .. } => Some(ArgClass::Numeric),
-            RockyType::String => Some(ArgClass::Text),
-            RockyType::Boolean => Some(ArgClass::Boolean),
-            RockyType::Date => Some(ArgClass::Date),
-            RockyType::Timestamp => Some(ArgClass::Timestamp),
-            RockyType::DecimalUnsized { .. }
-            | RockyType::TimestampNtz
-            | RockyType::Binary
-            | RockyType::Array(_)
-            | RockyType::Map(_, _)
-            | RockyType::Struct(_)
-            | RockyType::Variant
-            | RockyType::Unknown => None,
-        }
-    }
-}
 
 #[derive(Debug, Default)]
 struct Signatures {
     arity: HashSet<(String, usize)>,
     above: HashMap<String, usize>,
-    arg: HashSet<(String, usize, usize, ArgClass)>,
 }
 
 static SIGNATURES: LazyLock<Signatures> =
@@ -149,13 +57,6 @@ fn parse(text: &str) -> Signatures {
                     out.above.insert((*name).to_string(), n);
                 }
             }
-            ["arg", name, k, p, class] => {
-                if let (Ok(k), Ok(p), Some(class)) =
-                    (k.parse(), p.parse(), ArgClass::from_name(class))
-                {
-                    out.arg.insert(((*name).to_string(), k, p, class));
-                }
-            }
             _ => {}
         }
     }
@@ -168,15 +69,6 @@ pub fn refuses_count(name: &str, count: usize) -> bool {
     let sigs = &*SIGNATURES;
     sigs.arity.contains(&(name.to_string(), count))
         || sigs.above.get(name).is_some_and(|n| count > *n)
-}
-
-/// Whether DuckDB refuses `name` (lower case) called with `count` arguments
-/// when argument `position` (0-based) is a column of `class`, whatever the
-/// other arguments are.
-pub fn refuses_argument(name: &str, count: usize, position: usize, class: ArgClass) -> bool {
-    SIGNATURES
-        .arg
-        .contains(&(name.to_string(), count, position, class))
 }
 
 /// The argument counts the data shows DuckDB accepts for `name`, for the
@@ -197,21 +89,55 @@ pub fn accepted_counts(name: &str) -> (Vec<usize>, bool) {
     (accepted, above.is_some())
 }
 
-/// The classes DuckDB accepts at `position` of `name` with `count`
-/// arguments, for the message.
-pub fn accepted_classes(name: &str, count: usize, position: usize) -> Vec<ArgClass> {
-    ArgClass::ALL
-        .into_iter()
-        .filter(|c| !refuses_argument(name, count, position, *c))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fmt::Write as _;
 
     const NO_MATCH: &str = "No function matches the given name and argument types";
+
+    /// A family of column types DuckDB binds alike, for the probes' fillers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum ArgClass {
+        Numeric,
+        Text,
+        Boolean,
+        Date,
+        Timestamp,
+    }
+
+    impl ArgClass {
+        const ALL: [ArgClass; 5] = [
+            ArgClass::Numeric,
+            ArgClass::Text,
+            ArgClass::Boolean,
+            ArgClass::Date,
+            ArgClass::Timestamp,
+        ];
+
+        /// Every DuckDB type a column of this class can be. A class is refused
+        /// only when each of these is.
+        fn duckdb_types(self) -> &'static [&'static str] {
+            match self {
+                ArgClass::Numeric => &[
+                    "TINYINT",
+                    "SMALLINT",
+                    "INTEGER",
+                    "BIGINT",
+                    "HUGEINT",
+                    "FLOAT",
+                    "DOUBLE",
+                    "DECIMAL(4,1)",
+                    "DECIMAL(18,2)",
+                    "DECIMAL(38,2)",
+                ],
+                ArgClass::Text => &["VARCHAR"],
+                ArgClass::Boolean => &["BOOLEAN"],
+                ArgClass::Date => &["DATE"],
+                ArgClass::Timestamp => &["TIMESTAMP", "TIMESTAMPTZ"],
+            }
+        }
+    }
 
     /// Names the call checks leave alone: rewritten by the parser, or handled
     /// as special forms by `function_check`.
@@ -278,22 +204,6 @@ mod tests {
             .all(|f| no_match(conn, name, &vec![f.clone(); k]))
     }
 
-    /// Whether `name` with `k` arguments is refused when position `p` is a
-    /// column of type `ty`, for every filler in the other positions.
-    fn refuses_argument_probe(
-        conn: &duckdb::Connection,
-        name: &str,
-        k: usize,
-        p: usize,
-        ty: &str,
-    ) -> bool {
-        fillers().iter().all(|f| {
-            let mut args = vec![f.clone(); k];
-            args[p] = column_name(ty);
-            no_match(conn, name, &args)
-        })
-    }
-
     /// Whether a `NULL` argument binds differently from a column for `name`:
     /// some count is refused with all `NULL` but accepted with columns
     /// (`struct_pack` names its fields after its arguments). Such a name is
@@ -358,19 +268,6 @@ mod tests {
             if !varargs && (max + 1..=max + 3).all(|k| !accepted.contains(&k)) {
                 writeln!(out, "above {name} {}", max + 3).unwrap();
             }
-            for k in accepted.into_iter().filter(|k| *k >= 1) {
-                for p in 0..k {
-                    for class in ArgClass::ALL {
-                        let refused = class
-                            .duckdb_types()
-                            .iter()
-                            .all(|ty| refuses_argument_probe(conn, &name, k, p, ty));
-                        if refused {
-                            writeln!(out, "arg {name} {k} {p} {}", class.name()).unwrap();
-                        }
-                    }
-                }
-            }
         }
         out
     }
@@ -422,7 +319,6 @@ mod tests {
         let sigs = &*SIGNATURES;
         // Guard against a file that refuses nothing and so proves nothing.
         assert!(sigs.arity.len() > 1000, "arity lines: {}", sigs.arity.len());
-        assert!(sigs.arg.len() > 1000, "arg lines: {}", sigs.arg.len());
         for (name, k) in &sigs.arity {
             assert!(
                 refuses_every_count_probe(&conn, name, *k),
@@ -437,31 +333,15 @@ mod tests {
                 );
             }
         }
-        for (name, k, p, class) in &sigs.arg {
-            for ty in class.duckdb_types() {
-                assert!(
-                    refuses_argument_probe(&conn, name, *k, *p, ty),
-                    "DuckDB accepts {name} with {k} arguments, a {ty} column at {p}"
-                );
-            }
-        }
     }
 
     /// The issue's calls are in the file.
     #[test]
     fn the_issue_calls_are_refused() {
-        assert!(refuses_argument("lower", 1, 0, ArgClass::Numeric));
-        assert!(refuses_argument("abs", 1, 0, ArgClass::Text));
-        assert!(refuses_argument("md5", 1, 0, ArgClass::Numeric));
         assert!(refuses_count("lower", 2));
         assert!(refuses_count("lower", 0));
         assert!(refuses_count("round", 3));
         assert!(!refuses_count("round", 1));
         assert!(!refuses_count("round", 2));
-        assert!(!refuses_argument("concat", 2, 0, ArgClass::Numeric));
-        // `date_trunc` over a timestamp: TIMESTAMP binds, so the class is not
-        // refused even if one member were.
-        assert!(!refuses_argument("date_trunc", 2, 1, ArgClass::Timestamp));
-        assert!(refuses_argument("date_trunc", 2, 1, ArgClass::Numeric));
     }
 }

@@ -271,30 +271,12 @@ pub const E064: &str = "E064";
 /// the model runs on DuckDB; the counts come from
 /// [`crate::duckdb_signatures`], generated from the bundled engine.
 pub const E068: &str = "E068";
-/// A column argument whose type no overload of a DuckDB built-in accepts at
-/// that position, as in `lower(amount)` over a number or `abs(name)` over
-/// text (#2659). DuckDB refuses the statement at bind time. Emitted by
-/// `rocky compile` from [`crate::operand_check`] when the model runs on
-/// DuckDB. Aggregates [`E042`] already judges are left to it.
-pub const E069: &str = "E069";
-/// `CASE` or `COALESCE` branches that are columns of types DuckDB has no
-/// common type for, as in `COALESCE(order_date, customer_name)` (#2661).
-/// DuckDB refuses the statement at bind time. Emitted by `rocky compile` from
-/// [`crate::operand_check`] when the model runs on DuckDB.
-pub const E070: &str = "E070";
 /// The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different
 /// numbers of columns (#2661). SQL requires the same number in every branch,
 /// so it is checked whatever the warehouse. Emitted by
 /// `rocky compile` from [`crate::set_operation`] when both counts are known
 /// from the SQL; `BY NAME` is not checked.
 pub const E071: &str = "E071";
-/// The warning form of [`E069`]: the column's type comes from a source schema
-/// Rocky cannot confirm is current, a schema-cache entry older than
-/// `[cache.schemas] trusted_max_age_seconds` (the E041 staleness test) or a
-/// schema of unknown origin.
-pub const W069: &str = "W069";
-/// The warning form of [`E070`], on the same terms as [`W069`].
-pub const W070: &str = "W070";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
@@ -750,7 +732,7 @@ pub const W058: &str = "W058";
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W069, W070, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

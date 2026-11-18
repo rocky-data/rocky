@@ -123,15 +123,11 @@ use indexmap::IndexMap;
 use sqlparser::ast::{self, Expr, SetExpr, Spanned, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{
-    Diagnostic, E042, E043, E069, E070, Severity, SourceSpan, W042, W043, W069, W070,
-};
-use crate::duckdb_signatures::{self, ArgClass};
+use crate::diagnostic::{Diagnostic, E042, E043, SourceSpan, W042, W043};
 use crate::semantic::SemanticGraph;
-use crate::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use crate::typecheck::{
-    InferEnv, RelationRef, TypeScope, has_exact_type, infer_expr_type, infer_query_types,
-    rename_relation_columns, select_type_scope,
+    InferEnv, RelationRef, TypeScope, infer_expr_type, infer_query_types, rename_relation_columns,
+    select_type_scope,
 };
 use crate::types::{RockyType, TypedColumn};
 
@@ -490,101 +486,20 @@ pub fn check_operand_types_per_model(
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
     target_for: &dyn Fn(&str) -> OperandTarget,
 ) -> Vec<Diagnostic> {
-    check_operand_types_with(
-        models,
-        graph,
-        typed_models,
-        &SourceProvenance::default(),
-        &HashSet::new(),
-        target_for,
-    )
-}
-
-/// [`check_operand_types_per_model`], with what proves a column's type to
-/// E069 / E070.
-///
-/// Only a source schema does. A project model's columns are Rocky's own
-/// inference, which is not DuckDB's answer, so they are never judged. A
-/// source type gives the error only when `provenance` says it is current: a
-/// seed, a live read, or a schema-cache entry within `[cache.schemas]
-/// trusted_max_age_seconds` (the staleness test E041 uses). Otherwise a model
-/// gets W069 / W070. `seed_names` are the functions and macros the project's
-/// seed file creates: a call to one is not judged against DuckDB's built-ins.
-pub fn check_operand_types_with(
-    models: &[rocky_core::models::Model],
-    graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    provenance: &SourceProvenance,
-    seed_names: &HashSet<String>,
-    target_for: &dyn Fn(&str) -> OperandTarget,
-) -> Vec<Diagnostic> {
-    // Every column of a project model is a guess to E069 / E070.
-    let model_columns: std::collections::HashMap<&str, HashSet<usize>> = models
-        .iter()
-        .filter_map(|model| {
-            let name = model.config.name.as_str();
-            let columns = typed_models.get(name)?;
-            Some((name, (0..columns.len()).collect()))
-        })
-        .collect();
-    let evidence = Evidence {
-        typed_models,
-        model_columns: &model_columns,
-        provenance,
-    };
     let mut diagnostics = Vec::new();
     for model in models {
         let target = target_for(&model.config.name);
-        diagnostics.extend(check_model(model, graph, &evidence, seed_names, target));
+        diagnostics.extend(check_model(model, graph, typed_models, target));
     }
     diagnostics
-}
-
-/// What [`check_model`] reads a relation's columns from, and what proves
-/// their types.
-struct Evidence<'e> {
-    typed_models: &'e IndexMap<String, Vec<TypedColumn>>,
-    model_columns: &'e std::collections::HashMap<&'e str, HashSet<usize>>,
-    provenance: &'e SourceProvenance,
-}
-
-/// Whether a source schema of this origin is current enough to make E069 /
-/// E070 an error: a seed is DuckDB's own answer, a live read is the
-/// warehouse's, and a cache entry must pass the E041 staleness test.
-fn proves_types(origin: &SourceSchemaOrigin) -> bool {
-    match origin {
-        SourceSchemaOrigin::Seed | SourceSchemaOrigin::Live => true,
-        SourceSchemaOrigin::Cache { trusted, .. } => *trusted,
-    }
-}
-
-/// The warning form of an E069 / E070, for a model that reads a source
-/// whose schema is not known to be current.
-fn demote(diag: Diagnostic) -> Diagnostic {
-    let code = match &*diag.code {
-        c if c == E069 => W069,
-        c if c == E070 => W070,
-        _ => return diag,
-    };
-    Diagnostic {
-        severity: Severity::Warning,
-        code: std::sync::Arc::from(code),
-        message: std::sync::Arc::from(format!(
-            "{} (a warning: Rocky cannot confirm this source's schema is current)",
-            diag.message
-        )),
-        ..diag
-    }
 }
 
 fn check_model(
     model: &rocky_core::models::Model,
     graph: &SemanticGraph,
-    evidence: &Evidence<'_>,
-    seed_names: &HashSet<String>,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
     target: OperandTarget,
 ) -> Vec<Diagnostic> {
-    let typed_models = evidence.typed_models;
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
     else {
         return Vec::new();
@@ -604,42 +519,12 @@ fn check_model(
         file,
         precise_spans,
         target,
-        functions: graph.functions(),
-        seed_names,
         join_key_columns: join_key_checked_columns(&model.config.name, graph, typed_models),
-        having_aliases: HashSet::new(),
-        having_opaque: false,
         seen: HashSet::new(),
         out: Vec::new(),
     };
-    // Set when the model reads a source whose schema is not known to be
-    // current: its E069 / E070 become warnings.
-    let unproven = std::cell::Cell::new(false);
-    let lookup = |name: &str| {
-        let columns = typed_models.get(name)?;
-        if let Some(all) = evidence.model_columns.get(name) {
-            return Some(RelationRef {
-                columns,
-                inexact: Some(all),
-            });
-        }
-        if !evidence
-            .provenance
-            .origins
-            .get(name)
-            .is_some_and(proves_types)
-        {
-            unproven.set(true);
-        }
-        Some(RelationRef {
-            columns,
-            inexact: None,
-        })
-    };
+    let lookup = |name: &str| typed_models.get(name).map(Vec::as_slice);
     walk_query(query, &lookup, &mut ctx);
-    if unproven.get() {
-        return ctx.out.into_iter().map(demote).collect();
-    }
     ctx.out
 }
 
@@ -684,17 +569,7 @@ struct Ctx<'m> {
     file: String,
     precise_spans: bool,
     target: OperandTarget,
-    /// Functions the project declares in `functions/`: a call to one is not
-    /// judged against DuckDB's built-ins.
-    functions: &'m crate::udf::FunctionRegistry,
-    /// Functions and macros the project's seed file creates.
-    seed_names: &'m HashSet<String>,
     join_key_columns: HashSet<String>,
-    /// Lower-case select-list aliases while `HAVING` is checked, else empty.
-    having_aliases: HashSet<String>,
-    /// While `HAVING` is checked: the select list can rename columns in a
-    /// way the aliases do not show, so no bare name is judged.
-    having_opaque: bool,
     /// `(code, line, col, message)` already emitted — CTE bodies are typed
     /// twice by construction, never reported twice.
     seen: HashSet<(String, usize, usize, String)>,
@@ -740,59 +615,35 @@ impl Ctx<'_> {
 
 fn walk_query<'a>(
     query: &ast::Query,
-    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
     ctx: &mut Ctx<'_>,
 ) {
-    // Each CTE keeps which of its columns are a guess, as inference does
-    // (#2320), so a guessed column is not judged by E069 / E070.
-    let mut ctes: std::collections::HashMap<String, (Vec<TypedColumn>, HashSet<usize>)> =
+    let mut ctes: std::collections::HashMap<String, Vec<TypedColumn>> =
         std::collections::HashMap::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let cte_lookup = |name: &str| cte_ref(&ctes, name).or_else(|| lookup(name));
+            let cte_lookup =
+                |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
             walk_query(&cte.query, &cte_lookup, ctx);
+            let relation = |name: &str| cte_lookup(name).map(RelationRef::from);
             let env = InferEnv {
-                lookup: &cte_lookup,
+                lookup: &relation,
                 target: &ctx.target,
             };
-            let (mut columns, inexact) = match infer_query_types(&cte.query, env) {
-                Ok(inferred) => {
-                    let inexact = guessed_outputs(&inferred);
-                    (inferred.columns, inexact)
-                }
-                Err(_) => (Vec::new(), HashSet::new()),
-            };
+            let mut columns = infer_query_types(&cte.query, env)
+                .unwrap_or_default()
+                .columns;
             rename_relation_columns(&mut columns, &cte.alias);
-            ctes.insert(cte.alias.name.value.clone(), (columns, inexact));
+            ctes.insert(cte.alias.name.value.clone(), columns);
         }
     }
-    let lookup = |name: &str| cte_ref(&ctes, name).or_else(|| lookup(name));
+    let lookup = |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
     walk_set_expr(&query.body, &lookup, ctx);
-}
-
-fn cte_ref<'c>(
-    ctes: &'c std::collections::HashMap<String, (Vec<TypedColumn>, HashSet<usize>)>,
-    name: &str,
-) -> Option<RelationRef<'c>> {
-    ctes.get(name).map(|(columns, inexact)| RelationRef {
-        columns,
-        inexact: Some(inexact),
-    })
-}
-
-/// The output positions of an inferred query whose type is a guess: not
-/// exact per `has_exact_type`, or a guess where a `*` read it from.
-fn guessed_outputs(inferred: &crate::typecheck::SelectInference) -> HashSet<usize> {
-    (0..inferred.columns.len())
-        .filter(|i| {
-            !inferred.exact_type_outputs.contains(i) || inferred.relation_inexact.contains(i)
-        })
-        .collect()
 }
 
 fn walk_set_expr<'a>(
     body: &SetExpr,
-    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
     ctx: &mut Ctx<'_>,
 ) {
     match body {
@@ -808,7 +659,7 @@ fn walk_set_expr<'a>(
 
 fn walk_table_factor<'a>(
     factor: &TableFactor,
-    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
     ctx: &mut Ctx<'_>,
 ) {
     match factor {
@@ -864,7 +715,7 @@ fn join_on_constraints(from: &ast::TableWithJoins, out: &mut Vec<Expr>) {
 
 fn walk_select<'a>(
     select: &ast::Select,
-    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
     ctx: &mut Ctx<'_>,
 ) {
     let mut on_exprs = Vec::new();
@@ -875,8 +726,9 @@ fn walk_select<'a>(
         }
         join_on_constraints(from, &mut on_exprs);
     }
+    let relation = |name: &str| lookup(name).map(RelationRef::from);
     let env = InferEnv {
-        lookup,
+        lookup: &relation,
         target: &ctx.target,
     };
     let (_, scope) = select_type_scope(select, env);
@@ -894,38 +746,10 @@ fn walk_select<'a>(
     for expr in on_exprs
         .iter()
         .chain(select.selection.as_ref())
+        .chain(select.having.as_ref())
         .chain(select.qualify.as_ref())
     {
         check_expr(expr, &scope, lookup, ctx);
-    }
-    if let Some(having) = &select.having {
-        // A `* REPLACE (...)`, `* RENAME (...)` or `COLUMNS(...)` item can
-        // give a source column's name to another expression, and the names
-        // are not spelled out here. Then no bare name in `HAVING` is judged.
-        let opaque = select.projection.iter().any(|item| match item {
-            ast::SelectItem::Wildcard(opts) | ast::SelectItem::QualifiedWildcard(_, opts) => {
-                opts.opt_replace.is_some() || opts.opt_rename.is_some()
-            }
-            ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                crate::set_operation::expands_to_columns(expr)
-            }
-            ast::SelectItem::ExprWithAliases { .. } => true,
-        });
-        let outer_opaque = std::mem::replace(&mut ctx.having_opaque, opaque);
-        let aliases: HashSet<String> = select
-            .projection
-            .iter()
-            .filter_map(|item| match item {
-                ast::SelectItem::ExprWithAlias { alias, .. } => {
-                    Some(alias.value.to_ascii_lowercase())
-                }
-                _ => None,
-            })
-            .collect();
-        let outer = std::mem::replace(&mut ctx.having_aliases, aliases);
-        check_expr(having, &scope, lookup, ctx);
-        ctx.having_aliases = outer;
-        ctx.having_opaque = outer_opaque;
     }
 }
 
@@ -936,7 +760,7 @@ fn walk_select<'a>(
 fn check_expr<'a>(
     expr: &Expr,
     scope: &TypeScope,
-    lookup: &dyn Fn(&str) -> Option<RelationRef<'a>>,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
     ctx: &mut Ctx<'_>,
 ) {
     match expr {
@@ -989,12 +813,6 @@ fn check_expr<'a>(
             if let Some(else_result) = else_result {
                 check_expr(else_result, scope, lookup, ctx);
             }
-            let branches: Vec<&Expr> = conditions
-                .iter()
-                .map(|w| &w.result)
-                .chain(else_result.as_deref())
-                .collect();
-            check_branch_types(expr, "CASE", &branches, scope, ctx);
         }
         Expr::Nested(inner)
         | Expr::UnaryOp { expr: inner, .. }
@@ -1007,23 +825,6 @@ fn check_expr<'a>(
         | Expr::Cast { expr: inner, .. } => check_expr(inner, scope, lookup, ctx),
         Expr::Function(func) => {
             check_aggregate(expr, func, scope, ctx);
-            check_duckdb_call(expr, func, scope, ctx);
-            if let [ast::ObjectNamePart::Identifier(ident)] = func.name.0.as_slice()
-                && ident.quote_style.is_none()
-                && ident.value.eq_ignore_ascii_case("coalesce")
-                && let ast::FunctionArguments::List(list) = &func.args
-                && crate::function_check::plain_argument_count(func).is_some()
-            {
-                let branches: Vec<&Expr> = list
-                    .args
-                    .iter()
-                    .filter_map(|a| match a {
-                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => Some(e),
-                        _ => None,
-                    })
-                    .collect();
-                check_branch_types(expr, "COALESCE", &branches, scope, ctx);
-            }
             if let ast::FunctionArguments::List(list) = &func.args {
                 for arg in &list.args {
                     if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
@@ -1193,183 +994,6 @@ fn check_comparison(at: &Expr, left: &Expr, right: &Expr, scope: &TypeScope, ctx
     ctx.emit(refused, W043, E043, at, message, suggestion);
 }
 
-/// Whether the model runs on DuckDB: the call checks generated from the
-/// bundled DuckDB (E069, E070) fire only then (#2659, #2661).
-fn runs_on_duckdb(target: &OperandTarget) -> bool {
-    matches!(target, OperandTarget::Targets { dialects, .. } if dialects.contains(&OperandDialect::DuckDb))
-}
-
-/// The class of a branch or argument that is a column whose type Rocky read
-/// from the SQL, not a guess. A literal, `NULL`, a computed expression and an
-/// unresolved column give `None`: DuckDB coerces literals, and a computed
-/// type can be a guess.
-fn exact_column_class(
-    expr: &Expr,
-    scope: &TypeScope,
-    aliases: &HashSet<String>,
-    opaque: bool,
-) -> Option<(ArgClass, RockyType)> {
-    let mut inner = expr;
-    while let Expr::Nested(e) = inner {
-        inner = e;
-    }
-    // In `HAVING`, DuckDB reads a bare name that is a select-list alias as
-    // the aliased expression, not the source column.
-    if let Expr::Identifier(ident) = inner
-        && (opaque || aliases.contains(&ident.value.to_ascii_lowercase()))
-    {
-        return None;
-    }
-    if !matches!(inner, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-        || scope.is_unresolved_column(inner)
-        || !has_exact_type(inner, scope)
-    {
-        return None;
-    }
-    let (ty, _) = infer_expr_type(inner, scope);
-    ArgClass::of(&ty).map(|class| (class, ty))
-}
-
-/// E069: a column argument of a type no DuckDB overload of the function
-/// accepts at that position (#2659). Judged only for plain calls to
-/// unqualified built-ins the project does not declare; aggregates
-/// [`check_aggregate`] judges (E042) and call counts DuckDB refuses (E068)
-/// are left to those checks.
-fn check_duckdb_call(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &mut Ctx<'_>) {
-    if !runs_on_duckdb(&ctx.target) {
-        return;
-    }
-    let [ast::ObjectNamePart::Identifier(ident)] = func.name.0.as_slice() else {
-        return;
-    };
-    if ident.quote_style.is_some() {
-        return;
-    }
-    let lower = ident.value.to_ascii_lowercase();
-    if aggregate_kind(&lower.to_ascii_uppercase()).is_some()
-        || crate::function_check::is_special_form(&lower)
-        || ctx.functions.declares(&lower)
-        || ctx.seed_names.contains(&lower)
-    {
-        return;
-    }
-    let Some(count) = crate::function_check::plain_argument_count(func) else {
-        return;
-    };
-    if duckdb_signatures::refuses_count(&lower, count) {
-        return;
-    }
-    let ast::FunctionArguments::List(list) = &func.args else {
-        return;
-    };
-    for (position, arg) in list.args.iter().enumerate() {
-        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)) = arg else {
-            continue;
-        };
-        let Some((class, ty)) =
-            exact_column_class(arg, scope, &ctx.having_aliases, ctx.having_opaque)
-        else {
-            continue;
-        };
-        if !duckdb_signatures::refuses_argument(&lower, count, position, class) {
-            continue;
-        }
-        let name = &ident.value;
-        let accepted: Vec<&str> = duckdb_signatures::accepted_classes(&lower, count, position)
-            .iter()
-            .map(|c| c.name())
-            .collect();
-        let accepts = if accepted.is_empty() {
-            "no column type Rocky checks".to_string()
-        } else {
-            accepted.join(", ")
-        };
-        let message = format!(
-            "DuckDB has no `{name}` that takes {} at argument {} of {count}: `{arg}` is {ty}, \
-             so DuckDB refuses the query before it reads any data. That argument takes: \
-             {accepts}",
-            class_phrase(class),
-            position + 1,
-        );
-        let suggestion = format!(
-            "pass a column of a type `{name}` takes, or cast it explicitly (e.g. \
-             `CAST({arg} AS VARCHAR)`). If `{name}` is a macro created outside Rocky, call it \
-             schema-qualified (`main.{name}(...)`), which Rocky does not check"
-        );
-        ctx.emit(true, E069, E069, at, message, suggestion);
-        return;
-    }
-}
-
-fn class_phrase(class: ArgClass) -> &'static str {
-    match class {
-        ArgClass::Numeric => "a number",
-        ArgClass::Text => "text",
-        ArgClass::Boolean => "a boolean",
-        ArgClass::Date => "a date",
-        ArgClass::Timestamp => "a timestamp",
-    }
-}
-
-/// The groups of [`ArgClass`] whose members DuckDB can give one common type
-/// in `CASE` and `COALESCE`. Two branches from different groups never bind;
-/// within a group the result can depend on the branch order (`COALESCE(i,
-/// b, d)` binds, `COALESCE(b, d)` does not), so those are not checked.
-fn branch_group(class: ArgClass) -> u8 {
-    match class {
-        ArgClass::Numeric | ArgClass::Boolean => 0,
-        ArgClass::Text => 1,
-        ArgClass::Date | ArgClass::Timestamp => 2,
-    }
-}
-
-/// E070: `CASE` / `COALESCE` branches that are columns from groups DuckDB
-/// has no common type for (#2661).
-fn check_branch_types(
-    at: &Expr,
-    construct: &str,
-    branches: &[&Expr],
-    scope: &TypeScope,
-    ctx: &mut Ctx<'_>,
-) {
-    if !runs_on_duckdb(&ctx.target) {
-        return;
-    }
-    // Every branch must be a classed column or `NULL`: any other branch (a
-    // literal, a computed value, a JSON column) can change the type DuckDB
-    // unifies to, so the list is then not judged.
-    let mut typed: Vec<(&Expr, ArgClass, RockyType)> = Vec::new();
-    for branch in branches {
-        if matches!(branch, Expr::Value(v) if v.value == ast::Value::Null) {
-            continue;
-        }
-        let Some((class, ty)) =
-            exact_column_class(branch, scope, &ctx.having_aliases, ctx.having_opaque)
-        else {
-            return;
-        };
-        typed.push((branch, class, ty));
-    }
-    let Some((first, first_class, first_ty)) = typed.first() else {
-        return;
-    };
-    let Some((other, _, other_ty)) = typed
-        .iter()
-        .find(|(_, c, _)| branch_group(*c) != branch_group(*first_class))
-    else {
-        return;
-    };
-    let message = format!(
-        "{construct} mixes `{first}` ({first_ty}) and `{other}` ({other_ty}). DuckDB has no \
-         common type for them, so it refuses the query before it reads any data"
-    );
-    let suggestion = format!(
-        "cast the branches to one type (e.g. `CAST({other} AS VARCHAR)`), or return the \
-         intended column"
-    );
-    ctx.emit(true, E070, E070, at, message, suggestion);
-}
-
 fn check_aggregate(at: &Expr, func: &ast::Function, scope: &TypeScope, ctx: &mut Ctx<'_>) {
     let Some(name) = func
         .name
@@ -1536,372 +1160,16 @@ mod tests {
             ..Default::default()
         };
         let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
-        let target = OperandTarget::from(dialect);
-        check_operand_types_with(
+        check_operand_types(
             &result.project.models,
             &result.semantic_graph,
             &result.type_check.typed_models,
-            &seed_proven(),
-            &HashSet::new(),
-            &|_| target.clone(),
+            dialect,
         )
-    }
-
-    /// Every test source schema recorded as read from a seed file.
-    fn seed_proven() -> SourceProvenance {
-        SourceProvenance::uniform(sources().keys(), &SourceSchemaOrigin::Seed)
     }
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
         diags.iter().map(|d| &*d.code).collect()
-    }
-
-    fn codes_on(sql: &str, dialect: Option<OperandDialect>) -> Vec<String> {
-        run(&[("m", sql)], dialect)
-            .into_iter()
-            .map(|d| d.code.to_string())
-            .collect()
-    }
-
-    /// E069: a column argument no DuckDB overload takes (#2659).
-    #[test]
-    fn a_column_argument_duckdb_has_no_overload_for_is_refused() {
-        let duckdb = Some(OperandDialect::DuckDb);
-        for sql in [
-            "SELECT lower(qty) AS x FROM raw.orders",
-            "SELECT abs(status) AS x FROM raw.orders",
-            "SELECT md5(order_id) AS x FROM raw.orders",
-            "SELECT upper(is_paid) AS x FROM raw.orders",
-            "SELECT abs(order_date) AS x FROM raw.orders",
-            "SELECT date_trunc('day', qty) AS x FROM raw.orders",
-            "SELECT length(o.qty) AS x FROM raw.orders o",
-            "SELECT o.order_id FROM raw.orders o WHERE lower(o.amount) = 'x'",
-        ] {
-            assert_eq!(codes_on(sql, duckdb), ["E069"], "{sql}");
-        }
-        for sql in [
-            "SELECT lower(status) AS x FROM raw.orders",
-            "SELECT abs(amount) AS x FROM raw.orders",
-            "SELECT abs(price) AS x FROM raw.orders",
-            "SELECT lower('x') AS x FROM raw.orders",
-            "SELECT abs('5') AS x FROM raw.orders",
-            "SELECT substr(status, 1) AS x FROM raw.orders",
-            "SELECT concat(qty, status) AS x FROM raw.orders",
-            "SELECT date_trunc('day', order_date) AS x FROM raw.orders",
-            "SELECT main.lower(qty) AS x FROM raw.orders",
-            "SELECT lower(CAST(qty AS VARCHAR)) AS x FROM raw.orders",
-            "SELECT lower(missing_col) AS x FROM raw.orders",
-            "SELECT lower(q) AS x FROM (SELECT qty + 1 AS q FROM raw.orders) s",
-            // Red team: in HAVING a bare name can be a select-list alias.
-            "SELECT CAST(qty AS VARCHAR) AS qty, count(*) AS n FROM raw.orders GROUP BY ALL \
-             HAVING lower(qty) = '2'",
-            "SELECT * REPLACE (CAST(qty AS VARCHAR) AS qty) FROM raw.orders GROUP BY ALL \
-             HAVING lower(qty) = '2'",
-            "SELECT o.* REPLACE (CAST(qty AS VARCHAR) AS qty) FROM raw.orders o GROUP BY ALL \
-             HAVING lower(qty) = '2'",
-            "SELECT CAST(COLUMNS('^qty$') AS VARCHAR), count(*) AS n FROM raw.orders \
-             GROUP BY ALL HAVING lower(qty) = '2'",
-        ] {
-            assert!(codes_on(sql, duckdb).is_empty(), "{sql}");
-        }
-        // SUM over text is E042's, once.
-        assert_eq!(
-            codes_on("SELECT SUM(status) AS s FROM raw.orders", duckdb),
-            ["E042"]
-        );
-        // Only DuckDB's signatures are known.
-        for dialect in [Some(OperandDialect::Snowflake), None] {
-            assert!(codes_on("SELECT lower(qty) AS x FROM raw.orders", dialect).is_empty());
-        }
-    }
-
-    /// DuckDB's top-n `max(col, n)` / `min(col, n)` returns a list, so a
-    /// column built from one is not a scalar of the argument's type.
-    #[test]
-    fn a_top_n_min_max_column_is_not_judged_as_a_scalar() {
-        assert!(
-            codes_on(
-                "SELECT array_length(m) AS a, list_sort(n) AS b FROM \
-                 (SELECT max(status, 2) AS m, min(qty, 3) AS n FROM raw.orders) t",
-                Some(OperandDialect::DuckDb)
-            )
-            .is_empty()
-        );
-        assert!(
-            codes_on(
-                "WITH c AS (SELECT max(status, 2) AS m FROM raw.orders) \
-                 SELECT array_length(m) AS a FROM c",
-                Some(OperandDialect::DuckDb)
-            )
-            .is_empty()
-        );
-        assert!(
-            codes_on(
-                "SELECT len(max(order_date, 2)) AS x FROM raw.orders",
-                Some(OperandDialect::DuckDb)
-            )
-            .is_empty()
-        );
-    }
-
-    /// `AVG` over a column of a table with no known schema is typed `Float64`
-    /// only so a contract on it is checked; DuckDB may return a timestamp. A
-    /// column built from that guess is not judged, in a CTE or a derived
-    /// table.
-    #[test]
-    fn a_guessed_avg_column_is_not_judged() {
-        let duckdb = Some(OperandDialect::DuckDb);
-        assert!(
-            codes_on(
-                "WITH c AS (SELECT avg(ts) AS a FROM ext.events) SELECT year(a) AS y FROM c",
-                duckdb
-            )
-            .is_empty()
-        );
-        assert!(
-            codes_on(
-                "SELECT year(a) AS y FROM (SELECT avg(ts) AS a FROM ext.events) t",
-                duckdb
-            )
-            .is_empty()
-        );
-        // A known AVG is still judged: AVG over a number is a DOUBLE.
-        assert_eq!(
-            codes_on(
-                "WITH c AS (SELECT avg(qty) AS a FROM raw.orders) SELECT lower(a) AS y FROM c",
-                duckdb
-            ),
-            ["E069"]
-        );
-    }
-
-    /// A seed-file macro reusing a built-in name is the project's to judge.
-    #[test]
-    fn a_seed_file_macro_argument_is_not_judged() {
-        let models = vec![model("m", "SELECT lower(qty) AS x FROM raw.orders")];
-        let config = crate::compile::CompilerConfig {
-            source_schemas: sources(),
-            ..Default::default()
-        };
-        let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
-        let target = OperandTarget::from(Some(OperandDialect::DuckDb));
-        let judge = |seed: &HashSet<String>| {
-            check_operand_types_with(
-                &result.project.models,
-                &result.semantic_graph,
-                &result.type_check.typed_models,
-                &seed_proven(),
-                seed,
-                &|_| target.clone(),
-            )
-        };
-        assert_eq!(codes(&judge(&HashSet::new())), vec!["E069"]);
-        assert!(judge(&HashSet::from(["lower".to_string()])).is_empty());
-    }
-
-    /// Only a source schema proves a column's type to E069 / E070. A model's
-    /// columns are Rocky's own inference, which has guessed wrong before
-    /// (#2659 red team): they are not judged, however they are read.
-    #[test]
-    fn no_upstream_model_column_is_judged() {
-        let up = (
-            "up",
-            "SELECT qty AS n, order_date AS d, avg(qty) AS a FROM raw.orders GROUP BY qty, order_date",
-        );
-        for down in [
-            "SELECT lower(n) AS x FROM up",
-            "SELECT lower(u.n) AS x FROM up u",
-            "SELECT lower(n) AS x FROM main.up",
-            "SELECT lower(n) AS x FROM (SELECT * FROM up) t",
-            "SELECT lower(n) AS x FROM (SELECT n FROM up) t",
-            "WITH c AS (SELECT n FROM up) SELECT lower(n) AS x FROM c",
-            "WITH c AS (SELECT * FROM up) SELECT lower(c.n) AS x FROM c",
-            "SELECT lower(a) AS x FROM up",
-            "SELECT coalesce(n, d) AS x FROM up",
-            "SELECT CASE WHEN n > 1 THEN d ELSE n END AS x FROM up",
-            "SELECT coalesce(u.n, o.order_date) AS x FROM up u, raw.orders o",
-        ] {
-            let diags = run(&[up, ("down", down)], Some(OperandDialect::DuckDb));
-            assert!(diags.is_empty(), "{down}: {diags:?}");
-        }
-        // Through a pass-through model read by its qualified name.
-        let diags = run(
-            &[
-                up,
-                ("mid", "SELECT n, d FROM main.up"),
-                ("down", "SELECT lower(n) AS x FROM mid"),
-            ],
-            Some(OperandDialect::DuckDb),
-        );
-        assert!(diags.is_empty(), "{diags:?}");
-        // E042 still judges a model column: only E069 / E070 need a source.
-        assert_eq!(
-            codes(&run(
-                &[
-                    ("up_s", "SELECT status AS s FROM raw.orders"),
-                    ("down", "SELECT SUM(s) AS x FROM up_s"),
-                ],
-                Some(OperandDialect::DuckDb)
-            )),
-            vec!["E042"]
-        );
-        // The same read from the source table is judged.
-        assert_eq!(
-            codes(&run(
-                &[("down", "SELECT lower(qty) AS x FROM raw.orders")],
-                Some(OperandDialect::DuckDb)
-            )),
-            vec!["E069"]
-        );
-    }
-
-    /// A source type is an error's proof only when it is current: a seed
-    /// (DuckDB's own answer), a live read, or a schema-cache entry that
-    /// passes the E041 staleness test. A stale entry, or a schema of unknown
-    /// origin, gives the warning form.
-    #[test]
-    fn a_stale_source_type_gives_a_warning() {
-        let models = vec![
-            model("a", "SELECT lower(qty) AS x FROM raw.orders"),
-            model("b", "SELECT coalesce(qty, status) AS x FROM raw.orders"),
-        ];
-        let config = crate::compile::CompilerConfig {
-            source_schemas: sources(),
-            ..Default::default()
-        };
-        let result = crate::compile::compile_preloaded_models(models, &config).expect("compile");
-        let target = OperandTarget::from(Some(OperandDialect::DuckDb));
-        let judge = |provenance: &SourceProvenance| {
-            let diags = check_operand_types_with(
-                &result.project.models,
-                &result.semantic_graph,
-                &result.type_check.typed_models,
-                provenance,
-                &HashSet::new(),
-                &|_| target.clone(),
-            );
-            diags
-                .iter()
-                .map(|d| format!("{}:{:?}", d.code, d.severity))
-                .collect::<Vec<_>>()
-        };
-        let cached = |trusted| SourceSchemaOrigin::Cache {
-            cached_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-            trusted,
-        };
-        let errors = vec!["E069:Error", "E070:Error"];
-        let warnings = vec!["W069:Warning", "W070:Warning"];
-        for (origin, want) in [
-            (SourceSchemaOrigin::Seed, &errors),
-            (SourceSchemaOrigin::Live, &errors),
-            (cached(true), &errors),
-            (cached(false), &warnings),
-        ] {
-            let provenance = SourceProvenance::uniform(sources().keys(), &origin);
-            assert_eq!(&judge(&provenance), want, "{origin:?}");
-        }
-        assert_eq!(judge(&SourceProvenance::default()), warnings);
-    }
-
-    /// E070: `CASE` / `COALESCE` branches DuckDB has no common type for
-    /// (#2661).
-    #[test]
-    fn branches_duckdb_cannot_unify_are_refused() {
-        let duckdb = Some(OperandDialect::DuckDb);
-        for sql in [
-            "SELECT coalesce(order_date, status) AS x FROM raw.orders",
-            "SELECT coalesce(qty, status) AS x FROM raw.orders",
-            "SELECT CASE WHEN is_paid THEN qty ELSE status END AS x FROM raw.orders",
-            "SELECT CASE WHEN qty > 1 THEN order_date WHEN is_paid THEN amount END AS x \
-             FROM raw.orders",
-            "SELECT coalesce(is_paid, order_date) AS x FROM raw.orders",
-            "SELECT coalesce(qty, NULL, status) AS x FROM raw.orders",
-        ] {
-            assert_eq!(codes_on(sql, duckdb), ["E070"], "{sql}");
-        }
-        for sql in [
-            "SELECT coalesce(qty, price, amount) AS x FROM raw.orders",
-            "SELECT coalesce(qty, is_paid, price) AS x FROM raw.orders",
-            "SELECT coalesce(status, 'x') AS x FROM raw.orders",
-            "SELECT coalesce(qty, '1') AS x FROM raw.orders",
-            "SELECT coalesce(order_date, '2024-01-01') AS x FROM raw.orders",
-            // The issue's repro binds; it fails only when a row reaches the
-            // text branch, so it is not refused here.
-            "SELECT CASE WHEN qty > 1 THEN 'many' ELSE qty END AS x FROM raw.orders",
-            "SELECT CASE WHEN is_paid THEN qty ELSE CAST(status AS INT) END AS x \
-             FROM raw.orders",
-            // Red team: a branch Rocky does not class can change DuckDB's
-            // result type (JSON here), so the list is not judged.
-            "SELECT coalesce(qty, CAST(status AS JSON), status) AS x FROM raw.orders",
-            "SELECT coalesce(qty, upper(status), status) AS x FROM raw.orders",
-            "SELECT coalesce(qty, '1', status) AS x FROM raw.orders",
-            "SELECT CAST(order_date AS VARCHAR) AS order_date, max(status) AS status \
-             FROM raw.orders GROUP BY ALL HAVING coalesce(order_date, status) = 's'",
-        ] {
-            assert!(codes_on(sql, duckdb).is_empty(), "{sql}");
-        }
-        assert!(codes_on("SELECT coalesce(qty, status) AS x FROM raw.orders", None).is_empty());
-    }
-
-    /// Every branch list E070's rule refuses, built from the DuckDB types
-    /// each class stands for, is refused by the bundled DuckDB, in `COALESCE`
-    /// and in `CASE`, in every order and with a `NULL` branch mixed in.
-    #[test]
-    fn duckdb_refuses_every_branch_mix_e070_reports() {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        let mut members: Vec<(ArgClass, String, &str)> = Vec::new();
-        let mut columns = Vec::new();
-        for class in ArgClass::ALL {
-            for (i, ty) in class.duckdb_types().iter().enumerate() {
-                let name = format!("c_{}_{i}", class.name());
-                columns.push(format!("{name} {ty}"));
-                members.push((class, name, ty));
-            }
-        }
-        conn.execute_batch(&format!(
-            "CREATE TABLE t (b BOOLEAN, {})",
-            columns.join(", ")
-        ))
-        .unwrap();
-        let refused_by_rule = |list: &[&(ArgClass, String, &str)]| {
-            list.iter()
-                .any(|m| branch_group(m.0) != branch_group(list[0].0))
-        };
-        let mut checked = 0;
-        let mut lists: Vec<Vec<&(ArgClass, String, &str)>> = Vec::new();
-        for a in &members {
-            for b in &members {
-                lists.push(vec![a, b]);
-                for c in &members {
-                    lists.push(vec![a, b, c]);
-                }
-            }
-        }
-        for list in lists {
-            if !refused_by_rule(&list) {
-                continue;
-            }
-            let mut names: Vec<&str> = list.iter().map(|m| m.1.as_str()).collect();
-            for with_null in [false, true] {
-                if with_null {
-                    names.insert(1, "NULL");
-                }
-                let coalesce = format!("SELECT coalesce({}) FROM t", names.join(", "));
-                let (last, init) = names.split_last().unwrap();
-                let whens: Vec<String> = init.iter().map(|n| format!("WHEN b THEN {n}")).collect();
-                let case = format!("SELECT CASE {} ELSE {last} END FROM t", whens.join(" "));
-                for sql in [coalesce, case] {
-                    let err = conn.prepare(&sql).err().map(|e| e.to_string());
-                    assert!(
-                        err.as_deref()
-                            .is_some_and(|e| e.contains("Cannot mix values of type")),
-                        "DuckDB does not refuse {sql} for its branch types: {err:?}"
-                    );
-                    checked += 1;
-                }
-            }
-        }
-        assert!(checked > 2000, "checked {checked}");
     }
 
     const D2: &str =

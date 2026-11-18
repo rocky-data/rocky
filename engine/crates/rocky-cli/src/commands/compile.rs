@@ -557,6 +557,7 @@ fn compile_inner(
         project_config.as_ref(),
         model_targets.as_ref(),
         target_dialect,
+        Some(project_root),
     );
 
     // Compute DAG-propagated cost estimates for all models.
@@ -831,7 +832,13 @@ pub fn apply_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_path.parent(),
+    );
     apply_inlined_sql_gates(result, &targets);
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
@@ -847,7 +854,13 @@ pub fn apply_authored_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_path.parent(),
+    );
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
 
@@ -899,20 +912,30 @@ fn apply_operand_gates(
     project_config: Option<&rocky_config::RockyConfig>,
     targets: Option<&ModelTargets<'_>>,
     target_dialect: Option<Dialect>,
+    project_root: Option<&Path>,
 ) {
-    // The functions and macros the seed that typed this compile created are
-    // the project's own: a call to one is not judged against DuckDB's
-    // built-ins (E057, E068, E069). They travel with the source schemas, so
-    // every entry point reads them from the seed it typed from.
-    let seed_names = &result.seed_function_names;
+    // The functions and macros the project's seed creates are the project's
+    // own: a call to one is not judged against DuckDB's built-ins (E057,
+    // E068). A name missed here is a false refusal, a name wrongly kept only
+    // a missed check, so this is the union of every source: the names the
+    // DuckDB that ran the seed reports (when this compile ran it), and a
+    // text scan of each seed file the gate can find, which covers a seed
+    // that did not run and the entry points that never run one.
+    let mut seed_names = result.seed_function_names.clone();
+    for seed in reachable_seed_files(result, project_root) {
+        if let Ok(sql) = std::fs::read_to_string(&seed) {
+            seed_names.extend(rocky_compiler::function_check::seed_function_names_in_text(
+                &sql,
+            ));
+        }
+    }
+    let seed_names = &seed_names;
     let target_for =
         |model: &str| operand_target_for(target_dialect, project_config, targets, model);
-    let mut operand_diags = rocky_compiler::operand_check::check_operand_types_with(
+    let mut operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
         &result.project.models,
         &result.semantic_graph,
         &result.type_check.typed_models,
-        &result.source_provenance,
-        seed_names,
         &target_for,
     );
     // Calls to functions the target warehouse does not have: E057 on the
@@ -935,6 +958,38 @@ fn apply_operand_gates(
         result.has_errors = true;
     }
     result.diagnostics.extend(operand_diags);
+}
+
+/// The seed files a compile can have been typed from: `<root>/data/seed.sql`
+/// for `project_root`, and for each model, the first directory above its
+/// file that holds a `data/seed.sql` or a `rocky.toml`. Every one is read,
+/// since a name from a seed that is not the project's only loses a check.
+fn reachable_seed_files(
+    result: &compile::CompileResult,
+    project_root: Option<&Path>,
+) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut seeds = std::collections::BTreeSet::new();
+    if let Some(root) = project_root {
+        seeds.insert(seed_file(root));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for model in &result.project.models {
+        for dir in model.file_path.ancestors().skip(1) {
+            if !seen.insert(dir.to_path_buf()) {
+                break;
+            }
+            let seed = seed_file(dir);
+            if seed.is_file() {
+                seeds.insert(seed);
+                break;
+            }
+            if dir.join("rocky.toml").is_file() {
+                break;
+            }
+        }
+    }
+    seeds.retain(|seed| seed.is_file());
+    seeds
 }
 
 /// SQL Server lifts every CTE to the head of the statement; check that on

@@ -218,14 +218,11 @@ pub struct CompileResult {
     /// holds only the `depends_on` entries that name a model; an entry that
     /// does not is an `E060` in [`Self::diagnostics`].
     pub consumers: Vec<rocky_core::consumers::Consumer>,
-    /// [`CompilerConfig::source_provenance`], for the gates that run after
-    /// the compile (E069 / E070 read it).
-    pub source_provenance: crate::source_refs::SourceProvenance,
     /// The lower-case names of the functions and macros the seed that typed
     /// this compile created, read from the DuckDB that ran it. The compile
     /// leaves it empty; a caller that typed [`CompilerConfig::source_schemas`]
     /// from a seed fills it, so the names always come from the seed the
-    /// schemas did. E057, E068 and E069 skip these names on DuckDB.
+    /// schemas did. E057 and E068 skip these names on DuckDB.
     pub seed_function_names: std::collections::HashSet<String>,
 }
 
@@ -652,7 +649,6 @@ pub fn compile_project(
         model_timings,
         contract_files,
         consumers,
-        source_provenance: config.source_provenance.clone(),
         seed_function_names: std::collections::HashSet::new(),
     })
 }
@@ -1041,7 +1037,6 @@ pub fn compile_incremental(
         model_timings,
         contract_files,
         consumers,
-        source_provenance: config.source_provenance.clone(),
         seed_function_names: std::collections::HashSet::new(),
     })
 }

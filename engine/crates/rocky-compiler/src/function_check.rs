@@ -270,6 +270,7 @@ const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try", "date"];
 
 /// Whether `lower_name` is a call-position form the parser or the warehouse
 /// rewrites ([`SPECIAL_FORMS`]) or one only DuckDB's grammar has.
+#[cfg(test)]
 pub(crate) fn is_special_form(lower_name: &str) -> bool {
     SPECIAL_FORMS.contains(&lower_name) || DUCKDB_ONLY_FORMS.contains(&lower_name)
 }
@@ -288,6 +289,43 @@ pub fn check_unknown_functions(
     written_for: Option<OperandDialect>,
 ) -> Vec<Diagnostic> {
     check_unknown_functions_with(models, registry, &HashSet::new(), target_for, written_for)
+}
+
+/// The lower-case names a seed file's text may create as functions or
+/// macros: every `CREATE [OR REPLACE] [TEMP | TEMPORARY] MACRO | FUNCTION
+/// [IF NOT EXISTS] [schema.]name`, case-insensitive.
+///
+/// Comments and string literals are not skipped. A name found inside one
+/// only turns a check off for that name, while a real one the scan dropped
+/// would be refused, so the scan errs toward finding more.
+pub fn seed_function_names_in_text(seed_sql: &str) -> HashSet<String> {
+    static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)\bcreate\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:macro|function)\s+(?:if\s+not\s+exists\s+)?((?:(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)\s*\.\s*)*(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*))"#,
+        )
+        .expect("valid regex")
+    });
+    CREATE
+        .captures_iter(seed_sql)
+        .filter_map(|c| c.get(1))
+        .filter_map(|m| last_name_part(m.as_str()))
+        .collect()
+}
+
+/// The last part of a possibly qualified, possibly quoted name, lower-cased
+/// and unquoted.
+fn last_name_part(qualified: &str) -> Option<String> {
+    static LAST: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(?:"((?:[^"]|"")+)"|([a-z_][a-z0-9_$]*))\s*$"#)
+            .expect("valid regex")
+    });
+    let captures = LAST.captures(qualified)?;
+    let name = match (captures.get(1), captures.get(2)) {
+        (Some(quoted), _) => quoted.as_str().replace("\"\"", "\""),
+        (None, Some(bare)) => bare.as_str().to_string(),
+        (None, None) => return None,
+    };
+    Some(name.to_ascii_lowercase())
 }
 
 /// [`check_unknown_functions`], skipping DuckDB's verdict on calls to
@@ -733,6 +771,28 @@ mod tests {
         assert_eq!(
             judged("select my_macro(a) from t", OperandDialect::Snowflake).len(),
             1
+        );
+    }
+
+    /// The text scan finds every `CREATE MACRO` / `FUNCTION` name, also one
+    /// between comment markers inside string literals (#2659 red team). A
+    /// name inside a comment or a string is found too: that only turns the
+    /// check off for it.
+    #[test]
+    fn the_seed_text_scan_drops_no_name() {
+        let seed = "CREATE TABLE p AS SELECT 'raw/orders/*.csv' AS p, 'a--b' AS q;\n\
+                    CREATE MACRO lower(a, b) AS a || b;\n\
+                    SELECT 'raw/events/*/part.parquet';\n\
+                    create or replace temp macro My_Macro(x) as x + 1;\n\
+                    CREATE TEMPORARY FUNCTION util.\"Shout\"(s) AS upper(s);\n\
+                    CREATE MACRO IF NOT EXISTS keep(x) AS x;\n\
+                    CREATE FUNCTION \"we\"\"ird\"(x) AS x;\n\
+                    -- CREATE MACRO commented(x) AS x\n";
+        let mut names: Vec<String> = seed_function_names_in_text(seed).into_iter().collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["commented", "keep", "lower", "my_macro", "shout", "we\"ird"]
         );
     }
 
