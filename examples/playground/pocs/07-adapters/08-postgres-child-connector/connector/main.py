@@ -92,6 +92,9 @@ def load_source(request):
     for key in ("schema", "table", "cursor_column"):
         if not isinstance(source.get(key), str) or not source[key]:
             fail("[connector.<name>.options] needs a non-empty string %r" % key)
+    if "replay_sql" in source:
+        # The key is internal: it holds the fixture's text.
+        fail("replay_sql is not an option; set replay_fixture to a SQL file")
     replay = source.get("replay_fixture")
     if replay is not None:
         if not isinstance(replay, str) or not replay:
