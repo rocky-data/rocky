@@ -9,11 +9,13 @@
 //! The finding is the error `E071` only where DuckDB is shown to bind the
 //! query: the model's query, its set-operation branches, derived tables in
 //! `FROM`, and subqueries in the select list, `WHERE`, `HAVING` and a join's
-//! `ON`, nested any number of times, even a subquery that never runs
+//! `ON` reached only through forms a macro cannot shadow ([`keeps_binding`]),
+//! nested any number of times, even a subquery that never runs
 //! ([`bound_subqueries`]). Everywhere else, a CTE body, a named `WINDOW`, an
-//! `ORDER BY` or any place not on that list, it is the warning `W071`:
-//! DuckDB skips a CTE nothing reads or a window nothing uses, and an
-//! unlisted place may be skipped too. The check needs no name resolution:
+//! `ORDER BY`, a function argument, an operand of an operator a macro can
+//! shadow, or any place not on that list, it is the warning `W071`: DuckDB
+//! skips a CTE nothing reads or a window nothing uses, a macro drops an
+//! argument its body does not use, and an unlisted place may be skipped too. The check needs no name resolution:
 //! it compares the widths the syntax states.
 //!
 //! A branch's width is counted only when the SQL states it: a `*`, a
@@ -57,8 +59,9 @@ enum Place {
     /// Reached from the model's query only through places DuckDB is shown to
     /// bind ([`bound_subqueries`]), so the warehouse refuses it: `E071`.
     Bound,
-    /// Anywhere else: a CTE body, a named window, an `ORDER BY`, a lambda,
-    /// or any place not on that list. The warehouse may skip it: `W071`.
+    /// Anywhere else: a CTE body, a named window, an `ORDER BY`, a function
+    /// argument, an operand of an operator a macro can shadow, a lambda, or
+    /// any place not on that list. The warehouse may skip it: `W071`.
     MaybeSkipped,
 }
 
@@ -99,8 +102,7 @@ impl Visitor for Places<'_> {
 /// - a branch of a set operation, or the body in parentheses;
 /// - a derived table in `FROM` or a join, `LATERAL` included;
 /// - a subquery in the select list, `WHERE`, `HAVING` or a join's `ON`,
-///   unless it sits inside a function call's arguments or a lambda
-///   ([`hides_binding`]).
+///   reached only through the expression forms [`keeps_binding`] lists.
 fn bound_subqueries(body: &SetExpr, out: &mut HashSet<*const Query>) {
     match body {
         SetExpr::Select(select) => {
@@ -164,29 +166,40 @@ fn on_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
     }
 }
 
-/// An expression whose operands DuckDB may drop before binding them:
-/// - a function call, since a macro drops an argument its body does not use
-///   (`has_table_privilege` and the other built-in macros, and the macros
-///   Rocky makes from `functions/`), and a name alone does not say whether a
-///   call is a macro;
-/// - a lambda, which the parser reads as `Expr::Lambda` or, for
-///   `x -> body`, as an `->` operator. `->` is also DuckDB's JSON lookup;
-///   counting that here only turns an error into a warning.
-fn hides_binding(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Function(_)
-            | Expr::Lambda(_)
-            | Expr::BinaryOp {
-                op: sqlparser::ast::BinaryOperator::Arrow,
-                ..
-            }
-    )
+/// Whether a subquery under `expr` stays bound when `expr` is. This is an
+/// allow-list of forms DuckDB binds in full and a user macro cannot shadow:
+/// comparisons, `AND`, `OR`, `NOT`, `CASE`, `BETWEEN`, `IS [NOT] DISTINCT
+/// FROM`, casts, `IN`, `EXISTS`, parentheses and a subquery itself (tests
+/// show DuckDB refuses a mismatch under each, with a shadowing macro
+/// defined). Anything else hides its operands: a function call, since a
+/// macro drops an argument its body does not use; an operator or keyword
+/// DuckDB rewrites into a call a macro can shadow (`+`, `||`, `LIKE`,
+/// `TRIM`, ...); a lambda; and any form not listed.
+fn keeps_binding(expr: &Expr) -> bool {
+    use sqlparser::ast::{BinaryOperator as B, UnaryOperator as U};
+    match expr {
+        Expr::Nested(_)
+        | Expr::Subquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::InList { .. }
+        | Expr::Case { .. }
+        | Expr::Between { .. }
+        | Expr::IsDistinctFrom(..)
+        | Expr::IsNotDistinctFrom(..)
+        | Expr::Cast { .. } => true,
+        Expr::BinaryOp { op, .. } => matches!(
+            op,
+            B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::And | B::Or
+        ),
+        Expr::UnaryOp { op, .. } => matches!(op, U::Not),
+        _ => false,
+    }
 }
 
-/// Collects the outermost queries in an expression that are not inside a
-/// function call or a lambda ([`hides_binding`]). Fields: output, query
-/// depth, depth of such expressions.
+/// Collects the outermost queries in an expression reached only through
+/// [`keeps_binding`] forms. Fields: output, query depth, depth of other
+/// forms.
 struct ExprSubqueries<'o>(&'o mut HashSet<*const Query>, usize, usize);
 
 impl Visitor for ExprSubqueries<'_> {
@@ -206,14 +219,14 @@ impl Visitor for ExprSubqueries<'_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
-        if hides_binding(expr) {
+        if !keeps_binding(expr) {
             self.2 += 1;
         }
         std::ops::ControlFlow::Continue(())
     }
 
     fn post_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
-        if hides_binding(expr) {
+        if !keeps_binding(expr) {
             self.2 -= 1;
         }
         std::ops::ControlFlow::Continue(())
@@ -575,6 +588,22 @@ mod tests {
             format!("SELECT * FROM (SELECT a FROM t WHERE a IN ({bad})) d"),
             format!("SELECT a FROM t WHERE a IN (SELECT a FROM ({bad}) d)"),
             format!("SELECT a FROM t WHERE a IN ({bad}) UNION ALL SELECT a FROM t"),
+            // Each form `keeps_binding` lists.
+            format!("SELECT a FROM t WHERE a = ({bad})"),
+            format!("SELECT a FROM t WHERE a <> ({bad})"),
+            format!("SELECT a FROM t WHERE a < ({bad})"),
+            format!("SELECT a FROM t WHERE a <= ({bad})"),
+            format!("SELECT a FROM t WHERE a > ({bad})"),
+            format!("SELECT a FROM t WHERE a >= ({bad})"),
+            format!("SELECT a FROM t WHERE true OR a IN ({bad})"),
+            format!("SELECT a FROM t WHERE NOT EXISTS ({bad})"),
+            format!("SELECT a FROM t WHERE NOT (a IN ({bad}))"),
+            format!("SELECT a FROM t WHERE a BETWEEN ({bad}) AND 2"),
+            format!("SELECT a FROM t WHERE a IS DISTINCT FROM ({bad})"),
+            format!("SELECT a FROM t WHERE a IS NOT DISTINCT FROM ({bad})"),
+            format!("SELECT CAST(({bad}) AS BIGINT) FROM t"),
+            format!("SELECT a FROM t WHERE a IN (1, ({bad}))"),
+            format!("SELECT ((({bad}))) FROM t"),
         ] {
             assert_eq!(severities(&sql), ["E071"], "{sql}");
             let err = conn.prepare(&sql).err().map(|e| e.to_string());
@@ -603,6 +632,32 @@ mod tests {
             format!("SELECT a FROM t WHERE has_column_privilege('t', ({bad}), 'select')"),
             format!("SELECT * FROM (SELECT a, pg_table_is_visible(({bad})) v FROM t) d"),
             format!("SELECT pick(a, ({bad})) FROM t"),
+        ] {
+            assert_eq!(severities(&sql), ["W071"], "{sql}");
+            conn.prepare(&sql)
+                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
+        }
+    }
+
+    /// DuckDB rewrites operators and keyword syntax into calls to built-ins,
+    /// which a user macro can shadow and so drop an operand (round-11 red
+    /// team, #2661). Only expressions on the transparent list keep a
+    /// subquery bound. DuckDB runs every query here.
+    #[test]
+    fn a_shadowable_operator_is_a_warning() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a INTEGER, s VARCHAR); CREATE TABLE u (a INTEGER, b INTEGER); \
+             CREATE MACRO \"+\"(x, y) AS x; CREATE MACRO \"||\"(x, y) AS x; \
+             CREATE MACRO \"~~\"(x, y) AS true; CREATE MACRO trim(x) AS 'k';",
+        )
+        .unwrap();
+        let bad = "(SELECT a FROM u UNION ALL SELECT a, b FROM u)";
+        for sql in [
+            format!("SELECT a + {bad} AS v FROM t"),
+            format!("SELECT s || {bad} AS v FROM t"),
+            format!("SELECT a FROM t WHERE s LIKE {bad}"),
+            format!("SELECT trim({bad}) AS v FROM t"),
         ] {
             assert_eq!(severities(&sql), ["W071"], "{sql}");
             conn.prepare(&sql)

@@ -278,15 +278,18 @@ query, even a subquery that never runs:
 - a derived table in `FROM` or a join, `LATERAL` and parenthesised joins
   included;
 - a subquery in the select list, `WHERE`, `HAVING` or a join's `ON` (an
-  inner, left, right or full join), unless it is inside a function call's
-  arguments or a lambda.
+  inner, left, right or full join), reached only through comparisons,
+  `AND`, `OR`, `NOT`, `CASE`, `BETWEEN`, `IS [NOT] DISTINCT FROM`, casts,
+  `IN`, `EXISTS` or parentheses.
 
 These places nest: a subquery in the `WHERE` of a derived table counts.
 Anywhere else, the same finding is the warning `W071`. That covers a CTE
 body, a named `WINDOW`, `ORDER BY`, `GROUP BY`, `QUALIFY`, `LIMIT`, any
-function call's arguments and a lambda. A warehouse can skip a CTE nothing
-reads or a window nothing uses, and a DuckDB macro drops an argument its body
-does not use, so the model may still run.
+function call's arguments, a lambda, and an operand of any other operator,
+such as `+`, `||` or `LIKE`. A warehouse can skip a CTE nothing reads or a
+window nothing uses. A DuckDB macro drops an argument its body does not use,
+and DuckDB turns many operators into function calls a macro can replace. So
+the model may still run.
 
 Rocky does not check whether the column types match across branches.
 DuckDB accepts every type mix when it checks the query, though a mix can
