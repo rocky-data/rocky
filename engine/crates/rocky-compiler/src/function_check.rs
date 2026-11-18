@@ -57,7 +57,7 @@ use std::sync::LazyLock;
 use sqlparser::ast::{self, Expr, Spanned, Statement, Visit, Visitor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E057, E068, SourceSpan, W057};
+use crate::diagnostic::{Diagnostic, E057, SourceSpan, W057};
 use crate::operand_check::{OperandDialect, OperandTarget};
 use crate::udf::FunctionRegistry;
 
@@ -268,13 +268,6 @@ const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 /// dialect's list already holds it.
 const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try", "date"];
 
-/// Whether `lower_name` is a call-position form the parser or the warehouse
-/// rewrites ([`SPECIAL_FORMS`]) or one only DuckDB's grammar has.
-#[cfg(test)]
-pub(crate) fn is_special_form(lower_name: &str) -> bool {
-    SPECIAL_FORMS.contains(&lower_name) || DUCKDB_ONLY_FORMS.contains(&lower_name)
-}
-
 /// Report calls to functions the target dialect does not have.
 ///
 /// `target_for` maps a model name to the warehouses it runs on, as for the
@@ -285,125 +278,6 @@ pub(crate) fn is_special_form(lower_name: &str) -> bool {
 pub fn check_unknown_functions(
     models: &[rocky_core::models::Model],
     registry: &FunctionRegistry,
-    target_for: &dyn Fn(&str) -> OperandTarget,
-    written_for: Option<OperandDialect>,
-) -> Vec<Diagnostic> {
-    check_unknown_functions_with(models, registry, &HashSet::new(), target_for, written_for)
-}
-
-/// The lower-case names a seed file's text may create as functions or
-/// macros: every `CREATE [OR REPLACE] [TEMP | TEMPORARY] MACRO | FUNCTION
-/// [IF NOT EXISTS] [schema.]name`, case-insensitive, with Unicode letters in
-/// names.
-///
-/// The text is scanned twice, raw and with its comments removed
-/// ([`without_comments`]), and the names are the union. The raw scan finds a
-/// name a misread string literal would hide from the second; the second
-/// finds a name with comments between the words. A name found inside a
-/// comment or literal only turns a check off for that name, while a real
-/// one the scan dropped would be refused, so the scan errs toward finding
-/// more. Both scans take time linear in the text.
-pub fn seed_function_names_in_text(seed_sql: &str) -> HashSet<String> {
-    static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        let name = r#"(?:"(?:[^"]|"")+"|[\p{L}_][\p{L}\p{N}_$]*)"#;
-        regex::Regex::new(&format!(
-            concat!(
-                r"(?i)\bcreate\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?",
-                r"(?:macro|function)\s+(?:if\s+not\s+exists\s+)?",
-                r"((?:{name}\s*\.\s*)*{name})",
-            ),
-            name = name,
-        ))
-        .expect("valid regex")
-    });
-    let stripped = without_comments(seed_sql);
-    [seed_sql, stripped.as_str()]
-        .into_iter()
-        .flat_map(|text| CREATE.captures_iter(text))
-        .filter_map(|c| c.get(1))
-        .filter_map(|m| last_name_part(m.as_str()))
-        .collect()
-}
-
-/// `sql` with each `--` and (nested) `/* */` comment replaced by a space.
-/// Single-quoted strings and double-quoted names are kept whole, with `''`
-/// and `""` as escapes. One pass, so linear in the text.
-fn without_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' => {
-                out.push(c);
-                while let Some(d) = chars.next() {
-                    out.push(d);
-                    if d == c {
-                        if chars.peek() == Some(&c) {
-                            out.push(c);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                for d in chars.by_ref() {
-                    if d == '\n' {
-                        break;
-                    }
-                }
-                out.push('\n');
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut depth = 1usize;
-                while depth > 0 {
-                    match chars.next() {
-                        Some('*') if chars.peek() == Some(&'/') => {
-                            chars.next();
-                            depth -= 1;
-                        }
-                        Some('/') if chars.peek() == Some(&'*') => {
-                            chars.next();
-                            depth += 1;
-                        }
-                        Some(_) => {}
-                        None => break,
-                    }
-                }
-                out.push(' ');
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// The last part of a possibly qualified, possibly quoted name, lower-cased
-/// and unquoted.
-fn last_name_part(qualified: &str) -> Option<String> {
-    static LAST: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)(?:"((?:[^"]|"")+)"|([\p{L}_][\p{L}\p{N}_$]*))\s*$"#)
-            .expect("valid regex")
-    });
-    let captures = LAST.captures(qualified)?;
-    let name = match (captures.get(1), captures.get(2)) {
-        (Some(quoted), _) => quoted.as_str().replace("\"\"", "\""),
-        (None, Some(bare)) => bare.as_str().to_string(),
-        (None, None) => return None,
-    };
-    Some(name.to_ascii_lowercase())
-}
-
-/// [`check_unknown_functions`], skipping DuckDB's verdict on calls to
-/// `seed_names`: the lower-case names of the functions and macros the
-/// project's seed file creates. The seed runs only in DuckDB, so another
-/// warehouse still judges the call.
-pub fn check_unknown_functions_with(
-    models: &[rocky_core::models::Model],
-    registry: &FunctionRegistry,
-    seed_names: &HashSet<String>,
     target_for: &dyn Fn(&str) -> OperandTarget,
     written_for: Option<OperandDialect>,
 ) -> Vec<Diagnostic> {
@@ -431,7 +305,7 @@ pub fn check_unknown_functions_with(
         if dialects.is_empty() {
             continue;
         }
-        diagnostics.extend(check_model(model, registry, seed_names, &dialects));
+        diagnostics.extend(check_model(model, registry, &dialects));
     }
     diagnostics
 }
@@ -439,7 +313,6 @@ pub fn check_unknown_functions_with(
 fn check_model(
     model: &rocky_core::models::Model,
     registry: &FunctionRegistry,
-    seed_names: &HashSet<String>,
     dialects: &[FunctionDialect],
 ) -> Vec<Diagnostic> {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
@@ -451,9 +324,6 @@ fn check_model(
     };
     let mut visitor = Calls {
         registry,
-        unreferenced: crate::set_operation::unreferenced_cte_bodies(&statements),
-        skipping: 0,
-        chained: HashSet::new(),
         found: Vec::new(),
     };
     let _ = statements.visit(&mut visitor);
@@ -466,36 +336,18 @@ fn check_model(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"));
     let file = model.file_path.display().to_string();
     let mut diagnostics = Vec::new();
-    let at = |line: usize, col: usize| {
-        if precise_spans && line > 0 {
-            (line, col)
-        } else {
-            (1, 1)
-        }
-    };
     for &dialect in dialects {
         let mut seen = HashSet::new();
-        for (name, line, col, count) in &visitor.found {
+        for (name, line, col) in &visitor.found {
             let lower = name.to_ascii_lowercase();
-            if dialect == FunctionDialect::DuckDb && seed_names.contains(&lower) {
+            if dialect.knows(&lower) || !seen.insert(lower) {
                 continue;
             }
-            if dialect.knows(&lower) {
-                if dialect == FunctionDialect::DuckDb
-                    && let Some(count) = *count
-                    && crate::duckdb_signatures::refuses_count(&lower, count)
-                {
-                    let (line, col) = at(*line, *col);
-                    diagnostics.push(count_diagnostic(
-                        model, name, &lower, count, &file, line, col,
-                    ));
-                }
-                continue;
-            }
-            if !seen.insert(lower) {
-                continue;
-            }
-            let (line, col) = at(*line, *col);
+            let (line, col) = if precise_spans && *line > 0 {
+                (*line, *col)
+            } else {
+                (1, 1)
+            };
             let (code, constructor, phrase): (_, fn(&str, &str, String) -> Diagnostic, _) =
                 match dialect.tier() {
                     Tier::Verified => (E057, Diagnostic::error, "does not exist in"),
@@ -525,44 +377,6 @@ fn check_model(
         }
     }
     diagnostics
-}
-
-/// E068: DuckDB has no overload of `name` that takes `count` arguments.
-fn count_diagnostic(
-    model: &rocky_core::models::Model,
-    name: &str,
-    lower: &str,
-    count: usize,
-    file: &str,
-    line: usize,
-    col: usize,
-) -> Diagnostic {
-    let (accepted, bounded) = crate::duckdb_signatures::accepted_counts(lower);
-    let accepted: Vec<String> = accepted.iter().map(ToString::to_string).collect();
-    let more = if bounded { "" } else { ", or more" };
-    let takes = if accepted.is_empty() {
-        String::new()
-    } else {
-        format!(" It takes {} argument(s){more}.", accepted.join(", "))
-    };
-    let plural = if count == 1 { "" } else { "s" };
-    Diagnostic::error(
-        E068,
-        &model.config.name,
-        format!(
-            "DuckDB has no `{name}` that takes {count} argument{plural}, so DuckDB refuses the \
-             query before it reads any data.{takes}"
-        ),
-    )
-    .with_suggestion(format!(
-        "pass the number of arguments `{name}` takes. If `{name}` is a macro created outside \
-         Rocky, call it schema-qualified (`main.{name}(...)`), which Rocky does not check"
-    ))
-    .with_span(SourceSpan {
-        file: file.to_string(),
-        line,
-        col,
-    })
 }
 
 /// "did you mean …" from edit distance, plus the escape hatch.
@@ -604,88 +418,15 @@ fn suggestion(name: &str, dialect: FunctionDialect) -> String {
 
 struct Calls<'r> {
     registry: &'r FunctionRegistry,
-    /// The bodies of CTEs nothing reads.
-    unreferenced: HashSet<*const ast::Query>,
-    /// How many unreferenced CTE bodies the visitor is inside.
-    skipping: usize,
-    /// Calls that are a link of a dot-call chain (`(x).lower()`).
-    chained: HashSet<*const ast::Function>,
     /// Unqualified, unquoted calls the project does not declare:
-    /// `(name as written, line, column, argument count)`. The count is
-    /// `None` when the call's arguments are not a plain list
-    /// ([`plain_argument_count`]).
-    found: Vec<(String, usize, usize, Option<usize>)>,
-}
-
-/// The argument count of a call whose arguments are a plain list of
-/// expressions, the shape the DuckDB count data was probed with. `None` for
-/// a call with no parentheses, a subquery argument, a named or `*`
-/// argument, a lambda, `DISTINCT` / `ALL`, a clause inside the parentheses
-/// (`ORDER BY`, `SEPARATOR`, ...), `WITHIN GROUP`, `FILTER` or `OVER`, an
-/// `name := value` argument, and an argument that expands to several
-/// (`UNPACK(COLUMNS(...))`).
-pub(crate) fn plain_argument_count(function: &ast::Function) -> Option<usize> {
-    let ast::FunctionArguments::List(list) = &function.args else {
-        return None;
-    };
-    if list.duplicate_treatment.is_some()
-        || !list.clauses.is_empty()
-        || !function.within_group.is_empty()
-        || function.filter.is_some()
-        || function.over.is_some()
-        || !matches!(function.parameters, ast::FunctionArguments::None)
-    {
-        return None;
-    }
-    // `name := value` parses as an expression, not a named argument, and an
-    // `UNPACK(COLUMNS(...))` argument expands to several.
-    list.args
-        .iter()
-        .all(|arg| {
-            matches!(
-                arg,
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
-                    if !matches!(
-                        e,
-                        Expr::Lambda(_)
-                            | Expr::BinaryOp {
-                                op: ast::BinaryOperator::Assignment,
-                                ..
-                            }
-                    ) && !crate::set_operation::expands_to_columns(e)
-            )
-        })
-        .then_some(list.args.len())
+    /// `(name as written, line, column)`.
+    found: Vec<(String, usize, usize)>,
 }
 
 impl Visitor for Calls<'_> {
     type Break = ();
 
-    fn pre_visit_query(&mut self, query: &ast::Query) -> std::ops::ControlFlow<()> {
-        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
-            self.skipping += 1;
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, query: &ast::Query) -> std::ops::ControlFlow<()> {
-        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
-            self.skipping -= 1;
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
-        // `x.lower()` with `x` not a bare name parses as a field access whose
-        // chain holds the call. Its receiver is the call's first argument,
-        // which the call's own list does not hold, so it is not counted.
-        if let Expr::CompoundFieldAccess { access_chain, .. } = expr {
-            for access in access_chain {
-                if let ast::AccessExpr::Dot(Expr::Function(function)) = access {
-                    self.chained.insert(std::ptr::from_ref(function));
-                }
-            }
-        }
         if let Expr::Function(function) = expr
             && let [ast::ObjectNamePart::Identifier(ident)] = function.name.0.as_slice()
             && ident.quote_style.is_none()
@@ -696,12 +437,6 @@ impl Visitor for Calls<'_> {
                 ident.value.clone(),
                 span.start.line as usize,
                 span.start.column as usize,
-                // A call in a CTE nothing reads, which DuckDB never binds,
-                // or in a dot-call chain is not counted (E068), but is still
-                // a name E057 judges.
-                (self.skipping == 0 && !self.chained.contains(&std::ptr::from_ref(function)))
-                    .then(|| plain_argument_count(function))
-                    .flatten(),
             ));
         }
         std::ops::ControlFlow::Continue(())
@@ -787,281 +522,6 @@ mod tests {
 
     fn run(sql: &str, target: &OperandTarget, registry: &FunctionRegistry) -> Vec<Diagnostic> {
         check_unknown_functions(&[model("m", sql)], registry, &|_| target.clone(), None)
-    }
-
-    fn count_codes(sql: &str, target: &OperandTarget) -> Vec<String> {
-        run(sql, target, &FunctionRegistry::default())
-            .into_iter()
-            .map(|d| d.code.to_string())
-            .collect()
-    }
-
-    /// E068: a DuckDB built-in called with a number of arguments it does not
-    /// take (#2659).
-    #[test]
-    fn dot_call_chains_and_unreferenced_ctes_are_not_counted() {
-        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE t (status VARCHAR, amount DOUBLE, created_at TIMESTAMP, \
-             tags VARCHAR[], qty INTEGER)",
-        )
-        .unwrap();
-        // Red team, #2659: in a dot-call chain the receiver is the first
-        // argument, which the call's own list does not hold. A CTE nothing
-        // reads is never bound by DuckDB.
-        for sql in [
-            "select status.upper().lower() from t",
-            "select (status).lower() from t",
-            "select upper(status).lower() from t",
-            "select amount.round(1).abs() from t",
-            "select (amount + 1).round() from t",
-            "select created_at.strftime('%Y').upper() from t",
-            "select 'a,b'.split(',').len() from t",
-            "select (created_at).year() from t",
-            "select (status || 'x').md5() from t",
-            "select ('abc').upper() from t",
-            "select tags[1].upper() from t",
-            "with x as (select lower(status, 'x') as l from t) select qty from t",
-            "with x as (select lower(status, 'x') as l from t), \
-             y as (select l from x) select qty from t",
-        ] {
-            assert!(count_codes(sql, &duckdb).is_empty(), "{sql}");
-            conn.prepare(sql)
-                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
-        }
-        // A CTE the query reads, directly or through another, is still
-        // judged, and so is a call the chain only receives.
-        for sql in [
-            "with x as (select lower(status, 'x') as l from t) select l from x",
-            "with x as (select lower(status, 'x') as l from t), \
-             y as (select l from x) select l from y",
-            "select lower(status, 'x').upper() from t",
-        ] {
-            assert_eq!(count_codes(sql, &duckdb), ["E068"], "{sql}");
-        }
-    }
-
-    /// DuckDB binds every subquery of the main query, even one that never
-    /// runs, so `E068` there is an error DuckDB also raises.
-    #[test]
-    fn a_never_evaluated_subquery_is_still_judged() {
-        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t (s VARCHAR)").unwrap();
-        for sql in [
-            "SELECT CASE WHEN false THEN (SELECT lower(s, 'x') FROM t) ELSE 1 END FROM t",
-            "SELECT 1 FROM t WHERE false AND EXISTS (SELECT lower(s, 'x') FROM t)",
-            "SELECT * FROM (SELECT lower(s, 'x') FROM t) d WHERE false",
-            "SELECT CASE WHEN false THEN lower(s, 'x') END FROM t",
-        ] {
-            assert_eq!(count_codes(sql, &duckdb), ["E068"], "{sql}");
-            assert!(conn.prepare(sql).is_err(), "DuckDB binds {sql}");
-        }
-    }
-
-    /// Round-7 red team, #2659: a CTE counts as read only when a reached
-    /// reader names it in scope. DuckDB binds every query here.
-    #[test]
-    fn cte_reads_follow_duckdb_scoping() {
-        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE orders (status VARCHAR, qty INTEGER); \
-             CREATE TABLE v (a INTEGER, b INTEGER);",
-        )
-        .unwrap();
-        let bad = "SELECT lower(status, 'x') l FROM orders";
-        for sql in [
-            // A nested WITH hides the outer name.
-            format!("WITH x AS ({bad}) SELECT * FROM (WITH x AS (SELECT 1 a) SELECT * FROM x) s"),
-            format!(
-                "WITH x AS ({bad}) SELECT qty FROM orders WHERE qty IN (WITH x AS (SELECT 1 a) SELECT a FROM x)"
-            ),
-            format!(
-                "WITH x AS ({bad}), y AS (WITH x AS (SELECT 1 a) SELECT * FROM x) SELECT * FROM y"
-            ),
-            // The only reader is itself unread.
-            format!("WITH x AS ({bad}) SELECT * FROM (WITH y AS (SELECT * FROM x) SELECT 1 a) s"),
-            format!(
-                "WITH x AS ({bad}), y AS (SELECT * FROM (WITH z AS (SELECT * FROM x) SELECT 1 a) s) SELECT * FROM y"
-            ),
-            format!("WITH x AS ({bad}), y AS (SELECT * FROM x) SELECT 1"),
-            // A table function is not a CTE read.
-            format!("WITH range AS ({bad}) SELECT * FROM range(3)"),
-            format!("WITH unnest AS ({bad}) SELECT * FROM unnest([1, 2])"),
-            // A CTE sees only earlier CTEs: `v` here is the table.
-            format!("WITH x AS (SELECT * FROM v), v AS ({bad}) SELECT * FROM x"),
-            format!("WITH v AS (SELECT * FROM v), w AS ({bad}) SELECT * FROM v"),
-            // An alias is not a CTE read.
-            format!("WITH x AS ({bad}) SELECT x.qty FROM orders AS x"),
-        ] {
-            assert!(count_codes(&sql, &duckdb).is_empty(), "{sql}");
-            conn.prepare(&sql)
-                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
-        }
-        // A reached read in scope is still judged.
-        for sql in [
-            format!("WITH x AS ({bad}) SELECT qty FROM orders WHERE EXISTS (SELECT 1 FROM x)"),
-            format!("WITH x AS ({bad}) SELECT qty FROM orders ORDER BY (SELECT count(*) FROM x)"),
-            format!("WITH \"X\" AS ({bad}) SELECT * FROM x"),
-            format!("WITH x AS ({bad}), y AS (SELECT * FROM x) SELECT * FROM y"),
-            format!(
-                "WITH x AS ({bad}) SELECT * FROM (WITH y AS (SELECT * FROM x) SELECT * FROM y) s"
-            ),
-            format!("WITH RECURSIVE x AS ({bad}) SELECT * FROM x"),
-        ] {
-            assert_eq!(count_codes(&sql, &duckdb), ["E068"], "{sql}");
-        }
-    }
-
-    /// Round-7 red team: a `.` inside a comment after the name, or a nested
-    /// comment, does not lose the name; an unclosed `/*` does not make the
-    /// scan slow.
-    #[test]
-    fn the_seed_text_scan_survives_comments_after_the_name() {
-        let names = seed_function_names_in_text(
-            "CREATE MACRO lower -- see docs.md\n(a, b) AS a;\n\
-             CREATE MACRO upper /* a /* b */ . c */ (a, b) AS a;\n",
-        );
-        assert!(
-            names.contains("lower") && names.contains("upper"),
-            "{names:?}"
-        );
-        // DuckDB nests block comments; only the comment-free pass sees `g`.
-        // A `$$` string the comment pass misreads: only the raw pass sees `f`.
-        let names = seed_function_names_in_text(
-            "CREATE /* a /* b */ c */ MACRO g(x) AS x;\n\
-             SELECT $$--$$ AS d; CREATE MACRO f(x) AS x;\n",
-        );
-        assert!(names.contains("g") && names.contains("f"), "{names:?}");
-        let seed = "-- CREATE MACRO a /* x\n".repeat(40_000);
-        let start = std::time::Instant::now();
-        let _ = seed_function_names_in_text(&seed);
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
-            "{:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn a_wrong_argument_count_is_refused_on_duckdb() {
-        let duckdb = OperandTarget::from(Some(OperandDialect::DuckDb));
-        for sql in [
-            "select lower(name, 'x') from t",
-            "select lower() from t",
-            "select round(price, 1, 2) from t",
-            "select md5(a, b) from t",
-            "select upper(lower(a, b)) from t",
-        ] {
-            assert_eq!(count_codes(sql, &duckdb), ["E068"], "{sql}");
-        }
-        for sql in [
-            "select lower(name) from t",
-            "select round(price) from t",
-            "select round(price, 2) from t",
-            "select concat(a, b, c, d, e, f, g) from t",
-            "select count(*) from t",
-            "select main.lower(a, b) from t",
-            "select \"lower\"(a, b) from t",
-            "select string_agg(a, ',' order by a) from t",
-            "select count(distinct a, b) from t",
-            "select coalesce(a, b, c) from t",
-            // Red team, #2659: name-bound calls and expanded arguments.
-            "select struct_pack(a := qty) from t",
-            "select struct_pack(qty, status) from t",
-            "select struct_insert(payload, extra := qty) from t",
-            "select union_value(k := qty) from t",
-            "select date_diff(unpack(columns(['a', 'b', 'c']))) from t",
-            "select lower(columns('n.*')) from t",
-        ] {
-            assert!(count_codes(sql, &duckdb).is_empty(), "{sql}");
-        }
-        // Only DuckDB's counts are known.
-        let snowflake = OperandTarget::from(Some(OperandDialect::Snowflake));
-        assert!(count_codes("select lower(name, 'x') from t", &snowflake).is_empty());
-        assert!(
-            count_codes(
-                "select lower(name, 'x') from t",
-                &OperandTarget::Unconfigured
-            )
-            .is_empty()
-        );
-        // A model that also runs on DuckDB is refused.
-        let both = OperandTarget::Targets {
-            dialects: vec![OperandDialect::Snowflake, OperandDialect::DuckDb],
-            unruled: Vec::new(),
-        };
-        assert_eq!(
-            count_codes("select lower(name, 'x') from t", &both),
-            ["E068"]
-        );
-    }
-
-    /// Macros and functions the project's seed file creates are the
-    /// project's: a call to one is not judged against DuckDB's built-ins.
-    #[test]
-    fn a_seed_file_macro_is_not_judged() {
-        let names: HashSet<String> = ["lower", "my_macro"].map(String::from).into();
-        let registry = FunctionRegistry::default();
-        let judged = |sql: &str, dialect: OperandDialect| {
-            let target = OperandTarget::from(Some(dialect));
-            check_unknown_functions_with(
-                &[model("m", sql)],
-                &registry,
-                &names,
-                &|_| target.clone(),
-                None,
-            )
-        };
-        let duckdb = OperandDialect::DuckDb;
-        assert!(judged("select lower(a, b) from t", duckdb).is_empty());
-        assert!(judged("select my_macro(a) from t", duckdb).is_empty());
-        // A name the seed does not create is still judged.
-        assert_eq!(judged("select upper(a, b) from t", duckdb).len(), 1);
-        // The seed runs only in DuckDB: another warehouse still judges it.
-        assert_eq!(
-            judged("select my_macro(a) from t", OperandDialect::Snowflake).len(),
-            1
-        );
-    }
-
-    /// The text scan finds every `CREATE MACRO` / `FUNCTION` name, also one
-    /// between comment markers inside string literals (#2659 red team). A
-    /// name inside a comment or a string is found too: that only turns the
-    /// check off for it.
-    #[test]
-    fn the_seed_text_scan_drops_no_name() {
-        let seed = "CREATE TABLE p AS SELECT 'raw/orders/*.csv' AS p, 'a--b' AS q;\n\
-                    CREATE MACRO lower(a, b) AS a || b;\n\
-                    SELECT 'raw/events/*/part.parquet';\n\
-                    create or replace temp macro My_Macro(x) as x + 1;\n\
-                    CREATE TEMPORARY FUNCTION util.\"Shout\"(s) AS upper(s);\n\
-                    CREATE MACRO IF NOT EXISTS keep(x) AS x;\n\
-                    CREATE FUNCTION \"we\"\"ird\"(x) AS x;\n\
-                    -- CREATE MACRO commented(x) AS x\n\
-                    CREATE /* util */ MACRO round(a, b, c) AS a;\n\
-                    CREATE OR REPLACE -- note\n MACRO\n\tabs(a, b) AS a;\n\
-                    CREATE MACRO café(x) AS x;\n\
-                    CREATE MACRO s . \"Dotted.Name\" (x) AS x;\n";
-        let mut names: Vec<String> = seed_function_names_in_text(seed).into_iter().collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "abs",
-                "café",
-                "commented",
-                "dotted.name",
-                "keep",
-                "lower",
-                "my_macro",
-                "round",
-                "shout",
-                "we\"ird"
-            ]
-        );
     }
 
     fn registry_with(name: &str) -> FunctionRegistry {

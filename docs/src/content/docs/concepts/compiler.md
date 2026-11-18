@@ -256,55 +256,7 @@ These calls are never reported:
 - A form the SQL parser or the warehouse rewrites, such as `COALESCE`, `IF` or
   `IFNULL`.
 
-#### Calls with an argument count DuckDB refuses (`E068`)
-
-When a model runs on DuckDB, Rocky reports a call to a DuckDB built-in with
-a number of arguments DuckDB refuses before it reads any data:
-
-```sql
--- E068: DuckDB has no `lower` that takes 2 arguments
-SELECT lower(customer_name, 'x') AS n FROM customers
-```
-
-Rocky does not guess the counts. A test probes the bundled DuckDB 2.0 and
-writes them to `engine/crates/rocky-compiler/src/data/duckdb_signatures.txt`.
-Each count is probed with every argument `NULL`, and with every argument a
-column of one type from each type group. Another test replays every probe
-and fails if DuckDB accepts one, or if the bundled version changes.
-
-The check runs when DuckDB is one of the warehouses Rocky resolves for the
-model, as for `E042`: `--target-dialect`, then the adapters of the pipelines
-that run the model, then `[portability] target_dialect` when no adapter has
-operand rules. A model no pipeline lists is judged against every pipeline's
-adapter. Other warehouses are not checked.
-
-These are not reported:
-
-- The same calls as for `E057`: schema-qualified, quoted, declared in
-  `functions/`, or a rewritten form.
-- A call to a function or macro the project's `data/seed.sql` creates, even
-  when it reuses a built-in name. Rocky takes the names from the DuckDB that
-  ran the seed and from a scan of the seed's text, so a seed that does not run
-  still counts. `E057` skips these names too, but only on DuckDB: the seed
-  does not run on other warehouses. A macro the seed brings in with `ATTACH`
-  or `IMPORT DATABASE` is found only when the seed runs.
-- A call with named arguments (`name := value` too), `*`, `DISTINCT`,
-  `ORDER BY` inside the parentheses, a lambda, an argument that expands to
-  several (`UNPACK(COLUMNS(...))`), `FILTER`, `WITHIN GROUP` or `OVER`.
-- A function such as `struct_pack`, which treats a `NULL` argument
-  differently from a column.
-- A call in a dot-call chain, as in `upper(status).lower()`: the value
-  before the dot is the call's first argument.
-- A call in a CTE that nothing in the query reads, since DuckDB never binds
-  it.
-
-A DuckDB macro created outside the project that reuses a built-in name is a
-known false refusal: Rocky checks the call against the built-in. Call the
-macro schema-qualified (`main.lower(...)`), which Rocky does not check.
-
-Argument types and `CASE` / `COALESCE` branch types are not checked yet.
-
-#### Set operations with different column counts (`E071`)
+#### Set operations with different column counts (`E071`, `W071`)
 
 `E071` reports a `UNION`, `INTERSECT` or `EXCEPT` whose branches return
 different numbers of columns, on every warehouse:
@@ -316,10 +268,15 @@ SELECT order_id, status FROM orders UNION ALL SELECT order_id FROM returns
 
 A branch is counted only when its select list states its width. A `*`, a
 `t.*`, or a call that returns several columns (`COLUMNS(...)`, `UNNEST`,
-`EXPLODE`) is not counted. `UNION BY NAME` is not checked, and neither is a
-CTE that nothing in the query reads, since DuckDB never binds it. Rocky does not
-check whether the column types match across branches: DuckDB accepts every
-type mix, and the other warehouses are not checked yet.
+`EXPLODE`) is not counted. `UNION BY NAME` is not checked.
+
+Inside a CTE body the same finding is the warning `W071`. A warehouse can
+skip a CTE that nothing reads (DuckDB never checks one), so the model may
+still run. Everywhere else in the query, a subquery that never runs
+included, it is the error `E071`.
+
+Rocky does not check whether the column types match across branches:
+DuckDB accepts every type mix, and the other warehouses are not checked yet.
 
 ### 5. Validate contracts
 
@@ -690,8 +647,7 @@ span, and sometimes a suggested fix.
 | `E062` | A model with a contract repeats an output name the contract constrains (`[[columns]]`, `required` or `protected`). The contract checks one column of that name; the warehouse writes the other under another name. Alias the repeat. Names match as for `E061` |
 | `E063` | `[rules] no_extra_columns = true` and the model outputs a column the contract does not name in `[[columns]]`, `required` or `protected`, or Rocky cannot prove the column list (a `SELECT *`, an unaliased expression). Declare the column, drop it, or list the columns explicitly |
 | `E064` | A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no known source table, and is one or two edits from a model name (one edit for names under 5 characters). The message names the model. If it is a real warehouse table, qualify it with its schema (`main.stg_ordrs`) |
-| `E068` | A call to a DuckDB built-in passes a number of arguments it does not take. Only when the model runs on DuckDB. See [Calls with an argument count DuckDB refuses](#calls-with-an-argument-count-duckdb-refuses-e068) |
-| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071) |
+| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, outside any CTE body. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -719,6 +675,7 @@ span, and sometimes a suggested fix.
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
+| `W071` | The warning form of `E071`, for a set-operation mismatch inside a CTE body: a warehouse can skip a CTE nothing reads, so the model may still run. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

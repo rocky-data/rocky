@@ -265,18 +265,16 @@ pub const E063: &str = "E063";
 /// [`crate::unknown_relations`]; a two-part read (`main.stg_ordrs`) is never
 /// checked.
 pub const E064: &str = "E064";
-/// A call to a DuckDB built-in with a number of arguments no overload of it
-/// takes, as in `lower(name, 'x')` (#2659). DuckDB refuses the statement at
-/// bind time. Emitted by `rocky compile` from [`crate::function_check`] when
-/// the model runs on DuckDB; the counts come from
-/// [`crate::duckdb_signatures`], generated from the bundled engine.
-pub const E068: &str = "E068";
 /// The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different
 /// numbers of columns (#2661). SQL requires the same number in every branch,
 /// so it is checked whatever the warehouse. Emitted by
 /// `rocky compile` from [`crate::set_operation`] when both counts are known
-/// from the SQL; `BY NAME` is not checked.
+/// from the SQL, outside every CTE body; `BY NAME` is not checked.
 pub const E071: &str = "E071";
+/// The warning form of [`E071`], for a mismatch inside a CTE body. A
+/// warehouse may skip a CTE nothing reads (DuckDB never binds one), so it
+/// never fails a compile on its own.
+pub const W071: &str = "W071";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
@@ -732,7 +730,7 @@ pub const W058: &str = "W058";
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W071, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

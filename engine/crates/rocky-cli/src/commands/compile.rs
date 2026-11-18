@@ -344,15 +344,14 @@ fn compile_inner(
     let config_strict_sources = project_config
         .as_ref()
         .is_some_and(|config| config.cache.schemas.strict_sources);
-    let (source_schemas, source_provenance, seed_function_names) = if seed_use == SeedUse::Required
-    {
+    let (source_schemas, source_provenance) = if seed_use == SeedUse::Required {
         // Seed loader: run `data/seed.sql` in in-memory DuckDB, read
         // columns from its `information_schema`. Turns leaf .sql models
         // from `RockyType::Unknown` into concrete types for any project
         // that ships a runnable seed (the entire playground).
-        let (schemas, names) = load_seed_at(project_root, project_config.as_ref())?;
+        let schemas = load_source_schemas_from_seed_at(project_root, project_config.as_ref())?;
         let provenance = SourceProvenance::uniform(schemas.keys(), &SourceSchemaOrigin::Seed);
-        (schemas, provenance, names)
+        (schemas, provenance)
     } else {
         let (mut schemas, mut provenance) = if let Some(config) = &project_config {
             // TTL-filtered load from `state.redb`'s `SCHEMA_CACHE` table.
@@ -370,10 +369,9 @@ fn compile_inner(
         } else {
             (HashMap::new(), SourceProvenance::default())
         };
-        let mut names = std::collections::HashSet::new();
         match seed_use {
             SeedUse::IfPresent => {
-                names = merge_default_seed_schemas(
+                merge_default_seed_schemas(
                     project_root,
                     project_config.as_ref(),
                     &mut schemas,
@@ -382,7 +380,7 @@ fn compile_inner(
             }
             SeedUse::Never | SeedUse::Required => {}
         }
-        (schemas, provenance, names)
+        (schemas, provenance)
     };
     let source_provenance = source_provenance.with_strict(strict_sources || config_strict_sources);
     // `--strict-contracts` ORs with `[contracts] strict`; it can turn
@@ -478,9 +476,6 @@ fn compile_inner(
             None => return Err(error.into()),
         },
     };
-    // The seed that typed the compile created these; the gates below read
-    // them from the result.
-    result.seed_function_names = seed_function_names;
 
     // `--model` may also name a user-defined function (`functions/`), valid
     // or not, to see its own diagnostics.
@@ -557,7 +552,6 @@ fn compile_inner(
         project_config.as_ref(),
         model_targets.as_ref(),
         target_dialect,
-        Some(project_root),
     );
 
     // Compute DAG-propagated cost estimates for all models.
@@ -832,13 +826,7 @@ pub fn apply_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(
-        result,
-        Some(config),
-        Some(&targets),
-        None,
-        config_path.parent(),
-    );
+    apply_operand_gates(result, Some(config), Some(&targets), None);
     apply_inlined_sql_gates(result, &targets);
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
@@ -854,13 +842,7 @@ pub fn apply_authored_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(
-        result,
-        Some(config),
-        Some(&targets),
-        None,
-        config_path.parent(),
-    );
+    apply_operand_gates(result, Some(config), Some(&targets), None);
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
 
@@ -912,24 +894,7 @@ fn apply_operand_gates(
     project_config: Option<&rocky_config::RockyConfig>,
     targets: Option<&ModelTargets<'_>>,
     target_dialect: Option<Dialect>,
-    project_root: Option<&Path>,
 ) {
-    // The functions and macros the project's seed creates are the project's
-    // own: a call to one is not judged against DuckDB's built-ins (E057,
-    // E068). A name missed here is a false refusal, a name wrongly kept only
-    // a missed check, so this is the union of every source: the names the
-    // DuckDB that ran the seed reports (when this compile ran it), and a
-    // text scan of each seed file the gate can find, which covers a seed
-    // that did not run and the entry points that never run one.
-    let mut seed_names = result.seed_function_names.clone();
-    for seed in reachable_seed_files(result, project_root) {
-        if let Ok(sql) = std::fs::read_to_string(&seed) {
-            seed_names.extend(rocky_compiler::function_check::seed_function_names_in_text(
-                &sql,
-            ));
-        }
-    }
-    let seed_names = &seed_names;
     let target_for =
         |model: &str| operand_target_for(target_dialect, project_config, targets, model);
     let mut operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
@@ -945,51 +910,16 @@ fn apply_operand_gates(
     let written_for = project_config
         .and_then(|c| c.portability.target_dialect)
         .map(rocky_compiler::operand_check::OperandDialect::from);
-    operand_diags.extend(
-        rocky_compiler::function_check::check_unknown_functions_with(
-            &result.project.models,
-            result.semantic_graph.functions(),
-            seed_names,
-            &target_for,
-            written_for,
-        ),
-    );
+    operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
+        &result.project.models,
+        result.semantic_graph.functions(),
+        &target_for,
+        written_for,
+    ));
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
     }
     result.diagnostics.extend(operand_diags);
-}
-
-/// The seed files a compile can have been typed from: `<root>/data/seed.sql`
-/// for `project_root`, and for each model, the first directory above its
-/// file that holds a `data/seed.sql` or a `rocky.toml`. Every one is read,
-/// since a name from a seed that is not the project's only loses a check.
-fn reachable_seed_files(
-    result: &compile::CompileResult,
-    project_root: Option<&Path>,
-) -> std::collections::BTreeSet<std::path::PathBuf> {
-    let mut seeds = std::collections::BTreeSet::new();
-    if let Some(root) = project_root {
-        seeds.insert(seed_file(root));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for model in &result.project.models {
-        for dir in model.file_path.ancestors().skip(1) {
-            if !seen.insert(dir.to_path_buf()) {
-                break;
-            }
-            let seed = seed_file(dir);
-            if seed.is_file() {
-                seeds.insert(seed);
-                break;
-            }
-            if dir.join("rocky.toml").is_file() {
-                break;
-            }
-        }
-    }
-    seeds.retain(|seed| seed.is_file());
-    seeds
 }
 
 /// SQL Server lifts every CTE to the head of the statement; check that on
@@ -1624,9 +1554,7 @@ pub(crate) fn load_source_schemas_from_seed(
 }
 
 /// Fill `schemas` with the tables of the project's seed file that it does
-/// not already hold, recorded as [`SourceSchemaOrigin::Seed`]. Returns the
-/// names of the functions and macros the seed created (empty when it did not
-/// run).
+/// not already hold, recorded as [`SourceSchemaOrigin::Seed`].
 ///
 /// The default source-schema tier of `rocky compile`: with no `--with-seed`,
 /// a project that ships `data/seed.sql` is still typed from it, so a model
@@ -1642,13 +1570,13 @@ fn merge_default_seed_schemas(
     config: Option<&rocky_config::RockyConfig>,
     schemas: &mut HashMap<String, Vec<TypedColumn>>,
     provenance: &mut SourceProvenance,
-) -> std::collections::HashSet<String> {
+) {
     // A build without DuckDB cannot run a seed; the default tier is silent.
     if cfg!(not(feature = "duckdb")) || !seed_file(project_root).is_file() {
-        return std::collections::HashSet::new();
+        return;
     }
-    match load_seed_at(project_root, config) {
-        Ok((seed, names)) => {
+    match load_source_schemas_from_seed_at(project_root, config) {
+        Ok(seed) => {
             for (key, columns) in seed {
                 if schemas.contains_key(&key) {
                     continue;
@@ -1671,15 +1599,11 @@ fn merge_default_seed_schemas(
                     .insert(key.clone(), SourceSchemaOrigin::Seed);
                 schemas.insert(key, columns);
             }
-            names
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "the seed file did not run; compiling without its source schemas"
-            );
-            std::collections::HashSet::new()
-        }
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "the seed file did not run; compiling without its source schemas"
+        ),
     }
 }
 
@@ -1689,28 +1613,11 @@ fn seed_file(project_root: &Path) -> std::path::PathBuf {
 
 /// [`load_source_schemas_from_seed`] for the seed at
 /// `<project_root>/data/seed.sql`.
+#[cfg(feature = "duckdb")]
 pub(crate) fn load_source_schemas_from_seed_at(
     project_root: &Path,
     config: Option<&rocky_config::RockyConfig>,
 ) -> Result<HashMap<String, Vec<TypedColumn>>> {
-    load_seed_at(project_root, config).map(|(schemas, _)| schemas)
-}
-
-/// The source schemas a seed gave, and the names of the functions and macros
-/// it created.
-type SeedTypes = (
-    HashMap<String, Vec<TypedColumn>>,
-    std::collections::HashSet<String>,
-);
-
-/// The source schemas of the seed at `<project_root>/data/seed.sql`, and the
-/// names of the functions and macros it created, both read from the one
-/// DuckDB that ran it.
-#[cfg(feature = "duckdb")]
-fn load_seed_at(
-    project_root: &Path,
-    config: Option<&rocky_config::RockyConfig>,
-) -> Result<SeedTypes> {
     use anyhow::Context;
     use rocky_duckdb::DuckDbConnector;
 
@@ -1735,19 +1642,17 @@ fn load_seed_at(
 
     // The same derivation `rocky test` and `rocky ci` type their compile
     // from, on the database they then execute in.
-    let schemas = rocky_engine::test_runner::source_schemas_from_db(&conn)?;
-    let names = rocky_engine::test_runner::seed_function_names_from_db(&conn)?;
-    Ok((schemas, names))
+    rocky_engine::test_runner::source_schemas_from_db(&conn)
 }
 
 /// Stub used when the binary is built without the `duckdb` feature. The
 /// flag exists in the clap definition unconditionally so feature-stripped
 /// builds give a clear error rather than a silent no-op.
 #[cfg(not(feature = "duckdb"))]
-fn load_seed_at(
+pub(crate) fn load_source_schemas_from_seed_at(
     _project_root: &Path,
     _config: Option<&rocky_config::RockyConfig>,
-) -> Result<SeedTypes> {
+) -> Result<HashMap<String, Vec<TypedColumn>>> {
     anyhow::bail!("--with-seed requires the `duckdb` feature; rebuild with `--features duckdb`");
 }
 

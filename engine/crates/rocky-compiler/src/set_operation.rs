@@ -1,13 +1,16 @@
-//! E071: set-operation branches that return different numbers of columns
-//! (#2661).
+//! E071 / W071: set-operation branches that return different numbers of
+//! columns (#2661).
 //!
 //! `SELECT a, b FROM t UNION ALL SELECT a FROM u` is refused by every
 //! warehouse. Type inference already notices the mismatch, but only to give
 //! up on the model's columns, so the model compiled clean and failed at run
 //! time.
 //!
-//! A CTE nothing reads, directly or through another CTE, is not checked:
-//! DuckDB never binds it.
+//! Outside any CTE body the finding is the error `E071`: every warehouse
+//! binds the whole main query, a subquery that never runs included. Inside
+//! a CTE body it is the warning `W071`, since DuckDB never binds a CTE
+//! nothing reads, and telling which CTEs are read needs name resolution.
+//! The check itself needs none: it compares the widths the syntax states.
 //!
 //! A branch's width is counted only when the SQL states it: a `*`, a
 //! `t.*`, a multi-alias item, and a call that expands to several columns
@@ -15,14 +18,12 @@
 //! unknown width is never a mismatch. `UNION BY NAME` matches columns by
 //! name, not position, and is not checked.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use sqlparser::ast::{
-    Expr, Query, SelectItem, SetExpr, SetQuantifier, Statement, TableFactor, Visit, Visitor,
-};
+use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, SetQuantifier, Statement, Visit, Visitor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E071};
+use crate::diagnostic::{Diagnostic, E071, W071};
 
 /// Report every set operation in `sql` whose two sides have different known
 /// column counts.
@@ -35,8 +36,8 @@ pub fn check_set_operation_widths(model_name: &str, sql: &str) -> Vec<Diagnostic
     };
     let mut visitor = Queries {
         model_name,
-        unreferenced: unreferenced_cte_bodies(&statements),
-        skipping: 0,
+        cte_bodies: HashSet::new(),
+        in_cte: 0,
         out: Vec::new(),
     };
     let _ = statements.visit(&mut visitor);
@@ -45,10 +46,11 @@ pub fn check_set_operation_widths(model_name: &str, sql: &str) -> Vec<Diagnostic
 
 struct Queries<'m> {
     model_name: &'m str,
-    /// The bodies of CTEs nothing reads ([`unreferenced_cte_bodies`]).
-    unreferenced: HashSet<*const Query>,
-    /// How many unreferenced CTE bodies the visitor is inside.
-    skipping: usize,
+    /// The body of every CTE seen so far. A query's `WITH` is visited before
+    /// its CTE bodies, so each body is here when the visitor reaches it.
+    cte_bodies: HashSet<*const Query>,
+    /// How many CTE bodies the visitor is inside.
+    in_cte: usize,
     out: Vec<Diagnostic>,
 }
 
@@ -56,162 +58,46 @@ impl Visitor for Queries<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
-            self.skipping += 1;
-        }
-        if self.skipping == 0 {
-            report(&query.body, self.model_name, &mut self.out);
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        if self.unreferenced.contains(&std::ptr::from_ref(query)) {
-            self.skipping -= 1;
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-}
-
-/// The bodies of the CTEs in `statements` that nothing reads. DuckDB never
-/// binds such a CTE, so a check that reports what DuckDB refuses at bind
-/// time skips it.
-///
-/// A table reference reads a CTE when it names one in scope the way DuckDB
-/// resolves it: a CTE sees only the CTEs before it (and itself under
-/// `RECURSIVE`), the query's body sees all of them, and a nested `WITH`
-/// hides an outer CTE of the same name. A table function call
-/// (`range(3)`) reads none. A CTE counts as read only when the main query
-/// reaches it, directly or through CTEs that are read. A reference
-/// through text, as in `query_table('x')`, is not followed, so that CTE is
-/// skipped: a miss, never a refusal.
-pub(crate) fn unreferenced_cte_bodies(statements: &[Statement]) -> HashSet<*const Query> {
-    let mut reads = CteReads::default();
-    for statement in statements {
-        let _ = statement.visit(&mut reads);
-    }
-    let mut reached = HashSet::new();
-    let mut pending: Vec<usize> = reads.edges.get(&None).cloned().unwrap_or_default();
-    while let Some(id) = pending.pop() {
-        if reached.insert(id) {
-            pending.extend(reads.edges.get(&Some(id)).into_iter().flatten().copied());
-        }
-    }
-    reads
-        .bodies
-        .iter()
-        .enumerate()
-        .filter(|(id, _)| !reached.contains(id))
-        .map(|(_, body)| *body)
-        .collect()
-}
-
-/// One `WITH` clause being visited.
-struct Frame {
-    query: *const Query,
-    /// Lower-case CTE names and their ids, in order.
-    ctes: Vec<(String, usize)>,
-    /// How many of `ctes` the reference being visited can see.
-    visible: usize,
-    recursive: bool,
-}
-
-/// Which CTE reads which, resolved in scope. A read made outside any CTE
-/// body is the main query's (`None`).
-#[derive(Default)]
-struct CteReads {
-    /// CTE id -> its body.
-    bodies: Vec<*const Query>,
-    /// CTE body -> (the query whose `WITH` defines it, its index there).
-    defined_by: HashMap<*const Query, (*const Query, usize)>,
-    frames: Vec<Frame>,
-    /// The CTE bodies being visited, innermost last.
-    readers: Vec<usize>,
-    edges: HashMap<Option<usize>, Vec<usize>>,
-}
-
-impl CteReads {
-    fn frame_of(&mut self, query: *const Query) -> Option<&mut Frame> {
-        self.frames.iter_mut().rev().find(|f| f.query == query)
-    }
-}
-
-impl Visitor for CteReads {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        let this = std::ptr::from_ref(query);
-        if let Some(&(owner, index)) = self.defined_by.get(&this)
-            && let Some(frame) = self.frame_of(owner)
-        {
-            frame.visible = index + usize::from(frame.recursive);
-            let id = frame.ctes[index].1;
-            self.readers.push(id);
+        if self.cte_bodies.contains(&std::ptr::from_ref(query)) {
+            self.in_cte += 1;
         }
         if let Some(with) = &query.with {
-            let mut ctes = Vec::new();
-            for (index, cte) in with.cte_tables.iter().enumerate() {
-                let body = std::ptr::from_ref(&*cte.query);
-                let id = self.bodies.len();
-                self.bodies.push(body);
-                self.defined_by.insert(body, (this, index));
-                ctes.push((cte.alias.name.value.to_lowercase(), id));
-            }
-            self.frames.push(Frame {
-                query: this,
-                ctes,
-                visible: 0,
-                recursive: with.recursive,
-            });
+            self.cte_bodies.extend(
+                with.cte_tables
+                    .iter()
+                    .map(|cte| std::ptr::from_ref(&*cte.query)),
+            );
         }
+        let place = if self.in_cte == 0 {
+            Place::MainQuery
+        } else {
+            Place::CteBody
+        };
+        report(&query.body, self.model_name, place, &mut self.out);
         std::ops::ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
-        let this = std::ptr::from_ref(query);
-        if query.with.is_some() {
-            self.frames.pop();
-        }
-        if let Some(&(owner, index)) = self.defined_by.get(&this)
-            && let Some(frame) = self.frame_of(owner)
-        {
-            frame.visible = index + 1;
-            self.readers.pop();
+        if self.cte_bodies.contains(&std::ptr::from_ref(query)) {
+            self.in_cte -= 1;
         }
         std::ops::ControlFlow::Continue(())
     }
+}
 
-    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> std::ops::ControlFlow<()> {
-        let TableFactor::Table {
-            name, args: None, ..
-        } = factor
-        else {
-            return std::ops::ControlFlow::Continue(());
-        };
-        let [part] = name.0.as_slice() else {
-            return std::ops::ControlFlow::Continue(());
-        };
-        let Some(ident) = part.as_ident() else {
-            return std::ops::ControlFlow::Continue(());
-        };
-        let wanted = ident.value.to_lowercase();
-        let found = self.frames.iter().rev().find_map(|frame| {
-            frame.ctes[..frame.visible]
-                .iter()
-                .find(|(name, _)| *name == wanted)
-                .map(|(_, id)| *id)
-        });
-        if let Some(id) = found {
-            let reader = self.readers.last().copied();
-            self.edges.entry(reader).or_default().push(id);
-        }
-        std::ops::ControlFlow::Continue(())
-    }
+/// Where a set operation sits, which sets the finding's severity.
+#[derive(Clone, Copy)]
+enum Place {
+    /// Outside every CTE body: always bound, so an error (`E071`).
+    MainQuery,
+    /// Inside a CTE body, at any depth: bound only if the CTE is read, so a
+    /// warning (`W071`).
+    CteBody,
 }
 
 /// Check the set operations of one query body. A parenthesised query inside
 /// it is its own query, reported when the visitor reaches it.
-fn report(body: &SetExpr, model_name: &str, out: &mut Vec<Diagnostic>) {
+fn report(body: &SetExpr, model_name: &str, place: Place, out: &mut Vec<Diagnostic>) {
     let SetExpr::SetOperation {
         op,
         set_quantifier,
@@ -221,27 +107,32 @@ fn report(body: &SetExpr, model_name: &str, out: &mut Vec<Diagnostic>) {
     else {
         return;
     };
-    report(left, model_name, out);
-    report(right, model_name, out);
+    report(left, model_name, place, out);
+    report(right, model_name, place, out);
     if by_name(set_quantifier) {
         return;
     }
     if let (Some(l), Some(r)) = (width(left), width(right))
         && l != r
     {
-        out.push(
-            Diagnostic::error(
-                E071,
+        let message = format!(
+            "the branches of this {op} return different numbers of columns: {l} on the \
+             left, {r} on the right. SQL requires the same number in every branch"
+        );
+        let diagnostic = match place {
+            Place::MainQuery => Diagnostic::error(E071, model_name, message),
+            Place::CteBody => Diagnostic::warning(
+                W071,
                 model_name,
                 format!(
-                    "the branches of this {op} return different numbers of columns: {l} on the \
-                     left, {r} on the right. SQL requires the same number in every branch"
+                    "{message}. It is inside a CTE, which the warehouse may skip if nothing \
+                     reads it"
                 ),
-            )
-            .with_suggestion(
-                "select the same columns, in the same order, in every branch".to_string(),
             ),
-        );
+        };
+        out.push(diagnostic.with_suggestion(
+            "select the same columns, in the same order, in every branch".to_string(),
+        ));
     }
 }
 
@@ -402,31 +293,6 @@ mod tests {
         }
     }
 
-    /// A CTE nothing reads is never bound by DuckDB, so its mismatch is not
-    /// reported (red team, #2661). One the query reads still is.
-    #[test]
-    fn an_unreferenced_cte_is_not_checked() {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE u (a INTEGER); CREATE TABLE v (a INTEGER, b INTEGER)")
-            .unwrap();
-        for sql in [
-            "with x as (select a from u union all select a, b from v) select a, b from v",
-            "with x as (select a from u union all select a, b from v), \
-             y as (select * from x) select a from u",
-        ] {
-            assert_eq!(codes(sql), 0, "{sql}");
-            conn.prepare(sql)
-                .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
-        }
-        assert_eq!(
-            codes(
-                "with x as (select a from u union all select a, b from v), \
-                   y as (select * from x) select * from y"
-            ),
-            1
-        );
-    }
-
     /// DuckDB binds a set operation in a subquery that never runs.
     #[test]
     fn a_never_evaluated_subquery_is_still_checked() {
@@ -442,23 +308,57 @@ mod tests {
         assert!(conn.prepare(sql).is_err());
     }
 
-    /// Round-7 red team, #2661: CTE reads follow DuckDB's scoping.
+    fn severities(sql: &str) -> Vec<&'static str> {
+        check_set_operation_widths("m", sql)
+            .iter()
+            .map(|d| match &*d.code {
+                "E071" => "E071",
+                "W071" => "W071",
+                other => panic!("unexpected {other}"),
+            })
+            .collect()
+    }
+
+    /// A mismatch inside any CTE body is the warning `W071`, read or not:
+    /// DuckDB binds every query here (round 6 to 8 red team, #2661).
+    /// Outside every CTE body it stays `E071`.
     #[test]
-    fn a_shadowed_or_forward_cte_is_not_checked() {
+    fn a_mismatch_inside_a_cte_is_a_warning() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE u1 (a INTEGER); CREATE TABLE v (a INTEGER, b INTEGER)")
-            .unwrap();
-        let bad = "SELECT a FROM u1 UNION ALL SELECT a, b FROM v";
+        conn.execute_batch(
+            "CREATE TABLE u (a INTEGER); CREATE TABLE v (a INTEGER, b INTEGER); \
+             CREATE TABLE \"Ä\" (a INTEGER)",
+        )
+        .unwrap();
+        let bad = "SELECT a FROM u UNION ALL SELECT a, b FROM v";
         for sql in [
+            format!("WITH x AS ({bad}) SELECT a, b FROM v"),
+            format!("WITH x AS ({bad}), y AS (SELECT * FROM x) SELECT a FROM u"),
             format!("WITH x AS ({bad}) SELECT * FROM (WITH x AS (SELECT 1 a) SELECT * FROM x) s"),
             format!("WITH x AS ({bad}) SELECT * FROM (WITH y AS (SELECT * FROM x) SELECT 1 a) s"),
             format!("WITH x AS (SELECT * FROM v), v AS ({bad}) SELECT * FROM x"),
+            format!("WITH \"ä\" AS ({bad}) SELECT * FROM \"Ä\""),
+            format!("WITH x AS (SELECT * FROM (SELECT a FROM u WHERE a IN ({bad})) d) SELECT 1"),
         ] {
-            assert_eq!(codes(&sql), 0, "{sql}");
+            assert_eq!(severities(&sql), ["W071"], "{sql}");
             conn.prepare(&sql)
                 .unwrap_or_else(|e| panic!("DuckDB refuses {sql}: {e}"));
         }
-        assert_eq!(codes(&format!("WITH x AS ({bad}) SELECT * FROM x")), 1);
+        // A read CTE is still flagged, as a warning.
+        assert_eq!(
+            severities(&format!("WITH x AS ({bad}) SELECT * FROM x")),
+            ["W071"]
+        );
+        // Outside every CTE body: an error, also next to a CTE.
+        for sql in [
+            bad.to_string(),
+            format!("WITH c AS (SELECT 1 a) SELECT * FROM ({bad}) d"),
+            "(WITH c AS (SELECT a FROM u) SELECT a FROM c) UNION ALL SELECT a, b FROM v"
+                .to_string(),
+            format!("SELECT * FROM (WITH c AS (SELECT 1 a) {bad}) d"),
+        ] {
+            assert_eq!(severities(&sql), ["E071"], "{sql}");
+        }
     }
 
     /// The bundled DuckDB refuses every mismatch this check reports.
