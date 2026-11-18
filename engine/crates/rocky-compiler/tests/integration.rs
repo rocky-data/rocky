@@ -2385,3 +2385,205 @@ fn upstream_checks_see_the_shadowed_source_a_read_reaches() {
         assert_eq!(star, ["k", "extra"], "{model}: the source table's columns");
     }
 }
+
+/// A source table's `(name, columns)`, each column `(name, type, nullable)`.
+type Source2674<'a> = (&'a str, &'a [(&'a str, rocky_ir::RockyType, bool)]);
+
+/// Compile a model directory of `(name, sql, sidecar extra, target table)`
+/// files with `sources` as the source schemas, for the #2674 red-team cases.
+fn compile_2674(
+    files: &[(&str, &str, &str, &str)],
+    sources: &[Source2674<'_>],
+) -> rocky_compiler::compile::CompileResult {
+    use rocky_compiler::types::TypedColumn;
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for (name, sql, extra, table) in files {
+        std::fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+        std::fs::write(
+            models.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n{extra}\n[target]\ncatalog = \"cat\"\n\
+                 schema = \"sch\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    let config = CompilerConfig {
+        models_dir: models,
+        source_schemas: sources
+            .iter()
+            .map(|(name, cols)| {
+                (
+                    (*name).to_string(),
+                    cols.iter()
+                        .map(|(c, ty, nullable)| TypedColumn {
+                            name: (*c).to_string(),
+                            data_type: ty.clone(),
+                            nullable: *nullable,
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+        ..Default::default()
+    };
+    compile(&config).expect("compile")
+}
+
+fn columns_2674(
+    result: &rocky_compiler::compile::CompileResult,
+    model: &str,
+) -> Vec<(String, rocky_ir::RockyType)> {
+    result.type_check.typed_models[model]
+        .iter()
+        .map(|c| (c.name.clone(), c.data_type.clone()))
+        .collect()
+}
+
+/// #2674 red team: an ephemeral model named in mixed case, read at the top
+/// level and in a subquery. Both reads are the model (they are one name on
+/// DuckDB); the subquery's spelling must not unbind the top-level read.
+#[test]
+fn a_mixed_case_model_read_twice_stays_bound_to_the_model() {
+    use rocky_ir::RockyType;
+    const EPH: &str = "[strategy]\ntype = \"ephemeral\"\n";
+    let result = compile_2674(
+        &[
+            ("Eph", "SELECT id, status FROM raw_orders", EPH, "Eph"),
+            (
+                "e_both",
+                "SELECT a.* FROM Eph a WHERE a.id IN (SELECT id FROM Eph)",
+                "",
+                "e_both",
+            ),
+            (
+                "e_both2",
+                "SELECT a.id, a.status FROM Eph a WHERE a.id IN (SELECT id FROM Eph)",
+                "",
+                "e_both2",
+            ),
+        ],
+        &[(
+            "raw_orders",
+            &[
+                ("id", RockyType::Int64, false),
+                ("status", RockyType::String, true),
+            ],
+        )],
+    );
+    let expected = vec![
+        ("id".to_string(), RockyType::Int64),
+        ("status".to_string(), RockyType::String),
+    ];
+    assert_eq!(columns_2674(&result, "e_both"), expected);
+    assert_eq!(columns_2674(&result, "e_both2"), expected);
+}
+
+/// #2674 red team: a model's read of its own name is typed as before the
+/// fix. Which table a self-read reaches (the last build, or a stale cache of
+/// it) is out of #2674's scope; the operand check must not start refusing it.
+#[test]
+fn a_self_read_is_typed_as_before() {
+    use rocky_ir::RockyType;
+    let result = compile_2674(
+        &[(
+            "inc4",
+            "SELECT r.id, CAST(1 AS INTEGER) AS amt FROM raw_b r \
+             WHERE r.id > (SELECT COALESCE(SUM(amt), 0) FROM inc4)",
+            "",
+            "inc4",
+        )],
+        &[
+            ("raw_b", &[("id", RockyType::Int64, false)]),
+            (
+                "inc4",
+                &[
+                    ("id", RockyType::Int64, false),
+                    ("amt", RockyType::String, true),
+                ],
+            ),
+        ],
+    );
+    let diags = rocky_compiler::operand_check::check_operand_types(
+        &result.project.models,
+        &result.semantic_graph,
+        &result.type_check.typed_models,
+        &result.type_check.shadowed_sources,
+        None,
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// #2674 red team: model `customers` writes `customers_v2`, and model
+/// `dim_customers` writes the table `customers`. A bare `customers` binds to
+/// `dim_customers`, which replaces the source table of that name. Its type
+/// is neither model `customers`'s nor the stale source's: Unknown, until
+/// reads are typed through the model they bind to.
+#[test]
+fn a_read_bound_to_another_model_takes_neither_name() {
+    use rocky_ir::RockyType;
+    let result = compile_2674(
+        &[
+            (
+                "customers",
+                "SELECT CAST('x' AS VARCHAR) AS id",
+                "",
+                "customers_v2",
+            ),
+            (
+                "dim_customers",
+                "SELECT CAST(1.5 AS DOUBLE) AS id",
+                "",
+                "customers",
+            ),
+            ("late", "SELECT id FROM customers", "", "late"),
+        ],
+        &[("customers", &[("id", RockyType::Int64, false)])],
+    );
+    let deps = &result
+        .project
+        .dag_nodes
+        .iter()
+        .find(|n| n.name == "late")
+        .unwrap()
+        .depends_on;
+    assert_eq!(deps, &vec!["dim_customers".to_string()]);
+    assert_eq!(
+        columns_2674(&result, "late"),
+        vec![("id".to_string(), RockyType::Unknown)]
+    );
+}
+
+/// #2674 red team: recursive `WITH` names that shadow model `orders`. The
+/// type checker asks about them; each is the CTE, never the model or table.
+#[test]
+fn a_recursive_with_name_is_the_cte() {
+    use rocky_ir::RockyType;
+    let readers = [
+        "WITH Orders AS (SELECT 1.5 AS id) SELECT id FROM orders",
+        "WITH RECURSIVE orders AS (SELECT CAST(1.5 AS DOUBLE) AS id \
+         UNION ALL SELECT id + 1 FROM orders WHERE id < 3) SELECT id FROM orders",
+        "WITH RECURSIVE orders(id) AS (SELECT CAST(1.5 AS DOUBLE) \
+         UNION ALL SELECT id + 1 FROM orders WHERE id < 3) SELECT id FROM orders",
+    ];
+    let mut files = vec![(
+        "orders",
+        "SELECT CAST('x' AS VARCHAR) AS id",
+        "",
+        "orders_v2",
+    )];
+    let names: Vec<String> = (0..readers.len()).map(|i| format!("r{i}")).collect();
+    for (name, sql) in names.iter().zip(readers) {
+        files.push((name, sql, "depends_on = [\"orders\"]\n", name));
+    }
+    let result = compile_2674(&files, &[("orders", &[("id", RockyType::Int64, false)])]);
+    for name in &names {
+        let ty = &columns_2674(&result, name)[0].1;
+        assert!(
+            *ty != RockyType::String && *ty != RockyType::Int64,
+            "{name}: {ty:?}"
+        );
+    }
+}

@@ -147,13 +147,15 @@ impl<'a> Relations<'a> {
                 .and_then(|(s, by_name)| qualified_upstream_model(read, &s.upstream, by_name));
             return Reach::Typed(model.unwrap_or(read).to_string());
         }
-        if !self.graph.models.contains_key(read) {
+        // A model's read of its own name (the table its last run built, as
+        // the schema cache has it) is typed as before #2674.
+        if read == reader || !self.graph.models.contains_key(read) {
             return Reach::Typed(read.to_string());
         }
         match reader_schema.map_or(NamedRead::NotComputed, |s| s.named_read(read)) {
             NamedRead::ThatModel | NamedRead::NotComputed => Reach::Typed(read.to_string()),
-            NamedRead::Elsewhere => Reach::Shadowed,
-            NamedRead::Local => Reach::Unknown,
+            NamedRead::Source => Reach::Shadowed,
+            NamedRead::OtherModel | NamedRead::Local => Reach::Unknown,
             NamedRead::Unlisted => {
                 debug_assert!(
                     false,
@@ -194,17 +196,23 @@ impl<'a> Relations<'a> {
 
     /// The columns of upstream model `upstream` as `reader` reads it: the
     /// model's, unless `reader`'s bare read of that name reaches the source
-    /// table. A declared model the SQL never reads bare keeps its columns,
-    /// as before.
+    /// table, or another model (then nothing). A declared model the SQL
+    /// never reads bare keeps its columns, as before.
     pub(crate) fn upstream(&self, reader: &str, upstream: &str) -> Option<&'a [TypedColumn]> {
-        let elsewhere = self
+        let read = self
             .graph
             .model_schema(reader)
-            .is_some_and(|s| s.named_read(upstream) == NamedRead::Elsewhere);
-        if elsewhere {
-            self.shadowed.get(upstream).map(Vec::as_slice)
-        } else {
-            self.typed.get(upstream).map(Vec::as_slice)
+            .map(|s| s.named_read(upstream));
+        match read {
+            Some(NamedRead::Source) => self.shadowed.get(upstream).map(Vec::as_slice),
+            Some(NamedRead::OtherModel) => None,
+            Some(
+                NamedRead::ThatModel
+                | NamedRead::Local
+                | NamedRead::Unlisted
+                | NamedRead::NotComputed,
+            )
+            | None => self.typed.get(upstream).map(Vec::as_slice),
         }
     }
 

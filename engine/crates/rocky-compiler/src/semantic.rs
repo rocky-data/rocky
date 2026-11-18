@@ -128,9 +128,13 @@ pub enum ReadTarget {
 pub enum NamedRead {
     /// The read binds to the model of that name.
     ThatModel,
-    /// The read reaches something else: a table of that name that no model
-    /// writes, or another model's table.
-    Elsewhere,
+    /// The read reaches a table of that name no model of the project is
+    /// bound to: the source table the model's name shadows.
+    Source,
+    /// The read binds to another model, one that writes a table of that
+    /// name. Its type is unknown until reads are typed through the model
+    /// they bind to.
+    OtherModel,
     /// A `WITH` name of the reader's query. A walker that matches `WITH`
     /// names in another case than lineage does can ask about one; it is not
     /// a table, so its type is unknown.
@@ -185,7 +189,8 @@ impl ModelSchema {
         };
         match reads.get(&rocky_core::physical_edges::fold_identifier(name)) {
             Some(ReadTarget::Model(model)) if model == name => NamedRead::ThatModel,
-            Some(ReadTarget::Model(_) | ReadTarget::Table) => NamedRead::Elsewhere,
+            Some(ReadTarget::Model(_)) => NamedRead::OtherModel,
+            Some(ReadTarget::Table) => NamedRead::Source,
             Some(ReadTarget::Local) => NamedRead::Local,
             None => NamedRead::Unlisted,
         }
@@ -494,7 +499,8 @@ pub fn build_semantic_graph(
             .get(model_name.as_str())
             .copied()
             .unwrap_or_default();
-        let mut reads: HashMap<String, ReadTarget> = lineage_result
+        let mut reads: HashMap<String, ReadTarget> = HashMap::new();
+        let bound = lineage_result
             .source_tables
             .iter()
             .filter(|t| t.binding == lineage::TableBinding::Physical)
@@ -511,8 +517,23 @@ pub fn build_semantic_graph(
                     | crate::resolve::BareBinding::Ambiguous(_) => ReadTarget::Table,
                 };
                 (rocky_core::physical_edges::fold_identifier(name), target)
-            })
-            .collect();
+            });
+        // Two spellings of one name fold to one key, and they reach one
+        // table. `bind` matches an ephemeral model's name exactly, and lineage
+        // lowercases a nested read, so a binding to a model wins over a
+        // spelling that missed it.
+        for (key, target) in bound {
+            match reads.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(target);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if *slot.get() == ReadTarget::Table {
+                        slot.insert(target);
+                    }
+                }
+            }
+        }
         for cte in lineage_result
             .source_tables
             .iter()
