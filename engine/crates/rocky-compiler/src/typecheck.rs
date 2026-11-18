@@ -3630,7 +3630,63 @@ fn has_plain_group_by(select: &ast::Select) -> bool {
     let ast::GroupByExpr::Expressions(keys, modifiers) = &select.group_by else {
         return false;
     };
-    !keys.is_empty() && modifiers.is_empty() && keys.iter().all(is_plain_grouping_key)
+    !keys.is_empty()
+        && modifiers.is_empty()
+        && keys.iter().all(is_plain_grouping_key)
+        && keys
+            .iter()
+            .any(|key| grouping_key_reads_a_column(key, select))
+}
+
+/// Whether a `GROUP BY` key reads a column of the query, directly or through
+/// a select-list position (`GROUP BY 1`). A key list of constants alone is
+/// not plain: an optimizer may fold it into one global group, which outputs
+/// a row over empty input (Spark had this bug, SPARK-17114).
+fn grouping_key_reads_a_column(key: &Expr, select: &ast::Select) -> bool {
+    fn reads_column(expr: &Expr) -> bool {
+        struct Finder {
+            depth: usize,
+        }
+        impl ast::Visitor for Finder {
+            type Break = ();
+            fn pre_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+                self.depth += 1;
+                std::ops::ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+                self.depth -= 1;
+                std::ops::ControlFlow::Continue(())
+            }
+            fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+                if self.depth == 0
+                    && matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                {
+                    return std::ops::ControlFlow::Break(());
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+        ast::Visit::visit(expr, &mut Finder { depth: 0 }).is_break()
+    }
+    if let Expr::Value(value) = strip_nested(key)
+        && let ast::Value::Number(number, _) = &value.value
+    {
+        let Some(item) = number
+            .parse::<usize>()
+            .ok()
+            .and_then(|position| position.checked_sub(1))
+            .and_then(|index| select.projection.get(index))
+        else {
+            return false;
+        };
+        return match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                reads_column(expr)
+            }
+            _ => false,
+        };
+    }
+    reads_column(key)
 }
 
 /// Whether a `GROUP BY` key is one Rocky recognises as a single key: a
@@ -5349,9 +5405,24 @@ impl SubtotalKeys {
 
 /// Whether `expr` is a call named `ROLLUP`, `CUBE` or `GROUPING SETS`: how
 /// `GROUP BY (ROLLUP(x))` parses.
+///
+/// The last part of the name is read without its quotes, so a qualified
+/// `builtin.rollup(x)` or a quoted `` `rollup`(x) `` counts too: matching
+/// more calls only makes more outputs nullable.
 fn is_grouping_construct_call(expr: &Expr) -> bool {
-    function_name(expr)
-        .is_some_and(|name| matches!(name.as_str(), "ROLLUP" | "CUBE" | "GROUPING SETS"))
+    let Expr::Function(func) = strip_nested(expr) else {
+        return false;
+    };
+    func.name
+        .0
+        .last()
+        .and_then(ast::ObjectNamePart::as_ident)
+        .is_some_and(|ident| {
+            matches!(
+                ident.value.to_uppercase().as_str(),
+                "ROLLUP" | "CUBE" | "GROUPING SETS"
+            )
+        })
 }
 
 /// Push every key inside a grouping construct, looking through nested
@@ -13766,6 +13837,35 @@ mod tests {
                      from t group by n",
                     true,
                 ),
+                // A qualified or quoted ROLLUP / CUBE call (Opus review).
+                (
+                    "select n, sum(x) as c from t group by builtin.rollup(n)",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by (builtin.cube(n))",
+                    true,
+                ),
+                ("select n, sum(x) as c from t group by `rollup`(n)", true),
+                // A plain key beside a construct or the empty set.
+                (
+                    "select n, sum(x) as c from t group by floor(f), (rollup(n))",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by case when x > 0 then 1 end, ()",
+                    true,
+                ),
+                // Constant keys only: an optimizer may fold them into one
+                // global group, which has a row over empty input.
+                ("select sum(x) as c from t group by 'a'", true),
+                (
+                    "select sum(x) as c from t group by floor(1.5), null is null",
+                    true,
+                ),
+                ("select 'k' as k, sum(x) as c from t group by 1", true),
+                // A constant beside a column is still plain.
+                ("select n, sum(x) as c from t group by 'a', n", false),
                 // A tuple key may be the empty set; it is kept nullable.
                 ("select n, sum(x) as c from t group by (n, x)", true),
                 // GROUP BY ALL with no plain output groups nothing.
