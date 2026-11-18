@@ -54,8 +54,31 @@ jobs:
       - name: Install the rocky binary (latest engine release)
         # The unit tests mock the binary; this job drives the SDK against a real
         # rocky to catch breakage the mocks can't (argv, exit codes, JSON shapes).
+        #
+        # Resolve the version here, not in install.sh: install.sh asks the
+        # GitHub REST API, and shared runners exhaust its anonymous rate limit,
+        # which fails this job with a 403 (#2684). `git ls-remote` reads tags
+        # over git, not the REST API, and needs no token. A tag can exist
+        # without release assets (a release in progress, or a deleted one), so
+        # take the newest tag whose checksums.txt is downloadable.
         run: |
-          bash "$GITHUB_WORKSPACE/engine/install.sh"
+          tag=""
+          for candidate in $(git ls-remote --tags --refs https://github.com/rocky-data/rocky 'engine-v*' \
+              | sed 's#.*refs/tags/##' \
+              | grep -E '^engine-v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V -r \
+              | head -5); do
+            if curl -fsIL -o /dev/null "https://github.com/rocky-data/rocky/releases/download/${candidate}/checksums.txt"; then
+              tag="${candidate}"
+              break
+            fi
+            echo "skipping ${candidate}: no release assets" >&2
+          done
+          if [[ -z "${tag}" ]]; then
+            echo "no engine release with assets among the five newest engine-v* tags" >&2
+            exit 1
+          fi
+          ROCKY_VERSION="${tag}" bash "$GITHUB_WORKSPACE/engine/install.sh"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: uv sync
       - name: Run the SDK quickstart against a generated playground
