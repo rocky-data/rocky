@@ -422,20 +422,34 @@ fn bench_sql_gen(iterations: usize) -> Result<Vec<BenchResult>> {
     Ok(results)
 }
 
-fn bench_startup(iterations: usize) -> Vec<BenchResult> {
-    let times = measure(iterations.min(5), || {
+fn bench_startup(iterations: usize) -> Result<Vec<BenchResult>> {
+    let version_command = || {
         let mut command = std::process::Command::new("cargo");
         rocky_core::process::strip_dagster_pipes_env(&mut command);
-        let _ = command
-            .args(["run", "-q", "-p", "rocky", "--", "--version"])
-            .output();
+        command.args(["run", "-q", "-p", "rocky", "--", "--version"]);
+        command
+    };
+    // Same rule as `bench_compile` (#2677): never time a command that
+    // fails. Check the exit status once, before the timed runs.
+    let output = version_command()
+        .output()
+        .context("failed to run `cargo run -p rocky -- --version` for the startup benchmark")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`cargo run -p rocky -- --version` exited with {}, so its timings would be false: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let times = measure(iterations.min(5), || {
+        let _ = version_command().output();
     });
-    vec![durations_to_result(
+    Ok(vec![durations_to_result(
         "startup",
         "binary_version",
         &times,
         None,
-    )]
+    )])
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +479,7 @@ pub fn run_bench(
             "compile" => results.extend(bench_compile(model_count, iterations)?),
             "dag" => results.extend(bench_dag(iterations)),
             "sql_gen" => results.extend(bench_sql_gen(iterations)?),
-            "startup" => results.extend(bench_startup(iterations)),
+            "startup" => results.extend(bench_startup(iterations)?),
             other => anyhow::bail!("unknown benchmark group: {other}"),
         }
     }
@@ -589,15 +603,18 @@ mod tests {
     }
 
     /// #2677: the generated project must compile with no error diagnostic,
-    /// or `bench compile` times a project Rocky refuses. 1,000 models is
-    /// enough for marts to read the DSL intermediates that used to lack
-    /// `name`.
+    /// or `bench compile` times a project Rocky refuses. 100 models (the
+    /// default) is already enough for marts to read the DSL intermediates
+    /// that used to lack `name`.
     #[test]
     fn the_generated_project_compiles_without_errors() {
-        let dir = tempfile::TempDir::new().unwrap();
-        generate_synthetic_project(1000, dir.path());
-        ensure_compiles_clean(&config_for(dir.path()))
-            .expect("the synthetic benchmark project must compile cleanly");
+        for size in [10, 100, 1000] {
+            let dir = tempfile::TempDir::new().unwrap();
+            generate_synthetic_project(size, dir.path());
+            ensure_compiles_clean(&config_for(dir.path())).unwrap_or_else(|e| {
+                panic!("the {size}-model benchmark project must compile cleanly: {e:#}")
+            });
+        }
     }
 
     #[test]
