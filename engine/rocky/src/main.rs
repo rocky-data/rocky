@@ -1438,7 +1438,7 @@ enum Command {
         connector: Option<String>,
     },
 
-    /// Scaffold child connectors.
+    /// Scaffold and test child connectors.
     ///
     /// A child connector is a program `rocky load --connector <name>` runs.
     /// It writes Parquet files and a result file; Rocky loads the files and
@@ -3059,6 +3059,21 @@ enum ConnectorSubcommand {
         /// Language of the scaffold.
         #[arg(long, value_enum, default_value_t = rocky_cli::commands::ConnectorLang::Python)]
         lang: rocky_cli::commands::ConnectorLang,
+    },
+
+    /// Run a connector against recorded input and check what it returns.
+    ///
+    /// Reads `connector-test.toml` beside the manifest: one `[[run]]` per
+    /// run, each with option overrides and the rows it must write. Each run
+    /// gets the state the run before it returned. Every Parquet file must
+    /// have one schema. Loads nothing, saves no state and passes no
+    /// secrets. Exits non-zero when a check fails.
+    Test {
+        /// The `[connector.<name>]` key in rocky.toml.
+        name: String,
+        /// Spec file (default: `connector-test.toml` beside the manifest).
+        #[arg(long)]
+        spec: Option<PathBuf>,
     },
 }
 
@@ -5746,6 +5761,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Connector { subcommand } => match subcommand {
             ConnectorSubcommand::Init { name, dir, lang } => {
                 rocky_cli::commands::run_connector_init(&name, dir.as_deref(), lang)
+            }
+            ConnectorSubcommand::Test { name, spec } => {
+                let loaded = rocky_core::config::load_rocky_config_fingerprinted(&cli.config)
+                    .with_context(|| {
+                        format!("failed to load config from {}", cli.config.display())
+                    })?;
+                rocky_cli::commands::run_connector_test(
+                    &cli.config,
+                    &loaded,
+                    &name,
+                    spec.as_deref(),
+                    json,
+                )
+                .await
             }
         },
         Command::TestAdapter {

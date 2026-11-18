@@ -1,0 +1,24 @@
+# Read only by `rocky connector test __NAME__`. Each [[run]] runs the
+# connector once, with these options merged over [connector.__NAME__.options]
+# in rocky.toml, and gives it the state the run before it returned.
+#
+# The scaffold's example source has `example_rows` rows. Point the options at
+# recorded input when you replace fetch(): `rocky connector test` passes no
+# secrets, so a run that calls the live source fails.
+
+[[run]]
+options = { example_rows = 3 }
+rows    = 3
+state   = "advanced"
+
+# Two more rows exist now: only they are read.
+[[run]]
+options = { example_rows = 5 }
+rows    = 2
+state   = "advanced"
+
+# Nothing new: no rows, and the cursor stays.
+[[run]]
+options = { example_rows = 5 }
+rows    = 0
+state   = "unchanged"

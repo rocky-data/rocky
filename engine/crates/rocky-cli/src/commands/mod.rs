@@ -22,6 +22,7 @@ mod completions;
 mod compliance;
 pub(crate) mod connector_init;
 mod connector_load;
+mod connector_test;
 mod containment;
 pub(crate) mod cost;
 mod dag;
@@ -163,6 +164,10 @@ pub use connector_init::{
 pub use connector_load::{
     ConnectorLoadOutcome, ConnectorLoadParams, claim_key, claim_ttl_hours, execute_connector_load,
     run_connector_load,
+};
+pub use connector_test::{
+    ConnectorTestRun, ConnectorTestSpec, TEST_SPEC_FILE_NAME, execute_connector_test,
+    run_connector_test,
 };
 pub use cost::{CostGroupBy, compute_cost, compute_month_cost, run_cost};
 pub use dag::{dag_output, run_dag};

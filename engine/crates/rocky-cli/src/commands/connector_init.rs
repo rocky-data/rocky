@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 pub const HELPER_PY: &str = include_str!("connector_data/rocky_connector.py");
 const MAIN_PY: &str = include_str!("connector_data/main.py");
 const MANIFEST_TOML: &str = include_str!("connector_data/connector.toml");
+const TEST_SPEC_TOML: &str = include_str!("connector_data/connector-test.toml");
 
 /// The file name the helper is written under.
 pub const HELPER_FILE_NAME: &str = "rocky_connector.py";
@@ -71,6 +72,10 @@ fn write_python(name: &str, dir: &Path) -> Result<()> {
     };
     write("connector.toml", &MANIFEST_TOML.replace("__NAME__", name))?;
     write("main.py", &MAIN_PY.replace("__NAME__", name))?;
+    write(
+        super::connector_test::TEST_SPEC_FILE_NAME,
+        &TEST_SPEC_TOML.replace("__NAME__", name),
+    )?;
     write(HELPER_FILE_NAME, HELPER_PY)?;
     // Python writes `__pycache__/` beside the helper on each load.
     write(".gitignore", "__pycache__/\n")?;
@@ -120,7 +125,8 @@ pub fn run_connector_init(name: &str, dir: Option<&Path>, lang: ConnectorLang) -
             "  3. Set `license` in {}.",
             dir.join("connector.toml").display()
         );
-        println!("  4. Run: rocky load --connector {name}");
+        println!("  4. Check it: rocky connector test {name}");
+        println!("  5. Run: rocky load --connector {name}");
         println!();
         println!("The connector needs python3 (3.8 or newer) and the duckdb CLI on PATH.");
         if cfg!(not(unix)) {
@@ -184,6 +190,11 @@ mod tests {
         let main = std::fs::read_to_string(dir.join("main.py")).unwrap();
         assert!(!main.contains("__NAME__"));
         assert!(main.contains("STATE_SCHEMA_VERSION = 1"));
+        let spec = crate::commands::ConnectorTestSpec::load(
+            &dir.join(crate::commands::TEST_SPEC_FILE_NAME),
+        )
+        .unwrap();
+        assert_eq!(spec.runs.len(), 3);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
