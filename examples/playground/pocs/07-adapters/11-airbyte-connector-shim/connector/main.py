@@ -84,6 +84,14 @@ BATCH_FILE = "batch-0.parquet"
 MOUNT = "/rocky_airbyte"
 MAX_STATE_BYTES = 900 * 1024
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The oldest airbyte-cdk this shim runs. In 7.48.0 a manifest the caller
+# supplies may not name any custom class (`class_name`) unless
+# AIRBYTE_ENABLE_UNSAFE_CODE is set. The shim relies on that, so it refuses
+# an older airbyte-cdk rather than guess what that version gates.
+MIN_CDK_VERSION = (7, 48, 0)
+# airbyte-cdk runs a manifest found here instead of --manifest-path, with its
+# custom components trusted.
+CDK_LOCAL_MANIFEST = "/airbyte/integration_code/source_declarative_manifest/manifest.yaml"
 # Names of the containers this run started. They are removed when the run ends.
 CONTAINERS = []
 # The airbyte-cdk processes running now. SIGTERM stops them.
@@ -141,6 +149,15 @@ def load_options(request):
         # set. Rocky hands the shim only the variables under `secrets`.
         fail("AIRBYTE_ENABLE_UNSAFE_CODE is set; the shim runs no custom connector code. "
              "Remove it from secrets")
+    python_vars = sorted(k for k in os.environ if k.startswith("PYTHON"))
+    if python_vars:
+        # PYTHONPATH, PYTHONSTARTUP and the like make the airbyte-cdk
+        # interpreter load code the manifest hash does not cover.
+        fail("%s is set; the shim runs airbyte-cdk with no PYTHON* variable. "
+             "Remove it from secrets" % ", ".join(python_vars))
+    if os.path.exists(CDK_LOCAL_MANIFEST):
+        fail("%s exists, and airbyte-cdk would run it instead of the pinned manifest, "
+             "with custom components trusted" % CDK_LOCAL_MANIFEST)
     digest = options.get("manifest_sha256")
     if not isinstance(digest, str) or not re.match(r"^[0-9a-f]{64}$", digest):
         fail("manifest mode needs options.manifest_sha256: the SHA-256 of the manifest, 64 lowercase hex")
@@ -151,6 +168,43 @@ def load_options(request):
         if not os.path.isfile(options[key]):
             fail("options.%s %s is not a file" % (key, options[key]))
     return options
+
+
+def check_cdk_version(options):
+    """Fail unless cdk_bin belongs to airbyte-cdk MIN_CDK_VERSION or newer.
+
+    A venv puts its `python` beside its scripts; that interpreter is asked.
+    Otherwise the script's `#!` line names it. (pip writes a `#!/bin/sh`
+    launcher when the interpreter path is long, so the sibling comes first.)
+    """
+    sibling = os.path.join(os.path.dirname(options["cdk_bin"]), "python")
+    if os.path.isfile(sibling):
+        interpreter = [sibling]
+    else:
+        try:
+            with open(options["cdk_bin"], "rb") as handle:
+                first = handle.readline().decode("utf-8", "replace").strip()
+        except OSError as error:
+            fail("cannot read %s: %s" % (options["cdk_bin"], error))
+        if not first.startswith("#!"):
+            fail("cdk_bin must be the source-declarative-manifest script of an airbyte-cdk install")
+        interpreter = first[2:].split()
+    script = "import importlib.metadata as m; print(m.version('airbyte-cdk'))"
+    try:
+        done = subprocess.run(
+            interpreter + ["-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, check=False,
+        )
+    except OSError as error:
+        fail("cannot start the interpreter of %s: %s" % (options["cdk_bin"], error))
+    version = done.stdout.strip()
+    parts = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+    if done.returncode != 0 or not parts:
+        fail("cannot read the airbyte-cdk version beside %s" % options["cdk_bin"])
+    if tuple(int(p) for p in parts.groups()) < MIN_CDK_VERSION:
+        fail("airbyte-cdk %s is older than %s, the oldest this shim runs"
+             % (version, ".".join(str(p) for p in MIN_CDK_VERSION)))
+    log("airbyte-cdk %s" % version)
 
 
 def copy_manifest(options, work_dir):
@@ -167,7 +221,9 @@ def copy_manifest(options, work_dir):
             "Review the manifest, then update the hash."
             % (options["manifest"], found, options["manifest_sha256"])
         )
-    path = os.path.join(work_dir, "manifest.yaml")
+    # Not named manifest.yaml: airbyte-cdk must read it through
+    # --manifest-path, never by finding a file of that name.
+    path = os.path.join(work_dir, "pinned-manifest.yaml")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
@@ -224,9 +280,12 @@ def on_sigterm(signum, frame):
     # caught: after a SIGKILL the container (named rocky-<run>-<attempt>-<step>)
     # can outlive the run until it ends by itself.
     remove_containers()
-    for child in CHILDREN:
+    for child in list(CHILDREN):
         try:
             child.terminate()
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
         except OSError:
             pass
     sys.exit(128 + signum)
@@ -276,14 +335,20 @@ def cdk_run(options, work_dir, args, step, capture_to=None):
     """
     command = [options["cdk_bin"]] + args + ["--manifest-path", options["manifest_copy"]]
     out = open(capture_to, "w", encoding="utf-8") if capture_to else subprocess.PIPE
+    # Hold SIGTERM and SIGINT until the child is in CHILDREN, so the handler
+    # always sees it.
+    held = (signal.SIGTERM, signal.SIGINT)
+    signal.pthread_sigmask(signal.SIG_BLOCK, held)
     try:
         child = subprocess.Popen(
             command, stdout=out, stderr=subprocess.PIPE, cwd=work_dir,
             universal_newlines=True,
         )
+        CHILDREN.append(child)
     except OSError as error:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
         fail("cannot start %s: %s" % (options["cdk_bin"], error))
-    CHILDREN.append(child)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
     try:
         stdout, stderr = child.communicate()
     finally:
@@ -485,6 +550,7 @@ def main():
     try:
         write_private(os.path.join(work_dir, "config.json"), config)
         if "manifest" in options:
+            check_cdk_version(options)
             options["manifest_copy"] = copy_manifest(options, work_dir)
         run_spec(options, work_dir)
         streams = run_discover(options, work_dir)

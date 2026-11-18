@@ -13,13 +13,14 @@
 #                     order 4 again, then 5 to 7
 #   load 3   1 row    nothing new; order 7, at the cursor, comes again
 #
-# airbyte-cdk starts the next read AT the saved cursor, not after it, so the
-# row at the cursor loads again on every load. The target only appends, so
-# that row is a duplicate. This is at-least-once delivery: deduplicate
+# airbyte-cdk starts the next read AT the saved cursor, not after it. This
+# stub's lower bound is inclusive, so the row at the cursor loads again on
+# every load. The target only appends, so that row is a duplicate. This is at-least-once delivery: deduplicate
 # downstream on a key (here `id`).
 #
-# Then two failures: a manifest whose SHA-256 is not the pinned one, and a
-# manifest that names a custom Python component.
+# Then three failures: a manifest whose SHA-256 is not the pinned one, a
+# manifest that names a custom Python component, and AIRBYTE_ENABLE_UNSAFE_CODE
+# handed to the shim.
 #
 # No airbyte-cdk and it cannot be installed here: `rocky validate` only, then
 # exit 0 with a SKIP message. Set REQUIRE_AIRBYTE_CDK=1 to fail instead.

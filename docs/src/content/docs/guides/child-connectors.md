@@ -320,8 +320,8 @@ All three follow the same rules.
 The Airbyte shim's no-Docker mode has rules of its own:
 
 - **The manifest is pinned by hash.** Set `manifest_sha256`. The shim never downloads a manifest, and a file with another hash fails the run. The hash is required because the manifest decides which hosts receive the source config, secrets included.
-- **No custom code runs.** The shim never passes `--components-path`, and refuses to run when `AIRBYTE_ENABLE_UNSAFE_CODE` is set. A manifest that needs custom Python components does not work in this mode.
-- **Rows load again at the cursor.** `airbyte-cdk` starts each read at the saved cursor, not after it, so the row at the cursor loads again. A manifest with a `lookback_window` loads the whole window again. The target only appends, so those rows are duplicates: deduplicate downstream on a key.
+- **No custom code runs.** The shim never passes `--components-path`. It needs `airbyte-cdk` 7.48.0 or newer, which refuses custom classes in a manifest it did not ship. It refuses to run when `AIRBYTE_ENABLE_UNSAFE_CODE` or any `PYTHON*` variable is set. A manifest that needs custom Python components does not work in this mode.
+- **Rows can load again at the cursor.** `airbyte-cdk` starts each read at the saved cursor, not after it. When the API's lower bound is inclusive, the row at the cursor loads again. A manifest with a `lookback_window` loads the whole window again. The target only appends, so those rows are duplicates: deduplicate downstream on a key.
 - **Rocky ships no Airbyte manifest.** The POC uses its own Apache-2.0 manifest against a local stub.
 
 The POCs run offline once the tool is installed. Each skips with exit 0 when its tool is missing. Set `REQUIRE_DLT=1`, `REQUIRE_DOCKER=1` or `REQUIRE_MELTANO=1` to make that a failure.
