@@ -5,19 +5,21 @@
 # a minute. It interrupts cargo when either:
 # - available memory plus free swap drops below GUARD_MB, or
 # - the kernel's "full" memory pressure (share of time every task stalled
-#   on memory, 10 s average) goes above GUARD_PSI percent.
+#   on memory, 60 s average) goes above GUARD_PSI percent. The 10 s average
+#   spikes past 40% during a normal link, so it only gets printed.
 # It first prints the largest processes, so the step fails with its log
 # kept instead of the hosted runner dying with no log at all.
 set -u
 guard_mb=${GUARD_MB:-300}
-guard_psi=${GUARD_PSI:-40}
+guard_psi=${GUARD_PSI:-60}
 n=0
 while sleep 5; do
   avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
   swapfree=$(awk '/^SwapFree:/{print int($2/1024)}' /proc/meminfo)
-  psi=$(awk '/^full/{split($2,a,"="); print int(a[2])}' /proc/pressure/memory 2>/dev/null || echo 0)
+  psi10=$(awk '/^full/{split($2,a,"="); print int(a[2])}' /proc/pressure/memory 2>/dev/null || echo 0)
+  psi=$(awk '/^full/{split($3,a,"="); print int(a[2])}' /proc/pressure/memory 2>/dev/null || echo 0)
   load=$(cut -d' ' -f1 /proc/loadavg)
-  line="mem_avail=${avail}M swap_free=${swapfree}M psi_full10=${psi}% load=${load}"
+  line="mem_avail=${avail}M swap_free=${swapfree}M psi_full10=${psi10}% psi_full60=${psi}% load=${load}"
   if [ $((n % 12)) -eq 0 ]; then
     echo "[memory-guard $(date -u +%T)] $line"
   fi
