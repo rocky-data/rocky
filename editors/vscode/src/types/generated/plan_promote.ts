@@ -155,6 +155,9 @@ export type AuditEventKind =
   | "breaking_changes_blocked"
   | "breaking_changes_allowed"
   | "breaking_changes_gate_skipped"
+  | "failing_tests_blocked"
+  | "failing_tests_allowed"
+  | "test_evidence_missing"
   | "promote_plan_created";
 
 /**
@@ -181,6 +184,10 @@ export interface PromotePlan {
    * Whether `--allow-breaking` was set at plan time.
    */
   allow_breaking?: boolean;
+  /**
+   * Whether `--allow-failing-tests` was set at plan time.
+   */
+  allow_failing_tests?: boolean;
   /**
    * Approval artifacts loaded from disk that failed verification at plan time.
    */
