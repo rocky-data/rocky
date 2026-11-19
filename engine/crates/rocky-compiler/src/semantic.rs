@@ -79,6 +79,18 @@ pub struct ModelSchema {
     /// they deserialize as "fully understood", matching how they behaved then.
     #[serde(default)]
     pub unresolved_projections: usize,
+    /// Whether the model's `SELECT *` expands to a column list Rocky knows in
+    /// full (#2701): every star is a plain `*` (no qualifier, no `EXCLUDE`,
+    /// `REPLACE` or other modifier), and every relation it expands is an
+    /// in-project model this model depends on, whose own schema is complete,
+    /// that is not a snapshot (its table adds SCD2 columns the graph does not
+    /// list), and whose columns collide with no other output name (a warehouse
+    /// can rename a duplicate). `false` when the model has no star.
+    ///
+    /// `#[serde(default)]`: a graph serialized by an older build reads as
+    /// `false`, so its star models stay incomplete, as they were then.
+    #[serde(default)]
+    pub star_columns_complete: bool,
     /// Constructs in this model whose lineage Rocky does not record, sorted
     /// (#2377): the extractor's [`rocky_sql::lineage::LineageResult::lineage_gaps`]
     /// plus [`LineageGap::UnresolvedStar`] when a `SELECT *` expanded columns
@@ -111,7 +123,8 @@ impl ModelSchema {
     ///   a cached schema, but it cannot when the star expands a raw table Rocky
     ///   has never described — and a root `SELECT * FROM raw.t` records *no*
     ///   upstream models, so "is any upstream unknown?" is vacuously false
-    ///   there. Any star is therefore treated as not-provably-complete.
+    ///   there. A star is therefore treated as not-provably-complete unless
+    ///   [`Self::star_columns_complete`] proves its expansion (#2701).
     /// - **A projection item lineage could not name**, counted in
     ///   [`Self::unresolved_projections`]. This is the part `has_star` says
     ///   nothing about: `SELECT (order_id) FROM raw.t` is star-free and yields
@@ -124,7 +137,7 @@ impl ModelSchema {
     /// ones need not — a column that *is* listed really is produced.
     #[must_use]
     pub fn schema_is_complete(&self) -> bool {
-        !self.has_star && self.unresolved_projections == 0
+        (!self.has_star || self.star_columns_complete) && self.unresolved_projections == 0
     }
 
     /// Whether this model's lineage may be missing edges: a known gap, or
@@ -372,6 +385,43 @@ fn source_names(name: &str) -> [&str; 2] {
 /// `source_schemas` provides column info for external sources (from warehouse
 /// `DESCRIBE TABLE` or cache). Models that reference external tables without
 /// schema info get `has_star = true` treatment.
+/// Whether `item` is a plain `*`: no qualifier and no modifier.
+pub(crate) fn is_plain_star(item: &sqlparser::ast::SelectItem) -> bool {
+    match item {
+        sqlparser::ast::SelectItem::Wildcard(options) => {
+            options.opt_ilike.is_none()
+                && options.opt_exclude.is_none()
+                && options.opt_except.is_none()
+                && options.opt_replace.is_none()
+                && options.opt_rename.is_none()
+                && options.opt_alias.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `sql` is one `SELECT` whose every star is a plain `*` (#2701). A
+/// qualified star (`t.*`), a set operation or SQL that does not parse is not.
+fn has_only_plain_stars(sql: &str) -> bool {
+    use sqlparser::ast::{SelectItem, SetExpr, Statement};
+    let Ok(statements) =
+        sqlparser::parser::Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql)
+    else {
+        return false;
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.projection.iter().all(|item| match item {
+        SelectItem::Wildcard(_) => is_plain_star(item),
+        SelectItem::QualifiedWildcard(..) => false,
+        _ => true,
+    })
+}
+
 pub fn build_semantic_graph(
     project: &Project,
     source_schemas: &HashMap<String, Vec<ColumnInfo>>,
@@ -514,6 +564,20 @@ pub fn build_semantic_graph(
         if lineage_result.has_star && top.unmodelled {
             star_unresolved = true;
         }
+        // Whether the star's expansion is the model's whole star output
+        // (#2701); cleared below by any relation or name that cannot prove it.
+        let mut star_complete = lineage_result.has_star
+            && !top.unmodelled
+            && top.excluded.is_empty()
+            && top.replaced.is_empty()
+            && top.by_relation.is_empty()
+            && has_only_plain_stars(&model.sql);
+        // Output names so far, lower-cased, to spot a name the star repeats.
+        let mut star_names: std::collections::HashSet<String> = if star_complete {
+            output_names.iter().map(|n| n.to_lowercase()).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         // If SELECT *, expand upstream model columns into output
         if lineage_result.has_star && !top.unmodelled {
             for table_ref in &lineage_result.source_tables {
@@ -533,6 +597,7 @@ pub fn build_semantic_graph(
                 // origin, and a body that is itself an unresolved `SELECT *`
                 // lists the physical tables it passes through.
                 if table_ref.binding == lineage::TableBinding::Cte {
+                    star_complete = false;
                     // A CTE column built from several columns has one entry
                     // per origin: one output column, several edges (#2318).
                     let mut keep = false;
@@ -646,10 +711,21 @@ pub fn build_semantic_graph(
                     .get(table_name.as_str())
                     .filter(|_| reader_depends_on_it)
                 {
+                    let is_snapshot = model_by_name
+                        .get(table_name.as_str())
+                        .is_some_and(|m| m.config.strategy.snapshot_lowered().is_some());
+                    if !upstream_schema.schema_is_complete() || is_snapshot {
+                        star_complete = false;
+                    }
                     for col in &upstream_schema.columns {
                         let effect = rel.column(&col.name);
                         if effect == StarColumn::Excluded {
                             continue;
+                        }
+                        if star_complete && !star_names.insert(col.name.to_lowercase()) {
+                            // Two outputs share a name: the warehouse keeps
+                            // both, and may rename one (`id_1`).
+                            star_complete = false;
                         }
                         if output_names.insert(col.name.clone()) {
                             let col_arc: Arc<str> = Arc::from(col.name.as_str());
@@ -673,6 +749,7 @@ pub fn build_semantic_graph(
                         }
                     }
                 } else if let Some(derived_cols) = &table_ref.derived_columns {
+                    star_complete = false;
                     // Derived table (subquery in FROM): expand to the inner
                     // query's statically-resolved output columns. These carry
                     // no cross-model edge (the subquery isn't a named model or
@@ -691,6 +768,7 @@ pub fn build_semantic_graph(
                         }
                     }
                 } else if !table_ref.derived_sources.is_empty() {
+                    star_complete = false;
                     // Derived table whose inner projection is itself an
                     // unresolved `SELECT *` (e.g. the importer's microbatch
                     // wrapper `SELECT * FROM (SELECT * FROM up) AS x`). The
@@ -731,6 +809,9 @@ pub fn build_semantic_graph(
                         }
                     }
                 } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
+                    // A source schema lists what Rocky was told, which may be
+                    // fewer columns than the table has.
+                    star_complete = false;
                     // External source with known schema
                     for col in source_cols {
                         let effect = rel.column(&col.name);
@@ -761,6 +842,7 @@ pub fn build_semantic_graph(
                 } else {
                     // A raw table with no known schema: nothing to expand.
                     star_unresolved = true;
+                    star_complete = false;
                 }
             }
         }
@@ -778,6 +860,7 @@ pub fn build_semantic_graph(
                 columns: output_columns,
                 has_star: lineage_result.has_star,
                 unresolved_projections: lineage_result.unresolved_projections,
+                star_columns_complete: star_complete && !star_unresolved,
                 lineage_gaps,
                 upstream: upstream_map
                     .get(model_name.as_str())
@@ -942,6 +1025,95 @@ mod tests {
         assert!(!schema.schema_is_complete());
         // Non-empty but incomplete: an emptiness heuristic would miss this.
         assert_eq!(schema.columns.len(), 1);
+    }
+
+    fn star_schema(models: Vec<Model>, name: &str) -> ModelSchema {
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        graph.models.get(name).expect("model present").clone()
+    }
+
+    /// A plain star over a complete in-project model expands to a known
+    /// column list, so the reader's schema is complete (#2701).
+    #[test]
+    fn a_plain_star_over_a_complete_model_is_complete() {
+        for sql in [
+            "SELECT * FROM up",
+            "SELECT *, upper(name) AS name_clean FROM up WHERE id > 0",
+            "SELECT * FROM up u",
+        ] {
+            let schema = star_schema(
+                vec![
+                    make_model("up", "SELECT id, name FROM source.raw.users"),
+                    make_model("reader", sql),
+                ],
+                "reader",
+            );
+            assert!(schema.has_star, "{sql}");
+            assert!(schema.star_columns_complete, "{sql}");
+            assert!(schema.schema_is_complete(), "{sql}");
+        }
+        // Transitively: a star over a star over a complete model.
+        let schema = star_schema(
+            vec![
+                make_model("up", "SELECT id, name FROM source.raw.users"),
+                make_model("mid", "SELECT * FROM up"),
+                make_model("reader", "SELECT *, 1 AS one FROM mid"),
+            ],
+            "reader",
+        );
+        assert!(schema.schema_is_complete());
+    }
+
+    /// Every way the star's expansion is not provably the whole output.
+    #[test]
+    fn a_star_stays_incomplete_when_its_expansion_is_not_proven() {
+        let up = || make_model("up", "SELECT id, name FROM source.raw.users");
+        let other = || make_model("other", "SELECT id, total FROM source.raw.orders");
+        let cases: Vec<(&str, Vec<Model>)> = vec![
+            // Over a raw table, with or without a cached schema.
+            ("SELECT * FROM source.raw.users", vec![]),
+            // Over a model whose own star is over a raw table.
+            (
+                "SELECT * FROM mid",
+                vec![make_model("mid", "SELECT * FROM source.raw.users")],
+            ),
+            // Qualified star and star modifiers.
+            ("SELECT u.* FROM up u", vec![up()]),
+            ("SELECT * EXCLUDE (name) FROM up", vec![up()]),
+            ("SELECT * REPLACE (upper(name) AS name) FROM up", vec![up()]),
+            // A name the star repeats: an explicit alias, or a joined column.
+            ("SELECT *, upper(name) AS NAME FROM up", vec![up()]),
+            (
+                "SELECT * FROM up JOIN other USING (id)",
+                vec![up(), other()],
+            ),
+            (
+                "SELECT * FROM up JOIN other ON up.id = other.id",
+                vec![up(), other()],
+            ),
+            // A CTE, a derived table, a set operation.
+            ("WITH c AS (SELECT id FROM up) SELECT * FROM c", vec![up()]),
+            ("SELECT * FROM (SELECT id FROM up) AS d", vec![up()]),
+            ("SELECT * FROM up UNION ALL SELECT * FROM up", vec![up()]),
+        ];
+        for (sql, mut models) in cases {
+            models.push(make_model("reader", sql));
+            let schema = star_schema(models, "reader");
+            assert!(!schema.star_columns_complete, "{sql}");
+            assert!(!schema.schema_is_complete(), "{sql}");
+        }
+        // A snapshot's table adds SCD2 columns the graph does not list.
+        let mut snap = make_model("snap", "SELECT id, name, ts FROM source.raw.users");
+        snap.config.strategy = toml::from_str(
+            "type = \"snapshot\"\nunique_key = \"id\"\nstrategy = \"timestamp\"\nupdated_at = \"ts\"",
+        )
+        .unwrap();
+        let schema = star_schema(
+            vec![snap, make_model("reader", "SELECT * FROM snap")],
+            "reader",
+        );
+        assert!(!schema.schema_is_complete());
     }
 
     #[test]
