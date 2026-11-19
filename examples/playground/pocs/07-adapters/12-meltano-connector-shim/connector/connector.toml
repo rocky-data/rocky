@@ -9,6 +9,9 @@ state_schema_version = 1
 # A real tap calls its own API hosts: list them here, as a statement of intent.
 egress_hosts         = []
 
+# The license of the code in this directory. The tool the shim runs
+# has its own license.
+license              = "Apache-2.0"
 # Rocky supports the shim, the state and the load. A bug in the tool it
 # runs goes to that tool's authors.
 support_tier         = "community"
