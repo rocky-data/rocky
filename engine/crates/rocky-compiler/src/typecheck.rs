@@ -89,6 +89,9 @@ pub(crate) struct TypeScope {
     /// The warehouses the SQL runs on. A `CAST` target whose width differs
     /// between warehouses is typed from them (#2333).
     target: OperandTarget,
+    /// The `SELECT` this scope belongs to groups by a plain key list, so
+    /// every group has at least one row ([`has_plain_group_by`]).
+    plain_group_by: bool,
 }
 
 impl TypeScope {
@@ -105,6 +108,7 @@ impl TypeScope {
             inexact: HashSet::new(),
             qualified_inexact: HashMap::new(),
             target,
+            plain_group_by: false,
         }
     }
 
@@ -640,6 +644,24 @@ fn compute_model_typecheck(
                 }
                 None => true,
             });
+    // A grouped `SUM` may be non-null, and only inference reads the
+    // `GROUP BY` (#2658). When that is the only reason to infer, a failed
+    // inference leaves lineage's answer as it was, rather than wiping the
+    // model's types below.
+    let sum_only_inference = !needs_inference
+        && typed_cols.iter().any(|col| {
+            col.nullable
+                && graph
+                    .producing_edge(model_name, &col.name)
+                    .is_some_and(|edge| {
+                        matches!(
+                            &edge.transform,
+                            rocky_sql::lineage::TransformKind::Aggregation(func)
+                                if func.eq_ignore_ascii_case("sum")
+                        )
+                    })
+        });
+    let needs_inference = needs_inference || sum_only_inference;
     let inference = model_by_name
         .get(model_name)
         .filter(|_| needs_inference)
@@ -650,7 +672,8 @@ fn compute_model_typecheck(
                 target,
             )
             .ok()
-        });
+        })
+        .filter(|answer| answer.is_some() || !sum_only_inference);
     // Inference was needed and could not answer (a query form it does not
     // read, mismatched set-operation branches). Lineage then holds only a
     // guess, so claim nothing it cannot back: every column is nullable, and a
@@ -697,10 +720,11 @@ fn compute_model_typecheck(
                 inferred.count_outputs.contains(&index),
                 inferred.cast_outputs.contains(&index),
                 inferred.coalesce_outputs.contains(&index),
+                inferred.exact_null_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count, cast, coalesce)) =
+            let Some(&(inferred_col, exact_type, count, cast, coalesce, exact_null)) =
                 inferred_by_name.get(col.name.as_str())
             else {
                 // Inference ran but names no output like this one: lineage
@@ -722,6 +746,9 @@ fn compute_model_typecheck(
             // the type. Nullability only: the type keeps the rules below
             // (#2553).
             let coalesce_non_null = coalesce && !inferred_col.nullable;
+            // A grouped `SUM` or arithmetic over typed numbers: inference's
+            // non-null answer is exact, though the type may not be (#2658).
+            let exact_non_null = exact_null && !inferred_col.nullable;
             // A cast's output type is its target type, whatever the input
             // is (or whether it has a traceable column at all). Only the
             // type is taken here: nullability keeps following the input
@@ -742,7 +769,7 @@ fn compute_model_typecheck(
                     col.data_type = inferred_col.data_type.clone();
                     col.nullable = inferred_col.nullable;
                 }
-                if coalesce_non_null {
+                if coalesce_non_null || exact_non_null {
                     col.nullable = false;
                 }
                 continue;
@@ -786,7 +813,7 @@ fn compute_model_typecheck(
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
                     }
-                    if coalesce_non_null {
+                    if coalesce_non_null || exact_non_null {
                         col.nullable = false;
                     }
                 }
@@ -816,8 +843,8 @@ fn compute_model_typecheck(
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
                     }
-                    // `coalesce` is never set for a set operation's output.
-                    if coalesce_non_null {
+                    // Neither flag is ever set for a set operation's output.
+                    if coalesce_non_null || exact_non_null {
                         col.nullable = false;
                     }
                 }
@@ -878,6 +905,11 @@ fn compute_model_typecheck(
             model_name,
             &model.sql,
             &relation_columns,
+        ));
+        // E065 / E066 / E067: an aggregate or window in WHERE, and a
+        // GROUP BY position out of range. Read from the SQL alone.
+        diagnostics.extend(crate::clause_placement::check_clause_placement(
+            model_name, &model.sql,
         ));
         // E029: a bare column name two joined relations both provably have.
         diagnostics.extend(crate::ambiguous::check_ambiguous_columns(
@@ -3591,6 +3623,251 @@ fn args_all_non_null(name: &str, func: &ast::Function, scope: &TypeScope) -> boo
 /// ranking and distribution window functions, value and offset window
 /// functions, string functions, numeric functions, date/time functions,
 /// and conditional functions (IF, NULLIF, GREATEST, LEAST).
+/// Whether `select` groups by a plain, non-empty list of keys, so that every
+/// group it outputs has at least one row (#2658).
+///
+/// An allow-list: anything else may output a row over no input rows, where
+/// `SUM` is NULL. That covers no `GROUP BY` at all (an empty input gives one
+/// row), `GROUP BY ALL` (with no non-aggregate output it groups nothing),
+/// `ROLLUP`, `CUBE` and `GROUPING SETS` (their grand-total set `()` gives a
+/// row over empty input), a `WITH ROLLUP` / `WITH CUBE` / `WITH TOTALS`
+/// modifier, and a parenthesised key list, which may be the empty set `()`.
+fn has_plain_group_by(select: &ast::Select) -> bool {
+    let ast::GroupByExpr::Expressions(keys, modifiers) = &select.group_by else {
+        return false;
+    };
+    !keys.is_empty()
+        && modifiers.is_empty()
+        && keys.iter().all(is_plain_grouping_key)
+        && keys
+            .iter()
+            .any(|key| grouping_key_reads_a_column(key, select))
+}
+
+/// Whether a `GROUP BY` key reads a column of the query, directly or through
+/// a select-list position (`GROUP BY 1`). A key list of constants alone is
+/// not plain: an optimizer may fold it into one global group, which outputs
+/// a row over empty input (Spark had this bug, SPARK-17114).
+fn grouping_key_reads_a_column(key: &Expr, select: &ast::Select) -> bool {
+    fn reads_column(expr: &Expr) -> bool {
+        struct Finder {
+            depth: usize,
+        }
+        impl ast::Visitor for Finder {
+            type Break = ();
+            fn pre_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+                self.depth += 1;
+                std::ops::ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+                self.depth -= 1;
+                std::ops::ControlFlow::Continue(())
+            }
+            fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+                if self.depth == 0
+                    && matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                {
+                    return std::ops::ControlFlow::Break(());
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+        ast::Visit::visit(expr, &mut Finder { depth: 0 }).is_break()
+    }
+    if let Expr::Value(value) = strip_nested(key)
+        && let ast::Value::Number(number, _) = &value.value
+    {
+        let Some(item) = number
+            .parse::<usize>()
+            .ok()
+            .and_then(|position| position.checked_sub(1))
+            .and_then(|index| select.projection.get(index))
+        else {
+            return false;
+        };
+        return match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                reads_column(expr)
+            }
+            _ => false,
+        };
+    }
+    // A bare key that names a select-list alias may mean the aliased
+    // expression (DuckDB, Databricks, Snowflake, BigQuery): `SELECT 'a' AS k
+    // ... GROUP BY k` groups by a constant. The aliased expression decides.
+    if let Expr::Identifier(ident) = strip_nested(key) {
+        let aliased = select.projection.iter().find_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias }
+                if alias.value.eq_ignore_ascii_case(&ident.value) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        });
+        if let Some(expr) = aliased {
+            return reads_column(expr);
+        }
+    }
+    reads_column(key)
+}
+
+/// Whether a `GROUP BY` key is one Rocky recognises as a single key: a
+/// column, a position, a literal, a cast, an operator, a `CASE`, one of the
+/// functions sqlparser gives its own shape (`EXTRACT`, `FLOOR`, `CEIL`,
+/// `SUBSTRING`, `TRIM`, `POSITION`), `IS [NOT] NULL`, or a call that is not
+/// `ROLLUP` / `CUBE` / `GROUPING SETS`. A parenthesised `(ROLLUP(n))` parses
+/// as a call named `ROLLUP`, not as [`Expr::Rollup`] (#2566), so a call is
+/// checked by name. Any other shape (a tuple, which may be the empty set, a
+/// grouping construct, a subquery) is not plain.
+fn is_plain_grouping_key(key: &Expr) -> bool {
+    let key = strip_nested(key);
+    match key {
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::Cast { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::Case { .. }
+        | Expr::Extract { .. }
+        | Expr::Floor { .. }
+        | Expr::Ceil { .. }
+        | Expr::Substring { .. }
+        | Expr::Trim { .. }
+        | Expr::Position { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_) => true,
+        Expr::Function(_) => !is_grouping_construct_call(key),
+        _ => false,
+    }
+}
+
+/// Whether `SUM(...)` is never NULL: it aggregates one group of a plain
+/// `GROUP BY` ([`has_plain_group_by`]), so the group has a row, and its
+/// argument is a non-null number (#2658).
+///
+/// - No `FILTER`: a group can have no row that passes it. No `OVER`: a
+///   window frame can be empty.
+/// - The argument's nullable bit is read in the relation scope, so a column
+///   of the null-extended side of an outer join is nullable here.
+/// - An integer or float argument is never NULL on any warehouse: an
+///   integer sum widens (DuckDB `HUGEINT`), wraps (Spark with ANSI off) or
+///   fails, and a float sum overflows to infinity.
+/// - A decimal argument is NOT NULL only when every warehouse the model runs
+///   on is known and none is Databricks. Spark and Databricks with
+///   `ANSI_MODE` off write NULL when a decimal sum overflows, the rule
+///   [`InferredType::over_cap`] follows for arithmetic. Spark is not a ruled
+///   dialect, so a Spark target leaves the dialects unknown.
+///
+/// [`InferredType::over_cap`]: rocky_ir::types::InferredType::over_cap
+fn grouped_sum_is_never_null(func: &ast::Function, scope: &TypeScope) -> bool {
+    if !scope.plain_group_by || func.over.is_some() || func.filter.is_some() {
+        return false;
+    }
+    let ast::FunctionArguments::List(list) = &func.args else {
+        return false;
+    };
+    let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg))] = list.args.as_slice() else {
+        return false;
+    };
+    // The argument's type must be read from the SQL, not guessed: Rocky
+    // types every number literal as `Int64`, so `x * 1.5` would look like
+    // an integer sum, but it is a decimal one (red team, #2658).
+    if !has_exact_type(arg, scope) && !is_exact_null_arithmetic(arg, scope) {
+        return false;
+    }
+    let (arg_type, arg_nullable) = infer_expr_type(arg, scope);
+    if arg_nullable {
+        return false;
+    }
+    match arg_type {
+        RockyType::Int32 | RockyType::Int64 | RockyType::Float32 | RockyType::Float64 => true,
+        RockyType::Decimal { .. } | RockyType::DecimalUnsized { .. } => {
+            let dialects = scope.target.known_dialects();
+            !dialects.is_empty()
+                && dialects.iter().all(|dialect| match dialect {
+                    OperandDialect::Databricks => false,
+                    OperandDialect::DuckDb
+                    | OperandDialect::Snowflake
+                    | OperandDialect::BigQuery
+                    | OperandDialect::Trino
+                    | OperandDialect::SqlServer
+                    | OperandDialect::Postgres
+                    | OperandDialect::Redshift => true,
+                })
+        }
+        RockyType::Boolean
+        | RockyType::String
+        | RockyType::Date
+        | RockyType::Timestamp
+        | RockyType::TimestampNtz
+        | RockyType::Binary
+        | RockyType::Array(_)
+        | RockyType::Map(_, _)
+        | RockyType::Struct(_)
+        | RockyType::Variant
+        | RockyType::Unknown => false,
+    }
+}
+
+/// Whether `expr` is `+`, `-` or `*` over operands whose nullable bit
+/// inference reads exactly, so its non-null answer holds though its type is
+/// not exact (#2658).
+///
+/// Each leaf is a column of a known integer, float or sized decimal type
+/// whose type is exact ([`has_exact_type`]), or an integer literal that fits
+/// in 64 bits. Anything else keeps the
+/// expression out:
+///
+/// - `NULL`, a placeholder, a non-integer literal: `NULL` is NULL, and a
+///   literal Rocky types as `Int64` may need more digits than it claims.
+/// - `/` and `%`: a zero divisor is NULL on several warehouses.
+/// - A cast, which can fail to NULL; any function call.
+/// - An unsized decimal column (`SUM` over a decimal): its digits are not
+///   known, so an overflow to NULL (Databricks with ANSI off) cannot be
+///   ruled out. A sized result over 38 digits is nullable through
+///   [`InferredType::over_cap`].
+///
+/// [`InferredType::over_cap`]: rocky_ir::types::InferredType::over_cap
+fn is_exact_null_arithmetic(expr: &Expr, scope: &TypeScope) -> bool {
+    fn leaf(expr: &Expr, scope: &TypeScope) -> bool {
+        match expr {
+            Expr::Nested(inner) => leaf(inner, scope),
+            Expr::BinaryOp {
+                left,
+                op:
+                    ast::BinaryOperator::Plus
+                    | ast::BinaryOperator::Minus
+                    | ast::BinaryOperator::Multiply,
+                right,
+            } => leaf(left, scope) && leaf(right, scope),
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Minus | ast::UnaryOperator::Plus,
+                expr,
+            } => leaf(expr, scope),
+            // The column's type must be read from the SQL: a CTE or
+            // derived column built from a literal has a guessed type whose
+            // digit bound may be too low to see an overflow (red team).
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                has_exact_type(expr, scope)
+                    && matches!(
+                        infer_expr_type(expr, scope).0,
+                        RockyType::Int32
+                            | RockyType::Int64
+                            | RockyType::Float32
+                            | RockyType::Float64
+                            | RockyType::Decimal { .. }
+                    )
+            }
+            Expr::Value(value) => {
+                matches!(&value.value, ast::Value::Number(n, _) if n.parse::<i64>().is_ok())
+            }
+            _ => false,
+        }
+    }
+    matches!(strip_nested(expr), Expr::BinaryOp { .. }) && leaf(expr, scope)
+}
+
 fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, bool) {
     let name = func.name.to_string().to_uppercase();
 
@@ -3604,7 +3881,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         "COUNT" => (RockyType::Int64, false),
         "SUM" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("SUM", &arg_type, ArgResolution::Resolved, &scope.target)
+            let (ty, nullable) =
+                infer_aggregation_type("SUM", &arg_type, ArgResolution::Resolved, &scope.target);
+            (ty, nullable && !grouped_sum_is_never_null(func, scope))
         }
         "AVG" => {
             let arg_type = first_arg_type(func, scope);
@@ -4257,6 +4536,12 @@ pub(crate) struct SelectInference {
     /// through parentheses. Such an output's nullable bit is exact: it is
     /// NULL only when every argument is (#2553).
     coalesce_outputs: HashSet<usize>,
+    /// Outputs whose inferred non-null answer is exact, though their type
+    /// may not be: a grouped `SUM` ([`grouped_sum_is_never_null`]) or
+    /// arithmetic over typed numbers ([`is_exact_null_arithmetic`]). The
+    /// merge takes a non-null answer for these whatever the lineage edge
+    /// says (#2658).
+    exact_null_outputs: HashSet<usize>,
     /// Outputs with no alias whose name Rocky made up from the expression
     /// (`count` for `COUNT(*)`, `?column?`). The warehouse names them its
     /// own way, so such a name says nothing about a real column of that
@@ -4298,6 +4583,12 @@ impl SelectInference {
         }
         if function_call(expr).is_some_and(is_coalesce_call) {
             self.coalesce_outputs.insert(self.columns.len());
+        }
+        // `SUM` is non-null in inference only by the grouped rule.
+        if !nullable
+            && (function.as_deref() == Some("SUM") || is_exact_null_arithmetic(expr, scope))
+        {
+            self.exact_null_outputs.insert(self.columns.len());
         }
         // The cast's type was read for the model's warehouses
         // ([`cast_target_type`]): a name whose meaning differs between them
@@ -4529,7 +4820,7 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
 
 /// Whether the branches of a `CASE` or `COALESCE` fix its type `result`:
 /// every branch is exact (see [`has_exact_type`]), a text or boolean literal,
-/// an integer literal, or `NULL`; at least one branch is neither `NULL` nor a
+/// an integer literal that fits in 64 bits, or `NULL`; at least one branch is neither `NULL` nor a
 /// number; and every branch that is neither infers to `result` exactly.
 ///
 /// An integer literal takes its type from the context in DuckDB
@@ -4546,7 +4837,12 @@ fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> 
         if let Expr::Value(value) = branch {
             match &value.value {
                 ast::Value::Null => continue,
-                ast::Value::Number(text, _) if text.bytes().all(|b| b.is_ascii_digit()) => {
+                // Only a literal that fits in a `BIGINT`: a larger one is a
+                // `DECIMAL(38,0)` on Databricks and Spark, not an integer
+                // (#2658 red team).
+                ast::Value::Number(text, _)
+                    if text.bytes().all(|b| b.is_ascii_digit()) && text.parse::<i64>().is_ok() =>
+                {
                     continue;
                 }
                 // A double-quoted value is an identifier in DuckDB and
@@ -4771,6 +5067,7 @@ fn combine_set_operation(
         // A combined column may be NULL from any branch; the merge does not
         // narrow a set operation's nullability.
         coalesce_outputs: HashSet::new(),
+        exact_null_outputs: HashSet::new(),
         synthesized_names: std::mem::take(&mut left.synthesized_names),
         set_operation: true,
         set_branches,
@@ -5138,9 +5435,24 @@ impl SubtotalKeys {
 
 /// Whether `expr` is a call named `ROLLUP`, `CUBE` or `GROUPING SETS`: how
 /// `GROUP BY (ROLLUP(x))` parses.
+///
+/// The last part of the name is read without its quotes, so a qualified
+/// `builtin.rollup(x)` or a quoted `` `rollup`(x) `` counts too: matching
+/// more calls only makes more outputs nullable.
 fn is_grouping_construct_call(expr: &Expr) -> bool {
-    function_name(expr)
-        .is_some_and(|name| matches!(name.as_str(), "ROLLUP" | "CUBE" | "GROUPING SETS"))
+    let Expr::Function(func) = strip_nested(expr) else {
+        return false;
+    };
+    func.name
+        .0
+        .last()
+        .and_then(ast::ObjectNamePart::as_ident)
+        .is_some_and(|ident| {
+            matches!(
+                ident.value.to_uppercase().as_str(),
+                "ROLLUP" | "CUBE" | "GROUPING SETS"
+            )
+        })
 }
 
 /// Push every key inside a grouping construct, looking through nested
@@ -5178,6 +5490,7 @@ pub(crate) fn select_type_scope(
         from_scope.inexact.extend(joined.inexact);
     }
     let mut type_scope = TypeScope::with_target(env.target.clone());
+    type_scope.plain_group_by = has_plain_group_by(select);
     type_scope.inexact.clone_from(&from_scope.inexact);
     for relation in &from_scope.relations {
         if !relation.inexact.is_empty() {
@@ -13507,5 +13820,526 @@ mod tests {
                 result.diagnostics
             );
         }
+    }
+
+    /// Typecheck `sql` as model `m` on `target` and return output `c`'s
+    /// nullable bit, and whether a `nullable = false` contract on `c` gives
+    /// `E012`. Sources: `t` (`x INT`, `n STRING`, `f DOUBLE`,
+    /// `d DECIMAL(10,2)`, `big DECIMAL(38,2)`, `p DECIMAL(9,0)`, `b BIGINT`,
+    /// all NOT NULL, and a nullable `y INT`) and `u` (`k INT`, `v INT`, NOT NULL).
+    fn not_null_contract_on_c(sql: &str, target: OperandTarget) -> (bool, bool) {
+        let dec = |precision, scale| RockyType::Decimal { precision, scale };
+        let sources = HashMap::from([
+            (
+                "t".to_string(),
+                source_schema(&[
+                    ("x", RockyType::Int32, false),
+                    ("n", RockyType::String, false),
+                    ("f", RockyType::Float64, false),
+                    ("d", dec(10, 2), false),
+                    ("big", dec(38, 2), false),
+                    ("p", dec(9, 0), false),
+                    ("b", RockyType::Int64, false),
+                    ("y", RockyType::Int32, true),
+                ]),
+            ),
+            (
+                "u".to_string(),
+                source_schema(&[
+                    ("k", RockyType::Int32, false),
+                    ("v", RockyType::Int32, false),
+                ]),
+            ),
+        ]);
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(target),
+        );
+        let columns = &result.typed_models["m"];
+        let c = columns
+            .iter()
+            .find(|col| col.name == "c")
+            .unwrap_or_else(|| panic!("{sql}: no column c in {columns:?}"));
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: None,
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let e012 = validate_contract("m", columns, &contract)
+            .iter()
+            .any(|d| &*d.code == "E012");
+        (c.nullable, e012)
+    }
+
+    fn assert_not_null_contract(rows: &[(&str, bool)], target: &OperandTarget, label: &str) {
+        for &(sql, nullable) in rows {
+            assert_eq!(
+                not_null_contract_on_c(sql, target.clone()),
+                (nullable, nullable),
+                "{label}: {sql} (expected nullable = {nullable}, E012 = {nullable})"
+            );
+        }
+    }
+
+    /// #2658: with a plain `GROUP BY` every group has a row, so `SUM` over a
+    /// NOT NULL number is NOT NULL and passes a `nullable = false` contract.
+    /// Every shape that can sum no rows, or a NULL, keeps `E012`.
+    #[test]
+    fn a_grouped_sum_over_a_not_null_number_is_not_null() {
+        assert_not_null_contract(
+            &[
+                // The issue's repro (DuckDB, a DECIMAL column) and its forms.
+                ("select n, sum(d) as c from t group by n", false),
+                ("select n, sum(x) as c from t group by n", false),
+                ("select n, sum(f) as c from t group by n", false),
+                ("select sum(x) as c from t group by n", false),
+                ("select sum(x) as c from t group by y", false),
+                ("select n, sum(distinct x) as c from t group by n", false),
+                ("select n, sum(t.x) as c from t group by 1", false),
+                (
+                    "select t.n, sum(t.x) as c from t join u on t.x = u.k group by t.n",
+                    false,
+                ),
+                // No GROUP BY: an empty input gives one row, and SUM is NULL.
+                ("select sum(x) as c from t", true),
+                // A nullable argument.
+                ("select n, sum(y) as c from t group by n", true),
+                // A grouping set that holds the empty set () gives a row over
+                // empty input.
+                ("select n, sum(x) as c from t group by rollup (n)", true),
+                ("select n, sum(x) as c from t group by cube (n)", true),
+                (
+                    "select n, sum(x) as c from t group by grouping sets ((n), ())",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by grouping sets ((n))",
+                    true,
+                ),
+                ("select sum(x) as c from t group by ()", true),
+                // A parenthesised ROLLUP or CUBE parses as a function call,
+                // not as the grouping construct (red team, #2566).
+                ("select n, sum(x) as c from t group by (rollup(n))", true),
+                ("select n, sum(x) as c from t group by (cube(n))", true),
+                ("select n, sum(x) as c from t group by n, (rollup(x))", true),
+                // Plain keys of every shape.
+                (
+                    "select sum(x) as c from t group by cast(n as string)",
+                    false,
+                ),
+                ("select sum(x) as c from t group by x + 1", false),
+                ("select sum(x) as c from t group by -x", false),
+                (
+                    "select sum(x) as c from t group by case when x > 0 then 1 else 0 end",
+                    false,
+                ),
+                ("select sum(x) as c from t group by floor(f)", false),
+                (
+                    "select sum(x) as c from t group by substring(n, 1, 2)",
+                    false,
+                ),
+                ("select sum(x) as c from t group by n is null", false),
+                // Accepted arithmetic as the argument.
+                ("select n, sum(x * x) as c from t group by n", false),
+                // A literal above the BIGINT range is a decimal on Databricks
+                // and Spark, not an integer (red team).
+                (
+                    "select n, sum(case when b > 0 then b \
+                     else 99999999999999999999999999999999999999 end) as c from t group by n",
+                    true,
+                ),
+                (
+                    "select n, sum(coalesce(y, 99999999999999999999999999999999999999)) as c \
+                     from t group by n",
+                    true,
+                ),
+                // A qualified or quoted ROLLUP / CUBE call (Opus review).
+                (
+                    "select n, sum(x) as c from t group by builtin.rollup(n)",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by (builtin.cube(n))",
+                    true,
+                ),
+                ("select n, sum(x) as c from t group by `rollup`(n)", true),
+                // A plain key beside a construct or the empty set.
+                (
+                    "select n, sum(x) as c from t group by floor(f), (rollup(n))",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by case when x > 0 then 1 end, ()",
+                    true,
+                ),
+                // Constant keys only: an optimizer may fold them into one
+                // global group, which has a row over empty input.
+                ("select sum(x) as c from t group by 'a'", true),
+                (
+                    "select sum(x) as c from t group by floor(1.5), null is null",
+                    true,
+                ),
+                ("select 'k' as k, sum(x) as c from t group by 1", true),
+                ("select 'k' as k, sum(x) as c from t group by k", true),
+                // An alias of a column still reads it.
+                ("select upper(n) as k, sum(x) as c from t group by k", false),
+                // A constant beside a column is still plain.
+                ("select n, sum(x) as c from t group by 'a', n", false),
+                // A tuple key may be the empty set; it is kept nullable.
+                ("select n, sum(x) as c from t group by (n, x)", true),
+                // GROUP BY ALL with no plain output groups nothing.
+                ("select sum(x) as c from t group by all", true),
+                ("select n, sum(x) as c from t group by all", true),
+                // FILTER: a group may have no row that passes.
+                (
+                    "select n, sum(x) filter (where x > 0) as c from t group by n",
+                    true,
+                ),
+                // A window frame can be empty, grouped or not.
+                ("select sum(x) over (partition by n) as c from t", true),
+                (
+                    "select sum(x) over (order by x rows between 1 following and 2 following) \
+                     as c from t",
+                    true,
+                ),
+                (
+                    "select n, sum(sum(x)) over (order by n rows between 1 following and 1 following) as c from t group by n",
+                    true,
+                ),
+                // The null-extended side of an outer join.
+                (
+                    "select t.n, sum(u.v) as c from t left join u on t.x = u.k group by t.n",
+                    true,
+                ),
+                // The grouped flag belongs to one SELECT: a subquery, and a
+                // grouped CTE read by an ungrouped sum.
+                (
+                    "select n, (select sum(v) from u) as c from t group by n",
+                    true,
+                ),
+                (
+                    "select n, (select sum(v) from u group by k limit 1) as c from t group by n",
+                    true,
+                ),
+                // The null-extended side of a RIGHT or FULL join.
+                (
+                    "select u.k, sum(t.x) as c from t right join u on t.x = u.k group by u.k",
+                    true,
+                ),
+                (
+                    "select u.k, sum(t.x) as c from t full join u on t.x = u.k group by u.k",
+                    true,
+                ),
+                (
+                    "select t.n, sum(u.v) as c from t full join u on t.x = u.k group by t.n",
+                    true,
+                ),
+                (
+                    "with g as (select n, sum(x) as s from t group by n) select sum(s) as c from g",
+                    true,
+                ),
+            ],
+            &duckdb(),
+            "duckdb",
+        );
+    }
+
+    /// #2658: a grouped `SUM` over a DECIMAL is NOT NULL only where every
+    /// warehouse is known and none is Databricks, which writes NULL on a
+    /// decimal overflow with `ANSI_MODE` off. Integer and float sums are NOT
+    /// NULL on every target.
+    #[test]
+    fn a_grouped_decimal_sum_is_not_null_only_off_databricks() {
+        let decimal = "select n, sum(d) as c from t group by n";
+        let integer = "select n, sum(x) as c from t group by n";
+        let float = "select n, sum(f) as c from t group by n";
+        let databricks: OperandTarget = Some(OperandDialect::Databricks).into();
+        let spark = OperandTarget::Targets {
+            dialects: Vec::new(),
+            unruled: vec!["spark".to_string()],
+        };
+        let duckdb_and_databricks = OperandTarget::Targets {
+            dialects: vec![OperandDialect::DuckDb, OperandDialect::Databricks],
+            unruled: Vec::new(),
+        };
+        // A literal Rocky types as `Int64` makes `x * 1.5` look like an
+        // integer, but it is a decimal: the sum stays under the decimal rule
+        // (red team).
+        let guessed = "select n, sum(x * 1.5) as c from t group by n";
+        for target in [Some(OperandDialect::Databricks).into(), duckdb()] {
+            assert_not_null_contract(&[(guessed, true)], &target, "guessed argument");
+        }
+        // Accepted arithmetic over a decimal is a decimal sum.
+        let product = "select n, sum(x * d) as c from t group by n";
+        assert_not_null_contract(&[(product, false)], &duckdb(), "duckdb product");
+        assert_not_null_contract(
+            &[(product, true)],
+            &Some(OperandDialect::Databricks).into(),
+            "databricks product",
+        );
+        for (label, target, decimal_nullable) in [
+            ("duckdb", duckdb(), false),
+            ("trino", Some(OperandDialect::Trino).into(), false),
+            ("sqlserver", Some(OperandDialect::SqlServer).into(), false),
+            ("redshift", Some(OperandDialect::Redshift).into(), false),
+            ("snowflake", Some(OperandDialect::Snowflake).into(), false),
+            ("bigquery", Some(OperandDialect::BigQuery).into(), false),
+            ("postgres", Some(OperandDialect::Postgres).into(), false),
+            ("databricks", databricks, true),
+            ("duckdb and databricks", duckdb_and_databricks, true),
+            ("spark", spark, true),
+            ("unconfigured", OperandTarget::Unconfigured, true),
+        ] {
+            assert_not_null_contract(
+                &[
+                    (decimal, decimal_nullable),
+                    (integer, false),
+                    (float, false),
+                ],
+                &target,
+                label,
+            );
+        }
+    }
+
+    /// #2658: `+`, `-` and `*` over NOT NULL typed numbers are NOT NULL,
+    /// though their type stays `Unknown` (#2295). NULL, division, a cast, an
+    /// unknown or nullable operand, a non-integer literal and a product over
+    /// the 38-digit cap keep `E012`.
+    #[test]
+    fn arithmetic_over_not_null_numbers_is_not_null() {
+        let rows = [
+            // The issue's repro: INTEGER * DECIMAL(10,2).
+            ("select x * d as c from t", false),
+            ("select d * x as c from t", false),
+            ("select x * x as c from t", false),
+            ("select d * d as c from t", false),
+            ("select x + d as c from t", false),
+            ("select d - x as c from t", false),
+            ("select d * 2 as c from t", false),
+            ("select (x + 1) * -d as c from t", false),
+            ("select f * x as c from t", false),
+            ("select t.x * u.v as c from t join u on t.x = u.k", false),
+            // A nullable operand, or the null-extended side of an outer join.
+            ("select x * y as c from t", true),
+            (
+                "select t.x * u.v as c from t left join u on t.x = u.k",
+                true,
+            ),
+            // NULL is not a numeric literal.
+            ("select x * null as c from t", true),
+            ("select x + cast(null as int) as c from t", true),
+            // Division, modulo and casts stay out.
+            ("select x / d as c from t", true),
+            ("select x % d as c from t", true),
+            ("select cast(x as int) * d as c from t", true),
+            // A column Rocky has no type for, and a function call.
+            ("select x * missing as c from t", true),
+            ("select abs(x) * d as c from t", true),
+            // A literal Rocky types as Int64 may need more digits.
+            ("select x * 2.5 as c from t", true),
+            ("select x * 99999999999999999999 as c from t", true),
+            // Over the 38-digit cap: Databricks with ANSI off writes NULL.
+            ("select big * x as c from t", true),
+            ("select big + big as c from t", true),
+            // A derived column built from a decimal literal has a guessed
+            // type whose digit bound is too low: Spark types `a` as
+            // DECIMAL(31,3), and `a * p` can overflow (red team).
+            (
+                "select s.a * s.p as c from (select d * 1000000000000000000.5 as a, p from t) s",
+                true,
+            ),
+            (
+                "with s as (select d * 1000000000000000000.5 as a, p from t) select a * p as c from s",
+                true,
+            ),
+            // A CASE with a literal above the BIGINT range is not an exact
+            // BIGINT (red team).
+            (
+                "with s as (select case when b > 0 then b \
+                 else 99999999999999999999999999999999999999 end as a, p from t) \
+                 select a * p as c from s",
+                true,
+            ),
+            // An exact derived column keeps the rule.
+            ("select s.x * s.d as c from (select x, d from t) s", false),
+        ];
+        for (label, target) in [
+            ("duckdb", duckdb()),
+            ("databricks", Some(OperandDialect::Databricks).into()),
+        ] {
+            assert_not_null_contract(&rows, &target, label);
+        }
+    }
+
+    /// #2660: `E065`, `E066` and `E067` reach the project typecheck, which
+    /// `rocky compile` and the compile in `rocky run` both call.
+    #[test]
+    fn clause_placement_errors_reach_the_typecheck() {
+        for (sql, code) in [
+            (
+                "select customer_id from main.orders where sum(amount) > 1 group by customer_id",
+                "E065",
+            ),
+            (
+                "select order_id from main.orders where row_number() over (order by order_id) = 1",
+                "E066",
+            ),
+            (
+                "select customer_id, count(*) as n from main.orders group by 3",
+                "E067",
+            ),
+        ] {
+            let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            let result = typecheck_project_for_targets(
+                &graph,
+                &HashMap::new(),
+                &project.models,
+                None,
+                &TargetDialects::uniform(duckdb()),
+            );
+            let found: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|d| d.model == "m" && d.is_error())
+                .map(|d| d.code.to_string())
+                .collect();
+            assert_eq!(found, [code], "{sql}");
+        }
+    }
+
+    /// #2658: a cast over a grouped `SUM`. Only `CAST(SUM(int) AS BIGINT)`
+    /// is NOT NULL, on a known warehouse that names `BIGINT` (#2333): the
+    /// sum of an integer is a `BIGINT` on Databricks and Spark, so the cast
+    /// is a no-op there, and on DuckDB a `HUGEINT` cast overflow is an
+    /// error, not NULL. Every cast that can narrow stays nullable on every
+    /// target, and a Spark or unknown target types none of them.
+    #[test]
+    fn a_cast_over_a_grouped_sum_is_not_null_only_when_it_cannot_fail() {
+        let casts = [
+            "select n, cast(sum(x) as bigint) as c from t group by n",
+            "select n, cast(sum(x) as int) as c from t group by n",
+            "select n, cast(sum(d) as bigint) as c from t group by n",
+            "select n, cast(sum(d) as decimal(12,2)) as c from t group by n",
+            "select n, cast(sum(f) as bigint) as c from t group by n",
+        ];
+        let spark = OperandTarget::Targets {
+            dialects: Vec::new(),
+            unruled: vec!["spark".to_string()],
+        };
+        for (label, target, bigint_of_int_nullable) in [
+            ("duckdb", duckdb(), false),
+            ("databricks", Some(OperandDialect::Databricks).into(), false),
+            ("spark", spark, true),
+            ("unconfigured", OperandTarget::Unconfigured, true),
+        ] {
+            let rows: Vec<(&str, bool)> = casts
+                .iter()
+                .enumerate()
+                .map(|(i, sql)| (*sql, if i == 0 { bigint_of_int_nullable } else { true }))
+                .collect();
+            assert_not_null_contract(&rows, &target, label);
+        }
+    }
+
+    /// #2658: inference now also runs for a model whose only reason is a
+    /// nullable `SUM`. When it then fails (a `VALUES` CTE it does not read),
+    /// the model keeps lineage's answer, as before: the sum is still typed
+    /// `Int64`, not wiped to `Unknown`, and stays nullable.
+    #[test]
+    fn a_failed_sum_only_inference_keeps_the_lineage_type() {
+        assert_eq!(
+            typecheck_over_decimal_t("with v as (values (1)) select sum(x) as c from t group by n"),
+            vec![("c".to_string(), RockyType::Int64, true)]
+        );
+    }
+
+    /// #2658: a grouped `SUM` that is NOT NULL stays NOT NULL in a model that
+    /// reads it, so a downstream `nullable = false` contract passes too.
+    #[test]
+    fn a_not_null_grouped_sum_reaches_a_downstream_model() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+            ]),
+        )]);
+        let project = Project::from_models(vec![
+            make_model("m1", "select n, sum(x) as c from t group by n"),
+            make_model("m2", "select n, c from m1"),
+        ])
+        .unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
+        for model in ["m1", "m2"] {
+            let c = result.typed_models[model]
+                .iter()
+                .find(|col| col.name == "c")
+                .unwrap();
+            assert_eq!(
+                (&c.data_type, c.nullable),
+                (&RockyType::Int64, false),
+                "{model}"
+            );
+        }
+    }
+
+    /// #2658: `GROUP BY` modifiers and tuple keys are not plain, in the
+    /// dialects whose parser reads them, even where the lineage parser
+    /// refuses the model first.
+    #[test]
+    fn grouping_modifiers_and_tuples_are_not_a_plain_group_by() {
+        use sqlparser::dialect::{ClickHouseDialect, GenericDialect, MySqlDialect};
+        let select_of = |dialect: &dyn sqlparser::dialect::Dialect, sql: &str| {
+            let statements = Parser::parse_sql(dialect, sql).unwrap();
+            let Statement::Query(query) = &statements[0] else {
+                panic!("{sql}");
+            };
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("{sql}");
+            };
+            has_plain_group_by(select)
+        };
+        assert!(!select_of(
+            &MySqlDialect {},
+            "select n from t group by n with rollup"
+        ));
+        assert!(!select_of(
+            &ClickHouseDialect {},
+            "select n from t group by n with totals"
+        ));
+        assert!(!select_of(
+            &GenericDialect {},
+            "select n from t group by (n, x)"
+        ));
+        assert!(!select_of(
+            &GenericDialect {},
+            "select n from t group by (rollup(n))"
+        ));
+        assert!(!select_of(
+            &GenericDialect {},
+            "select n from t group by grouping sets ((n), ())"
+        ));
+        assert!(select_of(
+            &GenericDialect {},
+            "select n from t group by n, upper(n), 1"
+        ));
     }
 }

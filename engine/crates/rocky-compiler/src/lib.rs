@@ -18,6 +18,7 @@ pub mod ambiguous;
 pub mod arena;
 pub mod blast_radius;
 pub mod cache;
+pub mod clause_placement;
 pub mod clickhouse_options;
 pub mod compile;
 pub mod consumers;
