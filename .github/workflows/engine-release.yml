@@ -121,12 +121,12 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
 
-      # Linux: free disk space and add swap (DuckDB C++ is memory-hungry)
-      - name: Free disk space and add swap
+      # Linux: free disk space. No swap file (#2630): with one, AWS-backed
+      # runners froze mid-build.
+      - name: Free disk space
         if: runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
 
       # The browser UI, built once by the `ui` job below, embedded into
       # every target with `--features ui`.
