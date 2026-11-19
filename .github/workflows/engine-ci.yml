@@ -332,6 +332,106 @@ jobs:
             jobs: 4
             swapfile: 'true'
             aws_only: 'true'
+          - variant: control-j4
+            rep: 11
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 12
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 13
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 14
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 15
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 16
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 17
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 18
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 19
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 20
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 21
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 22
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 23
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 24
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 25
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 26
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 27
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 28
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 29
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
+          - variant: control-j4
+            rep: 30
+            jobs: 4
+            swapfile: 'true'
+            aws_only: 'true'
           - variant: noswap-j4
             rep: 1
             jobs: 4
@@ -376,32 +476,12 @@ jobs:
             rep: 9
             jobs: 4
             swapfile: 'false'
-            aws_only: 'false'
+            aws_only: 'true'
           - variant: noswap-j4
             rep: 10
             jobs: 4
             swapfile: 'false'
-            aws_only: 'false'
-          - variant: noswap-j3
-            rep: 1
-            jobs: 3
-            swapfile: 'false'
-            aws_only: 'false'
-          - variant: noswap-j3
-            rep: 2
-            jobs: 3
-            swapfile: 'false'
-            aws_only: 'false'
-          - variant: noswap-j2
-            rep: 1
-            jobs: 2
-            swapfile: 'false'
-            aws_only: 'false'
-          - variant: noswap-j2
-            rep: 2
-            jobs: 2
-            swapfile: 'false'
-            aws_only: 'false'
+            aws_only: 'true'
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
