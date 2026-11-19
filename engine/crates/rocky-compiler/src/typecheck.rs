@@ -1048,7 +1048,10 @@ fn check_known_missing_upstream_refs(
         else {
             continue;
         };
-        if !has_provably_fixed_output_names(&upstream_model.sql) {
+        if !has_provably_fixed_output_names(
+            &upstream_model.sql,
+            upstream_schema.star_columns_complete,
+        ) {
             continue;
         }
         let mut output_names = HashSet::with_capacity(upstream_schema.columns.len());
@@ -1164,8 +1167,10 @@ pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
 /// An alias over a function that can expand into several output columns
 /// (`unnest` of a struct in DuckDB, `explode` of a map in Spark, `COLUMNS`,
 /// `UNPACK`, `json_tuple`, `stack`, `inline`) does not fix the names, and
-/// neither does a set operation, a star, or a string-quoted alias.
-fn has_provably_fixed_output_names(sql: &str) -> bool {
+/// neither does a set operation, a star, or a string-quoted alias. A plain
+/// `*` counts only with `plain_star_is_known`: the semantic graph proved what
+/// it expands to ([`ModelSchema::star_columns_complete`], #2701).
+pub(crate) fn has_provably_fixed_output_names(sql: &str, plain_star_is_known: bool) -> bool {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return false;
     };
@@ -1184,6 +1189,7 @@ fn has_provably_fixed_output_names(sql: &str) -> bool {
             SelectItem::ExprWithAlias { expr, alias } => {
                 alias.quote_style != Some('\'') && !calls_expanding_function(expr)
             }
+            item if plain_star_is_known => crate::semantic::is_plain_star(item),
             _ => false,
         })
 }
@@ -9704,6 +9710,64 @@ mod tests {
             .collect()
     }
 
+    /// An upstream whose plain star expands over a complete model is complete
+    /// itself (#2701): a missing column read from it is E039, and it no longer
+    /// hides a qualified missing column of another relation it is joined to.
+    #[test]
+    fn a_star_over_a_complete_model_makes_absence_provable() {
+        let models = || {
+            vec![
+                make_model("src", "SELECT id, name FROM raw.orders"),
+                make_model("stg", "SELECT *, upper(name) AS name_clean FROM src"),
+                make_model("int", "SELECT id, name FROM raw.orders"),
+            ]
+        };
+        for (sql, missing) in [
+            ("SELECT nope FROM stg", "nope"),
+            ("SELECT s.nope FROM stg s", "nope"),
+            // The bench mart shape (#2699).
+            (
+                "SELECT i.id, i.no_such_column, s.name_clean FROM int i \
+                 LEFT JOIN stg s ON i.id = s.id",
+                "no_such_column",
+            ),
+        ] {
+            let mut all = models();
+            all.push(make_model("consumer", sql));
+            let result = compile_typechecks(all);
+            let e039 = e039_diagnostics(&result);
+            assert_eq!(e039.len(), 1, "{sql}: {:?}", result.diagnostics);
+            assert!(e039[0].message.contains(&format!("'{missing}'")), "{sql}");
+        }
+        for sql in [
+            "SELECT id, name, name_clean FROM stg",
+            "SELECT i.id, s.name_clean FROM int i LEFT JOIN stg s ON i.id = s.id",
+        ] {
+            let mut all = models();
+            all.push(make_model("consumer", sql));
+            let result = compile_typechecks(all);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "{sql}: {:?}",
+                result.diagnostics
+            );
+        }
+        // A star over a raw table keeps the upstream opaque: no E039.
+        let result = compile_typechecks(vec![
+            make_model("stg", "SELECT *, 1 AS one FROM raw.orders"),
+            make_model("int", "SELECT id FROM raw.orders"),
+            make_model(
+                "consumer",
+                "SELECT i.nope FROM int i LEFT JOIN stg s ON i.id = s.id",
+            ),
+        ]);
+        assert!(
+            e039_diagnostics(&result).is_empty(),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
     /// A star modifier over a complete upstream model that names a column
     /// the model does not output is E039, as a plain read of it is (#2624
     /// red team, finding 2). A present name is clean.
@@ -9907,7 +9971,8 @@ mod tests {
         }
 
         assert!(!has_provably_fixed_output_names(
-            "SELECT id FROM raw.left UNION BY NAME SELECT id FROM raw.right"
+            "SELECT id FROM raw.left UNION BY NAME SELECT id FROM raw.right",
+            true,
         ));
     }
 
