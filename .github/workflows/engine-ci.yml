@@ -70,6 +70,7 @@ jobs:
       # Exactly one of the two steps runs per event; a skipped step's output
       # is empty, and `||` picks the one that wrote.
       engine: ${{ steps.diff.outputs.engine || steps.trigger.outputs.engine }}
+      connectors: ${{ steps.diff.outputs.connectors || steps.trigger.outputs.connectors }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
@@ -84,9 +85,15 @@ jobs:
           # Mirrors the push trigger paths: engine/**, schemas/**, the skill
           # compiled into the binary (#1557), and this workflow itself.
           ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
+          # Only the `connector-test` job reads this: the connector code it
+          # runs (the manifest, the runner and verifier, and the `rocky
+          # connector` commands), this workflow, and the two connector POCs it
+          # tests. A change to a POC alone runs that job and no other.
+          CONNECTOR_PATHS_RE: ^(engine/crates/rocky-core/src/connector\.rs$|engine/crates/rocky-cli/src/connector/|engine/crates/rocky-cli/src/commands/connector_|\.github/workflows/engine-ci\.yml$|examples/playground/pocs/07-adapters/08-postgres-child-connector/|examples/playground/pocs/07-adapters/12-meltano-connector-shim/)
         run: |
           set -uo pipefail
           engine=true
+          connectors=true
           files=$(mktemp)
           # --no-renames: a rename lists BOTH its old and its new path. Plain
           # `git diff` folds a rename into the destination alone, so a file
@@ -110,11 +117,21 @@ jobs:
               1) engine=false ;;
               *) echo "::warning::grep exited $status while matching the changed paths; running engine CI to fail closed" ;;
             esac
+            # The same listing, matched again for the connector-test job.
+            status=0
+            grep -zqE "$CONNECTOR_PATHS_RE" "$files" || status=$?
+            case "$status" in
+              0) connectors=true ;;
+              1) connectors=false ;;
+              *) echo "::warning::grep exited $status while matching the connector paths; running the connector test to fail closed" ;;
+            esac
           else
             echo "::warning::could not diff the merge commit; running engine CI to fail closed"
           fi
           echo "engine=$engine" >> "$GITHUB_OUTPUT"
+          echo "connectors=$connectors" >> "$GITHUB_OUTPUT"
           echo "engine=$engine"
+          echo "connectors=$connectors"
       - name: Trust the trigger's own paths filter
         id: trigger
         if: github.event_name != 'pull_request'
@@ -123,6 +140,7 @@ jobs:
         working-directory: .
         run: |
           echo "engine=true" >> "$GITHUB_OUTPUT"
+          echo "connectors=true" >> "$GITHUB_OUTPUT"
           echo "engine=true"
 
   test:
@@ -447,6 +465,78 @@ jobs:
           test "$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/api/v1/meta)" = "401"
           test "$(curl -s -o /dev/null -w "%{http_code}" -H "Host: evil.example" http://127.0.0.1:18080/ui/)" = "421"
           kill "$server"
+
+  # `rocky connector test` against the connectors that need no service and
+  # no PyPI package: a fresh `rocky connector init` scaffold, the Postgres
+  # reference connector in replay mode, and the Meltano shim against its
+  # replay stand-in. All three write Parquet through the real duckdb CLI.
+  # The dlt shim needs dlt from PyPI, so only engine-weekly runs it. A job of
+  # its own, away from Test, and not a required check. It builds rocky a
+  # second time, so on a pull request it runs only when the connector code or
+  # those POCs change (`connectors`); every push to main runs it. A push to
+  # main that touches only those POCs does not start this workflow at all:
+  # the push `paths:` are the engine's, so the PR run is what covers it.
+  # And code outside `connectors` that the connector path calls, such as the
+  # `[connector.*]` config parsing in rocky-core/src/config.rs, does not run
+  # this job on a pull request; the next push to main does, so a regression
+  # shows within one merge.
+  connector-test:
+    name: Connector test
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.connectors != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: engine
+          # Save only from main; see the note on the Clippy job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # See the Clippy job: a restored cache breaks libduckdb-sys's build.
+      - name: Drop the cached bundled DuckDB sources
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
+      - name: Install cmake
+        run: |
+          command -v cmake >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      # The same pinned, checksum-verified CLI as the engine-weekly POC job.
+      - name: Install the duckdb CLI
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz -o /tmp/duckdb.tar.gz
+          echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  /tmp/duckdb.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/duckdb.tar.gz -C /usr/local/bin duckdb
+          sudo chmod +x /usr/local/bin/duckdb
+          duckdb --version
+      - name: Build rocky
+        run: cargo build -p rocky
+      - name: Test a fresh connector scaffold
+        run: |
+          set -euo pipefail
+          rocky="$GITHUB_WORKSPACE/engine/target/debug/rocky"
+          dir="$(mktemp -d)"
+          cd "$dir"
+          "$rocky" connector init demo
+          printf '[adapter]\ntype = "duckdb"\npath = "poc.duckdb"\n\n[connector.demo]\nmanifest = "connectors/demo/connector.toml"\noutput_uri = "file://./.rocky/landing/demo"\ntarget = { catalog = "poc", schema = "main", table = "demo" }\n' > rocky.toml
+          "$rocky" -c rocky.toml connector test demo --output table
+      - name: Test the Postgres reference connector (replay)
+        working-directory: examples/playground/pocs/07-adapters/08-postgres-child-connector
+        run: '"$GITHUB_WORKSPACE/engine/target/debug/rocky" -c rocky.toml connector test pg_events --output table'
+      - name: Test the Meltano shim (replay)
+        working-directory: examples/playground/pocs/07-adapters/12-meltano-connector-shim
+        run: '"$GITHUB_WORKSPACE/engine/target/debug/rocky" -c rocky.toml connector test orders_tap --output table'
 
   # The browser UI `rocky serve --ui` embeds: lint, typecheck, test, build,
   # and hand `dist/` to the release-build smoke so the embedding compiles.

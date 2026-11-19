@@ -1,0 +1,127 @@
+{
+  "streams": [
+    {
+      "key_properties": [
+        "id"
+      ],
+      "metadata": [
+        {
+          "breadcrumb": [
+            "properties",
+            "id"
+          ],
+          "metadata": {
+            "inclusion": "automatic"
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "name"
+          ],
+          "metadata": {
+            "inclusion": "available"
+          }
+        },
+        {
+          "breadcrumb": [],
+          "metadata": {
+            "inclusion": "available",
+            "selected": true,
+            "selected-by-default": true,
+            "table-key-properties": [
+              "id"
+            ]
+          }
+        }
+      ],
+      "replication_method": "FULL_TABLE",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "type": [
+              "integer"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "stream": "customers",
+      "tap_stream_id": "customers"
+    },
+    {
+      "key_properties": [
+        "id"
+      ],
+      "metadata": [
+        {
+          "breadcrumb": [
+            "properties",
+            "id"
+          ],
+          "metadata": {
+            "inclusion": "automatic"
+          }
+        },
+        {
+          "breadcrumb": [
+            "properties",
+            "amount_cents"
+          ],
+          "metadata": {
+            "inclusion": "available"
+          }
+        },
+        {
+          "breadcrumb": [],
+          "metadata": {
+            "inclusion": "available",
+            "replication-key": "id",
+            "selected": true,
+            "selected-by-default": true,
+            "table-key-properties": [
+              "id"
+            ],
+            "valid-replication-keys": [
+              "id"
+            ]
+          }
+        }
+      ],
+      "replication_key": "id",
+      "replication_method": "INCREMENTAL",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "amount_cents": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "type": [
+              "integer"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "stream": "orders",
+      "tap_stream_id": "orders"
+    }
+  ]
+}

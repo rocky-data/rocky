@@ -470,6 +470,35 @@ jobs:
           REQUIRE_DOCKER: "1"
         run: bash examples/playground/pocs/07-adapters/08-postgres-child-connector/run.sh
 
+      # The dlt connector shim with the real dlt. PR CI cannot run it: it
+      # needs dlt from PyPI. Every package comes from requirements.lock, which
+      # pins the whole dependency tree with hashes (pip --require-hashes).
+      # A fresh .venv first: run-all-duckdb.sh above may have made one from
+      # the unhashed requirements.txt. REQUIRE_DLT=1 makes a failed install a
+      # failure, not a skip. Then `rocky connector test` replays its spec.
+      - name: dlt connector shim (real dlt, hash-pinned)
+        if: ${{ !cancelled() }}
+        working-directory: ${{ github.workspace }}/examples/playground/pocs/07-adapters/10-dlt-connector-shim
+        timeout-minutes: 10
+        env:
+          REQUIRE_DLT: "1"
+        # requirements.lock is compiled for Python 3.12 on Linux x86_64.
+        # Known risk: when ubuntu-latest moves to an image with another Python,
+        # the version check below fails every week until the lock is
+        # recompiled for that Python. That is the intended failure. There is no
+        # setup-python step: a new action pin needs the allow-list first.
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), "requirements.lock is for Python 3.12, not " + sys.version'
+          rm -rf .venv
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet --require-hashes --no-deps -r requirements.lock
+          # Fail here if the hashed install is not enough, so run.sh never
+          # falls back to installing the unhashed requirements.txt.
+          .venv/bin/python -c "import dlt; print('dlt', dlt.__version__)"
+          bash run.sh
+          rocky -c rocky.toml connector test shop_orders --output table
+
       # The Airbyte connector shim with no Docker: the POC's own declarative
       # manifest run through airbyte-cdk against a local stub. PR CI cannot
       # run it: it needs airbyte-cdk from PyPI. Every package comes from

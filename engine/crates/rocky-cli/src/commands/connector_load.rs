@@ -122,15 +122,21 @@ pub struct ConnectorLoadOutcome {
 
 /// A connector with its config and manifest read and checked, before any
 /// child runs.
-struct Prepared<'a> {
-    config: &'a ConnectorConfig,
-    manifest: ConnectorManifest,
-    argv: Vec<std::ffi::OsString>,
-    limits: EffectiveLimits,
-    landing_dir: PathBuf,
+pub(crate) struct Prepared<'a> {
+    pub(crate) config: &'a ConnectorConfig,
+    pub(crate) manifest: ConnectorManifest,
+    /// The manifest file, resolved.
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) argv: Vec<std::ffi::OsString>,
+    pub(crate) limits: EffectiveLimits,
+    pub(crate) landing_dir: PathBuf,
 }
 
-fn prepare<'a>(config_path: &Path, loaded: &'a LoadedConfig, name: &str) -> Result<Prepared<'a>> {
+pub(crate) fn prepare<'a>(
+    config_path: &Path,
+    loaded: &'a LoadedConfig,
+    name: &str,
+) -> Result<Prepared<'a>> {
     let Some(config) = loaded.config.connectors.get(name) else {
         let known: Vec<&str> = loaded
             .config
@@ -173,6 +179,7 @@ fn prepare<'a>(config_path: &Path, loaded: &'a LoadedConfig, name: &str) -> Resu
     Ok(Prepared {
         config,
         manifest,
+        manifest_path: manifest_path.clone(),
         argv,
         limits,
         landing_dir,
@@ -1225,7 +1232,7 @@ async fn count_rows(warehouse: &dyn WarehouseAdapter, table_ref: &str) -> Result
 /// Refuse an append whose Parquet columns differ (by name or type) from the
 /// first file's. A load by position would otherwise put values in the wrong
 /// columns.
-fn same_parquet_schema(first: &Path, other: &Path) -> Result<()> {
+pub(crate) fn same_parquet_schema(first: &Path, other: &Path) -> Result<()> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
     let columns = |path: &Path| -> Result<Vec<(String, String)>> {
         let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;
