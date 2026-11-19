@@ -3740,6 +3740,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             };
             infer_aggregation_type("AVG", &arg_type, resolution, &scope.target)
         }
+        // DuckDB's `max(x, n)` / `min(x, n)` is a top-n aggregate that
+        // returns a list, not a value of `x`'s type.
+        "MIN" | "MAX" if !has_one_argument(func) => (RockyType::Unknown, true),
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
             (arg_type, true)
@@ -4502,6 +4505,11 @@ fn function_name(expr: &Expr) -> Option<String> {
         Expr::Function(func) => Some(func.name.to_string().to_uppercase()),
         _ => None,
     }
+}
+
+/// Whether `func` is called with exactly one argument.
+fn has_one_argument(func: &ast::Function) -> bool {
+    matches!(&func.args, ast::FunctionArguments::List(list) if list.args.len() == 1)
 }
 
 /// Whether [`infer_expr_type`] reads this expression's type from the SQL
@@ -8070,6 +8078,42 @@ mod tests {
                 .map(|(n, t, nl)| (n.to_string(), t, nl))
                 .collect();
             assert_eq!(typecheck_over_t("t", sql), expected, "{sql}");
+        }
+    }
+
+    /// DuckDB's top-n `max(x, n)` / `min(x, n)` returns a list, so inference
+    /// types it `Unknown`, also through a CTE or derived table. A plain
+    /// `max(x)` keeps `x`'s type.
+    #[test]
+    fn a_top_n_min_max_is_unknown() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[("x", RockyType::Int32, false)]),
+        )]);
+        for (sql, want) in [
+            ("SELECT max(x, 2) AS m FROM t", RockyType::Unknown),
+            ("SELECT min(x, 3) AS m FROM t", RockyType::Unknown),
+            (
+                "WITH c AS (SELECT max(x, 2) AS m FROM t) SELECT m FROM c",
+                RockyType::Unknown,
+            ),
+            (
+                "SELECT m FROM (SELECT min(x, 2) AS m FROM t) d",
+                RockyType::Unknown,
+            ),
+            ("SELECT max(x) AS m FROM t", RockyType::Int32),
+            (
+                "WITH c AS (SELECT max(x) AS m FROM t) SELECT m FROM c",
+                RockyType::Int32,
+            ),
+        ] {
+            let inferred = infer_select_types_with_lookup(
+                sql,
+                &|name| sources.get(name).map(Vec::as_slice),
+                &duckdb(),
+            )
+            .unwrap();
+            assert_eq!(inferred.columns[0].data_type, want, "{sql}");
         }
     }
 

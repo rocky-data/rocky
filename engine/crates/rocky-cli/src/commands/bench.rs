@@ -621,21 +621,30 @@ mod tests {
     fn a_project_with_a_compile_error_is_refused() {
         let dir = tempfile::TempDir::new().unwrap();
         generate_synthetic_project(100, dir.path());
+        // Every mart, not the first one `read_dir` returns (#2699). A mart
+        // that also joins a model with an incomplete schema gets no E039 for
+        // `i.no_such_column`: DuckDB could read it as a field of a struct
+        // column `i` in that model (#2701). The marts that join only complete
+        // models do report it.
         let models = dir.path().join("models");
-        let mart = fs::read_dir(&models)
+        let marts: Vec<_> = fs::read_dir(&models)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .find(|p| {
+            .filter(|p| {
                 p.extension().is_some_and(|e| e == "sql")
                     && p.file_name().unwrap().to_string_lossy().starts_with("fct_")
             })
-            .expect("the project has a mart");
-        let sql = fs::read_to_string(&mart).unwrap();
-        fs::write(
-            &mart,
-            sql.replacen("i.id,", "i.id,\n    i.no_such_column,", 1),
-        )
-        .unwrap();
+            .collect();
+        assert!(!marts.is_empty(), "the project has marts");
+        for mart in &marts {
+            let sql = fs::read_to_string(mart).unwrap();
+            assert!(sql.contains("i.id,"), "{} reads i.id", mart.display());
+            fs::write(
+                mart,
+                sql.replacen("i.id,", "i.id,\n    i.no_such_column,", 1),
+            )
+            .unwrap();
+        }
 
         let err = ensure_compiles_clean(&config_for(dir.path()))
             .expect_err("a project with an E039 must be refused");
