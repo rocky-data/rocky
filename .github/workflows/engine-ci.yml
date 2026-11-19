@@ -183,10 +183,17 @@ jobs:
       - name: Drop the cached bundled DuckDB sources
         shell: bash
         run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
-      - name: Free disk space and add swap
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
+      # No swap file (#2630). With the 4 GB swap file this step used to add,
+      # 6 of 6 replicated Test builds on AWS-backed runners froze mid-build;
+      # GitHub then failed the jobs with "The hosted runner lost
+      # communication with the server" or at the job time limit. Without it,
+      # 7 of 7 passed. On those VMs `/` is a device-mapper snapshot (an EBS
+      # origin with a copy-on-write store on local NVMe), and the VM has no
+      # swap of its own. On the runs measured, the build peaked at 8,103 MiB
+      # of anonymous memory with a warm cache and 9,893 MiB with a cold one,
+      # of the runner's 15,700 MiB.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
       # `apt-get update` exits non-zero when ANY configured source serves a
       # bad index, including the third-party ones the GitHub runner image
       # ships (Google Chrome, Microsoft). On 2026-09-09 Chrome's repo served
@@ -240,6 +247,13 @@ jobs:
         run: |
           test -x target/debug/rocky || cargo build -p rocky --all-features
           cd evals && ROCKY_BIN="$GITHUB_WORKSPACE/engine/target/debug/rocky" python3 run_evals.py --contract-quality
+      # Runs when any step above failed. Prints the kernel's OOM kills and
+      # hung-task warnings, and fails loudly if it cannot read the kernel log.
+      - name: Report kernel out-of-memory kills
+        if: failure()
+        run: |
+          log=$(sudo dmesg) || { echo "::error::could not read the kernel log"; exit 1; }
+          grep -iE 'out of memory|oom-kill|killed process|blocked for more than|hung_task' <<<"$log" || echo "no OOM kills or hung tasks in dmesg"
 
   clippy:
     name: Clippy
