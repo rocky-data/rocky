@@ -5811,6 +5811,39 @@ egress_hosts         = []
         );
     }
 
+    /// A fresh `rocky connector init` scaffold, with the block it prints,
+    /// validates: V067 passes, and the missing license is only a V068 warning.
+    #[test]
+    fn a_fresh_connector_scaffold_validates_with_only_a_v068_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("connectors/demo");
+        crate::commands::scaffold_connector(
+            "demo",
+            Some(&dir.path().join(rel)),
+            crate::commands::ConnectorLang::Python,
+        )
+        .unwrap();
+        let block = crate::commands::connector_init::config_block("demo", rel)
+            .replace("<catalog>", "poc")
+            .replace("<schema>", "main");
+        std::fs::write(
+            dir.path().join("rocky.toml"),
+            format!("[adapter]\ntype = \"duckdb\"\npath = \"poc.duckdb\"\n\n{block}"),
+        )
+        .unwrap();
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        assert!(out.valid, "{:?}", out.messages);
+        assert!(
+            !out.messages.iter().any(|m| m.severity == "error"),
+            "{:?}",
+            out.messages
+        );
+        assert_eq!(v067(&out)[0].0, "ok", "{:?}", out.messages);
+        let v068: Vec<_> = out.messages.iter().filter(|m| m.code == "V068").collect();
+        assert_eq!(v068.len(), 1, "{:?}", out.messages);
+        assert_eq!(v068[0].severity, "warn");
+    }
+
     /// A bare program name is looked up on PATH at run time, so validate
     /// does not judge it.
     #[test]
