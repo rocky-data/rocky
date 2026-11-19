@@ -780,7 +780,22 @@ pub fn build_semantic_graph(
                             upstream_schema.star_columns_complete,
                         )
                     });
-                    if !upstream_schema.schema_is_complete() || is_snapshot || !names_fixed {
+                    // A dependency can be declared while the bare read reaches
+                    // another table of that name: the star then expands that
+                    // table, not this model. Same rule as E039's bare binding.
+                    let bare_read_reaches_it =
+                        model_by_name.get(table_name.as_str()).is_some_and(|m| {
+                            matches!(
+                                m.config.strategy,
+                                rocky_core::models::StrategyConfig::Ephemeral
+                            ) || rocky_core::physical_edges::fold_identifier(&m.config.target.table)
+                                == rocky_core::physical_edges::fold_identifier(table_name)
+                        });
+                    if !upstream_schema.schema_is_complete()
+                        || is_snapshot
+                        || !names_fixed
+                        || !bare_read_reaches_it
+                    {
                         star_complete = false;
                     }
                     for col in &upstream_schema.columns {
@@ -1222,6 +1237,14 @@ mod tests {
             vec![snap, make_model("reader", "SELECT * FROM snap")],
             "reader",
         );
+        assert!(!schema.schema_is_complete());
+        // A model that writes another table: a bare `FROM up` reads table
+        // `up`, which this model does not write.
+        let mut renamed = up();
+        renamed.config.target.table = "users_v2".to_string();
+        let mut reader = make_model("reader", "SELECT * FROM up");
+        reader.config.depends_on = vec!["up".to_string()];
+        let schema = star_schema(vec![renamed, reader], "reader");
         assert!(!schema.schema_is_complete());
     }
 
