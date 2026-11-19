@@ -101,7 +101,7 @@ wall_time_secs = 1800
 - `egress_hosts` is required. Write `[]` for a program that calls no host.
 - `license` is optional. It is an SPDX identifier or expression, such as `MIT` or `Apache-2.0 OR MIT`. It must not be blank. Rocky does not check the name against the SPDX list. `rocky load` reports it, and reports `unknown` when it is not set. `rocky validate` warns (**V068**) when it is not set.
 - `support_tier` is optional. It says who supports the connector: `reference` (maintained by the Rocky project and tested in its CI) or `community` (not tested in CI by the Rocky project; Rocky supports the protocol, the state and the load, and a bug in the program the connector runs goes to that program's authors). `rocky load` reports it, and reports `unknown` when it is not set.
-- Both keys are the author's own statement. Rocky does not verify them.
+- Both keys are the author's own statement. Rocky does not verify them. A shim that runs another tool, such as the dlt, Airbyte and Meltano shims, declares the license of the shim's code. The tool it runs has its own license.
 - Rocky 1.93.0 and older refuse a manifest that sets `license` or `support_tier`, because they refuse unknown keys. Leave both out if the manifest must load on those versions.
 
 A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
