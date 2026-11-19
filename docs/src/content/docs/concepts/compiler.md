@@ -262,6 +262,46 @@ These calls are never reported:
 - A form the SQL parser or the warehouse rewrites, such as `COALESCE`, `IF` or
   `IFNULL`.
 
+#### Set operations with different column counts (`E071`, `W071`)
+
+`E071` reports a `UNION`, `INTERSECT` or `EXCEPT` whose branches return
+different numbers of columns, on every warehouse:
+
+```sql
+-- E071: the branches of this UNION return different numbers of columns: 2 on the left, 1 on the right
+SELECT order_id, status FROM orders UNION ALL SELECT order_id FROM returns
+```
+
+A branch is counted only when its select list states its width. A `*`, a
+`t.*`, or a call that returns several columns (`COLUMNS(...)`, `UNNEST`,
+`EXPLODE`) is not counted. `UNION BY NAME` is not checked.
+
+It is the error `E071` only in places where tests show DuckDB checks the
+query, even a subquery that never runs:
+
+- the model's query, the query in parentheses, and each branch of a set
+  operation;
+- a derived table in `FROM` or a join, `LATERAL` and parenthesised joins
+  included;
+- a subquery in the select list, `WHERE`, `HAVING` or a join's `ON` (an
+  inner, left, right or full join), reached only through comparisons,
+  `AND`, `OR`, `NOT`, `CASE`, `BETWEEN`, `IS [NOT] DISTINCT FROM`, casts,
+  `IN`, `EXISTS` or parentheses.
+
+These places nest: a subquery in the `WHERE` of a derived table counts.
+Anywhere else, the same finding is the warning `W071`. That covers a CTE
+body, a named `WINDOW`, `ORDER BY`, `GROUP BY`, `QUALIFY`, `LIMIT`, any
+function call's arguments, a lambda, a wildcard's `REPLACE`, and an operand
+of any other operator, such as `+`, `||` or `LIKE`. A warehouse can skip a CTE nothing reads or a
+window nothing uses. A DuckDB macro drops an argument its body does not use,
+and DuckDB turns many operators into function calls a macro can replace. So
+the model may still run.
+
+Rocky does not check whether the column types match across branches.
+DuckDB accepts every type mix when it checks the query, though a mix can
+still fail on real rows (`Conversion Error`). The other warehouses are not
+checked yet.
+
 ### 5. Validate contracts
 
 Rocky loads the `.contract.toml` files and checks resolvable facts against
@@ -659,6 +699,7 @@ span, and sometimes a suggested fix.
 | `E065` | A `WHERE` clause contains an aggregate (`WHERE SUM(amount) > 1`). Move the condition to `HAVING` |
 | `E066` | A `WHERE` clause contains a window function, a call with `OVER`. Filter on it with `QUALIFY`, or in a subquery |
 | `E067` | A `GROUP BY` position names no output column (`GROUP BY 3` over two columns, or `GROUP BY 0`) |
+| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, in a place tests show DuckDB checks. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -686,6 +727,7 @@ span, and sometimes a suggested fix.
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
+| `W071` | The warning form of `E071`, for a set-operation mismatch in a place the warehouse may skip, such as a CTE body or a named `WINDOW` nothing uses. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

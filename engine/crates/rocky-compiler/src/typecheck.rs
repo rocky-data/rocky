@@ -911,6 +911,10 @@ fn compute_model_typecheck(
         diagnostics.extend(crate::clause_placement::check_clause_placement(
             model_name, &model.sql,
         ));
+        // E071: set-operation branches with different column counts.
+        diagnostics.extend(crate::set_operation::check_set_operation_widths(
+            model_name, &model.sql,
+        ));
         // E029: a bare column name two joined relations both provably have.
         diagnostics.extend(crate::ambiguous::check_ambiguous_columns(
             model_name,

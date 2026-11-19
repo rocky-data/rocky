@@ -44,6 +44,7 @@ pub mod resolve;
 pub mod salsa_compile;
 pub mod schema_cache;
 pub mod semantic;
+pub mod set_operation;
 pub mod snapshot;
 pub mod source_refs;
 pub mod typecheck;

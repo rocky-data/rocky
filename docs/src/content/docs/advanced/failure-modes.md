@@ -76,7 +76,7 @@ Every finding is a [diagnostic](/reference/glossary/#diagnostic-code): a stable 
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
 
-This table is not exhaustive. The compiler also emits `E010`–`E014`, `E029`–`E061`, `E062`, `E063`, `E064` and `E065`–`E067`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all.
+This table is not exhaustive. The compiler also emits `E010`–`E014`, `E029`–`E061`, `E062`, `E063`, `E064`, `E065`–`E067` and `E071`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all.
 
 Codes `E010`–`E014`, `E062` and `E063` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
 
