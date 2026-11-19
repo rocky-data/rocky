@@ -929,14 +929,24 @@ pub fn build_semantic_graph(
         }
         // A `[[surrogate_key]]` column: `rocky run` wraps the model's SELECT
         // as `SELECT *, <hash> AS <name> FROM (...)`, so the table holds it
-        // (#2705). Not for an ephemeral model, which readers inline unwrapped.
-        // A key name that repeats an output column, or keys Rocky cannot
-        // read, leave the schema not provably complete.
+        // (#2705). Not where the run adds no key: an ephemeral model (readers
+        // inline it unwrapped), and `time_interval` / `microbatch`, which
+        // build from the bare model SQL. Only on a schema that is complete
+        // without the key: on a partial list the key would be the one typed
+        // column, and a `merge` would update only the key. A key name that
+        // repeats an output column, or keys Rocky cannot read, leave the
+        // schema not provably complete.
         let mut unresolved_projections = lineage_result.unresolved_projections;
-        if !matches!(
+        let complete_without_key = (!lineage_result.has_star
+            || (star_complete && !star_unresolved))
+            && unresolved_projections == 0;
+        let run_adds_key = !matches!(
             model.config.strategy,
             rocky_core::models::StrategyConfig::Ephemeral
-        ) {
+                | rocky_core::models::StrategyConfig::TimeInterval { .. }
+                | rocky_core::models::StrategyConfig::Microbatch { .. }
+        );
+        if run_adds_key && complete_without_key {
             match rocky_core::models::surrogate_keys_for_model_file(&model.file_path) {
                 Ok(Some((_, specs))) => {
                     for spec in specs {
@@ -1188,6 +1198,31 @@ mod tests {
         model.config.strategy = StrategyConfig::Ephemeral;
         let schema = star_schema(vec![model], "up");
         assert!(!schema.columns.iter().any(|c| c.name == "sk"));
+        // `time_interval` and `microbatch` build from the bare SQL.
+        for strategy in [
+            StrategyConfig::TimeInterval {
+                time_column: "id".into(),
+                granularity: rocky_ir::TimeGrain::Day,
+                lookback: 0,
+                batch_size: std::num::NonZeroU32::new(1).unwrap(),
+                first_partition: None,
+            },
+            StrategyConfig::Microbatch {
+                timestamp_column: "id".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
+            },
+        ] {
+            let mut model = keyed_model(dir.path(), KEY);
+            model.config.strategy = strategy;
+            let schema = star_schema(vec![model], "up");
+            assert!(!schema.columns.iter().any(|c| c.name == "sk"));
+        }
+        // A star Rocky cannot expand: the key would be the only known
+        // column, and a `merge` would update only it.
+        let mut model = keyed_model(dir.path(), KEY);
+        model.sql = "SELECT * FROM source.raw.users".into();
+        let schema = star_schema(vec![model], "up");
+        assert!(schema.columns.is_empty());
         // A key named like an output column: the table holds both.
         let repeat = "[[surrogate_key]]\nname = \"NAME\"\ncolumns = [\"id\"]\n";
         let schema = star_schema(vec![keyed_model(dir.path(), repeat)], "up");
