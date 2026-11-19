@@ -22,7 +22,7 @@ use crate::diagnostic::{
     SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
 use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
-use crate::semantic::{ModelSchema, SemanticGraph};
+use crate::semantic::{ModelSchema, NamedRead, SemanticGraph};
 use crate::types::{
     DecimalOp, InferredType, RockyType, TypedColumn, arithmetic_result_type, common_supertype_of,
 };
@@ -63,6 +63,154 @@ pub struct TypeCheckResult {
     /// the model wasn't typechecked (e.g., source schemas injected
     /// directly via `source_schemas`).
     pub model_typecheck_ms: HashMap<String, u64>,
+    /// The source schemas whose name a project model also has (#2674). In
+    /// [`Self::typed_models`] the model's columns replace them, but a read of
+    /// that name that does not bind to the model reaches the source table.
+    /// See [`Relations`].
+    pub shadowed_sources: HashMap<String, Vec<TypedColumn>>,
+}
+
+/// The source schemas a project model's name shadows in the typed map
+/// (#2674).
+fn shadowed_sources(
+    graph: &SemanticGraph,
+    source_schemas: &HashMap<String, Vec<TypedColumn>>,
+) -> HashMap<String, Vec<TypedColumn>> {
+    source_schemas
+        .iter()
+        .filter(|(name, _)| graph.models.contains_key(name.as_str()))
+        .map(|(name, columns)| (name.clone(), columns.clone()))
+        .collect()
+}
+
+/// The columns a table read in a model's SQL reaches when it runs (#2674).
+///
+/// The typed map holds every source schema, each replaced by a project model
+/// of the same name once that model is typed. A read spelled with a model's
+/// name reaches that model only when it binds to it: a bare read reaches the
+/// table a model WRITES (#1354), and `depends_on` orders a run without
+/// rewriting a read. Any other read of that name reaches the table of that
+/// name, so it takes the source schema the model's columns replaced. Before
+/// this, the read took whichever the typed map held when the reader's DAG
+/// layer ran.
+///
+/// Every lookup of a table read goes through here, keyed by its READER, so a
+/// lineage edge is resolved with the bindings of the model whose SQL holds it.
+#[derive(Clone, Copy)]
+pub(crate) struct Relations<'a> {
+    graph: &'a SemanticGraph,
+    typed: &'a IndexMap<String, Vec<TypedColumn>>,
+    /// Column positions for `typed`, when the caller keeps them.
+    typed_index: Option<&'a HashMap<String, HashMap<String, usize>>>,
+    shadowed: &'a HashMap<String, Vec<TypedColumn>>,
+    /// The project's models by name, to resolve a qualified read of an
+    /// upstream model's target. `None`: a qualified read is looked up as
+    /// spelled.
+    model_by_name: Option<&'a HashMap<&'a str, &'a rocky_core::models::Model>>,
+}
+
+/// Where a read's columns are.
+enum Reach {
+    /// The typed map, under this key.
+    Typed(String),
+    /// The source schema the same-named model shadows.
+    Shadowed,
+    /// Nothing the type checker can name: the read is not one the bindings
+    /// list.
+    Unknown,
+}
+
+impl<'a> Relations<'a> {
+    pub(crate) fn new(
+        graph: &'a SemanticGraph,
+        typed: &'a IndexMap<String, Vec<TypedColumn>>,
+        typed_index: Option<&'a HashMap<String, HashMap<String, usize>>>,
+        shadowed: &'a HashMap<String, Vec<TypedColumn>>,
+        model_by_name: Option<&'a HashMap<&'a str, &'a rocky_core::models::Model>>,
+    ) -> Self {
+        Relations {
+            graph,
+            typed,
+            typed_index,
+            shadowed,
+            model_by_name,
+        }
+    }
+
+    fn reach(&self, reader: &str, read: &str) -> Reach {
+        let reader_schema = self.graph.model_schema(reader);
+        // A qualified read of an upstream model's own target table
+        // (`FROM analytics.main.customer_ltv`) types from that model.
+        if read.contains('.') {
+            let model = reader_schema
+                .zip(self.model_by_name)
+                .and_then(|(s, by_name)| qualified_upstream_model(read, &s.upstream, by_name));
+            return Reach::Typed(model.unwrap_or(read).to_string());
+        }
+        // A model's read of its own name (the table its last run built, as
+        // the schema cache has it) is typed as before #2674.
+        if read == reader || !self.graph.models.contains_key(read) {
+            return Reach::Typed(read.to_string());
+        }
+        match reader_schema.map_or(NamedRead::NotComputed, |s| s.named_read(read)) {
+            NamedRead::ThatModel | NamedRead::NotComputed => Reach::Typed(read.to_string()),
+            NamedRead::Source => Reach::Shadowed,
+            NamedRead::OtherModel | NamedRead::Local => Reach::Unknown,
+            NamedRead::Unlisted => {
+                debug_assert!(
+                    false,
+                    "#2674: the type checker reads `{read}` in `{reader}`, \
+                     which the read bindings do not list"
+                );
+                Reach::Unknown
+            }
+        }
+    }
+
+    /// The columns `reader`'s read spelled `read` reaches.
+    pub(crate) fn get(&self, reader: &str, read: &str) -> Option<&'a [TypedColumn]> {
+        match self.reach(reader, read) {
+            Reach::Typed(key) => self.typed.get(&key).map(Vec::as_slice),
+            Reach::Shadowed => self.shadowed.get(read).map(Vec::as_slice),
+            Reach::Unknown => None,
+        }
+    }
+
+    /// The column `column` of what `reader`'s read spelled `read` reaches.
+    fn column(&self, reader: &str, read: &str, column: &str) -> Option<&'a TypedColumn> {
+        match self.reach(reader, read) {
+            Reach::Typed(key) => {
+                let columns = self.typed.get(&key)?;
+                match self.typed_index {
+                    Some(index) => index
+                        .get(&key)
+                        .and_then(|i| i.get(column))
+                        .map(|&i| &columns[i]),
+                    None => columns.iter().find(|c| c.name == column),
+                }
+            }
+            Reach::Shadowed => self.shadowed.get(read)?.iter().find(|c| c.name == column),
+            Reach::Unknown => None,
+        }
+    }
+
+    /// The columns of upstream model `upstream`, for checks that walk a
+    /// reader's upstream models (join keys, `E001`): the model's own, as
+    /// before #2674. The walk is keyed by model, not by read, so it cannot
+    /// tell a bare read of the model's name from a read of its target table
+    /// (per-read upstream: #2695).
+    pub(crate) fn upstream(&self, _reader: &str, upstream: &str) -> Option<&'a [TypedColumn]> {
+        self.typed.get(upstream).map(Vec::as_slice)
+    }
+
+    /// Whether `reader`'s read spelled `read` reaches a project model's
+    /// output, rather than a table outside the project.
+    fn reaches_model(&self, reader: &str, read: &str) -> bool {
+        match self.reach(reader, read) {
+            Reach::Typed(key) => self.graph.model_schema(&key).is_some(),
+            Reach::Shadowed | Reach::Unknown => false,
+        }
+    }
 }
 
 /// Scope for resolving column types during expression inference.
@@ -227,6 +375,7 @@ pub fn typecheck_project_for_targets(
     for (source_name, cols) in source_schemas {
         typed_models.insert(source_name.clone(), cols.clone());
     }
+    let shadowed = shadowed_sources(graph, source_schemas);
 
     // Compute execution layers from the graph itself so we don't need a Project
     // here (keeps `typecheck_project` callable in test/AI contexts that don't
@@ -265,8 +414,13 @@ pub fn typecheck_project_for_targets(
                     model_name,
                     model_schema,
                     graph,
-                    typed_snapshot,
-                    col_index_snapshot,
+                    Relations::new(
+                        graph,
+                        typed_snapshot,
+                        Some(col_index_snapshot),
+                        &shadowed,
+                        Some(&model_by_name),
+                    ),
                     &model_by_name,
                     &model_names,
                     join_keys_acc,
@@ -300,6 +454,7 @@ pub fn typecheck_project_for_targets(
         diagnostics,
         reference_map,
         model_typecheck_ms,
+        shadowed_sources: shadowed,
     }
 }
 
@@ -402,6 +557,7 @@ pub fn typecheck_project_incremental(
     for (source_name, cols) in source_schemas {
         typed_models.insert(source_name.clone(), cols.clone());
     }
+    let shadowed = shadowed_sources(graph, source_schemas);
 
     // Seed typed_models with non-affected entries from the previous result.
     // Source schemas overlap is fine — we inserted them first, and re-inserting
@@ -445,8 +601,13 @@ pub fn typecheck_project_incremental(
                     model_name,
                     model_schema,
                     graph,
-                    typed_snapshot,
-                    col_index_snapshot,
+                    Relations::new(
+                        graph,
+                        typed_snapshot,
+                        Some(col_index_snapshot),
+                        &shadowed,
+                        Some(&model_by_name),
+                    ),
                     &model_by_name,
                     &model_names,
                     join_keys_acc,
@@ -486,6 +647,7 @@ pub fn typecheck_project_incremental(
         diagnostics,
         reference_map,
         model_typecheck_ms,
+        shadowed_sources: shadowed,
     }
 }
 
@@ -509,8 +671,7 @@ fn compute_model_typecheck(
     model_name: &str,
     model_schema: &ModelSchema,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
+    relations: Relations<'_>,
     model_by_name: &HashMap<&str, &rocky_core::models::Model>,
     model_names: &HashSet<String>,
     join_keys_acc: Option<&Arc<AtomicU64>>,
@@ -536,13 +697,6 @@ fn compute_model_typecheck(
         ReferenceMap::default()
     };
 
-    // A qualified read of an upstream model's own target table
-    // (`FROM analytics.main.customer_ltv`) types from that model.
-    let relation_key = |name: &str| -> String {
-        qualified_upstream_model(name, &model_schema.upstream, model_by_name)
-            .map_or_else(|| name.to_string(), str::to_string)
-    };
-
     // Step 1: Lineage-based type propagation
     let mut typed_cols: Vec<TypedColumn> = Vec::with_capacity(model_schema.columns.len());
 
@@ -550,13 +704,8 @@ fn compute_model_typecheck(
         let producing_edge = graph.producing_edge(model_name, &col_def.name);
 
         let (data_type, nullable) = if let Some(edge) = producing_edge {
-            let source_model = relation_key(&edge.source.model);
-            let upstream_col = typed_models.get(&source_model).and_then(|cols| {
-                col_index
-                    .get(&source_model)
-                    .and_then(|idx| idx.get(&*edge.source.column))
-                    .map(|&i| &cols[i])
-            });
+            let upstream_col =
+                relations.column(model_name, &edge.source.model, &edge.source.column);
             // Whether the source column was found at all. A missing schema
             // and a column of a type Rocky does not model are both `Unknown`;
             // `AVG` tells them apart (#2588). The index lookup is exact, but
@@ -565,10 +714,12 @@ fn compute_model_typecheck(
             // match counts as found, so the two passes agree.
             let resolution = || {
                 let found = upstream_col.is_some()
-                    || typed_models.get(&source_model).is_some_and(|cols| {
-                        cols.iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(&edge.source.column))
-                    });
+                    || relations
+                        .get(model_name, &edge.source.model)
+                        .is_some_and(|cols| {
+                            cols.iter()
+                                .any(|c| c.name.eq_ignore_ascii_case(&edge.source.column))
+                        });
                 if found {
                     ArgResolution::Resolved
                 } else {
@@ -668,7 +819,7 @@ fn compute_model_typecheck(
         .map(|model| {
             infer_select_types_with_lookup(
                 &model.sql,
-                &|name| typed_models.get(&relation_key(name)).map(Vec::as_slice),
+                &|name| relations.get(model_name, name),
                 target,
             )
             .ok()
@@ -808,7 +959,7 @@ fn compute_model_typecheck(
                 rocky_sql::lineage::TransformKind::Expression => {
                     if exact_type
                         && inferred_col.data_type != RockyType::Unknown
-                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
+                        && edge_input_is_known(edge, relations)
                     {
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
@@ -835,7 +986,7 @@ fn compute_model_typecheck(
                     } else if col.data_type == RockyType::Unknown
                         && exact_type
                         && inferred_col.data_type != RockyType::Unknown
-                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
+                        && edge_input_is_known(edge, relations)
                     {
                         // A function over one column that Step 1 cannot type
                         // from its name alone (`COALESCE(id, 0)`): take
@@ -860,9 +1011,7 @@ fn compute_model_typecheck(
     let enhanced_diags = enhanced_inference(
         model_name,
         graph,
-        typed_models,
-        col_index,
-        &relation_key,
+        relations,
         inferred_cols
             .as_ref()
             .map(|inferred| inferred.columns.as_slice()),
@@ -888,14 +1037,15 @@ fn compute_model_typecheck(
     if let Some(model) = model_by_name.get(model_name) {
         let relation_columns = |name: &str| -> Option<Vec<String>> {
             let columns = if name.contains('.') {
-                typed_models.get(&relation_key(name)).or_else(|| {
-                    typed_models
+                relations.get(model_name, name).or_else(|| {
+                    relations
+                        .typed
                         .iter()
                         .find(|(key, _)| key.contains('.') && key.eq_ignore_ascii_case(name))
-                        .map(|(_, columns)| columns)
+                        .map(|(_, columns)| columns.as_slice())
                 })
             } else if model_schema.upstream.iter().any(|up| up == name) {
-                typed_models.get(name)
+                relations.upstream(model_name, name)
             } else {
                 None
             }?;
@@ -930,10 +1080,11 @@ fn compute_model_typecheck(
 
     // Step 3: SELECT * warning
     let schema_incomplete = model_schema.has_star
-        && model_schema
-            .upstream
-            .iter()
-            .any(|up| typed_models.get(up).is_none_or(std::vec::Vec::is_empty));
+        && model_schema.upstream.iter().any(|up| {
+            relations
+                .upstream(model_name, up)
+                .is_none_or(<[_]>::is_empty)
+        });
 
     if model_schema.has_star {
         if schema_incomplete {
@@ -953,7 +1104,7 @@ fn compute_model_typecheck(
 
     // Step 4: Join key compatibility (timed if accumulator provided).
     let jk_start = join_keys_acc.map(|_| Instant::now());
-    let join_diags = check_join_keys(model_name, typed_models, graph);
+    let join_diags = check_join_keys(model_name, relations, graph);
     if let (Some(start), Some(acc)) = (jk_start, join_keys_acc) {
         acc.fetch_add(start.elapsed().as_micros() as u64 / 1000, Ordering::Relaxed);
     }
@@ -989,14 +1140,7 @@ fn compute_model_typecheck(
         // unknown input. That guess must not refuse the model.
         if let rocky_core::models::StrategyConfig::TimeInterval { time_column, .. } =
             &model.config.strategy
-            && !nullability_is_proven(
-                graph,
-                typed_models,
-                col_index,
-                &relation_key,
-                model_name,
-                time_column,
-            )
+            && !nullability_is_proven(graph, relations, model_name, time_column)
         {
             time_interval_diagnostics.retain(|d| &*d.code != E022);
         }
@@ -3057,22 +3201,11 @@ fn reconcile_lineage_type(
     }
 }
 
-/// Whether the source column a lineage edge reads has a known type.
-fn edge_input_is_known(
-    edge: &crate::semantic::LineageEdge,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
-    relation_key: &dyn Fn(&str) -> String,
-) -> bool {
-    let source = relation_key(&edge.source.model);
-    typed_models
-        .get(&source)
-        .and_then(|columns| {
-            col_index
-                .get(&source)
-                .and_then(|index| index.get(&*edge.source.column))
-                .map(|&index| &columns[index])
-        })
+/// Whether the source column a lineage edge reads has a known type. The read
+/// is resolved with the bindings of the model whose SQL holds it.
+fn edge_input_is_known(edge: &crate::semantic::LineageEdge, relations: Relations<'_>) -> bool {
+    relations
+        .column(&edge.target.model, &edge.source.model, &edge.source.column)
         .is_some_and(|input| input.data_type != RockyType::Unknown)
 }
 
@@ -3088,9 +3221,7 @@ fn edge_input_is_known(
 /// because the column "is nullable" must ask this first.
 fn nullability_is_proven(
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
-    relation_key: &dyn Fn(&str) -> String,
+    relations: Relations<'_>,
     model: &str,
     column: &str,
 ) -> bool {
@@ -3102,9 +3233,11 @@ fn nullability_is_proven(
     // edge of its own (`SELECT CAST('2024-01-01' AS DATE) AS d`) has typed
     // output and a guessed nullable bit, in an upstream model just as in this
     // one. An external source column has no model in the graph; its type is
-    // checked by `edge_input_is_known`.
+    // checked by `edge_input_is_known`. Whether an edge reaches a model is
+    // the read's binding, not its name (#2674): a read of model `orders`'s
+    // name that reaches the source table `orders` reaches a source column.
     let reaches_edgeless_column = edges.iter().any(|edge| {
-        graph.model_schema(&edge.source.model).is_some()
+        relations.reaches_model(&edge.target.model, &edge.source.model)
             && graph
                 .producing_edge(&edge.source.model, &edge.source.column)
                 .is_none()
@@ -3112,7 +3245,7 @@ fn nullability_is_proven(
     !reaches_edgeless_column
         && edges
             .into_iter()
-            .all(|edge| edge_input_is_known(edge, typed_models, col_index, relation_key))
+            .all(|edge| edge_input_is_known(edge, relations))
 }
 
 /// Refine explicit casts by parsing their target types from the model SQL.
@@ -3147,9 +3280,7 @@ fn nullability_is_proven(
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
-    relation_key: &dyn Fn(&str) -> String,
+    relations: Relations<'_>,
     inferred_cols: Option<&[TypedColumn]>,
     typed_cols: &mut [TypedColumn],
 ) -> Vec<Diagnostic> {
@@ -3167,7 +3298,7 @@ fn enhanced_inference(
             continue;
         }
 
-        if !edge_input_is_known(edge, typed_models, col_index, relation_key) {
+        if !edge_input_is_known(edge, relations) {
             continue;
         }
 
@@ -4933,7 +5064,7 @@ pub(crate) fn infer_query_types(
 ) -> Result<SelectInference, String> {
     // Each CTE keeps which of its columns are exact, so an outer expression
     // over one is exact only when the CTE's expression is (#2320).
-    let mut ctes: HashMap<String, (Vec<TypedColumn>, HashSet<usize>)> = HashMap::new();
+    let mut ctes: WithNames<(Vec<TypedColumn>, HashSet<usize>)> = WithNames::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let inferred = {
@@ -4951,10 +5082,7 @@ pub(crate) fn infer_query_types(
             };
             let mut columns = inferred.columns;
             rename_relation_columns(&mut columns, &cte.alias);
-            ctes.insert(
-                cte.alias.name.value.clone(),
-                (columns, inferred.relation_inexact),
-            );
+            ctes.insert(&cte.alias.name, (columns, inferred.relation_inexact));
         }
     }
     let lookup = |name: &str| cte_relation(&ctes, name).or_else(|| (env.lookup)(name));
@@ -4968,13 +5096,56 @@ pub(crate) fn infer_query_types(
 }
 
 fn cte_relation<'c>(
-    ctes: &'c HashMap<String, (Vec<TypedColumn>, HashSet<usize>)>,
+    ctes: &'c WithNames<(Vec<TypedColumn>, HashSet<usize>)>,
     name: &str,
 ) -> Option<RelationRef<'c>> {
     ctes.get(name).map(|(columns, inexact)| RelationRef {
         columns,
         inexact: Some(inexact),
     })
+}
+
+/// The `WITH` names in scope of one query, and what each holds (#2674).
+///
+/// A read matches a `WITH` name spelled exactly as written. It also matches
+/// one that differs only in case when both are unquoted: every warehouse
+/// folds two unquoted names the same way (DuckDB and PostgreSQL to lower
+/// case, Snowflake to upper case), so `WITH Orders AS (...) ... FROM orders`
+/// reads the CTE everywhere. A quoted name keeps its case on some warehouses
+/// and not on others, so it matches only exactly, as before (#2696).
+pub(crate) struct WithNames<V> {
+    entries: Vec<(String, bool, V)>,
+}
+
+impl<V> WithNames<V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Bring the `WITH` name `alias` into scope; a later one of the same
+    /// name hides an earlier one.
+    pub(crate) fn insert(&mut self, alias: &ast::Ident, value: V) {
+        self.entries
+            .push((alias.value.clone(), alias.quote_style.is_some(), value));
+    }
+
+    /// What the read spelled `name` (as SQL text) reaches among these
+    /// `WITH` names, if any.
+    pub(crate) fn get(&self, name: &str) -> Option<&V> {
+        if let Some((_, _, value)) = self.entries.iter().rev().find(|(n, ..)| n == name) {
+            return Some(value);
+        }
+        if name.starts_with(['"', '`', '[']) || name.contains('.') {
+            return None;
+        }
+        self.entries
+            .iter()
+            .rev()
+            .find(|(n, quoted, _)| !quoted && n.eq_ignore_ascii_case(name))
+            .map(|(_, _, value)| value)
+    }
 }
 
 /// Infer the output columns of one query body: a `SELECT`, a parenthesised
@@ -5839,7 +6010,7 @@ fn expr_name(expr: &Expr) -> String {
 /// Returns owned diagnostics so this is safe to call from a parallel worker.
 fn check_join_keys(
     model_name: &str,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    relations: Relations<'_>,
     graph: &SemanticGraph,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -5856,7 +6027,7 @@ fn check_join_keys(
     let mut columns_by_name: HashMap<String, Vec<(&str, &RockyType)>> = HashMap::new();
 
     for upstream_name in &model_schema.upstream {
-        if let Some(upstream_cols) = typed_models.get(upstream_name.as_str()) {
+        if let Some(upstream_cols) = relations.upstream(model_name, upstream_name) {
             for col in upstream_cols {
                 columns_by_name
                     .entry(col.name.clone())

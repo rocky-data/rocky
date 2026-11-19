@@ -1232,6 +1232,72 @@ struct ContractScope<'a> {
     strict: bool,
 }
 
+/// The reads of `model_name` spelled with a model's name that `resolve.rs`
+/// binds to another model, as `(read, writer)`, sorted (#2674). Such a read
+/// is typed Unknown: the binding ignores the schema, so the run reaches the
+/// writer's table or the source table, and the compiler cannot tell which.
+fn ambiguous_model_reads(graph: &SemanticGraph, model_name: &str) -> Vec<(String, String)> {
+    let Some(reads) = graph
+        .model_schema(model_name)
+        .and_then(|schema| schema.reads.as_ref())
+    else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, String)> = reads
+        .iter()
+        .filter_map(|(key, target)| {
+            let crate::semantic::ReadTarget::Model(writer) = target else {
+                return None;
+            };
+            graph
+                .models
+                .keys()
+                .find(|name| {
+                    crate::semantic::binding_decides(name)
+                        && *name != writer
+                        && rocky_core::physical_edges::fold_identifier(name) == *key
+                })
+                .map(|name| (name.clone(), writer.clone()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Say why a contract error rests on an unknown type, when the model has a
+/// read [`ambiguous_model_reads`] lists (#2674). Wording only: an `E010`, or
+/// an `E012` on a column typed Unknown, keeps its code and severity.
+fn note_ambiguous_read(
+    mut diagnostic: Diagnostic,
+    schema: &[TypedColumn],
+    ambiguous: &[(String, String)],
+) -> Diagnostic {
+    if ambiguous.is_empty() {
+        return diagnostic;
+    }
+    let applies = match &*diagnostic.code {
+        "E010" => true,
+        "E012" => schema.iter().any(|c| {
+            c.data_type == RockyType::Unknown
+                && diagnostic.message.contains(&format!("column '{}'", c.name))
+        }),
+        _ => false,
+    };
+    if applies {
+        let notes: Vec<String> = ambiguous
+            .iter()
+            .map(|(read, writer)| {
+                format!(
+                    "type unknown: `{read}` may read model `{writer}`'s table or the source \
+                     table `{read}`; see D012"
+                )
+            })
+            .collect();
+        diagnostic.message = format!("{} ({})", diagnostic.message, notes.join("; ")).into();
+    }
+    diagnostic
+}
+
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
@@ -1265,7 +1331,12 @@ fn validate_all_contracts(
             } else {
                 contracts::validate_contract(model_name, schema, contract)
             };
-            all_diags.extend(diags);
+            let ambiguous = ambiguous_model_reads(graph, model_name);
+            all_diags.extend(
+                diags
+                    .into_iter()
+                    .map(|d| note_ambiguous_read(d, schema, &ambiguous)),
+            );
             // A model the graph does not know has no provable column list.
             let schema_complete = graph
                 .model_schema(model_name)
@@ -3555,6 +3626,7 @@ mod tests {
                 diagnostics: Vec::new(),
                 reference_map: Default::default(),
                 model_typecheck_ms: HashMap::new(),
+                shadowed_sources: HashMap::new(),
             };
             let result = typecheck::typecheck_project_incremental(
                 &graph,
