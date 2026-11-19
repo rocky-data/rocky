@@ -20,6 +20,7 @@ mod compare;
 mod compile;
 mod completions;
 mod compliance;
+pub(crate) mod connector_init;
 mod connector_load;
 mod containment;
 pub(crate) mod cost;
@@ -158,6 +159,9 @@ pub use compile::{
 };
 pub use completions::run_completions;
 pub use compliance::{compute_compliance, run_compliance};
+pub use connector_init::{
+    ConnectorLang, HELPER_FILE_NAME, HELPER_PY, run_connector_init, scaffold_connector,
+};
 pub use connector_load::{
     ConnectorLoadOutcome, ConnectorLoadParams, claim_key, claim_ttl_hours, execute_connector_load,
     run_connector_load,
