@@ -2001,3 +2001,57 @@ fn a_scoped_compile_judges_consumers_against_the_whole_project() {
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(messages[0].contains("`nowhere`"), "{}", messages[0]);
 }
+
+/// DuckDB's top-n `max(x, n)` / `min(x, n)` returns a list, not a value of
+/// `x`'s type, so the model's column is `Unknown`: a contract type on it is
+/// reported not checked rather than checked against the wrong type. A plain
+/// `max(x)` keeps `x`'s type.
+#[test]
+fn a_top_n_min_max_model_column_is_unknown() {
+    use rocky_compiler::types::TypedColumn;
+    use rocky_ir::RockyType;
+
+    let dir = temp_model_project(
+        "SELECT max(qty, 2) AS m, min(qty, 3) AS n, max(qty) AS k FROM raw.orders",
+    );
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        source_schemas: std::collections::HashMap::from([(
+            "raw.orders".to_string(),
+            vec![TypedColumn {
+                name: "qty".to_string(),
+                data_type: RockyType::Int32,
+                nullable: true,
+            }],
+        )]),
+        ..Default::default()
+    };
+    let result = rocky_compiler::compile::compile(&config).expect("compile");
+    let typed = &result.type_check.typed_models["m"];
+    let type_of = |name: &str| {
+        typed
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.data_type.clone())
+            .unwrap_or_else(|| panic!("no column {name}: {typed:?}"))
+    };
+    assert_eq!(type_of("m"), RockyType::Unknown);
+    assert_eq!(type_of("n"), RockyType::Unknown);
+    assert_eq!(type_of("k"), RockyType::Int32);
+
+    // A contract type on the list column is reported not checked (I003),
+    // not checked against `qty`'s type.
+    std::fs::write(
+        dir.path().join("models").join("m.contract.toml"),
+        "[[columns]]\nname = \"m\"\ntype = \"Int32\"\n",
+    )
+    .unwrap();
+    let result = rocky_compiler::compile::compile(&config).expect("compile");
+    let i003: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "I003")
+        .collect();
+    assert_eq!(i003.len(), 1, "{:?}", result.diagnostics);
+    assert!(!result.has_errors, "{:?}", result.diagnostics);
+}
