@@ -400,10 +400,35 @@ pub(crate) fn is_plain_star(item: &sqlparser::ast::SelectItem) -> bool {
     }
 }
 
-/// Whether `sql` is one `SELECT` whose every star is a plain `*` (#2701). A
-/// qualified star (`t.*`), a set operation or SQL that does not parse is not.
+/// Whether `sql` has the one shape whose star Rocky can expand exactly
+/// (#2701): one `SELECT` with exactly one plain `*` and no qualified star,
+/// no lateral view and no pipe operator, reading only named tables (no
+/// arguments, no alias column list, no sample or time travel) joined by
+/// inner, outer or cross joins. Anything else (a nested join, a derived
+/// table, `PIVOT`, a table function, a semi or anti join, a second star) can
+/// add, drop or rename columns the expansion would not see.
 fn has_only_plain_stars(sql: &str) -> bool {
-    use sqlparser::ast::{SelectItem, SetExpr, Statement};
+    use sqlparser::ast::{JoinOperator, SelectItem, SetExpr, Statement, TableFactor};
+    fn plain_table(factor: &TableFactor) -> bool {
+        matches!(
+            factor,
+            TableFactor::Table {
+                alias,
+                args: None,
+                with_hints,
+                version: None,
+                with_ordinality: false,
+                partitions,
+                json_path: None,
+                sample: None,
+                index_hints,
+                ..
+            } if alias.as_ref().is_none_or(|a| a.columns.is_empty())
+                && with_hints.is_empty()
+                && partitions.is_empty()
+                && index_hints.is_empty()
+        )
+    }
     let Ok(statements) =
         sqlparser::parser::Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql)
     else {
@@ -415,11 +440,42 @@ fn has_only_plain_stars(sql: &str) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.projection.iter().all(|item| match item {
-        SelectItem::Wildcard(_) => is_plain_star(item),
-        SelectItem::QualifiedWildcard(..) => false,
-        _ => true,
-    })
+    let stars = select
+        .projection
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        })
+        .count();
+    let star_is_plain = select.projection.iter().any(is_plain_star);
+    query.pipe_operators.is_empty()
+        && stars == 1
+        && star_is_plain
+        && select.lateral_views.is_empty()
+        && select.exclude.is_none()
+        && select.value_table_mode.is_none()
+        && select.flavor == sqlparser::ast::SelectFlavor::Standard
+        && !select.from.is_empty()
+        && select.from.iter().all(|twj| {
+            plain_table(&twj.relation)
+                && twj.joins.iter().all(|join| {
+                    plain_table(&join.relation)
+                        && matches!(
+                            join.join_operator,
+                            JoinOperator::Join(_)
+                                | JoinOperator::Inner(_)
+                                | JoinOperator::Left(_)
+                                | JoinOperator::LeftOuter(_)
+                                | JoinOperator::Right(_)
+                                | JoinOperator::RightOuter(_)
+                                | JoinOperator::FullOuter(_)
+                                | JoinOperator::CrossJoin(_)
+                        )
+                })
+        })
 }
 
 pub fn build_semantic_graph(
@@ -714,7 +770,17 @@ pub fn build_semantic_graph(
                     let is_snapshot = model_by_name
                         .get(table_name.as_str())
                         .is_some_and(|m| m.config.strategy.snapshot_lowered().is_some());
-                    if !upstream_schema.schema_is_complete() || is_snapshot {
+                    // The upstream's names must be fixed by its own SQL too: a
+                    // complete schema can still hide columns a set operation
+                    // or an expanding function adds (`UNION BY NAME`,
+                    // `unnest`), and the star would pass them on.
+                    let names_fixed = model_by_name.get(table_name.as_str()).is_some_and(|m| {
+                        crate::typecheck::has_provably_fixed_output_names(
+                            &m.sql,
+                            upstream_schema.star_columns_complete,
+                        )
+                    });
+                    if !upstream_schema.schema_is_complete() || is_snapshot || !names_fixed {
                         star_complete = false;
                     }
                     for col in &upstream_schema.columns {
@@ -1096,6 +1162,49 @@ mod tests {
             ("WITH c AS (SELECT id FROM up) SELECT * FROM c", vec![up()]),
             ("SELECT * FROM (SELECT id FROM up) AS d", vec![up()]),
             ("SELECT * FROM up UNION ALL SELECT * FROM up", vec![up()]),
+            // FROM shapes lineage does not list as star sources (red team).
+            (
+                "SELECT * FROM (up JOIN other ON up.id = other.id)",
+                vec![up(), other()],
+            ),
+            ("SELECT * FROM up, (SELECT 1 AS extra)", vec![up()]),
+            ("SELECT * FROM up AS u(x, y)", vec![up()]),
+            (
+                "SELECT * FROM up PIVOT (count(*) FOR name IN ('a', 'b'))",
+                vec![up()],
+            ),
+            (
+                "SELECT * FROM up LATERAL VIEW explode(array(1)) x AS tag",
+                vec![up()],
+            ),
+            ("SELECT *, * FROM up", vec![up()]),
+            (
+                "SELECT * FROM up LEFT SEMI JOIN other ON up.id = other.id",
+                vec![up(), other()],
+            ),
+            (
+                "SELECT * FROM up LEFT ANTI JOIN other ON up.id = other.id",
+                vec![up(), other()],
+            ),
+            // An upstream whose complete schema hides columns its own SQL adds.
+            (
+                "SELECT * FROM a",
+                vec![
+                    up(),
+                    other(),
+                    make_model(
+                        "a",
+                        "SELECT id FROM up UNION BY NAME SELECT total FROM other",
+                    ),
+                ],
+            ),
+            (
+                "SELECT * FROM a",
+                vec![
+                    up(),
+                    make_model("a", "SELECT id, unnest(name) AS s FROM up"),
+                ],
+            ),
         ];
         for (sql, mut models) in cases {
             models.push(make_model("reader", sql));

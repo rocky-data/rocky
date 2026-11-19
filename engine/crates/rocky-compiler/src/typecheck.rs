@@ -1166,7 +1166,7 @@ pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
 /// neither does a set operation, a star, or a string-quoted alias. A plain
 /// `*` counts only with `plain_star_is_known`: the semantic graph proved what
 /// it expands to ([`ModelSchema::star_columns_complete`], #2701).
-fn has_provably_fixed_output_names(sql: &str, plain_star_is_known: bool) -> bool {
+pub(crate) fn has_provably_fixed_output_names(sql: &str, plain_star_is_known: bool) -> bool {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return false;
     };
