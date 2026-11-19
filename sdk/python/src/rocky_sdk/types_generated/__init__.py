@@ -259,6 +259,9 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ListSourceEntry": ("list_sources_schema", "ListSourceEntry"),
     "ListSourcesOutput": ("list_sources_schema", "ListSourcesOutput"),
     "ConnectorLoadInfo": ("load_schema", "ConnectorLoadInfo"),
+    "ConnectorTestOutput": ("connector_test_schema", "ConnectorTestOutput"),
+    "ConnectorTestRunOutput": ("connector_test_schema", "ConnectorTestRunOutput"),
+    "ConnectorTestStateCheck": ("connector_test_schema", "ConnectorTestStateCheck"),
     "ConnectorLoadStatus": ("load_schema", "ConnectorLoadStatus"),
     "ConnectorSupportTier": ("load_schema", "ConnectorSupportTier"),
     "LoadFileOutput": ("load_schema", "LoadFileOutput"),
@@ -914,6 +917,11 @@ if TYPE_CHECKING:
     from .state_schedule_hold_schema import (
         ScheduleHoldOutput,
     )
+    from .connector_test_schema import (
+        ConnectorTestOutput,
+        ConnectorTestRunOutput,
+        ConnectorTestStateCheck,
+    )
     from .load_schema import (
         ConnectorLoadInfo,
         ConnectorLoadStatus,
@@ -1297,6 +1305,9 @@ __all__ = [
     "LoadOutput",
     "LoadFileOutput",
     "ConnectorLoadInfo",
+    "ConnectorTestOutput",
+    "ConnectorTestRunOutput",
+    "ConnectorTestStateCheck",
     "ConnectorLoadStatus",
     "ConnectorSupportTier",
     # `rocky list pipelines / adapters / models / sources` (#1760).
