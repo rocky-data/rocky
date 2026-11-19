@@ -37,6 +37,16 @@ The steps, in order:
 5. Rocky loads every file into one staging table, handles schema drift, and appends the rows to the target table with one `INSERT` that names every column.
 6. Rocky drops the staging table and saves the connector's new state.
 
+## Start from a scaffold
+
+`rocky connector init <name>` writes a Python connector that loads as written:
+
+```bash
+rocky connector init orders
+```
+
+It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
+
 ## Configure a connector
 
 Add a `[connector.<name>]` block to `rocky.toml`.
