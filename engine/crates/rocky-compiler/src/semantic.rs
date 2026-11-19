@@ -927,6 +927,34 @@ pub fn build_semantic_graph(
                 }
             }
         }
+        // A `[[surrogate_key]]` column: `rocky run` wraps the model's SELECT
+        // as `SELECT *, <hash> AS <name> FROM (...)`, so the table holds it
+        // (#2705). Not for an ephemeral model, which readers inline unwrapped.
+        // A key name that repeats an output column, or keys Rocky cannot
+        // read, leave the schema not provably complete.
+        let mut unresolved_projections = lineage_result.unresolved_projections;
+        if !matches!(
+            model.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            match rocky_core::models::surrogate_keys_for_model_file(&model.file_path) {
+                Ok(Some((_, specs))) => {
+                    for spec in specs {
+                        let repeats = output_columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&spec.name));
+                        if repeats {
+                            unresolved_projections += 1;
+                        } else {
+                            output_names.insert(spec.name.clone());
+                            output_columns.push(ColumnDef { name: spec.name });
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => unresolved_projections += 1,
+            }
+        }
         let lineage_gaps = lineage_result.lineage_gaps.clone().map(|mut gaps| {
             if star_unresolved && !gaps.contains(&LineageGap::UnresolvedStar) {
                 gaps.push(LineageGap::UnresolvedStar);
@@ -940,7 +968,7 @@ pub fn build_semantic_graph(
             ModelSchema {
                 columns: output_columns,
                 has_star: lineage_result.has_star,
-                unresolved_projections: lineage_result.unresolved_projections,
+                unresolved_projections,
                 star_columns_complete: star_complete && !star_unresolved,
                 lineage_gaps,
                 upstream: upstream_map
@@ -1112,6 +1140,62 @@ mod tests {
         let project = Project::from_models(models).unwrap();
         let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
         graph.models.get(name).expect("model present").clone()
+    }
+
+    /// `up` with its SQL and sidecar written to `dir`, so the builder reads
+    /// its `[[surrogate_key]]` blocks from disk as `rocky run` does.
+    fn keyed_model(dir: &std::path::Path, sidecar: &str) -> Model {
+        let sql = "SELECT id, name FROM source.raw.users";
+        let path = dir.join("up.sql");
+        std::fs::write(&path, sql).unwrap();
+        std::fs::write(dir.join("up.toml"), sidecar).unwrap();
+        let mut model = make_model("up", sql);
+        model.file_path = path;
+        model
+    }
+
+    const KEY: &str = "[[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\", \"name\"]\n";
+
+    /// A `[[surrogate_key]]` column is in the model's schema, as in its table
+    /// (#2705), and a plain star passes it on.
+    #[test]
+    fn a_surrogate_key_column_is_in_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = star_schema(vec![keyed_model(dir.path(), KEY)], "up");
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "sk"]);
+        assert!(schema.schema_is_complete());
+
+        let schema = star_schema(
+            vec![
+                keyed_model(dir.path(), KEY),
+                make_model("mid", "SELECT * FROM up"),
+            ],
+            "mid",
+        );
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "sk"]);
+        assert!(schema.schema_is_complete());
+    }
+
+    /// No key column where the run adds none, and no completeness claim where
+    /// the keys cannot be read or repeat a column.
+    #[test]
+    fn a_surrogate_key_the_run_may_not_add_is_not_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ephemeral: inlined into readers without the key wrap.
+        let mut model = keyed_model(dir.path(), KEY);
+        model.config.strategy = StrategyConfig::Ephemeral;
+        let schema = star_schema(vec![model], "up");
+        assert!(!schema.columns.iter().any(|c| c.name == "sk"));
+        // A key named like an output column: the table holds both.
+        let repeat = "[[surrogate_key]]\nname = \"NAME\"\ncolumns = [\"id\"]\n";
+        let schema = star_schema(vec![keyed_model(dir.path(), repeat)], "up");
+        assert!(!schema.schema_is_complete());
+        // A spec that does not validate.
+        let bad = "[[surrogate_key]]\nname = \"sk\"\ncolumns = []\n";
+        let schema = star_schema(vec![keyed_model(dir.path(), bad)], "up");
+        assert!(!schema.schema_is_complete());
     }
 
     /// A plain star over a complete in-project model expands to a known
