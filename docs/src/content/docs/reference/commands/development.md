@@ -610,6 +610,94 @@ The command then prints the next steps: add the crate to the workspace, choose `
 
 ---
 
+## `rocky connector init`
+
+Scaffold a child connector: a program that `rocky load --connector <name>` runs. It refuses when the directory already exists. See [Child connectors](/guides/child-connectors/) for the protocol.
+
+```bash
+rocky connector init <name> [--dir <path>] [--lang python]
+```
+
+| Argument / flag | Type | Default | Description |
+|----------|------|---------|-------------|
+| `name` | `string` | **(required)** | Connector name: letters, digits and underscores. It is also the `[connector.<name>]` key. |
+| `--dir` | `path` | `connectors/<name>` | Directory to create. It must not exist. |
+| `--lang` | `python` | `python` | Language of the scaffold. Python is the only one. |
+
+```bash
+rocky connector init orders
+```
+
+```
+Created connector `orders` in connectors/orders
+```
+
+The directory holds five files:
+
+- `connector.toml`: the manifest. `license` is left out, as a commented line: set it to the license of your code. Until you do, `rocky validate` warns V068 and `rocky load` reports `unknown`.
+- `main.py`: the program. Its `fetch()` returns a fixed list of 5 rows and keeps the largest `id` as its cursor, so a second load reads 0 rows. Replace `fetch()` with code that reads your source.
+- `rocky_connector.py`: the helper. It reads the request, the options and the saved state, writes Parquet through the `duckdb` CLI, and writes the result file. It uses the Python standard library only. Do not edit it: a newer Rocky may ship a newer copy, with a higher `HELPER_VERSION`.
+- `connector-test.toml`: three runs for [`rocky connector test`](#rocky-connector-test): 3 rows, then 2, then 0.
+- `.gitignore`: ignores the `__pycache__/` directory Python writes on each load.
+
+`run.write(rows, columns=...)` takes a list of dicts and, in `columns`, one DuckDB type per column. With `columns`, a row may leave out a column, which is written as NULL. A row with a key that is not in `columns` stops the run, so no value is dropped, and so does a column that no row has. Without `columns`, every row must have the same keys and DuckDB infers each type from the rows; a column that is NULL in every row stops the run. Every later `write()` in the run reuses the first call's columns and types, so the files share one schema. An inferred type can still change from one run to the next, and Rocky then refuses the load when the change is not a safe widening, so pass `columns` for a connector you run more than once. `bytes` and NaN values are refused. The rows are staged as JSON in the output directory while DuckDB converts them, and that file counts toward the connector's `output_bytes` limit.
+
+The command then prints the `[connector.<name>]` block to add to `rocky.toml`. Its `manifest` path is relative to the directory that holds `rocky.toml`, so run the command there or edit the path. The connector needs `python3` (3.8 or newer) and the `duckdb` CLI on `PATH`.
+
+The scaffold runs on Linux and macOS. Its manifest starts `./main.py` through the file's `#!` line, which Windows does not use. On Windows, set `command` in `connector.toml` to a program that starts `main.py`.
+
+### Related Commands
+
+- [`rocky load --connector`](/guides/child-connectors/) -- run the connector and load its files
+- [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- check the manifest (V067, V068)
+- [`rocky connector test`](#rocky-connector-test) -- run the connector against recorded input
+
+---
+
+## `rocky connector test`
+
+Run a child connector more than once against recorded input, and check what it returns. Nothing is loaded and no state is saved.
+
+```bash
+rocky connector test <name> [--spec <path>]
+```
+
+| Argument / flag | Type | Default | Description |
+|----------|------|---------|-------------|
+| `name` | `string` | **(required)** | The `[connector.<name>]` key in `rocky.toml`. |
+| `--spec` | `path` | `connector-test.toml` beside the manifest | The test spec. |
+
+The spec lists one `[[run]]` per run. Unknown keys are refused. Each key in a run's `options` replaces the key of the same name in `[connector.<name>.options]`. A table replaces the whole table: it is not merged key by key.
+
+```toml
+[[run]]
+options = { replay_fixture = "replay/events-1.sql" }  # set over [connector.<name>.options]
+rows    = 19                                           # rows the run must write
+state   = "advanced"                                   # optional: "advanced" or "unchanged"
+```
+
+Each run starts the program through the same runner and checks as `rocky load --connector`, in a temporary directory. The command checks four things:
+
+- the result file and every Parquet file pass the load checks;
+- the run writes exactly `rows` rows;
+- the state the run returns is `unchanged` or `advanced` from the state it was given, when `state` is set (a cursor can move on a run with no rows, so there is no default). The first run is given no state, which counts as `null`: returning `null` there is `unchanged`, not `advanced`;
+- every Parquet file of every run has the same column names and types. Types are read from the Parquet schema, so `BIGINT` and `TIMESTAMP` differ. The `ARROW:schema` hint pyarrow writes is ignored, so `string` and `large_string` match. Nullability is not compared for a top-level column. It is compared inside a list or a struct.
+
+Each run gets the state the run before it returned. The first failed run stops the test. The command exits non-zero when any check fails.
+
+The program gets no secrets. A connector reads its recorded input through an option, such as `replay_fixture` for the [reference Postgres connector](/guides/child-connectors/#reference-connector). Rocky does not block the network, and it cannot tell a replay from a live run. A connector that ignores its replay option and can reach its source without credentials, such as a public API, runs against live data and can still pass. Make the replay option fail the run when its input is missing, as `replay_fixture` does.
+
+The command warns when the connector directory holds a `rocky_connector.py` older than the one this Rocky ships.
+
+`--output json` prints a `ConnectorTestOutput`: `passed`, one entry per run with `expected_rows`, `rows`, `files`, `state_check`, `passed` and `error`, and `warnings`.
+
+### Related Commands
+
+- [`rocky connector init`](#rocky-connector-init) -- scaffold a connector with a spec
+- [`rocky load --connector`](/guides/child-connectors/) -- run the connector for real
+
+---
+
 ## `rocky hooks`
 
 List the lifecycle hooks configured in `rocky.toml`, or fire a test event at them.

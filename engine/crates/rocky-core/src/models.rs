@@ -2481,53 +2481,84 @@ pub fn load_surrogate_keys_from_dir_filtered(
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        // Same sidecar, same two extensions as the unit-test and column-doc
-        // loaders: a `.rocky` model's `[[surrogate_key]]` block was dropped
-        // here, so the key column was never added to the built table (#2015).
-        let ext = path.extension().and_then(|e| e.to_str());
-        if (ext != Some("sql") && ext != Some("rocky")) || !include(&path) {
+        if !include(&path) {
             continue;
         }
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let toml_path = path.with_extension("toml");
-        let toml_src = if crate::path_presence::entry_is_present(&toml_path) {
-            std::fs::read_to_string(&toml_path)?
-        } else if ext == Some("rocky") {
-            // DSL files have no `---toml` frontmatter convention; without a
-            // sidecar there is nowhere a `[[surrogate_key]]` block could live.
-            continue;
-        } else {
-            let content = std::fs::read_to_string(&path)?;
-            match split_frontmatter(&content) {
-                Some((frontmatter, _)) => frontmatter.to_string(),
-                None => continue,
-            }
-        };
-
-        let substituted =
-            substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
-                path: path.display().to_string().into(),
-                source: Box::new(source),
-            })?;
-        let sidecar: SurrogateKeySidecar =
-            toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
-                path: path.display().to_string().into(),
-                error: e,
-            })?;
-        if sidecar.surrogate_key.is_empty() {
-            continue;
+        if let Some((model_name, specs)) = surrogate_keys_for_model_file(&path)? {
+            out.insert(model_name, specs);
         }
-        let model_name = sidecar.name.unwrap_or(stem);
-        for spec in &sidecar.surrogate_key {
-            validate_surrogate_key_spec(spec, &model_name)?;
-        }
-        out.insert(model_name, sidecar.surrogate_key);
     }
     Ok(out)
+}
+
+/// The `[[surrogate_key]]` specs one model file declares, with the model name
+/// they belong to (the sidecar `name`, or the file stem). `None` when the file
+/// is not a `.sql` / `.rocky` model or declares no key.
+///
+/// The one reader of a model's keys: the directory loaders above, which feed
+/// `rocky run`, and the compiler, which adds each key column to the model's
+/// schema (#2705), both call it.
+///
+/// # Errors
+///
+/// The sidecar or frontmatter cannot be read, its `${VAR}` substitution or
+/// TOML fails, or a spec does not pass validation.
+pub fn surrogate_keys_for_model_file(
+    path: &Path,
+) -> Result<Option<(String, Vec<SurrogateKeySpec>)>, ModelError> {
+    // Same sidecar, same two extensions as the unit-test and column-doc
+    // loaders: a `.rocky` model's `[[surrogate_key]]` block was dropped
+    // here, so the key column was never added to the built table (#2015).
+    let ext = path.extension().and_then(|e| e.to_str());
+    if ext != Some("sql") && ext != Some("rocky") {
+        return Ok(None);
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let toml_path = path.with_extension("toml");
+    let toml_src = if crate::path_presence::entry_is_present(&toml_path) {
+        std::fs::read_to_string(&toml_path)?
+    } else if ext == Some("rocky") {
+        // DSL files have no `---toml` frontmatter convention; without a
+        // sidecar there is nowhere a `[[surrogate_key]]` block could live.
+        return Ok(None);
+    } else if !crate::path_presence::entry_is_present(path) {
+        // A model built in memory (no file, no sidecar) declares no key.
+        return Ok(None);
+    } else {
+        let content = std::fs::read_to_string(path)?;
+        match split_frontmatter(&content) {
+            Some((frontmatter, _)) => frontmatter.to_string(),
+            None => return Ok(None),
+        }
+    };
+    // No block can parse from text that never names it. Skips the env
+    // substitution and TOML parse for nearly every model.
+    if !toml_src.contains("surrogate_key") {
+        return Ok(None);
+    }
+
+    let substituted =
+        substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
+            path: path.display().to_string().into(),
+            source: Box::new(source),
+        })?;
+    let sidecar: SurrogateKeySidecar =
+        toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
+            path: path.display().to_string().into(),
+            error: e,
+        })?;
+    if sidecar.surrogate_key.is_empty() {
+        return Ok(None);
+    }
+    let model_name = sidecar.name.unwrap_or(stem);
+    for spec in &sidecar.surrogate_key {
+        validate_surrogate_key_spec(spec, &model_name)?;
+    }
+    Ok(Some((model_name, sidecar.surrogate_key)))
 }
 
 /// Resolve surrogate-key specs into dialect-correct [`rocky_ir::MetadataColumn`]s

@@ -20,7 +20,7 @@ Read whichever signal you already have. Then follow the branch to a section.
  ─────────────────────────────────    ────────────────    ─────────────────
 
  Rocky never called the warehouse
-   ├─ code E010–E014                  2. Contracts        the contract file
+   ├─ E010–E014, E062, E063           2. Contracts        the contract file
    └─ any other error code            1. Compile-time     rocky compile
 
  The run printed JSON: which block is populated?
@@ -48,7 +48,7 @@ Entries on `contained[*]` are not failures of their own. They name models Rocky 
 | Category | Detection signal | Surface |
 |---|---|---|
 | [Compile-time](#1-compile-time-failures) | `severity: Error` diagnostic with code `E001`, `E020`–`E028` | `rocky compile`, `rocky ci`, LSP red squiggles |
-| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E014` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
+| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E014`, `E062`, `E063` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
 | [Schema drift](#3-schema-drift) | `drift.actions_taken[].action` on `rocky run` / `rocky apply` output | `rocky run`, `rocky apply` drift block |
 | [Quality check failures](#4-quality-check-failures) | `check_results[].checks[].passed == false` | `rocky run` / `rocky apply --output json` |
 | [Adapter / runtime failures](#5-adapter--runtime-failures) | Non-zero `rocky apply` exit + entry on `errors[*]` with typed `failure_kind` | `rocky apply`, `rocky doctor` |
@@ -76,9 +76,9 @@ Every finding is a [diagnostic](/reference/glossary/#diagnostic-code): a stable 
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
 
-This table is not exhaustive. The compiler also emits `E010`–`E014` and `E029`–`E061`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all.
+This table is not exhaustive. The compiler also emits `E010`–`E014`, `E029`–`E061`, `E062`, `E063`, `E064`, `E065`–`E067` and `E071`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all.
 
-Codes `E010`–`E014` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
+Codes `E010`–`E014`, `E062` and `E063` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
 
 **Recovery playbook.**
 
@@ -99,7 +99,7 @@ Rocky contains that failure at the table boundary instead of passing over the mo
 
 **Definition.** A model's output schema does not match its data contract (`<model>.contract.toml`). The contract declares required columns, protected columns, and the expected types and nullability. Rocky checks it at compile time, before any warehouse work.
 
-**Detection signal.** Diagnostic codes `E010`–`E014`:
+**Detection signal.** Diagnostic codes `E010`–`E014`, `E062` and `E063`:
 
 | Code | Severity | Meaning |
 |---|---|---|
@@ -108,6 +108,8 @@ Rocky contains that failure at the table boundary instead of passing over the mo
 | `E012` | Error | Nullability violation (contract says non-nullable, model says nullable) |
 | `E013` | Error | Protected column has been removed |
 | `E014` | Error | A nullable column the contract does not declare, under `[rules] no_new_nullable` |
+| `E062` | Error | The model output repeats a name the contract constrains |
+| `E063` | Error | An output column the contract does not declare, or a column list Rocky cannot prove, under `[rules] no_extra_columns` |
 
 **Recovery playbook.**
 
@@ -369,6 +371,7 @@ Permissions and masking apply *after* a successful materialisation. So a governa
 - [Troubleshooting](/advanced/troubleshooting/): symptom-first lookup ("I got error X")
 - [`rocky doctor`](/reference/commands/development/#rocky-doctor): aggregate health check across config, state, adapters, pipelines
 - [`rocky plan --resume-latest`](/reference/commands/core-pipeline/#rocky-plan): resume a failed run from its checkpoint (canonical, auditable form; the single-step `rocky run --resume-latest` alias does the same in one invocation)
+- [`rocky run --retry-failed`](/reference/commands/core-pipeline/#retrying-a-failed-run): rerun the failed and never-built models of a failed transformation run. `--resume` is for replication runs only.
 - [Schema drift](/concepts/schema-drift/): graduated drift handling deep dive
 - [Data quality checks](/concepts/data-quality-checks/): inline check authoring + result shape
 - [Governance guide](/guides/governance/): permissions, classification, masking, retention

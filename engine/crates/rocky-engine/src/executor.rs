@@ -581,6 +581,10 @@ fn set_search_path(
 }
 
 /// The catalogs holding a table or view `schema.table`, folded.
+///
+/// These inspection queries run on the connection a seed ran on, so a seed
+/// can define a macro that shadows a built-in. They call `lower` as
+/// `system.main.lower` so the built-in always answers.
 fn catalogs_holding(
     db: &DuckDbConnector,
     schema: &str,
@@ -588,11 +592,11 @@ fn catalogs_holding(
 ) -> Result<HashSet<String>, String> {
     let r = db
         .execute_sql(&format!(
-            "SELECT lower(database_name) FROM duckdb_tables() \
-             WHERE lower(schema_name) = {s} AND lower(table_name) = {t} \
+            "SELECT system.main.lower(database_name) FROM duckdb_tables() \
+             WHERE system.main.lower(schema_name) = {s} AND system.main.lower(table_name) = {t} \
              UNION ALL \
-             SELECT lower(database_name) FROM duckdb_views() \
-             WHERE lower(schema_name) = {s} AND lower(view_name) = {t}",
+             SELECT system.main.lower(database_name) FROM duckdb_views() \
+             WHERE system.main.lower(schema_name) = {s} AND system.main.lower(view_name) = {t}",
             s = literal(schema),
             t = literal(table)
         ))
@@ -612,11 +616,11 @@ fn first_on_path(
 ) -> Result<Option<Location>, String> {
     let r = db
         .execute_sql(&format!(
-            "SELECT lower(database_name), lower(schema_name) FROM duckdb_tables() \
-             WHERE lower(table_name) = {n} \
+            "SELECT system.main.lower(database_name), system.main.lower(schema_name) FROM duckdb_tables() \
+             WHERE system.main.lower(table_name) = {n} \
              UNION ALL \
-             SELECT lower(database_name), lower(schema_name) FROM duckdb_views() \
-             WHERE lower(view_name) = {n}",
+             SELECT system.main.lower(database_name), system.main.lower(schema_name) FROM duckdb_views() \
+             WHERE system.main.lower(view_name) = {n}",
             n = literal(&fold_identifier(name))
         ))
         .map_err(|e| format!("could not inspect local tables: {e}"))?;
@@ -1014,6 +1018,28 @@ mod tests {
             why.contains("'s.t' would reach cat.s.t") && why.contains("memory.s.t"),
             "{why}"
         );
+    }
+
+    /// A seed that redefines a built-in (`lower`) as a macro must not break the
+    /// catalog inspection queries: the redirect is still found and refused,
+    /// not reported as "could not inspect local tables".
+    #[test]
+    fn a_seed_macro_shadowing_a_builtin_does_not_break_inspection() {
+        let (result, _db, _) = run(
+            &[
+                m("p", "SELECT 1 AS v", ("cat", "s", "t")),
+                m(
+                    "reader",
+                    "SELECT t.v + seed.v AS v FROM t CROSS JOIN s.t AS seed",
+                    ("cat", "out", "reader"),
+                ),
+            ],
+            "CREATE SCHEMA memory.s; CREATE TABLE memory.s.t AS SELECT 7 AS v; \
+             CREATE MACRO lower(a, b) AS a || b",
+        );
+        let why = failure(&result, "reader").expect("the redirected read is refused");
+        assert!(!why.contains("could not inspect"), "{why}");
+        assert!(why.contains("'s.t' would reach cat.s.t"), "{why}");
     }
 
     /// A failed upstream withholds the readers of an ephemeral model that

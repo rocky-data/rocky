@@ -395,6 +395,7 @@ mod tests {
                 diagnostics: vec![],
                 reference_map: rocky_compiler::typecheck::ReferenceMap::default(),
                 model_typecheck_ms: std::collections::HashMap::new(),
+                shadowed_sources: std::collections::HashMap::new(),
             },
             ..empty_result()
         };
@@ -423,6 +424,7 @@ mod tests {
                 diagnostics: vec![],
                 reference_map: rocky_compiler::typecheck::ReferenceMap::default(),
                 model_typecheck_ms: std::collections::HashMap::new(),
+                shadowed_sources: std::collections::HashMap::new(),
             },
             contract_diagnostics: vec![],
             diagnostics: vec![],
