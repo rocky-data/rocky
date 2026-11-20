@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Rocky now builds on `sqlparser` 0.64 (was 0.63). The new `USING (col) AS alias` join form is treated like `USING (col)` everywhere the compiler and lineage read join keys, and `x IN (...)` and `x IN (SELECT ...)` are read through sqlparser's new single `IN` expression. Output does not change for SQL that parsed before.
+- The CI Test job now times out after 30 minutes, so a hung run fails instead of holding the runner.
 - The nextest default profile now has a slow-timeout (60s period, killed after 10 periods), so a stuck test fails after 10 minutes instead of hanging the job. No test is skipped or quarantined.
 
 ### Added

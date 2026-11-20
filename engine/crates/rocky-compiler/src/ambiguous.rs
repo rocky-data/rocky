@@ -207,7 +207,7 @@ fn join_shape(from: &[TableWithJoins]) -> JoinShape {
                 }
             };
             match constraint {
-                Some(JoinConstraint::Using(names)) => {
+                Some(JoinConstraint::Using(names) | JoinConstraint::UsingAlias(names, _)) => {
                     for name in names {
                         if let Some(ident) = name.0.last().and_then(ast::ObjectNamePart::as_ident) {
                             shape.using.insert(lower(ident));
