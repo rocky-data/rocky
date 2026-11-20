@@ -265,6 +265,32 @@ pub const E063: &str = "E063";
 /// [`crate::unknown_relations`]; a two-part read (`main.stg_ordrs`) is never
 /// checked.
 pub const E064: &str = "E064";
+/// A `WHERE` clause contains an aggregate (`WHERE SUM(amount) > 1`). Every
+/// warehouse refuses it: `WHERE` filters rows before they are grouped
+/// (#2660). Emitted by `rocky compile` from [`crate::clause_placement`],
+/// which lists what counts as an aggregate and which scopes it checks.
+pub const E065: &str = "E065";
+/// A `WHERE` clause contains a window function, a call with `OVER`
+/// (`WHERE ROW_NUMBER() OVER (ORDER BY id) = 1`). Every warehouse refuses
+/// it: window functions run after `WHERE` (#2660). Emitted by
+/// `rocky compile` from [`crate::clause_placement`].
+pub const E066: &str = "E066";
+/// A `GROUP BY` position names no output column: `GROUP BY 3` over a
+/// two-column select list, or `GROUP BY 0` (#2660). Checked only where the
+/// select list has a known length. Emitted by `rocky compile` from
+/// [`crate::clause_placement`].
+pub const E067: &str = "E067";
+/// The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different
+/// numbers of columns (#2661). SQL requires the same number in every branch,
+/// so it is checked whatever the warehouse. Emitted by
+/// `rocky compile` from [`crate::set_operation`] when both counts are known
+/// from the SQL, in a place on the bound list in [`crate::set_operation`],
+/// where tests show DuckDB binds the query; `BY NAME` is not checked.
+pub const E071: &str = "E071";
+/// The warning form of [`E071`], for a mismatch in a place the warehouse may
+/// skip: a CTE body, a named `WINDOW` or any place not on the bound list in
+/// [`crate::set_operation`]. It never fails a compile on its own.
+pub const W071: &str = "W071";
 /// An aggregate's argument type has no overload on the target dialect, and the
 /// dialect does not cast it implicitly — e.g. `SUM(VARCHAR)` on DuckDB,
 /// BigQuery or Trino. The statement can never run. Emitted by `rocky compile`
@@ -720,7 +746,7 @@ pub const W058: &str = "W058";
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W071, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

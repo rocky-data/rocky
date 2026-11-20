@@ -148,7 +148,13 @@ A cast keeps its operand's nullability only when the operand is a column and the
 A cast that can fail is nullable even over a `NOT NULL` input, because some warehouses return `NULL` for a value that does not convert (Spark and Databricks with ANSI mode off). These casts can fail: text or an unknown type to a number, boolean, date or timestamp; a number to a narrower number (`BIGINT` to `INT`, anything to `SMALLINT` or `TINYINT`, a number to a `DECIMAL` that may not hold it); a `DOUBLE` to `FLOAT`. These casts cannot fail and keep the operand's nullability: the same type, `INT` to `BIGINT`, a number to `DOUBLE` or `FLOAT`, anything to text, `DATE` to `TIMESTAMP`, and an integer literal that fits the target (`CAST(0 AS DECIMAL(18,2))`). `TRY_CAST` and `SAFE_CAST` are always nullable.
 A `nullable = false` contract over `CAST(text_col AS INT)` therefore fails `E012`. Use `COALESCE` or a source that is already numeric.
 A cast of a computed value takes that value's nullability: `CAST(MAX(x) AS BIGINT)` and `CAST(NULLIF(x, 0) AS INT)` are nullable even when `x` is not.
-An aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo and any function Rocky does not model are nullable.
+These are nullable: an aggregate other than `COUNT`, `NULLIF`, a `CASE` with no `ELSE`, a division, a modulo, and any function Rocky does not model.
+Two exceptions are non-null over `NOT NULL` inputs:
+
+- `+`, `-` and `*` over columns of a known integer, float or sized `DECIMAL` type, and over integer literals: `qty * amount` is non-null. Its type can still be `Unknown`. A `NULL`, a cast, a function call, a division, or a literal that is not an integer or is above the `BIGINT` range, anywhere in the expression keeps it nullable. So does a column whose type Rocky only guesses, such as a CTE column built from a decimal literal, and a result over 38 digits, which Databricks with ANSI mode off writes as `NULL`.
+- `SUM(x)` in a query with a plain `GROUP BY` key list, because every group has a row. It stays nullable with no `GROUP BY`, with `GROUP BY ALL`, `ROLLUP`, `CUBE`, `GROUPING SETS` (also written in parentheses, as `(ROLLUP(n))`), `GROUP BY ()`, a tuple key, or keys that read no column (`GROUP BY 'a'`), with `FILTER`, and with `OVER`. Each of these can sum no rows. The type of `x` must be read from the SQL: `SUM(x * 1.5)` stays nullable. A `DECIMAL` sum is non-null only when every warehouse the model runs on is known and none is Databricks. Spark and Databricks with ANSI mode off write `NULL` when a decimal sum overflows.
+
+These rules assume SQL Server runs with `ARITHABORT` and `ANSI_WARNINGS` on, the defaults. With both off, SQL Server returns `NULL` on an overflow instead of an error.
 `COUNT(...)`, including `COUNT(*)`, is a non-null `Int64`.
 A `UNION`, `INTERSECT` or `EXCEPT` is typed from all its branches, paired by position. The column name comes from the first branch. A column is non-null only if it is non-null in every branch, and its type is the common supertype of the branches (`Unknown` if there is none). If Rocky cannot type the query (for example branches with different column counts, or a `VALUES` branch), every column is nullable and computed columns are `Unknown`.
 A cast of a column Rocky can type is the cast's target type: `CAST(o.quantity * p.price AS DECIMAL(12, 2))` is `Decimal(12, 2)`. A cast of a column Rocky cannot type takes its target type only for `BOOLEAN`, `DOUBLE` (`DOUBLE PRECISION`, `FLOAT64`), `DATE`, text types (`VARCHAR`, `CHAR`, `TEXT`, `STRING`), binary types (`BINARY`, `VARBINARY`, `BLOB`), and `DECIMAL` or `NUMERIC` with digits (`DECIMAL(p)` or `DECIMAL(p, s)`, `1 <= p <= 38`, `0 <= s <= p`); the column stays nullable. A bare `DECIMAL` or `NUMERIC` is a decimal whose digits Rocky does not claim, because they differ by warehouse: a bare `Decimal` contract over it passes, and a `Decimal(p, s)` one is not checked. `DECIMAL` digits out of that range stay `Unknown`.
@@ -256,6 +262,46 @@ These calls are never reported:
 - A form the SQL parser or the warehouse rewrites, such as `COALESCE`, `IF` or
   `IFNULL`.
 
+#### Set operations with different column counts (`E071`, `W071`)
+
+`E071` reports a `UNION`, `INTERSECT` or `EXCEPT` whose branches return
+different numbers of columns, on every warehouse:
+
+```sql
+-- E071: the branches of this UNION return different numbers of columns: 2 on the left, 1 on the right
+SELECT order_id, status FROM orders UNION ALL SELECT order_id FROM returns
+```
+
+A branch is counted only when its select list states its width. A `*`, a
+`t.*`, or a call that returns several columns (`COLUMNS(...)`, `UNNEST`,
+`EXPLODE`) is not counted. `UNION BY NAME` is not checked.
+
+It is the error `E071` only in places where tests show DuckDB checks the
+query, even a subquery that never runs:
+
+- the model's query, the query in parentheses, and each branch of a set
+  operation;
+- a derived table in `FROM` or a join, `LATERAL` and parenthesised joins
+  included;
+- a subquery in the select list, `WHERE`, `HAVING` or a join's `ON` (an
+  inner, left, right or full join), reached only through comparisons,
+  `AND`, `OR`, `NOT`, `CASE`, `BETWEEN`, `IS [NOT] DISTINCT FROM`, casts,
+  `IN`, `EXISTS` or parentheses.
+
+These places nest: a subquery in the `WHERE` of a derived table counts.
+Anywhere else, the same finding is the warning `W071`. That covers a CTE
+body, a named `WINDOW`, `ORDER BY`, `GROUP BY`, `QUALIFY`, `LIMIT`, any
+function call's arguments, a lambda, a wildcard's `REPLACE`, and an operand
+of any other operator, such as `+`, `||` or `LIKE`. A warehouse can skip a CTE nothing reads or a
+window nothing uses. A DuckDB macro drops an argument its body does not use,
+and DuckDB turns many operators into function calls a macro can replace. So
+the model may still run.
+
+Rocky does not check whether the column types match across branches.
+DuckDB accepts every type mix when it checks the query, though a mix can
+still fail on real rows (`Conversion Error`). The other warehouses are not
+checked yet.
+
 ### 5. Validate contracts
 
 Rocky loads the `.contract.toml` files and checks resolvable facts against
@@ -334,6 +380,16 @@ Rocky reports the name only when absence is a fact:
 The binding rules are the ones for external sources below. A CTE, derived
 table, unknown relation, `SELECT` alias, struct field read, quoted name or
 warehouse metadata column keeps the name `Unknown`.
+
+A star modifier counts as a read. A name in a star's `EXCEPT`, `EXCLUDE` or
+`REPLACE` that the star's relation does not output is `E039`. The same name on
+an external source is `E041` or `W041`. Rocky checks it only when it knows every
+column of every relation the star covers. It does not check a star over a
+top-level `USING` or `NATURAL` join, or a star with `ILIKE` or `RENAME`. It does
+not check a quoted name, a `_`-prefixed name or a qualified `EXCLUDE` name. It
+does not check a qualified star such as `t.*` when `t` may also be a column or a
+`SELECT` alias in the star's own `FROM` scope: `t.*` may then expand a struct.
+A CTE, derived table or unknown relation in that scope counts as such a column.
 
 ### Missing columns in external sources (`E041` / `W041`)
 
@@ -459,6 +515,28 @@ These shapes stay silent:
 
 Each subquery and CTE is checked as its own query.
 
+### Aggregates and windows in WHERE, and GROUP BY positions
+
+Every warehouse refuses these shapes before it reads any data:
+
+```sql
+-- E065: WHERE filters rows before they are grouped
+SELECT customer_id FROM main.orders WHERE SUM(amount) > 1 GROUP BY customer_id
+-- E066: window functions run after WHERE
+SELECT order_id FROM main.orders WHERE ROW_NUMBER() OVER (ORDER BY order_id) = 1
+-- E067: the select list has 2 columns
+SELECT customer_id, COUNT(*) AS n FROM main.orders GROUP BY 3
+```
+
+Move an aggregate condition to `HAVING`, and a window condition to `QUALIFY`.
+
+These checks fire only when Rocky is certain:
+
+- `E065` counts `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` as aggregates, and any call with `FILTER` or `WITHIN GROUP`. Other aggregate names may belong to a user function.
+- An aggregate or window inside a subquery belongs to that subquery, so `WHERE amount > (SELECT AVG(amount) FROM orders)` is valid.
+- The `WHERE` of a scalar, `IN` or `EXISTS` subquery or a `LATERAL` table is not checked. There an aggregate over outer columns belongs to the outer query.
+- `E067` checks plain integer positions only, outside `ROLLUP`, `CUBE` and `GROUPING SETS`. A select list with `*`, `t.*` or `COLUMNS(...)` has no known length, so it is not checked.
+
 ### Ambiguous column names (`E029`)
 
 Rocky reports `E029` when a bare column name could come from two relations in
@@ -551,6 +629,14 @@ c.id → b.id → a.id → source.raw.users.id
 **Star expansion.** When a model uses `SELECT *`, the compiler expands it against
 the upstream model's inferred schema, or against a known source schema. That is
 why downstream models still see the full column list through a star select.
+A star can carry `EXCEPT (...)`, `EXCLUDE (...)` or `REPLACE (expr AS col)`.
+`EXCEPT` and `EXCLUDE` remove the named columns from the output. `REPLACE`
+keeps the column's name and position. The column takes its type and
+nullability from the new expression. A modifier on a qualified star, as in
+`t.* EXCEPT (n), u.*`, applies to that relation only. When an unqualified star
+sits beside another star and either has a modifier, the star's columns are
+unknown. A star with `ILIKE`, `RENAME`, an alias or a qualified `EXCLUDE` name
+leaves the columns of the whole query unknown.
 
 **Intent propagation.** Rocky stores each model's `intent` field, from its TOML
 config, in the semantic graph. The AI features (`ai-sync`, `ai-explain`) read it
@@ -610,6 +696,10 @@ span, and sometimes a suggested fix.
 | `E062` | A model with a contract repeats an output name the contract constrains (`[[columns]]`, `required` or `protected`). The contract checks one column of that name; the warehouse writes the other under another name. Alias the repeat. Names match as for `E061` |
 | `E063` | `[rules] no_extra_columns = true` and the model outputs a column the contract does not name in `[[columns]]`, `required` or `protected`, or Rocky cannot prove the column list (a `SELECT *`, an unaliased expression). Declare the column, drop it, or list the columns explicitly |
 | `E064` | A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no known source table, and is one or two edits from a model name (one edit for names under 5 characters). The message names the model. If it is a real warehouse table, qualify it with its schema (`main.stg_ordrs`) |
+| `E065` | A `WHERE` clause contains an aggregate (`WHERE SUM(amount) > 1`). Move the condition to `HAVING` |
+| `E066` | A `WHERE` clause contains a window function, a call with `OVER`. Filter on it with `QUALIFY`, or in a subquery |
+| `E067` | A `GROUP BY` position names no output column (`GROUP BY 3` over two columns, or `GROUP BY 0`) |
+| `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, in a place tests show DuckDB checks. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |
@@ -637,6 +727,7 @@ span, and sometimes a suggested fix.
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
+| `W071` | The warning form of `E071`, for a set-operation mismatch in a place the warehouse may skip, such as a CTE body or a named `WINDOW` nothing uses. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
 | `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |

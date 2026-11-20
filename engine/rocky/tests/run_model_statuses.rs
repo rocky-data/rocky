@@ -35,8 +35,10 @@ auto_create_schemas = true
 
 const CONTAIN: &str = "\n[resilience]\ncontain_failures = true\n";
 
-const BROKEN_STATUS_COUNTS: &str =
-    "select status, count(*) as n from main.raw_orders where sum(order_id) > 0 group by status";
+// The broken models must fail when DuckDB runs them, not at compile time:
+// `rocky compile` refuses an aggregate in `WHERE` (E065), so the failure is a
+// cast of `'shipped'` to an integer, which DuckDB only raises on a row.
+const BROKEN_STATUS_COUNTS: &str = "select status, count(*) as n from main.raw_orders where cast(status as integer) > 0 group by status";
 const FIXED_STATUS_COUNTS: &str =
     "select status, count(*) as n from main.raw_orders group by status";
 
@@ -375,7 +377,7 @@ fn contained_dependent_of_the_failing_model_is_skipped_upstream_failed() {
     write_model(
         dir.path(),
         "stg_orders",
-        "select order_id, customer_id, status from main.raw_orders where sum(order_id) > 0",
+        "select order_id, customer_id, status from main.raw_orders where cast(status as integer) > 0",
     );
     let out = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!out.status.success(), "{}", describe(&out));
@@ -406,7 +408,7 @@ fn production_retry_ignores_a_newer_failed_shadow_run() {
     write_model(
         dir.path(),
         "stg_orders",
-        "select order_id, customer_id, status from main.raw_orders where sum(order_id) > 0",
+        "select order_id, customer_id, status from main.raw_orders where cast(status as integer) > 0",
     );
     let shadow = rocky(dir.path(), &["--output", "json", "run", "--shadow"]);
     assert!(!shadow.status.success(), "{}", describe(&shadow));

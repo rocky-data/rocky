@@ -700,8 +700,9 @@ def main(
     Exit codes: in ``replay`` mode the run is deterministic, so it gates: it
     fails (1) when a model errored or when any item's outcome differs from the
     set's expected file next to the answer key. ``live`` and ``rehash`` never
-    gate on the score (a fail is data, as in the agent suite); they fail only
-    when the harness itself could not run.
+    gate on the score (a fail is data, as in the agent suite); they fail (1)
+    when the harness could not run or when a model errored, because an errored
+    model's recordings may be stale or incomplete.
     """
     from harness.environ import resolve_rocky_bin
 
@@ -741,13 +742,22 @@ def _run_set(rocky_bin: Path, mode: str, output_dir: Path, fixture_name: str, se
 
     errored = [m["model"] for m in card["models"] if m["error"]]
     if mode != "replay":
-        if mode == "live":
+        if mode == "live" and not errored:
             print(
                 f"Live run recorded in {spec.recordings}/. Commit the recordings with this "
                 f"scorecard; then run a replay and refresh {spec.expected} with "
                 "--contract-quality-update-expected."
             )
-        return 1 if errored and mode == "rehash" else 0
+        if errored:
+            # A model that errored may have kept a stale recording, or saved
+            # one even though `rocky ai-contract` exited non-zero, so the run
+            # must not look clean: name the models and exit non-zero.
+            print(
+                f"contract-quality ({set_name}): {mode} run failed for {', '.join(errored)}; "
+                "their recordings may be stale or incomplete. Re-run before committing."
+            )
+            return 1
+        return 0
 
     expected_path = _FIXTURES_DIR / fixture_name / spec.expected
     expected = json.loads(expected_path.read_text()) if expected_path.is_file() else {}

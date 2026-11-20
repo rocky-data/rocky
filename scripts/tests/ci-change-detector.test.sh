@@ -28,6 +28,8 @@ ROOT="${DETECTOR_TEST_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 
 pass=0
 fail=0
+# Other `NAME=value` settings a block reads, beside the regex under test.
+EXTRA_ENV=()
 
 # --- extraction -------------------------------------------------------------
 
@@ -218,7 +220,7 @@ run_case() {
     out="$( cd "$CASE_REPO/$RUNDIR" \
         && PATH="$CASE_BIN:$PATH" \
            GITHUB_OUTPUT="$CASE_SCRATCH/github_output" \
-           env "$REGEX_VAR=$REGEX" bash "$BLOCK" 2>&1 )"
+           env "$REGEX_VAR=$REGEX" ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} bash "$BLOCK" 2>&1 )"
     status=$?
     got="$(awk -v key="$OUT_KEY=" 'index($0, key) == 1 { v = substr($0, length(key) + 1) } END { print v }' \
         "$CASE_SCRATCH/github_output")"
@@ -302,8 +304,12 @@ run_suite() {
     echo
 }
 
+# engine-ci's block also matches CONNECTOR_PATHS_RE, and under `set -u` an
+# unset one would end the block early.
+EXTRA_ENV=("CONNECTOR_PATHS_RE=$(extract_regex "$ROOT/.github/workflows/engine-ci.yml" CONNECTOR_PATHS_RE)")
 run_suite engine-ci.yml      ENGINE_PATHS_RE  engine  engine \
     .claude/skills/rocky-ai-workflow/SKILL.md
+EXTRA_ENV=()
 # The four generator pins are listed explicitly: they are the paths #1587 was
 # filed about, and a regex that watches the generated OUTPUT but not the tool
 # that writes it reads as covered while a dependabot bump skips the check.
@@ -371,6 +377,73 @@ parity_case() {
     comm -13 <(printf '%s\n' "$FROM_PATHS") <(printf '%s\n' "$FROM_REGEX") | sed 's/^/          /'
     fail=$((fail + 1))
 }
+
+# --- engine-ci's second answer: the connector-test job ----------------------
+
+# The same `id: diff` block writes `connectors=` from CONNECTOR_PATHS_RE, read
+# only by the connector-test job. The listing is shared, so the rename, pipe
+# and quoting cases above cover it; these pin which paths the second regex
+# watches, that a connector POC alone does not run the engine jobs, and that
+# the second match fails closed too.
+connector_suite() {
+    WORKFLOW="$ROOT/.github/workflows/engine-ci.yml"
+    RUNDIR=engine
+    echo "engine-ci.yml (CONNECTOR_PATHS_RE, the connector-test job):"
+    REGEX_VAR=CONNECTOR_PATHS_RE
+    REGEX="$(extract_regex "$WORKFLOW" CONNECTOR_PATHS_RE)"
+    if [ -z "$REGEX" ]; then
+        echo "  FAIL  engine-ci.yml no longer defines CONNECTOR_PATHS_RE"
+        fail=$((fail + 1))
+        return
+    fi
+    EXTRA_ENV=("ENGINE_PATHS_RE=$(extract_regex "$WORKFLOW" ENGINE_PATHS_RE)")
+    BLOCK="$(mktemp)"
+    extract_run_block "$WORKFLOW" diff > "$BLOCK"
+    if ! grep -q 'CONNECTOR_PATHS_RE' "$BLOCK"; then
+        echo "  FAIL  the \`id: diff\` block no longer reads CONNECTOR_PATHS_RE"
+        fail=$((fail + 1))
+        rm -f "$BLOCK"
+        EXTRA_ENV=()
+        return
+    fi
+    OUT_KEY=connectors
+    for DOLLAR_PATH in \
+        engine/crates/rocky-core/src/connector.rs \
+        engine/crates/rocky-cli/src/connector/runner.rs \
+        engine/crates/rocky-cli/src/commands/connector_test.rs \
+        engine/crates/rocky-cli/src/commands/connector_data/rocky_connector.py \
+        .github/workflows/engine-ci.yml \
+        examples/playground/pocs/07-adapters/08-postgres-child-connector/connector/main.py \
+        examples/playground/pocs/07-adapters/12-meltano-connector-shim/replay/replay-meltano.py
+    do
+        run_case "$DOLLAR_PATH runs the connector test" build_dollar_anchored true
+    done
+    for DOLLAR_PATH in \
+        engine/crates/rocky-core/src/config.rs \
+        engine/crates/rocky-cli/tests/connector_load.rs \
+        examples/playground/pocs/07-adapters/10-dlt-connector-shim/run.sh
+    do
+        run_case "$DOLLAR_PATH skips the connector test" build_dollar_anchored false
+    done
+    run_case "an unwatched path skips the connector test" build_non_engine_path false
+    run_case "a grep error runs the connector test and warns" build_grep_error true warn
+    run_case "a failed diff runs the connector test and warns" build_no_parent true warn
+    # A connector POC alone runs no engine job.
+    OUT_KEY=engine
+    REGEX_VAR=ENGINE_PATHS_RE
+    REGEX="$(extract_regex "$WORKFLOW" ENGINE_PATHS_RE)"
+    EXTRA_ENV=("CONNECTOR_PATHS_RE=$(extract_regex "$WORKFLOW" CONNECTOR_PATHS_RE)")
+    for DOLLAR_PATH in \
+        examples/playground/pocs/07-adapters/08-postgres-child-connector/connector/main.py \
+        examples/playground/pocs/07-adapters/12-meltano-connector-shim/replay/replay-meltano.py
+    do
+        run_case "$DOLLAR_PATH alone skips the engine jobs" build_dollar_anchored false
+    done
+    EXTRA_ENV=()
+    rm -f "$BLOCK"
+    echo
+}
+connector_suite
 
 echo "push paths: <-> regex parity:"
 parity_case engine-ci.yml     ENGINE_PATHS_RE

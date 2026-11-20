@@ -265,8 +265,16 @@ const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 
 /// Special forms only DuckDB has. DuckDB's parser also turns `date(x)` into
 /// `CAST(x AS DATE)`, so `duckdb_functions()` never lists `date`; every other
-/// dialect's list already holds it.
+/// dialect's list already holds it. The ordered-set forms
+/// `percentile_cont(p) WITHIN GROUP (ORDER BY x)` and `percentile_disc(p) ...`
+/// are handled separately (see `DUCKDB_WITHIN_GROUP_FORMS`; `mode` is listed).
 const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try", "date"];
+
+/// Ordered-set aggregates DuckDB rewrites at parse time, and only in the
+/// `WITHIN GROUP (ORDER BY ...)` form. The plain call `percentile_cont(x, 0.5)`
+/// is an unknown function there, so these names are exempt only when the
+/// parsed call carries a non-empty `within_group`.
+const DUCKDB_WITHIN_GROUP_FORMS: &[&str] = &["percentile_cont", "percentile_disc"];
 
 /// Report calls to functions the target dialect does not have.
 ///
@@ -338,8 +346,14 @@ fn check_model(
     let mut diagnostics = Vec::new();
     for &dialect in dialects {
         let mut seen = HashSet::new();
-        for (name, line, col) in &visitor.found {
+        for (name, line, col, within_group) in &visitor.found {
             let lower = name.to_ascii_lowercase();
+            if dialect == FunctionDialect::DuckDb
+                && *within_group
+                && DUCKDB_WITHIN_GROUP_FORMS.contains(&lower.as_str())
+            {
+                continue;
+            }
             if dialect.knows(&lower) || !seen.insert(lower) {
                 continue;
             }
@@ -419,8 +433,8 @@ fn suggestion(name: &str, dialect: FunctionDialect) -> String {
 struct Calls<'r> {
     registry: &'r FunctionRegistry,
     /// Unqualified, unquoted calls the project does not declare:
-    /// `(name as written, line, column)`.
-    found: Vec<(String, usize, usize)>,
+    /// `(name as written, line, column, has WITHIN GROUP)`.
+    found: Vec<(String, usize, usize, bool)>,
 }
 
 impl Visitor for Calls<'_> {
@@ -437,6 +451,7 @@ impl Visitor for Calls<'_> {
                 ident.value.clone(),
                 span.start.line as usize,
                 span.start.column as usize,
+                !function.within_group.is_empty(),
             ));
         }
         std::ops::ControlFlow::Continue(())
@@ -859,6 +874,46 @@ mod tests {
         ] {
             let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
             assert!(diags.is_empty(), "{call}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn duckdb_accepts_the_ordered_set_aggregates_it_rewrites() {
+        // Live DuckDB 2.0 runs each of these; `duckdb_functions()` lists only
+        // the `quantile_*` names they are rewritten to.
+        let registry = FunctionRegistry::default();
+        for call in [
+            "percentile_cont(0.5) WITHIN GROUP (ORDER BY a)",
+            "percentile_disc(0.5) WITHIN GROUP (ORDER BY a)",
+            "mode() WITHIN GROUP (ORDER BY a)",
+        ] {
+            let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
+            assert!(diags.is_empty(), "{call}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn only_duckdb_exempts_the_within_group_percentiles() {
+        // The exemption is DuckDB's rewrite; Trino's list does not hold them.
+        let registry = FunctionRegistry::default();
+        let diags = run(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) AS c FROM t",
+            &Some(OperandDialect::Trino).into(),
+            &registry,
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(&*diags[0].code, "W057");
+    }
+
+    #[test]
+    fn duckdb_refuses_the_plain_percentile_call() {
+        // Live DuckDB rejects `percentile_cont(a, 0.5)`; only the WITHIN GROUP
+        // form is rewritten.
+        let registry = FunctionRegistry::default();
+        for call in ["percentile_cont(a, 0.5)", "percentile_disc(a, 0.5)"] {
+            let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
+            assert_eq!(diags.len(), 1, "{call}: {diags:?}");
+            assert_eq!(&*diags[0].code, "E057", "{call}");
         }
     }
 
