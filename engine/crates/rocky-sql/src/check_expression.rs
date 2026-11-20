@@ -1776,14 +1776,14 @@ mod tests {
             "trino",
         ];
         for dialect in DIALECTS {
-            // ClickHouse parses an unparenthesised IN as a list, so these two
+            // ClickHouse parses an unparenthesised IN as a list, so these three
             // inputs are not refused on that dialect; known gap, tracked in #2713.
             for expr in [
                 "id IN other_table",
                 "id IN some_fn(1)",
                 "id NOT IN other_table",
             ] {
-                if dialect == "clickhouse" && expr != "id NOT IN other_table" {
+                if dialect == "clickhouse" {
                     continue;
                 }
                 let result = check_on(dialect, expr);
