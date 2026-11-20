@@ -33,6 +33,8 @@ models = "models/**"
 auto_create_schemas = true
 "#;
 
+const FAIL_FAST: &str = "\n[resilience]\ncontain_failures = false\n";
+
 const CONTAIN: &str = "\n[resilience]\ncontain_failures = true\n";
 
 // The broken models must fail when DuckDB runs them, not at compile time:
@@ -159,7 +161,7 @@ fn built(v: &serde_json::Value) -> Vec<String> {
 #[test]
 fn fail_fast_run_reports_failed_and_not_started_models() {
     let dir = tempfile::tempdir().unwrap();
-    project(dir.path(), "", BROKEN_STATUS_COUNTS);
+    project(dir.path(), FAIL_FAST, BROKEN_STATUS_COUNTS);
 
     let out = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(
@@ -223,11 +225,85 @@ fn contained_run_builds_independent_models() {
 }
 
 #[test]
+fn default_config_contains_a_failure_and_exits_partial_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    // Empty extra config: no `[resilience]` table, so the default applies.
+    project(dir.path(), "", BROKEN_STATUS_COUNTS);
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(status_of(&v, "stg_orders"), "built");
+    assert_eq!(status_of(&v, "customer_orders"), "built");
+    assert_eq!(status_of(&v, "status_counts"), "failed");
+}
+
+/// `stg_orders` reads the bare raw table `orders`; the mart model
+/// `orders_enriched` writes `marts.orders` and depends on `stg_orders`.
+/// Containment resolves the bare `orders` read to `orders_enriched`'s target
+/// table, closing a cycle with the declared edge.
+fn bare_name_cycle_project(dir: &Path, extra_config: &str) {
+    let conn = duckdb::Connection::open(dir.join("warehouse.duckdb")).expect("open duckdb");
+    conn.execute_batch(
+        "CREATE TABLE orders (order_id INTEGER NOT NULL);
+         INSERT INTO orders VALUES (1), (2);",
+    )
+    .expect("seed source");
+    drop(conn);
+    fs::write(dir.join("rocky.toml"), format!("{CONFIG}{extra_config}")).unwrap();
+    write_model(dir, "stg_orders", "select order_id from orders");
+    let models = dir.join("models");
+    fs::write(
+        models.join("orders_enriched.toml"),
+        "name = \"orders_enriched\"\ndepends_on = [\"stg_orders\"]\n\n\
+         [strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+         catalog = \"warehouse\"\nschema = \"marts\"\ntable = \"orders\"\n",
+    )
+    .unwrap();
+    fs::write(
+        models.join("orders_enriched.sql"),
+        "select order_id from stg_orders",
+    )
+    .unwrap();
+}
+
+#[test]
+fn bare_name_cycle_is_withheld_under_default_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_name_cycle_project(dir.path(), "");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    let v = json(&out);
+    // Nothing builds, so this is a plain failure (exit 1), not a partial one.
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let errors = v["errors"].as_array().expect("errors");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e["asset_key"] == serde_json::json!(["<cycle>"])),
+        "{}",
+        describe(&out)
+    );
+    assert!(built(&v).is_empty(), "{}", describe(&out));
+}
+
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_under_fail_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_name_cycle_project(dir.path(), FAIL_FAST);
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(built(&v), ["orders", "stg_orders"], "{}", describe(&out));
+}
+
+#[test]
 fn retry_failed_reruns_only_failed_and_unbuilt_models() {
     let dir = tempfile::tempdir().unwrap();
     // `zz_counts` sorts after `stg_orders`, so layer 0 builds `stg_orders`
     // first and the run stops on `zz_counts` before layer 1.
-    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    project_with(dir.path(), FAIL_FAST, "zz_counts", BROKEN_STATUS_COUNTS);
     let first = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!first.status.success(), "{}", describe(&first));
     let first = json(&first);
@@ -398,7 +474,7 @@ fn contained_dependent_of_the_failing_model_is_skipped_upstream_failed() {
 #[test]
 fn production_retry_ignores_a_newer_failed_shadow_run() {
     let dir = tempfile::tempdir().unwrap();
-    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    project_with(dir.path(), FAIL_FAST, "zz_counts", BROKEN_STATUS_COUNTS);
     let prod = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!prod.status.success(), "{}", describe(&prod));
     assert_eq!(status_of(&json(&prod), "stg_orders"), "built");

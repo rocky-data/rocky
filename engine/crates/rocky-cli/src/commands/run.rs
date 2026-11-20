@@ -38758,7 +38758,10 @@ backend = "local"
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
-            rocky_core::config::ResilienceConfig::default(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures: false, // explicit fail-fast (default is true, #2617)
+                ..Default::default()
+            },
             false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
@@ -39978,7 +39981,7 @@ backend = "local"
         (output, result)
     }
 
-    /// Drive `execute_models` fail-fast (the default, `contain_failures =
+    /// Drive `execute_models` fail-fast (explicit, `contain_failures =
     /// false`) at the given `--parallel` width.
     async fn run_models_fail_fast(
         models_dir: &std::path::Path,
@@ -40015,7 +40018,10 @@ backend = "local"
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
-            rocky_core::config::ResilienceConfig::default(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures: false, // explicit fail-fast (default is true, #2617)
+                ..Default::default()
+            },
             false,
             true,
             None,
@@ -40829,7 +40835,7 @@ backend = "local"
         );
     }
 
-    /// Default posture (`contain_failures = false`) is byte-identical fail-fast:
+    /// Explicit `contain_failures = false` is byte-identical fail-fast:
     /// `execute_models` returns `Err` at the first failure and withholds
     /// nothing on `contained[]`. This is the §7.6 default-OFF regression guard.
     #[cfg(feature = "duckdb")]
@@ -40841,8 +40847,8 @@ backend = "local"
         write_containment_dag(&models_dir);
 
         let db = tmp.path().join("failfast.duckdb");
-        // `run_models_against_duckdb` uses `ResilienceConfig::default()`
-        // (contain_failures = false) — the default path.
+        // `run_models_against_duckdb` sets `contain_failures = false`
+        // explicitly (the default is `true` since #2617).
         let (out, result) = run_models_against_duckdb(&models_dir, &db, false, 1).await;
 
         result.expect_err("default fail-fast: execute_models returns Err at the first failure");
@@ -44182,7 +44188,10 @@ auto_create_schemas = true
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
-            rocky_core::config::ResilienceConfig::default(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures: false, // explicit fail-fast (default is true, #2617)
+                ..Default::default()
+            },
             false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
