@@ -702,7 +702,7 @@ def main(
     set's expected file next to the answer key. ``live`` and ``rehash`` never
     gate on the score (a fail is data, as in the agent suite); they fail (1)
     when the harness could not run or when a model errored, because an errored
-    model keeps its previous recording.
+    model's recordings may be stale or incomplete.
     """
     from harness.environ import resolve_rocky_bin
 
