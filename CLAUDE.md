@@ -8,9 +8,11 @@ Canonical agent guidance lives in [`AGENTS.md`](AGENTS.md) (shared across agent 
 
 The independent red team that [`AGENTS.md`](AGENTS.md) requires for substantive analyses and plans is chosen in this order. Take the first one that is available:
 
+For a soundness-critical engine change (the top four review priorities in `AGENT_REVIEW.md`), a fresh read-only Fable agent goes ahead of step 1, when its weekly limit allows and Fable did not author the change.
+
 1. **Codex**, if the `codex:codex-rescue` agent is in your list of agent types. Check the list each session; do not assume either way.
-2. **Opus authored the change:** a fresh read-only **Fable** agent (`model: "fable"`), when Fable's weekly limit allows. Otherwise a fresh read-only **Opus** agent at high effort that did not author the change.
-3. **Sonnet or Haiku authored it:** a fresh read-only **Opus** agent. Use **Fable** instead for a soundness-critical engine change (the top four review priorities in `AGENT_REVIEW.md`) when its weekly limit allows.
+2. **Opus authored the change:** a fresh read-only **Fable** agent (`model: "fable"`), when Fable's weekly limit allows (no limit warning from a Fable call this week, and Hugo has not said to save it). Otherwise a fresh read-only **Opus** agent at high effort that did not author the change.
+3. **Sonnet or Haiku authored it:** a fresh read-only **Opus** agent.
 4. **Fable authored it:** a fresh read-only **Opus** agent.
 
 Never use Sonnet as the red team for a substantive change. Check which model you are before you choose. The session's model can change mid-session.
