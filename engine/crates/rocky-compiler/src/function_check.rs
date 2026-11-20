@@ -265,8 +265,18 @@ const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 
 /// Special forms only DuckDB has. DuckDB's parser also turns `date(x)` into
 /// `CAST(x AS DATE)`, so `duckdb_functions()` never lists `date`; every other
-/// dialect's list already holds it.
-const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try", "date"];
+/// dialect's list already holds it. The ordered-set forms
+/// `percentile_cont(p) WITHIN GROUP (ORDER BY x)` and `percentile_disc(p) ...`
+/// are rewritten at parse time to `quantile_cont` / `quantile_disc`, so they
+/// are not listed either (`mode` is listed).
+const DUCKDB_ONLY_FORMS: &[&str] = &[
+    "columns",
+    "unpack",
+    "try",
+    "date",
+    "percentile_cont",
+    "percentile_disc",
+];
 
 /// Report calls to functions the target dialect does not have.
 ///
@@ -856,6 +866,21 @@ mod tests {
             "DATE(occurred_at)",
             "date('2024-01-01')",
             "interval('1 day')",
+        ] {
+            let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
+            assert!(diags.is_empty(), "{call}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn duckdb_accepts_the_ordered_set_aggregates_it_rewrites() {
+        // Live DuckDB 2.0 runs each of these; `duckdb_functions()` lists only
+        // the `quantile_*` names they are rewritten to.
+        let registry = FunctionRegistry::default();
+        for call in [
+            "percentile_cont(0.5) WITHIN GROUP (ORDER BY a)",
+            "percentile_disc(0.5) WITHIN GROUP (ORDER BY a)",
+            "mode() WITHIN GROUP (ORDER BY a)",
         ] {
             let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
             assert!(diags.is_empty(), "{call}: {diags:?}");
