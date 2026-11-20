@@ -268,12 +268,7 @@ const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 /// dialect's list already holds it. The ordered-set forms
 /// `percentile_cont(p) WITHIN GROUP (ORDER BY x)` and `percentile_disc(p) ...`
 /// are handled separately (see `DUCKDB_WITHIN_GROUP_FORMS`; `mode` is listed).
-const DUCKDB_ONLY_FORMS: &[&str] = &[
-    "columns",
-    "unpack",
-    "try",
-    "date",
-];
+const DUCKDB_ONLY_FORMS: &[&str] = &["columns", "unpack", "try", "date"];
 
 /// Ordered-set aggregates DuckDB rewrites at parse time, and only in the
 /// `WITHIN GROUP (ORDER BY ...)` form. The plain call `percentile_cont(x, 0.5)`
