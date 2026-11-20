@@ -267,16 +267,19 @@ const SNOWFLAKE_GRAMMAR_FORMS: &[&str] = &["identifier", "table"];
 /// `CAST(x AS DATE)`, so `duckdb_functions()` never lists `date`; every other
 /// dialect's list already holds it. The ordered-set forms
 /// `percentile_cont(p) WITHIN GROUP (ORDER BY x)` and `percentile_disc(p) ...`
-/// are rewritten at parse time to `quantile_cont` / `quantile_disc`, so they
-/// are not listed either (`mode` is listed).
+/// are handled separately (see `DUCKDB_WITHIN_GROUP_FORMS`; `mode` is listed).
 const DUCKDB_ONLY_FORMS: &[&str] = &[
     "columns",
     "unpack",
     "try",
     "date",
-    "percentile_cont",
-    "percentile_disc",
 ];
+
+/// Ordered-set aggregates DuckDB rewrites at parse time, and only in the
+/// `WITHIN GROUP (ORDER BY ...)` form. The plain call `percentile_cont(x, 0.5)`
+/// is an unknown function there, so these names are exempt only when the
+/// parsed call carries a non-empty `within_group`.
+const DUCKDB_WITHIN_GROUP_FORMS: &[&str] = &["percentile_cont", "percentile_disc"];
 
 /// Report calls to functions the target dialect does not have.
 ///
@@ -441,6 +444,8 @@ impl Visitor for Calls<'_> {
             && let [ast::ObjectNamePart::Identifier(ident)] = function.name.0.as_slice()
             && ident.quote_style.is_none()
             && !self.registry.declares(&ident.value.to_ascii_lowercase())
+            && !(!function.within_group.is_empty()
+                && DUCKDB_WITHIN_GROUP_FORMS.contains(&ident.value.to_ascii_lowercase().as_str()))
         {
             let span = expr.span();
             self.found.push((
@@ -884,6 +889,18 @@ mod tests {
         ] {
             let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
             assert!(diags.is_empty(), "{call}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn duckdb_refuses_the_plain_percentile_call() {
+        // Live DuckDB rejects `percentile_cont(a, 0.5)`; only the WITHIN GROUP
+        // form is rewritten.
+        let registry = FunctionRegistry::default();
+        for call in ["percentile_cont(a, 0.5)", "percentile_disc(a, 0.5)"] {
+            let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
+            assert_eq!(diags.len(), 1, "{call}: {diags:?}");
+            assert_eq!(&*diags[0].code, "E057", "{call}");
         }
     }
 
