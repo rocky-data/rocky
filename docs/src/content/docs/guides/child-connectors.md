@@ -37,6 +37,22 @@ The steps, in order:
 5. Rocky loads every file into one staging table, handles schema drift, and appends the rows to the target table with one `INSERT` that names every column.
 6. Rocky drops the staging table and saves the connector's new state.
 
+## Start from a scaffold
+
+`rocky connector init <name>` writes a Python connector that loads as written:
+
+```bash
+rocky connector init orders
+```
+
+It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
+
+## Test a connector
+
+`rocky connector test <name>` runs the connector once per `[[run]]` in `connector-test.toml`, beside the manifest. Each run sets options that point the connector at recorded input, and says how many rows it must write. Each run gets the state the run before it returned. Rocky checks the rows, the state (when the run declares `state = "advanced"` or `"unchanged"`) and that every Parquet file has the same column names and types. It loads nothing, saves no state and passes no secrets. It does not block the network, so it cannot prove a run used its recorded input. See [`rocky connector test`](/reference/commands/development/#rocky-connector-test).
+
+The spec lives in its own file because test fixtures do not belong in the manifest a connector ships.
+
 ## Configure a connector
 
 Add a `[connector.<name>]` block to `rocky.toml`.
@@ -79,6 +95,7 @@ command              = ["./main.py"]
 state_schema_version = 1
 egress_hosts         = ["api.stripe.com"]
 license              = "Apache-2.0"
+support_tier         = "community"
 
 [limits]
 wall_time_secs = 1800
@@ -88,7 +105,10 @@ wall_time_secs = 1800
 - `command` must not be empty. A first element with a slash and a relative path is relative to the directory of the manifest. A first element with no slash is looked up on `PATH`. Rocky does not change the other elements. The working directory of the program is its scratch directory, not the manifest directory.
 - `state_schema_version` is the version of the state shape the program reads and writes.
 - `egress_hosts` is required. Write `[]` for a program that calls no host.
-- `license` is optional. It is an SPDX identifier or expression, such as `MIT` or `Apache-2.0 OR MIT`. It must not be blank. Rocky checks only that it is not blank, and otherwise ignores it.
+- `license` is optional. It is an SPDX identifier or expression, such as `MIT` or `Apache-2.0 OR MIT`. It must not be blank. Rocky does not check the name against the SPDX list. `rocky load` reports it, and reports `unknown` when it is not set. `rocky validate` warns (**V068**) when it is not set.
+- `support_tier` is optional. It says who supports the connector: `reference` (maintained by the Rocky project and tested in its CI) or `community` (not tested in CI by the Rocky project; Rocky supports the protocol, the state and the load, and a bug in the program the connector runs goes to that program's authors). `rocky load` reports it, and reports `unknown` when it is not set.
+- Both keys are the author's own statement. Rocky does not verify them. A shim that runs another tool, such as the dlt, Airbyte and Meltano shims, declares the license of the shim's code. The tool it runs has its own license.
+- Rocky 1.93.0 and older refuse a manifest that sets `license` or `support_tier`, because they refuse unknown keys. Leave both out if the manifest must load on those versions.
 
 A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
 
@@ -257,6 +277,8 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 | `commit_seq_before`, `commit_seq_after` | The commit sequence before and after the run. |
 | `adopted_expired_claim` | `true` when the run took over an expired in-flight claim. |
 | `egress_hosts` | The hosts the manifest declares. |
+| `license` | The `license` the manifest declares, or `unknown`. |
+| `support_tier` | `reference`, `community`, or `unknown` when the manifest does not say. |
 | `error` | Why the run failed. Present only on failure. |
 
 ## Reference connector
@@ -288,6 +310,8 @@ The limits of this design:
 - Delivery is at least once, as for every child connector.
 - Each run scans the whole source table.
 
+**Replay mode.** With `replay_fixture` set in the options (a SQL file, relative to `main.py`), the connector builds a local DuckDB catalog named `pg` from that file instead of attaching Postgres. It runs the same two queries, skips the `postgres` extension and reads no `PG*` variable. A missing fixture fails the run; it never falls back to Postgres. The log says the run is a replay. `rocky connector test pg_events` uses it: its `connector-test.toml` replays the three loads below (19, 5 and 0 rows) with no Docker.
+
 The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file. The weekly CI runs it as a gate: a failure turns the weekly job red.
 
 The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the same connector inside a full project, with a data product, a deadline, volume ranges, a monthly cost and a budget.
@@ -299,8 +323,8 @@ Three POCs show how to run a third-party extraction tool as a child connector. E
 | Tool | POC | What the shim runs |
 |---|---|---|
 | dlt | [`07-adapters/10-dlt-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/10-dlt-connector-shim) | A dlt source, named by module and function, with the `filesystem` destination writing Parquet. |
-| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An open-source Airbyte source image with `docker run`: `spec`, `discover`, then `read`. |
-| Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. |
+| Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | An Airbyte source image with `docker run`: `spec`, `discover`, then `read`. Or, with no Docker, a declarative source manifest through `airbyte-cdk`'s `source-declarative-manifest`. The Airbyte protocol and `airbyte-cdk` are MIT. Each source image and manifest has its own license, often Elastic License 2.0 (ELv2), which is not open source: check its `metadata.yaml` first. |
+| Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap of a Meltano project with `meltano invoke`. Its `connector-test.toml` points `meltano_bin` at a replay stand-in for Meltano and the tap, so `rocky connector test orders_tap` needs no PyPI package. |
 
 All three follow the same rules.
 
@@ -310,6 +334,13 @@ All three follow the same rules.
 - **No catalog.** Rocky does not discover or list sources. The options name the module, the image or the tap.
 - **Credentials go under `secrets`.** Each tool reads its credentials from the environment. Declare the variable names under `secrets`. Never put a credential under `options`.
 - **The tool, not Rocky, calls the network.** The manifest `egress_hosts` lists the hosts the tool calls. Rocky does not enforce the list.
+
+The Airbyte shim's no-Docker mode has rules of its own:
+
+- **The manifest is pinned by hash.** Set `manifest_sha256`. The shim never downloads a manifest, and a file with another hash fails the run. The hash is required because the manifest decides which hosts receive the source config, secrets included.
+- **No custom code runs.** The shim never passes `--components-path`. It needs `airbyte-cdk` 7.48.0 or newer, which refuses custom classes in a manifest it did not ship. It refuses to run when `AIRBYTE_ENABLE_UNSAFE_CODE` or any `PYTHON*` variable is set. A manifest that needs custom Python components does not work in this mode.
+- **Rows can load again at the cursor.** `airbyte-cdk` starts each read at the saved cursor, not after it. When the API's lower bound is inclusive, the row at the cursor loads again. A manifest with a `lookback_window` loads the whole window again. The target only appends, so those rows are duplicates: deduplicate downstream on a key.
+- **Rocky ships no Airbyte manifest.** The POC uses its own Apache-2.0 manifest against a local stub.
 
 The POCs run offline once the tool is installed. Each skips with exit 0 when its tool is missing. Set `REQUIRE_DLT=1`, `REQUIRE_DOCKER=1` or `REQUIRE_MELTANO=1` to make that a failure.
 

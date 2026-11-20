@@ -130,7 +130,7 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         }
     }
 
-    // V067: each `[connector.<name>]` manifest, read offline.
+    // V067 / V068: each `[connector.<name>]` manifest, read offline.
     validate_connectors(&cfg, config_path, &mut out);
 
     // Validate pipelines. A project whose only work is child connectors
@@ -348,6 +348,9 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
 /// or invalid, or when the first entry of its `command` is a path that
 /// does not exist. Later arguments and secrets are not checked. Offline: nothing is
 /// started. The block's own fields are checked when the config loads.
+///
+/// **V068** — a `warn` when a valid manifest, whose program exists, declares
+/// no `license`.
 fn validate_connectors(
     cfg: &rocky_core::config::RockyConfig,
     config_path: &Path,
@@ -398,6 +401,19 @@ fn validate_connectors(
                 field,
             });
             continue;
+        }
+        if manifest.license.is_none() {
+            out.push(ValidateMessage {
+                severity: "warn".into(),
+                code: "V068".into(),
+                message: format!(
+                    "connector.{name}: the manifest `{}` declares no `license`. \
+                     `rocky load --connector {name}` reports the license as `unknown`",
+                    connector.manifest
+                ),
+                file: Some(config_path.display().to_string()),
+                field: field.clone(),
+            });
         }
         out.push(ValidateMessage {
             severity: "ok".into(),
@@ -5773,6 +5789,59 @@ egress_hosts         = []
         let msgs = v067(&out);
         assert_eq!(msgs[0].0, "error");
         assert!(msgs[0].1.contains("main.py"), "{msgs:?}");
+    }
+
+    /// A manifest with no `license` warns with V068 and stays valid; one
+    /// with a license does not warn.
+    #[test]
+    fn v068_warns_when_the_manifest_declares_no_license() {
+        let out = connector_project(Some(GOOD_MANIFEST), true);
+        assert!(out.valid, "{:?}", out.messages);
+        let v068: Vec<_> = out.messages.iter().filter(|m| m.code == "V068").collect();
+        assert_eq!(v068.len(), 1, "{:?}", out.messages);
+        assert_eq!(v068[0].severity, "warn");
+        assert!(v068[0].message.contains("unknown"), "{:?}", v068[0]);
+
+        let licensed = format!("{GOOD_MANIFEST}license = \"MIT\"\n");
+        let out = connector_project(Some(&licensed), true);
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V068"),
+            "{:?}",
+            out.messages
+        );
+    }
+
+    /// A fresh `rocky connector init` scaffold, with the block it prints,
+    /// validates: V067 passes, and the missing license is only a V068 warning.
+    #[test]
+    fn a_fresh_connector_scaffold_validates_with_only_a_v068_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = std::path::Path::new("connectors/demo");
+        crate::commands::scaffold_connector(
+            "demo",
+            Some(&dir.path().join(rel)),
+            crate::commands::ConnectorLang::Python,
+        )
+        .unwrap();
+        let block = crate::commands::connector_init::config_block("demo", rel)
+            .replace("<catalog>", "poc")
+            .replace("<schema>", "main");
+        std::fs::write(
+            dir.path().join("rocky.toml"),
+            format!("[adapter]\ntype = \"duckdb\"\npath = \"poc.duckdb\"\n\n{block}"),
+        )
+        .unwrap();
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        assert!(out.valid, "{:?}", out.messages);
+        assert!(
+            !out.messages.iter().any(|m| m.severity == "error"),
+            "{:?}",
+            out.messages
+        );
+        assert_eq!(v067(&out)[0].0, "ok", "{:?}", out.messages);
+        let v068: Vec<_> = out.messages.iter().filter(|m| m.code == "V068").collect();
+        assert_eq!(v068.len(), 1, "{:?}", out.messages);
+        assert_eq!(v068[0].severity, "warn");
     }
 
     /// A bare program name is looked up on PATH at run time, so validate

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Child connector license and tier (engine, unreleased). The generated `ConnectorLoadInfo` in `load_schema` gains `license` and `support_tier`, with the new enum `ConnectorSupportTier` (`reference`, `community`, `unknown`).
+
 ## [0.33.0] — 2026-11-14
 
 For engine 1.93.0. Every new field is optional, so this release still parses older engines' output.

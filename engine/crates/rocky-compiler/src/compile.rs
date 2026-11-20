@@ -1232,6 +1232,72 @@ struct ContractScope<'a> {
     strict: bool,
 }
 
+/// The reads of `model_name` spelled with a model's name that `resolve.rs`
+/// binds to another model, as `(read, writer)`, sorted (#2674). Such a read
+/// is typed Unknown: the binding ignores the schema, so the run reaches the
+/// writer's table or the source table, and the compiler cannot tell which.
+fn ambiguous_model_reads(graph: &SemanticGraph, model_name: &str) -> Vec<(String, String)> {
+    let Some(reads) = graph
+        .model_schema(model_name)
+        .and_then(|schema| schema.reads.as_ref())
+    else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, String)> = reads
+        .iter()
+        .filter_map(|(key, target)| {
+            let crate::semantic::ReadTarget::Model(writer) = target else {
+                return None;
+            };
+            graph
+                .models
+                .keys()
+                .find(|name| {
+                    crate::semantic::binding_decides(name)
+                        && *name != writer
+                        && rocky_core::physical_edges::fold_identifier(name) == *key
+                })
+                .map(|name| (name.clone(), writer.clone()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Say why a contract error rests on an unknown type, when the model has a
+/// read [`ambiguous_model_reads`] lists (#2674). Wording only: an `E010`, or
+/// an `E012` on a column typed Unknown, keeps its code and severity.
+fn note_ambiguous_read(
+    mut diagnostic: Diagnostic,
+    schema: &[TypedColumn],
+    ambiguous: &[(String, String)],
+) -> Diagnostic {
+    if ambiguous.is_empty() {
+        return diagnostic;
+    }
+    let applies = match &*diagnostic.code {
+        "E010" => true,
+        "E012" => schema.iter().any(|c| {
+            c.data_type == RockyType::Unknown
+                && diagnostic.message.contains(&format!("column '{}'", c.name))
+        }),
+        _ => false,
+    };
+    if applies {
+        let notes: Vec<String> = ambiguous
+            .iter()
+            .map(|(read, writer)| {
+                format!(
+                    "type unknown: `{read}` may read model `{writer}`'s table or the source \
+                     table `{read}`; see D012"
+                )
+            })
+            .collect();
+        diagnostic.message = format!("{} ({})", diagnostic.message, notes.join("; ")).into();
+    }
+    diagnostic
+}
+
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
@@ -1265,7 +1331,12 @@ fn validate_all_contracts(
             } else {
                 contracts::validate_contract(model_name, schema, contract)
             };
-            all_diags.extend(diags);
+            let ambiguous = ambiguous_model_reads(graph, model_name);
+            all_diags.extend(
+                diags
+                    .into_iter()
+                    .map(|d| note_ambiguous_read(d, schema, &ambiguous)),
+            );
             // A model the graph does not know has no provable column list.
             let schema_complete = graph
                 .model_schema(model_name)
@@ -2262,8 +2333,10 @@ mod tests {
         }
     }
 
+    /// A cast over `SUM` is NOT NULL under a plain `GROUP BY` and nullable
+    /// without one (#2295, #2658).
     #[test]
-    fn cast_over_grouped_aggregate_is_nullable_under_outer_join_propagation() {
+    fn cast_over_a_sum_is_not_null_only_under_a_plain_group_by() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("totals.toml"),
@@ -2291,32 +2364,48 @@ mod tests {
             ),
             ..Default::default()
         };
-        for join in ["", "LEFT JOIN raw.orders r ON o.id = r.id"] {
+        // Before #2295 lineage labelled `CAST(SUM(...))` a plain cast of
+        // `o.id`, which also made a global `CAST(SUM(x) AS BIGINT)` over an
+        // empty table NOT NULL: unsound. A cast takes its operand's
+        // nullability. With a plain `GROUP BY` every group has a row, so
+        // `SUM` over the NOT NULL `o.id` is NOT NULL (#2658); the `LEFT JOIN`
+        // null-extends `r`, not `o`. Without `GROUP BY` an empty input gives
+        // one row whose `SUM` is NULL, and the contract is refused.
+        for (from, group_by, refused) in [
+            ("raw.orders o", "GROUP BY o.id", false),
+            (
+                "raw.orders o LEFT JOIN raw.orders r ON o.id = r.id",
+                "GROUP BY o.id",
+                false,
+            ),
+            ("raw.orders o", "", true),
+        ] {
+            let id = if group_by.is_empty() {
+                "MIN(o.id) AS id"
+            } else {
+                "o.id"
+            };
             std::fs::write(
                 dir.path().join("totals.sql"),
-                format!(
-                    "SELECT o.id, CAST(SUM(o.id) AS BIGINT) AS total \
-                     FROM raw.orders o {join} GROUP BY o.id"
-                ),
+                format!("SELECT {id}, CAST(SUM(o.id) AS BIGINT) AS total FROM {from} {group_by}"),
             )
             .unwrap();
             let result = compile(&config).unwrap();
-            // This test used to assert `total` NOT NULL with no errors. That
-            // answer came from lineage labelling `CAST(SUM(...))` as a plain
-            // cast of `o.id`, which also made a global `CAST(SUM(x) AS BIGINT)`
-            // over an empty table NOT NULL — unsound (#2295). A cast takes its
-            // operand's nullability, and `SUM` is nullable, like a bare
-            // `SUM(o.id)` already was. The NOT NULL contract is now refused.
             let errors: Vec<_> = result
                 .diagnostics
                 .iter()
                 .filter(|d| d.is_error())
                 .map(|d| (&*d.code, d.model.as_str()))
                 .collect();
-            assert_eq!(errors, vec![("E012", "totals")], "{join}");
+            let expected = if refused {
+                vec![("E012", "totals")]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(errors, expected, "{from} {group_by}");
             let total = &result.type_check.typed_models["totals"][1];
             assert_eq!(total.data_type, RockyType::Int64);
-            assert!(total.nullable, "{join}");
+            assert_eq!(total.nullable, refused, "{from} {group_by}");
         }
     }
 
@@ -3537,6 +3626,7 @@ mod tests {
                 diagnostics: Vec::new(),
                 reference_map: Default::default(),
                 model_typecheck_ms: HashMap::new(),
+                shadowed_sources: HashMap::new(),
             };
             let result = typecheck::typecheck_project_incremental(
                 &graph,

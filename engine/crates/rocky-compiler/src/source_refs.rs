@@ -37,7 +37,9 @@
 //!    relation whose columns Rocky cannot enumerate makes the name
 //!    unprovable, and it stays `Unknown`. A qualified `a.b` is reported only
 //!    when `a` names exactly one source binding and cannot also be a column
-//!    (a struct field access such as `payload.field`).
+//!    (a struct field access such as `payload.field`). A qualified star
+//!    `a.* EXCLUDE (..)` follows the same rule, asked of the star's own
+//!    scope only (#2653).
 //!
 //! Quoted names are never reported: this dialect parses `"shipped"` as an
 //! identifier, but BigQuery (and Databricks by default) read it as a string.
@@ -755,11 +757,22 @@ impl<'s, 'a> Binder<'s, 'a> {
                         && qualifier.quote_style.is_none()
                     {
                         let qualifier = qualifier.value.to_lowercase();
-                        let bound: Vec<&Rel<'s, 'a>> = scope
-                            .rels
-                            .iter()
-                            .filter(|rel| rel.binding.as_deref() == Some(qualifier.as_str()))
-                            .collect();
+                        // `payload.*` over a struct column `payload` expands
+                        // the struct, on a warehouse that reads it so (#2653).
+                        // Only the star's own scope is asked: a relation bound
+                        // there shadows an outer column of the same name.
+                        let bound: Vec<&Rel<'s, 'a>> =
+                            if qualifier_may_be_a_column(std::slice::from_ref(scope), &qualifier) {
+                                Vec::new()
+                            } else {
+                                scope
+                                    .rels
+                                    .iter()
+                                    .filter(|rel| {
+                                        rel.binding.as_deref() == Some(qualifier.as_str())
+                                    })
+                                    .collect()
+                            };
                         if bound.len() == 1 {
                             self.check_star_options(options, &bound);
                         }
@@ -1184,6 +1197,20 @@ fn resolve_unqualified<'s, 'a>(chain: &[Scope<'s, 'a>], name: &str) -> Resolutio
     }
 }
 
+/// Whether `qualifier` (lower-cased) in `qualifier.x` or `qualifier.*` may
+/// name a column or alias rather than a relation: a struct whose field `x` is
+/// read, or whose fields `*` expands. If any relation in reach could carry such
+/// a column, the reading is ambiguous and nothing is proved.
+fn qualifier_may_be_a_column(chain: &[Scope<'_, '_>], qualifier: &str) -> bool {
+    chain.iter().any(|scope| {
+        scope.aliases.contains(qualifier)
+            || scope.rels.iter().any(|rel| match rel.kind {
+                RelKind::Opaque => true,
+                RelKind::Source(source) => source.has(qualifier),
+            })
+    })
+}
+
 fn resolve_qualified<'s, 'a>(
     chain: &[Scope<'s, 'a>],
     qualifier: &str,
@@ -1194,21 +1221,8 @@ fn resolve_qualified<'s, 'a>(
     if is_relation_free_name(&qualifier) || is_relation_free_name(&column) {
         return Resolution::Resolved;
     }
-    // `a.b` may be a field access on a column or alias named `a`. If any
-    // relation in reach could carry such a column, the reading is ambiguous.
-    for scope in chain {
-        if scope.aliases.contains(&qualifier) {
-            return Resolution::Unprovable;
-        }
-        for rel in &scope.rels {
-            match rel.kind {
-                RelKind::Opaque => return Resolution::Unprovable,
-                RelKind::Source(source) if source.has(&qualifier) => {
-                    return Resolution::Unprovable;
-                }
-                RelKind::Source(_) => {}
-            }
-        }
+    if qualifier_may_be_a_column(chain, &qualifier) {
+        return Resolution::Unprovable;
     }
     for scope in chain.iter().rev() {
         let mut bound = scope
@@ -1612,6 +1626,40 @@ mod tests {
         ] {
             let diagnostics = check(sql);
             assert!(diagnostics.is_empty(), "{sql}: {diagnostics:?}");
+        }
+    }
+
+    /// #2653: `payload.*` where `payload` is also a column or alias of the
+    /// star's own scope may expand a struct, not the relation, so its modifier
+    /// names are not checked, as a plain `payload.x` read is not. Only that
+    /// scope is asked: an outer relation cannot supply the struct, because the
+    /// relation bound in the star's scope shadows it.
+    #[test]
+    fn a_star_qualifier_that_may_be_a_struct_column_is_not_checked() {
+        for sql in [
+            // The qualifier's own relation has a column `payload`.
+            "SELECT payload.* EXCEPT (legacy_field) FROM raw.customers payload",
+            // A sibling relation has a column `amount`; the qualifier's own
+            // relation (`raw.customers`) does not.
+            "SELECT amount.* EXCLUDE (nope) FROM raw.orders o \
+             JOIN raw.customers amount ON o.customer_id = amount.customer_id",
+            // A select alias named like the qualifier.
+            "SELECT 1 AS o, o.* EXCLUDE (statsu) FROM raw.orders o",
+            // An opaque relation (a CTE) in the star's own scope may carry
+            // such a column, so the star is not checked.
+            "WITH s AS (SELECT order_id FROM raw.orders) \
+             SELECT o.* EXCLUDE (statsu) FROM raw.orders o JOIN s ON o.order_id = s.order_id",
+        ] {
+            let diagnostics = check(sql);
+            assert!(diagnostics.is_empty(), "{sql}: {diagnostics:?}");
+        }
+        for sql in [
+            "SELECT o.* EXCLUDE (statsu) FROM raw.orders o",
+            // An opaque relation in an OUTER scope does not silence the star.
+            "SELECT * FROM stg_x WHERE EXISTS (SELECT o.* EXCLUDE (statsu) FROM raw.orders o)",
+        ] {
+            let diagnostics = check(sql);
+            assert_eq!(codes(&diagnostics), ["E041"], "{sql}: {diagnostics:?}");
         }
     }
 

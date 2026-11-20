@@ -25,6 +25,9 @@ def _rows(path):
 
 @dlt.source
 def shop(data_dir: str = os.path.join(HERE, "data")):
+    # A relative data_dir is relative to this file: the shim runs in a
+    # scratch directory, so the current directory would not find it.
+    data_dir = os.path.join(HERE, data_dir)
     @dlt.resource(name="orders", write_disposition="append", primary_key="id")
     def orders(cursor=dlt.sources.incremental("id", initial_value=0)):
         for row in _rows(os.path.join(data_dir, "orders.jsonl")):

@@ -460,6 +460,10 @@ export type Dialect = "databricks" | "snowflake" | "bigquery" | "duckdb";
  */
 export type ProductBudgetBreachAction = "warn";
 /**
+ * `[run] tests_on_run` — whether a run evaluates the `[[tests]]` of the models it builds, and whether a failing one fails the model.
+ */
+export type TestsOnRun = "off" | "report" | "enforce";
+/**
  * State storage backend variants.
  */
 export type StateBackend = "local" | "s3" | "gcs" | "valkey" | "tiered";
@@ -2826,6 +2830,14 @@ export interface RunConfig {
    * Lives on `[run]` rather than `[execution]` deliberately: `[execution]` is per-pipeline, and `rocky run --dag` derives ordering ACROSS pipelines, so a per-pipeline switch would have no single answer on the path that most needs one.
    */
   strict_scheduling?: boolean;
+  /**
+   * Run each model's sidecar `[[tests]]` against the table the run just built (#2611).
+   *
+   * - `"off"` (default): no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `"report"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `"enforce"`: as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.
+   *
+   * A `severity = "warning"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation.
+   */
+  tests_on_run?: TestsOnRun & string;
 }
 /**
  * Project-level schedule defaults (`[schedule]`).

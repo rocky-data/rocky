@@ -1,0 +1,20 @@
+# `rocky connector test orders_tap`: three runs with no Meltano, no tap and
+# no PyPI. `meltano_bin` points at a replay stand-in for both Meltano and the
+# tap (../replay/replay-meltano.py), which returns recorded Singer output. The
+# shim's own steps all run: discover, stream selection, --state, Parquet and
+# the Singer bookmark. run.sh runs the real Meltano and tap.
+
+[[run]]
+options = { meltano_bin = "../replay/meltano-1.sh" }
+rows    = 4   # orders 1 to 4
+state   = "advanced"
+
+[[run]]
+options = { meltano_bin = "../replay/meltano-2.sh" }
+rows    = 3   # only orders 5 to 7: the bookmark came back as --state
+state   = "advanced"
+
+[[run]]
+options = { meltano_bin = "../replay/meltano-2.sh" }
+rows    = 0   # nothing new
+state   = "unchanged"

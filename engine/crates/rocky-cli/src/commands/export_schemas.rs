@@ -124,6 +124,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<LintOutput>("lint"),
         entry::<SeedOutput>("seed"),
         entry::<LoadOutput>("load"),
+        entry::<crate::output::ConnectorTestOutput>("connector_test"),
         entry::<DagOutput>("dag"),
         entry::<DagRunOutput>("dag_run"),
         entry::<TickOutput>("tick"),

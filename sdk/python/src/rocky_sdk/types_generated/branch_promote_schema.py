@@ -65,6 +65,30 @@ class AuditEventKind5(StrEnum):
 
 class AuditEventKind6(StrEnum):
     """
+    Emitted when a model's newest test evidence on the branch holds an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the failing tests and the runs that recorded them.
+    """
+
+    failing_tests_blocked = "failing_tests_blocked"
+
+
+class AuditEventKind7(StrEnum):
+    """
+    Emitted when a model's newest test evidence holds a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.
+    """
+
+    failing_tests_allowed = "failing_tests_allowed"
+
+
+class AuditEventKind8(StrEnum):
+    """
+    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. A warning only: the promote proceeds. `reason` says which.
+    """
+
+    test_evidence_missing = "test_evidence_missing"
+
+
+class AuditEventKind9(StrEnum):
+    """
     Emitted by `rocky plan promote` when the plan has been successfully written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an audit consumer can correlate plan creation to a subsequent `rocky apply` event without scanning the filesystem.
     """
 
@@ -499,6 +523,9 @@ class AuditEvent(BaseModel):
         | AuditEventKind4
         | AuditEventKind5
         | AuditEventKind6
+        | AuditEventKind7
+        | AuditEventKind8
+        | AuditEventKind9
     )
     """
     Categorical kind of an [`AuditEvent`] emitted by `branch promote`.
