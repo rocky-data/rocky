@@ -1389,7 +1389,7 @@ provides-extras = ["classify"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "datamodel-code-generator", specifier = ">=0.91.0,<0.92" },
+    { name = "datamodel-code-generator", specifier = ">=0.91.0,<0.96" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.4" },
 ]
