@@ -749,11 +749,12 @@ def _run_set(rocky_bin: Path, mode: str, output_dir: Path, fixture_name: str, se
                 "--contract-quality-update-expected."
             )
         if errored:
-            # A model whose call failed keeps its previous recording, so the
-            # run must not look clean: name the models and exit non-zero.
+            # A model that errored may have kept a stale recording, or saved
+            # one even though `rocky ai-contract` exited non-zero, so the run
+            # must not look clean: name the models and exit non-zero.
             print(
                 f"contract-quality ({set_name}): {mode} run failed for {', '.join(errored)}; "
-                "their previous recordings were kept and are stale. Re-run before committing."
+                "their recordings may be stale or incomplete. Re-run before committing."
             )
             return 1
         return 0
