@@ -901,6 +901,7 @@ fn apply_operand_gates(
         &result.project.models,
         &result.semantic_graph,
         &result.type_check.typed_models,
+        &result.type_check.shadowed_sources,
         &target_for,
     );
     // Calls to functions the target warehouse does not have: E057 on the

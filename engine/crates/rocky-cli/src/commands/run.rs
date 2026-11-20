@@ -13167,7 +13167,7 @@ pub(crate) async fn reconcile_model_governance(
 ///
 /// Nothing else crosses over: the executing compile keeps its own SQL,
 /// graph and every other diagnostic.
-fn adopt_contract_type_errors(
+pub(crate) fn adopt_contract_type_errors(
     executing: &mut rocky_compiler::compile::CompileResult,
     typed: rocky_compiler::compile::CompileResult,
 ) {
@@ -13216,7 +13216,7 @@ fn adopt_contract_type_errors(
 /// column as NOT NULL and raises no `E012` for it. A column the described
 /// compile does not type, or types as nullable, keeps its `E012`. This only
 /// ever removes errors, so a describe cannot refuse a run that passed before.
-fn drop_nullability_errors_the_describe_resolves(
+pub(crate) fn drop_nullability_errors_the_describe_resolves(
     executing: &mut rocky_compiler::compile::CompileResult,
     typed: &rocky_compiler::compile::CompileResult,
 ) {
@@ -13300,7 +13300,7 @@ fn adopt_unchecked_contract_type_errors(
 ///
 /// The entries carry no provenance, so the missing-source-column check
 /// (`E041` / `W041`) stays off for them.
-async fn describe_sources_for_unchecked_contract_types(
+pub(crate) async fn describe_sources_for_unchecked_contract_types(
     compile_result: &rocky_compiler::compile::CompileResult,
     known: &std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     external_dependencies: &BTreeSet<String>,

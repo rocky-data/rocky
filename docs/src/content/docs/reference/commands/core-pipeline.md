@@ -629,6 +629,8 @@ A review-gated `--dag` plan (agent-authored, or AI-authored) is checked across t
 
 `rocky apply` gates on the identity the command runs under. Set that identity with the global `--principal` flag, which takes `human` or `agent` and defaults to `human`. The `ROCKY_PRINCIPAL` environment variable sets it too, and may only raise it to `agent`. Rocky combines the runtime identity most restrictively with the plan kind's own default. The kinds `ai_authored`, `backfill`, and `gc` default to `agent`, so a policy rule scoped to agents applies to them even when nobody set a principal. That includes an interactive `rocky gc` run by a person. It never trusts the principal field stored inside the plan file. An agent running `rocky apply` is gated as an agent whatever that field says. Without a `[policy]` block in `rocky.toml`, the principal changes nothing.
 
+`rocky run` reads the same `--principal` and `ROCKY_PRINCIPAL`. An agent's run in a project with a `[policy]` block is evaluated under the `run` capability, and a `deny` exits 1. An invalid `ROCKY_PRINCIPAL` value fails the run. See [`[policy]`](/reference/configuration/#policy).
+
 ### Examples
 
 Plan, read the SQL, then apply:
@@ -694,7 +696,7 @@ rocky run [flags]
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
 | `--tests <MODE>` | `off`, `report`, `enforce` | config, else `enforce` | Evaluate each built model's `[[tests]]` after it builds. See [Tests during a run](#tests-during-a-run). |
-| `--retry-failed [<RUN_ID>]` | `string` | | Rerun the failed and never-built models of a failed transformation run, and the models downstream of them. Without a value, the run is the latest production run of the pipeline (or of `--branch`). A model is not rerun when that run built it with the SQL it has now. Refuses when the run succeeded, is not found, is not a production run of this pipeline, nothing is left to retry, or `[state]` uses a remote backend. Rejected with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model`, `--select`, `--exclude`, `--shadow`, `--shadow-schema` and the `--defer` flags. See [Retrying a failed run](#retrying-a-failed-run). |
+| `--retry-failed [<RUN_ID>]` | `string` | | Rerun the failed and never-built models of a failed transformation run, and the models downstream of them. Without a value, the run is the latest production run of the pipeline (or of `--branch`). A model is not rerun when that run built it with the SQL it has now. Refuses when the run succeeded, is not found, is not a production run of this pipeline, nothing is left to retry, or `[state]` uses a remote backend. Rejected with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model`, `--select`, `--exclude`, `--filter`, `--all`, `--shadow`, `--shadow-schema` and the `--defer` flags. See [Retrying a failed run](#retrying-a-failed-run). |
 | `--shadow` | `bool` | `false` | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
 | `--keep-shadow` | `bool` | `false` | Requires `--shadow` and conflicts with `--watch`. Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
@@ -725,7 +727,7 @@ rocky run [flags]
 | `--parallel <N>` | `integer` | `4` without `--dag` | Models in a topological layer (and partitions of a `time_interval` model) run up to N at a time. Pass `--parallel 1` to run one model or partition at a time. Under `--dag` the flag bounds how many pipeline **nodes** run at once, and it has no default there: left unset, a `--dag` run keeps its unbounded node fan-out. It does **not** bound a replication pipeline's table fan-out, which comes from that pipeline's `[execution] concurrency` (default 32), so `--parallel 1` alone does not make a replication run serial. DuckDB always runs serially regardless of this flag (its adapter holds a single connection mutex); Snowflake and Databricks parallelize up to N. |
 
 :::caution[`--defer` SQL-rewrite limitation]
-`--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support (`SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals) cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
+`--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support (trailing-comma select lists and `STRUCT(...)` literals) cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
 :::
 
 ### Retrying a failed run
@@ -812,6 +814,8 @@ The run checks each contract in the compile that supplies the model SQL. This ap
 - The run exits non-zero. Under `--dag`, the failed node's `error` names the code, for example `first error: fct_orders: [E012] ...`.
 
 A contract can declare a column type that Rocky cannot infer from the SQL alone, because the source table has no known schema. The compile reports that as `I003`. The run then reads that source's columns from the warehouse and compiles again, so it checks the type before it writes. If the warehouse cannot describe the source, the type stays unchecked. With `[contracts] strict = true` in `rocky.toml`, a type that stays unchecked after that is the `E059` error and the run refuses it before it writes.
+
+A `nullable = false` contract on a column read from such a source is `E012`, because Rocky reads an unknown source column as nullable. The run describes that source too. It drops the `E012` when the warehouse reports the column as NOT NULL. A nullable column keeps the `E012`.
 
 `--contracts <DIR>` replaces the project directory for one run. A contract in the project directory for a model that the compile does not include is skipped, because one directory serves every pipeline. A contract in an explicit `--contracts` directory for an unknown model is still the `W011` warning.
 

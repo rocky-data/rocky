@@ -1,0 +1,18 @@
+# `rocky connector test pg_events`: three runs against recorded input, with
+# no Postgres. Each fixture is public.events as run.sh leaves it before that
+# load. The weekly Docker run of run.sh stays the live check.
+
+[[run]]
+options = { replay_fixture = "replay/events-1.sql" }
+rows    = 19   # the row at the source maximum waits for the next run
+state   = "advanced"
+
+[[run]]
+options = { replay_fixture = "replay/events-2.sql" }
+rows    = 5    # the held-back row plus four new rows
+state   = "advanced"
+
+[[run]]
+options = { replay_fixture = "replay/events-2.sql" }
+rows    = 0    # no new row
+state   = "unchanged"

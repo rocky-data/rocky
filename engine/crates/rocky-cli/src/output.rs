@@ -6298,6 +6298,60 @@ pub struct SeedTableOutput {
 
 // --- Load output ---
 
+/// JSON output for `rocky connector test <name>`.
+///
+/// The command runs the connector once per `[[run]]` in its
+/// `connector-test.toml`, feeding each run the state the run before it
+/// returned. It loads nothing and saves no state.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConnectorTestOutput {
+    pub version: String,
+    pub command: String,
+    /// The `[connector.<name>]` key.
+    pub connector: String,
+    /// The test spec that was read.
+    pub spec: String,
+    /// `true` when every run passed every check.
+    pub passed: bool,
+    /// One entry per run that started, in order. A failed run stops the
+    /// test, so later runs are not listed.
+    pub runs: Vec<ConnectorTestRunOutput>,
+    /// Problems that do not fail the test, such as a stale helper copy.
+    pub warnings: Vec<String>,
+}
+
+/// One run of `rocky connector test`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConnectorTestRunOutput {
+    /// 1 for the first run.
+    pub run: u32,
+    /// The rows the spec expects.
+    pub expected_rows: u64,
+    /// The rows the connector wrote; absent when the run failed before its
+    /// result was verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// Parquet files the run wrote.
+    pub files: u64,
+    /// The state check the spec declares for this run, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_check: Option<ConnectorTestStateCheck>,
+    pub passed: bool,
+    /// Why the run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A state check a `[[run]]` in `connector-test.toml` declares:
+/// `unchanged` (the run must return the state it was given) or `advanced`
+/// (the run must return another state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorTestStateCheck {
+    Unchanged,
+    Advanced,
+}
+
 /// JSON output for `rocky load`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct LoadOutput {
