@@ -122,15 +122,21 @@ pub struct ConnectorLoadOutcome {
 
 /// A connector with its config and manifest read and checked, before any
 /// child runs.
-struct Prepared<'a> {
-    config: &'a ConnectorConfig,
-    manifest: ConnectorManifest,
-    argv: Vec<std::ffi::OsString>,
-    limits: EffectiveLimits,
-    landing_dir: PathBuf,
+pub(crate) struct Prepared<'a> {
+    pub(crate) config: &'a ConnectorConfig,
+    pub(crate) manifest: ConnectorManifest,
+    /// The manifest file, resolved.
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) argv: Vec<std::ffi::OsString>,
+    pub(crate) limits: EffectiveLimits,
+    pub(crate) landing_dir: PathBuf,
 }
 
-fn prepare<'a>(config_path: &Path, loaded: &'a LoadedConfig, name: &str) -> Result<Prepared<'a>> {
+pub(crate) fn prepare<'a>(
+    config_path: &Path,
+    loaded: &'a LoadedConfig,
+    name: &str,
+) -> Result<Prepared<'a>> {
     let Some(config) = loaded.config.connectors.get(name) else {
         let known: Vec<&str> = loaded
             .config
@@ -158,6 +164,13 @@ fn prepare<'a>(config_path: &Path, loaded: &'a LoadedConfig, name: &str) -> Resu
         )
     })?;
     let manifest = ConnectorManifest::load(&manifest_path)?;
+    if manifest.license.is_none() {
+        warn!(
+            connector = name,
+            manifest = %manifest_path.display(),
+            "the connector manifest declares no license; the load output reports `unknown`"
+        );
+    }
     let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
     let argv = manifest.resolved_command(manifest_dir);
     let limits = ConnectorLimitsConfig::effective(&manifest.limits, &config.limits);
@@ -166,6 +179,7 @@ fn prepare<'a>(config_path: &Path, loaded: &'a LoadedConfig, name: &str) -> Resu
     Ok(Prepared {
         config,
         manifest,
+        manifest_path: manifest_path.clone(),
         argv,
         limits,
         landing_dir,
@@ -313,6 +327,12 @@ pub async fn execute_connector_load(params: &ConnectorLoadParams<'_>) -> Connect
             commit_seq_after: commit_seq_before,
             adopted_expired_claim: false,
             egress_hosts: prepared.manifest.egress_hosts.clone(),
+            license: prepared
+                .manifest
+                .license
+                .clone()
+                .unwrap_or_else(|| crate::output::UNKNOWN_CONNECTOR_LICENSE.to_string()),
+            support_tier: prepared.manifest.support_tier.into(),
             error: None,
         },
         files: Vec::new(),
@@ -1212,7 +1232,7 @@ async fn count_rows(warehouse: &dyn WarehouseAdapter, table_ref: &str) -> Result
 /// Refuse an append whose Parquet columns differ (by name or type) from the
 /// first file's. A load by position would otherwise put values in the wrong
 /// columns.
-fn same_parquet_schema(first: &Path, other: &Path) -> Result<()> {
+pub(crate) fn same_parquet_schema(first: &Path, other: &Path) -> Result<()> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
     let columns = |path: &Path| -> Result<Vec<(String, String)>> {
         let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;

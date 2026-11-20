@@ -413,6 +413,12 @@ pub struct RunOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) retry_of: Option<String>,
+    /// Models an enforced `[[tests]]` failure marked failed after their write.
+    /// `to_run_record` records them as failed executions, as it does for a
+    /// volume breach. Not part of the JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) test_failed_models: std::collections::BTreeSet<String>,
     /// `errors` index -> the model whose measurement in `failed_attempts`
     /// belongs to that entry. Matching by entry, never by name, so a
     /// replication table that shares a model's bare name gets nothing.
@@ -449,6 +455,13 @@ pub struct RunOutput {
     /// or without models, never has it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_statuses: Vec<ModelRunStatusOutput>,
+    /// The `[[tests]]` this run evaluated after building models, one entry per
+    /// test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run
+    /// --tests`). Omitted when no test ran, so a default run is unchanged on
+    /// the wire. The same list is persisted on the run record, where `rocky
+    /// plan promote` reads it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<RunTestResultOutput>,
     pub check_results: Vec<TableCheckOutput>,
     /// Row-quarantine outcomes — one entry per table the quality
     /// pipeline quarantined. Empty for runs that did not use
@@ -2026,6 +2039,38 @@ pub struct ModelRunStatusOutput {
     /// reach this one. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+}
+
+/// One `[[tests]]` outcome on [`RunOutput::test_results`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RunTestResultOutput {
+    /// The model the test belongs to.
+    pub model: String,
+    /// The test type (`not_null`, `unique`, `accepted_values`, ...).
+    pub test_type: String,
+    /// The column the test checks, when it checks one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// `error` or `warning`. Only `error` can fail a model.
+    pub severity: String,
+    /// `pass`, `fail`, or `error` (the test query could not run).
+    pub status: String,
+    /// What the test found, or why it could not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl From<&RunTestResultOutput> for rocky_core::state::RunTestRecord {
+    fn from(r: &RunTestResultOutput) -> Self {
+        Self {
+            model: r.model.clone(),
+            test_type: r.test_type.clone(),
+            column: r.column.clone(),
+            severity: r.severity.clone(),
+            status: r.status.clone(),
+            detail: r.detail.clone(),
+        }
+    }
 }
 
 /// One model withheld from a run because an upstream failed (or was itself
@@ -6252,6 +6297,60 @@ pub struct SeedTableOutput {
 
 // --- Load output ---
 
+/// JSON output for `rocky connector test <name>`.
+///
+/// The command runs the connector once per `[[run]]` in its
+/// `connector-test.toml`, feeding each run the state the run before it
+/// returned. It loads nothing and saves no state.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConnectorTestOutput {
+    pub version: String,
+    pub command: String,
+    /// The `[connector.<name>]` key.
+    pub connector: String,
+    /// The test spec that was read.
+    pub spec: String,
+    /// `true` when every run passed every check.
+    pub passed: bool,
+    /// One entry per run that started, in order. A failed run stops the
+    /// test, so later runs are not listed.
+    pub runs: Vec<ConnectorTestRunOutput>,
+    /// Problems that do not fail the test, such as a stale helper copy.
+    pub warnings: Vec<String>,
+}
+
+/// One run of `rocky connector test`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConnectorTestRunOutput {
+    /// 1 for the first run.
+    pub run: u32,
+    /// The rows the spec expects.
+    pub expected_rows: u64,
+    /// The rows the connector wrote; absent when the run failed before its
+    /// result was verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// Parquet files the run wrote.
+    pub files: u64,
+    /// The state check the spec declares for this run, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_check: Option<ConnectorTestStateCheck>,
+    pub passed: bool,
+    /// Why the run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A state check a `[[run]]` in `connector-test.toml` declares:
+/// `unchanged` (the run must return the state it was given) or `advanced`
+/// (the run must return another state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorTestStateCheck {
+    Unchanged,
+    Advanced,
+}
+
 /// JSON output for `rocky load`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct LoadOutput {
@@ -6282,6 +6381,32 @@ pub enum ConnectorLoadStatus {
     Failed,
 }
 
+/// Who supports a child connector, as its manifest declares: `reference`
+/// (the author says the Rocky project maintains and tests it), `community`
+/// (not tested in CI by the Rocky project) or `unknown` (the manifest does
+/// not say). The author declares it. Rocky does not verify it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorSupportTier {
+    Reference,
+    Community,
+    Unknown,
+}
+
+impl From<Option<rocky_core::connector::SupportTier>> for ConnectorSupportTier {
+    fn from(tier: Option<rocky_core::connector::SupportTier>) -> Self {
+        use rocky_core::connector::SupportTier;
+        match tier {
+            Some(SupportTier::Reference) => Self::Reference,
+            Some(SupportTier::Community) => Self::Community,
+            None => Self::Unknown,
+        }
+    }
+}
+
+/// The license a `rocky load` output reports when the manifest declares none.
+pub const UNKNOWN_CONNECTOR_LICENSE: &str = "unknown";
+
 /// The child connector part of a `rocky load --connector` result.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConnectorLoadInfo {
@@ -6301,6 +6426,11 @@ pub struct ConnectorLoadInfo {
     pub adopted_expired_claim: bool,
     /// The hosts the manifest declares. Declared, not enforced.
     pub egress_hosts: Vec<String>,
+    /// The `license` the manifest declares, or `unknown` when it declares
+    /// none. Declared, not checked.
+    pub license: String,
+    /// The `support_tier` the manifest declares, or `unknown`.
+    pub support_tier: ConnectorSupportTier,
     /// Why the run failed. Present only when `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -6724,6 +6854,8 @@ impl RunOutput {
             withheld_models: Default::default(),
             frozen_stop: false,
             retry_of: None,
+            test_failed_models: Default::default(),
+            test_results: Vec::new(),
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
@@ -6976,16 +7108,38 @@ impl RunOutput {
             tracing::warn!("{summary}");
         }
 
-        // Models an `error` volume breach marks failed. Each execution is
-        // failed by its own check, so a time-interval model fails only the
-        // partitions that breached; the model's `errors` entry is not
-        // recorded again for any of them (see below).
-        let volume_failed: std::collections::BTreeSet<String> = self
+        // Whether `tests_on_run = "enforce"` failed the model this
+        // materialization built. Matched on the Rocky model in
+        // `output_target` only: every transformation output carries it, the
+        // asset key's last segment is the table name (which differs when
+        // `[target] table` is set), and a replication table never matches.
+        let test_failed = |mat: &MaterializationOutput| {
+            mat.output_target
+                .as_ref()
+                .is_some_and(|target| self.test_failed_models.contains(&target.model))
+        };
+        // Models whose materialization below is recorded `failed`: an
+        // `error` volume breach, or a failing test under `tests_on_run =
+        // "enforce"`. Each execution is failed by its own check, so a
+        // time-interval model fails only the partitions that breached; the
+        // model's `errors` entry is not recorded again for any of them (see
+        // below). A model that failed with no materialization in this run
+        // keeps its `errors` entry, so the run record still holds a failed
+        // execution for it.
+        let failed_materialized: std::collections::BTreeSet<String> = self
             .materializations
             .iter()
-            .filter_map(|mat| mat.volume.as_ref())
-            .filter(|volume| volume.fails_the_build())
-            .map(|volume| volume.model.clone())
+            .filter_map(|mat| {
+                if let Some(volume) = mat.volume.as_ref().filter(|v| v.fails_the_build()) {
+                    Some(volume.model.clone())
+                } else if test_failed(mat) {
+                    mat.output_target
+                        .as_ref()
+                        .map(|target| target.model.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         let output_volumes: Vec<rocky_core::state::OutputVolumeRecord> = self
             .materializations
@@ -7023,6 +7177,7 @@ impl RunOutput {
                     .volume
                     .as_ref()
                     .is_some_and(VolumeCheckOutput::fails_the_build)
+                    || test_failed(mat)
                 {
                     "failed".to_string()
                 } else {
@@ -7085,9 +7240,9 @@ impl RunOutput {
             });
         }
 
-        // Models whose materializations above already record the volume
-        // failure (`volume_failed`). Their `errors` entry would be a
-        // second execution.
+        // Models whose materializations above already record the failure
+        // (`failed_materialized`). Their `errors` entry would be a second
+        // execution.
 
         for (idx, err) in self.errors.iter().enumerate() {
             // A run that stopped at its first failure reports one entry under
@@ -7101,7 +7256,10 @@ impl RunOutput {
                     .cloned()
                     .unwrap_or_else(|| "<unknown>".to_string())
             });
-            if volume_failed.contains(&model_name) {
+            // A failed replication copy (it carries its own attempts) is
+            // never the model's duplicate, even when it shares the name.
+            if failed_materialized.contains(&model_name) && !self.table_attempts.contains_key(&idx)
+            {
                 continue;
             }
             // The retry loop's measurement for this model, when it ran
@@ -7192,6 +7350,7 @@ impl RunOutput {
             rocky_version: audit.rocky_version,
             rocky_branch: audit.rocky_branch,
             retry_of: self.retry_of.clone(),
+            test_results: self.test_results.iter().map(Into::into).collect(),
             run_scope: Some(audit.run_scope),
             check_outcomes,
             pipeline: None,
@@ -9571,6 +9730,120 @@ mod run_record_tests {
         );
     }
 
+    fn record_of(out: &RunOutput) -> rocky_core::state::RunRecord {
+        let start = fixed_start();
+        out.to_run_record(
+            "run-tests",
+            start,
+            start + chrono::Duration::seconds(5),
+            "cfghash".to_string(),
+            RunTrigger::Manual,
+            RunStatus::Failure,
+            RunRecordAudit::test_sentinels(),
+        )
+    }
+
+    fn model_mat(model: &str, table: &str) -> MaterializationOutput {
+        let mut m = mat(&["s", table], 10, None, fixed_start());
+        m.output_target = Some(rocky_core::state::RecordedTarget {
+            model: model.to_string(),
+            catalog: "c".to_string(),
+            schema: "s".to_string(),
+            table: table.to_string(),
+        });
+        m
+    }
+
+    fn model_error(out: &mut RunOutput, model: &str) {
+        out.errors.push(TableErrorOutput {
+            asset_key: vec!["s".to_string(), model.to_string()],
+            error: "failed a test".to_string(),
+            failure_kind: FailureKind::default(),
+            cooldown_seconds: None,
+        });
+        out.error_models
+            .insert(out.errors.len() - 1, model.to_string());
+    }
+
+    /// An enforce failure with no materialization (a time-interval model that
+    /// wrote no partition) keeps its `errors` entry: one failed execution.
+    #[test]
+    fn a_test_failure_with_no_materialization_is_one_failed_execution() {
+        let mut out = RunOutput::new(String::new(), 5_000, 1);
+        out.test_failed_models.insert("daily".to_string());
+        model_error(&mut out, "daily");
+        let record = record_of(&out);
+        let daily: Vec<_> = record
+            .models_executed
+            .iter()
+            .filter(|e| e.model_name == "daily")
+            .collect();
+        assert_eq!(daily.len(), 1, "{:?}", record.models_executed);
+        assert_eq!(daily[0].status, "failed");
+    }
+
+    /// A failed replication copy of a table that shares a failed model's
+    /// name keeps its own failed execution.
+    #[test]
+    fn a_failed_same_named_replication_copy_keeps_its_execution() {
+        let mut out = RunOutput::new(String::new(), 5_000, 1);
+        out.test_failed_models.insert("daily".to_string());
+        out.materializations.push(model_mat("daily", "daily"));
+        out.errors.push(TableErrorOutput {
+            asset_key: vec!["raw".to_string(), "daily".to_string()],
+            error: "copy failed".to_string(),
+            failure_kind: FailureKind::default(),
+            cooldown_seconds: None,
+        });
+        out.error_models.insert(0, "daily".to_string());
+        out.table_attempts.insert(
+            0,
+            crate::commands::resilience::FailedModelAttempts {
+                duration_ms: 7,
+                attempts: Vec::new(),
+            },
+        );
+        let record = record_of(&out);
+        let failed = record
+            .models_executed
+            .iter()
+            .filter(|e| e.model_name == "daily" && e.status == "failed")
+            .count();
+        assert_eq!(failed, 2, "{:?}", record.models_executed);
+    }
+
+    /// Every partition of a model that failed enforce is recorded failed,
+    /// matched by model name though the table is named otherwise, and the
+    /// `errors` entry is not recorded a second time. A replication table
+    /// of the model's name is not touched.
+    #[test]
+    fn a_test_failure_fails_every_partition_by_model_name_only() {
+        let mut out = RunOutput::new(String::new(), 5_000, 1);
+        out.test_failed_models.insert("daily".to_string());
+        for _ in 0..3 {
+            out.materializations.push(model_mat("daily", "daily_tbl"));
+        }
+        out.materializations
+            .push(mat(&["raw", "daily"], 10, None, fixed_start()));
+        model_error(&mut out, "daily");
+        let record = record_of(&out);
+        let statuses: Vec<(&str, &str)> = record
+            .models_executed
+            .iter()
+            .map(|e| (e.model_name.as_str(), e.status.as_str()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("daily_tbl", "failed"),
+                ("daily_tbl", "failed"),
+                ("daily_tbl", "failed"),
+                ("daily", "success"),
+            ],
+            "{statuses:?}"
+        );
+    }
+
     /// The content-addressed consumer baseline (`consumed_column_baseline`)
     /// must land on the persisted `ModelExecution.upstream_freshness` — the
     /// 🔴 The load-bearing identity invariant for classified retry, at the
@@ -10497,6 +10770,20 @@ pub enum AuditEventKind {
     /// Rocky version. Fail-open: the gate is skipped and the promote
     /// proceeds, but the reason is recorded so the bypass is auditable.
     BreakingChangesGateSkipped,
+    /// Emitted when a model's newest test evidence on the branch holds an
+    /// error-severity `[[tests]]` failure and the promote was refused (#2609).
+    /// `reason` names the failing tests and the runs that recorded them.
+    FailingTestsBlocked,
+    /// Emitted when a model's newest test evidence holds a failing
+    /// error-severity test and the operator overrode the refusal with
+    /// `--allow-failing-tests`.
+    FailingTestsAllowed,
+    /// Emitted when the promote has no passing test evidence to rely on: the
+    /// branch has no run, its newest run failed, a model that declares
+    /// error-severity tests was last built with no recorded test result, or
+    /// the models could not be loaded to tell. A warning only: the promote
+    /// proceeds. `reason` says which.
+    TestEvidenceMissing,
     /// Emitted by `rocky plan promote` when the plan has been successfully
     /// written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an
     /// audit consumer can correlate plan creation to a subsequent
@@ -10707,6 +10994,9 @@ pub struct PromotePlan {
     /// Whether `--allow-breaking` was set at plan time.
     #[serde(default)]
     pub allow_breaking: bool,
+    /// Whether `--allow-failing-tests` was set at plan time.
+    #[serde(default)]
+    pub allow_failing_tests: bool,
     /// Per-model SQL plan, in dispatch order. SQL is persisted verbatim so
     /// `rocky apply` executes the exact statements generated at plan time.
     pub targets: Vec<PromoteTargetPlan>,

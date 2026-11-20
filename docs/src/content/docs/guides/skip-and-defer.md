@@ -171,7 +171,7 @@ report: FROM orders  ──rewrite──▶ FROM prod.orders
 - `--defer-to-state` and `--defer-to` cannot be combined.
 
 :::caution[Defer rewrites SQL with the Databricks dialect]
-To qualify deferred upstream references, `--defer` parses each selected model's SQL. The parser uses Rocky's Databricks dialect. A few constructs it does not yet support therefore **cannot be rewritten**, and fail with a clear error: `SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals. The error names the model and tells you to build it **without `--defer`**, or to adjust its SQL. Default-off means a plain run is unaffected.
+To qualify deferred upstream references, `--defer` parses each selected model's SQL. The parser uses Rocky's Databricks dialect. A few constructs it does not yet support therefore **cannot be rewritten**, and fail with a clear error: trailing-comma select lists and `STRUCT(...)` literals. Star `EXCEPT`, `EXCLUDE` and `REPLACE` parse, so `--defer` rewrites a model that uses them. The error names the model and tells you to build it **without `--defer`**, or to adjust its SQL. Default-off means a plain run is unaffected.
 :::
 
 ## Full refresh: rebuild from scratch

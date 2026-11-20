@@ -8613,10 +8613,12 @@ adapter = "db"
                 ],
                 has_star: false,
                 unresolved_projections: 0,
+                star_columns_complete: false,
                 lineage_gaps: Some(Vec::new()),
                 upstream: vec![],
                 downstream: vec!["staging".to_string()],
                 intent: None,
+                reads: None,
             },
         );
         models.insert(
@@ -8632,10 +8634,12 @@ adapter = "db"
                 ],
                 has_star: false,
                 unresolved_projections: 0,
+                star_columns_complete: false,
                 lineage_gaps: Some(Vec::new()),
                 upstream: vec!["source_table".to_string()],
                 downstream: vec!["mart".to_string()],
                 intent: None,
+                reads: None,
             },
         );
         models.insert(
@@ -8646,10 +8650,12 @@ adapter = "db"
                 }],
                 has_star: false,
                 unresolved_projections: 0,
+                star_columns_complete: false,
                 lineage_gaps: Some(Vec::new()),
                 upstream: vec!["staging".to_string()],
                 downstream: vec![],
                 intent: None,
+                reads: None,
             },
         );
 

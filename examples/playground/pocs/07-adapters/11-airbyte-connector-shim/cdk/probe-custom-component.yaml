@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A probe for run-cdk.sh: orders-manifest.yaml, but its extractor is a custom
+# Python component. The shim never passes --components-path, and airbyte-cdk
+# treats a caller-supplied manifest's custom components as untrusted, so a run
+# with this manifest must fail. No `components.py` exists anywhere here.
+version: 6.0.0
+type: DeclarativeSource
+check:
+  type: CheckStream
+  stream_names:
+    - orders
+spec:
+  type: Spec
+  connection_specification:
+    type: object
+    required:
+      - base_url
+      - start_date
+      - end_date
+    properties:
+      base_url:
+        type: string
+      start_date:
+        type: string
+      end_date:
+        type: string
+streams:
+  - type: DeclarativeStream
+    name: orders
+    primary_key:
+      - id
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "{{ config['base_url'] }}"
+        path: /orders
+        http_method: GET
+        request_parameters:
+          updated_since: "{{ stream_interval.start_time }}"
+          updated_until: "{{ stream_interval.end_time }}"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: CustomRecordExtractor
+          class_name: components.OrdersExtractor
+    incremental_sync:
+      type: DatetimeBasedCursor
+      cursor_field: updated_at
+      datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+      cursor_granularity: PT1S
+      start_datetime:
+        type: MinMaxDatetime
+        datetime: "{{ config['start_date'] }}"
+        datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+      end_datetime:
+        type: MinMaxDatetime
+        datetime: "{{ config['end_date'] }}"
+        datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+      step: P1Y
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        $schema: http://json-schema.org/draft-07/schema#
+        additionalProperties: true
+        properties:
+          id:
+            type: integer
+          amount_cents:
+            type:
+              - "null"
+              - integer
+          updated_at:
+            type: string
+            format: date-time
