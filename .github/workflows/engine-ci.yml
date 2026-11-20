@@ -150,6 +150,8 @@ jobs:
     # (the detection job itself failed) runs the suite — fail closed.
     if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
+    # Normal runs take 12 to 16 minutes. 30 leaves room and stops a hang.
+    timeout-minutes: 30
     # CI-only: emit `line-tables-only` debuginfo on the dev+test profiles
     # instead of full debuginfo. Linking the workspace's test binaries with
     # full debuginfo dominated the build half of this job; line tables keep
