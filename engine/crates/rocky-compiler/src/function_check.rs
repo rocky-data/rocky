@@ -351,8 +351,14 @@ fn check_model(
     let mut diagnostics = Vec::new();
     for &dialect in dialects {
         let mut seen = HashSet::new();
-        for (name, line, col) in &visitor.found {
+        for (name, line, col, within_group) in &visitor.found {
             let lower = name.to_ascii_lowercase();
+            if dialect == FunctionDialect::DuckDb
+                && *within_group
+                && DUCKDB_WITHIN_GROUP_FORMS.contains(&lower.as_str())
+            {
+                continue;
+            }
             if dialect.knows(&lower) || !seen.insert(lower) {
                 continue;
             }
@@ -432,8 +438,8 @@ fn suggestion(name: &str, dialect: FunctionDialect) -> String {
 struct Calls<'r> {
     registry: &'r FunctionRegistry,
     /// Unqualified, unquoted calls the project does not declare:
-    /// `(name as written, line, column)`.
-    found: Vec<(String, usize, usize)>,
+    /// `(name as written, line, column, has WITHIN GROUP)`.
+    found: Vec<(String, usize, usize, bool)>,
 }
 
 impl Visitor for Calls<'_> {
@@ -444,14 +450,13 @@ impl Visitor for Calls<'_> {
             && let [ast::ObjectNamePart::Identifier(ident)] = function.name.0.as_slice()
             && ident.quote_style.is_none()
             && !self.registry.declares(&ident.value.to_ascii_lowercase())
-            && !(!function.within_group.is_empty()
-                && DUCKDB_WITHIN_GROUP_FORMS.contains(&ident.value.to_ascii_lowercase().as_str()))
         {
             let span = expr.span();
             self.found.push((
                 ident.value.clone(),
                 span.start.line as usize,
                 span.start.column as usize,
+                !function.within_group.is_empty(),
             ));
         }
         std::ops::ControlFlow::Continue(())
@@ -890,6 +895,19 @@ mod tests {
             let diags = run(&format!("SELECT {call} AS c FROM t"), &duckdb(), &registry);
             assert!(diags.is_empty(), "{call}: {diags:?}");
         }
+    }
+
+    #[test]
+    fn only_duckdb_exempts_the_within_group_percentiles() {
+        // The exemption is DuckDB's rewrite; Trino's list does not hold them.
+        let registry = FunctionRegistry::default();
+        let diags = run(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) AS c FROM t",
+            &Some(OperandDialect::Trino).into(),
+            &registry,
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(&*diags[0].code, "W057");
     }
 
     #[test]
