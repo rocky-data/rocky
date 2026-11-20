@@ -10,7 +10,7 @@
 //!   rocky run (agent, [policy] set)
 //!     pre-run   compiled models / model-less writes ── evaluate(run) ── record
 //!     in-run    replication targets after discovery ── evaluate(run) ── record
-//!   verdict     allow → run │ require_review → warn, run │ deny → refuse
+//!   verdict     allow → run │ require_review → refuse │ deny → refuse
 //! ```
 //!
 //! Scope, as ruled for this change:
@@ -23,9 +23,8 @@
 //!   for it: only an explicit `run` rule governs it. The documented agent
 //!   flow (`run --branch`, then a gated `plan promote`) keeps working under
 //!   `default_agent_effect = "deny"`.
-//! - `require_review` is recorded and warned about but not enforced: a
-//!   one-step run has no plan to review. Refusing it is a separate change
-//!   that waits on the owner.
+//! - `require_review` refuses: a one-step run has no plan to review, so the
+//!   verdict cannot be satisfied here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -401,15 +400,18 @@ fn enforce(verdict: PolicyGate, plan_id: &str, branch: bool) -> Result<()> {
             rule_id,
             reason,
         } => {
-            tracing::warn!(
-                plan_id,
-                model = model.as_str(),
-                "policy resolved require_review for agent `rocky run` on model '{model}'{} — \
-                 {reason}. A one-step run has no plan to review, so this verdict is recorded \
-                 but not enforced; the run proceeds",
+            let alternatives = if branch {
+                "Have a human run it, or change the `run` rule"
+            } else {
+                "Build it on a branch (`rocky run --branch <name>`, then `rocky plan promote`), \
+                 use a reviewed plan (`rocky plan`, `rocky review <plan-id> --approve`, \
+                 `rocky apply <plan-id>`), or have a human run it"
+            };
+            bail!(
+                "policy requires review for agent `rocky run` ({plan_id}): model '{model}'{} — \
+                 {reason}. A one-step run has no plan to review. {alternatives}.",
                 rule_suffix(rule_id)
-            );
-            Ok(())
+            )
         }
         PolicyGate::Deny {
             model,
