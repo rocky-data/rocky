@@ -52,8 +52,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart,
-    Query, TableFactor, UnaryOperator, Value, Visit, Visitor,
+    DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget,
+    ObjectNamePart, Query, TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 use sqlparser::dialect::{
     BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect,
@@ -1020,6 +1020,17 @@ impl Visitor for Walker<'_> {
                     context: self.context.to_string(),
                 })
             }
+            // `x IN other_table` and `x IN some_fn(1)` (sqlparser 0.64, dialects
+            // with `supports_in_table_expression`, GenericDialect among them)
+            // read a table or call a table function. The visitor has no
+            // relation hook that reaches them, so refuse the target here.
+            Expr::In {
+                target: InTarget::Table { .. },
+                ..
+            } => ControlFlow::Break(ValidationError::ExpressionSubquery {
+                context: self.context.to_string(),
+                use_: self.use_,
+            }),
             Expr::Function(function) => {
                 let parts = &function.name.0;
                 let [ObjectNamePart::Identifier(ident)] = parts.as_slice() else {
@@ -1743,6 +1754,65 @@ mod tests {
                 "{expr} must be refused as a subquery: {:?}",
                 check(expr)
             );
+        }
+    }
+
+    /// `IN <table>` and `IN <function>(..)` read another table. sqlparser 0.64
+    /// parses them under `GenericDialect` (so for Trino, unknown adapters and
+    /// an unset dialect); 0.63 rejected them. Every dialect `dialect_for`
+    /// returns must refuse them, and the plain list form must still pass.
+    #[test]
+    fn in_with_a_table_or_function_target_is_refused_on_every_dialect() {
+        const DIALECTS: [&str; 10] = [
+            "duckdb",
+            "snowflake",
+            "bigquery",
+            "databricks",
+            "postgres",
+            "redshift",
+            "clickhouse",
+            "sqlserver",
+            "generic",
+            "trino",
+        ];
+        for dialect in DIALECTS {
+            for expr in [
+                "id IN other_table",
+                "id IN some_fn(1)",
+                "id NOT IN other_table",
+            ] {
+                let result = check_on(dialect, expr);
+                assert!(
+                    matches!(
+                        result,
+                        Err(ValidationError::ExpressionSubquery { .. }
+                            | ValidationError::ExpressionUnparseable { .. }
+                            | ValidationError::ExpressionTrailingTokens { .. })
+                    ),
+                    "{expr} on {dialect} must be refused: {result:?}"
+                );
+            }
+            for expr in ["id IN (1, 2)", "id NOT IN (1, 2)"] {
+                assert!(
+                    check_on(dialect, expr).is_ok(),
+                    "{expr} on {dialect} must pass: {:?}",
+                    check_on(dialect, expr)
+                );
+            }
+        }
+        // The dialects `dialect_for` maps to `GenericDialect` parse the table
+        // form, so the walker itself must refuse it as a table read.
+        for dialect in ["generic", "trino", "no-such-adapter"] {
+            for expr in ["id IN other_table", "id IN some_fn(1)"] {
+                assert!(
+                    matches!(
+                        check_on(dialect, expr),
+                        Err(ValidationError::ExpressionSubquery { .. })
+                    ),
+                    "{expr} on {dialect} must be refused as a table read: {:?}",
+                    check_on(dialect, expr)
+                );
+            }
         }
     }
 
