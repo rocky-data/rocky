@@ -504,12 +504,13 @@ fn has_only_plain_stars(sql: &str) -> bool {
                 partitions,
                 json_path: None,
                 sample: None,
-                index_hints,
+                index_directives,
+                inheritance: None,
                 ..
             } if alias.as_ref().is_none_or(|a| a.columns.is_empty())
                 && with_hints.is_empty()
                 && partitions.is_empty()
-                && index_hints.is_empty()
+                && index_directives.is_empty()
         )
     }
     let Ok(statements) =

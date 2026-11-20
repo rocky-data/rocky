@@ -53,7 +53,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use sqlparser::ast::{
-    self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, InTarget,
     JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
     TableWithJoins,
 };
@@ -722,7 +722,11 @@ impl<'s, 'a> Binder<'s, 'a> {
         let merged_join = select.from.iter().flat_map(|t| &t.joins).any(|join| {
             matches!(
                 join_constraint(&join.join_operator),
-                Some(JoinConstraint::Using(_) | JoinConstraint::Natural)
+                Some(
+                    JoinConstraint::Using(_)
+                        | JoinConstraint::UsingAlias(..)
+                        | JoinConstraint::Natural
+                )
             )
         });
 
@@ -837,7 +841,8 @@ impl<'s, 'a> Binder<'s, 'a> {
                 partitions,
                 json_path,
                 sample,
-                index_hints,
+                index_directives,
+                inheritance: _,
             } => {
                 let parts: Option<Vec<&str>> = name
                     .0
@@ -856,7 +861,7 @@ impl<'s, 'a> Binder<'s, 'a> {
                     && partitions.is_empty()
                     && json_path.is_none()
                     && sample.is_none()
-                    && index_hints.is_empty()
+                    && index_directives.is_empty()
                     && alias.as_ref().is_none_or(|alias| alias.columns.is_empty());
                 let source = parts.filter(|_| plain).and_then(|parts| {
                     let dotted = parts.join(".").to_lowercase();
@@ -939,7 +944,11 @@ impl<'s, 'a> Binder<'s, 'a> {
             | Expr::IsNotFalse(expr)
             | Expr::Cast { expr, .. }
             | Expr::Extract { expr, .. } => self.check_expr(expr, chain, ctes),
-            Expr::InList { expr, list, .. } => {
+            Expr::In {
+                expr,
+                target: InTarget::List(list),
+                ..
+            } => {
                 self.check_expr(expr, chain, ctes);
                 for item in list {
                     self.check_expr(item, chain, ctes);
@@ -985,7 +994,11 @@ impl<'s, 'a> Binder<'s, 'a> {
             } => {
                 self.check_query(query, chain, ctes);
             }
-            Expr::InSubquery { expr, subquery, .. } => {
+            Expr::In {
+                expr,
+                target: InTarget::Subquery(subquery),
+                ..
+            } => {
                 self.check_expr(expr, chain, ctes);
                 self.check_query(subquery, chain, ctes);
             }

@@ -120,7 +120,7 @@
 use std::collections::HashSet;
 
 use indexmap::IndexMap;
-use sqlparser::ast::{self, Expr, SetExpr, Spanned, Statement, TableFactor};
+use sqlparser::ast::{self, Expr, InTarget, SetExpr, Spanned, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
 use crate::diagnostic::{Diagnostic, E042, E043, SourceSpan, W042, W043};
@@ -796,8 +796,10 @@ fn check_expr<'a>(
                 check_expr(e, scope, lookup, ctx);
             }
         }
-        Expr::InList {
-            expr: inner, list, ..
+        Expr::In {
+            expr: inner,
+            target: InTarget::List(list),
+            ..
         } => {
             for item in list {
                 check_comparison(expr, inner, item, scope, ctx);
@@ -851,9 +853,9 @@ fn check_expr<'a>(
                 }
             }
         }
-        Expr::InSubquery {
+        Expr::In {
             expr: inner,
-            subquery,
+            target: InTarget::Subquery(subquery),
             ..
         } => {
             check_expr(inner, scope, lookup, ctx);

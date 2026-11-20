@@ -772,7 +772,9 @@ impl AstVisitor {
         }
         for twj in &select.from {
             for join in &twj.joins {
-                if let Some(JoinConstraint::Using(cols)) = join_constraint(join) {
+                if let Some(JoinConstraint::Using(cols) | JoinConstraint::UsingAlias(cols, _)) =
+                    join_constraint(join)
+                {
                     for name in cols {
                         if let Some(last) = name.0.last().and_then(|p| p.as_ident()) {
                             collector.ignore.insert(last.value.to_ascii_lowercase());

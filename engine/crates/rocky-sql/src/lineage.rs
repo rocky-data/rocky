@@ -2363,7 +2363,7 @@ fn extract_row_selection(
                 Some(JoinConstraint::On(expr)) => {
                     push(column_refs(expr), RowSelectionKind::JoinKey, None);
                 }
-                Some(JoinConstraint::Using(names)) => {
+                Some(JoinConstraint::Using(names) | JoinConstraint::UsingAlias(names, _)) => {
                     // `USING (k)` reads `k` from the right relation and from
                     // the left side. The left side is unambiguous only when a
                     // single relation precedes this join.
