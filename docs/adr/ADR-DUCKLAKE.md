@@ -129,10 +129,14 @@ Reviewer: Claude Opus 5.5, a fresh read-only agent that did not author the rulin
 | 5 | A DuckLake scan reports `rows_scanned: 0`. | Fixed: counted as unattributed, measured and unit-tested on the real shape. |
 | 6 | A lake made elsewhere keeps a relative stored data path. A missing metadata file starts a new lake. | First half fixed: a relative stored path is refused (D1). Second half rebutted: it matches how a missing main file behaves; recorded in Consequences. |
 | 7 | The hidden metadata catalog can be named as a target. | Fixed: `CatalogKind::DuckLakeMetadata`, refused by every gate (second red team, finding 3). |
-| 8 | At launch, `delete_insert` committed the delete before the insert. | The partition replacement fix groups all writes in one transaction with rollback (#2605). |
+| 8 | `delete_insert` is two autocommit statements, so two snapshots. | Recorded in Consequences. Native DuckDB has the same gap; a wrapping transaction needs its own rollback path, so it is a separate change. |
 | 9 | The matrix is otherwise sound; `content_addressed` was missing from the ruling's list; some refusals are scope choices. | Fixed: D3 lists `content_addressed` and says which refusals are scope choices. |
 | 10 | A defaulted scope needs a trailing `/`, and must count as a scope with two secrets. | Fixed (D1). |
 | 11 | The supported list rests on a non-required job. | Accepted: the PR that lands this ADR runs the conformance workflow once and records the run. |
+
+### Follow-up to finding 8 (2026-11-21, #2605 / PR #2606)
+
+The original disposition above records the launch decision. The partition replacement fix now stages the incoming rows before deleting anything. It runs the delete and insert in one transaction for native DuckDB and DuckLake. A failed insert rolls back the replacement. `rocky emit-sql` includes the transaction; run exported scripts with `duckdb -bail` to stop at the first error.
 
 ## Red team of the implementation (2026-11-12)
 
