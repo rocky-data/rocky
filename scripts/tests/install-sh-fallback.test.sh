@@ -48,11 +48,12 @@ cat >"$STUB_BIN/curl" <<'STUB'
 printf 'curl' >>"$STUB_LOG"
 printf ' %q' "$@" >>"$STUB_LOG"
 printf '\n' >>"$STUB_LOG"
-out="" head=0 url=""
+out="" head=0 url="" fmt=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -o) out="$2"; shift 2 ;;
-        -w|--retry) shift 2 ;;
+        -w) fmt="$2"; shift 2 ;;
+        --retry) shift 2 ;;
         -sIL) head=1; shift ;;
         -*) shift ;;
         *) url="$1"; shift ;;
@@ -73,7 +74,8 @@ if [[ "$head" == 1 ]]; then
     for pair in $STUB_HEAD; do
         [[ "${pair%%=*}" == "$tag" ]] && status="${pair#*=}"
     done
-    printf '%s' "$status"
+    # Like real curl, print the status only when asked for it with -w.
+    [[ "$fmt" == '%{http_code}' ]] && printf '%s' "$status"
     exit 0
 fi
 case "$url" in
@@ -91,7 +93,10 @@ STUB
 # config isolation the fallback promises.
 cat >"$STUB_BIN/git" <<'STUB'
 #!/usr/bin/env bash
-printf 'git cwd=%s global=%s nosystem=%s' "$PWD" "${GIT_CONFIG_GLOBAL:-}" "${GIT_CONFIG_NOSYSTEM:-}" >>"$STUB_LOG"
+printf 'git cwd=%s global=%s nosystem=%s prompt=%s home=%s xdg=%s gitdir=%s params=%s count=%s' \
+    "$PWD" "${GIT_CONFIG_GLOBAL:-}" "${GIT_CONFIG_NOSYSTEM:-}" "${GIT_TERMINAL_PROMPT:-}" \
+    "${HOME:-}" "${XDG_CONFIG_HOME:-}" "${GIT_DIR-unset}" "${GIT_CONFIG_PARAMETERS-unset}" \
+    "${GIT_CONFIG_COUNT-unset}" >>"$STUB_LOG"
 printf ' %q' "$@" >>"$STUB_LOG"
 printf '\n' >>"$STUB_LOG"
 if [[ "$STUB_GIT" != "ok" ]]; then
@@ -119,6 +124,9 @@ run_case() {
         PATH="$STUB_BIN:$PATH" \
         STUB_LOG="$LOG" STUB_FIXTURE="$FIXTURE/rocky.tar.gz" \
         GITHUB_TOKEN="$TOKEN_SENTINEL" \
+        GIT_DIR="$WORK/inherited.git" GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: bearer $TOKEN_SENTINEL" \
+        GIT_CONFIG_PARAMETERS="'http.extraheader'='AUTHORIZATION: bearer $TOKEN_SENTINEL'" \
         ROCKY_INSTALL_DIR="$DEST" \
         bash "$UNDER_TEST" </dev/null >"$OUT" 2>&1
     RC=$?
@@ -142,7 +150,7 @@ run_case fallback STUB_API=fail STUB_GIT=ok STUB_HEAD="engine-v1.10.0=200 engine
 grep -q "Installing Rocky engine-v1.10.0" "$OUT" || fail "fallback: wrong version" "$OUT"
 grep -q "git ls-remote" "$OUT" || fail "fallback: no notice of the fallback" "$OUT"
 [[ -x "$DEST/rocky" ]] || fail "fallback: rocky not installed" "$OUT"
-grep -q '^git cwd=/ global=/dev/null nosystem=1 ls-remote --tags --refs https://github.com/rocky-data/rocky.git engine-v\\\*$' "$LOG" \
+grep -q '^git cwd=/ global=/dev/null nosystem=1 prompt=0 home=/nonexistent-rocky-install xdg=/nonexistent-rocky-install gitdir=unset params=unset count=unset ls-remote --tags --refs https://github.com/rocky-data/rocky.git engine-v\\\*$' "$LOG" \
     || fail "fallback: git ran without the config isolation" "$LOG"
 echo "ok: API failure falls back to the newest tag with assets"
 

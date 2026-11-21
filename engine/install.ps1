@@ -103,10 +103,18 @@ function Resolve-VersionFromTags {
     }
     # Run git outside any repository and with no user or system config, so it
     # cannot pick up a checkout's auth header, a credential helper or a URL
-    # rewrite. Its exit code is read from $LASTEXITCODE: redirecting a native
-    # command's stderr under ErrorActionPreference Stop can throw on Windows
-    # PowerShell 5.1.
-    $GitEnv = @{ GIT_CONFIG_GLOBAL = '/dev/null'; GIT_CONFIG_NOSYSTEM = '1'; GIT_TERMINAL_PROMPT = '0' }
+    # rewrite that carries a token. GIT_CONFIG_GLOBAL needs git 2.32 or newer,
+    # so HOME and XDG_CONFIG_HOME also point at a directory that does not
+    # exist, for older git. Config passed through the environment is cleared
+    # ($null removes the variable while git runs). Its exit code is read from
+    # $LASTEXITCODE: redirecting a native command's stderr under
+    # ErrorActionPreference Stop can throw on Windows PowerShell 5.1.
+    $NoDir = Join-Path ([System.IO.Path]::GetTempPath()) "nonexistent-rocky-install-$(Get-Random)"
+    $GitEnv = @{
+        GIT_CONFIG_GLOBAL = '/dev/null'; GIT_CONFIG_NOSYSTEM = '1'; GIT_TERMINAL_PROMPT = '0'
+        HOME = $NoDir; XDG_CONFIG_HOME = $NoDir
+        GIT_DIR = $null; GIT_CONFIG_PARAMETERS = $null; GIT_CONFIG_COUNT = $null
+    }
     $Saved = @{}
     foreach ($Name in $GitEnv.Keys) {
         $Saved[$Name] = [Environment]::GetEnvironmentVariable($Name)

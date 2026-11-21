@@ -141,9 +141,15 @@ resolve_version_from_tags() {
     fi
     # Run git outside any repository and with no user or system config, so it
     # cannot pick up a checkout's auth header, a credential helper or a URL
-    # rewrite. stdin is closed because this script is often piped into bash.
+    # rewrite that carries a token. GIT_CONFIG_GLOBAL needs git 2.32 or newer,
+    # so HOME and XDG_CONFIG_HOME also point at a directory that does not
+    # exist, for older git. Config passed through the environment (GIT_DIR,
+    # GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT) is cleared. stdin is closed
+    # because this script is often piped into bash.
     local refs
-    if ! refs="$(cd / && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+    if ! refs="$(cd / && env -u GIT_DIR -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+            HOME=/nonexistent-rocky-install XDG_CONFIG_HOME=/nonexistent-rocky-install \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
             git ls-remote --tags --refs "https://github.com/${REPO}.git" "${TAG_PREFIX}*" </dev/null)"; then
         echo "Error: git ls-remote against https://github.com/${REPO}.git failed. Set ROCKY_VERSION and retry." >&2
         return 1
