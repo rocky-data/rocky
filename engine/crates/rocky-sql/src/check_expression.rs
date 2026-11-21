@@ -27,7 +27,9 @@
 //! 1. anything that does not parse as exactly one expression under the
 //!    target dialect (trailing tokens included — `x) OR 1=1 --` must not
 //!    be able to close the generated `NOT (` and add clauses);
-//! 2. any nested query, wherever it appears;
+//! 2. any nested query, wherever it appears, and any `IN` whose target is a
+//!    table or table function — on ClickHouse that includes `IN (<name>)`
+//!    with one name (#2713);
 //! 3. any qualified function name — that is how UDFs, remote functions and
 //!    plugin functions are reached;
 //! 4. any unqualified function not in [`CHECK_EXPRESSION_FUNCTIONS`];
@@ -910,6 +912,19 @@ impl ExpressionUse {
     }
 }
 
+// ClickHouse, minus the unparenthesised `IN` target. ClickHouse reads
+// `x IN t` as a read of table `t`, and sqlparser parses it as a one-element
+// list, so the walker could not tell it from `x IN (1)` (#2713). With the
+// flag off, `x IN t` and `x IN f(1)` do not parse. `preserve_type_id` keeps
+// every ClickHouse-specific parser path (`dialect_of!`) and lets the walker
+// recognise the dialect with `is::<ClickHouseDialect>()`.
+sqlparser::derive_dialect!(
+    CheckExpressionClickHouseDialect,
+    ClickHouseDialect,
+    preserve_type_id = true,
+    overrides = { supports_in_unparenthesized_expr = false }
+);
+
 /// The sqlparser dialect to parse an expression under, from a Rocky
 /// `SqlDialect::name()`.
 ///
@@ -917,6 +932,10 @@ impl ExpressionUse {
 /// accepts a superset of the syntax the others share. Unknown names take
 /// the same route — parsing under a broader dialect can only *accept* more
 /// syntax, and acceptance still has to clear the walker below.
+///
+/// ClickHouse parses under a derived dialect that refuses an unparenthesised
+/// `IN` target, because every caller of this function parses a check
+/// expression.
 pub fn dialect_for(name: &str) -> Box<dyn Dialect> {
     match name.to_ascii_lowercase().as_str() {
         "duckdb" => Box::new(DuckDbDialect),
@@ -925,7 +944,7 @@ pub fn dialect_for(name: &str) -> Box<dyn Dialect> {
         "databricks" => Box::new(DatabricksDialect),
         "postgres" => Box::new(PostgreSqlDialect {}),
         "redshift" => Box::new(RedshiftSqlDialect {}),
-        "clickhouse" => Box::new(ClickHouseDialect {}),
+        "clickhouse" => Box::new(CheckExpressionClickHouseDialect::new()),
         "sqlserver" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect),
     }
@@ -967,7 +986,11 @@ pub fn validate_check_expression(
             use_,
         });
     }
-    let mut walker = Walker { context, use_ };
+    let mut walker = Walker {
+        context,
+        use_,
+        clickhouse: dialect.is::<ClickHouseDialect>(),
+    };
     match expr.visit(&mut walker) {
         ControlFlow::Break(err) => Err(err),
         ControlFlow::Continue(()) => Ok(()),
@@ -982,6 +1005,22 @@ pub fn validate_check_expression(
 struct Walker<'a> {
     context: &'a str,
     use_: ExpressionUse,
+    /// The expression parsed under ClickHouse, where `x IN (t)` with one
+    /// name reads table `t`.
+    clickhouse: bool,
+}
+
+/// True when `list` is one bare or qualified name, seen through any
+/// parentheses: `(t)`, `(db.t)`, `((t))`. On ClickHouse that is a table read.
+fn is_single_name(list: &[Expr]) -> bool {
+    let [only] = list else {
+        return false;
+    };
+    let mut expr = only;
+    while let Expr::Nested(inner) = expr {
+        expr = inner;
+    }
+    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
 
 impl Visitor for Walker<'_> {
@@ -1031,6 +1070,19 @@ impl Visitor for Walker<'_> {
                 context: self.context.to_string(),
                 use_: self.use_,
             }),
+            // ClickHouse reads `x IN (t)` as a read of table `t` when `t` is a
+            // single name (#2713). sqlparser parses it as a one-element list,
+            // so refuse that shape here. A list of two or more is a value
+            // list and still passes.
+            Expr::In {
+                target: InTarget::List(list),
+                ..
+            } if self.clickhouse && is_single_name(list) => {
+                ControlFlow::Break(ValidationError::ExpressionInSingleName {
+                    context: self.context.to_string(),
+                    use_: self.use_,
+                })
+            }
             Expr::Function(function) => {
                 let parts = &function.name.0;
                 let [ObjectNamePart::Identifier(ident)] = parts.as_slice() else {
@@ -1776,16 +1828,11 @@ mod tests {
             "trino",
         ];
         for dialect in DIALECTS {
-            // ClickHouse parses an unparenthesised IN as a list, so these three
-            // inputs are not refused on that dialect; known gap, tracked in #2713.
             for expr in [
                 "id IN other_table",
                 "id IN some_fn(1)",
                 "id NOT IN other_table",
             ] {
-                if dialect == "clickhouse" {
-                    continue;
-                }
                 let result = check_on(dialect, expr);
                 assert!(
                     matches!(
@@ -1822,6 +1869,55 @@ mod tests {
                     check_on(dialect, expr)
                 );
             }
+        }
+    }
+
+    /// ClickHouse reads `x IN (t)` with one name as a read of table `t`
+    /// (#2713). One name, qualified or not, in any number of parentheses, is
+    /// refused there, and the message says to write `=`.
+    #[test]
+    fn clickhouse_in_with_one_parenthesised_name_is_refused() {
+        for expr in [
+            "id IN (other_table)",
+            "id NOT IN (other_table)",
+            "id IN ((other_table))",
+            "id IN (db.other_table)",
+        ] {
+            let result = check_on("clickhouse", expr);
+            let Err(err @ ValidationError::ExpressionInSingleName { .. }) = &result else {
+                panic!("{expr} on clickhouse must be refused as a table read: {result:?}");
+            };
+            assert!(
+                err.to_string().contains("write `=`"),
+                "the refusal must tell the user to write `=`: {err}"
+            );
+        }
+        // The same text is a one-column comparison elsewhere, so other
+        // dialects keep accepting it.
+        for dialect in ["duckdb", "postgres", "generic"] {
+            assert!(
+                check_on(dialect, "id IN (other_col)").is_ok(),
+                "id IN (other_col) on {dialect} must pass: {:?}",
+                check_on(dialect, "id IN (other_col)")
+            );
+        }
+    }
+
+    /// A list of two or more names is a value list on ClickHouse too, and
+    /// still passes. So does a one-element list that is not a name.
+    #[test]
+    fn clickhouse_in_with_a_list_of_names_passes() {
+        for expr in [
+            "id IN (a, b)",
+            "id NOT IN (a, b)",
+            "id IN (1)",
+            "id IN ('x')",
+        ] {
+            assert!(
+                check_on("clickhouse", expr).is_ok(),
+                "{expr} on clickhouse must pass: {:?}",
+                check_on("clickhouse", expr)
+            );
         }
     }
 

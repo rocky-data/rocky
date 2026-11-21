@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On ClickHouse, a check expression can no longer read another table through `IN` (#2713). `id IN other_table`, `id NOT IN other_table` and `id IN some_fn(1)` no longer parse. `id IN (other_table)`, with one name in the parentheses, is refused: ClickHouse reads it as a table read. The message says to write `=` to compare with one column. A list of two or more, such as `id IN (a, b)`, still passes. Other dialects do not change.
 - `rocky test` and `rocky ci` no longer fail a model with "could not inspect local tables" when a seed defines a macro named like a DuckDB built-in such as `lower` (#2688). The local catalog queries now call `system.main.lower`.
 - `E057` no longer refuses `percentile_cont(p) WITHIN GROUP (ORDER BY x)` and `percentile_disc(p) WITHIN GROUP (ORDER BY x)` on DuckDB (#2689). DuckDB rewrites both to `quantile_*` at parse time, so its function list never held them. Only the `WITHIN GROUP` form is accepted; the plain call `percentile_cont(x, 0.5)` still gets `E057`. The change is DuckDB only; other dialects are unchanged.
 - `run_evals.py --contract-quality --contract-quality-mode live` now exits 1 and names the model when any model errors in a live run (#2608). Before, the run exited 0 and could leave a stale recording.
