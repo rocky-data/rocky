@@ -17565,6 +17565,8 @@ async fn execute_one_plain_model(
     // This build created the target (first-run bootstrap): every row in it
     // is this build's, which the volume check reads.
     let mut bootstrapped = false;
+    // The existence probe's describe of a target that is already there.
+    let mut existing_target_columns = None;
     if strategy_mutates_existing_target {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
@@ -17581,7 +17583,10 @@ async fn execute_one_plain_model(
         // never classified transient, so first-run bootstrap stays intact on
         // every adapter.
         let target_absent = match warehouse.describe_table(&target_table_struct).await {
-            Ok(_) => false,
+            Ok(columns) => {
+                existing_target_columns = Some(columns);
+                false
+            }
             Err(e) if warehouse.classify_failure(&e).is_retryable() => {
                 return Err(anyhow::Error::from(e).context(format!(
                     "target existence probe for model '{model_name}' failed with a \
@@ -17653,6 +17658,24 @@ async fn execute_one_plain_model(
             }
             skip_strategy_exec = bootstrap_is_the_load;
             bootstrapped = true;
+        }
+    }
+    // A `merge` keeps a column its SQL stopped selecting (#2707). Warn and
+    // name it; never refuse, since `--full-refresh` does not rebuild a merge.
+    let mut merge_stale_note = None;
+    if let rocky_ir::MaterializationStrategy::Merge { .. } = &model_ir.materialization
+        && let Some(columns) = &existing_target_columns
+    {
+        merge_stale_note = super::run_incremental::merge_stale_columns_note(
+            &model_ir,
+            columns,
+            warehouse,
+            dialect,
+            &target_ref,
+        )
+        .await;
+        if let Some(note) = &merge_stale_note {
+            eprintln!("warning: {note}");
         }
     }
 
@@ -18000,6 +18023,7 @@ async fn execute_one_plain_model(
             })
             .into_iter()
             .chain(kind_probe_note)
+            .chain(merge_stale_note)
             .chain(incremental_notes)
             .chain(swap_notes)
             .collect(),
@@ -31397,6 +31421,157 @@ timestamp_column = "ts"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Run the `merge` model `mrg` (`unique_key = ["id"]`, target `tgt.mrg`)
+    /// once through `execute_one_plain_model`, with `typed` as the compiler's
+    /// output columns.
+    #[cfg(feature = "duckdb")]
+    async fn run_merge_model(
+        adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        sql: &str,
+        typed: &[&str],
+    ) -> MaterializationOutput {
+        use rocky_core::models::load_model_pair;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("mrg.toml"),
+            "name = \"mrg\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\n\
+             [target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"mrg\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("mrg.sql"), sql).unwrap();
+        let model = load_model_pair(
+            &dir.path().join("mrg.sql"),
+            &dir.path().join("mrg.toml"),
+            None,
+        )
+        .expect("load merge model");
+        let mut typed_models = indexmap::IndexMap::new();
+        typed_models.insert(
+            "mrg".to_string(),
+            typed
+                .iter()
+                .map(|name| rocky_compiler::types::TypedColumn {
+                    name: (*name).to_string(),
+                    data_type: rocky_compiler::types::RockyType::Unknown,
+                    nullable: true,
+                })
+                .collect(),
+        );
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            product_volumes: None,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
+        super::execute_one_plain_model(
+            &model,
+            adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "mrg",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("the merge run succeeds")
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn merge_fixture() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        use rocky_core::traits::WarehouseAdapter;
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, legacy VARCHAR, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES (1, 'a', TIMESTAMP '2026-03-01 10:00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        adapter
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn stale_notes(output: &MaterializationOutput) -> Vec<&String> {
+        output
+            .notes
+            .iter()
+            .filter(|n| n.contains("no longer outputs"))
+            .collect()
+    }
+
+    /// #2707: a `merge` model whose SQL stops selecting a column keeps that
+    /// column in its table. The run still succeeds, and warns with the
+    /// column's name. It does not suggest `--full-refresh` as a fix.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_warns_and_names_a_column_its_sql_dropped() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let adapter = merge_fixture().await;
+        let run1 = run_merge_model(
+            &adapter,
+            "SELECT id, legacy, ts FROM src.events",
+            &["id", "legacy", "ts"],
+        )
+        .await;
+        assert!(stale_notes(&run1).is_empty(), "{:?}", run1.notes);
+
+        adapter
+            .execute_statement(
+                "INSERT INTO src.events VALUES (2, 'b', TIMESTAMP '2026-03-02 10:00:00')",
+            )
+            .await
+            .unwrap();
+        let run2 = run_merge_model(&adapter, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+        let stale = stale_notes(&run2);
+        assert_eq!(stale.len(), 1, "{:?}", run2.notes);
+        assert!(
+            stale[0].contains("model 'mrg': the target tgt.mrg still has column(s) legacy that"),
+            "{}",
+            stale[0]
+        );
+        assert!(
+            stale[0].contains("`--full-refresh` does not rebuild a merge model"),
+            "{}",
+            stale[0]
+        );
+
+        // The column is still in the table, NULL in the new row.
+        let rows = adapter
+            .execute_query("SELECT id, legacy FROM tgt.mrg ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 2, "{:?}", rows.rows);
+        assert_eq!(rows.rows[1][1], serde_json::Value::Null, "{:?}", rows.rows);
+    }
+
+    /// #2707: an unchanged `merge` model gets no stale-column warning, also
+    /// when the compiler's typed list misses some of its columns (the zero-row
+    /// probe confirms they are still output).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_without_a_stale_column_does_not_warn() {
+        let adapter = merge_fixture().await;
+        let sql = "SELECT id, legacy, ts FROM src.events";
+        for typed in [&["id", "legacy", "ts"][..], &["id"][..]] {
+            let output = run_merge_model(&adapter, sql, typed).await;
+            assert!(
+                stale_notes(&output).is_empty(),
+                "{typed:?}: {:?}",
+                output.notes
+            );
+        }
+        let output = run_merge_model(&adapter, sql, &["id", "legacy", "ts"]).await;
+        assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
     }
 
     /// Fail-closed bootstrap — transformation path (`execute_one_plain_model`).

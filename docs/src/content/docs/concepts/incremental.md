@@ -237,6 +237,8 @@ WHEN NOT MATCHED THEN INSERT *
 
 If `update_columns` is omitted, all columns are updated on match.
 
+A merge does not drop columns. When the model's SQL stops selecting a column, the column stays in the table and new rows hold `NULL` there. The run still succeeds and prints a warning that names the column. The same text is in the model's `notes`. `--full-refresh` does not rebuild a merge model, so it does not remove the column. To keep the column, select it again. To remove it, drop it from the table in the warehouse (`ALTER TABLE ... DROP COLUMN`).
+
 ## Partition-level checksums
 
 :::caution[Not wired into runs]
