@@ -450,12 +450,14 @@ fn build_diagnostic(model_name: &str, finding: &Finding<'_, '_>, strict: bool) -
         if !merges.is_empty() {
             // A merge never drops a column, so the table can still hold one
             // the SQL used to select (#2707). The compiler reads the SQL.
+            let subject = match merges.as_slice() {
+                [one] => format!("{one} is a merge model: its table"),
+                many => format!("{} are merge models: their tables", many.join(", ")),
+            };
             suggestion.push_str(&format!(
-                ". {} {} a merge model: its table may still hold '{column}' if the model's SQL \
-                 used to select it, because a merge does not drop columns. The column is not \
-                 in the model's output, so a read of it is refused",
-                merges.join(", "),
-                if merges.len() == 1 { "is" } else { "are" }
+                ". {subject} may still hold '{column}' if the model's SQL used to select it, \
+                 because a merge does not drop columns. The column is not in the model's \
+                 output, so a read of it is refused"
             ));
         }
         return Diagnostic::error(E039, model_name, message).with_suggestion(suggestion);

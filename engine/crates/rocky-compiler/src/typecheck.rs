@@ -10254,6 +10254,31 @@ mod tests {
             "{suggestion}"
         );
         assert!(!suggestion.contains("merge"), "{suggestion}");
+
+        // Two merge upstreams in scope: the hint names both, in plural.
+        let merge = |name: &str| {
+            let mut model = make_model(name, "SELECT id, ts FROM raw.events");
+            model.config.strategy = rocky_core::models::StrategyConfig::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: None,
+            };
+            model
+        };
+        let result = compile_typechecks(vec![
+            merge("m1"),
+            merge("m2"),
+            make_model("reader", "SELECT legacy FROM m1 JOIN m2 ON m1.id = m2.id"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{:?}", result.diagnostics);
+        let suggestion = e039[0].suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.contains(
+                ". 'm1', 'm2' are merge models: their tables may still hold 'legacy' if the \
+                 model's SQL used to select it"
+            ),
+            "{suggestion}"
+        );
     }
 
     /// An upstream whose plain star expands over a complete model is complete
