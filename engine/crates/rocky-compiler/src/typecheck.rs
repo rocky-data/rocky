@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 use rayon::prelude::*;
-use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{self, Expr, InTarget, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
@@ -2418,10 +2418,11 @@ fn conjunct_window_bound(conjunct: &Expr, scope: &mut CteScope) -> WindowBound {
             bound.start = placeholder_term(low) == Some(WindowEdge::Start);
             bound.end = placeholder_term(high) == Some(WindowEdge::End);
         }
-        Expr::InSubquery {
+        Expr::In {
             expr,
-            subquery,
+            target: InTarget::Subquery(subquery),
             negated: false,
+            ..
         } if is_column_term(expr) => bound = query_window_bound(subquery, scope),
         _ => {}
     }
@@ -3001,8 +3002,10 @@ fn collect_refs_from_expr(expr: &Expr, file_path: &str, ref_map: &mut ReferenceM
         Expr::Cast { expr: inner, .. } => {
             collect_refs_from_expr(inner, file_path, ref_map);
         }
-        Expr::InList {
-            expr: inner, list, ..
+        Expr::In {
+            expr: inner,
+            target: InTarget::List(list),
+            ..
         } => {
             collect_refs_from_expr(inner, file_path, ref_map);
             for e in list {
@@ -3412,14 +3415,21 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
         // IN list → Boolean. Per SQL 3VL the result is NULL only when the
         // operand is NULL, or a list item is NULL and nothing matched; so it is
         // nullable iff the operand or any item is. `NOT IN` is the same.
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => {
             let nullable =
                 infer_expr_type(expr, scope).1 || list.iter().any(|e| infer_expr_type(e, scope).1);
             (RockyType::Boolean, nullable)
         }
 
         // IN subquery → Boolean; the subquery's nullability is not modelled.
-        Expr::InSubquery { .. } => (RockyType::Boolean, true),
+        Expr::In {
+            target: InTarget::Subquery(_),
+            ..
+        } => (RockyType::Boolean, true),
 
         // EXISTS → Boolean
         Expr::Exists { .. } => (RockyType::Boolean, false),
@@ -5855,7 +5865,7 @@ fn merged_join_columns(
     };
     if !matches!(
         constraint,
-        JoinConstraint::Using(_) | JoinConstraint::Natural
+        JoinConstraint::Using(_) | JoinConstraint::UsingAlias(..) | JoinConstraint::Natural
     ) {
         return HashMap::new();
     }
@@ -5864,7 +5874,7 @@ fn merged_join_columns(
         .map(|col| (CiKey::owned(col.name.clone()), col))
         .collect();
     let using: HashSet<_> = match constraint {
-        JoinConstraint::Using(names) => names
+        JoinConstraint::Using(names) | JoinConstraint::UsingAlias(names, _) => names
             .iter()
             .filter_map(|name| name.0.last().and_then(ast::ObjectNamePart::as_ident))
             .map(|name| CiKey::owned(name.value.clone()))

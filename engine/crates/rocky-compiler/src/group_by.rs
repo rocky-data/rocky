@@ -56,8 +56,8 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor, WindowType,
+    self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, InTarget, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor, WindowType,
 };
 use sqlparser::parser::Parser;
 
@@ -657,7 +657,11 @@ impl Checker<'_> {
             | Expr::Extract { expr: inner, .. }
             | Expr::Ceil { expr: inner, .. }
             | Expr::Floor { expr: inner, .. }
-            | Expr::InSubquery { expr: inner, .. } => self.walk(inner),
+            | Expr::In {
+                expr: inner,
+                target: InTarget::Subquery(_),
+                ..
+            } => self.walk(inner),
             Expr::BinaryOp { left, right, .. }
             | Expr::IsDistinctFrom(left, right)
             | Expr::IsNotDistinctFrom(left, right)
@@ -697,7 +701,11 @@ impl Checker<'_> {
                 self.walk(low);
                 self.walk(high);
             }
-            Expr::InList { expr, list, .. } => {
+            Expr::In {
+                expr,
+                target: InTarget::List(list),
+                ..
+            } => {
                 self.walk(expr);
                 list.iter().for_each(|item| self.walk(item));
             }

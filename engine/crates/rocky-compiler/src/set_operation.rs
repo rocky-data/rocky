@@ -28,8 +28,8 @@
 use std::collections::HashSet;
 
 use sqlparser::ast::{
-    Expr, JoinConstraint, JoinOperator, Query, SelectItem, SetExpr, SetQuantifier, Statement,
-    TableFactor, TableWithJoins, Visit, Visitor,
+    Expr, InTarget, JoinConstraint, JoinOperator, Query, SelectItem, SetExpr, SetQuantifier,
+    Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
 
@@ -186,8 +186,10 @@ fn keeps_binding(expr: &Expr) -> bool {
         Expr::Nested(_)
         | Expr::Subquery(_)
         | Expr::Exists { .. }
-        | Expr::InSubquery { .. }
-        | Expr::InList { .. }
+        | Expr::In {
+            target: InTarget::Subquery(_) | InTarget::List(_),
+            ..
+        }
         | Expr::Case { .. }
         | Expr::Between { .. }
         | Expr::IsDistinctFrom(..)

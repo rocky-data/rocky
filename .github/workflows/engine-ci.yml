@@ -150,6 +150,8 @@ jobs:
     # (the detection job itself failed) runs the suite — fail closed.
     if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
+    # Normal runs take 12 to 16 minutes. 30 leaves room and stops a hang.
+    timeout-minutes: 30
     # CI-only: emit `line-tables-only` debuginfo on the dev+test profiles
     # instead of full debuginfo. Linking the workspace's test binaries with
     # full debuginfo dominated the build half of this job; line tables keep
@@ -227,7 +229,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: nextest
       # nextest runs all test binaries in one global scheduler instead of
