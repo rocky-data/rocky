@@ -166,7 +166,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 redis = "1.8"
 
 # Cloud object store (unified S3/GCS/Azure backend for state sync + loaders)
-object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.14.2", features = ["aws", "gcp", "azure"] }
 bytes = "1"
 url = "2"
 
