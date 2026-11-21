@@ -3859,12 +3859,12 @@ pub(crate) fn assess_branch_test_evidence(
 /// leave a test result.
 /// Counting them would refuse every promote with no way to cure it.
 ///
-/// Returns the names, a gap when some models could not be loaded, and a
-/// notice when a pipeline's models directory does not exist. The gap refuses
-/// the promote; the notice only warns, because a pipeline with no models
-/// directory has no model to test. The caller treats that warning as an evidence gap and refuses
-/// the promote with it, unless `--allow-failing-tests`. It never reads as "no
-/// tested models".
+/// Returns the names, a gap, and a notice. The gap is set when some models
+/// could not be loaded, or when the `--models` path cannot be read. The
+/// caller refuses the promote on the gap, unless `--allow-failing-tests`, so
+/// a load failure never reads as "no tested models". The notice is set when
+/// a pipeline's models directory does not exist. It only warns: a pipeline
+/// with no models directory has no model to test.
 fn models_with_error_tests(
     config_path: &Path,
     cfg: &rocky_core::config::RockyConfig,
@@ -3925,11 +3925,19 @@ fn models_with_error_tests(
         }
         Err(e) => problems.push(format!("the models could not be loaded ({e:#})")),
     }
-    // `try_exists`, as `locate_models_dir` does: only `NotFound` is absent.
-    // A directory that cannot be reached, or a path that is not a directory,
-    // is a gap, never a silent pass.
+    // The same probe as `locate_models_dir`: `try_exists`, then
+    // `classify_not_found` on `Ok(false)`, because `try_exists` folds a
+    // dangling symlink into `Ok(false)`. Only a proven absence is skipped. A
+    // path that cannot be reached, a link to nowhere, or a path that is not a
+    // directory is a gap, never a silent pass.
     match models_dir.try_exists() {
-        Ok(false) => {}
+        Ok(false) => match rocky_core::path_presence::classify_not_found(models_dir) {
+            rocky_core::path_presence::PathPresence::Absent => {}
+            rocky_core::path_presence::PathPresence::Present { detail } => problems.push(format!(
+                "--models {} cannot be read: {detail}",
+                models_dir.display()
+            )),
+        },
         Ok(true) if models_dir.is_dir() => {
             match rocky_core::models::load_models_from_dir(models_dir, None) {
                 Ok(models) => names.extend(error_tested(models)),
@@ -4428,6 +4436,45 @@ mod tests {
                 .is_some_and(|g| g.contains("is not a directory")),
             "{gap:?}"
         );
+    }
+
+    /// A `--models` path that is a dangling symlink is a gap. `try_exists`
+    /// reports it as absent; the promote must not.
+    #[cfg(unix)]
+    #[test]
+    fn a_models_flag_that_is_a_dangling_symlink_is_a_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n",
+        )
+        .unwrap();
+        let link = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let (_names, gap, _notice) = super::models_with_error_tests(&config_path, &cfg, &link);
+        assert!(
+            gap.as_deref().is_some_and(|g| g.contains("cannot be read")),
+            "{gap:?}"
+        );
+    }
+
+    /// A `--models` path with nothing there stays a silent skip: the default
+    /// `models` directory need not exist.
+    #[test]
+    fn an_absent_models_flag_is_no_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let absent = tmp.path().join("models");
+        let (_names, gap, _notice) = super::models_with_error_tests(&config_path, &cfg, &absent);
+        assert!(gap.is_none(), "{gap:?}");
     }
 
     /// A transformation pipeline whose models directory does not exist only
