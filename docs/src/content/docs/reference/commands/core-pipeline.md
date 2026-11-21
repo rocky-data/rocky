@@ -486,7 +486,7 @@ Fix the data and re-run `rocky run --branch <name>`, or pass `--allow-failing-te
 
 Two cases only warn, because Rocky cannot check them here. The promote goes on, with a `WARNING` on stderr and a `TestEvidenceMissing` audit event.
 
-- The branch has no run in the local state store, and `[state]` uses a remote backend (`s3`, `gcs`, `valkey` or `tiered`). Its runs may be recorded there. Use `--allow-failing-tests` only if you know the branch is safe. A run that the local store does hold is still checked, and a bad one refuses.
+- The branch has no run in the local state store, and `[state]` uses a remote backend (`s3`, `gcs`, `valkey` or `tiered`). Its runs may be recorded there, so the run history could not be checked here. A run that the local store does hold is still checked, and a bad one refuses. With a local backend, a branch with no run refuses.
 - A transformation pipeline's models directory does not exist, so it has no model to check.
 
 `[run] tests_on_run` defaults to `enforce`, so a branch run records its tests unless it used `--tests off`.

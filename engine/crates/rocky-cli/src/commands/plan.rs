@@ -3925,14 +3925,28 @@ fn models_with_error_tests(
         }
         Err(e) => problems.push(format!("the models could not be loaded ({e:#})")),
     }
-    if models_dir.is_dir() {
-        match rocky_core::models::load_models_from_dir(models_dir, None) {
-            Ok(models) => names.extend(error_tested(models)),
-            Err(e) => problems.push(format!(
-                "--models {} could not be loaded ({e})",
-                models_dir.display()
-            )),
+    // `try_exists`, as `locate_models_dir` does: only `NotFound` is absent.
+    // A directory that cannot be reached, or a path that is not a directory,
+    // is a gap, never a silent pass.
+    match models_dir.try_exists() {
+        Ok(false) => {}
+        Ok(true) if models_dir.is_dir() => {
+            match rocky_core::models::load_models_from_dir(models_dir, None) {
+                Ok(models) => names.extend(error_tested(models)),
+                Err(e) => problems.push(format!(
+                    "--models {} could not be loaded ({e})",
+                    models_dir.display()
+                )),
+            }
         }
+        Ok(true) => problems.push(format!(
+            "--models {} is not a directory",
+            models_dir.display()
+        )),
+        Err(e) => problems.push(format!(
+            "--models {} could not be checked ({e})",
+            models_dir.display()
+        )),
     }
     let gap = (!problems.is_empty()).then(|| {
         format!(
@@ -3954,7 +3968,7 @@ fn models_with_error_tests(
 ///
 /// With no branch run here, a local `[state]` backend means the branch was
 /// never run: a gap that refuses. A remote backend may hold runs this store
-/// does not, so the history could not be checked locally: a notice that only
+/// does not, so the history could not be checked here: a notice that only
 /// warns. A run seen here is always assessed, and a bad one refuses.
 fn promote_test_evidence(
     branch: &str,
@@ -3978,8 +3992,7 @@ fn promote_test_evidence(
             notices: vec![format!(
                 "branch '{branch}' has no run in the local state store {}, and `[state]` \
                  uses the {backend:?} backend, so the run history could not be checked \
-                 locally. The promote goes on with no test evidence; use \
-                 `--allow-failing-tests` only if you know the branch is safe",
+                 here. The promote goes ahead with this warning and no test evidence",
                 state_path.display()
             )],
         };
@@ -4368,10 +4381,10 @@ mod tests {
             assert!(ev.failures.is_empty() && ev.warnings.is_empty(), "{ev:?}");
             assert_eq!(ev.notices.len(), 1, "{ev:?}");
             assert!(
-                ev.notices[0].contains("could not be checked locally"),
+                ev.notices[0].contains("could not be checked here"),
                 "{ev:?}"
             );
-            assert!(ev.notices[0].contains("--allow-failing-tests"), "{ev:?}");
+            assert!(ev.notices[0].contains("goes ahead"), "{ev:?}");
         }
         let ev = super::promote_test_evidence("pr1", &[], &none, path, StateBackend::Local);
         assert!(ev.notices.is_empty(), "{ev:?}");
@@ -4393,6 +4406,28 @@ mod tests {
                 "{ev:?}"
             );
         }
+    }
+
+    /// A `--models` path that exists but is not a directory is a gap, not a
+    /// silent pass.
+    #[test]
+    fn a_models_flag_that_is_not_a_directory_is_a_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n",
+        )
+        .unwrap();
+        let file = tmp.path().join("models");
+        std::fs::write(&file, "not a directory").unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let (_names, gap, _notice) = super::models_with_error_tests(&config_path, &cfg, &file);
+        assert!(
+            gap.as_deref()
+                .is_some_and(|g| g.contains("is not a directory")),
+            "{gap:?}"
+        );
     }
 
     /// A transformation pipeline whose models directory does not exist only

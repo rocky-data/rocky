@@ -81,7 +81,7 @@ class AuditEventKind16(StrEnum):
 
 class AuditEventKind17(StrEnum):
     """
-    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. It is recorded only when `--allow-failing-tests` overrode the refusal for the gap. Without the flag the gap refuses the promote. `reason` says which.
+    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. Each such gap refuses the promote, and this event records it when `--allow-failing-tests` overrode the refusal. It is also recorded, with no flag, for what Rocky could not check here, which only warns: no branch run in the local state store under a remote `[state]` backend, or a pipeline whose models directory does not exist. `reason` says which.
     """
 
     test_evidence_missing = "test_evidence_missing"

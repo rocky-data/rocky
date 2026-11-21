@@ -498,6 +498,32 @@ fn promote_refuses_when_the_branch_has_no_run() {
     refused_then_allowed(dir, "no recorded run");
 }
 
+/// Under a remote `[state]` backend, a branch with no run in the local store
+/// only warns: its runs may live in the backend. This pins the backend the
+/// promote reads to the project's `[state]`, not a constant.
+#[test]
+fn promote_warns_when_the_branch_has_no_local_run_under_remote_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(
+        dir,
+        "\n[state]\nbackend = \"valkey\"\nvalkey_url = \"redis://127.0.0.1:1/\"\n",
+        FAN_OUT,
+        UNIQUE_ERROR,
+    );
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("WARNING"), "{}", describe(&out));
+    assert!(
+        stderr.contains("could not be checked here"),
+        "{}",
+        describe(&out)
+    );
+    assert!(plan_texts(dir)[0].contains("test_evidence_missing"));
+}
+
 #[test]
 fn bare_branch_promote_refuses_a_branch_with_no_run_and_prints_the_block() {
     let tmp = tempfile::tempdir().unwrap();
