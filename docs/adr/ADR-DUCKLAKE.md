@@ -107,7 +107,7 @@ Reads change too, because an attached catalog shares the connection:
 - DuckLake keeps old data files until snapshots expire. Rocky expires nothing; run DuckLake's `ducklake_expire_snapshots` and `ducklake_cleanup_old_files` yourself.
 - A lake is pinned to the absolute directory it was created in. A moved project, a CI checkout at another path or another mount fails at attach, loudly, until `data_path` names the stored path.
 - A missing metadata file is created on attach, as a missing main DuckDB file is. A typo in `metadata_path` starts an empty lake rather than failing.
-- `delete_insert` runs its `DELETE` and `INSERT` as two statements, so on DuckLake it is two snapshots and a reader can see the gap between them. Native DuckDB has the same gap today; it is tracked separately.
+- Rocky runs `delete_insert` in one transaction for native DuckDB and DuckLake. It stages the incoming rows before deleting anything. The SQL from `rocky emit-sql` includes the transaction. Use `duckdb -bail` to stop an exported script at the first error and roll back the open transaction.
 
 ## Alternatives considered
 
@@ -133,6 +133,10 @@ Reviewer: Claude Opus 5.5, a fresh read-only agent that did not author the rulin
 | 9 | The matrix is otherwise sound; `content_addressed` was missing from the ruling's list; some refusals are scope choices. | Fixed: D3 lists `content_addressed` and says which refusals are scope choices. |
 | 10 | A defaulted scope needs a trailing `/`, and must count as a scope with two secrets. | Fixed (D1). |
 | 11 | The supported list rests on a non-required job. | Accepted: the PR that lands this ADR runs the conformance workflow once and records the run. |
+
+### Follow-up to finding 8 (2026-11-21, #2605 / PR #2606)
+
+The original disposition above records the launch decision. The partition replacement fix now stages the incoming rows before deleting anything. It runs the delete and insert in one transaction for native DuckDB and DuckLake. A failed insert rolls back the replacement. `rocky emit-sql` includes the transaction; run exported scripts with `duckdb -bail` to stop at the first error.
 
 ## Red team of the implementation (2026-11-12)
 

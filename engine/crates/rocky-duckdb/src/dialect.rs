@@ -16,6 +16,13 @@ use rocky_core::traits::{
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
+const DELETE_INSERT_KEYS: &str = "temp.main.__rocky_delete_insert_keys";
+const DELETE_INSERT_ROWS: &str = "temp.main.__rocky_delete_insert_rows";
+pub(crate) const DELETE_INSERT_STAGE_ROWS: &str =
+    "CREATE TEMP TABLE temp.main.__rocky_delete_insert_rows AS";
+pub(crate) const DELETE_INSERT_BEGIN: &str = "BEGIN TRANSACTION";
+pub(crate) const DELETE_INSERT_COMMIT: &str = "COMMIT";
+
 /// The column reference [`SqlDialect::watermark_where`] and
 /// [`SqlDialect::watermark_hold_back`] share, so both bounds read the same
 /// column the same way.
@@ -167,6 +174,79 @@ impl SqlDialect for DuckDbSqlDialect {
         // projection ordered differently from the target cannot write values
         // into the wrong columns (#2465).
         format!("INSERT INTO {target} BY NAME\n{select_sql}")
+    }
+
+    fn delete_insert_sql(
+        &self,
+        target: &str,
+        partition_cols: &[std::sync::Arc<str>],
+        source_sql: &str,
+    ) -> Vec<String> {
+        let columns: Vec<_> = partition_cols
+            .iter()
+            .map(|column| self.quote_identifier(column))
+            .collect();
+        // Stage distinct keys once so both deletes read the same partition set.
+        // Ordinary equality lets DuckDB prune target blocks and DuckLake files.
+        // The null-safe join only handles incoming keys that need it.
+        let nullable_key = columns
+            .iter()
+            .map(|column| format!("{column} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let nullable_target_key = columns
+            .iter()
+            .map(|column| format!("_rocky_target.{column} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let matches = columns
+            .iter()
+            .map(|column| {
+                format!("_rocky_target.{column} IS NOT DISTINCT FROM _rocky_incoming.{column}")
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let key_fields = (1..=columns.len())
+            .map(|index| format!("struct_extract_at(_rocky_key, {index})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let columns = columns.join(", ");
+        vec![
+            DELETE_INSERT_BEGIN.into(),
+            // Keep one input snapshot for the keys and the final rows. The
+            // model can read the target directly or through another relation.
+            format!("{DELETE_INSERT_STAGE_ROWS}\n{source_sql}\n"),
+            // Compare the keys as stored in the target. Assignment casts
+            // preserve untyped NULLs and avoid rounding the existing keys
+            // when the source has a less precise type.
+            format!(
+                "CREATE TEMP TABLE {DELETE_INSERT_KEYS} AS\n\
+                 SELECT {columns} FROM {target} WHERE FALSE"
+            ),
+            // Cast before grouping. A row comparison keeps the source's
+            // string collation from collapsing separate target keys.
+            format!(
+                "INSERT INTO {DELETE_INSERT_KEYS}\n\
+                 SELECT {key_fields} FROM (\n\
+                 SELECT DISTINCT cast_to_type(ROW({columns}),\n\
+                 (SELECT ROW({columns}) FROM {DELETE_INSERT_KEYS} WHERE FALSE)) AS _rocky_key\n\
+                 FROM {DELETE_INSERT_ROWS}\n\
+                 ) AS _rocky_distinct_keys"
+            ),
+            format!(
+                "DELETE FROM {target} WHERE ({columns}) IN (\n\
+                 SELECT DISTINCT {columns} FROM {DELETE_INSERT_KEYS} WHERE NOT ({nullable_key})\n)"
+            ),
+            format!(
+                "DELETE FROM {target} AS _rocky_target\n\
+                 USING (SELECT DISTINCT {columns} FROM {DELETE_INSERT_KEYS} WHERE {nullable_key}) AS _rocky_incoming\n\
+                 WHERE ({nullable_target_key}) AND {matches}"
+            ),
+            self.insert_into(target, &format!("SELECT * FROM {DELETE_INSERT_ROWS}")),
+            format!("DROP TABLE {DELETE_INSERT_KEYS}"),
+            format!("DROP TABLE {DELETE_INSERT_ROWS}"),
+            DELETE_INSERT_COMMIT.into(),
+        ]
     }
 
     /// Render a DuckDB-native `MERGE INTO ... USING ... WHEN MATCHED ... WHEN NOT MATCHED`.
@@ -1214,6 +1294,177 @@ mod tests {
         let sql = dialect().insert_into("tgt", "SELECT amount, id, note FROM src");
         conn.execute_sql(&sql).expect("insert must execute");
         assert_reordered_rows(&conn);
+    }
+
+    #[test]
+    fn delete_insert_replaces_nullable_partitions() {
+        let dialect = dialect();
+        for (partition_by, expected) in [
+            (&["region"][..], vec![12, 16, 20, 21, 22, 23, 24]),
+            (
+                &["tenant", "region"][..],
+                vec![12, 15, 16, 20, 21, 22, 23, 24],
+            ),
+        ] {
+            let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+            conn.execute_statement(
+                "CREATE TABLE tgt (tenant INT, region INT, amount INT);
+                 INSERT INTO tgt VALUES (NULL, NULL, 10), (NULL, 1, 11), (NULL, 2, 12),
+                       (1, NULL, 13), (1, 1, 14), (2, NULL, 15), (2, 2, 16);
+                 CREATE TABLE incoming (tenant INT, region INT, amount INT);
+                 INSERT INTO incoming VALUES (NULL, NULL, 20), (NULL, NULL, 21),
+                       (NULL, 1, 22), (1, NULL, 23), (1, 1, 24);",
+            )
+            .expect("seed target and incoming partitions");
+            let keys = partition_by
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect::<Vec<_>>();
+            let source = "SELECT tenant, region, amount FROM incoming";
+            let target = "memory.main.tgt";
+            let statements = dialect.delete_insert_sql(target, &keys, source);
+
+            for run in 1..=3 {
+                if run == 3 {
+                    conn.execute_statement("DELETE FROM incoming")
+                        .expect("clear source");
+                }
+                for sql in &statements {
+                    conn.execute_statement(sql)
+                        .expect("replace incoming partitions");
+                }
+                let result = conn
+                    .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+                    .unwrap();
+                let amounts = result
+                    .rows
+                    .iter()
+                    .map(|row| cell_i64(&row[0], "amount"))
+                    .collect::<Vec<_>>();
+                assert_eq!(amounts, expected, "keys {partition_by:?}, run {run}");
+            }
+        }
+    }
+
+    #[test]
+    fn delete_insert_accepts_an_untyped_null_for_a_date_key() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (day_key DATE, amount INT);
+             INSERT INTO tgt VALUES (NULL, 10), (DATE '2026-11-15', 11);",
+        )
+        .unwrap();
+        for sql in dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["day_key".into()],
+            "SELECT NULL AS day_key, 20 AS amount",
+        ) {
+            conn.execute_statement(&sql).unwrap();
+        }
+        let result = conn
+            .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![serde_json::json!("11")], vec![serde_json::json!("20")]]
+        );
+    }
+
+    #[test]
+    fn delete_insert_keeps_distinct_target_keys_that_round_to_the_same_double() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (tenant BIGINT, region INT, amount INT);
+             INSERT INTO tgt VALUES (1000000000000000000, NULL, 10),
+                                    (1000000000000000001, NULL, 11);",
+        )
+        .unwrap();
+        let statements = dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["tenant".into(), "region".into()],
+            "SELECT 1e18 AS tenant, NULL::INT AS region, 20 AS amount",
+        );
+        for _ in 0..2 {
+            for sql in &statements {
+                conn.execute_statement(sql).unwrap();
+            }
+        }
+        let rows = conn
+            .execute_sql("SELECT tenant, amount FROM tgt ORDER BY tenant")
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    serde_json::json!("1000000000000000000"),
+                    serde_json::json!("20")
+                ],
+                vec![
+                    serde_json::json!("1000000000000000001"),
+                    serde_json::json!("11")
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn delete_insert_deduplicates_keys_using_the_target_collation() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (region VARCHAR, amount INT);
+             INSERT INTO tgt VALUES ('A', 10), ('a', 11), ('B', 12), ('b', 13);
+             CREATE TABLE incoming (region VARCHAR COLLATE NOCASE, amount INT);
+             INSERT INTO incoming VALUES ('A', 20), ('a', 21), ('B', 22);",
+        )
+        .unwrap();
+        for sql in dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["region".into()],
+            "SELECT region, amount FROM incoming",
+        ) {
+            conn.execute_statement(&sql).unwrap();
+        }
+        let rows = conn
+            .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![
+                vec![serde_json::json!("13")],
+                vec![serde_json::json!("20")],
+                vec![serde_json::json!("21")],
+                vec![serde_json::json!("22")],
+            ],
+        );
+    }
+
+    #[test]
+    fn delete_insert_does_not_recompute_a_model_after_deleting_its_input() {
+        let conn = crate::DuckDbConnector::in_memory().expect("in-memory DuckDB");
+        conn.execute_statement(
+            "CREATE TABLE tgt (region INT, amount INT);
+             INSERT INTO tgt VALUES (NULL, 10), (1, 11);
+             CREATE VIEW repair_input AS SELECT * FROM tgt WHERE region IS NULL;",
+        )
+        .unwrap();
+        for sql in dialect().delete_insert_sql(
+            "memory.main.tgt",
+            &["region".into()],
+            "SELECT region, amount * 2 AS amount FROM repair_input",
+        ) {
+            conn.execute_statement(&sql).unwrap();
+        }
+        let rows = conn
+            .execute_sql("SELECT amount FROM tgt ORDER BY amount")
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!("11")], vec![serde_json::json!("20")]]
+        );
     }
 
     #[test]

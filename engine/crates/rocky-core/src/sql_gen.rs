@@ -736,11 +736,7 @@ pub fn generate_transformation_sql_with_warehouse(
                 validation::validate_identifier(col)?;
             }
 
-            // The DELETE that clears the incoming partitions (dialect-shaped:
-            // T-SQL has no row-value IN).
-            let delete_sql = dialect.delete_partitions_sql(&target, partition_by, &model_ir.sql);
-            let insert_sql = dialect.insert_into(&target, &model_ir.sql);
-            Ok(dialect.delete_insert_statements(delete_sql, insert_sql))
+            Ok(dialect.delete_insert_sql(&target, partition_by, &model_ir.sql))
         }
         MaterializationStrategy::Microbatch { .. } => {
             Err(microbatch_transformation_refused(model_ir))
