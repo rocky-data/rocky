@@ -25,6 +25,9 @@ on:
       - ".github/workflows/changelog-gate.yml"
       - ".github/workflows/attribution-gate.yml"
       - ".github/PULL_REQUEST_TEMPLATE.md"
+      # The install-sh-fallback test runs this script, so a PR that edits
+      # only the installer still runs the test that guards it (#2684).
+      - "engine/install.sh"
   push:
     branches: [main]
     paths:
@@ -35,6 +38,7 @@ on:
       - ".github/workflows/codegen-drift.yml"
       - ".github/workflows/changelog-gate.yml"
       - ".github/PULL_REQUEST_TEMPLATE.md"
+      - "engine/install.sh"
 
 permissions:
   contents: read
@@ -125,6 +129,18 @@ jobs:
         # this exercises the script it calls against fixture text.
         run: bash scripts/tests/attribution-gate.test.sh
 
+  install-sh-fallback:
+    name: install.sh API-failure fallback
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin the git ls-remote fallback when the GitHub API call fails (#2684)
+        # Stub curl and git, so no network and no GitHub token are needed.
+        run: bash scripts/tests/install-sh-fallback.test.sh
+
   shellcheck:
     name: Shellcheck scripts
     runs-on: ubuntu-latest
@@ -136,7 +152,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh scripts/soak-docker.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/attribution_gate.sh scripts/tests/attribution-gate.test.sh scripts/tests/soak-jq16-keywords.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/soak-docker.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh scripts/attribution_gate.sh scripts/tests/attribution-gate.test.sh scripts/tests/soak-jq16-keywords.test.sh scripts/tests/install-sh-fallback.test.sh scripts/setup-agent-tools.sh .claude/hooks/session-start.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).
