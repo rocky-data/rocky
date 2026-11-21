@@ -1,5 +1,5 @@
-//! `rocky run` evaluates a model's `[[tests]]` when asked to (#2611), and
-//! `rocky plan promote` refuses a branch whose newest run recorded a failing
+//! `rocky run` evaluates a model's `[[tests]]`, by default under `enforce`
+//! (#2611), and `rocky plan promote` refuses a branch whose newest run recorded a failing
 //! one (#2609).
 //!
 //! The project is the three-model one of `run_policy_gate.rs` plus a
@@ -176,9 +176,25 @@ fn test_result<'a>(v: &'a serde_json::Value, model: &str) -> &'a serde_json::Val
 }
 
 #[test]
-fn off_by_default_runs_no_test_and_adds_no_output_field() {
+fn enforce_by_default_fails_a_model_whose_test_fails() {
     let tmp = tempfile::tempdir().unwrap();
     project(tmp.path(), "", FAN_OUT, UNIQUE_ERROR);
+    let out = rocky(tmp.path(), &["--output", "json", "run"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(status_of(&v, "customer_orders"), "failed", "{v}");
+    assert_eq!(test_result(&v, "customer_orders")["status"], "fail", "{v}");
+}
+
+#[test]
+fn off_runs_no_test_and_adds_no_output_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(
+        tmp.path(),
+        "\n[run]\ntests_on_run = \"off\"\n",
+        FAN_OUT,
+        UNIQUE_ERROR,
+    );
     let out = rocky(tmp.path(), &["--output", "json", "run"]);
     assert!(out.status.success(), "{}", describe(&out));
     let v = json(&out);
@@ -355,7 +371,12 @@ fn promote_warns_but_proceeds_when_the_newest_run_recorded_no_tests() {
     project(dir, "", FAN_OUT, UNIQUE_ERROR);
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
     // Tests off: the run records none.
-    let run = rocky(dir, &["--output", "json", "run", "--branch", "pr1"]);
+    let run = rocky(
+        dir,
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "off",
+        ],
+    );
     assert!(run.status.success(), "{}", describe(&run));
 
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
@@ -498,7 +519,12 @@ fn promote_names_an_untested_model_whose_table_has_another_name() {
         "",
     );
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
-    let run = rocky(dir, &["--output", "json", "run", "--branch", "pr1"]);
+    let run = rocky(
+        dir,
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "off",
+        ],
+    );
     assert!(run.status.success(), "{}", describe(&run));
 
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);

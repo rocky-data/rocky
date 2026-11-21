@@ -3827,6 +3827,10 @@ pub(crate) fn assess_branch_test_evidence(
 /// `--models` directory when it exists (a model leg run with `--models` or
 /// `--all` has no transformation pipeline of its own).
 ///
+/// Models whose strategy is `content_addressed` are left out. The run never
+/// evaluates their `[[tests]]` (#2632), so they can never leave a test result.
+/// Counting them would raise an evidence gap that no run can cure.
+///
 /// Returns the names and, when some models could not be loaded, a warning
 /// saying so. The caller warns with it; it never refuses the promote and never
 /// reads as "no tested models".
@@ -3835,9 +3839,28 @@ fn models_with_error_tests(
     cfg: &rocky_core::config::RockyConfig,
     models_dir: &Path,
 ) -> (std::collections::BTreeSet<String>, Option<String>) {
+    fn runs_tests(strategy: &rocky_core::models::StrategyConfig) -> bool {
+        use rocky_core::models::StrategyConfig;
+        match strategy {
+            // #2632: the run never evaluates `[[tests]]` for these models.
+            StrategyConfig::ContentAddressed { .. } => false,
+            StrategyConfig::FullRefresh
+            | StrategyConfig::Incremental { .. }
+            | StrategyConfig::Merge { .. }
+            | StrategyConfig::TimeInterval { .. }
+            | StrategyConfig::Ephemeral
+            | StrategyConfig::DeleteInsert { .. }
+            | StrategyConfig::Microbatch { .. }
+            | StrategyConfig::View
+            | StrategyConfig::MaterializedView
+            | StrategyConfig::DynamicTable { .. }
+            | StrategyConfig::Snapshot { .. } => true,
+        }
+    }
     fn error_tested(models: Vec<rocky_core::models::Model>) -> impl Iterator<Item = String> {
         models
             .into_iter()
+            .filter(|m| runs_tests(&m.config.strategy))
             .filter(|m| {
                 m.config
                     .tests
@@ -4219,6 +4242,44 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    /// #2632: a content-addressed model never gets test results, so its
+    /// error-severity test must not create a promote gap.
+    #[test]
+    fn content_addressed_model_with_error_test_is_not_a_promote_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let tests = "\n[[tests]]\ntype = \"unique\"\ncolumn = \"id\"\n";
+        let target = "\n[target]\ncatalog = \"c\"\nschema = \"s\"\n";
+        std::fs::write(
+            models_dir.join("ca.toml"),
+            format!(
+                "name = \"ca\"\n\n[strategy]\ntype = \"content_addressed\"\n\
+                 storage_prefix = \"s3://b/ca\"\n{target}table = \"ca\"\n{tests}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("ca.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("plain.toml"),
+            format!(
+                "name = \"plain\"\n\n[strategy]\ntype = \"full_refresh\"\n{target}table = \"plain\"\n{tests}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("plain.sql"), "SELECT 1 AS id").unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let (names, _warning) = super::models_with_error_tests(&config_path, &cfg, &models_dir);
+        assert!(names.contains("plain"), "{names:?}");
+        assert!(!names.contains("ca"), "{names:?}");
+    }
 
     #[test]
     fn a_consumer_diagnostic_does_not_refuse_a_run_plan() {
