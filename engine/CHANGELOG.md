@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- With `[resilience] contain_failures = true`, a bare table-name read that would close a dependency cycle no longer withholds the cycle (rocky#2638). Rocky now drops that read from the run order and reports it under `scheduling_warnings`, as a fail-fast run already does. When two models each read the other's table by bare name, both reads are dropped from the order. The read still counts for containment: when the model it reads has already failed (a compile failure), the reader is withheld. The order between the pair is no longer guaranteed, so the reader can run first or in the same layer. A cycle through `depends_on` or a qualified `schema.table` read is still withheld with a `<cycle>` error. With `[run] strict_scheduling`, a dropped read refuses the run, also on `--shadow` and `--branch` runs. The default of `contain_failures` does not change.
 - Rocky now builds on `sqlparser` 0.64 (was 0.63). The new `USING (col) AS alias` join form is treated like `USING (col)` everywhere the compiler and lineage read join keys, and `x IN (...)` and `x IN (SELECT ...)` are read through sqlparser's new single `IN` expression. Output does not change for SQL that parsed before.
 - The CI Test job now times out after 30 minutes, so a hung run fails instead of holding the runner.
 - The nextest default profile now has a slow-timeout (60s period, killed after 10 periods), so a stuck test fails after 10 minutes instead of hanging the job. No test is skipped or quarantined.

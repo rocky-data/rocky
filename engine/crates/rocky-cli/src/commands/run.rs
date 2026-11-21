@@ -14783,12 +14783,50 @@ async fn execute_models_phase(
     // scheduled strictly after its producer — closing the same-layer `--parallel`
     // race where a reader and its (about-to-fail) producer co-scheduled and the
     // reader built on stale output. When off, the original ref-only layers are
-    // used, byte-for-byte. Any model stuck in an augmented-graph cycle is
-    // contained up front (fail closed) and recorded as a single run error so the
-    // run reports non-success.
+    // used, byte-for-byte. A bare-name read edge that would close a cycle is
+    // dropped from the ordering (the same policy as the fail-fast physical-read
+    // derivation) and reported as a scheduling warning; the closure still
+    // withholds its reader when the producer is already failed. Any model stuck
+    // in a cycle of declared or qualified edges is contained up front (fail
+    // closed) and recorded as a single run error so the run reports non-success.
     let augmented_plan = resilience
         .contain_failures
         .then(|| containment.augmented_layers());
+    if let Some(plan) = &augmented_plan {
+        // Render with the derivation's own warning text. On a non-shadow run
+        // `augment_physical_read_edges` may already have reported the same
+        // pair (a mutual pair in either order), so it is not reported twice.
+        let render = |skipped: &[(String, String)], mutual: &[(String, String)]| {
+            rocky_core::physical_edges::derivation_warnings(
+                &rocky_core::physical_edges::DerivedPhysicalEdges {
+                    skipped_cycle_edges: skipped.to_vec(),
+                    ambiguous_bare_pairs: mutual.to_vec(),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut new_warnings: Vec<String> = Vec::new();
+        for edge in &plan.skipped_bare_edges {
+            new_warnings.extend(render(std::slice::from_ref(edge), &[]));
+        }
+        for (a, b) in &plan.mutual_bare_pairs {
+            let reported_reversed = render(&[], &[(b.clone(), a.clone())]);
+            if reported_reversed
+                .iter()
+                .any(|w| output.scheduling_warnings.contains(w))
+            {
+                continue;
+            }
+            new_warnings.extend(render(&[], &[(a.clone(), b.clone())]));
+        }
+        new_warnings.retain(|w| !output.scheduling_warnings.contains(w));
+        output
+            .scheduling_warnings
+            .extend(new_warnings.iter().cloned());
+        // `[run] strict_scheduling` refuses an unresolved ordering on every
+        // path, including a shadow or branch run that skipped the derivation.
+        refuse_on_scheduling_warnings(strict_scheduling, &new_warnings)?;
+    }
     if let Some(plan) = &augmented_plan
         && !plan.cyclic.is_empty()
     {
@@ -14797,8 +14835,8 @@ async fn execute_models_phase(
             output.contained.push(crate::output::ContainedModelOutput {
                 model: model.clone(),
                 blocked_by: Vec::new(),
-                unblock_hint: "a physical/bare-name read forms a dependency cycle; \
-                                   declare dependencies via ref() and break the cycle"
+                unblock_hint: "a declared or qualified-name read forms a dependency cycle; \
+                                   break the cycle in depends_on or in the reads"
                     .to_string(),
             });
         }
@@ -14806,8 +14844,8 @@ async fn execute_models_phase(
         output.errors.push(crate::output::TableErrorOutput {
             asset_key: vec!["<cycle>".to_string()],
             error: format!(
-                "dependency cycle in the containment graph (physical/bare-name reads) — \
-                 withheld {} model(s): {}. Declare dependencies via ref() and remove the cycle.",
+                "dependency cycle in the containment graph (declared or qualified-name reads) — \
+                 withheld {} model(s): {}. Remove the cycle.",
                 plan.cyclic.len(),
                 plan.cyclic.join(", "),
             ),

@@ -222,6 +222,189 @@ fn contained_run_builds_independent_models() {
     assert_eq!(status_of(&v, "status_counts"), "failed");
 }
 
+/// `stg_orders` reads `orders` by bare name (the raw table in `main`). The
+/// model `orders_enriched` writes `marts.orders` and depends on `stg_orders`.
+/// Containment resolves a bare read against every producer's table name, so
+/// the bare `orders` read is a candidate edge to `orders_enriched` that would
+/// close a cycle with the declared edge. `stg_read` is how `stg_orders` reads.
+fn bare_cycle_project(dir: &Path, extra_config: &str, stg_read: &str) {
+    let conn = duckdb::Connection::open(dir.join("warehouse.duckdb")).expect("open duckdb");
+    conn.execute_batch(
+        "CREATE TABLE orders (order_id INTEGER NOT NULL);
+         INSERT INTO orders VALUES (1), (2);",
+    )
+    .expect("seed source");
+    drop(conn);
+    fs::write(dir.join("rocky.toml"), format!("{CONFIG}{extra_config}")).unwrap();
+    write_model(
+        dir,
+        "stg_orders",
+        &format!("select order_id from {stg_read}"),
+    );
+    let models = dir.join("models");
+    fs::write(
+        models.join("orders_enriched.toml"),
+        "name = \"orders_enriched\"\ndepends_on = [\"stg_orders\"]\n\n\
+         [strategy]\ntype = \"full_refresh\"\n\n[target]\n\
+         catalog = \"warehouse\"\nschema = \"marts\"\ntable = \"orders\"\n",
+    )
+    .unwrap();
+    fs::write(
+        models.join("orders_enriched.sql"),
+        "select order_id from stg_orders",
+    )
+    .unwrap();
+}
+
+/// The scheduling warnings of a run that name the skipped bare edge.
+fn bare_cycle_warnings(v: &serde_json::Value) -> Vec<String> {
+    v["scheduling_warnings"]
+        .as_array()
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| w.as_str())
+                .filter(|w| w.contains("'stg_orders' -> 'orders_enriched'"))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn has_cycle_error(v: &serde_json::Value) -> bool {
+    v["errors"].as_array().is_some_and(|errors| {
+        errors
+            .iter()
+            .any(|e| e["asset_key"] == serde_json::json!(["<cycle>"]))
+    })
+}
+
+/// With `contain_failures = true` set explicitly, a bare read that would
+/// close a cycle is dropped from the ordering with one warning, like the
+/// fail-fast run does, instead of withholding both models.
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_under_explicit_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
+    assert_eq!(built(&v), ["orders", "stg_orders"], "{}", describe(&out));
+    assert_eq!(
+        bare_cycle_warnings(&v).len(),
+        1,
+        "exactly one warning for the skipped pair: {}",
+        describe(&out)
+    );
+}
+
+/// The same project on a branch run. The shadow rewrite matches a bare name
+/// against each routed model's table, so it rewrites `stg_orders`' bare
+/// `orders` read to `orders_enriched`'s branch table and records that read as
+/// a dependency. The read is then no longer a bare guess but a real read of a
+/// table this run builds, so the cycle is real and stays withheld (fail
+/// closed). No bare-edge warning is reported. This pins today's behaviour of
+/// the rewrite, which this change does not touch.
+#[test]
+fn bare_name_cycle_on_a_branch_run_is_withheld_after_the_shadow_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+
+    let out = rocky(dir.path(), &["--output", "json", "run", "--branch", "fix"]);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let v = json(&out);
+    assert!(has_cycle_error(&v), "{}", describe(&out));
+    assert!(built(&v).is_empty(), "{}", describe(&out));
+    assert!(bare_cycle_warnings(&v).is_empty(), "{}", describe(&out));
+}
+
+/// A branch run of `stg_orders` alone: `orders_enriched` is not routed, so
+/// the shadow rewrite leaves the bare `orders` read as written and the
+/// fail-fast derivation does not run on a branch. The containment ledger
+/// alone drops the bare edge, warns once, and `stg_orders` builds.
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_on_a_branch_run_of_one_model() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+
+    let out = rocky(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            "--branch",
+            "fix",
+            "--model",
+            "stg_orders",
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
+    assert_eq!(built(&v), ["stg_orders"], "{}", describe(&out));
+    assert_eq!(
+        bare_cycle_warnings(&v).len(),
+        1,
+        "exactly one warning for the skipped pair: {}",
+        describe(&out)
+    );
+}
+
+/// `[run] strict_scheduling` refuses an ordering it cannot guarantee, also
+/// on a branch run where only the containment ledger saw the dropped edge.
+#[test]
+fn strict_scheduling_refuses_a_dropped_bare_edge_on_a_branch_run() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(
+        dir.path(),
+        &format!("{CONTAIN}\n[run]\nstrict_scheduling = true\n"),
+        "orders",
+    );
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+
+    let out = rocky(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            "--branch",
+            "fix",
+            "--model",
+            "stg_orders",
+        ],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("strict scheduling is on")
+            && err.contains("'stg_orders' -> 'orders_enriched'"),
+        "{}",
+        describe(&out)
+    );
+}
+
+/// A cycle through a qualified read is still contained: `stg_orders` reads
+/// `marts.orders`, `orders_enriched`'s own target, by its qualified name.
+#[test]
+fn qualified_name_cycle_is_still_withheld_under_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "marts.orders");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let v = json(&out);
+    assert!(has_cycle_error(&v), "{}", describe(&out));
+    assert!(built(&v).is_empty(), "{}", describe(&out));
+}
+
 #[test]
 fn retry_failed_reruns_only_failed_and_unbuilt_models() {
     let dir = tempfile::tempdir().unwrap();
