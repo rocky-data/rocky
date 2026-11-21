@@ -3846,7 +3846,9 @@ fn models_with_error_tests(
             // #2632: the run never evaluates `[[tests]]` for these models.
             StrategyConfig::ContentAddressed { .. } => false,
             // Never executed: compile inlines it into each consumer, and the
-            // run filters it out before any test runs.
+            // run filters it out before any test runs. Unreachable in a project
+            // that compiles (`[[tests]]` on an ephemeral model is E038); kept
+            // because this loader does not compile the models.
             StrategyConfig::Ephemeral => false,
             StrategyConfig::FullRefresh
             | StrategyConfig::Incremental { .. }
