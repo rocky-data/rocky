@@ -3532,7 +3532,10 @@ pub async fn plan_promote(
                 .iter()
                 .any(|e| matches!(e.kind, AuditEventKind::FailingTestsAllowed))
         {
-            println!("WARNING: failing test(s) allowed (--allow-failing-tests was set)");
+            println!(
+                "WARNING: failing test(s) or missing test evidence allowed \
+                 (--allow-failing-tests was set)"
+            );
         }
         if let Some(bc) = &result.plan.breaking_changes {
             let breaking_count = bc.iter().filter(|f| f.is_breaking()).count();
@@ -3682,6 +3685,11 @@ pub(crate) struct PromoteTestEvidence {
     /// model built with no recorded test result. These refuse the promote
     /// like a failure, unless `--allow-failing-tests`.
     pub warnings: Vec<String>,
+    /// What Rocky could not check here, which only warns: the branch's runs
+    /// may live in a remote `[state]` backend, or a pipeline's models
+    /// directory does not exist. A run seen locally, or a model that loads,
+    /// still refuses on a gap.
+    pub notices: Vec<String>,
 }
 
 /// Decide what the branch's runs mean for a promote.
@@ -3741,6 +3749,7 @@ pub(crate) fn assess_branch_test_evidence(
             warnings: vec![format!(
                 "branch '{branch}' has no recorded run, so there is no test evidence for it"
             )],
+            notices: Vec::new(),
         };
     };
     let mut warnings = Vec::new();
@@ -3833,7 +3842,11 @@ pub(crate) fn assess_branch_test_evidence(
             untested.join(", ")
         ));
     }
-    PromoteTestEvidence { failures, warnings }
+    PromoteTestEvidence {
+        failures,
+        warnings,
+        notices: Vec::new(),
+    }
 }
 
 /// The models that declare at least one error-severity `[[tests]]` entry:
@@ -3846,15 +3859,21 @@ pub(crate) fn assess_branch_test_evidence(
 /// leave a test result.
 /// Counting them would refuse every promote with no way to cure it.
 ///
-/// Returns the names and, when some models could not be loaded, a warning
-/// saying so. The caller treats that warning as an evidence gap and refuses
+/// Returns the names, a gap when some models could not be loaded, and a
+/// notice when a pipeline's models directory does not exist. The gap refuses
+/// the promote; the notice only warns, because a pipeline with no models
+/// directory has no model to test. The caller treats that warning as an evidence gap and refuses
 /// the promote with it, unless `--allow-failing-tests`. It never reads as "no
 /// tested models".
 fn models_with_error_tests(
     config_path: &Path,
     cfg: &rocky_core::config::RockyConfig,
     models_dir: &Path,
-) -> (std::collections::BTreeSet<String>, Option<String>) {
+) -> (
+    std::collections::BTreeSet<String>,
+    Option<String>,
+    Option<String>,
+) {
     fn runs_tests(strategy: &rocky_core::models::StrategyConfig) -> bool {
         use rocky_core::models::StrategyConfig;
         match strategy {
@@ -3891,10 +3910,11 @@ fn models_with_error_tests(
     }
     let mut names = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
+    let mut missing = Vec::new();
     match crate::models_loader::load_transformation_models(config_path, cfg) {
         Ok(loaded) => {
             for (pipeline, dir) in &loaded.missing_roots {
-                problems.push(format!(
+                missing.push(format!(
                     "the models directory of pipeline '{pipeline}' ({}) does not exist",
                     dir.display()
                 ));
@@ -3914,13 +3934,65 @@ fn models_with_error_tests(
             )),
         }
     }
-    let warning = (!problems.is_empty()).then(|| {
+    let gap = (!problems.is_empty()).then(|| {
         format!(
             "{}, so models built with no recorded test result may not all be named",
             problems.join("; ")
         )
     });
-    (names, warning)
+    let notice = (!missing.is_empty()).then(|| {
+        format!(
+            "{}, so its models were not checked for test evidence",
+            missing.join("; ")
+        )
+    });
+    (names, gap, notice)
+}
+
+/// The branch's test evidence for a promote, from the runs this state store
+/// holds.
+///
+/// With no branch run here, a local `[state]` backend means the branch was
+/// never run: a gap that refuses. A remote backend may hold runs this store
+/// does not, so the history could not be checked locally: a notice that only
+/// warns. A run seen here is always assessed, and a bad one refuses.
+fn promote_test_evidence(
+    branch: &str,
+    branch_runs: &[rocky_core::state::RunRecord],
+    error_test_models: &std::collections::BTreeSet<String>,
+    state_path: &Path,
+    backend: rocky_core::config::StateBackend,
+) -> PromoteTestEvidence {
+    use rocky_core::config::StateBackend;
+    if !branch_runs.is_empty() {
+        return assess_branch_test_evidence(branch, branch_runs, error_test_models);
+    }
+    let remote = match backend {
+        StateBackend::Local => false,
+        StateBackend::S3 | StateBackend::Gcs | StateBackend::Valkey | StateBackend::Tiered => true,
+    };
+    if remote {
+        return PromoteTestEvidence {
+            failures: Vec::new(),
+            warnings: Vec::new(),
+            notices: vec![format!(
+                "branch '{branch}' has no run in the local state store {}, and `[state]` \
+                 uses the {backend:?} backend, so the run history could not be checked \
+                 locally. The promote goes on with no test evidence; use \
+                 `--allow-failing-tests` only if you know the branch is safe",
+                state_path.display()
+            )],
+        };
+    }
+    PromoteTestEvidence {
+        failures: Vec::new(),
+        warnings: vec![format!(
+            "branch '{branch}' has no recorded run in the state store {}, so there is no \
+             test evidence for it",
+            state_path.display()
+        )],
+        notices: Vec::new(),
+    }
 }
 
 /// Build and persist a `PromotePlan` from the given parameters.
@@ -4092,23 +4164,17 @@ pub(crate) async fn build_promote_plan_inner(
                     | rocky_core::state::RunStatus::SkippedInFlight
             )
     })?;
-    let (error_test_models, models_load_warning) =
+    let (error_test_models, models_load_gap, models_missing_notice) =
         models_with_error_tests(config_path, &rocky_cfg, models_dir);
-    let mut evidence = if branch_runs.is_empty() {
-        // Runs recorded in another state store (a remote backend, another
-        // `--state-namespace`) are not seen here; name the one read.
-        PromoteTestEvidence {
-            failures: Vec::new(),
-            warnings: vec![format!(
-                "branch '{branch_name}' has no recorded run in the state store {}, so there \
-                 is no test evidence for it",
-                state_path.display()
-            )],
-        }
-    } else {
-        assess_branch_test_evidence(branch_name, &branch_runs, &error_test_models)
-    };
-    evidence.warnings.extend(models_load_warning);
+    let mut evidence = promote_test_evidence(
+        branch_name,
+        &branch_runs,
+        &error_test_models,
+        state_path,
+        rocky_cfg.state.backend,
+    );
+    evidence.warnings.extend(models_load_gap);
+    evidence.notices.extend(models_missing_notice);
     let test_audit = |kind: AuditEventKind, reason: String| AuditEvent {
         kind,
         at: Utc::now(),
@@ -4118,6 +4184,14 @@ pub(crate) async fn build_promote_plan_inner(
         reason: Some(reason),
         breaking_changes: None,
     };
+    // What could not be checked here only warns.
+    for notice in &evidence.notices {
+        eprintln!("WARNING: promote of branch '{branch_name}': {notice}");
+        audit.push(test_audit(
+            AuditEventKind::TestEvidenceMissing,
+            notice.clone(),
+        ));
+    }
     // A recorded failure and every gap in the evidence refuse the promote.
     if !evidence.failures.is_empty() || !evidence.warnings.is_empty() {
         let mut parts = Vec::new();
@@ -4266,6 +4340,87 @@ pub(crate) async fn build_promote_plan_inner(
 #[cfg(test)]
 mod tests {
 
+    /// A run record of `branch` with the given status and no test results.
+    fn branch_run(branch: &str, status: &str) -> rocky_core::state::RunRecord {
+        serde_json::from_value(serde_json::json!({
+            "run_id": "r1", "started_at": "2026-01-01T00:00:00Z",
+            "finished_at": "2026-01-01T00:00:01Z", "status": status,
+            "models_executed": [], "trigger": "Manual", "config_hash": "c",
+            "rocky_branch": branch, "test_results": [],
+        }))
+        .expect("run record")
+    }
+
+    /// No branch run in a store backed remotely only warns: the history
+    /// could not be checked here. With a local backend it refuses.
+    #[test]
+    fn no_local_branch_run_warns_under_remote_state_and_refuses_under_local() {
+        use rocky_core::config::StateBackend;
+        let none = std::collections::BTreeSet::new();
+        let path = std::path::Path::new("state.redb");
+        for backend in [
+            StateBackend::S3,
+            StateBackend::Gcs,
+            StateBackend::Valkey,
+            StateBackend::Tiered,
+        ] {
+            let ev = super::promote_test_evidence("pr1", &[], &none, path, backend);
+            assert!(ev.failures.is_empty() && ev.warnings.is_empty(), "{ev:?}");
+            assert_eq!(ev.notices.len(), 1, "{ev:?}");
+            assert!(
+                ev.notices[0].contains("could not be checked locally"),
+                "{ev:?}"
+            );
+            assert!(ev.notices[0].contains("--allow-failing-tests"), "{ev:?}");
+        }
+        let ev = super::promote_test_evidence("pr1", &[], &none, path, StateBackend::Local);
+        assert!(ev.notices.is_empty(), "{ev:?}");
+        assert!(ev.warnings[0].contains("no recorded run"), "{ev:?}");
+    }
+
+    /// A failed branch run seen locally refuses whatever the backend.
+    #[test]
+    fn a_local_failed_branch_run_refuses_under_remote_state() {
+        use rocky_core::config::StateBackend;
+        let none = std::collections::BTreeSet::new();
+        let path = std::path::Path::new("state.redb");
+        let runs = [branch_run("pr1", "Failure")];
+        for backend in [StateBackend::Local, StateBackend::S3] {
+            let ev = super::promote_test_evidence("pr1", &runs, &none, path, backend);
+            assert!(ev.notices.is_empty(), "{ev:?}");
+            assert!(
+                ev.warnings.iter().any(|w| w.contains("did not succeed")),
+                "{ev:?}"
+            );
+        }
+    }
+
+    /// A transformation pipeline whose models directory does not exist only
+    /// warns; it is not a gap that refuses.
+    #[test]
+    fn a_missing_models_directory_is_a_notice_not_a_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"w.duckdb\"\n\n\
+             [pipeline.t]\ntype = \"transformation\"\nmodels = \"nowhere/**\"\n\n\
+             [pipeline.t.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let (names, gap, notice) =
+            super::models_with_error_tests(&config_path, &cfg, &tmp.path().join("models"));
+        assert!(names.is_empty(), "{names:?}");
+        assert!(gap.is_none(), "{gap:?}");
+        assert!(
+            notice
+                .as_deref()
+                .is_some_and(|n| n.contains("does not exist")),
+            "{notice:?}"
+        );
+    }
+
     /// #2632: a content-addressed model never gets test results, and an
     /// ephemeral model is never executed, so neither one's error-severity
     /// test may create a promote gap.
@@ -4306,7 +4461,8 @@ mod tests {
         )
         .unwrap();
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
-        let (names, _warning) = super::models_with_error_tests(&config_path, &cfg, &models_dir);
+        let (names, _gap, _notice) =
+            super::models_with_error_tests(&config_path, &cfg, &models_dir);
         assert!(names.contains("plain"), "{names:?}");
         assert!(!names.contains("ca"), "{names:?}");
         assert!(!names.contains("eph"), "{names:?}");
