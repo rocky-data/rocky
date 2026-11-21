@@ -299,6 +299,39 @@ fn bare_name_cycle_is_skipped_with_a_warning_under_explicit_containment() {
     );
 }
 
+/// A text-mode run shows the dropped edge too: it is logged as a warning at
+/// the default log level, not only listed in the JSON output.
+#[test]
+fn bare_name_cycle_warning_is_shown_in_text_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+
+    // A branch run of one model: only the containment ledger sees the edge,
+    // so this line is the only place the warning can come from.
+    let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("--config")
+        .arg(dir.path().join("rocky.toml"))
+        .args(["run", "--branch", "fix", "--model", "stg_orders"])
+        .current_dir(dir.path())
+        .env_remove("RUST_LOG")
+        .env_remove("ROCKY_PRINCIPAL")
+        .output()
+        .expect("spawn rocky");
+    assert!(out.status.success(), "{}", describe(&out));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        all.contains("'stg_orders' -> 'orders_enriched'"),
+        "{}",
+        describe(&out)
+    );
+}
+
 /// The same project on a branch run. The shadow rewrite matches a bare name
 /// against each routed model's table, so it rewrites `stg_orders`' bare
 /// `orders` read to `orders_enriched`'s branch table and records that read as
@@ -368,6 +401,7 @@ fn strict_scheduling_refuses_a_dropped_bare_edge_on_a_branch_run() {
     );
     let created = rocky(dir.path(), &["branch", "create", "fix"]);
     assert!(created.status.success(), "{}", describe(&created));
+    let before = warehouse_objects(dir.path());
 
     let out = rocky(
         dir.path(),
@@ -389,6 +423,33 @@ fn strict_scheduling_refuses_a_dropped_bare_edge_on_a_branch_run() {
         "{}",
         describe(&out)
     );
+    // The refusal comes before `auto_create_schemas` and function DDL: the
+    // branch schema is never created, and no table or function appears.
+    assert_eq!(
+        warehouse_objects(dir.path()),
+        before,
+        "a refused run must write nothing: {}",
+        describe(&out)
+    );
+}
+
+/// Every schema, table and function in the warehouse, sorted.
+fn warehouse_objects(dir: &Path) -> Vec<String> {
+    let conn = duckdb::Connection::open(dir.join("warehouse.duckdb")).expect("open duckdb");
+    let mut stmt = conn
+        .prepare(
+            "SELECT 'schema ' || schema_name FROM information_schema.schemata \
+             UNION ALL SELECT 'table ' || table_schema || '.' || table_name \
+             FROM information_schema.tables \
+             UNION ALL SELECT 'function ' || schema_name || '.' || function_name \
+             FROM duckdb_functions() WHERE NOT internal \
+             ORDER BY 1",
+        )
+        .expect("prepare");
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect()
 }
 
 /// A cycle through a qualified read is still contained: `stg_orders` reads

@@ -14383,6 +14383,142 @@ async fn execute_models_phase(
         }
     }
 
+    // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
+    // Tracks the downstream closure of every failed / withheld model so a
+    // disjoint subgraph can continue while a failure's blast radius is withheld.
+    // The closure does NOT trust the declared graph (`dag_nodes`) as complete:
+    // it also folds physical-target reads (a raw-SQL model reading a producer's
+    // table by physical name, not by `ref()`) into the closure, and fails closed
+    // on any model whose reads can't be proven disjoint from the failure set —
+    // see `commands::containment`. Seeded with the compile-failed models
+    // excluded above (a compile error is a failure; its downstream is withheld).
+    //
+    // Built only when `contain_failures` is on (extracting each model's reads
+    // has a cost); when off the ledger stays empty and unconsulted, and the run
+    // keeps its historical fail-fast-at-first-failure behaviour byte-for-byte.
+    let mut containment = super::containment::ContainmentLedger::new();
+    if resilience.contain_failures {
+        let producers = super::containment::ProducerIndex::build(
+            compile_result.project.models.iter().map(|m| {
+                (
+                    m.config.name.as_str(),
+                    m.config.target.catalog.as_str(),
+                    m.config.target.schema.as_str(),
+                    m.config.target.table.as_str(),
+                )
+            }),
+        );
+        let dep_by_model: std::collections::HashMap<&str, &[String]> = compile_result
+            .project
+            .dag_nodes
+            .iter()
+            .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+            .collect();
+        for model in &compile_result.project.models {
+            let name = model.config.name.as_str();
+            let declared_ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
+            let externalized = externalized_defer_edges.get(name);
+            let filtered_ref_deps: Vec<String>;
+            let ref_deps = if let Some(externalized) = externalized {
+                filtered_ref_deps = declared_ref_deps
+                    .iter()
+                    .filter(|dependency| !externalized.contains(*dependency))
+                    .cloned()
+                    .collect();
+                filtered_ref_deps.as_slice()
+            } else {
+                declared_ref_deps
+            };
+            // Enumerate physical reads only when the read set is provably
+            // complete; otherwise the model fails closed (`reads_complete =
+            // false`), so it is withheld once a failure has occurred.
+            let (reads, reads_complete): (Vec<String>, bool) =
+                if rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
+                    match rocky_sql::lineage::extract_lineage(&model.sql) {
+                        Ok(l) => (
+                            l.source_tables
+                                .iter()
+                                .map(|t| t.name.to_lowercase())
+                                .filter(|read| {
+                                    !externalized.is_some_and(|externalized| {
+                                        matches!(
+                                            producers.resolve(read),
+                                            super::containment::ReadResolution::Edges(ref models)
+                                                if models.iter().all(|model| externalized.contains(model))
+                                        )
+                                    })
+                                })
+                                .collect(),
+                            true,
+                        ),
+                        // Provably-complete said yes but extraction failed — fail
+                        // closed rather than trust an empty read set.
+                        Err(_) => (Vec::new(), false),
+                    }
+                } else {
+                    (Vec::new(), false)
+                };
+            containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
+        }
+        containment.seed_failed(compile_failed_models.iter().cloned());
+    }
+
+    // When containment is on, execution follows layers recomputed over the FULL
+    // containment edge set (ref ∪ physical ∪ bare), so a physical/bare reader is
+    // scheduled strictly after its producer — closing the same-layer `--parallel`
+    // race where a reader and its (about-to-fail) producer co-scheduled and the
+    // reader built on stale output. When off, the original ref-only layers are
+    // used, byte-for-byte. A bare-name read edge that would close a cycle is
+    // dropped from the ordering (the same policy as the fail-fast physical-read
+    // derivation) and reported as a scheduling warning; the closure still
+    // withholds its reader when the producer is already failed. Any model stuck
+    // in a cycle of declared or qualified edges is contained up front (fail
+    // closed) and recorded as a single run error so the run reports non-success.
+    let augmented_plan = resilience
+        .contain_failures
+        .then(|| containment.augmented_layers());
+    if let Some(plan) = &augmented_plan {
+        // Render with the derivation's own warning text. On a non-shadow run
+        // `augment_physical_read_edges` may already have reported the same
+        // pair (a mutual pair in either order), so it is not reported twice.
+        let render = |skipped: &[(String, String)], mutual: &[(String, String)]| {
+            rocky_core::physical_edges::derivation_warnings(
+                &rocky_core::physical_edges::DerivedPhysicalEdges {
+                    skipped_cycle_edges: skipped.to_vec(),
+                    ambiguous_bare_pairs: mutual.to_vec(),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut new_warnings: Vec<String> = Vec::new();
+        for edge in &plan.skipped_bare_edges {
+            new_warnings.extend(render(std::slice::from_ref(edge), &[]));
+        }
+        for (a, b) in &plan.mutual_bare_pairs {
+            let reported_reversed = render(&[], &[(b.clone(), a.clone())]);
+            if reported_reversed
+                .iter()
+                .any(|w| output.scheduling_warnings.contains(w))
+            {
+                continue;
+            }
+            new_warnings.extend(render(&[], &[(a.clone(), b.clone())]));
+        }
+        new_warnings.retain(|w| !output.scheduling_warnings.contains(w));
+        // Logged as well, so a text-mode run shows the dropped edge.
+        for warning in &new_warnings {
+            warn!("{warning}");
+        }
+        output
+            .scheduling_warnings
+            .extend(new_warnings.iter().cloned());
+        // `[run] strict_scheduling` refuses an unresolved ordering on every
+        // path, including a shadow or branch run that skipped the derivation.
+        // This runs before any hook, source count, schema or function DDL, so
+        // a refused run writes nothing.
+        refuse_on_scheduling_warnings(strict_scheduling, &new_warnings)?;
+    }
+
     // #1093: capture governance from the same in-memory model set the
     // fingerprint gate verified, after execution-only defer SQL and physical
     // shadow-target rewrites. No files are re-read, and governance follows the
@@ -14698,135 +14834,6 @@ async fn execute_models_phase(
     let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project)
         .with_function_callers(function_callers.clone());
 
-    // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
-    // Tracks the downstream closure of every failed / withheld model so a
-    // disjoint subgraph can continue while a failure's blast radius is withheld.
-    // The closure does NOT trust the declared graph (`dag_nodes`) as complete:
-    // it also folds physical-target reads (a raw-SQL model reading a producer's
-    // table by physical name, not by `ref()`) into the closure, and fails closed
-    // on any model whose reads can't be proven disjoint from the failure set —
-    // see `commands::containment`. Seeded with the compile-failed models
-    // excluded above (a compile error is a failure; its downstream is withheld).
-    //
-    // Built only when `contain_failures` is on (extracting each model's reads
-    // has a cost); when off the ledger stays empty and unconsulted, and the run
-    // keeps its historical fail-fast-at-first-failure behaviour byte-for-byte.
-    let mut containment = super::containment::ContainmentLedger::new();
-    if resilience.contain_failures {
-        let producers = super::containment::ProducerIndex::build(
-            compile_result.project.models.iter().map(|m| {
-                (
-                    m.config.name.as_str(),
-                    m.config.target.catalog.as_str(),
-                    m.config.target.schema.as_str(),
-                    m.config.target.table.as_str(),
-                )
-            }),
-        );
-        let dep_by_model: std::collections::HashMap<&str, &[String]> = compile_result
-            .project
-            .dag_nodes
-            .iter()
-            .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
-            .collect();
-        for model in &compile_result.project.models {
-            let name = model.config.name.as_str();
-            let declared_ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
-            let externalized = externalized_defer_edges.get(name);
-            let filtered_ref_deps: Vec<String>;
-            let ref_deps = if let Some(externalized) = externalized {
-                filtered_ref_deps = declared_ref_deps
-                    .iter()
-                    .filter(|dependency| !externalized.contains(*dependency))
-                    .cloned()
-                    .collect();
-                filtered_ref_deps.as_slice()
-            } else {
-                declared_ref_deps
-            };
-            // Enumerate physical reads only when the read set is provably
-            // complete; otherwise the model fails closed (`reads_complete =
-            // false`), so it is withheld once a failure has occurred.
-            let (reads, reads_complete): (Vec<String>, bool) =
-                if rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
-                    match rocky_sql::lineage::extract_lineage(&model.sql) {
-                        Ok(l) => (
-                            l.source_tables
-                                .iter()
-                                .map(|t| t.name.to_lowercase())
-                                .filter(|read| {
-                                    !externalized.is_some_and(|externalized| {
-                                        matches!(
-                                            producers.resolve(read),
-                                            super::containment::ReadResolution::Edges(ref models)
-                                                if models.iter().all(|model| externalized.contains(model))
-                                        )
-                                    })
-                                })
-                                .collect(),
-                            true,
-                        ),
-                        // Provably-complete said yes but extraction failed — fail
-                        // closed rather than trust an empty read set.
-                        Err(_) => (Vec::new(), false),
-                    }
-                } else {
-                    (Vec::new(), false)
-                };
-            containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
-        }
-        containment.seed_failed(compile_failed_models.iter().cloned());
-    }
-
-    // When containment is on, execution follows layers recomputed over the FULL
-    // containment edge set (ref ∪ physical ∪ bare), so a physical/bare reader is
-    // scheduled strictly after its producer — closing the same-layer `--parallel`
-    // race where a reader and its (about-to-fail) producer co-scheduled and the
-    // reader built on stale output. When off, the original ref-only layers are
-    // used, byte-for-byte. A bare-name read edge that would close a cycle is
-    // dropped from the ordering (the same policy as the fail-fast physical-read
-    // derivation) and reported as a scheduling warning; the closure still
-    // withholds its reader when the producer is already failed. Any model stuck
-    // in a cycle of declared or qualified edges is contained up front (fail
-    // closed) and recorded as a single run error so the run reports non-success.
-    let augmented_plan = resilience
-        .contain_failures
-        .then(|| containment.augmented_layers());
-    if let Some(plan) = &augmented_plan {
-        // Render with the derivation's own warning text. On a non-shadow run
-        // `augment_physical_read_edges` may already have reported the same
-        // pair (a mutual pair in either order), so it is not reported twice.
-        let render = |skipped: &[(String, String)], mutual: &[(String, String)]| {
-            rocky_core::physical_edges::derivation_warnings(
-                &rocky_core::physical_edges::DerivedPhysicalEdges {
-                    skipped_cycle_edges: skipped.to_vec(),
-                    ambiguous_bare_pairs: mutual.to_vec(),
-                    ..Default::default()
-                },
-            )
-        };
-        let mut new_warnings: Vec<String> = Vec::new();
-        for edge in &plan.skipped_bare_edges {
-            new_warnings.extend(render(std::slice::from_ref(edge), &[]));
-        }
-        for (a, b) in &plan.mutual_bare_pairs {
-            let reported_reversed = render(&[], &[(b.clone(), a.clone())]);
-            if reported_reversed
-                .iter()
-                .any(|w| output.scheduling_warnings.contains(w))
-            {
-                continue;
-            }
-            new_warnings.extend(render(&[], &[(a.clone(), b.clone())]));
-        }
-        new_warnings.retain(|w| !output.scheduling_warnings.contains(w));
-        output
-            .scheduling_warnings
-            .extend(new_warnings.iter().cloned());
-        // `[run] strict_scheduling` refuses an unresolved ordering on every
-        // path, including a shadow or branch run that skipped the derivation.
-        refuse_on_scheduling_warnings(strict_scheduling, &new_warnings)?;
-    }
     if let Some(plan) = &augmented_plan
         && !plan.cyclic.is_empty()
     {
@@ -14835,8 +14842,9 @@ async fn execute_models_phase(
             output.contained.push(crate::output::ContainedModelOutput {
                 model: model.clone(),
                 blocked_by: Vec::new(),
-                unblock_hint: "a declared or qualified-name read forms a dependency cycle; \
-                                   break the cycle in depends_on or in the reads"
+                unblock_hint: "this model is in, or downstream of, a dependency cycle \
+                                   that cannot be ordered; break the cycle in depends_on \
+                                   or in the reads"
                     .to_string(),
             });
         }
@@ -14844,8 +14852,8 @@ async fn execute_models_phase(
         output.errors.push(crate::output::TableErrorOutput {
             asset_key: vec!["<cycle>".to_string()],
             error: format!(
-                "dependency cycle in the containment graph (declared or qualified-name reads) — \
-                 withheld {} model(s): {}. Remove the cycle.",
+                "dependency cycle in the containment graph — withheld {} model(s) in or \
+                 downstream of the cycle: {}. Break the cycle in depends_on or in the reads.",
                 plan.cyclic.len(),
                 plan.cyclic.join(", "),
             ),
