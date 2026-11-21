@@ -47,6 +47,20 @@
 //! scheduled strictly after every producer it reads — closing the same-layer
 //! `--parallel` race for *resolvable* reads.
 //!
+//! # Cycle policy
+//!
+//! A cycle through declared (`depends_on`) or qualified-name edges cannot be
+//! ordered, so it is contained (fail closed, a `<cycle>` run error). A
+//! **bare-name** read edge is a search-path guess: when it would close a cycle
+//! it is dropped from the *ordering* and reported as a warning — the same
+//! policy as the fail-fast physical-read derivation
+//! (`rocky_core::physical_edges`). When two models bare-read each other's
+//! tables, both directions are dropped, because neither guess outranks the
+//! other. A dropped edge stays in the containment closure, so a producer that
+//! is already failed (a compile failure) still withholds its bare reader. What
+//! it no longer guarantees is the order: the bare reader can run before, or in
+//! the same layer as, the producer it reads.
+//!
 //! # Guarantee scope
 //!
 //! Failure containment is **guaranteed** for dependencies declared with
@@ -271,6 +285,11 @@ fn canonicalize_identifier(read: &str) -> Option<Vec<String>> {
 pub(crate) struct ContainmentLedger {
     /// `model name → its containment upstreams` (ref-deps ∪ physical edges).
     upstreams: HashMap<String, Vec<String>>,
+    /// `model name → the upstreams it reaches ONLY by a bare (1-part) read` —
+    /// not by a declared dependency and not by a qualified read. A subset of
+    /// `upstreams`. [`Self::augmented_layers`] may drop these from the
+    /// ordering when they close a cycle; the closure keeps them.
+    bare_upstreams: HashMap<String, BTreeSet<String>>,
     /// Models whose read set could not be proven complete / unambiguous — they
     /// fail closed once any failure has occurred.
     uncertain: HashSet<String>,
@@ -293,21 +312,31 @@ pub(crate) struct ContainmentDecision {
 }
 
 /// Execution layers over the augmented containment graph, plus any models that
-/// couldn't be ordered because a physical/bare edge formed a cycle.
+/// couldn't be ordered because a declared or qualified edge formed a cycle, and
+/// the bare-read edges dropped from the ordering to avoid a cycle.
 pub(crate) struct LayerPlan {
     /// Topological execution layers (longest-path) over ref ∪ physical ∪ bare
-    /// edges. A reader is strictly later than every producer it reads.
+    /// edges, minus the dropped bare edges below. A reader is strictly later
+    /// than every producer it reads, except across a dropped bare edge.
     pub layers: Vec<Vec<String>>,
-    /// Models in — or downstream of — an augmented-graph cycle. They can't be
-    /// safely ordered, so the caller contains them (fail closed). Empty in the
-    /// common acyclic case.
+    /// Models in — or downstream of — a cycle of declared or qualified edges.
+    /// They can't be safely ordered, so the caller contains them (fail
+    /// closed). Empty in the common acyclic case.
     pub cyclic: Vec<String>,
+    /// `(reader, producer)` bare-read edges skipped because each would close a
+    /// cycle over the edges already placed. Sorted. The reader is still
+    /// withheld when the producer is poisoned before it runs.
+    pub skipped_bare_edges: Vec<(String, String)>,
+    /// `(a, b)` pairs, `a < b`, where each model bare-reads the other's table.
+    /// Both directions are dropped from the ordering. Sorted.
+    pub mutual_bare_pairs: Vec<(String, String)>,
 }
 
 impl ContainmentLedger {
     pub(crate) fn new() -> Self {
         Self {
             upstreams: HashMap::new(),
+            bare_upstreams: HashMap::new(),
             uncertain: HashSet::new(),
             known: HashSet::new(),
             poison: BTreeSet::new(),
@@ -330,6 +359,11 @@ impl ContainmentLedger {
     ) {
         self.known.insert(name.to_string());
         let mut ups: BTreeSet<String> = ref_deps.iter().cloned().collect();
+        // Upstreams reached by a bare (1-part) read. Those also reached by a
+        // declared dependency or a qualified read are removed below: only a
+        // bare-only edge is a guess the ordering may drop.
+        let mut bare: BTreeSet<String> = BTreeSet::new();
+        let mut strong: BTreeSet<String> = ref_deps.iter().cloned().collect();
         // A read set we cannot fully enumerate cannot prove disjointness.
         let mut uncertain = !reads_complete;
         for read in reads {
@@ -351,8 +385,14 @@ impl ContainmentLedger {
                 // candidate edge (self-reads excluded); the model is blocked iff
                 // at least one candidate is poisoned.
                 ReadResolution::Edges(producers) => {
+                    let is_bare = canonicalize_identifier(read).is_some_and(|p| p.len() == 1);
                     for producer in producers {
                         if producer != name {
+                            if is_bare {
+                                bare.insert(producer.clone());
+                            } else {
+                                strong.insert(producer.clone());
+                            }
                             ups.insert(producer);
                         }
                     }
@@ -365,6 +405,12 @@ impl ContainmentLedger {
         }
         self.upstreams
             .insert(name.to_string(), ups.into_iter().collect());
+        let bare_only: BTreeSet<String> = bare.difference(&strong).cloned().collect();
+        if bare_only.is_empty() {
+            self.bare_upstreams.remove(name);
+        } else {
+            self.bare_upstreams.insert(name.to_string(), bare_only);
+        }
         if uncertain {
             self.uncertain.insert(name.to_string());
         }
@@ -433,38 +479,85 @@ impl ContainmentLedger {
     ///
     /// Longest-path layering ([`rocky_ir::dag::execution_layers`]) places a node
     /// one layer after its deepest dependency, so no two models in the same
-    /// layer share a containment edge; combined with the executor's per-layer
+    /// layer share a containment edge, except across a bare edge dropped below
+    /// to avoid a cycle; combined with the executor's per-layer
     /// barrier, every prior failure is poisoned before the next layer is
     /// evaluated.
     ///
-    /// **Cycle → fail closed.** A physical/bare edge can introduce a dependency
-    /// cycle the ref-graph lacked. Rather than let the topological sort silently
-    /// drop the cyclic nodes, they are returned in [`LayerPlan::cyclic`] (the
-    /// stuck set — the cycle plus everything downstream of it) for the caller to
+    /// **Bare edge closing a cycle → dropped from the ordering.** Declared and
+    /// qualified edges are placed first. Then, if two models bare-read each
+    /// other's tables, both directions are dropped
+    /// ([`LayerPlan::mutual_bare_pairs`]). Each remaining bare-only edge is
+    /// added in sorted `(reader, producer)` order, and skipped
+    /// ([`LayerPlan::skipped_bare_edges`]) when the producer already depends,
+    /// directly or transitively, on the reader. The dropped edges stay in
+    /// `upstreams`, so [`Self::evaluate`] still withholds the reader of a
+    /// producer that is poisoned before the reader runs.
+    ///
+    /// **Cycle of declared or qualified edges → fail closed.** Such a cycle
+    /// cannot be ordered. Rather than let the topological sort silently drop
+    /// the cyclic nodes, they are returned in [`LayerPlan::cyclic`] (the stuck
+    /// set — the cycle plus everything downstream of it) for the caller to
     /// *contain*, and only the acyclic remainder is layered.
     pub(crate) fn augmented_layers(&self) -> LayerPlan {
+        use std::collections::BTreeMap;
+
         use rocky_ir::dag::{self, DagError, DagNode};
 
-        // Augmented graph: each model's dependencies are its full containment
-        // upstream set, restricted to known models.
-        let node = |name: &str, ups: &[String]| DagNode {
-            name: name.to_string(),
-            depends_on: ups
-                .iter()
-                .filter(|u| self.known.contains(*u))
-                .cloned()
-                .collect(),
-        };
-        let nodes: Vec<DagNode> = self
-            .known
-            .iter()
-            .map(|m| node(m, self.upstreams.get(m).map(Vec::as_slice).unwrap_or(&[])))
+        // Augmented graph, restricted to known models. Sorted maps keep the
+        // choice of skipped bare edge independent of hash order.
+        let mut depends_on: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut bare_edges: BTreeSet<(String, String)> = BTreeSet::new();
+        for model in &self.known {
+            let bare = self.bare_upstreams.get(model);
+            let strong = depends_on.entry(model.clone()).or_default();
+            for up in self.upstreams.get(model).into_iter().flatten() {
+                if !self.known.contains(up) {
+                    continue;
+                }
+                if bare.is_some_and(|b| b.contains(up)) {
+                    bare_edges.insert((model.clone(), up.clone()));
+                } else {
+                    strong.insert(up.clone());
+                }
+            }
+        }
+
+        let mut mutual_bare_pairs: Vec<(String, String)> = Vec::new();
+        let mut skipped_bare_edges: Vec<(String, String)> = Vec::new();
+        for (reader, producer) in &bare_edges {
+            if bare_edges.contains(&(producer.clone(), reader.clone())) {
+                if reader < producer {
+                    mutual_bare_pairs.push((reader.clone(), producer.clone()));
+                }
+                continue;
+            }
+            // reader→producer closes a cycle iff producer already reaches
+            // reader over the edges placed so far.
+            if reaches(&depends_on, producer, reader) {
+                skipped_bare_edges.push((reader.clone(), producer.clone()));
+                continue;
+            }
+            depends_on
+                .entry(reader.clone())
+                .or_default()
+                .insert(producer.clone());
+        }
+
+        let nodes: Vec<DagNode> = depends_on
+            .into_iter()
+            .map(|(name, deps)| DagNode {
+                name,
+                depends_on: deps.into_iter().collect(),
+            })
             .collect();
 
         match dag::execution_layers(&nodes) {
             Ok(layers) => LayerPlan {
                 layers,
                 cyclic: Vec::new(),
+                skipped_bare_edges,
+                mutual_bare_pairs,
             },
             // The stuck set (cycle + downstream) can't be ordered — fail closed:
             // contain it, and layer only the acyclic remainder.
@@ -486,7 +579,12 @@ impl ContainmentLedger {
                 let layers = dag::execution_layers(&acyclic).unwrap_or_default();
                 let mut cyclic = stuck;
                 cyclic.sort();
-                LayerPlan { layers, cyclic }
+                LayerPlan {
+                    layers,
+                    cyclic,
+                    skipped_bare_edges,
+                    mutual_bare_pairs,
+                }
             }
             // `UnknownDependency` cannot arise (deps are filtered to known
             // models), but fail closed if it somehow does: contain everything.
@@ -496,10 +594,36 @@ impl ContainmentLedger {
                 LayerPlan {
                     layers: Vec::new(),
                     cyclic,
+                    skipped_bare_edges,
+                    mutual_bare_pairs,
                 }
             }
         }
     }
+}
+
+/// Whether `from` depends, directly or transitively, on `to` over
+/// `depends_on`. The visited set keeps the walk finite when the graph already
+/// holds a cycle of declared or qualified edges.
+fn reaches(
+    depends_on: &std::collections::BTreeMap<String, BTreeSet<String>>,
+    from: &str,
+    to: &str,
+) -> bool {
+    let mut stack: Vec<&str> = vec![from];
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some(node) = stack.pop() {
+        if node == to {
+            return true;
+        }
+        if !seen.insert(node) {
+            continue;
+        }
+        if let Some(deps) = depends_on.get(node) {
+            stack.extend(deps.iter().map(String::as_str));
+        }
+    }
+    false
 }
 
 /// A human-readable hint telling the operator how to clear a withheld model.
@@ -968,8 +1092,8 @@ mod tests {
         }
     }
 
-    /// A physical/bare edge that forms a cycle the ref-graph lacked → fail
-    /// closed: the stuck set is surfaced in `cyclic` (for the caller to
+    /// A qualified physical edge that forms a cycle the ref-graph lacked →
+    /// fail closed: the stuck set is surfaced in `cyclic` (for the caller to
     /// contain), not silently dropped or mis-ordered.
     #[test]
     fn augmented_layers_cycle_is_contained() {
@@ -981,10 +1105,108 @@ mod tests {
         );
         let plan = led.augmented_layers();
         assert_eq!(plan.cyclic, vec!["A".to_string(), "B".to_string()]);
+        assert!(plan.skipped_bare_edges.is_empty());
+        assert!(plan.mutual_bare_pairs.is_empty());
         assert!(
             plan.layers
                 .iter()
                 .all(|l| l.is_empty() || !l.contains(&"A".to_string()))
         );
+    }
+
+    /// A BARE read that would close a cycle with a declared edge is dropped
+    /// from the ordering, not contained: no `cyclic`, one skipped pair, the
+    /// declared order stands. The closure keeps the edge, so a producer that
+    /// is already failed still withholds the bare reader.
+    #[test]
+    fn augmented_layers_bare_cycle_closer_is_skipped() {
+        // A depends on B (declared); B bare-reads `a`, A's table ⇒ the bare
+        // edge B→A would close the cycle.
+        let mut led = ledger(
+            &[("A", &["B"], &["b"], true), ("B", &[], &["a"], true)],
+            &[("A", "", "main", "a"), ("B", "", "main", "b")],
+        );
+        let plan = led.augmented_layers();
+        assert!(plan.cyclic.is_empty(), "{:?}", plan.cyclic);
+        assert_eq!(
+            plan.skipped_bare_edges,
+            vec![("B".to_string(), "A".to_string())]
+        );
+        assert!(plan.mutual_bare_pairs.is_empty());
+        assert!(
+            layer_of(&plan, "B").unwrap() < layer_of(&plan, "A").unwrap(),
+            "the declared order (B before A) stands"
+        );
+        led.seed_failed(["A".to_string()]);
+        let dec = led
+            .evaluate("B")
+            .expect("a failed producer still withholds its bare reader");
+        assert_eq!(dec.blocked_by, vec!["A".to_string()]);
+    }
+
+    /// Two models that bare-read each other's tables: both directions are
+    /// dropped from the ordering, and both edges stay in the closure.
+    #[test]
+    fn augmented_layers_mutual_bare_pair_drops_both_directions() {
+        let mut led = ledger(
+            &[("A", &[], &["b"], true), ("B", &[], &["a"], true)],
+            &[("A", "", "main", "a"), ("B", "", "main", "b")],
+        );
+        let plan = led.augmented_layers();
+        assert!(plan.cyclic.is_empty(), "{:?}", plan.cyclic);
+        assert!(plan.skipped_bare_edges.is_empty());
+        assert_eq!(
+            plan.mutual_bare_pairs,
+            vec![("A".to_string(), "B".to_string())]
+        );
+        assert_eq!(layer_of(&plan, "A"), Some(0));
+        assert_eq!(layer_of(&plan, "B"), Some(0));
+        led.seed_failed(["B".to_string()]);
+        assert!(led.evaluate("A").is_some(), "A still reads failed B");
+    }
+
+    /// A bare read that is ALSO a declared dependency is not a bare edge: a
+    /// cycle through it is still contained.
+    #[test]
+    fn bare_read_covered_by_a_declared_dep_still_reports_cycle() {
+        // A declares B; B declares A and also bare-reads `a`.
+        let led = ledger(
+            &[("A", &["B"], &[], true), ("B", &["A"], &["a"], true)],
+            &[("A", "", "main", "a"), ("B", "", "main", "b")],
+        );
+        let plan = led.augmented_layers();
+        assert_eq!(plan.cyclic, vec!["A".to_string(), "B".to_string()]);
+        assert!(plan.skipped_bare_edges.is_empty());
+    }
+
+    /// A bare edge that closes a cycle is skipped deterministically, and the
+    /// rest of a longer bare chain still orders: A→B→C bare, C bare-reads A.
+    #[test]
+    fn augmented_layers_bare_chain_skips_only_the_closer() {
+        let led = ledger(
+            &[
+                ("A", &[], &["c"], true),
+                ("B", &[], &["a"], true),
+                ("C", &[], &["b"], true),
+            ],
+            &[
+                ("A", "", "main", "a"),
+                ("B", "", "main", "b"),
+                ("C", "", "main", "c"),
+            ],
+        );
+        let plan = led.augmented_layers();
+        assert!(plan.cyclic.is_empty());
+        // Sorted order places (A, C) and (B, A) first; (C, B) closes the cycle.
+        assert_eq!(
+            plan.skipped_bare_edges,
+            vec![("C".to_string(), "B".to_string())]
+        );
+        let (la, lb, lc) = (
+            layer_of(&plan, "A").unwrap(),
+            layer_of(&plan, "B").unwrap(),
+            layer_of(&plan, "C").unwrap(),
+        );
+        assert!(lc < la && la < lb, "C={lc} A={la} B={lb}");
     }
 }
