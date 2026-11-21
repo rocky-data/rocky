@@ -14468,12 +14468,15 @@ async fn execute_models_phase(
     // scheduled strictly after its producer — closing the same-layer `--parallel`
     // race where a reader and its (about-to-fail) producer co-scheduled and the
     // reader built on stale output. When off, the original ref-only layers are
-    // used, byte-for-byte. A bare-name read edge that would close a cycle is
-    // dropped from the ordering (the same policy as the fail-fast physical-read
-    // derivation) and reported as a scheduling warning; the closure still
-    // withholds its reader when the producer is already failed. Any model stuck
-    // in a cycle of declared or qualified edges is contained up front (fail
-    // closed) and recorded as a single run error so the run reports non-success.
+    // used, byte-for-byte. Declared and qualified edges are placed first; a
+    // bare-name read edge is then added only if it does not close a cycle.
+    // A bare edge that would close one is dropped from the ordering (the same
+    // policy as the fail-fast physical-read derivation) and reported as a
+    // scheduling warning; the closure still withholds its reader when the
+    // producer is already failed. Any model that still cannot be ordered — in,
+    // or downstream of, a cycle of the placed edges — is contained up front
+    // (fail closed) and recorded as a single run error so the run reports
+    // non-success.
     let augmented_plan = resilience
         .contain_failures
         .then(|| containment.augmented_layers());
