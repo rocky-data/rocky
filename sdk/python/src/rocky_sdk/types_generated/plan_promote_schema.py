@@ -65,7 +65,7 @@ class AuditEventKind14(StrEnum):
 
 class AuditEventKind15(StrEnum):
     """
-    Emitted when a model's newest test evidence on the branch holds an error-severity `[[tests]]` failure and the promote was refused (#2609). `reason` names the failing tests and the runs that recorded them.
+    Emitted when the promote was refused (#2609). Either a model's newest test evidence holds an error-severity `[[tests]]` failure, or the evidence is missing: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. `reason` names each cause.
     """
 
     failing_tests_blocked = "failing_tests_blocked"
@@ -73,7 +73,7 @@ class AuditEventKind15(StrEnum):
 
 class AuditEventKind16(StrEnum):
     """
-    Emitted when a model's newest test evidence holds a failing error-severity test and the operator overrode the refusal with `--allow-failing-tests`.
+    Emitted when the operator overrode a refusal with `--allow-failing-tests`. The refusal was a failing error-severity test or missing test evidence. `reason` names which.
     """
 
     failing_tests_allowed = "failing_tests_allowed"
@@ -81,7 +81,7 @@ class AuditEventKind16(StrEnum):
 
 class AuditEventKind17(StrEnum):
     """
-    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. A warning only: the promote proceeds. `reason` says which.
+    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. It is recorded only when `--allow-failing-tests` overrode the refusal for the gap. Without the flag the gap refuses the promote. `reason` says which.
     """
 
     test_evidence_missing = "test_evidence_missing"
