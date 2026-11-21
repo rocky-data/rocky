@@ -879,6 +879,7 @@ fn governed_run_context<'a>(
         // preflight (`preflight_snapshot`), not folded into this flag.
         require_fingerprint: embedded.fingerprint_version >= 1,
         reviewed_source_schemas: embedded.reviewed_source_schemas,
+        described_source_schemas: embedded.described_source_schemas,
         reviewed_first_run_fills: embedded.first_run_fills,
         replication_verify_after: Mutex::new(BTreeSet::new()),
     })
@@ -3894,6 +3895,13 @@ pub struct ExecFingerprintGate {
     /// (v2 governed) plan with `None` REFUSES. Carried here because
     /// `execute_models` has no plan handle.
     pub reviewed_source_schemas: Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The sources the plan described to settle its contract verdicts
+    /// (`EmbeddedCapabilities::described_source_schemas`, #2635). The
+    /// choke-point replays them in place of `rocky run`'s live describe: they
+    /// settle `I003` / `E012` verdicts only and never seed the compile that
+    /// executes. Empty on a plan that described nothing, or one written before
+    /// the field existed; its `E012` then stays (fail closed).
+    pub described_source_schemas: BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
     /// The models the plan showed filling from `first_partition` on their
     /// first run (`EmbeddedCapabilities::first_run_fills`). A first-run fill
     /// of any other model refuses at execution. Carried here because
@@ -4000,6 +4008,10 @@ pub struct GovernedRunContext<'a> {
     /// REFUSES (fail-closed).
     pub reviewed_source_schemas:
         Option<std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The sources the plan described to settle its contract verdicts; see
+    /// [`ExecFingerprintGate::described_source_schemas`].
+    pub described_source_schemas:
+        std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
     /// The models the plan showed filling from `first_partition`; see
     /// [`ExecFingerprintGate::reviewed_first_run_fills`].
     pub reviewed_first_run_fills: BTreeSet<String>,
@@ -4055,6 +4067,7 @@ impl GovernedRunContext<'_> {
             exec_control_identity: execution_control_identity(cfg),
             resolved_mask: cfg.resolve_mask_for_env(env),
             reviewed_source_schemas: self.reviewed_source_schemas.clone(),
+            described_source_schemas: self.described_source_schemas.clone(),
             reviewed_first_run_fills: self.reviewed_first_run_fills.clone(),
             plan_id: self.plan_id.to_string(),
             require: self.require_fingerprint,
@@ -9352,6 +9365,7 @@ effect = "deny"
             models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["m".to_string()]);
@@ -9394,6 +9408,7 @@ effect = "deny"
             models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["m".to_string()]);
@@ -9429,6 +9444,7 @@ effect = "deny"
             models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["m".to_string()]);
@@ -9660,6 +9676,7 @@ effect = "allow"
             models_only_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
         };
         // Both models execute; only stg_x changed.
@@ -10812,6 +10829,7 @@ schema = "s"
             governance_identity: "g".to_string(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             plan_id: "p".to_string(),
             require: false,
@@ -10826,6 +10844,7 @@ schema = "s"
             governance_identity: "g".to_string(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             plan_id: "p".to_string(),
             require: true,
@@ -10841,6 +10860,7 @@ schema = "s"
             governance_identity: "g".to_string(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             plan_id: "p".to_string(),
             require: true,
@@ -10855,6 +10875,7 @@ schema = "s"
                 governance_identity: "g".to_string(),
                 exec_control_identity: String::new(),
                 resolved_mask: std::collections::BTreeMap::new(),
+                described_source_schemas: Default::default(),
                 reviewed_source_schemas: None,
                 plan_id: "p".to_string(),
                 require: true,
@@ -10872,6 +10893,7 @@ schema = "s"
                 governance_identity: "DIFFERENT".to_string(),
                 exec_control_identity: String::new(),
                 resolved_mask: std::collections::BTreeMap::new(),
+                described_source_schemas: Default::default(),
                 reviewed_source_schemas: None,
                 plan_id: "p".to_string(),
                 require: true,
@@ -10892,6 +10914,7 @@ schema = "s"
                 governance_identity: "g".to_string(),
                 exec_control_identity: "DIFFERENT".to_string(),
                 resolved_mask: std::collections::BTreeMap::new(),
+                described_source_schemas: Default::default(),
                 reviewed_source_schemas: None,
                 plan_id: "p".to_string(),
                 require: true,
@@ -10983,6 +11006,7 @@ schema = "s"
             expected_ir_fingerprint: None,
             expected_config_identity: expected,
             require_fingerprint: require,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: Mutex::new(BTreeSet::new()),
@@ -11090,6 +11114,7 @@ schema = "s"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: require,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: snapshot,
             expects_models: true,
             replication_verify_after: Mutex::new(BTreeSet::new()),
@@ -11156,6 +11181,7 @@ schema = "s"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: Mutex::new(BTreeSet::new()),
@@ -11208,6 +11234,7 @@ effect = "deny"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: Mutex::new(BTreeSet::new()),
@@ -11259,6 +11286,7 @@ effect = "allow"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: Mutex::new(BTreeSet::new()),
@@ -11316,6 +11344,7 @@ effect = "allow"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: Mutex::new(BTreeSet::new()),
@@ -11360,6 +11389,7 @@ verify_after = ["row_count"]
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: Mutex::new(BTreeSet::new()),
