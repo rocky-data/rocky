@@ -1759,31 +1759,45 @@ fn the_fulfill_apply_records_a_failing_test_without_failing_under_enforce() {
     );
 }
 
-/// With `tests_on_run = "off"`, the loop's apply runs no test query. The red
-/// is still found by the loop's own observation.
-#[test]
-fn the_fulfill_apply_runs_no_test_under_off() {
+/// With `tests_on_run = "<mode>"`, the loop's apply runs no test query. The
+/// red is still found by the loop's own observation.
+fn assert_the_fulfill_apply_runs_no_test(mode: &str) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let config = write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
     let text = std::fs::read_to_string(&config).expect("config");
-    std::fs::write(&config, format!("{text}\n[run]\ntests_on_run = \"off\"\n"))
-        .expect("config with tests off");
+    std::fs::write(
+        &config,
+        format!("{text}\n[run]\ntests_on_run = \"{mode}\"\n"),
+    )
+    .expect("config with a tests mode");
     let plan = drive_to_plan_review(dir);
     let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
     assert_eq!(code, 0, "review approve: {err}");
 
     let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
     let json = json.expect("fulfill json");
-    assert_eq!(code, 4, "{err} {json}");
-    assert_eq!(json["state"], "observed_failing", "{json}");
+    assert_eq!(code, 4, "{mode}: {err} {json}");
+    assert_eq!(json["state"], "observed_failing", "{mode}: {json}");
 
     let run = apply_run(dir);
     assert!(
         run.test_results.is_empty(),
-        "no test query ran on the apply: {:?}",
+        "{mode}: no test query ran on the apply: {:?}",
         run.test_results
     );
+}
+
+#[test]
+fn the_fulfill_apply_runs_no_test_under_off() {
+    assert_the_fulfill_apply_runs_no_test("off");
+}
+
+/// A configured `report` resolves to `off` for the loop's apply too: only
+/// `enforce` makes the apply run the tests.
+#[test]
+fn the_fulfill_apply_runs_no_test_under_report() {
+    assert_the_fulfill_apply_runs_no_test("report");
 }
 
 /// THE F3 acceptance path. A model that applies cleanly but violates a
