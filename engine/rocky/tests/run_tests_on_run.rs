@@ -186,6 +186,81 @@ fn enforce_by_default_fails_a_model_whose_test_fails() {
     assert_eq!(test_result(&v, "customer_orders")["status"], "fail", "{v}");
 }
 
+/// A project whose only pipeline is a replication one, so `rocky plan
+/// --model` writes a run plan that a plain `rocky apply` executes.
+const APPLY_CONFIG: &str = r#"
+[adapter]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+catalog_template = "fixture"
+schema_template = "staging__{source}"
+
+[pipeline.ingest.target.governance]
+auto_create_schemas = true
+"#;
+
+/// Plans `dupes`, whose `unique` test fails, and applies the plan. Returns
+/// the apply's output.
+fn plan_and_apply_a_failing_model(dir: &Path, extra_config: &str) -> Output {
+    fs::write(
+        dir.join("rocky.toml"),
+        format!("{APPLY_CONFIG}{extra_config}"),
+    )
+    .unwrap();
+    let models = dir.join("models");
+    fs::create_dir_all(&models).unwrap();
+    fs::write(
+        models.join("dupes.sql"),
+        "SELECT 1 AS id UNION ALL SELECT 1 AS id",
+    )
+    .unwrap();
+    fs::write(
+        models.join("dupes.toml"),
+        "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"fixture\"\nschema = \"main\"\n\n[[tests]]\ntype = \"unique\"\ncolumn = \"id\"\n",
+    )
+    .unwrap();
+    let plan = rocky(dir, &["--output", "json", "plan", "--model", "dupes"]);
+    assert!(plan.status.success(), "{}", describe(&plan));
+    let plan_id = json(&plan)["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no plan_id\n{}", describe(&plan)))
+        .to_string();
+    rocky(dir, &["--output", "json", "apply", &plan_id])
+}
+
+/// `rocky apply` keeps `[run] tests_on_run`, so under the default the applied
+/// run fails a model whose error-severity test fails. The same plan applies
+/// cleanly with tests off, so the refusal is the test's.
+#[test]
+fn apply_enforces_tests_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = plan_and_apply_a_failing_model(tmp.path(), "");
+    assert!(!out.status.success(), "{}", describe(&out));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("dupes"), "{}", describe(&out));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = plan_and_apply_a_failing_model(tmp.path(), "\n[run]\ntests_on_run = \"off\"\n");
+    assert!(out.status.success(), "{}", describe(&out));
+}
+
 #[test]
 fn off_runs_no_test_and_adds_no_output_field() {
     let tmp = tempfile::tempdir().unwrap();

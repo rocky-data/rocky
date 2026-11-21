@@ -658,9 +658,9 @@ pub async fn apply_plan(
         output_json,
         // The loop observes the applied model itself and routes a red to
         // repair. Under `enforce` the apply's own run would fail on a
-        // declared-test red first and block the loop, so the tests run in
-        // `report` mode: recorded, never failing the model.
-        Some(rocky_core::config::TestsOnRun::Report),
+        // declared-test red first and block the loop. `FulfillLoop` keeps the
+        // apply from failing on a test; it does not feed the loop's verdict.
+        super::apply::ApplyTests::FulfillLoop,
     )
     .await
 }

@@ -1709,10 +1709,8 @@ impl SkipRunOptions {
     /// source-sync phase off.
     ///
     /// `tests_on_run` overrides `[run] tests_on_run` for the applied run, as
-    /// `rocky run --tests` does; `None` keeps the config value. Plain
-    /// `rocky apply` passes `None`. The fulfill loop's apply step passes
-    /// `Some(TestsOnRun::Report)`, so a red that a declared test catches is
-    /// recorded for the loop to observe instead of blocking the apply.
+    /// `rocky run --tests` does; `None` keeps the config value. The apply
+    /// resolves it from `commands::apply::ApplyTests`.
     pub fn for_apply(tests_on_run: Option<rocky_core::config::TestsOnRun>) -> Self {
         Self {
             no_source_sync: true,

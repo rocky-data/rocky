@@ -3827,8 +3827,9 @@ pub(crate) fn assess_branch_test_evidence(
 /// `--models` directory when it exists (a model leg run with `--models` or
 /// `--all` has no transformation pipeline of its own).
 ///
-/// Models whose strategy is `content_addressed` are left out. The run never
-/// evaluates their `[[tests]]` (#2632), so they can never leave a test result.
+/// Models whose strategy is `content_addressed` (#2632) or `ephemeral` are
+/// left out. The run never evaluates their `[[tests]]`, so they can never
+/// leave a test result.
 /// Counting them would raise an evidence gap that no run can cure.
 ///
 /// Returns the names and, when some models could not be loaded, a warning
@@ -3844,11 +3845,13 @@ fn models_with_error_tests(
         match strategy {
             // #2632: the run never evaluates `[[tests]]` for these models.
             StrategyConfig::ContentAddressed { .. } => false,
+            // Never executed: compile inlines it into each consumer, and the
+            // run filters it out before any test runs.
+            StrategyConfig::Ephemeral => false,
             StrategyConfig::FullRefresh
             | StrategyConfig::Incremental { .. }
             | StrategyConfig::Merge { .. }
             | StrategyConfig::TimeInterval { .. }
-            | StrategyConfig::Ephemeral
             | StrategyConfig::DeleteInsert { .. }
             | StrategyConfig::Microbatch { .. }
             | StrategyConfig::View
@@ -4243,8 +4246,9 @@ pub(crate) async fn build_promote_plan_inner(
 #[cfg(test)]
 mod tests {
 
-    /// #2632: a content-addressed model never gets test results, so its
-    /// error-severity test must not create a promote gap.
+    /// #2632: a content-addressed model never gets test results, and an
+    /// ephemeral model is never executed, so neither one's error-severity
+    /// test may create a promote gap.
     #[test]
     fn content_addressed_model_with_error_test_is_not_a_promote_gap() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4269,6 +4273,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(models_dir.join("plain.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("eph.toml"),
+            format!("name = \"eph\"\n\n[strategy]\ntype = \"ephemeral\"\n{target}table = \"eph\"\n{tests}"),
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("eph.sql"), "SELECT 1 AS id").unwrap();
         let config_path = tmp.path().join("rocky.toml");
         std::fs::write(
             &config_path,
@@ -4279,6 +4289,7 @@ mod tests {
         let (names, _warning) = super::models_with_error_tests(&config_path, &cfg, &models_dir);
         assert!(names.contains("plain"), "{names:?}");
         assert!(!names.contains("ca"), "{names:?}");
+        assert!(!names.contains("eph"), "{names:?}");
     }
 
     #[test]
