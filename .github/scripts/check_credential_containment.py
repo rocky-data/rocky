@@ -1092,7 +1092,6 @@ def _check_preview_producer(workflow: Workflow, job: str) -> list[str]:
         steps[1], "with", indent=8
     ) != {
         "base_ref": "${{ github.event.pull_request.base.sha }}",
-        "branch_name": "${{ github.event.pull_request.head.ref }}",
         "working_directory": (
             "examples/playground/pocs/06-developer-experience/"
             "10-pr-preview-and-data-diff"
