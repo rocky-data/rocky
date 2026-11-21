@@ -1,8 +1,8 @@
 # ADR-STAGED-PUBLISH — Opt-in staged publish for transformation runs
 
-**Status:** Proposed. The direction was ruled on 2026-11-21: staged publish is opt-in, and the default stays in place. This note is the design for that ruling.
+**Status:** Proposed. Ruled 2026-11-21: staged publish is opt-in; the default stays in place.
 
-**Scope:** Issue #2612. A transformation run writes each model to production as it finishes. A later failure leaves production mixing new and old outputs.
+**Scope:** Issue #2612.
 
 ---
 
@@ -10,21 +10,28 @@
 
 ### The problem
 
-`rocky run` writes each model to its production target when that model finishes. The config docs say checks run after model execution (the `checks` field of `TransformationPipelineConfig`). So a failed downstream model, check or test leaves the upstream models already published. Consumers read a mix that no single run produced. The #2612 reproduction shows it on DuckDB: `stg_orders` holds the new text column, and `customer_orders` keeps its old columns.
+`rocky run` writes each model to its production target when that model finishes. A failed downstream model leaves the upstream models published, a mix no single run produced. The #2612 reproduction shows it on DuckDB: `stg_orders` holds the new text column, and `customer_orders` keeps its old columns.
+
+What runs after a write today:
+
+- The transformation run path never reads `pipeline.checks` (`commands/run_local.rs`). The doc comment on that field ("run after model execution") has no call site there.
+- Per model, right after its write, `run.rs` runs the volume check, then the model's `[[tests]]`.
+- The tests run only under `[run] tests_on_run`, which defaults to `off` (`rocky-core/src/config.rs`). By default, no test runs.
 
 ### What is already true
 
 - [`ADR-REPLACE.md`](ADR-REPLACE.md) makes **one table's** replace safe, not several tables changing together.
-- `SwapNames::for_target` (`rocky-core/src/replace.rs`) already reserves a stage name beside each target.
+- `SwapNames::for_target` (`rocky-core/src/replace.rs`) reserves a stage and a backup name beside each target.
+- Swap by rename is built only on Trino. `SqlDialect::rename_table_sql` refuses by default (`rocky-core/src/traits.rs`), and only `rocky-trino` overrides it.
 - Shadow and branch runs point each model's upstream references at the shadow targets (`apply_shadow_rewrite` in `commands/run.rs`).
 
 ### Why the branch flow alone does not close the gap
 
 The nearest path today is `rocky run --branch <name>`, then `rocky branch promote`. It has three limits.
 
-**1. Promote can stop after a partial write.** `run_promote_apply` (`commands/branch.rs`) checks every destination first. It reads each branch source with `SELECT * FROM <source> LIMIT 0`. Then it runs one autocommit statement per target, in order, and stops at the first failure. Each statement is a copy: `CREATE OR REPLACE TABLE prod.t AS SELECT * FROM branch.t`. A copy evaluates the source again at write time. The `LIMIT 0` check cannot see an error that appears only when rows are read.
+**1. Promote can stop after a partial write.** `run_promote_apply` (`commands/branch.rs`) checks every destination first. It reads each branch source with `SELECT * FROM <source> LIMIT 0`. Then it writes one target at a time and stops at the first failure. Each write copies: `CREATE OR REPLACE TABLE prod.t AS SELECT * FROM branch.t`, or on a staged-swap dialect (Trino), `promote_swap`, which builds its stage from the same `SELECT`. Either way the source is evaluated again at write time, which `LIMIT 0` cannot fully test.
 
-The test `promote_reports_all_targets_after_a_partial_write` (`commands/branch.rs`) proves this. Its second branch source is a view that does `CAST('bad' AS INTEGER)`. The `LIMIT 0` check passes. Then:
+The test `promote_reports_all_targets_after_a_partial_write` (`commands/branch.rs`) proves this. Its second source is a view doing `CAST('bad' AS INTEGER)`, which passes `LIMIT 0`:
 
 ```
 step 1  first   replaced            (production now holds the new rows)
@@ -32,11 +39,9 @@ step 2  second  not confirmed       (the copy failed while reading rows)
 step 3  third   not attempted       (production table never created)
 ```
 
-The test asserts `marts.first` holds the new value and `marts.third` does not exist.
+**2. Promote covers two strategies only**, `full_refresh` and `view`. A branch run also refuses the incremental strategies, because a branch target starts empty.
 
-**2. Promote covers two strategies only.** It refuses every strategy except `full_refresh` and `view` ("branch promotion is undefined for {other}"). A branch run refuses `incremental`, `merge`, `delete_insert`, `microbatch` and `snapshot`, because a branch target starts empty.
-
-**3. It is two manual commands**, which a scheduled `rocky run` does not use.
+**3. It is two manual commands**, unused by a scheduled `rocky run`.
 
 ## Decision
 
@@ -46,95 +51,110 @@ A new opt-in mode, `publish = "staged"`. The default, `"in_place"`, keeps today'
 
 ```
 build    every selected model  ->  <target>__rocky_stage   (production untouched)
-check    every check           ->  runs against the stages
-gate     any model or check failed?  ->  stop; production untouched
-swap     every stage           ->  production, by rename, in dependency order
+test     per model, on its stage: volume check, then [[tests]]
+gate     any failure?  ->  drop this run's stages; production untouched
+swap     every stage   ->  production, in dependency order
 clean    drop the old tables the swap moved aside
 ```
 
-- **Build.** The shadow rewrite points each downstream model at its upstream's stage.
-- **Check.** Pipeline checks and error-severity tests (the `--tests enforce` set that the #2609 promote gate reads) run against the stages. A failure blocks the publish, just like a failed model.
-- **Gate.** On any failure Rocky publishes nothing. It drops the stages it built in this run. A stage left behind would make the next replace refuse with `LeftoverStage` (`rocky-core/src/replace.rs`), so one failed scheduled run would block every later one.
-- **Swap.** The stage is already a built table, so the swap never runs model SQL again. The failure in the test above cannot recur here. The swap is a rename where the warehouse allows it. DuckDB over Iceberg is the exception: it overwrites in place from the stage (D2). Views are re-created against the production names after the tables, as promote does today.
-- **Swap failure.** Rocky stops and reports. It does not reverse the swaps already done in v1, because a reverse rename can fail too. The failed target keeps its old table through the ADR-REPLACE recovery.
+- **Build.** Downstream models read their upstream's stage, through the shadow rewrite.
+- **Test.** The same per-model checks as today, run against the stage. With `tests_on_run = "off"`, the default, the gate sees only model failures and volume breaches. Staged publish keeps that default.
+- **Gate.** On any failure Rocky publishes nothing and drops the stages it built in this run. A stage left behind would make the next replace refuse with `LeftoverStage`.
+- **Swap.** The stage is already a built table, so the swap never runs model SQL again. It reuses ADR-REPLACE's `StagedSwap` renames per target. That needs `rename_table_sql` on every adapter that opts in: new work everywhere except Trino. DuckDB over Iceberg cannot rename, so it overwrites in place from the stage (D2). Views are re-created against the production names after the tables.
 - **Clean.** Rocky drops the moved-aside tables only after every swap succeeded.
 
-Where the warehouse allows it, the swap and clean steps run in one transaction. See D2.
+Where the warehouse allows it, the swap and clean steps run in one transaction.
 
 ### D2 — Per-warehouse atomicity
 
-Staged publish always closes one gap. A failed model or check no longer publishes anything. Whether the **swap itself** is atomic depends on the warehouse.
+A failed model or test no longer publishes anything, on every warehouse. Whether the **swap itself** is atomic depends on the warehouse.
 
 **Grounded in tree** (the ADR-REPLACE and ADR-DUCKLAKE spikes):
 
-| Warehouse | What the swap can do |
+| Warehouse | What is proven |
 |---|---|
-| PostgreSQL, Redshift | One table's replace runs as one implicit transaction (`rocky-postgres` connector). |
+| PostgreSQL, Redshift | One table's replace runs as one implicit transaction. |
 | SQL Server | One table's replace runs `sp_rename` inside one transaction. |
-| DuckLake | A transaction that mixes DDL and DML rolls back fully. A transaction that writes the lake and the main database is refused. |
-| DuckDB over Iceberg REST | One transaction can write two **existing** tables atomically. It cannot create two tables, and it cannot include a rename or a drop. So the swap there is an in-place overwrite of existing tables, and a first build of two new tables cannot be atomic. |
-| Trino | Multi-statement transactions are refused ("only supports writes using autocommit"). Each table swaps by two renames. A reader can get "table not found" between them. No multi-table atomicity. |
+| DuckLake | A transaction that mixes DDL and DML rolls back fully. Writing the lake and the main database in one transaction is refused. |
+| DuckDB over Iceberg REST | One transaction can write two **existing** tables atomically. It cannot create two tables, rename or drop. A first build of two new tables cannot be atomic. |
+| Trino | Multi-statement transactions are refused. Each table swaps by two renames, with a "table not found" window between them. |
 
-**Not established in tree, needs a spike before a claim:**
+**Needs a spike before a claim:**
 
 | Warehouse | Assumed until a spike says otherwise |
 |---|---|
-| DuckDB (native file), PostgreSQL, Redshift, SQL Server | Several renames in one transaction. Only single-table replaces are probed. |
-| Snowflake, Databricks, BigQuery, ClickHouse, Spark | One object at a time. Each object's replace is atomic (ADR-REPLACE), but no multi-table swap is assumed. |
+| DuckDB (native), PostgreSQL, Redshift, SQL Server | Several renames in one transaction. |
+| Snowflake, Databricks, BigQuery, ClickHouse, Spark | One object at a time. No multi-table swap is assumed. |
 
-Where no transaction can span the swap, a failure **during** the swap can still leave a mix. Staged publish shrinks the failure window from "any model or check" to "the swap statements", which run no model SQL. Rocky reports every target as `published`, `not confirmed` or `not published`, the three outcomes the promote test checks. The run output says whether the swap was one transaction or per object.
+Where no transaction spans the swap, a failure during it still leaves a mix, but in a window of statements that run no model SQL. Rocky reports every target as `published`, `not confirmed` or `not published`, and says whether the swap was one transaction or per object.
 
-### D3 — Strategy scope (v1)
+### D3 — Recovery after a partial swap
 
-v1 stages `full_refresh` and `view` models, the set promote already handles. A staged run that selects any other strategy refuses at plan time and names the model. `materialized_view` and `dynamic_table` are a follow-up: a shadow run builds them, but how each warehouse renames them is not probed. A stage for `incremental`, `merge`, `delete_insert`, `microbatch` or `snapshot` must start as a copy of the current target. That is a clone or a full copy, a cost decision left to a follow-up.
+After a swap stops partway, the warehouse holds:
 
-### D4 — Config key
+```
+swapped targets     new table   + <target>__rocky_old    (backup)
+failed target       old table   (if StagedSwap's rollback succeeds)
+unswapped targets   old table   + <target>__rocky_stage  (stage)
+```
 
-The key sits under the pipeline's existing `[execution]` table. It is an enum, not a bool, so a later mode can be added.
+The next replace of any of them refuses (`LeftoverBackup`, `LeftoverStage`). Production stays mixed until someone acts.
+
+**Proposed rule.** Before the first swap, Rocky records the run's stage and backup names in the state store. The next staged run of that pipeline reads the record first. It drops each recorded backup beside a swapped target and each recorded stage beside an unswapped one. Then it rebuilds and publishes every selected model as normal. A table at a working name that is not in the record still refuses, as ADR-REPLACE requires. An in-place run never drops working tables. It refuses as today, and the message names the `DROP` to run by hand.
+
+**Decision for Hugo:** this rule drops a backup automatically, so the pre-run copy of a swapped target is lost. ADR-REPLACE's default keeps it and refuses.
+
+### D4 — Strategy scope (v1)
+
+v1 stages `full_refresh` and `view` models. It refuses `incremental`, `merge`, `time_interval`, `delete_insert`, `microbatch`, `snapshot`, `materialized_view`, `dynamic_table` and `content_addressed`. `ephemeral` models have no object, so they are skipped. The incremental family needs a stage copied from the target first, a cost decision for a follow-up.
+
+**One refused model refuses the whole run** at plan time, and the message names it. A pipeline that mixes strategies cannot use staged publish in v1.
+
+### D5 — Config key
+
+An enum under the pipeline's `[execution]` table:
 
 ```toml
 [pipeline.marts.execution]
 publish = "staged"     # default: "in_place"
 ```
 
-A `rocky run --publish staged|in_place` flag overrides it for one run. Other pipeline types share `ExecutionConfig`; they refuse `publish = "staged"` in v1. The names are proposed.
+A `rocky run --publish staged|in_place` flag overrides it for one run. Other pipeline types share `ExecutionConfig` and refuse `"staged"` in v1. The names are proposed.
 
 ## Consequences
 
-What changes for the user who opts in:
+For a user who opts in:
 
-- A failed model, check or test leaves production as before the run. The run exits non-zero.
-- A failed swap stops the run with some targets new and some old, and reports each one.
+- A failed model or test leaves production as before the run, and the run exits non-zero.
+- A failed swap leaves some targets new and some old, reported per target, until the next staged run (D3).
 - Readers see the previous outputs until the swap.
 - Storage peaks at about two copies of each rebuilt table.
 - The run needs rights to create and rename tables in each target schema.
-- The run JSON gains a publish section with a disposition per target. That is an output-schema change and goes through `just codegen`.
-A user who does not opt in sees no change.
+- The run JSON gains a per-target publish section, an output-schema change through `just codegen`.
 
-### What this does not close
+Nothing changes for anyone else.
 
-- Atomic multi-table publish on warehouses without multi-statement DDL transactions.
-- Incremental-family models under staged publish (D3).
-- Two concurrent staged runs on one target. ADR-REPLACE already does not support two concurrent runs.
+### Open questions
+
+- **Unverified:** after a model builds, `run.rs` records it as `Built` for the skip gate. If a staged model is recorded that way and the gate then fails, a later `--skip-unchanged` run could skip it, leaving production on the old version. The publish must record `Built` only after its swap.
+- Atomic multi-table publish where no multi-statement DDL transaction exists.
+- Two concurrent staged runs on one target, which ADR-REPLACE already does not support.
 
 ## Alternatives considered
 
-- **Make staged the default.** Not chosen. The 2026-11-21 ruling keeps in place as the default.
-- **Point users at the branch flow.** It does not close the gap (see Context).
-- **Publish through views over versioned tables.** Still one object at a time on most warehouses.
+- **Make staged the default.** Not chosen: the 2026-11-21 ruling keeps in place as the default.
 
 ## Validation
 
 - DuckDB: the #2612 recipe under `publish = "staged"`. The second model fails, and both production tables keep their old shape.
-- A failing check blocks the publish with every model built.
-- A scripted adapter that fails at each swap step reports the right disposition for every target.
-- A spike per warehouse in the "needs a spike" table before its row is stated as fact.
+- A failing test under `tests_on_run = "enforce"` blocks the publish.
+- A scripted adapter that fails at each swap step reports every target correctly, and the next staged run recovers (D3).
 
 ## Least confident
 
-- Whether DuckDB native, PostgreSQL, Redshift and SQL Server run several renames in one transaction. Only single-table replaces are probed.
-- Whether v1 without incremental-family models is useful enough, since many pipelines are mostly incremental.
+- Whether DuckDB native, PostgreSQL, Redshift and SQL Server commit several renames in one transaction. Only single-table replaces are probed.
+- Whether v1 is useful when one incremental model refuses the whole run.
 
 ## Missing
 
-A per-warehouse spike of a two-table rename swap inside one transaction, with a failure injected between the renames, would settle the D2 table.
+A per-warehouse spike of a two-table rename swap in one transaction, with a failure injected between the renames, would settle the D2 table.
