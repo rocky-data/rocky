@@ -2833,7 +2833,7 @@ export interface RunConfig {
   /**
    * Run each model's sidecar `[[tests]]` against the table the run just built (#2611).
    *
-   * - `"off"` (default): no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `"report"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `"enforce"`: as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.
+   * - `"off"`: no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `"report"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `"enforce"` (default): as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.
    *
    * A `severity = "warning"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation.
    */

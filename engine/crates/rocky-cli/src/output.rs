@@ -457,9 +457,10 @@ pub struct RunOutput {
     pub model_statuses: Vec<ModelRunStatusOutput>,
     /// The `[[tests]]` this run evaluated after building models, one entry per
     /// test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run
-    /// --tests`). Omitted when no test ran, so a default run is unchanged on
-    /// the wire. The same list is persisted on the run record, where `rocky
-    /// plan promote` reads it.
+    /// --tests`). Omitted when no test ran (`tests_on_run = "off"`, or a run
+    /// that built no model with a `[[tests]]` entry). The default is `enforce`,
+    /// so a default run lists its results here. The same list is persisted on
+    /// the run record, where `rocky plan promote` reads it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_results: Vec<RunTestResultOutput>,
     pub check_results: Vec<TableCheckOutput>,
@@ -10770,19 +10771,23 @@ pub enum AuditEventKind {
     /// Rocky version. Fail-open: the gate is skipped and the promote
     /// proceeds, but the reason is recorded so the bypass is auditable.
     BreakingChangesGateSkipped,
-    /// Emitted when a model's newest test evidence on the branch holds an
-    /// error-severity `[[tests]]` failure and the promote was refused (#2609).
-    /// `reason` names the failing tests and the runs that recorded them.
+    /// Emitted when the promote was refused (#2609). Either a model's newest
+    /// test evidence holds an error-severity `[[tests]]` failure, or the
+    /// evidence is missing: the branch has no run, its newest run failed, a
+    /// model that declares error-severity tests was last built with no
+    /// recorded test result, or the models could not be loaded to tell.
+    /// `reason` names each cause.
     FailingTestsBlocked,
-    /// Emitted when a model's newest test evidence holds a failing
-    /// error-severity test and the operator overrode the refusal with
-    /// `--allow-failing-tests`.
+    /// Emitted when the operator overrode a refusal with
+    /// `--allow-failing-tests`. The refusal was a failing error-severity test
+    /// or missing test evidence. `reason` names which.
     FailingTestsAllowed,
     /// Emitted when the promote has no passing test evidence to rely on: the
     /// branch has no run, its newest run failed, a model that declares
     /// error-severity tests was last built with no recorded test result, or
-    /// the models could not be loaded to tell. A warning only: the promote
-    /// proceeds. `reason` says which.
+    /// the models could not be loaded to tell. It is recorded only when
+    /// `--allow-failing-tests` overrode the refusal for the gap. Without the
+    /// flag the gap refuses the promote. `reason` says which.
     TestEvidenceMissing,
     /// Emitted by `rocky plan promote` when the plan has been successfully
     /// written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an

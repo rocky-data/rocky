@@ -308,7 +308,7 @@ export interface RunOutput {
   tables_failed: number;
   tables_skipped?: number;
   /**
-   * The `[[tests]]` this run evaluated after building models, one entry per test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run --tests`). Omitted when no test ran, so a default run is unchanged on the wire. The same list is persisted on the run record, where `rocky plan promote` reads it.
+   * The `[[tests]]` this run evaluated after building models, one entry per test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run --tests`). Omitted when no test ran (`tests_on_run = "off"`, or a run that built no model with a `[[tests]]` entry). The default is `enforce`, so a default run lists its results here. The same list is persisted on the run record, where `rocky plan promote` reads it.
    */
   test_results?: RunTestResultOutput[];
   /**
