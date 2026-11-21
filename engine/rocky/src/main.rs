@@ -3215,8 +3215,10 @@ enum PlanSubcommand {
         allow_breaking: bool,
         /// Bypass the failing-tests gate. `promote` refuses a branch when a
         /// model's newest test evidence on it holds an error-severity
-        /// `[[tests]]` failure (see `rocky run --tests`). An override of a
-        /// real refusal records a `FailingTestsAllowed` audit event.
+        /// `[[tests]]` failure (see `rocky run --tests`). It also overrides a
+        /// refusal for missing test evidence (no branch run, a failed newest
+        /// run, a tested model built with no recorded result). An override of
+        /// a real refusal records a `FailingTestsAllowed` audit event.
         #[arg(long)]
         allow_failing_tests: bool,
         /// Filter sources by component value (e.g., --filter client=acme).
@@ -3332,8 +3334,10 @@ enum BranchAction {
         allow_breaking: bool,
         /// Bypass the failing-tests gate. `promote` refuses a branch when a
         /// model's newest test evidence on it holds an error-severity
-        /// `[[tests]]` failure (see `rocky run --tests`). An override of a
-        /// real refusal records a `FailingTestsAllowed` audit event.
+        /// `[[tests]]` failure (see `rocky run --tests`). It also overrides a
+        /// refusal for missing test evidence (no branch run, a failed newest
+        /// run, a tested model built with no recorded result). An override of
+        /// a real refusal records a `FailingTestsAllowed` audit event.
         #[arg(long)]
         allow_failing_tests: bool,
         /// Git ref to diff against for the breaking-change gate.
