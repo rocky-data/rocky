@@ -130,13 +130,15 @@ pub enum ValidationError {
         use_: ExpressionUse,
     },
 
-    // ClickHouse reads `x IN (t)` as a read of table `t` when `t` is one
-    // name (#2713). The one-column comparison it may have meant is `=`.
+    // ClickHouse reads `x IN t` and `x IN (t)` as a read of table `t` when
+    // `t` names a table (#2713). The parse cannot tell a table from a
+    // column, so one name is refused either way. The one-column comparison
+    // it may have meant is `=`.
     #[error(
-        "{context}: expression uses `IN (<name>)` with one name. On ClickHouse this reads \
-         the table of that name, and {} may only read the row's own columns. To compare \
-         with one column, write `=` (for example `id = other_id`); for a list of values, \
-         write `IN (a, b)`",
+        "{context}: expression uses `IN` with a single name as its target. On ClickHouse \
+         that name may be a table, and IN then reads that table; {} may only read the \
+         row's own columns. To compare with one column or value, write `=` (for example \
+         `id = other_id`); for a list of values, write `IN (a, b)`",
         .use_.noun_lowercase()
     )]
     ExpressionInSingleName {

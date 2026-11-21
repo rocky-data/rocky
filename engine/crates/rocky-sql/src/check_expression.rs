@@ -28,8 +28,8 @@
 //!    target dialect (trailing tokens included — `x) OR 1=1 --` must not
 //!    be able to close the generated `NOT (` and add clauses);
 //! 2. any nested query, wherever it appears, and any `IN` whose target is a
-//!    table or table function — on ClickHouse that includes `IN (<name>)`
-//!    with one name (#2713);
+//!    table or table function — on ClickHouse that includes `IN <name>` and
+//!    `IN (<name>)` with one name, since the name may be a table (#2713);
 //! 3. any qualified function name — that is how UDFs, remote functions and
 //!    plugin functions are reached;
 //! 4. any unqualified function not in [`CHECK_EXPRESSION_FUNCTIONS`];
@@ -912,19 +912,6 @@ impl ExpressionUse {
     }
 }
 
-// ClickHouse, minus the unparenthesised `IN` target. ClickHouse reads
-// `x IN t` as a read of table `t`, and sqlparser parses it as a one-element
-// list, so the walker could not tell it from `x IN (1)` (#2713). With the
-// flag off, `x IN t` and `x IN f(1)` do not parse. `preserve_type_id` keeps
-// every ClickHouse-specific parser path (`dialect_of!`) and lets the walker
-// recognise the dialect with `is::<ClickHouseDialect>()`.
-sqlparser::derive_dialect!(
-    CheckExpressionClickHouseDialect,
-    ClickHouseDialect,
-    preserve_type_id = true,
-    overrides = { supports_in_unparenthesized_expr = false }
-);
-
 /// The sqlparser dialect to parse an expression under, from a Rocky
 /// `SqlDialect::name()`.
 ///
@@ -932,10 +919,6 @@ sqlparser::derive_dialect!(
 /// accepts a superset of the syntax the others share. Unknown names take
 /// the same route — parsing under a broader dialect can only *accept* more
 /// syntax, and acceptance still has to clear the walker below.
-///
-/// ClickHouse parses under a derived dialect that refuses an unparenthesised
-/// `IN` target, because every caller of this function parses a check
-/// expression.
 pub fn dialect_for(name: &str) -> Box<dyn Dialect> {
     match name.to_ascii_lowercase().as_str() {
         "duckdb" => Box::new(DuckDbDialect),
@@ -944,7 +927,7 @@ pub fn dialect_for(name: &str) -> Box<dyn Dialect> {
         "databricks" => Box::new(DatabricksDialect),
         "postgres" => Box::new(PostgreSqlDialect {}),
         "redshift" => Box::new(RedshiftSqlDialect {}),
-        "clickhouse" => Box::new(CheckExpressionClickHouseDialect::new()),
+        "clickhouse" => Box::new(ClickHouseDialect {}),
         "sqlserver" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect),
     }
@@ -1005,13 +988,14 @@ pub fn validate_check_expression(
 struct Walker<'a> {
     context: &'a str,
     use_: ExpressionUse,
-    /// The expression parsed under ClickHouse, where `x IN (t)` with one
-    /// name reads table `t`.
+    /// The expression parsed under ClickHouse, where `x IN t` and
+    /// `x IN (t)` with one name can read table `t`.
     clickhouse: bool,
 }
 
 /// True when `list` is one bare or qualified name, seen through any
-/// parentheses: `(t)`, `(db.t)`, `((t))`. On ClickHouse that is a table read.
+/// parentheses: `t`, `(t)`, `(db.t)`, `((t))`. On ClickHouse that can be a
+/// table read.
 fn is_single_name(list: &[Expr]) -> bool {
     let [only] = list else {
         return false;
@@ -1070,10 +1054,14 @@ impl Visitor for Walker<'_> {
                 context: self.context.to_string(),
                 use_: self.use_,
             }),
-            // ClickHouse reads `x IN (t)` as a read of table `t` when `t` is a
-            // single name (#2713). sqlparser parses it as a one-element list,
-            // so refuse that shape here. A list of two or more is a value
-            // list and still passes.
+            // ClickHouse reads `x IN t`, `x IN (t)` and their `GLOBAL` forms
+            // as a read of table `t` when `t` names a table (#2713).
+            // sqlparser parses all of them as a one-element list, and the
+            // parse cannot tell a table from a column, so refuse one name
+            // here. A list of two or more is a value list and still passes,
+            // as do one-element lists that are not a name (`x IN [1, 2]`,
+            // `x IN 1`). `x IN some_fn(1)` is a one-element list holding a
+            // function, which the `Expr::Function` arm judges.
             Expr::In {
                 target: InTarget::List(list),
                 ..
@@ -1834,15 +1822,27 @@ mod tests {
                 "id NOT IN other_table",
             ] {
                 let result = check_on(dialect, expr);
-                assert!(
-                    matches!(
+                // ClickHouse parses all three as a one-element list (#2713).
+                // A name there is refused by the single-name rule; a
+                // function call by the function allowlist.
+                let refused = match (dialect, expr) {
+                    ("clickhouse", "id IN some_fn(1)") => {
+                        matches!(
+                            result,
+                            Err(ValidationError::ExpressionFunctionNotAllowed { .. })
+                        )
+                    }
+                    ("clickhouse", _) => {
+                        matches!(result, Err(ValidationError::ExpressionInSingleName { .. }))
+                    }
+                    _ => matches!(
                         result,
                         Err(ValidationError::ExpressionSubquery { .. }
                             | ValidationError::ExpressionUnparseable { .. }
                             | ValidationError::ExpressionTrailingTokens { .. })
                     ),
-                    "{expr} on {dialect} must be refused: {result:?}"
-                );
+                };
+                assert!(refused, "{expr} on {dialect} must be refused: {result:?}");
             }
             for expr in ["id IN (1, 2)", "id NOT IN (1, 2)"] {
                 assert!(
@@ -1872,16 +1872,24 @@ mod tests {
         }
     }
 
-    /// ClickHouse reads `x IN (t)` with one name as a read of table `t`
-    /// (#2713). One name, qualified or not, in any number of parentheses, is
-    /// refused there, and the message says to write `=`.
+    /// ClickHouse reads `x IN t` and `x IN (t)` with one name as a read of
+    /// table `t` when `t` names a table (#2713). One name, qualified or not,
+    /// with or without parentheses, `GLOBAL` or not, is refused there, and
+    /// the message says to write `=`.
     #[test]
-    fn clickhouse_in_with_one_parenthesised_name_is_refused() {
+    fn clickhouse_in_with_one_name_is_refused() {
         for expr in [
+            "id IN other_table",
+            "id IN db.other_table",
             "id IN (other_table)",
             "id NOT IN (other_table)",
             "id IN ((other_table))",
             "id IN (db.other_table)",
+            "id GLOBAL IN t",
+            "id GLOBAL IN (t)",
+            "id GLOBAL NOT IN t",
+            // ClickHouse parses `current_user` here as a name, not a call.
+            "id IN (current_user)",
         ] {
             let result = check_on("clickhouse", expr);
             let Err(err @ ValidationError::ExpressionInSingleName { .. }) = &result else {
@@ -1904,14 +1912,20 @@ mod tests {
     }
 
     /// A list of two or more names is a value list on ClickHouse too, and
-    /// still passes. So does a one-element list that is not a name.
+    /// still passes. So does a one-element target that is not a name, with
+    /// or without parentheses: an array literal, a number, a string.
     #[test]
     fn clickhouse_in_with_a_list_of_names_passes() {
         for expr in [
             "id IN (a, b)",
             "id NOT IN (a, b)",
+            "id GLOBAL IN (a, b)",
             "id IN (1)",
             "id IN ('x')",
+            "id IN [1, 2]",
+            "id NOT IN [1, 2]",
+            "id IN 1",
+            "id IN 'x'",
         ] {
             assert!(
                 check_on("clickhouse", expr).is_ok(),
