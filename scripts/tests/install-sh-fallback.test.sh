@@ -97,17 +97,78 @@ printf 'git cwd=%s global=%s nosystem=%s prompt=%s home=%s xdg=%s gitdir=%s para
     "$PWD" "${GIT_CONFIG_GLOBAL:-}" "${GIT_CONFIG_NOSYSTEM:-}" "${GIT_TERMINAL_PROMPT:-}" \
     "${HOME:-}" "${XDG_CONFIG_HOME:-}" "${GIT_DIR-unset}" "${GIT_CONFIG_PARAMETERS-unset}" \
     "${GIT_CONFIG_COUNT-unset}" >>"$STUB_LOG"
+printf ' askpass=%s sshaskpass=%s' "${GIT_ASKPASS-unset}" "${SSH_ASKPASS-unset}" >>"$STUB_LOG"
 printf ' %q' "$@" >>"$STUB_LOG"
 printf '\n' >>"$STUB_LOG"
 if [[ "$STUB_GIT" != "ok" ]]; then
     echo "fatal: unable to access 'https://github.com/rocky-data/rocky.git/'" >&2
     exit 128
 fi
-for tag in engine-v1.2.0 engine-v1.10.0 engine-v1.9.0 engine-v1.10.0-rc1; do
+for tag in ${STUB_TAGS:-engine-v1.2.0 engine-v1.10.0 engine-v1.9.0 engine-v1.10.0-rc1}; do
     printf '0000000000000000000000000000000000000000\trefs/tags/%s\n' "$tag"
 done
 STUB
 chmod +x "$STUB_BIN/curl" "$STUB_BIN/git"
+
+# A second PATH with no curl, so install.sh takes its wget branch. It holds
+# links to the tools install.sh needs, the git stub, and a wget stub that
+# reads the same STUB_* variables as the curl stub. wget prints its response
+# headers on stderr, indented, one status line per redirect hop.
+readonly WGET_BIN="$WORK/wget-bin"
+mkdir -p "$WGET_BIN"
+for tool in awk basename bash cat chmod cut dirname env grep gzip head ldd ls mkdir mktemp mv \
+    rm sed sha256sum shasum sort sysctl tar uname; do
+    if tool_path="$(command -v "$tool")"; then
+        ln -s "$tool_path" "$WGET_BIN/$tool"
+    fi
+done
+cp "$STUB_BIN/git" "$WGET_BIN/git"
+cat >"$WGET_BIN/wget" <<'STUB'
+#!/usr/bin/env bash
+printf 'wget' >>"$STUB_LOG"
+printf ' %q' "$@" >>"$STUB_LOG"
+printf '\n' >>"$STUB_LOG"
+out="" spider=0 url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -O) out="$2"; shift 2 ;;
+        --spider) spider=1; shift ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+case "$url" in
+    https://api.github.com/*)
+        echo "  HTTP/1.1 403 rate limit exceeded" >&2
+        exit 8 ;;
+esac
+if [[ "$spider" == 1 ]]; then
+    tag="$(printf '%s\n' "$url" | sed 's#.*/releases/download/##; s#/.*##')"
+    status=404
+    for pair in $STUB_HEAD; do
+        [[ "${pair%%=*}" == "$tag" ]] && status="${pair#*=}"
+    done
+    {
+        echo "Spider mode enabled. Check if remote file exists."
+        echo "  HTTP/1.1 302 Found"
+        echo "  Location: https://objects.example.invalid/archive"
+        echo "  HTTP/1.1 $status Status"
+    } >&2
+    [[ "$status" == 200 ]] || exit 8
+    exit 0
+fi
+case "$url" in
+    */checksums.txt)
+        sum="$(shasum -a 256 "$STUB_FIXTURE" 2>/dev/null || sha256sum "$STUB_FIXTURE")"
+        name="$(ls "$(dirname "$out")" | grep '^rocky-.*\.tar\.gz$' | head -1)"
+        printf '%s  %s\n' "${sum%% *}" "$name" >"$out" ;;
+    */rocky-lsp-*) exit 8 ;;
+    */rocky-*.tar.gz) cat "$STUB_FIXTURE" >"$out" ;;
+    *) echo "stub wget: unexpected URL $url" >&2; exit 99 ;;
+esac
+STUB
+chmod +x "$WGET_BIN/wget"
+RUN_PATH="$STUB_BIN:$PATH"
 
 readonly TOKEN_SENTINEL="ghp_install_sh_must_not_send_this"
 
@@ -121,14 +182,15 @@ run_case() {
     : >"$LOG"
     set +e
     env -u ROCKY_VERSION "$@" \
-        PATH="$STUB_BIN:$PATH" \
+        PATH="$RUN_PATH" \
         STUB_LOG="$LOG" STUB_FIXTURE="$FIXTURE/rocky.tar.gz" \
         GITHUB_TOKEN="$TOKEN_SENTINEL" \
         GIT_DIR="$WORK/inherited.git" GIT_CONFIG_COUNT=1 \
         GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: bearer $TOKEN_SENTINEL" \
         GIT_CONFIG_PARAMETERS="'http.extraheader'='AUTHORIZATION: bearer $TOKEN_SENTINEL'" \
+        GIT_ASKPASS="/bin/echo $TOKEN_SENTINEL" SSH_ASKPASS="/bin/echo $TOKEN_SENTINEL" \
         ROCKY_INSTALL_DIR="$DEST" \
-        bash "$UNDER_TEST" </dev/null >"$OUT" 2>&1
+        "$BASH" "$UNDER_TEST" </dev/null >"$OUT" 2>&1
     RC=$?
     set -e
     if grep -q "$TOKEN_SENTINEL" "$LOG"; then
@@ -150,7 +212,7 @@ run_case fallback STUB_API=fail STUB_GIT=ok STUB_HEAD="engine-v1.10.0=200 engine
 grep -q "Installing Rocky engine-v1.10.0" "$OUT" || fail "fallback: wrong version" "$OUT"
 grep -q "git ls-remote" "$OUT" || fail "fallback: no notice of the fallback" "$OUT"
 [[ -x "$DEST/rocky" ]] || fail "fallback: rocky not installed" "$OUT"
-grep -q '^git cwd=/ global=/dev/null nosystem=1 prompt=0 home=/nonexistent-rocky-install xdg=/nonexistent-rocky-install gitdir=unset params=unset count=unset ls-remote --tags --refs https://github.com/rocky-data/rocky.git engine-v\\\*$' "$LOG" \
+grep -q '^git cwd=/ global=/dev/null nosystem=1 prompt=0 home=/nonexistent-rocky-install xdg=/nonexistent-rocky-install gitdir=unset params=unset count=unset askpass=unset sshaskpass=unset ls-remote --tags --refs https://github.com/rocky-data/rocky.git engine-v\\\*$' "$LOG" \
     || fail "fallback: git ran without the config isolation" "$LOG"
 echo "ok: API failure falls back to the newest tag with assets"
 
@@ -189,5 +251,36 @@ grep -q "Installing Rocky engine-v1.2.0" "$OUT" || fail "pinned: wrong version" 
 ! grep -q 'api.github.com' "$LOG" || fail "pinned: API called" "$LOG"
 ! grep -q '^git' "$LOG" || fail "pinned: git called" "$LOG"
 echo "ok: ROCKY_VERSION skips both lookups"
+
+# 8. A pre-release tag sorts above its release under sort -V -r. Only the
+# strict X.Y.Z filter keeps it out, even when its archive answers 200.
+run_case rc_tag STUB_API=fail STUB_GIT=ok STUB_HEAD="engine-v1.10.0-rc1=200 engine-v1.10.0=200"
+[[ "$RC" == 0 ]] || fail "rc_tag: exit $RC" "$OUT"
+grep -q "Installing Rocky engine-v1.10.0 " "$OUT" || fail "rc_tag: did not install engine-v1.10.0" "$OUT"
+! grep -q "rc1" "$LOG" || fail "rc_tag: the pre-release tag was checked" "$LOG"
+echo "ok: a pre-release tag is never a candidate"
+
+# 9. Only the five highest tags are candidates. When none of them has assets,
+# the install stops; it does not reach back to an old tag with assets.
+run_case five_limit STUB_API=fail STUB_GIT=ok \
+    STUB_TAGS="engine-v1.1.0 engine-v1.2.0 engine-v1.3.0 engine-v1.4.0 engine-v1.5.0 engine-v1.6.0 engine-v1.7.0" \
+    STUB_HEAD="engine-v1.1.0=200 engine-v1.2.0=200"
+[[ "$RC" != 0 ]] || fail "five_limit: exit 0" "$OUT"
+grep -q "no engine release with assets" "$OUT" || fail "five_limit: no reason given" "$OUT"
+[[ ! -e "$DEST/rocky" ]] || fail "five_limit: installed a tag outside the five newest" "$OUT"
+[[ "$(grep -c '^curl.*releases/download/engine-v' "$LOG")" == 5 ]] || fail "five_limit: did not check exactly five tags" "$LOG"
+echo "ok: only the five newest tags are checked"
+
+# 10. With no curl on PATH, the wget branch reads the status after redirects.
+RUN_PATH="$WGET_BIN"
+run_case wget_fallback STUB_API=fail STUB_GIT=ok STUB_HEAD="engine-v1.10.0=404 engine-v1.9.0=200"
+RUN_PATH="$STUB_BIN:$PATH"
+[[ "$RC" == 0 ]] || fail "wget_fallback: exit $RC" "$OUT"
+grep -q '^wget' "$LOG" || fail "wget_fallback: wget was not used" "$LOG"
+! grep -q '^curl' "$LOG" || fail "wget_fallback: curl was used" "$LOG"
+grep -q "Skipping engine-v1.10.0" "$OUT" || fail "wget_fallback: no skip notice" "$OUT"
+grep -q "Installing Rocky engine-v1.9.0" "$OUT" || fail "wget_fallback: wrong version" "$OUT"
+[[ -x "$DEST/rocky" ]] || fail "wget_fallback: rocky not installed" "$OUT"
+echo "ok: the wget branch falls back too"
 
 echo "install.sh fallback: all cases pass"

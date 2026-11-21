@@ -114,6 +114,7 @@ function Resolve-VersionFromTags {
         GIT_CONFIG_GLOBAL = '/dev/null'; GIT_CONFIG_NOSYSTEM = '1'; GIT_TERMINAL_PROMPT = '0'
         HOME = $NoDir; XDG_CONFIG_HOME = $NoDir
         GIT_DIR = $null; GIT_CONFIG_PARAMETERS = $null; GIT_CONFIG_COUNT = $null
+        GIT_ASKPASS = $null; SSH_ASKPASS = $null
     }
     $Saved = @{}
     foreach ($Name in $GitEnv.Keys) {

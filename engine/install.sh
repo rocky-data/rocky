@@ -144,10 +144,11 @@ resolve_version_from_tags() {
     # rewrite that carries a token. GIT_CONFIG_GLOBAL needs git 2.32 or newer,
     # so HOME and XDG_CONFIG_HOME also point at a directory that does not
     # exist, for older git. Config passed through the environment (GIT_DIR,
-    # GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT) is cleared. stdin is closed
-    # because this script is often piped into bash.
+    # GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT) and the askpass helpers that
+    # could answer a credential prompt (GIT_ASKPASS, SSH_ASKPASS) are cleared.
+    # stdin is closed because this script is often piped into bash.
     local refs
-    if ! refs="$(cd / && env -u GIT_DIR -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+    if ! refs="$(cd / && env -u GIT_DIR -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_ASKPASS -u SSH_ASKPASS \
             HOME=/nonexistent-rocky-install XDG_CONFIG_HOME=/nonexistent-rocky-install \
             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
             git ls-remote --tags --refs "https://github.com/${REPO}.git" "${TAG_PREFIX}*" </dev/null)"; then
