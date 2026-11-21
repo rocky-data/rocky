@@ -197,9 +197,11 @@ pub(super) async fn prepare(
 /// A warning for a `merge` model whose existing target still has columns the
 /// model no longer outputs (#2707), or `None`.
 ///
-/// A MERGE writes only the model's columns, so a column the SQL stopped
-/// selecting stays in the table and new rows hold NULL there. The run does
-/// not refuse: `--full-refresh` does not rebuild a `merge` model
+/// A MERGE does not drop columns, so a column the SQL stopped selecting stays
+/// in the table. On DuckDB new rows hold NULL there; other warehouses are not
+/// verified, and one whose MERGE inserts by position (Databricks `INSERT *`,
+/// BigQuery `INSERT ROW`) may refuse the statement. This check does not
+/// refuse: `--full-refresh` does not rebuild a `merge` model
 /// ([`rebuilds_on_full_refresh`]), so a refusal would have no remedy.
 ///
 /// `target_columns` is the existence probe's describe of the target, so the
@@ -251,8 +253,8 @@ pub(super) async fn merge_stale_columns_note(
 fn merge_stale_columns_message(model_name: &str, target_ref: &str, stale: &[String]) -> String {
     format!(
         "model '{model_name}': the target {target_ref} still has column(s) {} that the model \
-         no longer outputs. A merge does not drop columns, so new rows hold NULL there, and \
-         `--full-refresh` does not rebuild a merge model. To keep the column, select it again; \
+         no longer outputs. A merge does not drop columns, so the column stays in the table, \
+         and `--full-refresh` does not rebuild a merge model. To keep the column, select it again; \
          to remove it, drop it from the table in the warehouse (ALTER TABLE ... DROP COLUMN)",
         stale.join(", ")
     )

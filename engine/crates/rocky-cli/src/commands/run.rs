@@ -31428,7 +31428,7 @@ timestamp_column = "ts"
     /// output columns.
     #[cfg(feature = "duckdb")]
     async fn run_merge_model(
-        adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        adapter: &dyn rocky_core::traits::WarehouseAdapter,
         sql: &str,
         typed: &[&str],
     ) -> MaterializationOutput {
@@ -31474,7 +31474,7 @@ timestamp_column = "ts"
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
         super::execute_one_plain_model(
             &model,
-            adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            adapter,
             &dialect as &dyn rocky_core::traits::SqlDialect,
             "mrg",
             std::time::Instant::now(),
@@ -31572,6 +31572,122 @@ timestamp_column = "ts"
         }
         let output = run_merge_model(&adapter, sql, &["id", "legacy", "ts"]).await;
         assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+    }
+
+    /// How [`ProbeFault`] answers the stale-column check's zero-row query.
+    #[cfg(feature = "duckdb")]
+    #[derive(Clone, Copy)]
+    enum ProbeFaultMode {
+        /// The query fails.
+        Fail,
+        /// The query succeeds but reports no column names.
+        NoColumns,
+    }
+
+    /// DuckDB, except for the zero-row output probe (`_rocky_probe`), which
+    /// answers as `mode` says. Counts the probes it intercepted.
+    #[cfg(feature = "duckdb")]
+    struct ProbeFault<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        mode: ProbeFaultMode,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for ProbeFault<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            self.inner.execute_statement_with_stats(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            if !sql.contains("_rocky_probe") {
+                return self.inner.execute_query(sql).await;
+            }
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.mode {
+                ProbeFaultMode::Fail => Err(rocky_core::traits::AdapterError::msg(
+                    "injected probe failure",
+                )),
+                ProbeFaultMode::NoColumns => Ok(rocky_core::traits::QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                }),
+            }
+        }
+
+        fn classify_failure(
+            &self,
+            err: &rocky_core::traits::AdapterError,
+        ) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(err)
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// #2707: when the stale-column check's zero-row query fails, or reports
+    /// no column names, the merge run still succeeds and warns about nothing.
+    /// The probe count proves the check reached that query.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_a_failed_probe_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::Fail).await;
+    }
+
+    /// #2707: see [`merge_stale_check_with_a_failed_probe_stays_silent`]; here
+    /// the probe succeeds but reports no column names.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_no_probe_columns_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::NoColumns).await;
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_probe_fault_is_silent(mode: ProbeFaultMode) {
+        {
+            let adapter = merge_fixture().await;
+            run_merge_model(
+                &adapter,
+                "SELECT id, legacy, ts FROM src.events",
+                &["id", "legacy", "ts"],
+            )
+            .await;
+            let faulty = ProbeFault {
+                inner: &adapter,
+                mode,
+                probes: std::sync::atomic::AtomicUsize::new(0),
+            };
+            // `run_merge_model` panics if the run fails.
+            let output =
+                run_merge_model(&faulty, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+            assert_eq!(
+                faulty.probes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the check must reach the probe"
+            );
+            assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+        }
     }
 
     /// Fail-closed bootstrap — transformation path (`execute_one_plain_model`).

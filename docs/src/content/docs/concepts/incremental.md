@@ -237,7 +237,7 @@ WHEN NOT MATCHED THEN INSERT *
 
 If `update_columns` is omitted, all columns are updated on match.
 
-A merge does not drop columns. When the model's SQL stops selecting a column, the column stays in the table and new rows hold `NULL` there. The run still succeeds and prints a warning that names the column. The same text is in the model's `notes`. `--full-refresh` does not rebuild a merge model, so it does not remove the column. To keep the column, select it again. To remove it, drop it from the table in the warehouse (`ALTER TABLE ... DROP COLUMN`).
+A merge does not drop columns. When the model's SQL stops selecting a column, the column stays in the table. Rocky prints a warning that names the column, and the same text is in the model's `notes`. Rocky does not refuse the run. On DuckDB, the MERGE succeeds and new rows hold `NULL` there. Other warehouses are not verified. Databricks (`INSERT *`) and BigQuery (`INSERT ROW`) may refuse the MERGE when the model lacks a column of the target. `--full-refresh` does not rebuild a merge model, so it does not remove the column. To keep the column, select it again. To remove it, drop it from the table in the warehouse (`ALTER TABLE ... DROP COLUMN`).
 
 ## Partition-level checksums
 
