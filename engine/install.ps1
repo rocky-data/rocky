@@ -70,30 +70,127 @@ $ResolvedVersion = if ($env:ROCKY_VERSION) {
     ""
 }
 
-if (-not $ResolvedVersion) {
+$Archive = "rocky-x86_64-pc-windows-msvc.zip"
+
+# Return the HTTP status of a HEAD request to $Uri, after redirects, or 0 when
+# no response arrives.
+function Get-HttpStatus {
+    param([Parameter(Mandatory)] [string]$Uri)
     try {
-        # Filter by tag prefix — /releases/latest may return a non-engine tag
-        # in the monorepo (dagster-v*, vscode-v*, etc.). GitHub's /releases
-        # endpoint does not sort strictly by published_at across tag prefixes,
-        # and lexical sort places v1.10.0 before v1.9.0 — cast the stripped
-        # version to [version] and sort descending so 1.10.0 wins.
-        $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=30" -ErrorAction Stop
-        $ResolvedVersion = ($Releases |
-            Where-Object { $_.tag_name -match "^$TagPrefix\d+\.\d+\.\d+$" } |
-            Sort-Object -Property @{Expression = { [version]($_.tag_name -replace "^$TagPrefix", "") }} -Descending |
-            Select-Object -First 1).tag_name
-        if (-not $ResolvedVersion) {
-            Write-Error "Failed to find an engine release (tag prefix '$TagPrefix'). Set ROCKY_VERSION manually."
-            exit 1
-        }
+        $Response = Invoke-WebRequest -Uri $Uri -Method Head -UseBasicParsing -ErrorAction Stop
+        return [int]$Response.StatusCode
     }
     catch {
-        Write-Error "Failed to get latest version: $_"
-        exit 1
+        $Exception = $_.Exception
+        if ($Exception.PSObject.Properties['Response'] -and $Exception.Response) {
+            return [int]$Exception.Response.StatusCode
+        }
+        return 0
     }
 }
 
-$Archive = "rocky-x86_64-pc-windows-msvc.zip"
+# Resolve the newest engine release from the git tags, for when the API call
+# fails. Mirrors resolve_version_from_tags in install.sh: a tag can exist
+# without release assets (a draft release, or a deleted one), so take the
+# newest of the five highest engine tags whose Windows archive answers 200.
+# Only a 404 skips a tag; any other status gives up, so a transient error never
+# installs an older engine. Returns the tag, or $null after printing why.
+# Messages use [Console]::Error because Write-Error stops the script here.
+function Resolve-VersionFromTags {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        [Console]::Error.WriteLine("Error: the GitHub API call failed, and git is not installed to read the tags instead.")
+        return $null
+    }
+    # Run git outside any repository and with no user or system config, so it
+    # cannot pick up a checkout's auth header, a credential helper or a URL
+    # rewrite. Its exit code is read from $LASTEXITCODE: redirecting a native
+    # command's stderr under ErrorActionPreference Stop can throw on Windows
+    # PowerShell 5.1.
+    $GitEnv = @{ GIT_CONFIG_GLOBAL = '/dev/null'; GIT_CONFIG_NOSYSTEM = '1'; GIT_TERMINAL_PROMPT = '0' }
+    $Saved = @{}
+    foreach ($Name in $GitEnv.Keys) {
+        $Saved[$Name] = [Environment]::GetEnvironmentVariable($Name)
+        [Environment]::SetEnvironmentVariable($Name, $GitEnv[$Name])
+    }
+    try {
+        $Root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetTempPath())
+        $Refs = @(& git -C $Root ls-remote --tags --refs "https://github.com/$Repo.git" "$TagPrefix*")
+        $GitExit = $LASTEXITCODE
+    }
+    finally {
+        foreach ($Name in $Saved.Keys) {
+            [Environment]::SetEnvironmentVariable($Name, $Saved[$Name])
+        }
+    }
+    if ($GitExit -ne 0) {
+        [Console]::Error.WriteLine("Error: git ls-remote against https://github.com/$Repo.git failed.")
+        return $null
+    }
+    $Candidates = @($Refs |
+        ForEach-Object { ($_ -split "`t")[-1] -replace '^refs/tags/', '' } |
+        Where-Object { $_ -match "^$TagPrefix\d+\.\d+\.\d+$" } |
+        Sort-Object -Property @{Expression = { [version]($_ -replace "^$TagPrefix", "") }} -Descending |
+        Select-Object -First 5)
+    foreach ($Candidate in $Candidates) {
+        $Status = Get-HttpStatus -Uri "https://github.com/$Repo/releases/download/$Candidate/$Archive"
+        if ($Status -eq 200) {
+            return $Candidate
+        }
+        if ($Status -ne 404) {
+            [Console]::Error.WriteLine("Error: checking $Candidate returned HTTP $Status; refusing to fall back to an older engine.")
+            return $null
+        }
+        Write-Host "  Skipping ${Candidate}: no release assets (HTTP 404)."
+    }
+    [Console]::Error.WriteLine("Error: no engine release with assets among the five newest $TagPrefix* tags.")
+    return $null
+}
+
+if (-not $ResolvedVersion) {
+    # The API call sends no token. Without one, GitHub allows 60 API requests
+    # per hour per IP address, and shared CI runners can use that up, so the
+    # call fails with a 403 (#2684). When the call fails, and only then, read
+    # the tags over git instead, which needs no token either. Only the call is
+    # in this try: an empty answer is an error, not a reason to fall back.
+    $Releases = $null
+    $ApiFailed = $false
+    try {
+        $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=30" -ErrorAction Stop
+    }
+    catch {
+        $ApiFailed = $true
+        Write-Host "The GitHub API call failed ($_). Reading the engine tags with git ls-remote instead." -ForegroundColor Yellow
+    }
+    if ($ApiFailed) {
+        $ResolvedVersion = Resolve-VersionFromTags
+        if (-not $ResolvedVersion) {
+            Write-Error "Failed to get latest version from the git tags. Set ROCKY_VERSION and retry."
+            exit 1
+        }
+    }
+    else {
+        try {
+            # Filter by tag prefix — /releases/latest may return a non-engine tag
+            # in the monorepo (dagster-v*, vscode-v*, etc.). GitHub's /releases
+            # endpoint does not sort strictly by published_at across tag prefixes,
+            # and lexical sort places v1.10.0 before v1.9.0 — cast the stripped
+            # version to [version] and sort descending so 1.10.0 wins.
+            $ResolvedVersion = ($Releases |
+                Where-Object { $_.tag_name -match "^$TagPrefix\d+\.\d+\.\d+$" } |
+                Sort-Object -Property @{Expression = { [version]($_.tag_name -replace "^$TagPrefix", "") }} -Descending |
+                Select-Object -First 1).tag_name
+            if (-not $ResolvedVersion) {
+                Write-Error "Failed to find an engine release (tag prefix '$TagPrefix'). Set ROCKY_VERSION manually."
+                exit 1
+            }
+        }
+        catch {
+            Write-Error "Failed to get latest version: $_"
+            exit 1
+        }
+    }
+}
+
 $Url = "https://github.com/$Repo/releases/download/$ResolvedVersion/$Archive"
 $ChecksumsUrl = "https://github.com/$Repo/releases/download/$ResolvedVersion/checksums.txt"
 
