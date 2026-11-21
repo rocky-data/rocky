@@ -313,7 +313,15 @@ fn bare_name_cycle_warning_is_shown_in_text_mode() {
     let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
         .arg("--config")
         .arg(dir.path().join("rocky.toml"))
-        .args(["run", "--branch", "fix", "--model", "stg_orders"])
+        .args([
+            "--output",
+            "table",
+            "run",
+            "--branch",
+            "fix",
+            "--model",
+            "stg_orders",
+        ])
         .current_dir(dir.path())
         .env_remove("RUST_LOG")
         .env_remove("ROCKY_PRINCIPAL")
