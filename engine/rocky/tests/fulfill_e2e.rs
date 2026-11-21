@@ -1711,6 +1711,95 @@ fn confirm_red_and_repair(dir: &Path) -> String {
         .to_string()
 }
 
+/// The apply run the loop recorded: the newest run that executed the
+/// product's model.
+fn apply_run(dir: &Path) -> rocky_core::state::RunRecord {
+    state_store(dir)
+        .list_runs(50)
+        .expect("list runs")
+        .into_iter()
+        .find(|r| r.models_executed.iter().any(|m| m.model_name == PRODUCT))
+        .expect("the loop's apply recorded a run of the product model")
+}
+
+/// Under the `enforce` default, the loop's apply runs the product's declared
+/// test in `report` mode. The test fails and is recorded on the apply's run,
+/// but the run succeeds: the red reaches the loop's own observation
+/// (`observed_failing`, exit 4), not a failed apply (`blocked`, exit 2).
+#[test]
+fn the_fulfill_apply_records_a_failing_test_without_failing_under_enforce() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(
+        code, 4,
+        "the apply must not block on the test: {err} {json}"
+    );
+    assert_eq!(json["state"], "observed_failing", "{json}");
+
+    let run = apply_run(dir);
+    assert_eq!(
+        run.status,
+        rocky_core::state::RunStatus::Success,
+        "report mode never fails the model: {:?}",
+        run.test_results
+    );
+    assert!(
+        run.test_results
+            .iter()
+            .any(|t| t.model == PRODUCT && t.severity == "error" && t.status == "fail"),
+        "the declared test ran on the apply and failed: {:?}",
+        run.test_results
+    );
+}
+
+/// With `tests_on_run = "<mode>"`, the loop's apply runs no test query. The
+/// red is still found by the loop's own observation.
+fn assert_the_fulfill_apply_runs_no_test(mode: &str) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let config = write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+    let text = std::fs::read_to_string(&config).expect("config");
+    std::fs::write(
+        &config,
+        format!("{text}\n[run]\ntests_on_run = \"{mode}\"\n"),
+    )
+    .expect("config with a tests mode");
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 4, "{mode}: {err} {json}");
+    assert_eq!(json["state"], "observed_failing", "{mode}: {json}");
+
+    let run = apply_run(dir);
+    assert!(
+        run.test_results.is_empty(),
+        "{mode}: no test query ran on the apply: {:?}",
+        run.test_results
+    );
+}
+
+#[test]
+fn the_fulfill_apply_runs_no_test_under_off() {
+    assert_the_fulfill_apply_runs_no_test("off");
+}
+
+/// A configured `report` resolves to `off` for the loop's apply too: only
+/// `enforce` makes the apply run the tests.
+#[test]
+fn the_fulfill_apply_runs_no_test_under_report() {
+    assert_the_fulfill_apply_runs_no_test("report");
+}
+
 /// THE F3 acceptance path. A model that applies cleanly but violates a
 /// check the product declared about its own output is observed red,
 /// routes into a repair round, converges, and lands a NEW proposal that

@@ -1,5 +1,5 @@
-//! `rocky run` evaluates a model's `[[tests]]` when asked to (#2611), and
-//! `rocky plan promote` refuses a branch whose newest run recorded a failing
+//! `rocky run` evaluates a model's `[[tests]]`, by default under `enforce`
+//! (#2611), and `rocky plan promote` refuses a branch whose newest run recorded a failing
 //! one (#2609).
 //!
 //! The project is the three-model one of `run_policy_gate.rs` plus a
@@ -176,9 +176,100 @@ fn test_result<'a>(v: &'a serde_json::Value, model: &str) -> &'a serde_json::Val
 }
 
 #[test]
-fn off_by_default_runs_no_test_and_adds_no_output_field() {
+fn enforce_by_default_fails_a_model_whose_test_fails() {
     let tmp = tempfile::tempdir().unwrap();
     project(tmp.path(), "", FAN_OUT, UNIQUE_ERROR);
+    let out = rocky(tmp.path(), &["--output", "json", "run"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(status_of(&v, "customer_orders"), "failed", "{v}");
+    assert_eq!(test_result(&v, "customer_orders")["status"], "fail", "{v}");
+}
+
+/// A project whose only pipeline is a replication one, so `rocky plan
+/// --model` writes a run plan that a plain `rocky apply` executes.
+const APPLY_CONFIG: &str = r#"
+[adapter]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+catalog_template = "fixture"
+schema_template = "staging__{source}"
+
+[pipeline.ingest.target.governance]
+auto_create_schemas = true
+"#;
+
+/// Plans `dupes`, whose `unique` test fails, and applies the plan. Returns
+/// the apply's output.
+fn plan_and_apply_a_failing_model(dir: &Path, extra_config: &str) -> Output {
+    fs::write(
+        dir.join("rocky.toml"),
+        format!("{APPLY_CONFIG}{extra_config}"),
+    )
+    .unwrap();
+    let models = dir.join("models");
+    fs::create_dir_all(&models).unwrap();
+    fs::write(
+        models.join("dupes.sql"),
+        "SELECT 1 AS id UNION ALL SELECT 1 AS id",
+    )
+    .unwrap();
+    fs::write(
+        models.join("dupes.toml"),
+        "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"fixture\"\nschema = \"main\"\n\n[[tests]]\ntype = \"unique\"\ncolumn = \"id\"\n",
+    )
+    .unwrap();
+    let plan = rocky(dir, &["--output", "json", "plan", "--model", "dupes"]);
+    assert!(plan.status.success(), "{}", describe(&plan));
+    let plan_id = json(&plan)["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no plan_id\n{}", describe(&plan)))
+        .to_string();
+    rocky(dir, &["--output", "json", "apply", &plan_id])
+}
+
+/// `rocky apply` keeps `[run] tests_on_run`, so under the default the applied
+/// run fails a model whose error-severity test fails. The same plan applies
+/// cleanly with tests off, so the refusal is the test's.
+#[test]
+fn apply_enforces_tests_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = plan_and_apply_a_failing_model(tmp.path(), "");
+    assert!(!out.status.success(), "{}", describe(&out));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("dupes"), "{}", describe(&out));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = plan_and_apply_a_failing_model(tmp.path(), "\n[run]\ntests_on_run = \"off\"\n");
+    assert!(out.status.success(), "{}", describe(&out));
+}
+
+#[test]
+fn off_runs_no_test_and_adds_no_output_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(
+        tmp.path(),
+        "\n[run]\ntests_on_run = \"off\"\n",
+        FAN_OUT,
+        UNIQUE_ERROR,
+    );
     let out = rocky(tmp.path(), &["--output", "json", "run"]);
     assert!(out.status.success(), "{}", describe(&out));
     let v = json(&out);
@@ -355,7 +446,12 @@ fn promote_warns_but_proceeds_when_the_newest_run_recorded_no_tests() {
     project(dir, "", FAN_OUT, UNIQUE_ERROR);
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
     // Tests off: the run records none.
-    let run = rocky(dir, &["--output", "json", "run", "--branch", "pr1"]);
+    let run = rocky(
+        dir,
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "off",
+        ],
+    );
     assert!(run.status.success(), "{}", describe(&run));
 
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
@@ -498,7 +594,12 @@ fn promote_names_an_untested_model_whose_table_has_another_name() {
         "",
     );
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
-    let run = rocky(dir, &["--output", "json", "run", "--branch", "pr1"]);
+    let run = rocky(
+        dir,
+        &[
+            "--output", "json", "run", "--branch", "pr1", "--tests", "off",
+        ],
+    );
     assert!(run.status.success(), "{}", describe(&run));
 
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);

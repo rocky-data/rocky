@@ -1707,9 +1707,14 @@ pub struct SkipRunOptions {
 impl SkipRunOptions {
     /// The overlay for a run started by `rocky apply`: defaults, with the
     /// source-sync phase off.
-    pub fn for_apply() -> Self {
+    ///
+    /// `tests_on_run` overrides `[run] tests_on_run` for the applied run, as
+    /// `rocky run --tests` does; `None` keeps the config value. The apply
+    /// resolves it from `commands::apply::ApplyTests`.
+    pub fn for_apply(tests_on_run: Option<rocky_core::config::TestsOnRun>) -> Self {
         Self {
             no_source_sync: true,
+            tests_on_run,
             ..Self::default()
         }
     }
