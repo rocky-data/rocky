@@ -729,6 +729,20 @@ mod tests {
         }
     }
 
+    /// #2618: a DuckDB `* EXCLUDE (…)` / `* REPLACE (…)` model is not a parse
+    /// failure, so it cannot refuse the project. Before #2618 it did: the
+    /// dialect rejected the form and every model in the project was refused.
+    #[test]
+    fn duckdb_star_exclude_and_replace_models_resolve() {
+        let models = vec![
+            make_model("stg_orders", "select * exclude (status) from main.raw_orders"),
+            make_model("stg_payments", "select * replace (amount + 1 as amount) from main.raw"),
+        ];
+        let (nodes, _, _) =
+            resolve_dependencies(&models).expect("star modifiers must not fail resolution");
+        assert_eq!(nodes.len(), 2);
+    }
+
     /// #1224: every unparseable model is reported, not just the first.
     ///
     /// Resolution still fails as a whole — that contract is unchanged. But a
