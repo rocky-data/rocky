@@ -47110,6 +47110,41 @@ auto_create_schemas = true
         }
     }
 
+    /// The withhold message follows the cause: compile-origin upstreams are
+    /// named as compile failures, any other blocker apart, and a fail-closed
+    /// withhold names why its reads cannot be proven independent.
+    #[test]
+    fn withheld_model_error_words_the_message_by_cause() {
+        use crate::commands::containment::{ContainmentDecision, ContainmentLedger, ProducerIndex};
+        let mut ledger = ContainmentLedger::new();
+        let producers = ProducerIndex::build(std::iter::empty());
+        ledger.add_model("u", &[], &[], false, &producers);
+        let compile_origin: BTreeSet<String> = ["g".to_string()].into_iter().collect();
+        let decision = |blocked_by: &[&str], fail_closed| ContainmentDecision {
+            blocked_by: blocked_by.iter().map(ToString::to_string).collect(),
+            fail_closed,
+        };
+
+        assert_eq!(
+            withheld_model_error("r", &decision(&["g"], false), &compile_origin, &ledger),
+            "model 'r' was withheld because upstream compile failure(s) affect: g"
+        );
+        assert_eq!(
+            withheld_model_error("r", &decision(&["g", "x"], false), &compile_origin, &ledger),
+            "model 'r' was withheld because upstream compile failure(s) affect: g; and \
+             because of other failed or withheld upstream(s): x"
+        );
+        assert_eq!(
+            withheld_model_error("r", &decision(&["x"], false), &compile_origin, &ledger),
+            "model 'r' was withheld because of failed or withheld upstream(s): x"
+        );
+        assert_eq!(
+            withheld_model_error("u", &decision(&["g", "x"], true), &compile_origin, &ledger),
+            "model 'u' was withheld because its reads cannot be fully listed, so Rocky \
+             cannot prove it is independent of the failed or withheld model(s): g, x"
+        );
+    }
+
     /// `rocky run --model r`, where `r` reads the compile-blocked `main.g`
     /// and `f` and `g` are out of scope. `r` is withheld, so the run built
     /// nothing it was asked to build. It must record a compile error for `r`
