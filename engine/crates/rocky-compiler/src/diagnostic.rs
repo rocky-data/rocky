@@ -287,6 +287,14 @@ pub const E067: &str = "E067";
 /// from the SQL, in a place on the bound list in [`crate::set_operation`],
 /// where tests show DuckDB binds the query; `BY NAME` is not checked.
 pub const E071: &str = "E071";
+/// A `CASE` or `COALESCE` has branches of types with no common type, so the
+/// result has no type the warehouse can give (#2661). `CASE WHEN qty > 1
+/// THEN 'many' ELSE qty END` with an `INTEGER` `qty`, or `COALESCE(note,
+/// qty)` with a `VARCHAR` `note`. Emitted by `rocky compile` from
+/// [`crate::operand_check`], which judges a branch only when its type is
+/// exact. A pair DuckDB binds (an integer with a boolean, a float with a
+/// decimal, a date with a timestamp) is not refused.
+pub const E072: &str = "E072";
 /// The warning form of [`E071`], for a mismatch in a place the warehouse may
 /// skip: a CTE body, a named `WINDOW` or any place not on the bound list in
 /// [`crate::set_operation`]. It never fails a compile on its own.
