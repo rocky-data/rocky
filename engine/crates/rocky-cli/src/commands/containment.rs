@@ -635,7 +635,7 @@ pub(crate) fn unblock_hint(blocked_by: &[String], fail_closed: bool) -> String {
                 .to_string(),
             many => format!(
                 "contained conservatively: cannot prove this model is independent of the \
-                 failure(s) {}; declare dependencies via ref()/model name and re-run",
+                 failed or withheld model(s) {}; declare dependencies via ref()/model name and re-run",
                 many.join(", ")
             ),
         };

@@ -14402,6 +14402,14 @@ async fn execute_models_phase(
     // has a cost); when off the ledger stays empty and unconsulted, and the run
     // keeps its historical fail-fast-at-first-failure behaviour byte-for-byte.
     let mut containment = super::containment::ContainmentLedger::new();
+    // Models poisoned because of a compile failure: the failed and the
+    // compile-blocked models, plus each model withheld by one of them. A
+    // model withheld by one is reported as a compile error, as fail-fast does.
+    let mut compile_origin: BTreeSet<String> = compile_failed_models
+        .iter()
+        .chain(compile_blocked_models.keys())
+        .cloned()
+        .collect();
     if resilience.contain_failures {
         let producers = super::containment::ProducerIndex::build(
             compile_result.project.models.iter().map(|m| {
@@ -15027,6 +15035,31 @@ async fn execute_models_phase(
         // byte-identical.
         let matched: Vec<(usize, &String, &rocky_core::models::Model)> =
             if resilience.contain_failures {
+                // A model this run does not build (out of scope, or
+                // ephemeral) is not rebuilt either. When a proven upstream of
+                // it is poisoned, poison it too, so an in-scope reader of its
+                // table is withheld, as fail-fast's descendant closure does.
+                // It is never built and never reported. A fail-closed verdict
+                // does not propagate: fail-fast follows proven edges only.
+                let matched_names: std::collections::HashSet<&str> =
+                    matched.iter().map(|(_, name, _)| name.as_str()).collect();
+                for name in layer {
+                    if matched_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    if let Some(decision) = containment.evaluate(name)
+                        && !decision.fail_closed
+                    {
+                        containment.poison(name);
+                        if decision
+                            .blocked_by
+                            .iter()
+                            .any(|blocker| compile_origin.contains(blocker))
+                        {
+                            compile_origin.insert(name.clone());
+                        }
+                    }
+                }
                 let mut buildable = Vec::with_capacity(matched.len());
                 for (_, name, model) in matched {
                     match containment.evaluate(name) {
@@ -15036,6 +15069,30 @@ async fn execute_models_phase(
                         }
                         Some(decision) => {
                             containment.poison(name);
+                            // Withheld because of an upstream compile failure
+                            // or block: report it as fail-fast does, so a
+                            // scoped run that builds nothing is not Success.
+                            if !decision.fail_closed
+                                && decision
+                                    .blocked_by
+                                    .iter()
+                                    .any(|blocker| compile_origin.contains(blocker))
+                            {
+                                compile_origin.insert(name.clone());
+                                if !root_error_in_scope {
+                                    output.tables_failed += 1;
+                                    output.errors.push(crate::output::TableErrorOutput {
+                                        asset_key: vec![name.clone()],
+                                        error: format!(
+                                            "model '{name}' was withheld because upstream \
+                                             compile failure(s) affect: {}",
+                                            decision.blocked_by.join(", ")
+                                        ),
+                                        failure_kind: crate::output::FailureKind::CompileError,
+                                        cooldown_seconds: None,
+                                    });
+                                }
+                            }
                             info!(
                                 model = name.as_str(),
                                 blocked_by = decision.blocked_by.join(",").as_str(),
@@ -46772,6 +46829,203 @@ auto_create_schemas = true
                 count_rows(&db, "g").await,
                 2,
                 "contain_failures={contain_failures}: the stale `main.g` is untouched"
+            );
+        }
+    }
+
+    /// Runs the scoped blocked-reader project: `f` fails compile (E056), `g`
+    /// has `depends_on = ["f"]`, `r` reads `main.g` and `d` reads `main.r`,
+    /// both by qualified name. `main.g` and `main.r` hold two stale rows each,
+    /// so a model that wrongly builds succeeds instead of failing on a missing
+    /// table. Returns the run output and the database path.
+    #[cfg(feature = "duckdb")]
+    async fn run_scoped_blocked_reader(
+        tmp: &tempfile::TempDir,
+        model_filter: &str,
+        contain_failures: bool,
+    ) -> (RunOutput, std::path::PathBuf) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("scoped.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
+                .await
+                .unwrap();
+            for table in ["g", "r"] {
+                s.execute_statement(&format!(
+                    "CREATE TABLE main.{table} AS SELECT * FROM (VALUES (98), (99)) AS v(id)"
+                ))
+                .await
+                .unwrap();
+            }
+        }
+        let write = |name: &str, sql: &str, header: &str, table: &str, schema: &str| {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "{header}[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+                     schema = \"{schema}\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("w1", "SELECT 1 AS id\n", "", "t", "main");
+        write("w2", "SELECT 2 AS id\n", "", "t", "other");
+        write("f", "SELECT id FROM t\n", "", "f", "main");
+        write(
+            "g",
+            "SELECT 7 AS id\n",
+            "depends_on = [\"f\"]\n\n",
+            "g",
+            "main",
+        );
+        write("r", "SELECT id FROM main.g\n", "", "r", "main");
+        write("d", "SELECT id FROM main.r\n", "", "d", "main");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let gate_off = SkipGateConfig {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+            full_refresh: false,
+            tests_on_run: Default::default(),
+        };
+        let res = super::execute_models(
+            &models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &PartitionRunOptions::default(),
+            "run-scoped-blocked-reader",
+            Some(model_filter),
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            gate_off,
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures,
+                ..Default::default()
+            },
+            false,
+            true,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await;
+        drop(adapter);
+        assert!(
+            res.is_ok(),
+            "contain_failures={contain_failures}: {:?}",
+            res.as_ref().err()
+        );
+        (output, db)
+    }
+
+    /// `rocky run --model d`, where `d` reads `main.r` and `r` reads the
+    /// compile-blocked `main.g`. `r` is out of scope, so it is not built, but
+    /// it is still downstream of the failure: `d` must be withheld, and not
+    /// build on the stale `main.r`. Containment and fail-fast must agree.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_scoped_reader_of_an_out_of_scope_blocked_reader_is_withheld_in_both_modes() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (output, db) = run_scoped_blocked_reader(&tmp, "d", contain_failures).await;
+
+            assert!(
+                !output
+                    .materializations
+                    .iter()
+                    .any(|m| m.asset_key.last().map(String::as_str) == Some("d")),
+                "contain_failures={contain_failures}: `d` must not build: {:?}",
+                output.materializations
+            );
+            assert!(
+                output.contained.iter().any(|c| c.model == "d"),
+                "contain_failures={contain_failures}: `d` is reported as withheld: {:?}",
+                output.contained
+            );
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .filter(|e| e.asset_key == vec!["d".to_string()])
+                    .all(|e| matches!(e.failure_kind, crate::output::FailureKind::CompileError)),
+                "contain_failures={contain_failures}: no runtime error names `d`: {:?}",
+                output.errors
+            );
+            let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+            assert!(
+                !table_exists(&verify, "d").await,
+                "contain_failures={contain_failures}: `d` must not build on the stale `main.r`"
+            );
+            drop(verify);
+            assert_eq!(
+                count_rows(&db, "r").await,
+                2,
+                "contain_failures={contain_failures}: the out-of-scope `main.r` is untouched"
+            );
+        }
+    }
+
+    /// `rocky run --model r`, where `r` reads the compile-blocked `main.g`
+    /// and `f` and `g` are out of scope. `r` is withheld, so the run built
+    /// nothing it was asked to build. It must record a compile error for `r`
+    /// and not report Success, in both modes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_scoped_withheld_reader_of_an_out_of_scope_failure_fails_the_run_in_both_modes() {
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (output, _db) = run_scoped_blocked_reader(&tmp, "r", contain_failures).await;
+
+            assert!(
+                output.contained.iter().any(|c| c.model == "r"),
+                "contain_failures={contain_failures}: `r` is reported as withheld: {:?}",
+                output.contained
+            );
+            assert_eq!(
+                output.tables_failed, 1,
+                "contain_failures={contain_failures}: {:?}",
+                output.errors
+            );
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|e| e.asset_key == vec!["r".to_string()]
+                        && matches!(e.failure_kind, crate::output::FailureKind::CompileError)),
+                "contain_failures={contain_failures}: `r` carries a compile error: {:?}",
+                output.errors
+            );
+            assert!(
+                !matches!(
+                    output.derive_run_status(),
+                    rocky_core::state::RunStatus::Success
+                ),
+                "contain_failures={contain_failures}: a run that withheld its only model is \
+                 not Success"
             );
         }
     }
