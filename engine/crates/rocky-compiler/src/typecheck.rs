@@ -6646,6 +6646,8 @@ mod tests {
     /// an `IS NULL` guard in a `CASE` leave the column nullable, so the help
     /// must not offer them. `COALESCE` to a NOT NULL column or to a literal
     /// makes it non-null, also when it is the model's only column (#2553).
+    /// When the SQL cannot prove it, the help points at a `not_null` test
+    /// (#2662).
     #[test]
     fn e012_help_names_only_remedies_that_change_inference() {
         let t: &[(&str, RockyType, bool)] = &[
@@ -6710,10 +6712,21 @@ mod tests {
         ] {
             assert!(help.contains(remedy), "{remedy}: {help}");
         }
-        assert!(
-            help.contains("`WHERE c IS NOT NULL` filter does not help"),
-            "{help}"
-        );
+        // #2662: a column the SQL cannot prove non-null is checked by a
+        // `not_null` test, which `rocky run --tests enforce` runs and
+        // `rocky plan promote` gates on.
+        for remedy in [
+            "`[[tests]]` block with `type = \"not_null\"` and `column = \"c\"`",
+            "rocky run --tests enforce",
+            "[run] tests_on_run",
+            "set `nullable = true` in the contract",
+            "the rows it wrote stay in the table",
+            "`rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence",
+            "`WHERE c IS NOT NULL` filter does not clear `E012`",
+        ] {
+            assert!(help.contains(remedy), "{remedy}: {help}");
+        }
+        assert!(!help.contains("does not help"), "{help}");
         assert!(!help.contains("filter out NULLs"), "{help}");
         assert!(!help.contains("another column"), "{help}");
     }
