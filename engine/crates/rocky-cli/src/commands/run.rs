@@ -13814,6 +13814,14 @@ async fn execute_models_phase(
     // contract types before any write. A governed apply replays its reviewed
     // source snapshot and never takes this path.
     //
+    // Intended divergence (#2635): a bare `run` may write a model whose
+    // `nullable = false` contract a governed apply refuses with `E012`, when
+    // the reviewed snapshot has no entry for that model's source. The apply
+    // then fails closed; it never writes a model the snapshot does not prove.
+    // Capturing the described sources into the snapshot at plan time would
+    // close the gap, but it adds a warehouse describe to `rocky plan`, so it is
+    // not done here.
+    //
     // Only the second compile's `E011` (contract type mismatch) for a type the
     // first compile left unchecked (`I003`) is kept. The first compile stays
     // the one that executes, so the new source types cannot raise any other
