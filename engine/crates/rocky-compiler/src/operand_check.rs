@@ -19,6 +19,8 @@
 //!   (`SUM`, `AVG`, the `STDDEV` / `VARIANCE` family), boolean aggregates
 //!   (`BOOL_AND` / `BOOL_OR` and their dialect spellings) over text, and
 //!   string aggregates (`STRING_AGG` / `LISTAGG`) over numbers.
+//! - **Branch types** ([`E072`]): the branches of a `CASE` or `COALESCE` with no
+//!   common type, judged only where the branch's type is exact.
 //! - **Comparison operands** ([`E043`] / [`W043`]): `=`, `<>`, `<`, `>`,
 //!   `<=`, `>=`, `<=>`, `IN (...)`, `BETWEEN`, and simple `CASE x WHEN ...`,
 //!   wherever they appear (projection, `WHERE`, `HAVING`, `QUALIFY`, join
@@ -120,14 +122,16 @@
 use std::collections::HashSet;
 
 use indexmap::IndexMap;
+use rocky_ir::types::common_supertype;
 use sqlparser::ast::{self, Expr, InTarget, SetExpr, Spanned, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E042, E043, SourceSpan, W042, W043};
+use crate::diagnostic::{Diagnostic, E042, E043, E072, SourceSpan, W042, W043};
 use crate::semantic::SemanticGraph;
 use crate::typecheck::{
-    InferEnv, RelationRef, Relations, TypeScope, infer_expr_type, infer_query_types,
-    rename_relation_columns, select_type_scope,
+    InferEnv, RelationRef, Relations, TypeScope, function_branches, has_exact_type,
+    infer_expr_type, infer_query_types, is_coalesce_call, rename_relation_columns,
+    select_type_scope,
 };
 use crate::types::{RockyType, TypedColumn};
 
@@ -789,6 +793,7 @@ fn check_expr<'a>(
     lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
     ctx: &mut Ctx<'_>,
 ) {
+    check_branch_types(expr, scope, ctx);
     match expr {
         Expr::BinaryOp { left, op, right } => {
             if is_comparison(op) {
@@ -880,6 +885,125 @@ fn check_expr<'a>(
         } => walk_query(query, lookup, ctx),
         _ => {}
     }
+}
+
+/// A branch of a `CASE` or `COALESCE`, with its type and, for a string
+/// literal, its text.
+struct Branch<'e> {
+    expr: &'e Expr,
+    ty: RockyType,
+    literal: Option<&'e str>,
+}
+
+/// E072: the branches of a `CASE` or `COALESCE` have no common type (#2661).
+/// Pairs are judged in order and the first conflict makes the one finding. A
+/// branch of `Unknown` type, or one whose type is a guess, is not judged.
+fn check_branch_types(at: &Expr, scope: &TypeScope, ctx: &mut Ctx<'_>) {
+    let (kind, branches): (&str, Vec<&Expr>) = match at {
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => (
+            "CASE",
+            conditions
+                .iter()
+                .map(|case_when| &case_when.result)
+                .chain(else_result.as_deref())
+                .collect(),
+        ),
+        Expr::Function(func) if is_coalesce_call(func) => (
+            "COALESCE",
+            function_branches(func).into_iter().flatten().collect(),
+        ),
+        _ => return,
+    };
+    let judged: Vec<Branch<'_>> = branches
+        .into_iter()
+        .filter(|expr| !is_null_literal(expr))
+        .filter_map(|expr| {
+            let (ty, _) = infer_expr_type(expr, scope);
+            let literal = string_literal(expr);
+            (ty != RockyType::Unknown && (literal.is_some() || has_exact_type(expr, scope)))
+                .then_some(Branch { expr, ty, literal })
+        })
+        .collect();
+    for (i, a) in judged.iter().enumerate() {
+        for b in &judged[i + 1..] {
+            if !no_common_type(a, b) {
+                continue;
+            }
+            let message = format!(
+                "`{}` ({}) and `{}` ({}) are branches of this {kind} with no common type, so \
+                 the result has no type the warehouse can give. DuckDB refuses the pair, or \
+                 fails at run time when the text is not a number",
+                a.expr, a.ty, b.expr, b.ty
+            );
+            ctx.emit(
+                true,
+                E072,
+                E072,
+                at,
+                message,
+                "give every branch one type with CAST, so the branches agree".to_string(),
+            );
+            return;
+        }
+    }
+}
+
+fn is_null_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => matches!(value.value, ast::Value::Null),
+        Expr::Nested(inner) => is_null_literal(inner),
+        _ => false,
+    }
+}
+
+/// Whether two branches have no common type. A string literal conflicts
+/// only with a number it cannot parse as, since DuckDB casts the text at run
+/// time. Two typed branches conflict when `common_supertype` finds no type
+/// and DuckDB does not bind the pair anyway.
+fn no_common_type(a: &Branch<'_>, b: &Branch<'_>) -> bool {
+    match (a.literal, b.literal) {
+        (Some(_), Some(_)) => false,
+        (Some(text), None) => literal_conflicts(text, &b.ty),
+        (None, Some(text)) => literal_conflicts(text, &a.ty),
+        (None, None) => {
+            common_supertype(&a.ty, &b.ty).is_none() && !duckdb_binds_pair(&a.ty, &b.ty)
+        }
+    }
+}
+
+fn literal_conflicts(text: &str, other: &RockyType) -> bool {
+    is_numeric(other) && text.trim().parse::<f64>().is_err()
+}
+
+fn is_numeric(ty: &RockyType) -> bool {
+    ty.is_integer() || ty.is_decimal() || is_float(ty)
+}
+
+fn is_float(ty: &RockyType) -> bool {
+    matches!(ty, RockyType::Float32 | RockyType::Float64)
+}
+
+fn is_temporal(ty: &RockyType) -> bool {
+    matches!(
+        ty,
+        RockyType::Date | RockyType::Timestamp | RockyType::TimestampNtz
+    )
+}
+
+/// Pairs that `common_supertype` refuses and the bundled DuckDB still binds
+/// (measured on DuckDB 1.x): a boolean with an integer, a float with a
+/// decimal, and a date with a timestamp. Any other refused pair is refused by
+/// DuckDB too, as a text column or a date against a number.
+fn duckdb_binds_pair(a: &RockyType, b: &RockyType) -> bool {
+    let boolean_integer = (matches!(a, RockyType::Boolean) && b.is_integer())
+        || (a.is_integer() && matches!(b, RockyType::Boolean));
+    let float_decimal = (is_float(a) && b.is_decimal()) || (a.is_decimal() && is_float(b));
+    let temporal = is_temporal(a) && is_temporal(b);
+    boolean_integer || float_decimal || temporal
 }
 
 fn is_comparison(op: &ast::BinaryOperator) -> bool {
@@ -1936,5 +2060,144 @@ mod tests {
             Some(OperandDialect::Trino)
         );
         assert_eq!(OperandDialect::from_adapter_type("fivetran"), None);
+    }
+
+    /// Sources for the branch tests: one column of each type the branch rule
+    /// sorts, `note` a `VARCHAR` and `qty` an `INTEGER`.
+    fn mixed_sources() -> HashMap<String, Vec<TypedColumn>> {
+        HashMap::from([(
+            "raw.mixed".to_string(),
+            vec![
+                col("note", RockyType::String),
+                col("qty", RockyType::Int32),
+                col("big", RockyType::Int64),
+                col("f", RockyType::Float64),
+                col(
+                    "dec",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                ),
+                col("b", RockyType::Boolean),
+                col("d", RockyType::Date),
+                col("ts", RockyType::Timestamp),
+            ],
+        )])
+    }
+
+    /// Compile one model over `mixed_sources` and run this pass.
+    fn branch_diags(sql: &str) -> Vec<Diagnostic> {
+        let config = crate::compile::CompilerConfig {
+            source_schemas: mixed_sources(),
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(vec![model("m", sql)], &config)
+            .expect("compile");
+        check_operand_types(
+            &result.project.models,
+            &result.semantic_graph,
+            &result.type_check.typed_models,
+            &result.type_check.shadowed_sources,
+            Some(OperandDialect::DuckDb),
+        )
+    }
+
+    /// #2661: a `CASE` or `COALESCE` whose branches have no common type is
+    /// refused, as DuckDB refuses it.
+    #[test]
+    fn a_case_or_coalesce_with_no_common_type_is_e072() {
+        for sql in [
+            "SELECT CASE WHEN qty > 1 THEN 'many' ELSE qty END AS x FROM raw.mixed",
+            "SELECT COALESCE(note, qty) AS x FROM raw.mixed",
+            "SELECT CASE WHEN b THEN note ELSE qty END AS x FROM raw.mixed",
+            "SELECT CASE WHEN b THEN f ELSE b END AS x FROM raw.mixed",
+            "SELECT COALESCE(d, qty) AS x FROM raw.mixed",
+            "SELECT COALESCE(ts, dec) AS x FROM raw.mixed",
+        ] {
+            assert!(codes(&branch_diags(sql)).contains(&"E072"), "{sql}");
+        }
+    }
+
+    /// The pairs DuckDB binds stay clean: a literal that parses as the
+    /// other branch's number, integers of two widths, a boolean with an
+    /// integer, a float with a decimal, a date with a timestamp, and a
+    /// branch Rocky does not type.
+    #[test]
+    fn a_branch_set_duckdb_binds_stays_clean() {
+        for sql in [
+            "SELECT CASE WHEN qty > 1 THEN '5' ELSE qty END AS x FROM raw.mixed",
+            "SELECT COALESCE(qty, big) AS x FROM raw.mixed",
+            "SELECT CASE WHEN b THEN qty ELSE big END AS x FROM raw.mixed",
+            "SELECT COALESCE(f, dec) AS x FROM raw.mixed",
+            "SELECT COALESCE(d, ts) AS x FROM raw.mixed",
+            "SELECT COALESCE(note, 'none') AS x FROM raw.mixed",
+            "SELECT COALESCE(note, LENGTH(note)) AS x FROM raw.mixed",
+        ] {
+            assert!(!codes(&branch_diags(sql)).contains(&"E072"), "{sql}");
+        }
+    }
+
+    /// The set operation of an integer and a text column is not E072: DuckDB
+    /// casts it, so it is not refused here (#2661). Its column count is E071's.
+    #[test]
+    fn a_union_of_integer_and_text_is_not_e072() {
+        let sql = "SELECT qty AS x FROM raw.mixed UNION ALL SELECT note FROM raw.mixed";
+        assert!(!codes(&branch_diags(sql)).contains(&"E072"));
+    }
+
+    /// The DuckDB oracle: over every pair of branch columns and string
+    /// literals, Rocky refuses a `CASE` or `COALESCE` exactly when DuckDB
+    /// fails to run it. The rows reach every branch: a `CASE` row takes
+    /// each arm, and an all-`NULL` row reaches every `COALESCE` argument.
+    /// A literal against a boolean, date or timestamp is not compared: DuckDB
+    /// casts the text at run time, and Rocky does not judge that pair.
+    #[test]
+    fn e072_agrees_with_duckdb_on_every_branch_pair() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mixed (note VARCHAR, qty INTEGER, big BIGINT, f DOUBLE, \
+                dec DECIMAL(10,2), b BOOLEAN, d DATE, ts TIMESTAMP);\
+             INSERT INTO mixed VALUES \
+                ('abc', 2, 2, 2.5, 2.50, true, DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00'),\
+                (NULL, 0, 0, 0.5, 0.50, false, DATE '2021-01-01', TIMESTAMP '2021-01-01 00:00:00'),\
+                (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let columns = [
+            "note", "qty", "big", "f", "dec", "b", "d", "ts", "'many'", "'5'",
+        ];
+        let (mut refused, mut clean) = (0, 0);
+        for x in columns {
+            for y in columns {
+                if x == y {
+                    continue;
+                }
+                let literal_vs_other =
+                    |l: &str, o: &str| l.starts_with('\'') && matches!(o, "b" | "d" | "ts");
+                if literal_vs_other(x, y) || literal_vs_other(y, x) {
+                    continue;
+                }
+                for form in [
+                    format!("SELECT CASE WHEN qty > 1 THEN {x} ELSE {y} END AS r FROM raw.mixed"),
+                    format!("SELECT COALESCE({x}, {y}) AS r FROM raw.mixed"),
+                ] {
+                    let rocky = codes(&branch_diags(&form)).contains(&"E072");
+                    let duck_sql = form.replace("raw.mixed", "mixed");
+                    let duck = (|| -> duckdb::Result<()> {
+                        let mut stmt = conn.prepare(&duck_sql)?;
+                        for row in stmt.query_map([], |_| Ok(()))? {
+                            row?;
+                        }
+                        Ok(())
+                    })()
+                    .is_err();
+                    assert_eq!(rocky, duck, "Rocky and DuckDB disagree on {form}");
+                    if rocky { refused += 1 } else { clean += 1 }
+                }
+            }
+        }
+        // Both outcomes are exercised.
+        assert!(refused > 0 && clean > 0, "refused {refused}, clean {clean}");
     }
 }

@@ -4139,7 +4139,7 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
 /// as one (most warehouses refuse it; Redshift's `NVL` takes more), so it
 /// stays untyped and nullable: less precise, never wrongly non-null. Every site that reads a `COALESCE` by
 /// name goes through here, so the three spellings cannot drift apart.
-fn is_coalesce_call(func: &ast::Function) -> bool {
+pub(crate) fn is_coalesce_call(func: &ast::Function) -> bool {
     match func.name.to_string().to_uppercase().as_str() {
         "COALESCE" => true,
         "IFNULL" | "NVL" => matches!(
@@ -4152,7 +4152,7 @@ fn is_coalesce_call(func: &ast::Function) -> bool {
 
 /// The arguments of a function as branches of a set. An argument Rocky
 /// does not read as an expression (a named or wildcard argument) is `None`.
-fn function_branches(func: &ast::Function) -> Vec<Option<&Expr>> {
+pub(crate) fn function_branches(func: &ast::Function) -> Vec<Option<&Expr>> {
     match &func.args {
         ast::FunctionArguments::List(arg_list) => arg_list
             .args
@@ -4833,7 +4833,7 @@ fn has_one_argument(func: &ast::Function) -> bool {
 /// (`LENGTH`), a numeric literal, `COALESCE` over a literal that changes the
 /// type — is not exact, so a nested expression built from it stays `Unknown`
 /// (#2295).
-fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
+pub(crate) fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
     match expr {
         // A column of a CTE or derived table is exact only when the
         // expression that built it is (#2320).
