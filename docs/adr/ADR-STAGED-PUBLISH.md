@@ -115,7 +115,7 @@ B   swap started   B missing     B__rocky_old = old B   B__rocky_stage = new B
 C   built          C = old       C__rocky_stage = new C
 ```
 
-The next staged run first recovers: it drops new A and renames `A__rocky_old` back, restores old B, and drops the stages of B and C. Production is then old A, B and C. The run then rebuilds under a new record. If any recovery step fails, it stops.
+The next staged run first recovers: it drops new A and renames `A__rocky_old` back, restores old B, and drops the stages of B and C. Production is then old A, B and C. It then rebuilds under a new record. If any recovery step fails, it stops.
 
 **Clean-step failure.** If every swap succeeded but a backup drop failed (the `drop_backup` warning), the swap finished: the next run finishes the clean step and does not restore.
 
@@ -130,7 +130,7 @@ An in-place run never drops working tables.
 
 v1 stages `full_refresh` and `view` models. It refuses `incremental`, `merge`, `time_interval`, `delete_insert`, `microbatch`, `snapshot`, `materialized_view`, `dynamic_table` and `content_addressed`. `ephemeral` models are skipped. The incremental family needs a stage copied from the target, a follow-up.
 
-**One refused model refuses the whole run** at plan time, naming it. A pipeline that mixes strategies cannot use v1.
+**One refused model refuses the whole run** at plan time, naming it. 
 
 ### D5 — Config key
 
@@ -141,7 +141,7 @@ An enum under the pipeline's `[execution]` table:
 publish = "staged"     # default: "in_place"
 ```
 
-`rocky run --publish staged|in_place` overrides it. Other pipeline types share `ExecutionConfig` and refuse `"staged"`. Names are proposed.
+`rocky run --publish staged|in_place` overrides it. Other pipeline types share `ExecutionConfig` and refuse `"staged"`.  
 
 ## Consequences
 
@@ -149,7 +149,7 @@ For a user who opts in (nobody else sees a change):
 
 - A failed model or test leaves production as before the run, and the run exits non-zero.
 - A failed swap leaves a mix, reported per target, until the next staged run recovers it to the pre-run state. D3 assumes recovery succeeds; if a restore step fails, a person must act.
-- Storage peaks at two copies per rebuilt table. The run needs create and rename rights per target schema.
+- Storage peaks at two copies per rebuilt table. It needs create and rename rights per target schema.
 - The run JSON gains a per-target publish section (`just codegen`).
 
 
@@ -160,13 +160,13 @@ For a user who opts in (nobody else sees a change):
 
 ## Alternatives considered
 
-- **Make staged the default.** Not chosen: the 2026-11-21 ruling keeps in place as the default.
+- **Make staged the default.** Not chosen: the 2026-11-21 ruling keeps in place.
 
 ## Validation
 
 - DuckDB: the #2612 recipe under `publish = "staged"` leaves both production tables old.
 - A failing test under `tests_on_run = "enforce"` blocks the publish.
-- A scripted adapter failing at each swap step: correct reports, and the D3 trace recovers.
+- A scripted adapter failing at each swap step: correct reports, and the D3 trace restores.
 
 ## Least confident
 
