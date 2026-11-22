@@ -788,6 +788,10 @@ pub struct RemoteStateSession {
     /// One-shot: set by `finalize`/`abandon`; arms the Drop tripwire while
     /// false.
     finalized: bool,
+    /// Set when the in-run policy gate refused the run (#2622). Its decision
+    /// rows are in the local ledger only, so [`Self::settle_after_error`]
+    /// publishes that ledger instead of dropping it.
+    policy_refused: bool,
     /// The owned mid-run periodic uploader, when started.
     periodic: Option<tokio::task::JoinHandle<()>>,
     /// Cooperative-drain signal for the periodic uploader. `stop_periodic` fires
@@ -1939,6 +1943,7 @@ impl RemoteStateSession {
             durability,
             suppress_reason: None,
             finalized: false,
+            policy_refused: false,
             periodic: None,
             periodic_shutdown: None,
             base: None,
@@ -2369,6 +2374,36 @@ impl RemoteStateSession {
             self.replicate_schema_cache,
         )
         .await
+    }
+
+    /// Record that the in-run policy gate refused this run (#2622). The
+    /// refusal's decision rows must reach the remote ledger, so
+    /// [`Self::settle_after_error`] publishes it. Idempotent.
+    pub fn mark_policy_refusal(&mut self) {
+        self.policy_refused = true;
+    }
+
+    /// Settlement for an error exit that reached the run's error choke-point.
+    ///
+    /// An ordinary error exit ends with [`Self::abandon`] and uploads nothing
+    /// (unless a breach marker was written). A policy refusal instead finalizes
+    /// durably, so the decision rows it recorded reach the remote ledger before
+    /// the run fails. The upload honors any recorded suppression, so an
+    /// indeterminate download still uploads nothing. A failed upload is logged:
+    /// the run is already failing, and the caller's error stays the primary one.
+    pub async fn settle_after_error(mut self, reason: &str) {
+        if !self.policy_refused {
+            self.abandon(reason).await;
+            return;
+        }
+        self.durability = FinalizeDurability::Durable;
+        if let Err(e) = self.finalize().await {
+            error!(
+                reason,
+                error = %e,
+                "policy refusal decision rows were not uploaded; the remote ledger does not hold them"
+            );
+        }
     }
 
     /// Consumption for error/interrupted exits: stops (aborts + joins) the
@@ -6252,6 +6287,64 @@ mod tests {
         assert!(
             !local.exists(),
             "nothing to restore, so no local file is written"
+        );
+    }
+
+    /// #2622: a run refused by the in-run policy gate must upload its ledger.
+    /// The refusal's decision rows live only in the local file, so the error
+    /// exit has to publish it, or the next run's download drops them.
+    #[tokio::test]
+    async fn policy_refusal_settles_by_uploading_the_ledger() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join("state.redb");
+        seed_watermark_and_cache(&local);
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("test-bucket".into()),
+            ..Default::default()
+        };
+
+        let mut session =
+            RemoteStateSession::new(&config, &local, FinalizeDurability::ConfigDefault, false);
+        session.mark_policy_refusal();
+        session.settle_after_error("policy refusal").await;
+        test_support::clear();
+
+        let key = object_store_state_key("state.redb");
+        assert!(
+            provider.exists(&key).await.unwrap(),
+            "a policy-refused run must publish its decision rows to `{key}`"
+        );
+    }
+
+    /// #2622 control: an ordinary error exit with no breach marker still uploads
+    /// nothing. Only a policy refusal changes the error-exit settlement.
+    #[tokio::test]
+    async fn ordinary_error_exit_still_uploads_nothing() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join("state.redb");
+        seed_watermark_and_cache(&local);
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("test-bucket".into()),
+            ..Default::default()
+        };
+
+        let session =
+            RemoteStateSession::new(&config, &local, FinalizeDurability::ConfigDefault, false);
+        session
+            .settle_after_error("run exited before terminal state writes")
+            .await;
+        test_support::clear();
+
+        let key = object_store_state_key("state.redb");
+        assert!(
+            !provider.exists(&key).await.unwrap(),
+            "an ordinary error exit must not upload `{key}`"
         );
     }
 
