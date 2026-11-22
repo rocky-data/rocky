@@ -92,7 +92,7 @@ Where no transaction spans the swap, a failure during it still leaves a mix. Roc
 
 **The record.** Before the build, Rocky writes a publish record to the state store, keyed by pipeline and run id. It holds a phase per target: `built`, `swapped`, `cleaned`. Rocky writes each phase as an intent before the step starts, and marks it done after. The record is cleared only after every target reaches `cleaned`.
 
-**Ownership.** Working names (`<t>__rocky_stage`, `<t>__rocky_old`) carry no run id, so a name in the record does not prove this run made the table. v1 does not bind a table to its run. Recovery acts only where the warehouse state matches the recorded phase exactly (below). Any other combination refuses and names the `DROP` to run by hand.
+**Ownership.** Working names (`<t>__rocky_stage`, `<t>__rocky_old`) carry no run id, so a name does not prove this run made the table. Recovery acts only where the warehouse state matches the recorded phase exactly (below). Any other combination refuses and names the `DROP` to run by hand.
 
 **Recovery uses its own probes,** not `StagedSwap::execute`, which would refuse B's stage with `LeftoverStage`. It runs the same existence probe on target, stage and backup, then:
 
@@ -101,10 +101,11 @@ Where no transaction spans the swap, a failure during it still leaves a mix. Roc
 | `built` | target old, stage present | drop the stage |
 | swap started | target missing, backup, stage | rename backup to target, then drop the stage |
 | swap started | target present, backup, no stage | the swap finished: treat as `swapped` |
-| `swapped` | target new, backup present | roll forward: drop the backup |
+| `swapped`, some target not swapped | target new, backup present | restore: drop the new target, rename the backup to target |
+| `swapped`, every target swapped | target new, backup present | the swap finished: drop the backup |
 | `cleaned` | target new, nothing beside it | nothing |
 
-A `swapped` target is never restored. Views have no backup; once re-created, they are `swapped`.
+Restore is the default. Views have no backup; once re-created, they are `swapped`.
 
 **Trace.** Targets A, B and C. A swaps. B fails between `move_aside` and `swap_in`, and its restore fails too (`ReplaceError::RestoreFailed`). C is never attempted.
 
@@ -114,16 +115,16 @@ B   swap started   B missing     B__rocky_old = old B   B__rocky_stage = new B
 C   built          C = old       C__rocky_stage = new C
 ```
 
-The next staged run first recovers: it drops `A__rocky_old`, restores old B and drops its stage, and drops C's stage. Production is then new A with old B and C, still a mix. The run then rebuilds under a new record. If any recovery step fails, it stops.
+The next staged run first recovers: it drops new A and renames `A__rocky_old` back, restores old B, and drops the stages of B and C. Production is then old A, B and C. The run then rebuilds under a new record. If any recovery step fails, it stops.
 
-**Clean-step failure.** If every swap succeeded but a backup drop failed (the `drop_backup` warning), those targets are `swapped`: the next run finishes the clean step and never restores them.
+**Clean-step failure.** If every swap succeeded but a backup drop failed (the `drop_backup` warning), the swap finished: the next run finishes the clean step and does not restore.
 
 An in-place run never drops working tables.
 
-**Decisions for Hugo:**
+**Decided 2026-11-22:**
 
-- **(a) Roll forward after `swapped`.** Dropping A's backup loses the pre-run copy of A. If the rebuild then fails, production stays mixed with no way back. Restoring them instead needs a reverse rename per target.
-- **(b) Ownership key.** v1 refuses any mismatch; the cost is a manual `DROP` after an unusual failure. Putting the run id into working names would bind each table to its run, but it changes ADR-REPLACE's reserved names, and leftover detection would need a schema listing instead of a fixed-name probe.
+- **Restore, not roll forward.** After a partial swap, Rocky restores each target from its backup. Cost: a reverse rename and a drop per swapped target, and the run's new data is thrown away.
+- **Refuse what does not match.** v1 refuses any table it cannot match to a recorded phase. Cost: a manual `DROP` after an unusual failure. A run id in working names would bind tables to runs, but it would change ADR-REPLACE's reserved names and need a schema listing; not in v1.
 
 ### D4 — Strategy scope (v1)
 
@@ -144,19 +145,18 @@ publish = "staged"     # default: "in_place"
 
 ## Consequences
 
-For a user who opts in:
+For a user who opts in (nobody else sees a change):
 
 - A failed model or test leaves production as before the run, and the run exits non-zero.
-- A failed swap leaves a mix, reported per target, until the next staged run succeeds, which is not guaranteed. D3 assumes that run can recover.
+- A failed swap leaves a mix, reported per target, until the next staged run recovers it to the pre-run state. D3 assumes recovery succeeds; if a restore step fails, a person must act.
 - Storage peaks at two copies per rebuilt table. The run needs create and rename rights per target schema.
 - The run JSON gains a per-target publish section (`just codegen`).
 
-Nothing changes for anyone else.
 
 ### Open questions
 
 - **Unverified:** `run.rs` marks a built model `Built` for the skip gate. If that persists past a failed gate, `--skip-unchanged` could skip the model and leave production old.
-- Two concurrent staged runs on one target (unsupported, as in ADR-REPLACE).
+- Two concurrent staged runs on one target: unsupported.
 
 ## Alternatives considered
 
@@ -171,7 +171,7 @@ Nothing changes for anyone else.
 ## Least confident
 
 - Whether DuckDB native, PostgreSQL, Redshift and SQL Server commit several renames in one transaction.
-- Whether v1 is useful when one incremental model refuses the whole run.
+- Whether v1 is useful when one incremental model refuses the run.
 
 ## Missing
 
