@@ -14421,6 +14421,14 @@ async fn execute_models_phase(
             .collect();
         for model in &compile_result.project.models {
             let name = model.config.name.as_str();
+            // #1630: a compile-failed model does not run, so its own reads
+            // order nothing, as in `augment_physical_read_edges`. Kept, they
+            // can close a cycle that drops a TRUE read of its target from the
+            // ordering. It stays a producer, so its readers are withheld.
+            if compile_failed_models.contains(name) {
+                containment.add_model(name, &[], &[], true, &producers);
+                continue;
+            }
             let declared_ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
             let externalized = externalized_defer_edges.get(name);
             let filtered_ref_deps: Vec<String>;
