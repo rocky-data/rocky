@@ -15015,7 +15015,7 @@ async fn execute_models_phase(
         // model is never adjudicated by the skip gate and never built (it would
         // read a failure's stale/missing output) — it is recorded on
         // `output.contained` and poisons its own downstream. Identity no-op when
-        // `contain_failures` is off, keeping the default fail-fast path
+        // `contain_failures` is off, keeping the fail-fast path
         // byte-identical.
         let matched: Vec<(usize, &String, &rocky_core::models::Model)> =
             if resilience.contain_failures {
