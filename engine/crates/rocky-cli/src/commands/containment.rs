@@ -293,6 +293,10 @@ pub(crate) struct ContainmentLedger {
     /// Models whose read set could not be proven complete / unambiguous — they
     /// fail closed once any failure has occurred.
     uncertain: HashSet<String>,
+    /// `model name → the reads that could not be matched to one producer`.
+    /// Only for the message of a fail-closed withhold; [`Self::evaluate`]
+    /// reads `uncertain`, not this.
+    ambiguous_reads: HashMap<String, BTreeSet<String>>,
     /// Every model the ledger was told about (run-set coverage). A model queried
     /// but never added is treated as uncertain (fail closed).
     known: HashSet<String>,
@@ -338,6 +342,7 @@ impl ContainmentLedger {
             upstreams: HashMap::new(),
             bare_upstreams: HashMap::new(),
             uncertain: HashSet::new(),
+            ambiguous_reads: HashMap::new(),
             known: HashSet::new(),
             poison: BTreeSet::new(),
         }
@@ -366,6 +371,7 @@ impl ContainmentLedger {
         let mut strong: BTreeSet<String> = ref_deps.iter().cloned().collect();
         // A read set we cannot fully enumerate cannot prove disjointness.
         let mut uncertain = !reads_complete;
+        let mut ambiguous: BTreeSet<String> = BTreeSet::new();
         for read in reads {
             // A bare read is "already covered" only when the resolver made the
             // SAME call — ref-edge derivation is case-sensitive on the
@@ -398,7 +404,10 @@ impl ContainmentLedger {
                     }
                 }
                 // Cannot attribute the read to a bounded producer set — fail closed.
-                ReadResolution::Ambiguous => uncertain = true,
+                ReadResolution::Ambiguous => {
+                    uncertain = true;
+                    ambiguous.insert(read.clone());
+                }
                 // Genuinely external — a run failure cannot make it stale.
                 ReadResolution::External => {}
             }
@@ -413,6 +422,27 @@ impl ContainmentLedger {
         }
         if uncertain {
             self.uncertain.insert(name.to_string());
+        }
+        if ambiguous.is_empty() {
+            self.ambiguous_reads.remove(name);
+        } else {
+            self.ambiguous_reads.insert(name.to_string(), ambiguous);
+        }
+    }
+
+    /// Why `model`'s reads cannot be proven disjoint from the failure set, in
+    /// words: the reads that match no single producer, or that its read set
+    /// cannot be fully listed. For the message of a fail-closed withhold.
+    pub(crate) fn uncertain_reads(&self, model: &str) -> String {
+        if !self.known.contains(model) {
+            return "Rocky has no read set for it".to_string();
+        }
+        match self.ambiguous_reads.get(model) {
+            Some(reads) => format!(
+                "its read(s) {} cannot be matched to one model",
+                reads.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            None => "its reads cannot be fully listed".to_string(),
         }
     }
 
@@ -968,6 +998,31 @@ mod tests {
             .evaluate("reader")
             .expect("ambiguous read ⇒ fail closed");
         assert!(dec.fail_closed);
+    }
+
+    /// The fail-closed message names why: the ambiguous reads, or a read set
+    /// that cannot be fully listed, or a model the ledger does not know.
+    #[test]
+    fn uncertain_reads_names_the_cause() {
+        let led = ledger(
+            &[
+                ("reader", &[], &["marts.orders"], true),
+                ("cte", &[], &[], false),
+            ],
+            &[
+                ("p1", "cat_a", "marts", "orders"),
+                ("p2", "cat_b", "marts", "orders"),
+            ],
+        );
+        assert_eq!(
+            led.uncertain_reads("reader"),
+            "its read(s) marts.orders cannot be matched to one model"
+        );
+        assert_eq!(
+            led.uncertain_reads("cte"),
+            "its reads cannot be fully listed"
+        );
+        assert_eq!(led.uncertain_reads("ghost"), "Rocky has no read set for it");
     }
 
     /// A model unknown to the ledger fails closed once a failure has occurred —

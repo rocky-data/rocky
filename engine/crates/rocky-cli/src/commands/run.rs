@@ -12543,6 +12543,49 @@ fn collect_auto_create_targets(
     targets
 }
 
+/// The `errors[]` message for a model the containment ledger withheld.
+///
+/// The wording follows the cause. A fail-closed withhold names why the
+/// model's reads cannot be proven independent of the failure set. A proven
+/// withhold names its compile-origin upstreams as compile failures, and any
+/// other blocker (a runtime failure, or a model withheld for one) apart.
+fn withheld_model_error(
+    name: &str,
+    decision: &super::containment::ContainmentDecision,
+    compile_origin: &BTreeSet<String>,
+    containment: &super::containment::ContainmentLedger,
+) -> String {
+    if decision.fail_closed {
+        return format!(
+            "model '{name}' was withheld because {}, so Rocky cannot prove it is \
+             independent of the failed or withheld model(s): {}",
+            containment.uncertain_reads(name),
+            decision.blocked_by.join(", ")
+        );
+    }
+    let (compile, other): (Vec<&str>, Vec<&str>) = decision
+        .blocked_by
+        .iter()
+        .map(String::as_str)
+        .partition(|blocker| compile_origin.contains(*blocker));
+    match (compile.is_empty(), other.is_empty()) {
+        (false, true) => format!(
+            "model '{name}' was withheld because upstream compile failure(s) affect: {}",
+            compile.join(", ")
+        ),
+        (true, _) => format!(
+            "model '{name}' was withheld because of failed or withheld upstream(s): {}",
+            other.join(", ")
+        ),
+        (false, false) => format!(
+            "model '{name}' was withheld because upstream compile failure(s) affect: {}; \
+             and because of other failed or withheld upstream(s): {}",
+            compile.join(", "),
+            other.join(", ")
+        ),
+    }
+}
+
 /// Record a model's runtime failure as a *contained cause*: bump the failure
 /// tally, push an `errors[]` entry keyed by the model, and poison the model in
 /// the containment ledger so its downstream closure is withheld.
@@ -15072,26 +15115,30 @@ async fn execute_models_phase(
                             // Withheld because of an upstream compile failure
                             // or block: report it as fail-fast does, so a
                             // scoped run that builds nothing is not Success.
-                            if !decision.fail_closed
-                                && decision
-                                    .blocked_by
-                                    .iter()
-                                    .any(|blocker| compile_origin.contains(blocker))
-                            {
+                            // A fail-closed withhold is reported too: with no
+                            // in-scope root error, nothing else fails the run.
+                            // It does not join `compile_origin`, so a proven
+                            // reader of it is not said to be compile-blocked.
+                            let from_compile = decision
+                                .blocked_by
+                                .iter()
+                                .any(|blocker| compile_origin.contains(blocker));
+                            if from_compile && !decision.fail_closed {
                                 compile_origin.insert(name.clone());
-                                if !root_error_in_scope {
-                                    output.tables_failed += 1;
-                                    output.errors.push(crate::output::TableErrorOutput {
-                                        asset_key: vec![name.clone()],
-                                        error: format!(
-                                            "model '{name}' was withheld because upstream \
-                                             compile failure(s) affect: {}",
-                                            decision.blocked_by.join(", ")
-                                        ),
-                                        failure_kind: crate::output::FailureKind::CompileError,
-                                        cooldown_seconds: None,
-                                    });
-                                }
+                            }
+                            if from_compile && !root_error_in_scope {
+                                output.tables_failed += 1;
+                                output.errors.push(crate::output::TableErrorOutput {
+                                    asset_key: vec![name.clone()],
+                                    error: withheld_model_error(
+                                        name,
+                                        &decision,
+                                        &compile_origin,
+                                        &containment,
+                                    ),
+                                    failure_kind: crate::output::FailureKind::CompileError,
+                                    cooldown_seconds: None,
+                                });
                             }
                             info!(
                                 model = name.as_str(),
@@ -46835,9 +46882,11 @@ auto_create_schemas = true
 
     /// Runs the scoped blocked-reader project: `f` fails compile (E056), `g`
     /// has `depends_on = ["f"]`, `r` reads `main.g` and `d` reads `main.r`,
-    /// both by qualified name. `main.g` and `main.r` hold two stale rows each,
-    /// so a model that wrongly builds succeeds instead of failing on a missing
-    /// table. Returns the run output and the database path.
+    /// both by qualified name. `u` reads only its own CTE, so its read set
+    /// cannot be fully listed and containment withholds it fail-closed.
+    /// `main.g`, `main.r` and `main.u` hold two stale rows each, so a model
+    /// that wrongly builds succeeds instead of failing on a missing table.
+    /// Returns the run output and the database path.
     #[cfg(feature = "duckdb")]
     async fn run_scoped_blocked_reader(
         tmp: &tempfile::TempDir,
@@ -46856,7 +46905,7 @@ auto_create_schemas = true
             s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
                 .await
                 .unwrap();
-            for table in ["g", "r"] {
+            for table in ["g", "r", "u"] {
                 s.execute_statement(&format!(
                     "CREATE TABLE main.{table} AS SELECT * FROM (VALUES (98), (99)) AS v(id)"
                 ))
@@ -46887,6 +46936,13 @@ auto_create_schemas = true
         );
         write("r", "SELECT id FROM main.g\n", "", "r", "main");
         write("d", "SELECT id FROM main.r\n", "", "d", "main");
+        write(
+            "u",
+            "WITH x AS (SELECT 5 AS id)\nSELECT id FROM x\n",
+            "",
+            "u",
+            "main",
+        );
 
         let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
         let mut output = RunOutput::new(String::new(), 0, 1);
@@ -46966,13 +47022,18 @@ auto_create_schemas = true
                 "contain_failures={contain_failures}: `d` is reported as withheld: {:?}",
                 output.contained
             );
+            let d_errors: Vec<_> = output
+                .errors
+                .iter()
+                .filter(|e| e.asset_key == vec!["d".to_string()])
+                .collect();
             assert!(
-                output
-                    .errors
-                    .iter()
-                    .filter(|e| e.asset_key == vec!["d".to_string()])
-                    .all(|e| matches!(e.failure_kind, crate::output::FailureKind::CompileError)),
-                "contain_failures={contain_failures}: no runtime error names `d`: {:?}",
+                !d_errors.is_empty()
+                    && d_errors.iter().all(|e| matches!(
+                        e.failure_kind,
+                        crate::output::FailureKind::CompileError
+                    )),
+                "contain_failures={contain_failures}: `d` carries only compile errors: {:?}",
                 output.errors
             );
             let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
@@ -46985,6 +47046,66 @@ auto_create_schemas = true
                 count_rows(&db, "r").await,
                 2,
                 "contain_failures={contain_failures}: the out-of-scope `main.r` is untouched"
+            );
+        }
+    }
+
+    /// `rocky run --model u`, where `u` reads only its own CTE and `f` fails
+    /// compile out of scope. Containment withholds `u` fail-closed: its read
+    /// set cannot be fully listed, so it cannot be proven independent of
+    /// `f`. The run then built nothing it was asked to build, so it must not
+    /// report Success, and the error must name the uncertain reads, not a
+    /// compile failure. Fail-fast builds `u` and succeeds.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_scoped_fail_closed_withhold_of_an_out_of_scope_failure_fails_the_run() {
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (output, db) = run_scoped_blocked_reader(&tmp, "u", contain_failures).await;
+            let built = output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("u"));
+            let status = output.derive_run_status();
+            if !contain_failures {
+                assert!(built, "fail-fast builds `u`: {:?}", output.errors);
+                assert!(
+                    matches!(status, rocky_core::state::RunStatus::Success),
+                    "fail-fast: {:?}",
+                    output.errors
+                );
+                assert_eq!(count_rows(&db, "u").await, 1, "fail-fast rebuilt `main.u`");
+                continue;
+            }
+            assert!(!built, "`u` must not build: {:?}", output.materializations);
+            assert_eq!(
+                count_rows(&db, "u").await,
+                2,
+                "the stale `main.u` is untouched"
+            );
+            assert!(
+                output.contained.iter().any(|c| c.model == "u"),
+                "`u` is reported as withheld: {:?}",
+                output.contained
+            );
+            assert_eq!(output.tables_failed, 1, "{:?}", output.errors);
+            let u_errors: Vec<_> = output
+                .errors
+                .iter()
+                .filter(|e| e.asset_key == vec!["u".to_string()])
+                .collect();
+            assert_eq!(u_errors.len(), 1, "{:?}", output.errors);
+            assert!(
+                u_errors[0]
+                    .error
+                    .contains("its reads cannot be fully listed")
+                    && !u_errors[0].error.contains("compile failure"),
+                "the error names the uncertain reads: {}",
+                u_errors[0].error
+            );
+            assert!(
+                !matches!(status, rocky_core::state::RunStatus::Success),
+                "a run that withheld its only model is not Success"
             );
         }
     }
