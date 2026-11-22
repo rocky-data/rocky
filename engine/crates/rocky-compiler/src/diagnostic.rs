@@ -731,6 +731,16 @@ pub const W056: &str = "W056";
 /// extension, a UDF created outside Rocky), so this never fails a compile on
 /// its own. Escalate with `rocky compile --deny-warnings W057`.
 pub const W057: &str = "W057";
+/// A call to a DuckDB built-in with a number of arguments DuckDB refuses at
+/// bind time, for example `lower(name, 'x')`. The call is in the model's main
+/// `SELECT` list, `WHERE` or `HAVING`, outside any subquery, where DuckDB
+/// always binds it. Calls DuckDB may skip, and calls whose count is not known
+/// from the SQL, are never refused; see [`W068`] and `function_check`.
+pub const E068: &str = "E068";
+/// The warning form of [`E068`]: the same refused argument count in a place
+/// DuckDB may skip, such as a CTE body, a derived table, a subquery or an
+/// `ORDER BY`. It never fails a compile on its own.
+pub const W068: &str = "W068";
 /// A freshness block uses a deprecated spelling: `threshold_seconds` in
 /// `[checks.freshness]`, `max_lag_seconds` / `expected_lag_seconds` in a
 /// model sidecar, `_defaults.toml` or the project `[freshness]`, `max_lag`
@@ -746,7 +756,7 @@ pub const W058: &str = "W058";
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W071, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W068, W071, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

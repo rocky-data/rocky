@@ -57,7 +57,7 @@ use std::sync::LazyLock;
 use sqlparser::ast::{self, Expr, Spanned, Statement, Visit, Visitor};
 use sqlparser::parser::Parser;
 
-use crate::diagnostic::{Diagnostic, E057, SourceSpan, W057};
+use crate::diagnostic::{Diagnostic, E057, E068, SourceSpan, W057, W068};
 use crate::operand_check::{OperandDialect, OperandTarget};
 use crate::udf::FunctionRegistry;
 
@@ -237,6 +237,9 @@ const SPECIAL_FORMS: &[&str] = &[
     "extract",
     "position",
     "overlay",
+    // sqlparser reads `SUBSTR(...)` and `SUBSTRING(...)` as its own
+    // `Substring` expression, not as a function call.
+    "substr",
     "substring",
     "trim",
     "ceil",
@@ -288,6 +291,7 @@ pub fn check_unknown_functions(
     registry: &FunctionRegistry,
     target_for: &dyn Fn(&str) -> OperandTarget,
     written_for: Option<OperandDialect>,
+    seed_functions: &HashSet<String>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for model in models {
@@ -313,15 +317,48 @@ pub fn check_unknown_functions(
         if dialects.is_empty() {
             continue;
         }
-        diagnostics.extend(check_model(model, registry, &dialects));
+        diagnostics.extend(check_model(model, registry, &dialects, seed_functions));
     }
     diagnostics
+}
+
+/// The function and macro names a project's `data/seed.sql` creates, in
+/// lower case, for [`check_unknown_functions`].
+///
+/// A text scan, not a parse, so it errs toward allowing: it also reads
+/// `CREATE MACRO` inside comments and string literals. A missed name is a
+/// refusal the seed would have prevented, so the scan takes every match.
+/// Comments may sit between the keywords. The scan runs whether or not the
+/// seed does, so every entry point sees the same names. The last part of a
+/// qualified name is kept (`main.my_fn` is `my_fn`), since a call that is
+/// unqualified in the model still reaches it.
+pub fn seed_created_functions(seed_sql: &str) -> HashSet<String> {
+    static CREATE_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| {
+        // `SEP` is the whitespace or comment that may sit between two keywords.
+        const SEP: &str = r"(?:\s|--[^\n]*|/\*[\s\S]*?\*/)+";
+        const IDENT: &str = r#""[^"]+"|[A-Za-z_][A-Za-z0-9_$]*"#;
+        let pattern = format!(
+            r"(?i)\bcreate{SEP}(?:or{SEP}replace{SEP})?(?:(?:temp|temporary){SEP})?(?:macro|function){SEP}(?:if{SEP}not{SEP}exists{SEP})?((?:{IDENT})(?:\s*\.\s*(?:{IDENT}))*)"
+        );
+        regex::Regex::new(&pattern).expect("seed function pattern is valid")
+    });
+    CREATE_FUNCTION
+        .captures_iter(seed_sql)
+        .filter_map(|caps| caps.get(1))
+        .flat_map(|name| {
+            name.as_str()
+                .split('.')
+                .map(|part| part.trim_matches('"').to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn check_model(
     model: &rocky_core::models::Model,
     registry: &FunctionRegistry,
     dialects: &[FunctionDialect],
+    seed_functions: &HashSet<String>,
 ) -> Vec<Diagnostic> {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
     else {
@@ -333,6 +370,8 @@ fn check_model(
     let mut visitor = Calls {
         registry,
         found: Vec::new(),
+        chained: HashSet::new(),
+        top_level: top_level_calls(&statements),
     };
     let _ = statements.visit(&mut visitor);
 
@@ -346,12 +385,24 @@ fn check_model(
     let mut diagnostics = Vec::new();
     for &dialect in dialects {
         let mut seen = HashSet::new();
-        for (name, line, col, within_group) in &visitor.found {
+        for found in &visitor.found {
+            let Found {
+                name,
+                line,
+                col,
+                within_group,
+                ..
+            } = found;
             let lower = name.to_ascii_lowercase();
             if dialect == FunctionDialect::DuckDb
                 && *within_group
                 && DUCKDB_WITHIN_GROUP_FORMS.contains(&lower.as_str())
             {
+                continue;
+            }
+            // A macro the project's seed creates runs on DuckDB; it is not a
+            // call to an unknown function (the seed runs or not).
+            if dialect == FunctionDialect::DuckDb && seed_functions.contains(&lower) {
                 continue;
             }
             if dialect.knows(&lower) || !seen.insert(lower) {
@@ -389,6 +440,84 @@ fn check_model(
                 }),
             );
         }
+    }
+    if dialects.contains(&FunctionDialect::DuckDb) {
+        diagnostics.extend(arity_diagnostics(
+            &model.config.name,
+            &visitor.found,
+            seed_functions,
+            &file,
+            precise_spans,
+        ));
+    }
+    diagnostics
+}
+
+/// E068 / W068: a DuckDB built-in called with an argument count DuckDB
+/// refuses. Only a count the SQL states is judged ([`Found::arity`]). A
+/// name the seed, a parser rewrite or a special form owns is skipped. An
+/// error only where DuckDB always binds the call ([`Found::always_bound`]).
+///
+/// `precise_spans` is false for SQL that is not the file's own text (a
+/// `.rocky` model), so the span is `1:1` as for E057.
+fn arity_diagnostics(
+    model_name: &str,
+    found: &[Found],
+    seed_functions: &HashSet<String>,
+    file: &str,
+    precise_spans: bool,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for call in found {
+        let Some(arity) = call.arity else {
+            continue;
+        };
+        if call.within_group {
+            continue;
+        }
+        let lower = call.name.to_ascii_lowercase();
+        if SPECIAL_FORMS.contains(&lower.as_str())
+            || DUCKDB_ONLY_FORMS.contains(&lower.as_str())
+            || seed_functions.contains(&lower)
+        {
+            continue;
+        }
+        let Some(counts) = DUCKDB_ARITIES.get(lower.as_str()) else {
+            continue;
+        };
+        if counts.iter().any(|count| count.accepts(arity)) {
+            continue;
+        }
+        let (code, constructor): (_, fn(&str, &str, String) -> Diagnostic) = if call.always_bound {
+            (E068, Diagnostic::error)
+        } else {
+            (W068, Diagnostic::warning)
+        };
+        let (line, col) = if precise_spans && call.line > 0 {
+            (call.line, call.col)
+        } else {
+            (1, 1)
+        };
+        let diagnostic = constructor(
+            code,
+            model_name,
+            format!(
+                "DuckDB refuses `{}` with {arity} argument{}: it takes {}",
+                call.name,
+                if arity == 1 { "" } else { "s" },
+                describe_counts(counts),
+            ),
+        )
+        .with_suggestion(format!(
+            "check the argument list against DuckDB's signatures for `{}`",
+            call.name
+        ))
+        .with_span(SourceSpan {
+            file: file.to_string(),
+            line,
+            col,
+        });
+        diagnostics.push(diagnostic);
     }
     diagnostics
 }
@@ -430,32 +559,243 @@ fn suggestion(name: &str, dialect: FunctionDialect) -> String {
     }
 }
 
+/// One argument count a DuckDB function accepts: exactly `N`, or `N` and
+/// more (a variadic function).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgCount {
+    Exact(usize),
+    AtLeast(usize),
+}
+
+impl ArgCount {
+    fn accepts(self, arity: usize) -> bool {
+        match self {
+            Self::Exact(n) => n == arity,
+            Self::AtLeast(n) => arity >= n,
+        }
+    }
+}
+
+/// DuckDB's argument counts per function name, from `data/duckdb_arities.txt`
+/// (see the header there and the `duckdb_arity_table` test). A name not in
+/// the table is not judged.
+static DUCKDB_ARITIES: LazyLock<std::collections::HashMap<&'static str, Vec<ArgCount>>> =
+    LazyLock::new(|| parse_arities(include_str!("data/duckdb_arities.txt")));
+
+/// Parse `name: 1 2 3+` lines. A malformed line is dropped, which leaves the
+/// name unjudged rather than judged by a wrong count.
+fn parse_arities(text: &'static str) -> std::collections::HashMap<&'static str, Vec<ArgCount>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let (name, counts) = line.split_once(':')?;
+            let counts = counts
+                .split_whitespace()
+                .map(|token| match token.strip_suffix('+') {
+                    Some(n) => n.parse().ok().map(ArgCount::AtLeast),
+                    None => token.parse().ok().map(ArgCount::Exact),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (!counts.is_empty()).then_some((name.trim(), counts))
+        })
+        .collect()
+}
+
+/// "1 or 2", "1, 2 or at least 3" for the counts a function takes.
+fn describe_counts(counts: &[ArgCount]) -> String {
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|count| match count {
+            ArgCount::Exact(n) => n.to_string(),
+            ArgCount::AtLeast(n) => format!("at least {n}"),
+        })
+        .collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [init @ .., last] => format!("{} or {last}", init.join(", ")),
+    }
+}
+
+/// One unqualified call the project does not declare.
+struct Found {
+    name: String,
+    line: usize,
+    col: usize,
+    within_group: bool,
+    /// The number of arguments the SQL states, when it is known. `None` for
+    /// `*`, `DISTINCT`, named arguments, lambdas, `COLUMNS(...)`/`UNPACK(...)`
+    /// arguments, a dot-call chain or an ordered-set `WITHIN GROUP` call.
+    arity: Option<usize>,
+    /// Whether DuckDB always binds this call (see [`top_level_calls`]).
+    always_bound: bool,
+}
+
 struct Calls<'r> {
     registry: &'r FunctionRegistry,
-    /// Unqualified, unquoted calls the project does not declare:
-    /// `(name as written, line, column, has WITHIN GROUP)`.
-    found: Vec<(String, usize, usize, bool)>,
+    /// Unqualified, unquoted calls the project does not declare.
+    found: Vec<Found>,
+    /// Calls that are the root of a dot-call chain (`upper(x).lower()`):
+    /// their argument count is not the count the SQL states.
+    chained: HashSet<*const Expr>,
+    /// Calls DuckDB always binds: see [`top_level_calls`].
+    top_level: HashSet<*const Expr>,
 }
 
 impl Visitor for Calls<'_> {
     type Break = ();
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+        // A dot-call chain (`upper(x).lower()`) passes the root and every
+        // link to the next call. Their counts are not the ones the SQL states.
+        if let Expr::CompoundFieldAccess { root, access_chain } = expr {
+            let links = access_chain.iter().filter_map(|access| match access {
+                ast::AccessExpr::Dot(link) => Some(link),
+                ast::AccessExpr::Subscript(_) => None,
+            });
+            for link in std::iter::once(root.as_ref()).chain(links) {
+                if matches!(link, Expr::Function(_)) {
+                    self.chained.insert(link as *const Expr);
+                }
+            }
+        }
         if let Expr::Function(function) = expr
             && let [ast::ObjectNamePart::Identifier(ident)] = function.name.0.as_slice()
             && ident.quote_style.is_none()
             && !self.registry.declares(&ident.value.to_ascii_lowercase())
         {
             let span = expr.span();
-            self.found.push((
-                ident.value.clone(),
-                span.start.line as usize,
-                span.start.column as usize,
-                !function.within_group.is_empty(),
-            ));
+            let chained = self.chained.contains(&(expr as *const Expr));
+            self.found.push(Found {
+                name: ident.value.clone(),
+                line: span.start.line as usize,
+                col: span.start.column as usize,
+                within_group: !function.within_group.is_empty(),
+                arity: if chained {
+                    None
+                } else {
+                    stated_arity(function)
+                },
+                always_bound: self.top_level.contains(&(expr as *const Expr)),
+            });
         }
         std::ops::ControlFlow::Continue(())
     }
+}
+
+/// The argument count the SQL states for `function`, or `None` when DuckDB
+/// may bind a different count (see [`Found::arity`]).
+fn stated_arity(function: &ast::Function) -> Option<usize> {
+    if !function.within_group.is_empty() {
+        return None;
+    }
+    if !matches!(function.parameters, ast::FunctionArguments::None) {
+        return None;
+    }
+    match &function.args {
+        ast::FunctionArguments::None => Some(0),
+        ast::FunctionArguments::Subquery(_) => None,
+        ast::FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() {
+                return None;
+            }
+            let mut count = 0;
+            for arg in &list.args {
+                let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
+                    return None;
+                };
+                if !is_counted_argument(expr) {
+                    return None;
+                }
+                count += 1;
+            }
+            Some(count)
+        }
+    }
+}
+
+/// An argument that is one value: not a lambda, and not a `COLUMNS(...)` or
+/// `UNPACK(...)` call that expands to several.
+fn is_counted_argument(expr: &Expr) -> bool {
+    match expr {
+        Expr::Lambda(_) => false,
+        // `name := value` is a named argument; the Databricks grammar Rocky
+        // parses with reads it as an assignment operator, not `FunctionArg::Named`.
+        Expr::BinaryOp {
+            op: ast::BinaryOperator::Assignment,
+            ..
+        } => false,
+        Expr::Function(function) => {
+            let expands = matches!(
+                function.name.0.as_slice(),
+                [ast::ObjectNamePart::Identifier(ident)]
+                    if ident.value.eq_ignore_ascii_case("columns")
+                        || ident.value.eq_ignore_ascii_case("unpack")
+            );
+            !expands
+        }
+        _ => true,
+    }
+}
+
+/// The calls DuckDB always binds, for error placement: those in the main
+/// `SELECT` list, `WHERE` or `HAVING`, reached without passing through a
+/// subquery. A CTE body, a derived table, a subquery, an `ORDER BY`, a named
+/// `WINDOW` or a set-operation branch is not listed, since DuckDB may skip
+/// binding it.
+fn top_level_calls(statements: &[Statement]) -> HashSet<*const Expr> {
+    struct Depth {
+        query_depth: usize,
+        calls: HashSet<*const Expr>,
+    }
+    impl Visitor for Depth {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+            self.query_depth += 1;
+            std::ops::ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+            self.query_depth = self.query_depth.saturating_sub(1);
+            std::ops::ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+            if self.query_depth == 0 && matches!(expr, Expr::Function(_)) {
+                self.calls.insert(expr as *const Expr);
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    let mut roots: Vec<&Expr> = Vec::new();
+    for statement in statements {
+        let Statement::Query(query) = statement else {
+            continue;
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            continue;
+        };
+        for item in &select.projection {
+            match item {
+                ast::SelectItem::UnnamedExpr(expr)
+                | ast::SelectItem::ExprWithAlias { expr, .. } => roots.push(expr),
+                _ => {}
+            }
+        }
+        roots.extend(select.selection.iter());
+        roots.extend(select.having.iter());
+    }
+    let mut depth = Depth {
+        query_depth: 0,
+        calls: HashSet::new(),
+    };
+    for root in roots {
+        let _ = root.visit(&mut depth);
+    }
+    depth.calls
 }
 
 #[cfg(test)]
@@ -536,7 +876,13 @@ mod tests {
     }
 
     fn run(sql: &str, target: &OperandTarget, registry: &FunctionRegistry) -> Vec<Diagnostic> {
-        check_unknown_functions(&[model("m", sql)], registry, &|_| target.clone(), None)
+        check_unknown_functions(
+            &[model("m", sql)],
+            registry,
+            &|_| target.clone(),
+            None,
+            &HashSet::new(),
+        )
     }
 
     fn registry_with(name: &str) -> FunctionRegistry {
@@ -746,7 +1092,13 @@ mod tests {
         let on_duckdb = duckdb();
         let models = [model("m", sql)];
         let check = |written_for| {
-            check_unknown_functions(&models, &registry, &|_| on_duckdb.clone(), written_for)
+            check_unknown_functions(
+                &models,
+                &registry,
+                &|_| on_duckdb.clone(),
+                written_for,
+                &HashSet::new(),
+            )
         };
         assert_eq!(check(None).len(), 1);
         assert_eq!(check(Some(OperandDialect::DuckDb)).len(), 1);
@@ -961,5 +1313,331 @@ mod tests {
         for name in SPARK_FUNCTIONS.iter() {
             assert!(FunctionDialect::Databricks.knows(name), "{name}");
         }
+    }
+
+    /// #2691: the scan finds a seed macro however the seed writes it.
+    #[test]
+    fn seed_scan_finds_macros_in_every_written_form() {
+        let seed = "CREATE MACRO a(x) AS x;\n\
+            create or replace temp macro b(x) as x;\n\
+            CREATE FUNCTION main.c(x) AS x;\n\
+            CREATE /* note */ MACRO d(x) AS x;\n\
+            CREATE\n-- split\nMACRO e(x) AS x;\n\
+            CREATE MACRO IF NOT EXISTS f(x) AS x;\n\
+            CREATE MACRO \"G\"(x) AS x;\n\
+            CREATE TABLE t AS SELECT 1 AS h;\n";
+        let names = seed_created_functions(seed);
+        for name in ["a", "b", "c", "d", "e", "f", "g"] {
+            assert!(names.contains(name), "{name}: {names:?}");
+        }
+        assert!(!names.contains("t"), "{names:?}");
+    }
+
+    /// #2691, the DuckDB verdict next to Rocky's: the seed runs, the model
+    /// binds, and the check no longer refuses the seed's macro.
+    #[test]
+    fn a_seed_macro_is_not_an_unknown_function_on_duckdb() {
+        let seed = "CREATE TABLE orders AS SELECT 'a' AS status;\n\
+                    CREATE MACRO my_fn(x) AS upper(x);\n";
+        let sql = "SELECT my_fn(status) AS s FROM orders";
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(seed).unwrap();
+        conn.prepare(sql).expect("DuckDB binds the model");
+
+        let registry = FunctionRegistry::default();
+        let names = seed_created_functions(seed);
+        let models = [model("m", sql)];
+        let with_seed = check_unknown_functions(&models, &registry, &|_| duckdb(), None, &names);
+        assert!(with_seed.is_empty(), "{with_seed:?}");
+        // Without the seed's names the same call is still refused.
+        let without =
+            check_unknown_functions(&models, &registry, &|_| duckdb(), None, &HashSet::new());
+        assert_eq!(without.len(), 1, "{without:?}");
+    }
+
+    /// The largest argument count the table probes. DuckDB's built-ins take
+    /// at most a handful; a variadic one is `N+`, where `N` is the smallest
+    /// count of the tail the probe accepts.
+    const PROBE_MAX: usize = 10;
+
+    /// The argument counts DuckDB binds for `name`, by probing `SELECT
+    /// name(NULL, ...)` with `0..=PROBE_MAX` arguments. A NULL argument
+    /// matches any parameter type, so a refusal of the probe is a refusal of
+    /// the count. Only DuckDB's "No function matches" refuses a count; any
+    /// other bind error means the count is not judged.
+    fn probe_counts(conn: &duckdb::Connection, name: &str) -> Vec<ArgCount> {
+        let accepted: Vec<bool> = (0..=PROBE_MAX)
+            .map(|n| {
+                let nulls = vec!["NULL"; n].join(", ");
+                match conn.prepare(&format!("SELECT {name}({nulls})")) {
+                    Ok(_) => true,
+                    Err(err) => !err.to_string().contains("No function matches"),
+                }
+            })
+            .collect();
+        // The start of the run of counts accepted up to `PROBE_MAX`, when the
+        // function is variadic: every count from there on is accepted.
+        let open_from = accepted[PROBE_MAX].then(|| {
+            (0..=PROBE_MAX)
+                .rev()
+                .take_while(|&n| accepted[n])
+                .last()
+                .unwrap_or(PROBE_MAX)
+        });
+        let mut counts = Vec::new();
+        for (n, &ok) in accepted.iter().enumerate() {
+            if Some(n) == open_from {
+                counts.push(ArgCount::AtLeast(n));
+                break;
+            }
+            if ok {
+                counts.push(ArgCount::Exact(n));
+            }
+        }
+        counts
+    }
+
+    /// The table as DuckDB gives it: every plain lower-case function name
+    /// `duckdb_functions()` lists that accepts some count, with its counts.
+    fn live_arity_table(conn: &duckdb::Connection) -> Vec<(String, Vec<ArgCount>)> {
+        // A name an extension other than core_functions provides can have an
+        // overload with another count; the bundled build cannot load it offline.
+        let extension_owned: HashSet<&str> = EXTENSION_OWNED
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT lower(function_name) FROM duckdb_functions() ORDER BY 1")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|n| {
+                !n.is_empty()
+                    && n.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .filter(|n| !extension_owned.contains(&n.as_str()))
+            .filter_map(|name| {
+                let counts = probe_counts(conn, &name);
+                (!counts.is_empty()).then_some((name, counts))
+            })
+            .collect()
+    }
+
+    fn format_counts(counts: &[ArgCount]) -> String {
+        counts
+            .iter()
+            .map(|c| match c {
+                ArgCount::Exact(n) => n.to_string(),
+                ArgCount::AtLeast(n) => format!("{n}+"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    const ARITY_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/data/duckdb_arities.txt");
+    const EXTENSION_OWNED: &str = include_str!("data/duckdb_extension_functions.txt");
+
+    /// Regenerate `data/duckdb_arities.txt` from the bundled DuckDB. Run:
+    /// `cargo test -p rocky-compiler write_duckdb_arity_table -- --ignored`.
+    #[test]
+    #[ignore = "writes data/duckdb_arities.txt"]
+    fn write_duckdb_arity_table() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut text = String::from(
+            "# DuckDB argument counts, per function name: `name: N N+`. `N+` is N or more.\n\
+             # Generated from the bundled DuckDB (libduckdb-sys) by probing `SELECT name(NULL, ...)`\n\
+             # with 0..=10 arguments; a count DuckDB refuses with \"No function matches\" is absent.\n\
+             # Names an extension other than core_functions provides are left out\n\
+             # (data/duckdb_extension_functions.txt).\n\
+             # Regenerate: cargo test -p rocky-compiler write_duckdb_arity_table -- --ignored\n",
+        );
+        for (name, counts) in live_arity_table(&conn) {
+            text.push_str(&format!("{name}: {}\n", format_counts(&counts)));
+        }
+        std::fs::write(ARITY_FILE, text).unwrap();
+    }
+
+    /// The committed table is the bundled DuckDB's table, name by name.
+    #[test]
+    fn duckdb_arity_table_matches_the_bundled_duckdb() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let live = live_arity_table(&conn);
+        assert!(live.len() > 300, "probed {} names", live.len());
+        let committed: Vec<(String, String)> = std::fs::read_to_string(ARITY_FILE)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let (n, c) = l.split_once(": ").unwrap();
+                (n.to_string(), c.to_string())
+            })
+            .collect();
+        let expected: Vec<(String, String)> = live
+            .iter()
+            .map(|(n, c)| (n.clone(), format_counts(c)))
+            .collect();
+        assert!(
+            committed == expected,
+            "regenerate data/duckdb_arities.txt: `cargo test -p rocky-compiler \
+             write_duckdb_arity_table -- --ignored`"
+        );
+    }
+
+    /// Every name the table holds parses, so none is dropped silently.
+    #[test]
+    fn every_arity_line_parses() {
+        let lines = std::fs::read_to_string(ARITY_FILE).unwrap();
+        let data_lines = lines
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .count();
+        assert_eq!(DUCKDB_ARITIES.len(), data_lines);
+    }
+
+    /// The DuckDB verdict for one SQL text: does it bind?
+    fn duckdb_binds(conn: &duckdb::Connection, sql: &str) -> bool {
+        conn.prepare(sql).is_ok()
+    }
+
+    /// The E068 / W068 codes Rocky gives `sql` on DuckDB.
+    fn arity_codes(sql: &str) -> Vec<String> {
+        let registry = FunctionRegistry::default();
+        run(sql, &duckdb(), &registry)
+            .iter()
+            .filter(|d| matches!(d.code.to_string().as_str(), "E068" | "W068"))
+            .map(|d| d.code.to_string())
+            .collect()
+    }
+
+    /// E068 is an error where DuckDB always binds the call, the main
+    /// `SELECT` list, `WHERE` or `HAVING`, and the verdict matches DuckDB.
+    #[test]
+    fn a_wrong_count_in_the_main_select_is_an_error() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        for sql in [
+            "SELECT lower('a', 'b') AS x",
+            "SELECT 1 AS n WHERE lower('a', 'b') = 'a'",
+        ] {
+            assert!(!duckdb_binds(&conn, sql), "DuckDB binds {sql}");
+            let registry = FunctionRegistry::default();
+            let diags = run(sql, &duckdb(), &registry);
+            assert_eq!(
+                diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+                ["E068"],
+                "{sql}: {diags:?}"
+            );
+            assert!(diags[0].is_error(), "{sql}");
+        }
+    }
+
+    /// A call DuckDB may skip, a CTE body, a derived table or a subquery, is
+    /// the warning W068, never the error.
+    #[test]
+    fn a_wrong_count_outside_the_main_select_is_a_warning() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        for sql in [
+            "WITH c AS (SELECT lower('a', 'b') AS x) SELECT 1 AS n FROM c",
+            "SELECT x FROM (SELECT lower('a', 'b') AS x)",
+            "SELECT (SELECT lower('a', 'b')) AS x",
+            "SELECT 1 AS n ORDER BY lower('a', 'b')",
+        ] {
+            assert!(!duckdb_binds(&conn, sql), "DuckDB binds {sql}");
+            let registry = FunctionRegistry::default();
+            let diags = run(sql, &duckdb(), &registry);
+            assert_eq!(
+                diags.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
+                ["W068"],
+                "{sql}: {diags:?}"
+            );
+            assert!(!diags[0].is_error(), "{sql}");
+        }
+    }
+
+    /// E068 never refuses SQL DuckDB binds. Each call here is a count DuckDB
+    /// accepts, or a form Rocky must not count; the verdict is DuckDB's.
+    #[test]
+    fn e068_never_refuses_a_call_duckdb_binds() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        for sql in [
+            "SELECT lower('a') AS x",
+            "SELECT concat('a', 'b', 'c', 'd') AS x",
+            "SELECT round(1.5) AS x",
+            "SELECT round(1.5, 1) AS x",
+            "SELECT count(*) AS x FROM (SELECT 1)",
+            "SELECT count(DISTINCT 1) AS x FROM (SELECT 1)",
+            "SELECT list_transform([1], x -> x + 1) AS x",
+            "SELECT struct_pack(a := 1) AS x",
+            "SELECT upper('a').lower() AS x",
+            "SELECT substring('abc', 1, 2) AS x",
+            "SELECT regexp_extract('abc', 'b') AS x",
+            "SELECT coalesce(1) AS x",
+        ] {
+            let binds = duckdb_binds(&conn, sql);
+            let codes = arity_codes(sql);
+            if binds {
+                assert!(codes.is_empty(), "DuckDB binds {sql}; Rocky gave {codes:?}");
+            }
+        }
+    }
+
+    /// Across the whole table, Rocky's E068 on a main-select call with `n`
+    /// NULL arguments is exactly DuckDB's "No function matches" refusal of
+    /// the same call. Names Rocky never judges (special forms, parser
+    /// rewrites) are excluded from the comparison, not asserted.
+    #[test]
+    fn e068_agrees_with_duckdb_on_every_table_name() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut disagreements = Vec::new();
+        let mut checked = 0usize;
+        for name in DUCKDB_ARITIES.keys() {
+            if SPECIAL_FORMS.contains(name)
+                || DUCKDB_ONLY_FORMS.contains(name)
+                || DUCKDB_WITHIN_GROUP_FORMS.contains(name)
+            {
+                continue;
+            }
+            for n in 0..=3usize {
+                let nulls = vec!["NULL"; n].join(", ");
+                let sql = format!("SELECT {name}({nulls}) AS x");
+                let duck_refuses = conn
+                    .prepare(&format!("SELECT {name}({nulls})"))
+                    .err()
+                    .is_some_and(|e| e.to_string().contains("No function matches"));
+                let rocky_refuses = arity_codes(&sql).iter().any(|c| c == "E068");
+                checked += 1;
+                if duck_refuses != rocky_refuses {
+                    disagreements.push(format!(
+                        "{sql}: duckdb={duck_refuses} rocky={rocky_refuses}"
+                    ));
+                }
+            }
+        }
+        assert!(checked > 1000, "checked {checked}");
+        assert!(disagreements.is_empty(), "{disagreements:#?}");
+    }
+
+    /// A name an extension other than core_functions provides is not tabled,
+    /// since the extension can add an overload with another count; a core name
+    /// is tabled.
+    #[test]
+    fn extension_owned_names_are_not_judged_by_count() {
+        assert!(!DUCKDB_ARITIES.contains_key("json_extract"));
+        assert!(!DUCKDB_ARITIES.contains_key("timezone"));
+        assert!(DUCKDB_ARITIES.contains_key("lower"));
+        let registry = FunctionRegistry::default();
+        // `json_extract` takes two arguments in its extension; no count is judged.
+        let sql = "SELECT json_extract('{}', '$.a', 1) AS x";
+        assert!(
+            arity_codes(sql).is_empty(),
+            "{:?}",
+            run(sql, &duckdb(), &registry)
+        );
     }
 }

@@ -1,0 +1,727 @@
+# DuckDB argument counts, per function name: `name: N N+`. `N+` is N or more.
+# Generated from the bundled DuckDB (libduckdb-sys) by probing `SELECT name(NULL, ...)`
+# with 0..=10 arguments; a count DuckDB refuses with "No function matches" is absent.
+# Names an extension other than core_functions provides are left out
+# (data/duckdb_extension_functions.txt).
+# Regenerate: cargo test -p rocky-compiler write_duckdb_arity_table -- --ignored
+__between: 3
+__cast: 1
+__internal_barrier: 1
+__internal_compress_geometry_point: 1
+__internal_compress_integral_ubigint: 2
+__internal_compress_integral_uinteger: 2
+__internal_compress_integral_usmallint: 2
+__internal_compress_integral_utinyint: 2
+__internal_compress_string_hugeint: 1
+__internal_compress_string_ubigint: 1
+__internal_compress_string_uhugeint: 1
+__internal_compress_string_uinteger: 1
+__internal_compress_string_usmallint: 1
+__internal_compress_string_utinyint: 1
+__internal_compressed_materialization_cast: 1
+__internal_decompress_geometry_point: 1
+__internal_decompress_integral_bigint: 2
+__internal_decompress_integral_hugeint: 2
+__internal_decompress_integral_integer: 2
+__internal_decompress_integral_smallint: 2
+__internal_decompress_integral_ubigint: 2
+__internal_decompress_integral_uhugeint: 2
+__internal_decompress_integral_uinteger: 2
+__internal_decompress_integral_usmallint: 2
+__internal_decompress_string: 1
+__internal_tablefilter_bloom_filter: 1
+__internal_tablefilter_dynamic: 1
+__internal_tablefilter_optional: 1
+__internal_tablefilter_prefix_range: 1
+__internal_tablefilter_selectivity_optional: 1
+abs: 1
+acos: 1
+acosh: 1
+add: 0+
+aggregate: 2+
+ago: 0 2+
+alias: 1
+any_value: 1
+apply: 2
+approx_count_distinct: 1
+approx_quantile: 2
+approx_top_k: 2
+arbitrary: 1
+arg_max: 2 3
+arg_max_null: 2
+arg_max_nulls_last: 2 3
+arg_min: 2 3
+arg_min_null: 2
+arg_min_nulls_last: 2 3
+argmax: 2 3
+argmin: 2 3
+array_agg: 1
+array_aggr: 2+
+array_aggregate: 2+
+array_append: 0+
+array_apply: 2
+array_cat: 0+
+array_concat: 0+
+array_contains: 2
+array_cosine_distance: 2
+array_cosine_similarity: 2
+array_cross_product: 2
+array_distance: 2
+array_distinct: 1
+array_dot_product: 2
+array_extract: 2
+array_filter: 2
+array_grade_up: 1 2 3
+array_has: 2
+array_has_all: 2
+array_has_any: 2
+array_indexof: 2
+array_inner_product: 2
+array_intersect: 2
+array_length: 1 2
+array_negative_dot_product: 2
+array_negative_inner_product: 2
+array_pop_back: 0+
+array_pop_front: 0+
+array_position: 2
+array_prepend: 0+
+array_push_back: 0+
+array_push_front: 0+
+array_reduce: 2 3
+array_resize: 2 3
+array_reverse: 0+
+array_reverse_sort: 1 2
+array_select: 2
+array_slice: 3 4
+array_sort: 1 2 3
+array_to_string: 0+
+array_to_string_comma_default: 0+
+array_transform: 2
+array_unique: 1
+array_value: 0+
+array_where: 2
+array_zip: 0+
+arrow_scan: 0+
+arrow_scan_dumb: 0+
+ascii: 1
+asin: 1
+asinh: 1
+assert_true: 0+
+atan: 1
+atan2: 2
+atanh: 1
+avg: 1
+bar: 3 4
+base64: 1
+bin: 1
+binom: 2
+bit_and: 1
+bit_count: 1
+bit_length: 1
+bit_or: 1
+bit_position: 2
+bit_xor: 1
+bitstring: 2
+bitstring_agg: 1 3
+bitstring_byte_comparable: 1
+bool_and: 1
+bool_or: 1
+can_cast_implicitly: 2
+cardinality: 1+
+cast_to_type: 2
+cbrt: 1
+ceil: 1
+ceiling: 1
+char_length: 1
+character_length: 1
+checkpoint: 0+
+chr: 1
+col_description: 0+
+collations: 0+
+combine: 2
+combine_aggr: 1 2
+concat: 1+
+concat_ws: 2+
+constant_or_null: 2+
+contains: 2
+copy_database: 0+
+corr: 2
+cos: 1
+cosh: 1
+cot: 1
+count: 0 1
+count_if: 1
+count_star: 0
+countif: 1
+covar_pop: 2
+covar_samp: 2
+create_external_resource: 0+
+create_sort_key: 1+
+cume_dist: 0+
+current_catalog: 0+
+current_connection_id: 0
+current_database: 0
+current_query: 0
+current_query_id: 0
+current_role: 0+
+current_schema: 0
+current_schemas: 1
+current_setting: 1
+current_transaction_id: 0
+current_user: 0+
+currval: 1
+damerau_levenshtein: 2
+database_list: 0+
+database_size: 0+
+date_add: 0+
+days_in_month: 0+
+decimal_average: 1
+decimal_division: 2 3
+decode: 1 2
+degrees: 1
+dense_rank: 0+
+deregister_external_resource: 0+
+destroy_external_resource: 0+
+disable_checkpoint_on_shutdown: 0+
+disable_logging: 0+
+disable_object_cache: 0+
+disable_optimizer: 0+
+disable_print_progress_bar: 0+
+disable_profile: 0+
+disable_profiling: 0+
+disable_progress_bar: 0+
+disable_verification: 0+
+disable_verify_parallelism: 0+
+divide: 2
+duckdb_approx_database_count: 0+
+duckdb_available_metrics: 0+
+duckdb_columns: 0+
+duckdb_connection_count: 0+
+duckdb_constraints: 0+
+duckdb_coordinate_systems: 0+
+duckdb_databases: 0+
+duckdb_dependencies: 0+
+duckdb_dialects: 0+
+duckdb_eviction_queues: 0+
+duckdb_extension_repositories: 0+
+duckdb_extensions: 0+
+duckdb_external_file_cache: 0+
+duckdb_external_resource_types: 0+
+duckdb_external_resources: 0+
+duckdb_functions: 0+
+duckdb_grammar_extensions: 0+
+duckdb_indexes: 0+
+duckdb_keywords: 0+
+duckdb_log_contexts: 0+
+duckdb_logs: 0+
+duckdb_logs_parsed: 0+
+duckdb_memory: 0+
+duckdb_optimizers: 0+
+duckdb_prepared_statements: 0+
+duckdb_profiling_settings: 0+
+duckdb_schemas: 0+
+duckdb_secret_type_parameters: 0+
+duckdb_secret_types: 0+
+duckdb_secrets: 0+
+duckdb_sequences: 0+
+duckdb_settings: 0+
+duckdb_table_sample: 0+
+duckdb_tables: 0+
+duckdb_temporary_files: 0+
+duckdb_triggers: 0+
+duckdb_types: 0+
+duckdb_variables: 0+
+duckdb_views: 0+
+editdist3: 2
+element_at: 2
+enable_checkpoint_on_shutdown: 0+
+enable_logging: 0+
+enable_object_cache: 0+
+enable_optimizer: 0+
+enable_print_progress_bar: 0+
+enable_profile: 0+
+enable_profiling: 0+
+enable_progress_bar: 0+
+enable_verification: 0+
+encode: 1
+ends_with: 2
+entropy: 1
+enum_code: 1
+enum_first: 1
+enum_last: 1
+enum_range: 1
+enum_range_boundary: 2
+epoch_ms: 1
+epoch_ns: 1
+epoch_us: 1
+equi_width_bins: 4
+error: 1
+even: 1
+exp: 1
+extension_versions: 0+
+factorial: 1
+favg: 1
+fdiv: 0+
+fill: 0+
+filter: 2
+finalize: 1
+first: 1
+first_value: 0+
+flatten: 1
+floor: 1
+fmod: 0+
+force_checkpoint: 0+
+format: 1+
+format_bytes: 1
+format_pg_type: 0+
+format_type: 0+
+formatreadabledecimalsize: 1
+formatreadablesize: 1
+from_base64: 1
+from_binary: 1
+from_hex: 1
+fsum: 1
+functions: 0+
+gamma: 1
+gcd: 2
+gen_random_uuid: 0
+generate_subscripts: 0+
+geomean: 0+
+geometric_mean: 0+
+get_bit: 2
+get_block_size: 0+
+get_current_timestamp: 0
+get_type: 1
+getvariable: 1
+glob: 0+
+grade_up: 1 2 3
+greatest: 1+
+greatest_common_divisor: 2
+group_concat: 1 2
+hamming: 2
+has_any_column_privilege: 0+
+has_column_privilege: 0+
+has_database_privilege: 0+
+has_foreign_data_wrapper_privilege: 0+
+has_function_privilege: 0+
+has_language_privilege: 0+
+has_schema_privilege: 0+
+has_sequence_privilege: 0+
+has_server_privilege: 0+
+has_table_privilege: 0+
+has_tablespace_privilege: 0+
+hash: 1+
+hex: 1
+histogram: 1 2
+histogram_exact: 2
+histogram_values: 0+
+hive_partition_component: 2
+if: 0+
+ilike_escape: 3
+import_database: 0+
+in_search_path: 2
+index_key: 2+
+inet_client_addr: 0+
+inet_client_port: 0+
+inet_server_addr: 0+
+inet_server_port: 0+
+instr: 2
+invoke: 2+
+is_histogram_other_bin: 1
+isfinite: 1
+isinf: 1
+isnan: 1
+jaccard: 2
+jaro_similarity: 2 3
+jaro_winkler_similarity: 2 3
+kahan_sum: 1
+kurtosis: 1
+kurtosis_pop: 1
+lag: 0+
+last: 1
+last_value: 0+
+lcase: 1
+lcm: 2
+lead: 0+
+least: 1+
+least_common_multiple: 2
+left: 2
+left_grapheme: 2
+len: 1
+length: 1
+length_grapheme: 1
+levenshtein: 2
+lgamma: 1
+like_escape: 3
+list: 1
+list_aggr: 2+
+list_aggregate: 2+
+list_any_value: 0+
+list_append: 0+
+list_apply: 2
+list_approx_count_distinct: 0+
+list_avg: 0+
+list_bit_and: 0+
+list_bit_or: 0+
+list_bit_xor: 0+
+list_bool_and: 0+
+list_bool_or: 0+
+list_cat: 0+
+list_concat: 0+
+list_contains: 2
+list_cosine_distance: 2
+list_cosine_similarity: 2
+list_count: 0+
+list_distance: 2
+list_distinct: 1
+list_dot_product: 2
+list_element: 2
+list_entropy: 0+
+list_extract: 2
+list_filter: 2
+list_first: 0+
+list_grade_up: 1 2 3
+list_has: 2
+list_has_all: 2
+list_has_any: 2
+list_histogram: 0+
+list_indexof: 2
+list_inner_product: 2
+list_intersect: 2
+list_kurtosis: 0+
+list_kurtosis_pop: 0+
+list_last: 0+
+list_mad: 0+
+list_max: 0+
+list_median: 0+
+list_min: 0+
+list_mode: 0+
+list_negative_dot_product: 2
+list_negative_inner_product: 2
+list_pack: 0+
+list_position: 2
+list_prepend: 0+
+list_product: 0+
+list_reduce: 2 3
+list_resize: 2 3
+list_reverse: 0+
+list_reverse_sort: 1 2
+list_select: 2
+list_sem: 0+
+list_skewness: 0+
+list_slice: 3 4
+list_sort: 1 2 3
+list_stddev_pop: 0+
+list_stddev_samp: 0+
+list_string_agg: 0+
+list_sum: 0+
+list_transform: 2
+list_unique: 1
+list_value: 0+
+list_var_pop: 0+
+list_var_samp: 0+
+list_where: 2
+list_zip: 0+
+listagg: 1 2
+ln: 1
+log: 1 2
+log10: 1
+log2: 1
+lower: 1
+lpad: 3
+ltrim: 1 2
+lttb: 3
+mad: 1
+make_date: 1 3
+make_time: 3
+make_timestamp: 1 6
+make_timestamp_ms: 1
+make_timestamp_ns: 1
+make_type: 1+
+map: 0 2
+map_concat: 0+
+map_contains: 2
+map_contains_entry: 0+
+map_contains_value: 0+
+map_entries: 1
+map_extract: 2
+map_extract_value: 2
+map_from_entries: 1
+map_keys: 1
+map_to_pg_oid: 0+
+map_values: 1
+max: 1 2
+max_by: 2 3
+md5: 1
+md5_number: 1
+md5_number_lower: 0+
+md5_number_upper: 0+
+mean: 1
+median: 1
+metadata_info: 0+
+min: 1 2
+min_by: 2 3
+mismatches: 2
+mod: 2
+mode: 1
+multiply: 2
+nanosecond: 1
+nextafter: 2
+nextval: 1
+nfc_normalize: 1
+normalized_interval: 1
+not_ilike_escape: 3
+not_like_escape: 3
+now: 0
+nth_value: 0+
+ntile: 0+
+nullif: 0+
+obj_description: 0+
+octet_length: 1
+ord: 1
+overlay: 0 3 4
+parse_dirname: 1 2
+parse_dirpath: 1 2
+parse_duckdb_log_message: 2
+parse_filename: 1 2 3
+parse_formatted_bytes: 1
+parse_path: 1 2
+path_join: 1+
+percent_rank: 0+
+pg_collation_is_visible: 0+
+pg_conf_load_time: 0+
+pg_conversion_is_visible: 0+
+pg_function_is_visible: 0+
+pg_get_constraintdef: 0+
+pg_get_expr: 0+
+pg_get_viewdef: 0+
+pg_has_role: 0+
+pg_is_other_temp_schema: 0+
+pg_my_temp_schema: 0+
+pg_opclass_is_visible: 0+
+pg_operator_is_visible: 0+
+pg_opfamily_is_visible: 0+
+pg_postmaster_start_time: 0+
+pg_size_pretty: 0+
+pg_sleep: 0+
+pg_table_is_visible: 0+
+pg_ts_config_is_visible: 0+
+pg_ts_dict_is_visible: 0+
+pg_ts_parser_is_visible: 0+
+pg_ts_template_is_visible: 0+
+pg_type_is_visible: 0+
+pg_typeof: 0+
+pi: 0
+platform: 0+
+position: 0+
+pow: 2
+power: 2
+pragma_collations: 0+
+pragma_database_size: 0+
+pragma_metadata_info: 0+
+pragma_platform: 0+
+pragma_show: 0+
+pragma_storage_info: 0+
+pragma_table_info: 0+
+pragma_user_agent: 0+
+pragma_version: 0+
+prefix: 2
+printf: 1+
+product: 1
+quantile: 1 2
+quantile_cont: 2
+quantile_disc: 1 2
+query: 0+
+query_table: 0+
+radians: 1
+random: 0
+rank: 0+
+rank_dense: 0+
+read_blob: 0+
+read_csv: 0+
+read_csv_auto: 0+
+read_duckdb: 0+
+read_single_csv_file: 0+
+read_text: 0+
+reduce: 2 3
+regexp_escape: 1
+regexp_extract: 2 3 4
+regexp_extract_all: 2 3 4
+regexp_full_match: 2 3
+regexp_matches: 2 3
+regexp_replace: 3 4
+regexp_split_to_array: 2 3
+regexp_split_to_table: 0+
+register_external_resource: 0+
+register_external_resource_type: 0+
+regr_avgx: 2
+regr_avgy: 2
+regr_count: 2
+regr_intercept: 2
+regr_r2: 2
+regr_slope: 2
+regr_sxx: 2
+regr_sxy: 2
+regr_syy: 2
+remap_struct: 4
+repeat: 2
+repeat_row: 0+
+replace: 3
+replace_type: 3
+reservoir_quantile: 1 2 3
+reverse: 1
+right: 2
+right_grapheme: 2
+round: 1 2
+round_even: 2
+roundbankers: 2
+row: 0+
+row_number: 0+
+rpad: 3
+rtrim: 1 2
+sem: 1
+seq_scan: 0+
+session_user: 0+
+set_bit: 3
+setseed: 1
+setval: 2 3
+sha1: 1
+sha256: 1
+shobj_description: 0+
+show: 0+
+show_databases: 0+
+show_tables: 0+
+show_tables_expanded: 0+
+sign: 1
+signbit: 1
+sin: 1
+sinh: 1
+skewness: 1
+sleep_ms: 1
+sniff_csv: 0+
+split: 2
+split_part: 0+
+sqrt: 1
+st_asbinary: 1
+st_astext: 1
+st_aswkb: 1
+st_aswkt: 1
+st_crs: 1
+st_geomfromwkb: 1
+st_intersects_extent: 2
+st_setcrs: 2
+starts_with: 2
+stats: 1
+stddev: 1
+stddev_pop: 1
+stddev_samp: 1
+storage_info: 0+
+str_split: 2
+str_split_regex: 2 3
+strftime: 2
+string_agg: 1 2
+string_split: 2
+string_split_regex: 2 3
+string_to_array: 2
+strip_accents: 1
+strlen: 1
+strpos: 2
+strptime: 2
+struct_concat: 0+
+struct_contains: 2
+struct_extract: 2
+struct_extract_at: 2
+struct_has: 2
+struct_indexof: 2
+struct_insert: 1
+struct_keys: 1
+struct_pack: 0
+struct_position: 2
+struct_update: 1
+struct_values: 1
+substr: 2 3
+substring: 0 2 3
+substring_grapheme: 2 3
+subtract: 1 2
+suffix: 2
+sum: 1
+sum_no_overflow: 1
+sumkahan: 1
+summary: 0+
+switch: 1 2 3
+table_info: 0+
+tan: 1
+tanh: 1
+test_all_types: 0+
+test_vector_types: 0+
+timetz_byte_comparable: 1
+to_aggregate_state: 3 4 5
+to_base: 2 3
+to_base64: 1
+to_binary: 1
+to_centuries: 1
+to_days: 1
+to_decades: 1
+to_hex: 1
+to_hours: 1
+to_microseconds: 1
+to_millennia: 1
+to_milliseconds: 1
+to_minutes: 1
+to_months: 1
+to_quarters: 1
+to_seconds: 1
+to_timestamp: 1
+to_weeks: 1
+to_years: 1
+transaction_timestamp: 0
+translate: 3
+trim: 0 1 2
+trunc: 1 2
+truncate_duckdb_logs: 0+
+try_strptime: 2
+txid_current: 0
+typeof: 1
+ucase: 1
+unbin: 1
+unhex: 1
+unicode: 1
+union_extract: 2
+union_tag: 1
+union_value: 0
+unnest: 0+
+unpivot_list: 0+
+upper: 1
+url_decode: 1
+url_encode: 1
+user: 0+
+user_agent: 0+
+uuid: 0
+uuid_extract_timestamp: 1
+uuid_extract_version: 1
+uuidv4: 0
+uuidv7: 0
+var_pop: 1
+var_samp: 1
+variance: 1
+variant_array_length: 1 2
+variant_comparator: 1
+variant_contains: 2
+variant_exists: 2
+variant_extract: 2
+variant_extract_string: 2
+variant_group_array: 0+
+variant_group_object: 2
+variant_keys: 1 2
+variant_normalize: 1
+variant_type: 1 2
+variant_typeof: 1
+vector_type: 1
+verify_parallelism: 0+
+version: 0
+vertex_extract: 2
+wavg: 0+
+weighted_avg: 0+
+which_secret: 0+
+write_log: 1
+xor: 2
