@@ -379,6 +379,19 @@ impl OperandTarget {
             Self::Targets { .. } | Self::Unconfigured => &[],
         }
     }
+
+    /// How the target folds identifier case, for `WITH` name matching
+    /// (#2696). Snowflake folds only when every ruled target is Snowflake: a
+    /// model that runs on several targets, with one that differs, keeps the
+    /// DuckDB fold. Unconfigured, ClickHouse and the rest keep it too.
+    pub(crate) fn ident_fold(&self) -> crate::typecheck::IdentFold {
+        let dialects = self.known_dialects();
+        if !dialects.is_empty() && dialects.iter().all(|d| *d == OperandDialect::Snowflake) {
+            crate::typecheck::IdentFold::UpperUnquoted
+        } else {
+            crate::typecheck::IdentFold::Lower
+        }
+    }
 }
 
 /// The warehouse each model runs on, for the passes that need it inside the
@@ -632,7 +645,7 @@ fn walk_query<'a>(
     ctx: &mut Ctx<'_>,
 ) {
     let mut ctes: crate::typecheck::WithNames<Vec<TypedColumn>> =
-        crate::typecheck::WithNames::new();
+        crate::typecheck::WithNames::new(ctx.target.ident_fold());
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let cte_lookup =
@@ -1192,6 +1205,112 @@ mod tests {
         "SELECT customer_id, SUM(customer_name) AS s FROM raw.customers GROUP BY customer_id";
     const D5: &str = "SELECT o.order_id, c.customer_name FROM raw.orders o \
                       JOIN raw.customers c ON o.customer_id = c.customer_name";
+
+    /// Whether Rocky judges `SUM(status)` against the `WITH` name's CTE,
+    /// which is VARCHAR, rather than the source table, which is BIGINT. A
+    /// VARCHAR sum is `E042` on DuckDB and `W042` on Snowflake, where a string
+    /// casts to a number, so either code means the CTE was read.
+    fn refused_as_the_cte(sql: &str, dialect: OperandDialect) -> bool {
+        let mut source_schemas = sources();
+        source_schemas.insert("orders".to_string(), vec![col("status", RockyType::Int64)]);
+        let config = crate::compile::CompilerConfig {
+            source_schemas,
+            ..Default::default()
+        };
+        let result = crate::compile::compile_preloaded_models(vec![model("reader", sql)], &config)
+            .expect("compile");
+        let diags = check_operand_types(
+            &result.project.models,
+            &result.semantic_graph,
+            &result.type_check.typed_models,
+            &result.type_check.shadowed_sources,
+            Some(dialect),
+        );
+        codes(&diags).iter().any(|c| *c == "E042" || *c == "W042")
+    }
+
+    /// #2696: which relation a `WITH` name reaches depends on the target's
+    /// identifier folding. DuckDB folds quoted and unquoted names alike, so
+    /// every spelling reaches the CTE. Snowflake folds an unquoted name to
+    /// UPPER and keeps a quoted one, so only spellings that fold to `ORDERS`
+    /// reach it. The DuckDB rows are checked against DuckDB itself: a
+    /// prepared `SUM` over the VARCHAR CTE fails, over the BIGINT table it
+    /// does not. The Snowflake rows follow Snowflake's documented folding.
+    #[test]
+    fn with_names_fold_as_the_target_warehouse_folds_them() {
+        const CTE: &str = "SELECT 'x' AS status";
+        let duckdb = [
+            (
+                format!("WITH orders AS ({CTE}) SELECT SUM(status) AS t FROM \"ORDERS\""),
+                true,
+            ),
+            (
+                format!("WITH \"Orders\" AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
+                true,
+            ),
+            (
+                format!("WITH \"orders\" AS ({CTE}) SELECT SUM(status) AS t FROM \"ORDERS\""),
+                true,
+            ),
+        ];
+        let snowflake = [
+            (
+                format!("WITH Orders AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
+                true,
+            ),
+            (
+                format!("WITH orders AS ({CTE}) SELECT SUM(status) AS t FROM \"ORDERS\""),
+                true,
+            ),
+            (
+                format!("WITH \"ORDERS\" AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
+                true,
+            ),
+            (
+                format!("WITH \"orders\" AS ({CTE}) SELECT SUM(status) AS t FROM orders"),
+                false,
+            ),
+            (
+                format!("WITH orders AS ({CTE}) SELECT SUM(status) AS t FROM \"orders\""),
+                false,
+            ),
+        ];
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE orders AS SELECT 1::BIGINT AS status")
+            .unwrap();
+        for (sql, cte) in &duckdb {
+            assert_eq!(
+                conn.prepare(sql).is_err(),
+                *cte,
+                "DuckDB binds the CTE here: {sql}"
+            );
+            assert_eq!(
+                refused_as_the_cte(sql, OperandDialect::DuckDb),
+                *cte,
+                "{sql}"
+            );
+        }
+        for (sql, cte) in &snowflake {
+            assert_eq!(
+                refused_as_the_cte(sql, OperandDialect::Snowflake),
+                *cte,
+                "Snowflake folding: {sql}"
+            );
+        }
+    }
+
+    /// #2696: the fold applies to a Unicode name too. The lineage walker
+    /// lowercases with Unicode rules, and `WITH` matching must agree with it.
+    /// Before the fix the match was ASCII-only, so `"Émile"` and `"émile"`
+    /// read two different relations. Only a quoted non-ASCII name reaches
+    /// this: the parser takes unquoted identifiers as ASCII only.
+    #[test]
+    fn a_non_ascii_with_name_folds_the_way_lineage_folds_it() {
+        assert!(refused_as_the_cte(
+            "WITH \"Émile\" AS (SELECT 'x' AS status) SELECT SUM(status) AS t FROM \"émile\"",
+            OperandDialect::DuckDb,
+        ));
+    }
 
     #[test]
     /// #2674: an unquoted `WITH` name hides a table of the same name in any

@@ -735,8 +735,14 @@ mod tests {
     #[test]
     fn duckdb_star_exclude_and_replace_models_resolve() {
         let models = vec![
-            make_model("stg_orders", "select * exclude (status) from main.raw_orders"),
-            make_model("stg_payments", "select * replace (amount + 1 as amount) from main.raw"),
+            make_model(
+                "stg_orders",
+                "select * exclude (status) from main.raw_orders",
+            ),
+            make_model(
+                "stg_payments",
+                "select * replace (amount + 1 as amount) from main.raw",
+            ),
         ];
         let (nodes, _, _) =
             resolve_dependencies(&models).expect("star modifiers must not fail resolution");

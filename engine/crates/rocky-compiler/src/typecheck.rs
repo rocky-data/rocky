@@ -5074,7 +5074,8 @@ pub(crate) fn infer_query_types(
 ) -> Result<SelectInference, String> {
     // Each CTE keeps which of its columns are exact, so an outer expression
     // over one is exact only when the CTE's expression is (#2320).
-    let mut ctes: WithNames<(Vec<TypedColumn>, HashSet<usize>)> = WithNames::new();
+    let mut ctes: WithNames<(Vec<TypedColumn>, HashSet<usize>)> =
+        WithNames::new(env.target.ident_fold());
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let inferred = {
@@ -5115,21 +5116,56 @@ fn cte_relation<'c>(
     })
 }
 
+/// How a warehouse folds an identifier's case before two names are compared
+/// (#2696). Both sides of a `WITH` match fold through the same rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum IdentFold {
+    /// DuckDB, and every target this crate has no other rule for. Quoted and
+    /// unquoted names fold alike, to lower case (Unicode, as lineage does).
+    #[default]
+    Lower,
+    /// Snowflake: an unquoted name folds to upper case, and a quoted name
+    /// keeps its case.
+    UpperUnquoted,
+}
+
+impl IdentFold {
+    /// Fold a name whose quoting is known.
+    pub(crate) fn fold(self, name: &str, quoted: bool) -> String {
+        match self {
+            Self::Lower => name.to_lowercase(),
+            Self::UpperUnquoted if quoted => name.to_string(),
+            Self::UpperUnquoted => name.to_uppercase(),
+        }
+    }
+
+    /// Fold a name as the read spelled it in SQL text: `"Orders"`, `` `orders` ``
+    /// and `[orders]` are quoted, anything else is not.
+    fn fold_text(self, name: &str) -> String {
+        match name.as_bytes().first() {
+            Some(b'"' | b'`') => self.fold(name.trim_matches(['"', '`']), true),
+            Some(b'[') => self.fold(name.trim_start_matches('[').trim_end_matches(']'), true),
+            _ => self.fold(name, false),
+        }
+    }
+}
+
 /// The `WITH` names in scope of one query, and what each holds (#2674).
 ///
-/// A read matches a `WITH` name spelled exactly as written. It also matches
-/// one that differs only in case when both are unquoted: every warehouse
-/// folds two unquoted names the same way (DuckDB and PostgreSQL to lower
-/// case, Snowflake to upper case), so `WITH Orders AS (...) ... FROM orders`
-/// reads the CTE everywhere. A quoted name keeps its case on some warehouses
-/// and not on others, so it matches only exactly, as before (#2696).
+/// Each name is stored under its folded form, and a read is matched by the
+/// folded form of its own spelling. Which fold applies is the target's
+/// (#2696): DuckDB matches case-insensitively, quoted names included, and
+/// Snowflake matches only when the folded spellings are equal, so `"orders"`
+/// does not reach `WITH orders` there.
 pub(crate) struct WithNames<V> {
-    entries: Vec<(String, bool, V)>,
+    fold: IdentFold,
+    entries: Vec<(String, V)>,
 }
 
 impl<V> WithNames<V> {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(fold: IdentFold) -> Self {
         Self {
+            fold,
             entries: Vec::new(),
         }
     }
@@ -5137,24 +5173,22 @@ impl<V> WithNames<V> {
     /// Bring the `WITH` name `alias` into scope; a later one of the same
     /// name hides an earlier one.
     pub(crate) fn insert(&mut self, alias: &ast::Ident, value: V) {
-        self.entries
-            .push((alias.value.clone(), alias.quote_style.is_some(), value));
+        let key = self.fold.fold(&alias.value, alias.quote_style.is_some());
+        self.entries.push((key, value));
     }
 
     /// What the read spelled `name` (as SQL text) reaches among these
-    /// `WITH` names, if any.
+    /// `WITH` names, if any. A qualified name never names a `WITH` name.
     pub(crate) fn get(&self, name: &str) -> Option<&V> {
-        if let Some((_, _, value)) = self.entries.iter().rev().find(|(n, ..)| n == name) {
-            return Some(value);
-        }
-        if name.starts_with(['"', '`', '[']) || name.contains('.') {
+        if name.contains('.') {
             return None;
         }
+        let key = self.fold.fold_text(name);
         self.entries
             .iter()
             .rev()
-            .find(|(n, quoted, _)| !quoted && n.eq_ignore_ascii_case(name))
-            .map(|(_, _, value)| value)
+            .find(|(n, _)| *n == key)
+            .map(|(_, value)| value)
     }
 }
 
