@@ -141,7 +141,7 @@ An enum under the pipeline's `[execution]` table:
 publish = "staged"     # default: "in_place"
 ```
 
-`rocky run --publish staged|in_place` overrides it. Other pipeline types share `ExecutionConfig` and refuse `"staged"`.  
+`rocky run --publish staged|in_place` overrides it. Other pipeline types share `ExecutionConfig` and refuse `"staged"`. Names are proposed.
 
 ## Consequences
 
