@@ -199,8 +199,8 @@ pub(super) async fn prepare(
 ///
 /// A MERGE does not drop columns, so a column the SQL stopped selecting stays
 /// in the table. On DuckDB new rows hold NULL there; other warehouses are not
-/// verified, and one whose MERGE inserts by position (Databricks `INSERT *`,
-/// BigQuery `INSERT ROW`) may refuse the statement. This check does not
+/// verified, and Databricks (`INSERT *`) or BigQuery (`INSERT ROW`) may
+/// refuse the MERGE. This check does not
 /// refuse: `--full-refresh` does not rebuild a `merge` model
 /// ([`rebuilds_on_full_refresh`]), so a refusal would have no remedy.
 ///
