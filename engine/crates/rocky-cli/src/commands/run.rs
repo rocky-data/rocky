@@ -14473,7 +14473,15 @@ async fn execute_models_phase(
                 };
             containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
         }
-        containment.seed_failed(compile_failed_models.iter().cloned());
+        // A compile-blocked model is excluded from the layer loop before
+        // `evaluate` runs, so it is never poisoned there. Seed it here, so a
+        // model that reads its target by name is withheld, as fail-fast does.
+        containment.seed_failed(
+            compile_failed_models
+                .iter()
+                .chain(compile_blocked_models.keys())
+                .cloned(),
+        );
     }
 
     // When containment is on, execution follows layers recomputed over the FULL
@@ -46626,6 +46634,146 @@ auto_create_schemas = true
             "no true edge was skipped as a cycle-closer: {:?}",
             output.scheduling_warnings
         );
+    }
+
+    /// `f` fails compile (E056: its bare read of `t` is ambiguous). `g` has
+    /// `depends_on = ["f"]`, so it is withheld as compile-blocked. `r` reads
+    /// `main.g` by its qualified name. `g` is not rebuilt, so `r` must be
+    /// withheld too, and not build on the stale `main.g` an earlier run left.
+    /// Containment and fail-fast must agree.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_physical_reader_of_a_compile_blocked_model_is_withheld_in_both_modes() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("blocked.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            {
+                let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+                s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
+                    .await
+                    .unwrap();
+                // What an earlier run of `g` left behind.
+                // Two rows: a rebuild of `g` would leave one.
+                s.execute_statement(
+                    "CREATE TABLE main.g AS SELECT * FROM (VALUES (98), (99)) AS v(id)",
+                )
+                .await
+                .unwrap();
+            }
+            let write = |name: &str, sql: &str, header: &str, schema: &str, table: &str| {
+                std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+                std::fs::write(
+                    models_dir.join(format!("{name}.toml")),
+                    format!(
+                        "{header}[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+                         schema = \"{schema}\"\ntable = \"{table}\"\n"
+                    ),
+                )
+                .unwrap();
+            };
+            write("w1", "SELECT 1 AS id\n", "", "main", "t");
+            write("w2", "SELECT 2 AS id\n", "", "other", "t");
+            write("f", "SELECT id FROM t\n", "", "main", "f");
+            write(
+                "g",
+                "SELECT 7 AS id\n",
+                "depends_on = [\"f\"]\n\n",
+                "main",
+                "g",
+            );
+            write("r", "SELECT id FROM main.g\n", "", "main", "r");
+
+            let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let gate_off = SkipGateConfig {
+                feature_enabled: false,
+                force_rebuild: false,
+                rowcount_fallback: false,
+                lag_tolerance_seconds: 0,
+                shadow_or_branch: false,
+                full_refresh: false,
+                tests_on_run: Default::default(),
+            };
+            let res = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-blocked-reader",
+                None,
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                gate_off,
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false,
+                true,
+                None,
+                None,
+                false,
+                false,
+            )
+            .await;
+            drop(adapter);
+            assert!(
+                res.is_ok(),
+                "contain_failures={contain_failures}: {:?}",
+                res.as_ref().err()
+            );
+
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|e| e.asset_key == vec!["f".to_string()] && e.error.contains("[E056]")),
+                "contain_failures={contain_failures}: {:?}",
+                output.errors
+            );
+            for withheld in ["g", "r"] {
+                assert!(
+                    !output
+                        .materializations
+                        .iter()
+                        .any(|m| m.asset_key.last().map(String::as_str) == Some(withheld)),
+                    "contain_failures={contain_failures}: `{withheld}` must not build: {:?}",
+                    output.materializations
+                );
+                assert!(
+                    output.contained.iter().any(|c| c.model == withheld),
+                    "contain_failures={contain_failures}: `{withheld}` is reported as \
+                     withheld: {:?}",
+                    output.contained
+                );
+            }
+            let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+            assert!(
+                !table_exists(&verify, "r").await,
+                "contain_failures={contain_failures}: `r` must not build on the stale `main.g`"
+            );
+            assert_eq!(
+                count_rows(&db, "g").await,
+                2,
+                "contain_failures={contain_failures}: the stale `main.g` is untouched"
+            );
+        }
     }
 
     /// End to end through `execute_models`: an invalid ephemeral use (here
