@@ -437,6 +437,10 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
         // on `UnsupportedOperation` or `Transport` errors; everything else
         // (auth, permission, table-not-found, invalid shape) surfaces as
         // `AdapterError` to avoid masking real REST-side problems.
+        //
+        // Nullability: the REST path keeps NOT NULL only for a managed
+        // Delta table (`schema_from_table_info`); every other kind, and the
+        // whole SQL path, reports nullable.
         if let Some(client) = &self.catalog_client {
             let catalog_ref = ir_to_catalog_ref(table);
             match client.describe_table(&catalog_ref).await {

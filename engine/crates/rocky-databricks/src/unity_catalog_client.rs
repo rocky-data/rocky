@@ -228,17 +228,26 @@ struct PermissionChange {
 /// `POST /api/2.1/unity-catalog/tables`.
 ///
 /// Unity's table-info response is large (storage location, properties,
-/// metadata, owner, etc.); only the unqualified `name` and the column
-/// list are projected here. List responses use the same shape per
-/// entry; `name` is the unqualified table name and is `None` on
-/// describe responses that omit it (`full_name` carries the qualified
-/// form in that case but is not modelled today).
+/// metadata, owner, etc.); only the unqualified `name`, the column list
+/// and the table kind (`table_type`, `data_source_format`) are projected
+/// here. List responses use the same shape per entry; `name` is the
+/// unqualified table name and is `None` on describe responses that omit
+/// it (`full_name` carries the qualified form in that case but is not
+/// modelled today).
+///
+/// The kind fields stay free-form strings. An unknown or missing kind
+/// makes the columns nullable (see [`enforces_not_null`]); it does not
+/// fail the describe.
 #[derive(Debug, Clone, Deserialize)]
 struct TableInfo {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     columns: Vec<TableColumn>,
+    #[serde(default)]
+    table_type: Option<String>,
+    #[serde(default)]
+    data_source_format: Option<String>,
 }
 
 /// One column inside [`TableInfo::columns`].
@@ -484,10 +493,15 @@ impl From<UnityRestError> for CatalogError {
 ///
 /// `type_text` is preferred (SQL spelling, `"string"`/`"bigint"`); falls
 /// back to `type_name` (`"STRING"`/`"LONG"`) when `type_text` is absent.
-/// Defaults to `nullable = true` when Unity omits the flag — Delta's
-/// declarative nullability comes through this field but historical
+///
+/// A column is `nullable = false` only when Unity reports it NOT NULL
+/// *and* the table is a managed Delta table ([`enforces_not_null`]).
+/// Unity reports the declared NOT NULL for foreign tables and non-Delta
+/// external tables too, but those do not enforce it, so their columns
+/// are nullable here. A missing flag also means nullable: historical
 /// table-info responses occasionally omit it.
 fn schema_from_table_info(info: &TableInfo) -> TableSchema {
+    let trust_not_null = enforces_not_null(info);
     let columns = info
         .columns
         .iter()
@@ -498,10 +512,20 @@ fn schema_from_table_info(info: &TableInfo) -> TableSchema {
                 .clone()
                 .or_else(|| c.type_name.clone())
                 .unwrap_or_default(),
-            nullable: c.nullable.unwrap_or(true),
+            nullable: !trust_not_null || c.nullable.unwrap_or(true),
         })
         .collect();
     TableSchema { columns }
+}
+
+/// Whether the warehouse enforces the NOT NULL that Unity reports.
+///
+/// Only a managed Delta table counts: `table_type = "MANAGED"` and
+/// `data_source_format = "DELTA"`, exact match. Every other kind,
+/// including a missing or unknown one, fails closed to "not enforced".
+fn enforces_not_null(info: &TableInfo) -> bool {
+    info.table_type.as_deref() == Some("MANAGED")
+        && info.data_source_format.as_deref() == Some("DELTA")
 }
 
 /// Render Rocky's [`ColumnSchema::type_str`] into the trio of
@@ -1280,6 +1304,8 @@ mod tests {
                 type_name: Some("LONG".into()),
                 nullable: Some(false),
             }],
+            table_type: Some("MANAGED".into()),
+            data_source_format: Some("DELTA".into()),
         };
         let schema = schema_from_table_info(&info);
         assert_eq!(schema.columns[0].type_str, "bigint");
@@ -1296,6 +1322,8 @@ mod tests {
                 type_name: Some("LONG".into()),
                 nullable: None,
             }],
+            table_type: Some("MANAGED".into()),
+            data_source_format: Some("DELTA".into()),
         };
         let schema = schema_from_table_info(&info);
         assert_eq!(schema.columns[0].type_str, "LONG");
@@ -1303,6 +1331,52 @@ mod tests {
             schema.columns[0].nullable,
             "missing nullable defaults to true"
         );
+    }
+
+    /// A NOT NULL column described with the given table kind.
+    fn not_null_info(table_type: Option<&str>, data_source_format: Option<&str>) -> TableInfo {
+        TableInfo {
+            name: Some("orders".into()),
+            columns: vec![TableColumn {
+                name: "id".into(),
+                type_text: Some("bigint".into()),
+                type_name: Some("LONG".into()),
+                nullable: Some(false),
+            }],
+            table_type: table_type.map(Into::into),
+            data_source_format: data_source_format.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn schema_from_table_info_keeps_not_null_only_for_managed_delta() {
+        let managed_delta = schema_from_table_info(&not_null_info(Some("MANAGED"), Some("DELTA")));
+        assert!(
+            !managed_delta.columns[0].nullable,
+            "a managed Delta table enforces NOT NULL"
+        );
+
+        // Unity reports the declared NOT NULL for these kinds, but the
+        // warehouse does not enforce it.
+        for (table_type, format) in [
+            (Some("FOREIGN"), Some("MYSQL_FORMAT")),
+            (Some("FOREIGN"), None),
+            (Some("EXTERNAL"), Some("PARQUET")),
+            (Some("EXTERNAL"), Some("CSV")),
+            (Some("EXTERNAL"), Some("DELTA")),
+            (Some("MANAGED"), Some("PARQUET")),
+            (Some("MANAGED"), Some("DELTASHARING")),
+            (Some("MANAGED"), None),
+            (None, Some("DELTA")),
+            (None, None),
+            (Some("managed"), Some("delta")),
+        ] {
+            let schema = schema_from_table_info(&not_null_info(table_type, format));
+            assert!(
+                schema.columns[0].nullable,
+                "table_type={table_type:?} format={format:?} must report nullable"
+            );
+        }
     }
 
     // ---- request body serialisation ----
