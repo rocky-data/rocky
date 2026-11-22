@@ -37,8 +37,10 @@ const FAIL_FAST: &str = "\n[resilience]\ncontain_failures = false\n";
 
 const CONTAIN: &str = "\n[resilience]\ncontain_failures = true\n";
 
-const BROKEN_STATUS_COUNTS: &str =
-    "select status, count(*) as n from main.raw_orders where sum(order_id) > 0 group by status";
+// The broken models must fail when DuckDB runs them, not at compile time:
+// `rocky compile` refuses an aggregate in `WHERE` (E065), so the failure is a
+// cast of `'shipped'` to an integer, which DuckDB only raises on a row.
+const BROKEN_STATUS_COUNTS: &str = "select status, count(*) as n from main.raw_orders where cast(status as integer) > 0 group by status";
 const FIXED_STATUS_COUNTS: &str =
     "select status, count(*) as n from main.raw_orders group by status";
 
@@ -222,25 +224,12 @@ fn contained_run_builds_independent_models() {
     assert_eq!(status_of(&v, "status_counts"), "failed");
 }
 
-#[test]
-fn default_config_contains_a_failure_and_exits_partial_failure() {
-    let dir = tempfile::tempdir().unwrap();
-    // Empty extra config: no `[resilience]` table, so the default applies.
-    project(dir.path(), "", BROKEN_STATUS_COUNTS);
-
-    let out = rocky(dir.path(), &["--output", "json", "run"]);
-    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
-    let v = json(&out);
-    assert_eq!(status_of(&v, "stg_orders"), "built");
-    assert_eq!(status_of(&v, "customer_orders"), "built");
-    assert_eq!(status_of(&v, "status_counts"), "failed");
-}
-
-/// `stg_orders` reads the bare raw table `orders`; the mart model
-/// `orders_enriched` writes `marts.orders` and depends on `stg_orders`.
-/// Containment resolves the bare `orders` read to `orders_enriched`'s target
-/// table, closing a cycle with the declared edge.
-fn bare_name_cycle_project(dir: &Path, extra_config: &str) {
+/// `stg_orders` reads `orders` by bare name (the raw table in `main`). The
+/// model `orders_enriched` writes `marts.orders` and depends on `stg_orders`.
+/// Containment resolves a bare read against every producer's table name, so
+/// the bare `orders` read is a candidate edge to `orders_enriched` that would
+/// close a cycle with the declared edge. `stg_read` is how `stg_orders` reads.
+fn bare_cycle_project(dir: &Path, extra_config: &str, stg_read: &str) {
     let conn = duckdb::Connection::open(dir.join("warehouse.duckdb")).expect("open duckdb");
     conn.execute_batch(
         "CREATE TABLE orders (order_id INTEGER NOT NULL);
@@ -249,7 +238,11 @@ fn bare_name_cycle_project(dir: &Path, extra_config: &str) {
     .expect("seed source");
     drop(conn);
     fs::write(dir.join("rocky.toml"), format!("{CONFIG}{extra_config}")).unwrap();
-    write_model(dir, "stg_orders", "select order_id from orders");
+    write_model(
+        dir,
+        "stg_orders",
+        &format!("select order_id from {stg_read}"),
+    );
     let models = dir.join("models");
     fs::write(
         models.join("orders_enriched.toml"),
@@ -265,34 +258,268 @@ fn bare_name_cycle_project(dir: &Path, extra_config: &str) {
     .unwrap();
 }
 
-#[test]
-fn bare_name_cycle_is_withheld_under_default_containment() {
-    let dir = tempfile::tempdir().unwrap();
-    bare_name_cycle_project(dir.path(), "");
+/// The scheduling warnings of a run that name the skipped bare edge.
+fn bare_cycle_warnings(v: &serde_json::Value) -> Vec<String> {
+    v["scheduling_warnings"]
+        .as_array()
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| w.as_str())
+                .filter(|w| w.contains("'stg_orders' -> 'orders_enriched'"))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
-    let out = rocky(dir.path(), &["--output", "json", "run"]);
-    let v = json(&out);
-    // Nothing builds, so this is a plain failure (exit 1), not a partial one.
-    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
-    let errors = v["errors"].as_array().expect("errors");
-    assert!(
+fn has_cycle_error(v: &serde_json::Value) -> bool {
+    v["errors"].as_array().is_some_and(|errors| {
         errors
             .iter()
-            .any(|e| e["asset_key"] == serde_json::json!(["<cycle>"])),
+            .any(|e| e["asset_key"] == serde_json::json!(["<cycle>"]))
+    })
+}
+
+/// With `contain_failures = true` set explicitly, a bare read that would
+/// close a cycle is dropped from the ordering with one warning, like the
+/// fail-fast run does, instead of withholding both models.
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_under_explicit_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
+    assert_eq!(built(&v), ["orders", "stg_orders"], "{}", describe(&out));
+    assert_eq!(
+        bare_cycle_warnings(&v).len(),
+        1,
+        "exactly one warning for the skipped pair: {}",
+        describe(&out)
+    );
+}
+
+/// A text-mode run shows the dropped edge too: it is logged as a warning at
+/// the default log level, not only listed in the JSON output.
+#[test]
+fn bare_name_cycle_warning_is_shown_in_text_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+
+    // A branch run of one model: only the containment ledger sees the edge,
+    // so this line is the only place the warning can come from.
+    let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("--config")
+        .arg(dir.path().join("rocky.toml"))
+        .args([
+            "--output",
+            "table",
+            "run",
+            "--branch",
+            "fix",
+            "--model",
+            "stg_orders",
+        ])
+        .current_dir(dir.path())
+        .env_remove("RUST_LOG")
+        .env_remove("ROCKY_PRINCIPAL")
+        .output()
+        .expect("spawn rocky");
+    assert!(out.status.success(), "{}", describe(&out));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        all.contains("'stg_orders' -> 'orders_enriched'"),
         "{}",
         describe(&out)
     );
+}
+
+/// The same project on a branch run. The shadow rewrite matches a bare name
+/// against each routed model's table, so it rewrites `stg_orders`' bare
+/// `orders` read to `orders_enriched`'s branch table and records that read as
+/// a dependency. The read is then no longer a bare guess but a real read of a
+/// table this run builds, so the cycle is real and stays withheld (fail
+/// closed). No bare-edge warning is reported. This pins today's behaviour of
+/// the rewrite, which this change does not touch.
+#[test]
+fn bare_name_cycle_on_a_branch_run_is_withheld_after_the_shadow_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+
+    let out = rocky(dir.path(), &["--output", "json", "run", "--branch", "fix"]);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let v = json(&out);
+    assert!(has_cycle_error(&v), "{}", describe(&out));
     assert!(built(&v).is_empty(), "{}", describe(&out));
+    assert!(bare_cycle_warnings(&v).is_empty(), "{}", describe(&out));
+}
+
+/// A branch run of `stg_orders` alone: `orders_enriched` is not routed, so
+/// the shadow rewrite leaves the bare `orders` read as written and the
+/// fail-fast derivation does not run on a branch. The containment ledger
+/// alone drops the bare edge, warns once, and `stg_orders` builds.
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_on_a_branch_run_of_one_model() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "orders");
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+
+    let out = rocky(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            "--branch",
+            "fix",
+            "--model",
+            "stg_orders",
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
+    assert_eq!(built(&v), ["stg_orders"], "{}", describe(&out));
+    assert_eq!(
+        bare_cycle_warnings(&v).len(),
+        1,
+        "exactly one warning for the skipped pair: {}",
+        describe(&out)
+    );
+}
+
+/// `[run] strict_scheduling` refuses an ordering it cannot guarantee, also
+/// on a branch run where only the containment ledger saw the dropped edge.
+#[test]
+fn strict_scheduling_refuses_a_dropped_bare_edge_on_a_branch_run() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(
+        dir.path(),
+        &format!("{CONTAIN}\n[run]\nstrict_scheduling = true\n"),
+        "orders",
+    );
+    let created = rocky(dir.path(), &["branch", "create", "fix"]);
+    assert!(created.status.success(), "{}", describe(&created));
+    let before = warehouse_objects(dir.path());
+
+    let out = rocky(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            "--branch",
+            "fix",
+            "--model",
+            "stg_orders",
+        ],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("strict scheduling is on")
+            && err.contains("'stg_orders' -> 'orders_enriched'"),
+        "{}",
+        describe(&out)
+    );
+    // The refusal comes before `auto_create_schemas` and function DDL: the
+    // branch schema is never created, and no table or function appears.
+    assert_eq!(
+        warehouse_objects(dir.path()),
+        before,
+        "a refused run must write nothing: {}",
+        describe(&out)
+    );
+}
+
+/// Every schema, table and function in the warehouse, sorted.
+fn warehouse_objects(dir: &Path) -> Vec<String> {
+    let conn = duckdb::Connection::open(dir.join("warehouse.duckdb")).expect("open duckdb");
+    let mut stmt = conn
+        .prepare(
+            "SELECT 'schema ' || schema_name FROM information_schema.schemata \
+             UNION ALL SELECT 'table ' || table_schema || '.' || table_name \
+             FROM information_schema.tables \
+             UNION ALL SELECT 'function ' || schema_name || '.' || function_name \
+             FROM duckdb_functions() WHERE NOT internal \
+             ORDER BY 1",
+        )
+        .expect("prepare");
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect()
+}
+
+/// A cycle through a qualified read is still contained: `stg_orders` reads
+/// `marts.orders`, `orders_enriched`'s own target, by its qualified name.
+#[test]
+fn qualified_name_cycle_is_still_withheld_under_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), CONTAIN, "marts.orders");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    let v = json(&out);
+    assert!(has_cycle_error(&v), "{}", describe(&out));
+    assert!(built(&v).is_empty(), "{}", describe(&out));
+}
+
+#[test]
+fn default_config_contains_a_failure_and_exits_partial_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    // Empty extra config: no `[resilience]` table, so the default applies.
+    project(dir.path(), "", BROKEN_STATUS_COUNTS);
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(status_of(&v, "stg_orders"), "built");
+    assert_eq!(status_of(&v, "customer_orders"), "built");
+    assert_eq!(status_of(&v, "status_counts"), "failed");
+}
+
+/// With no `[resilience]` table, containment is on by default, and a bare
+/// read that would close a cycle keeps the fail-fast policy: it is dropped
+/// from the ordering with one warning, and both models build.
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_under_default_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), "", "orders");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
+    assert_eq!(built(&v), ["orders", "stg_orders"], "{}", describe(&out));
+    assert_eq!(
+        bare_cycle_warnings(&v).len(),
+        1,
+        "exactly one warning for the skipped pair: {}",
+        describe(&out)
+    );
 }
 
 #[test]
 fn bare_name_cycle_is_skipped_with_a_warning_under_fail_fast() {
     let dir = tempfile::tempdir().unwrap();
-    bare_name_cycle_project(dir.path(), FAIL_FAST);
+    bare_cycle_project(dir.path(), FAIL_FAST, "orders");
 
     let out = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(out.status.success(), "{}", describe(&out));
     let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
     assert_eq!(built(&v), ["orders", "stg_orders"], "{}", describe(&out));
 }
 
@@ -451,7 +678,7 @@ fn contained_dependent_of_the_failing_model_is_skipped_upstream_failed() {
     write_model(
         dir.path(),
         "stg_orders",
-        "select order_id, customer_id, status from main.raw_orders where sum(order_id) > 0",
+        "select order_id, customer_id, status from main.raw_orders where cast(status as integer) > 0",
     );
     let out = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!out.status.success(), "{}", describe(&out));
@@ -482,7 +709,7 @@ fn production_retry_ignores_a_newer_failed_shadow_run() {
     write_model(
         dir.path(),
         "stg_orders",
-        "select order_id, customer_id, status from main.raw_orders where sum(order_id) > 0",
+        "select order_id, customer_id, status from main.raw_orders where cast(status as integer) > 0",
     );
     let shadow = rocky(dir.path(), &["--output", "json", "run", "--shadow"]);
     assert!(!shadow.status.success(), "{}", describe(&shadow));

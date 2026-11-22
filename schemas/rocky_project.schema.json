@@ -4222,6 +4222,15 @@
           "default": false,
           "description": "Turn physical-read scheduling warnings into a run refusal.\n\n`false` (default) keeps today's behaviour: #1352 derives ordering edges from physical `schema.table` reads and reports what it could NOT safely resolve — contradicting bare-read pairs, models whose reference extraction failed, colliding targets — as advisory warnings, and the run still exits 0. A consumer that ignores them can read a stale physical target and report success.\n\n`true` refuses instead, for estates that want fail-closed ordering. Opt in rather than default, because making warnings fatal changes run semantics for every existing project (#1355).\n\nLives on `[run]` rather than `[execution]` deliberately: `[execution]` is per-pipeline, and `rocky run --dag` derives ordering ACROSS pipelines, so a per-pipeline switch would have no single answer on the path that most needs one.",
           "type": "boolean"
+        },
+        "tests_on_run": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TestsOnRun"
+            }
+          ],
+          "default": "enforce",
+          "description": "Run each model's sidecar `[[tests]]` against the table the run just built (#2611).\n\n- `\"off\"`: no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `\"report\"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `\"enforce\"` (default): as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.\n\nA `severity = \"warning\"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation."
         }
       },
       "type": "object"
@@ -5090,6 +5099,32 @@
         }
       ]
     },
+    "TestsOnRun": {
+      "description": "`[run] tests_on_run` — whether a run evaluates the `[[tests]]` of the models it builds, and whether a failing one fails the model.",
+      "oneOf": [
+        {
+          "description": "No test runs during `rocky run`.",
+          "enum": [
+            "off"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Run the tests and record the results; never fail a model.",
+          "enum": [
+            "report"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Run the tests; an error-severity failure fails the model. The default.",
+          "enum": [
+            "enforce"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "TransformationPipelineConfig": {
       "description": "Transformation pipeline configuration.\n\nOrchestrates `.sql` / `.rocky` model compilation and execution as a first-class pipeline, with its own execution, checks, and governance settings. Model-level strategy (incremental, merge, time_interval, etc.) is defined in each model's sidecar TOML, not at the pipeline level.\n\n```toml [pipeline.silver] type = \"transformation\" models = \"models/**\"\n\n[pipeline.silver.target] adapter = \"databricks_prod\" [pipeline.silver.target.governance] auto_create_schemas = true\n\n[pipeline.silver.execution] concurrency = 8 ```",
       "properties": {
@@ -5626,7 +5661,8 @@
         "lag_tolerance_seconds": 0,
         "skip_rowcount_fallback": false,
         "skip_unchanged": false,
-        "strict_scheduling": false
+        "strict_scheduling": false,
+        "tests_on_run": "enforce"
       },
       "description": "Opt-in run-execution tuning for the `--skip-unchanged` model-skip gate. Default-OFF: an absent `[run]` block (or one that leaves every field at its default) keeps `rocky run`'s behavior byte-identical to before the gate existed. See [`RunConfig`]."
     },

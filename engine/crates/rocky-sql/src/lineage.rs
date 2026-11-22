@@ -1923,7 +1923,12 @@ fn extract_expr_lineage(
                 }
             }
             let mut sources = dedup_sources(sources);
+            // DuckDB's `max(x, n)` / `min(x, n)` is a top-n aggregate that
+            // returns a list: not an aggregate of `x`'s type.
+            let top_n = matches!(func_name.as_str(), "MIN" | "MAX")
+                && !matches!(&func.args, FunctionArguments::List(list) if list.args.len() == 1);
             match sources.as_mut_slice() {
+                [only] if top_n => only.transform = TransformKind::Expression,
                 [only] => only.transform = compose_function_transform(&func_name, &only.transform),
                 many => {
                     for lineage in many {
@@ -2358,7 +2363,7 @@ fn extract_row_selection(
                 Some(JoinConstraint::On(expr)) => {
                     push(column_refs(expr), RowSelectionKind::JoinKey, None);
                 }
-                Some(JoinConstraint::Using(names)) => {
+                Some(JoinConstraint::Using(names) | JoinConstraint::UsingAlias(names, _)) => {
                     // `USING (k)` reads `k` from the right relation and from
                     // the left side. The left side is unambiguous only when a
                     // single relation precedes this join.
@@ -4059,6 +4064,28 @@ mod tests {
             .filter(|c| c.target_column == "amount" || c.target_column == "m")
             .map(|c| c.transform)
             .collect()
+    }
+
+    /// DuckDB's top-n `max(x, n)` / `min(x, n)` returns a list: an
+    /// expression over `x`, not an aggregate of its type.
+    #[test]
+    fn a_top_n_min_max_is_an_expression() {
+        assert_eq!(
+            amount_kinds("SELECT max(x, 2) AS m FROM t"),
+            vec![TransformKind::Expression]
+        );
+        assert_eq!(
+            amount_kinds("SELECT min(x, 3) AS m FROM t"),
+            vec![TransformKind::Expression]
+        );
+        assert_eq!(
+            amount_kinds("SELECT max(x) AS m FROM t"),
+            vec![TransformKind::Aggregation("MAX".into())]
+        );
+        assert_eq!(
+            amount_kinds("SELECT sum(x) AS m FROM t"),
+            vec![TransformKind::Aggregation("SUM".into())]
+        );
     }
 
     #[test]

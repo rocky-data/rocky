@@ -157,6 +157,24 @@ table = "{name}"
 // Benchmarks
 // ---------------------------------------------------------------------------
 
+/// A benchmark of a failing compile is a false number (#2677): `compile`
+/// returns `Ok` with error diagnostics, so fail loudly before timing.
+fn assert_compiles_clean(config: &CompilerConfig) {
+    let result = compile(config).expect("benchmark project must compile");
+    let errors: Vec<String> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error())
+        .take(3)
+        .map(|d| format!("{}: [{}] {}", d.model, d.code, d.message))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "the benchmark project has compile errors, so its timings would be false: {}",
+        errors.join("; ")
+    );
+}
+
 fn bench_cold_compile(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_compile");
 
@@ -181,6 +199,8 @@ fn bench_cold_compile(c: &mut Criterion) {
             source_schemas: HashMap::new(),
             ..Default::default()
         };
+
+        assert_compiles_clean(&config);
 
         group.bench_with_input(BenchmarkId::new("models", size), &config, |b, config| {
             b.iter(|| {
@@ -235,6 +255,7 @@ fn bench_phase_breakdown(c: &mut Criterion) {
         // Print the phase breakdown once. This is the load-bearing output:
         // it pins the share of compile time that a file-hash cache could
         // skip (project_load) versus the share it cannot (the rest).
+        assert_compiles_clean(&config);
         let result = compile(&config).expect("phase-breakdown compile must succeed");
         let t = &result.timings;
         let cacheable = t.project_load_ms;

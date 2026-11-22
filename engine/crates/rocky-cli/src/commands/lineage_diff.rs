@@ -43,6 +43,7 @@ pub fn run_lineage_diff(
         models_dir,
         cache_ttl_override,
         mode,
+        true,
     )?;
 
     let output = lineage_diff_output(base_ref, data);
@@ -800,6 +801,7 @@ mod tests {
             &models,
             None,
             CiDiffMode::Head,
+            true,
             Some(dir),
         )
         .expect("compute_ci_diff must succeed");

@@ -89,10 +89,36 @@ def _test_scorecard_render() -> str:
     return "scorecard JSON + Markdown render and summary math OK"
 
 
+def _test_live_run_with_a_failed_model_exits_nonzero() -> str:
+    import json
+    import tempfile
+    from unittest import mock
+
+    from harness import contract_quality as cq
+
+    def card(error: str | None) -> dict:
+        return {"models": [{"model": "orders", "error": error}]}
+
+    def status(mode: str, error: str | None) -> int:
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(
+            cq, "run_contract_quality", return_value=card(error)
+        ), mock.patch.object(cq, "render_markdown", return_value=json.dumps(card(error))):
+            return cq._run_set(Path("rocky"), mode, Path(out), "contract_quality", "scripted")
+
+    _check(status("live", "upstream HTTP 500") == 1, "live run with a failed model must exit 1")
+    _check(status("rehash", "upstream HTTP 500") == 1, "rehash with a failed model must exit 1")
+    _check(status("live", None) == 0, "a clean live run must exit 0")
+    return "live run with a failed model exits non-zero"
+
+
 _TESTS = (
     ("parse recorded transcript", _test_parse_recorded),
     ("empty transcript", _test_empty_transcript),
     ("scorecard render + math", _test_scorecard_render),
+    (
+        "live run with a failed model",
+        _test_live_run_with_a_failed_model_exits_nonzero,
+    ),
 )
 
 

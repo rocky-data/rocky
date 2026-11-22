@@ -1558,7 +1558,7 @@ fn deferred_externalized_edges_for(
 /// failed compilation. Values are the descendant's direct poisoned inputs.
 ///
 /// The fixed point is deliberately limited to declared model edges. Physical
-/// reads and unknown read sets retain their existing opt-in containment policy.
+/// reads and unknown read sets keep the `[resilience]` containment policy.
 /// A selected model whose inputs were successfully externalized by `--defer`
 /// has no local declared input edge for this execution.
 /// The refusals [`run_with_explicit_contracts`] can make from the config and
@@ -1698,14 +1698,23 @@ pub struct SkipRunOptions {
     /// one. The overlay travels to every `--dag` sub-run, which a forced run
     /// id would not.
     pub no_source_sync: bool,
+    /// `rocky run --tests <off|report|enforce>`. Wins over
+    /// `[run] tests_on_run` for this invocation; `None` keeps the config
+    /// value.
+    pub tests_on_run: Option<rocky_core::config::TestsOnRun>,
 }
 
 impl SkipRunOptions {
     /// The overlay for a run started by `rocky apply`: defaults, with the
     /// source-sync phase off.
-    pub fn for_apply() -> Self {
+    ///
+    /// `tests_on_run` overrides `[run] tests_on_run` for the applied run, as
+    /// `rocky run --tests` does; `None` keeps the config value. The apply
+    /// resolves it from `commands::apply::ApplyTests`.
+    pub fn for_apply(tests_on_run: Option<rocky_core::config::TestsOnRun>) -> Self {
         Self {
             no_source_sync: true,
+            tests_on_run,
             ..Self::default()
         }
     }
@@ -1742,6 +1751,12 @@ pub(crate) struct SkipGateConfig {
     /// threaded to `execute_models`; like `--force-rebuild` it turns the skip
     /// gate off.
     pub full_refresh: bool,
+    /// `--tests` over `[run] tests_on_run`: whether the run evaluates a built
+    /// model's `[[tests]]`, and whether a failing one fails the model. Rides
+    /// on this struct, as `full_refresh` does, because it is the run-scoped
+    /// decision already threaded to `execute_models`. It does not change what
+    /// the skip gate decides.
+    pub tests_on_run: rocky_core::config::TestsOnRun,
 }
 
 impl SkipGateConfig {
@@ -1759,6 +1774,7 @@ impl SkipGateConfig {
             lag_tolerance_seconds: run_config.lag_tolerance_seconds,
             shadow_or_branch,
             full_refresh: skip_opts.full_refresh,
+            tests_on_run: skip_opts.tests_on_run.unwrap_or(run_config.tests_on_run),
         }
     }
 
@@ -1782,6 +1798,7 @@ impl SkipGateConfig {
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: rocky_core::config::TestsOnRun::Off,
         }
     }
 }
@@ -13155,7 +13172,7 @@ pub(crate) async fn reconcile_model_governance(
 ///
 /// Nothing else crosses over: the executing compile keeps its own SQL,
 /// graph and every other diagnostic.
-fn adopt_contract_type_errors(
+pub(crate) fn adopt_contract_type_errors(
     executing: &mut rocky_compiler::compile::CompileResult,
     typed: rocky_compiler::compile::CompileResult,
 ) {
@@ -13204,7 +13221,7 @@ fn adopt_contract_type_errors(
 /// column as NOT NULL and raises no `E012` for it. A column the described
 /// compile does not type, or types as nullable, keeps its `E012`. This only
 /// ever removes errors, so a describe cannot refuse a run that passed before.
-fn drop_nullability_errors_the_describe_resolves(
+pub(crate) fn drop_nullability_errors_the_describe_resolves(
     executing: &mut rocky_compiler::compile::CompileResult,
     typed: &rocky_compiler::compile::CompileResult,
 ) {
@@ -13288,7 +13305,7 @@ fn adopt_unchecked_contract_type_errors(
 ///
 /// The entries carry no provenance, so the missing-source-column check
 /// (`E041` / `W041`) stays off for them.
-async fn describe_sources_for_unchecked_contract_types(
+pub(crate) async fn describe_sources_for_unchecked_contract_types(
     compile_result: &rocky_compiler::compile::CompileResult,
     known: &std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     external_dependencies: &BTreeSet<String>,
@@ -14371,6 +14388,145 @@ async fn execute_models_phase(
         }
     }
 
+    // Failure-containment ledger (`[resilience] contain_failures`, on by default).
+    // Tracks the downstream closure of every failed / withheld model so a
+    // disjoint subgraph can continue while a failure's blast radius is withheld.
+    // The closure does NOT trust the declared graph (`dag_nodes`) as complete:
+    // it also folds physical-target reads (a raw-SQL model reading a producer's
+    // table by physical name, not by `ref()`) into the closure, and fails closed
+    // on any model whose reads can't be proven disjoint from the failure set —
+    // see `commands::containment`. Seeded with the compile-failed models
+    // excluded above (a compile error is a failure; its downstream is withheld).
+    //
+    // Built only when `contain_failures` is on (extracting each model's reads
+    // has a cost); when off the ledger stays empty and unconsulted, and the run
+    // keeps its historical fail-fast-at-first-failure behaviour byte-for-byte.
+    let mut containment = super::containment::ContainmentLedger::new();
+    if resilience.contain_failures {
+        let producers = super::containment::ProducerIndex::build(
+            compile_result.project.models.iter().map(|m| {
+                (
+                    m.config.name.as_str(),
+                    m.config.target.catalog.as_str(),
+                    m.config.target.schema.as_str(),
+                    m.config.target.table.as_str(),
+                )
+            }),
+        );
+        let dep_by_model: std::collections::HashMap<&str, &[String]> = compile_result
+            .project
+            .dag_nodes
+            .iter()
+            .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+            .collect();
+        for model in &compile_result.project.models {
+            let name = model.config.name.as_str();
+            let declared_ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
+            let externalized = externalized_defer_edges.get(name);
+            let filtered_ref_deps: Vec<String>;
+            let ref_deps = if let Some(externalized) = externalized {
+                filtered_ref_deps = declared_ref_deps
+                    .iter()
+                    .filter(|dependency| !externalized.contains(*dependency))
+                    .cloned()
+                    .collect();
+                filtered_ref_deps.as_slice()
+            } else {
+                declared_ref_deps
+            };
+            // Enumerate physical reads only when the read set is provably
+            // complete; otherwise the model fails closed (`reads_complete =
+            // false`), so it is withheld once a failure has occurred.
+            let (reads, reads_complete): (Vec<String>, bool) =
+                if rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
+                    match rocky_sql::lineage::extract_lineage(&model.sql) {
+                        Ok(l) => (
+                            l.source_tables
+                                .iter()
+                                .map(|t| t.name.to_lowercase())
+                                .filter(|read| {
+                                    !externalized.is_some_and(|externalized| {
+                                        matches!(
+                                            producers.resolve(read),
+                                            super::containment::ReadResolution::Edges(ref models)
+                                                if models.iter().all(|model| externalized.contains(model))
+                                        )
+                                    })
+                                })
+                                .collect(),
+                            true,
+                        ),
+                        // Provably-complete said yes but extraction failed — fail
+                        // closed rather than trust an empty read set.
+                        Err(_) => (Vec::new(), false),
+                    }
+                } else {
+                    (Vec::new(), false)
+                };
+            containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
+        }
+        containment.seed_failed(compile_failed_models.iter().cloned());
+    }
+
+    // When containment is on, execution follows layers recomputed over the FULL
+    // containment edge set (ref ∪ physical ∪ bare), so a physical/bare reader is
+    // scheduled strictly after its producer — closing the same-layer `--parallel`
+    // race where a reader and its (about-to-fail) producer co-scheduled and the
+    // reader built on stale output. When off, the original ref-only layers are
+    // used, byte-for-byte. Declared and qualified edges are placed first; a
+    // bare-name read edge is then added only if it does not close a cycle.
+    // A bare edge that would close one is dropped from the ordering (the same
+    // policy as the fail-fast physical-read derivation) and reported as a
+    // scheduling warning; the closure still withholds its reader when the
+    // producer is already failed. Any model that still cannot be ordered — in,
+    // or downstream of, a cycle of the placed edges — is contained up front
+    // (fail closed) and recorded as a single run error so the run reports
+    // non-success.
+    let augmented_plan = resilience
+        .contain_failures
+        .then(|| containment.augmented_layers());
+    if let Some(plan) = &augmented_plan {
+        // Render with the derivation's own warning text. On a non-shadow run
+        // `augment_physical_read_edges` may already have reported the same
+        // pair (a mutual pair in either order), so it is not reported twice.
+        let render = |skipped: &[(String, String)], mutual: &[(String, String)]| {
+            rocky_core::physical_edges::derivation_warnings(
+                &rocky_core::physical_edges::DerivedPhysicalEdges {
+                    skipped_cycle_edges: skipped.to_vec(),
+                    ambiguous_bare_pairs: mutual.to_vec(),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut new_warnings: Vec<String> = Vec::new();
+        for edge in &plan.skipped_bare_edges {
+            new_warnings.extend(render(std::slice::from_ref(edge), &[]));
+        }
+        for (a, b) in &plan.mutual_bare_pairs {
+            let reported_reversed = render(&[], &[(b.clone(), a.clone())]);
+            if reported_reversed
+                .iter()
+                .any(|w| output.scheduling_warnings.contains(w))
+            {
+                continue;
+            }
+            new_warnings.extend(render(&[], &[(a.clone(), b.clone())]));
+        }
+        new_warnings.retain(|w| !output.scheduling_warnings.contains(w));
+        // Logged as well, so a text-mode run shows the dropped edge.
+        for warning in &new_warnings {
+            warn!("{warning}");
+        }
+        output
+            .scheduling_warnings
+            .extend(new_warnings.iter().cloned());
+        // `[run] strict_scheduling` refuses an unresolved ordering on every
+        // path, including a shadow or branch run that skipped the derivation.
+        // This runs before any hook, source count, schema or function DDL, so
+        // a refused run writes nothing.
+        refuse_on_scheduling_warnings(strict_scheduling, &new_warnings)?;
+    }
+
     // #1093: capture governance from the same in-memory model set the
     // fingerprint gate verified, after execution-only defer SQL and physical
     // shadow-target rewrites. No files are re-read, and governance follows the
@@ -14686,97 +14842,6 @@ async fn execute_models_phase(
     let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project)
         .with_function_callers(function_callers.clone());
 
-    // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
-    // Tracks the downstream closure of every failed / withheld model so a
-    // disjoint subgraph can continue while a failure's blast radius is withheld.
-    // The closure does NOT trust the declared graph (`dag_nodes`) as complete:
-    // it also folds physical-target reads (a raw-SQL model reading a producer's
-    // table by physical name, not by `ref()`) into the closure, and fails closed
-    // on any model whose reads can't be proven disjoint from the failure set —
-    // see `commands::containment`. Seeded with the compile-failed models
-    // excluded above (a compile error is a failure; its downstream is withheld).
-    //
-    // Built only when `contain_failures` is on (extracting each model's reads
-    // has a cost); when off the ledger stays empty and unconsulted, and the run
-    // keeps its historical fail-fast-at-first-failure behaviour byte-for-byte.
-    let mut containment = super::containment::ContainmentLedger::new();
-    if resilience.contain_failures {
-        let producers = super::containment::ProducerIndex::build(
-            compile_result.project.models.iter().map(|m| {
-                (
-                    m.config.name.as_str(),
-                    m.config.target.catalog.as_str(),
-                    m.config.target.schema.as_str(),
-                    m.config.target.table.as_str(),
-                )
-            }),
-        );
-        let dep_by_model: std::collections::HashMap<&str, &[String]> = compile_result
-            .project
-            .dag_nodes
-            .iter()
-            .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
-            .collect();
-        for model in &compile_result.project.models {
-            let name = model.config.name.as_str();
-            let declared_ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
-            let externalized = externalized_defer_edges.get(name);
-            let filtered_ref_deps: Vec<String>;
-            let ref_deps = if let Some(externalized) = externalized {
-                filtered_ref_deps = declared_ref_deps
-                    .iter()
-                    .filter(|dependency| !externalized.contains(*dependency))
-                    .cloned()
-                    .collect();
-                filtered_ref_deps.as_slice()
-            } else {
-                declared_ref_deps
-            };
-            // Enumerate physical reads only when the read set is provably
-            // complete; otherwise the model fails closed (`reads_complete =
-            // false`), so it is withheld once a failure has occurred.
-            let (reads, reads_complete): (Vec<String>, bool) =
-                if rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
-                    match rocky_sql::lineage::extract_lineage(&model.sql) {
-                        Ok(l) => (
-                            l.source_tables
-                                .iter()
-                                .map(|t| t.name.to_lowercase())
-                                .filter(|read| {
-                                    !externalized.is_some_and(|externalized| {
-                                        matches!(
-                                            producers.resolve(read),
-                                            super::containment::ReadResolution::Edges(ref models)
-                                                if models.iter().all(|model| externalized.contains(model))
-                                        )
-                                    })
-                                })
-                                .collect(),
-                            true,
-                        ),
-                        // Provably-complete said yes but extraction failed — fail
-                        // closed rather than trust an empty read set.
-                        Err(_) => (Vec::new(), false),
-                    }
-                } else {
-                    (Vec::new(), false)
-                };
-            containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
-        }
-        containment.seed_failed(compile_failed_models.iter().cloned());
-    }
-
-    // When containment is on, execution follows layers recomputed over the FULL
-    // containment edge set (ref ∪ physical ∪ bare), so a physical/bare reader is
-    // scheduled strictly after its producer — closing the same-layer `--parallel`
-    // race where a reader and its (about-to-fail) producer co-scheduled and the
-    // reader built on stale output. When off, the original ref-only layers are
-    // used, byte-for-byte. Any model stuck in an augmented-graph cycle is
-    // contained up front (fail closed) and recorded as a single run error so the
-    // run reports non-success.
-    let augmented_plan = resilience
-        .contain_failures
-        .then(|| containment.augmented_layers());
     if let Some(plan) = &augmented_plan
         && !plan.cyclic.is_empty()
     {
@@ -14785,8 +14850,9 @@ async fn execute_models_phase(
             output.contained.push(crate::output::ContainedModelOutput {
                 model: model.clone(),
                 blocked_by: Vec::new(),
-                unblock_hint: "a physical/bare-name read forms a dependency cycle; \
-                                   declare dependencies via ref() and break the cycle"
+                unblock_hint: "this model is in, or downstream of, a dependency cycle \
+                                   that cannot be ordered; break the cycle in depends_on \
+                                   or in the reads"
                     .to_string(),
             });
         }
@@ -14794,8 +14860,8 @@ async fn execute_models_phase(
         output.errors.push(crate::output::TableErrorOutput {
             asset_key: vec!["<cycle>".to_string()],
             error: format!(
-                "dependency cycle in the containment graph (physical/bare-name reads) — \
-                 withheld {} model(s): {}. Declare dependencies via ref() and remove the cycle.",
+                "dependency cycle in the containment graph — withheld {} model(s) in or \
+                 downstream of the cycle: {}. Break the cycle in depends_on or in the reads.",
                 plan.cyclic.len(),
                 plan.cyclic.join(", "),
             ),
@@ -14931,7 +14997,7 @@ async fn execute_models_phase(
             .map(|(idx, (name, model))| (idx, name, model))
             .collect();
 
-        // ---- failure containment (opt-in) ------------------------------
+        // ---- failure containment (on by default) -----------------------
         // Before the skip gate and any build, withhold every model in this
         // layer that `evaluate` deems unsafe: a proven poisoned upstream (ref OR
         // physical-target read), or — fail closed — a model whose reads can't be
@@ -15209,9 +15275,28 @@ async fn execute_models_phase(
                             output,
                         )
                         .await;
+                        // `[run] tests_on_run`: the model's `[[tests]]` run
+                        // against the table just written, before any
+                        // downstream layer starts. Under `enforce` an
+                        // error-severity failure is this model's failure, like
+                        // a volume breach. A model the volume check already
+                        // failed is not tested.
+                        let volume_failure = match volume_failure {
+                            Some(e) => Some(e),
+                            None => {
+                                super::run_tests::evaluate_model_tests(
+                                    skip_gate.tests_on_run,
+                                    warehouse,
+                                    matched[idx].2,
+                                    output,
+                                )
+                                .await
+                            }
+                        };
                         output.materializations.push(materialization);
                         // The success hook fires only when the volume check
-                        // passed: a breach fires `model_error` alone below.
+                        // and the tests passed: a breach fires `model_error`
+                        // alone below.
                         if volume_failure.is_none()
                             && let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name)
                         {
@@ -15952,11 +16037,28 @@ async fn execute_models_phase(
                     output.fail_fast_model = Some(model_name.to_string());
                     return Err(e);
                 }
-                // An `error` breach fails the model after its writes, as on
-                // the plain path: `model_error` fires, the success hook does
-                // not, and downstream is withheld (contained) or the run
-                // stops. The rows stay in the table. Only the breaching
-                // partitions were marked `Failed` above.
+                // `[run] tests_on_run`: the tests run once, over the table the
+                // partitions wrote, unless the run was cancelled or a breach
+                // already failed the model.
+                let volume_failure = match volume_failure {
+                    Some(e) => Some(e),
+                    None if cancel.is_cancelled() => None,
+                    None => {
+                        super::run_tests::evaluate_model_tests(
+                            skip_gate.tests_on_run,
+                            warehouse,
+                            model,
+                            output,
+                        )
+                        .await
+                    }
+                };
+                // An `error` breach or an enforced test failure fails the
+                // model after its writes, as on the plain path:
+                // `model_error` fires, the success hook does not, and
+                // downstream is withheld (contained) or the run stops. The
+                // rows stay in the table. Only the breaching partitions were
+                // marked `Failed` above.
                 if let Some(e) = volume_failure {
                     if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                         let _ = reg
@@ -16073,9 +16175,23 @@ async fn execute_models_phase(
                         output,
                     )
                     .await;
+                    // `[run] tests_on_run`, as on the concurrent path above.
+                    let volume_failure = match volume_failure {
+                        Some(e) => Some(e),
+                        None => {
+                            super::run_tests::evaluate_model_tests(
+                                skip_gate.tests_on_run,
+                                warehouse,
+                                model,
+                                output,
+                            )
+                            .await
+                        }
+                    };
                     output.materializations.push(materialization);
-                    // The success hook fires only when the volume check
-                    // passed: a breach fires `model_error` alone below.
+                    // The success hook fires only when the volume check and
+                    // the tests passed: a breach fires `model_error` alone
+                    // below.
                     if volume_failure.is_none()
                         && let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name)
                     {
@@ -17454,6 +17570,8 @@ async fn execute_one_plain_model(
     // This build created the target (first-run bootstrap): every row in it
     // is this build's, which the volume check reads.
     let mut bootstrapped = false;
+    // The existence probe's describe of a target that is already there.
+    let mut existing_target_columns = None;
     if strategy_mutates_existing_target {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
@@ -17470,7 +17588,10 @@ async fn execute_one_plain_model(
         // never classified transient, so first-run bootstrap stays intact on
         // every adapter.
         let target_absent = match warehouse.describe_table(&target_table_struct).await {
-            Ok(_) => false,
+            Ok(columns) => {
+                existing_target_columns = Some(columns);
+                false
+            }
             Err(e) if warehouse.classify_failure(&e).is_retryable() => {
                 return Err(anyhow::Error::from(e).context(format!(
                     "target existence probe for model '{model_name}' failed with a \
@@ -17542,6 +17663,24 @@ async fn execute_one_plain_model(
             }
             skip_strategy_exec = bootstrap_is_the_load;
             bootstrapped = true;
+        }
+    }
+    // A `merge` keeps a column its SQL stopped selecting (#2707). Warn and
+    // name it; never refuse, since `--full-refresh` does not rebuild a merge.
+    let mut merge_stale_note = None;
+    if let rocky_ir::MaterializationStrategy::Merge { .. } = &model_ir.materialization
+        && let Some(columns) = &existing_target_columns
+    {
+        merge_stale_note = super::run_incremental::merge_stale_columns_note(
+            &model_ir,
+            columns,
+            warehouse,
+            dialect,
+            &target_ref,
+        )
+        .await;
+        if let Some(note) = &merge_stale_note {
+            eprintln!("warning: {note}");
         }
     }
 
@@ -17750,33 +17889,46 @@ async fn execute_one_plain_model(
                 }
             }
         }
-        for (index, exec_sql) in exec_stmts.iter().enumerate() {
-            if atomic_create_done && index == 0 {
-                continue;
+        let mut record_stats = |stats: rocky_core::traits::ExecutionStats| {
+            bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+            bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+            reported_per_statement.push(stats.rows_affected);
+            egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
+            if let Some(jid) = stats.job_id {
+                job_ids_acc.push(jid);
             }
-            match super::run_upstream_reads::run_model_statement(
+        };
+        let model_error = |err| {
+            let guidance = kind_probe_note
+                .as_ref()
+                .map(|note| format!("model '{model_name}' failed; {note}"))
+                .unwrap_or_else(|| format!("model '{model_name}' failed"));
+            anyhow::Error::from(err).context(guidance)
+        };
+        if matches!(
+            model_ir.materialization,
+            rocky_ir::MaterializationStrategy::DeleteInsert { .. }
+        ) {
+            let reports = super::run_upstream_reads::run_delete_insert(
                 warehouse,
-                exec_sql,
+                &exec_stmts,
                 &mut reads_acc,
             )
             .await
-            {
-                Ok(stats) => {
-                    bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
-                    bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
-                    reported_per_statement.push(stats.rows_affected);
-                    egress_acc = accumulate_bytes(egress_acc, stats.egress_bytes);
-                    if let Some(jid) = stats.job_id {
-                        job_ids_acc.push(jid);
-                    }
-                }
-                Err(e) => {
-                    let guidance = kind_probe_note
-                        .as_ref()
-                        .map(|note| format!("model '{model_name}' failed; {note}"))
-                        .unwrap_or_else(|| format!("model '{model_name}' failed"));
-                    return Err(anyhow::Error::from(e).context(guidance));
-                }
+            .map_err(model_error)?;
+            for stats in reports {
+                record_stats(stats);
+            }
+        } else if !atomic_create_done {
+            for exec_sql in &exec_stmts {
+                let stats = super::run_upstream_reads::run_model_statement(
+                    warehouse,
+                    exec_sql,
+                    &mut reads_acc,
+                )
+                .await
+                .map_err(model_error)?;
+                record_stats(stats);
             }
         }
         if let Some((drop_sql, existing_name, expected_name)) = &pending_drop {
@@ -17876,6 +18028,7 @@ async fn execute_one_plain_model(
             })
             .into_iter()
             .chain(kind_probe_note)
+            .chain(merge_stale_note)
             .chain(incremental_notes)
             .chain(swap_notes)
             .collect(),
@@ -27923,6 +28076,8 @@ auto_create_schemas = true
             withheld_models: Default::default(),
             frozen_stop: false,
             retry_of: None,
+            test_failed_models: Default::default(),
+            test_results: Vec::new(),
             error_models: Default::default(),
             table_attempts: Default::default(),
             materializations: vec![],
@@ -31271,6 +31426,273 @@ timestamp_column = "ts"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Run the `merge` model `mrg` (`unique_key = ["id"]`, target `tgt.mrg`)
+    /// once through `execute_one_plain_model`, with `typed` as the compiler's
+    /// output columns.
+    #[cfg(feature = "duckdb")]
+    async fn run_merge_model(
+        adapter: &dyn rocky_core::traits::WarehouseAdapter,
+        sql: &str,
+        typed: &[&str],
+    ) -> MaterializationOutput {
+        use rocky_core::models::load_model_pair;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("mrg.toml"),
+            "name = \"mrg\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\n\
+             [target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"mrg\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("mrg.sql"), sql).unwrap();
+        let model = load_model_pair(
+            &dir.path().join("mrg.sql"),
+            &dir.path().join("mrg.toml"),
+            None,
+        )
+        .expect("load merge model");
+        let mut typed_models = indexmap::IndexMap::new();
+        typed_models.insert(
+            "mrg".to_string(),
+            typed
+                .iter()
+                .map(|name| rocky_compiler::types::TypedColumn {
+                    name: (*name).to_string(),
+                    data_type: rocky_compiler::types::RockyType::Unknown,
+                    nullable: true,
+                })
+                .collect(),
+        );
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            product_volumes: None,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
+        super::execute_one_plain_model(
+            &model,
+            adapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "mrg",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("the merge run succeeds")
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn merge_fixture() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        use rocky_core::traits::WarehouseAdapter;
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, legacy VARCHAR, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES (1, 'a', TIMESTAMP '2026-03-01 10:00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        adapter
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn stale_notes(output: &MaterializationOutput) -> Vec<&String> {
+        output
+            .notes
+            .iter()
+            .filter(|n| n.contains("no longer outputs"))
+            .collect()
+    }
+
+    /// #2707: a `merge` model whose SQL stops selecting a column keeps that
+    /// column in its table. The run still succeeds, and warns with the
+    /// column's name. It does not suggest `--full-refresh` as a fix.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_warns_and_names_a_column_its_sql_dropped() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let adapter = merge_fixture().await;
+        let run1 = run_merge_model(
+            &adapter,
+            "SELECT id, legacy, ts FROM src.events",
+            &["id", "legacy", "ts"],
+        )
+        .await;
+        assert!(stale_notes(&run1).is_empty(), "{:?}", run1.notes);
+
+        adapter
+            .execute_statement(
+                "INSERT INTO src.events VALUES (2, 'b', TIMESTAMP '2026-03-02 10:00:00')",
+            )
+            .await
+            .unwrap();
+        let run2 = run_merge_model(&adapter, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+        let stale = stale_notes(&run2);
+        assert_eq!(stale.len(), 1, "{:?}", run2.notes);
+        assert!(
+            stale[0].contains("model 'mrg': the target tgt.mrg still has column(s) legacy that"),
+            "{}",
+            stale[0]
+        );
+        assert!(
+            stale[0].contains("`--full-refresh` does not rebuild a merge model"),
+            "{}",
+            stale[0]
+        );
+
+        // The column is still in the table, NULL in the new row.
+        let rows = adapter
+            .execute_query("SELECT id, legacy FROM tgt.mrg ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 2, "{:?}", rows.rows);
+        assert_eq!(rows.rows[1][1], serde_json::Value::Null, "{:?}", rows.rows);
+    }
+
+    /// #2707: an unchanged `merge` model gets no stale-column warning, also
+    /// when the compiler's typed list misses some of its columns (the zero-row
+    /// probe confirms they are still output).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_without_a_stale_column_does_not_warn() {
+        let adapter = merge_fixture().await;
+        let sql = "SELECT id, legacy, ts FROM src.events";
+        for typed in [&["id", "legacy", "ts"][..], &["id"][..]] {
+            let output = run_merge_model(&adapter, sql, typed).await;
+            assert!(
+                stale_notes(&output).is_empty(),
+                "{typed:?}: {:?}",
+                output.notes
+            );
+        }
+        let output = run_merge_model(&adapter, sql, &["id", "legacy", "ts"]).await;
+        assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+    }
+
+    /// How [`ProbeFault`] answers the stale-column check's zero-row query.
+    #[cfg(feature = "duckdb")]
+    #[derive(Clone, Copy)]
+    enum ProbeFaultMode {
+        /// The query fails.
+        Fail,
+        /// The query succeeds but reports no column names.
+        NoColumns,
+    }
+
+    /// DuckDB, except for the zero-row output probe (`_rocky_probe`), which
+    /// answers as `mode` says. Counts the probes it intercepted.
+    #[cfg(feature = "duckdb")]
+    struct ProbeFault<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        mode: ProbeFaultMode,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for ProbeFault<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            self.inner.execute_statement_with_stats(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            if !sql.contains("_rocky_probe") {
+                return self.inner.execute_query(sql).await;
+            }
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.mode {
+                ProbeFaultMode::Fail => Err(rocky_core::traits::AdapterError::msg(
+                    "injected probe failure",
+                )),
+                ProbeFaultMode::NoColumns => Ok(rocky_core::traits::QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                }),
+            }
+        }
+
+        fn classify_failure(
+            &self,
+            err: &rocky_core::traits::AdapterError,
+        ) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(err)
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// #2707: when the stale-column check's zero-row query fails, or reports
+    /// no column names, the merge run still succeeds and warns about nothing.
+    /// The probe count proves the check reached that query.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_a_failed_probe_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::Fail).await;
+    }
+
+    /// #2707: see [`merge_stale_check_with_a_failed_probe_stays_silent`]; here
+    /// the probe succeeds but reports no column names.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_no_probe_columns_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::NoColumns).await;
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_probe_fault_is_silent(mode: ProbeFaultMode) {
+        {
+            let adapter = merge_fixture().await;
+            run_merge_model(
+                &adapter,
+                "SELECT id, legacy, ts FROM src.events",
+                &["id", "legacy", "ts"],
+            )
+            .await;
+            let faulty = ProbeFault {
+                inner: &adapter,
+                mode,
+                probes: std::sync::atomic::AtomicUsize::new(0),
+            };
+            // `run_merge_model` panics if the run fails.
+            let output =
+                run_merge_model(&faulty, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+            assert_eq!(
+                faulty.probes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the check must reach the probe"
+            );
+            assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+        }
     }
 
     /// Fail-closed bootstrap — transformation path (`execute_one_plain_model`).
@@ -44506,6 +44928,7 @@ auto_create_schemas = true
             lag_tolerance_seconds,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         }
     }
 
@@ -45103,6 +45526,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -45194,6 +45618,7 @@ auto_create_schemas = true
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         };
         let out2 = run_with_gate(
             &models_dir,
@@ -45479,6 +45904,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45556,6 +45982,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45613,6 +46040,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45742,6 +46170,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45815,6 +46244,7 @@ auto_create_schemas = true
                         lag_tolerance_seconds: 0,
                         shadow_or_branch: false,
                         full_refresh: false,
+                        tests_on_run: Default::default(),
                     },
                     false,
                     false,
@@ -45884,6 +46314,7 @@ auto_create_schemas = true
                     lag_tolerance_seconds: 0,
                     shadow_or_branch: false,
                     full_refresh: false,
+                    tests_on_run: Default::default(),
                 },
                 false,
                 false,
@@ -45974,6 +46405,7 @@ auto_create_schemas = true
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
                 full_refresh: false,
+                tests_on_run: Default::default(),
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -46124,6 +46556,7 @@ auto_create_schemas = true
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         };
         let res = super::execute_models(
             &models_dir,
@@ -46255,6 +46688,7 @@ auto_create_schemas = true
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
                 full_refresh: false,
+                tests_on_run: Default::default(),
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -46421,6 +46855,7 @@ auto_create_schemas = true
             lag_tolerance_seconds: 0,
             shadow_or_branch: false,
             full_refresh: false,
+            tests_on_run: Default::default(),
         };
         let resilience = rocky_core::config::ResilienceConfig {
             contain_failures: true,
@@ -47532,6 +47967,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -47745,6 +48181,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -48034,6 +48471,7 @@ auto_create_schemas = true
             verify_after_failed: false,
             rocky_branch: None,
             retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
@@ -49035,6 +49473,7 @@ auto_create_schemas = true
                 verify_after_failed: false,
                 rocky_branch: None,
                 retry_of: None,
+                test_results: Vec::new(),
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
@@ -49354,6 +49793,7 @@ auto_create_schemas = true
                     verify_after_failed: false,
                     rocky_branch: None,
                     retry_of: None,
+                    test_results: Vec::new(),
                     run_scope: Some(rocky_core::state::RunScope::Production),
                     queued_ms: None,
                     source_volumes: Vec::new(),

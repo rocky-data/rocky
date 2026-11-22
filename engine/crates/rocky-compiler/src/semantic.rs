@@ -79,6 +79,18 @@ pub struct ModelSchema {
     /// they deserialize as "fully understood", matching how they behaved then.
     #[serde(default)]
     pub unresolved_projections: usize,
+    /// Whether the model's `SELECT *` expands to a column list Rocky knows in
+    /// full (#2701): every star is a plain `*` (no qualifier, no `EXCLUDE`,
+    /// `REPLACE` or other modifier), and every relation it expands is an
+    /// in-project model this model depends on, whose own schema is complete,
+    /// that is not a snapshot (its table adds SCD2 columns the graph does not
+    /// list), and whose columns collide with no other output name (a warehouse
+    /// can rename a duplicate). `false` when the model has no star.
+    ///
+    /// `#[serde(default)]`: a graph serialized by an older build reads as
+    /// `false`, so its star models stay incomplete, as they were then.
+    #[serde(default)]
+    pub star_columns_complete: bool,
     /// Constructs in this model whose lineage Rocky does not record, sorted
     /// (#2377): the extractor's [`rocky_sql::lineage::LineageResult::lineage_gaps`]
     /// plus [`LineageGap::UnresolvedStar`] when a `SELECT *` expanded columns
@@ -96,6 +108,68 @@ pub struct ModelSchema {
     pub downstream: Vec<String>,
     /// Natural language intent (from model config).
     pub intent: Option<String>,
+    /// What each bare table read in this model's SQL reaches when it runs
+    /// (#2674), keyed by the read folded with
+    /// [`rocky_core::physical_edges::fold_identifier`], with the rule
+    /// `resolve.rs` derives the DAG edge with (#1354). A `WITH` name the
+    /// query reads is listed too, as [`ReadTarget::Local`], unless a table of
+    /// that name is also read.
+    ///
+    /// `None` for a schema built without the project's SQL, such as a
+    /// hand-built graph: read it through [`Self::named_read`]. Not serialized.
+    #[serde(skip)]
+    pub reads: Option<HashMap<String, ReadTarget>>,
+}
+
+/// What a bare name read in a model's SQL reaches when it runs (#2674).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadTarget {
+    /// The output of this model: the read binds to it and its DAG edge
+    /// survived (a binding that would close a cycle is dropped, `D013`).
+    Model(String),
+    /// A table no model of the project is bound to: external, ambiguous
+    /// (`E056`), or a binding whose edge was dropped.
+    Table,
+    /// A `WITH` name of the query, not a table.
+    Local,
+}
+
+/// What a read spelled with a model's exact name reaches, for the reader
+/// (#2674). See [`ModelSchema::named_read`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedRead {
+    /// The read binds to the model of that name.
+    ThatModel,
+    /// The read binds to no model: it reaches the table of that name, typed
+    /// from the source schema the model's name shadows.
+    Source,
+    /// `resolve.rs` binds the read to another model, one that writes a table
+    /// of that name. That binding ignores the schema, and the run reads the
+    /// connection's default schema: the read reaches that model's table if it
+    /// writes the default schema, and the source table otherwise. The
+    /// compiler cannot tell which, so the read's type is unknown (`D012`
+    /// names the read).
+    OtherModel,
+    /// A `WITH` name of the reader's query. A walker that matches `WITH`
+    /// names in another case than lineage does can ask about one; it is not
+    /// a table, so its type is unknown.
+    Local,
+    /// The reader's SQL has no bare read of that name the bindings list.
+    /// Asking about it is a walker mismatch; the type is unknown.
+    Unlisted,
+    /// The bindings were not computed (a hand-built schema).
+    NotComputed,
+}
+
+/// Whether the read binding decides what a bare read spelled with model
+/// `name` reaches (#2674). Only for a name with no upper-case letter: lineage
+/// lowercases a nested read, so a mixed-case name's nested reads bind under
+/// another spelling, and an exact-name binding (such as an ephemeral model's)
+/// can be missed. A read of a mixed-case model name is typed as before #2674:
+/// from the model, and a star expands it when the reader depends on it.
+#[must_use]
+pub fn binding_decides(name: &str) -> bool {
+    !name.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 impl ModelSchema {
@@ -111,7 +185,8 @@ impl ModelSchema {
     ///   a cached schema, but it cannot when the star expands a raw table Rocky
     ///   has never described — and a root `SELECT * FROM raw.t` records *no*
     ///   upstream models, so "is any upstream unknown?" is vacuously false
-    ///   there. Any star is therefore treated as not-provably-complete.
+    ///   there. A star is therefore treated as not-provably-complete unless
+    ///   [`Self::star_columns_complete`] proves its expansion (#2701).
     /// - **A projection item lineage could not name**, counted in
     ///   [`Self::unresolved_projections`]. This is the part `has_star` says
     ///   nothing about: `SELECT (order_id) FROM raw.t` is star-free and yields
@@ -124,12 +199,33 @@ impl ModelSchema {
     /// ones need not — a column that *is* listed really is produced.
     #[must_use]
     pub fn schema_is_complete(&self) -> bool {
-        !self.has_star && self.unresolved_projections == 0
+        (!self.has_star || self.star_columns_complete) && self.unresolved_projections == 0
     }
 
     /// Whether this model's lineage may be missing edges: a known gap, or
     /// gaps that were never computed (`None`). Only `Some(vec![])` is
     /// complete.
+    /// What this model's bare read of `name`, a model's exact name, reaches
+    /// when the SQL runs (#2674). A bare read is resolved by the table a
+    /// model WRITES, not by its name (#1354), and `depends_on` orders a run
+    /// without rewriting a read, so the name alone never says.
+    #[must_use]
+    pub fn named_read(&self, name: &str) -> NamedRead {
+        if !binding_decides(name) {
+            return NamedRead::ThatModel;
+        }
+        let Some(reads) = &self.reads else {
+            return NamedRead::NotComputed;
+        };
+        match reads.get(&rocky_core::physical_edges::fold_identifier(name)) {
+            Some(ReadTarget::Model(model)) if model == name => NamedRead::ThatModel,
+            Some(ReadTarget::Model(_)) => NamedRead::OtherModel,
+            Some(ReadTarget::Table) => NamedRead::Source,
+            Some(ReadTarget::Local) => NamedRead::Local,
+            None => NamedRead::Unlisted,
+        }
+    }
+
     #[must_use]
     pub fn lineage_is_incomplete(&self) -> bool {
         self.lineage_gaps
@@ -372,6 +468,100 @@ fn source_names(name: &str) -> [&str; 2] {
 /// `source_schemas` provides column info for external sources (from warehouse
 /// `DESCRIBE TABLE` or cache). Models that reference external tables without
 /// schema info get `has_star = true` treatment.
+/// Whether `item` is a plain `*`: no qualifier and no modifier.
+pub(crate) fn is_plain_star(item: &sqlparser::ast::SelectItem) -> bool {
+    match item {
+        sqlparser::ast::SelectItem::Wildcard(options) => {
+            options.opt_ilike.is_none()
+                && options.opt_exclude.is_none()
+                && options.opt_except.is_none()
+                && options.opt_replace.is_none()
+                && options.opt_rename.is_none()
+                && options.opt_alias.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `sql` has the one shape whose star Rocky can expand exactly
+/// (#2701): one `SELECT` with exactly one plain `*` and no qualified star,
+/// no lateral view and no pipe operator, reading only named tables (no
+/// arguments, no alias column list, no sample or time travel) joined by
+/// inner, outer or cross joins. Anything else (a nested join, a derived
+/// table, `PIVOT`, a table function, a semi or anti join, a second star) can
+/// add, drop or rename columns the expansion would not see.
+fn has_only_plain_stars(sql: &str) -> bool {
+    use sqlparser::ast::{JoinOperator, SelectItem, SetExpr, Statement, TableFactor};
+    fn plain_table(factor: &TableFactor) -> bool {
+        matches!(
+            factor,
+            TableFactor::Table {
+                alias,
+                args: None,
+                with_hints,
+                version: None,
+                with_ordinality: false,
+                partitions,
+                json_path: None,
+                sample: None,
+                index_directives,
+                inheritance: None,
+                ..
+            } if alias.as_ref().is_none_or(|a| a.columns.is_empty())
+                && with_hints.is_empty()
+                && partitions.is_empty()
+                && index_directives.is_empty()
+        )
+    }
+    let Ok(statements) =
+        sqlparser::parser::Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql)
+    else {
+        return false;
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let stars = select
+        .projection
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        })
+        .count();
+    let star_is_plain = select.projection.iter().any(is_plain_star);
+    query.pipe_operators.is_empty()
+        && stars == 1
+        && star_is_plain
+        && select.lateral_views.is_empty()
+        && select.exclude.is_none()
+        && select.value_table_mode.is_none()
+        && select.flavor == sqlparser::ast::SelectFlavor::Standard
+        && !select.from.is_empty()
+        && select.from.iter().all(|twj| {
+            plain_table(&twj.relation)
+                && twj.joins.iter().all(|join| {
+                    plain_table(&join.relation)
+                        && matches!(
+                            join.join_operator,
+                            JoinOperator::Join(_)
+                                | JoinOperator::Inner(_)
+                                | JoinOperator::Left(_)
+                                | JoinOperator::LeftOuter(_)
+                                | JoinOperator::Right(_)
+                                | JoinOperator::RightOuter(_)
+                                | JoinOperator::FullOuter(_)
+                                | JoinOperator::CrossJoin(_)
+                        )
+                })
+        })
+}
+
 pub fn build_semantic_graph(
     project: &Project,
     source_schemas: &HashMap<String, Vec<ColumnInfo>>,
@@ -406,6 +596,14 @@ pub fn build_semantic_graph(
         .map(|m| (m.config.name.as_str(), m))
         .collect();
 
+    // Every model a bare read could bind to (#1354), for `reads` (#2674).
+    let bare_reads = crate::resolve::BareReadIndex::new(&project.models);
+    let model_names: std::collections::HashSet<&str> = project
+        .models
+        .iter()
+        .map(|m| m.config.name.as_str())
+        .collect();
+
     // Process models in topological order
     for model_name in &project.execution_order {
         let model = match model_by_name.get(model_name.as_str()) {
@@ -421,6 +619,83 @@ pub fn build_semantic_graph(
             Some(cached) => cached.clone(),
             None => lineage::extract_lineage(&model.sql)
                 .map_err(|e| format!("lineage extraction failed for '{}': {}", model_name, e))?,
+        };
+
+        // What each bare read reaches (#2674): the binding `resolve.rs` derived
+        // the edge from, kept only when that edge is in the DAG (a binding
+        // that would close a cycle is dropped there, `D013`).
+        let reader_upstream: &[String] = upstream_map
+            .get(model_name.as_str())
+            .copied()
+            .unwrap_or_default();
+        let mut reads: HashMap<String, ReadTarget> = HashMap::new();
+        let bound = lineage_result
+            .source_tables
+            .iter()
+            .filter(|t| t.binding == lineage::TableBinding::Physical)
+            .map(|t| &t.name)
+            .chain(lineage_result.nested_sources.iter())
+            .filter(|name| !name.contains('.'))
+            .map(|name| {
+                let target = match bare_reads.bind(name, model) {
+                    crate::resolve::BareBinding::Model(m) if reader_upstream.contains(&m) => {
+                        ReadTarget::Model(m)
+                    }
+                    crate::resolve::BareBinding::Model(_)
+                    | crate::resolve::BareBinding::External
+                    | crate::resolve::BareBinding::Ambiguous(_) => ReadTarget::Table,
+                };
+                (rocky_core::physical_edges::fold_identifier(name), target)
+            });
+        // Two spellings of one name fold to one key, and they reach one
+        // table. `bind` matches an ephemeral model's name exactly, and lineage
+        // lowercases a nested read, so a binding to a model wins over a
+        // spelling that missed it.
+        for (key, target) in bound {
+            match reads.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(target);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if *slot.get() == ReadTarget::Table {
+                        slot.insert(target);
+                    }
+                }
+            }
+        }
+        for cte in lineage_result
+            .source_tables
+            .iter()
+            .filter(|t| t.binding == lineage::TableBinding::Cte)
+        {
+            reads
+                .entry(rocky_core::physical_edges::fold_identifier(&cte.name))
+                .or_insert(ReadTarget::Local);
+        }
+        // Whether this model's read of `name`, a model's name, binds to another
+        // model. Which table it reaches depends on the schema that model
+        // writes (see `NamedRead::OtherModel`), so a star over it stays
+        // unexpanded: neither that model's columns nor the source's (#2674).
+        let star_reads_other_model = |name: &str| {
+            binding_decides(name)
+                && model_names.contains(name)
+                && matches!(
+                    reads.get(&rocky_core::physical_edges::fold_identifier(name)),
+                    Some(ReadTarget::Model(m)) if m != name
+                )
+        };
+        // Whether this model's star over `name` reads the model of that name.
+        // For a mixed-case name, the rule before #2674: the reader depends on
+        // the model.
+        let star_reads_model = |name: &str| {
+            if binding_decides(name) {
+                reads.get(&rocky_core::physical_edges::fold_identifier(name))
+                    == Some(&ReadTarget::Model(name.to_string()))
+            } else {
+                upstream_map
+                    .get(model_name.as_str())
+                    .is_some_and(|deps| deps.iter().any(|dep| dep == name))
+            }
         };
 
         // Build table alias → resolved name map for this model's SQL
@@ -514,6 +789,20 @@ pub fn build_semantic_graph(
         if lineage_result.has_star && top.unmodelled {
             star_unresolved = true;
         }
+        // Whether the star's expansion is the model's whole star output
+        // (#2701); cleared below by any relation or name that cannot prove it.
+        let mut star_complete = lineage_result.has_star
+            && !top.unmodelled
+            && top.excluded.is_empty()
+            && top.replaced.is_empty()
+            && top.by_relation.is_empty()
+            && has_only_plain_stars(&model.sql);
+        // Output names so far, lower-cased, to spot a name the star repeats.
+        let mut star_names: std::collections::HashSet<String> = if star_complete {
+            output_names.iter().map(|n| n.to_lowercase()).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         // If SELECT *, expand upstream model columns into output
         if lineage_result.has_star && !top.unmodelled {
             for table_ref in &lineage_result.source_tables {
@@ -533,6 +822,7 @@ pub fn build_semantic_graph(
                 // origin, and a body that is itself an unresolved `SELECT *`
                 // lists the physical tables it passes through.
                 if table_ref.binding == lineage::TableBinding::Cte {
+                    star_complete = false;
                     // A CTE column built from several columns has one entry
                     // per origin: one output column, several edges (#2318).
                     let mut keep = false;
@@ -567,11 +857,9 @@ pub fn build_semantic_graph(
                         }
                     }
                     for inner_name in &table_ref.derived_sources {
-                        // Same #1631 rule as a direct star: a model's columns
-                        // only when the reader depends on that model.
-                        let reader_depends_on_it = upstream_map
-                            .get(model_name.as_str())
-                            .is_some_and(|deps| deps.iter().any(|dep| dep == inner_name));
+                        // Same rule as a direct star: a model's columns only
+                        // when the read reaches that model (#1631, #2674).
+                        let reader_depends_on_it = star_reads_model(inner_name);
                         let inner_columns: Vec<&str> = if let Some(upstream_schema) = models
                             .get(inner_name.as_str())
                             .filter(|_| reader_depends_on_it)
@@ -581,7 +869,10 @@ pub fn build_semantic_graph(
                                 .iter()
                                 .map(|c| c.name.as_str())
                                 .collect()
-                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
+                        } else if let Some(source_cols) = source_schemas
+                            .get(inner_name.as_str())
+                            .filter(|_| !star_reads_other_model(inner_name))
+                        {
                             source_cols.iter().map(|c| c.name.as_str()).collect()
                         } else {
                             star_unresolved = true;
@@ -639,17 +930,59 @@ pub fn build_semantic_graph(
                 //
                 // Falling through reaches `source_schemas` below, which is the
                 // right answer for an external table of the same name.
-                let reader_depends_on_it = upstream_map
-                    .get(model_name.as_str())
-                    .is_some_and(|deps| deps.iter().any(|dep| dep == table_name));
+                //
+                // #2674: depending on the model is not enough either. A bare
+                // read reaches the table a model WRITES (#1354), and
+                // `depends_on` orders the run without rewriting the read, so
+                // a reader that declares model `orders`, which writes
+                // `orders_v2`, still reads a table called `orders`. The
+                // star takes the model's columns only when the read binds to
+                // it.
+                let reader_depends_on_it = star_reads_model(table_name);
                 if let Some(upstream_schema) = models
                     .get(table_name.as_str())
                     .filter(|_| reader_depends_on_it)
                 {
+                    let is_snapshot = model_by_name
+                        .get(table_name.as_str())
+                        .is_some_and(|m| m.config.strategy.snapshot_lowered().is_some());
+                    // The upstream's names must be fixed by its own SQL too: a
+                    // complete schema can still hide columns a set operation
+                    // or an expanding function adds (`UNION BY NAME`,
+                    // `unnest`), and the star would pass them on.
+                    let names_fixed = model_by_name.get(table_name.as_str()).is_some_and(|m| {
+                        crate::typecheck::has_provably_fixed_output_names(
+                            &m.sql,
+                            upstream_schema.star_columns_complete,
+                        )
+                    });
+                    // A dependency can be declared while the bare read reaches
+                    // another table of that name: the star then expands that
+                    // table, not this model. Same rule as E039's bare binding.
+                    let bare_read_reaches_it =
+                        model_by_name.get(table_name.as_str()).is_some_and(|m| {
+                            matches!(
+                                m.config.strategy,
+                                rocky_core::models::StrategyConfig::Ephemeral
+                            ) || rocky_core::physical_edges::fold_identifier(&m.config.target.table)
+                                == rocky_core::physical_edges::fold_identifier(table_name)
+                        });
+                    if !upstream_schema.schema_is_complete()
+                        || is_snapshot
+                        || !names_fixed
+                        || !bare_read_reaches_it
+                    {
+                        star_complete = false;
+                    }
                     for col in &upstream_schema.columns {
                         let effect = rel.column(&col.name);
                         if effect == StarColumn::Excluded {
                             continue;
+                        }
+                        if star_complete && !star_names.insert(col.name.to_lowercase()) {
+                            // Two outputs share a name: the warehouse keeps
+                            // both, and may rename one (`id_1`).
+                            star_complete = false;
                         }
                         if output_names.insert(col.name.clone()) {
                             let col_arc: Arc<str> = Arc::from(col.name.as_str());
@@ -673,6 +1006,7 @@ pub fn build_semantic_graph(
                         }
                     }
                 } else if let Some(derived_cols) = &table_ref.derived_columns {
+                    star_complete = false;
                     // Derived table (subquery in FROM): expand to the inner
                     // query's statically-resolved output columns. These carry
                     // no cross-model edge (the subquery isn't a named model or
@@ -691,6 +1025,7 @@ pub fn build_semantic_graph(
                         }
                     }
                 } else if !table_ref.derived_sources.is_empty() {
+                    star_complete = false;
                     // Derived table whose inner projection is itself an
                     // unresolved `SELECT *` (e.g. the importer's microbatch
                     // wrapper `SELECT * FROM (SELECT * FROM up) AS x`). The
@@ -706,7 +1041,11 @@ pub fn build_semantic_graph(
                             break;
                         }
                         let via = through.for_relation(&source_names(inner_name));
-                        if let Some(upstream_schema) = models.get(inner_name.as_str()) {
+                        if let Some(upstream_schema) =
+                            models.get(inner_name.as_str()).filter(|_| {
+                                !binding_decides(inner_name) || star_reads_model(inner_name)
+                            })
+                        {
                             for col in &upstream_schema.columns {
                                 if via.column(&col.name) == StarColumn::Excluded {
                                     continue;
@@ -717,7 +1056,10 @@ pub fn build_semantic_graph(
                                     });
                                 }
                             }
-                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
+                        } else if let Some(source_cols) = source_schemas
+                            .get(inner_name.as_str())
+                            .filter(|_| !star_reads_other_model(inner_name))
+                        {
                             for col in source_cols {
                                 if via.column(&col.name) == StarColumn::Excluded {
                                     continue;
@@ -730,7 +1072,13 @@ pub fn build_semantic_graph(
                             }
                         }
                     }
-                } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
+                } else if let Some(source_cols) = source_schemas
+                    .get(table_name.as_str())
+                    .filter(|_| !star_reads_other_model(table_name))
+                {
+                    // A source schema lists what Rocky was told, which may be
+                    // fewer columns than the table has.
+                    star_complete = false;
                     // External source with known schema
                     for col in source_cols {
                         let effect = rel.column(&col.name);
@@ -761,7 +1109,46 @@ pub fn build_semantic_graph(
                 } else {
                     // A raw table with no known schema: nothing to expand.
                     star_unresolved = true;
+                    star_complete = false;
                 }
+            }
+        }
+        // A `[[surrogate_key]]` column: `rocky run` wraps the model's SELECT
+        // as `SELECT *, <hash> AS <name> FROM (...)`, so the table holds it
+        // (#2705). Not where the run adds no key: an ephemeral model (readers
+        // inline it unwrapped), and `time_interval` / `microbatch`, which
+        // build from the bare model SQL. Only on a schema that is complete
+        // without the key: on a partial list the key would be the one typed
+        // column, and a `merge` would update only the key. A key name that
+        // repeats an output column, or keys Rocky cannot read, leave the
+        // schema not provably complete.
+        let mut unresolved_projections = lineage_result.unresolved_projections;
+        let complete_without_key = (!lineage_result.has_star
+            || (star_complete && !star_unresolved))
+            && unresolved_projections == 0;
+        let run_adds_key = !matches!(
+            model.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+                | rocky_core::models::StrategyConfig::TimeInterval { .. }
+                | rocky_core::models::StrategyConfig::Microbatch { .. }
+        );
+        if run_adds_key && complete_without_key {
+            match rocky_core::models::surrogate_keys_for_model_file(&model.file_path) {
+                Ok(Some((_, specs))) => {
+                    for spec in specs {
+                        let repeats = output_columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&spec.name));
+                        if repeats {
+                            unresolved_projections += 1;
+                        } else {
+                            output_names.insert(spec.name.clone());
+                            output_columns.push(ColumnDef { name: spec.name });
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => unresolved_projections += 1,
             }
         }
         let lineage_gaps = lineage_result.lineage_gaps.clone().map(|mut gaps| {
@@ -777,7 +1164,8 @@ pub fn build_semantic_graph(
             ModelSchema {
                 columns: output_columns,
                 has_star: lineage_result.has_star,
-                unresolved_projections: lineage_result.unresolved_projections,
+                unresolved_projections,
+                star_columns_complete: star_complete && !star_unresolved,
                 lineage_gaps,
                 upstream: upstream_map
                     .get(model_name.as_str())
@@ -788,6 +1176,7 @@ pub fn build_semantic_graph(
                     .map(|v| v.iter().map(std::string::ToString::to_string).collect())
                     .unwrap_or_default(),
                 intent: model.config.intent.clone(),
+                reads: Some(reads),
             },
         );
     }
@@ -942,6 +1331,227 @@ mod tests {
         assert!(!schema.schema_is_complete());
         // Non-empty but incomplete: an emptiness heuristic would miss this.
         assert_eq!(schema.columns.len(), 1);
+    }
+
+    fn star_schema(models: Vec<Model>, name: &str) -> ModelSchema {
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        graph.models.get(name).expect("model present").clone()
+    }
+
+    /// `up` with its SQL and sidecar written to `dir`, so the builder reads
+    /// its `[[surrogate_key]]` blocks from disk as `rocky run` does.
+    fn keyed_model(dir: &std::path::Path, sidecar: &str) -> Model {
+        let sql = "SELECT id, name FROM source.raw.users";
+        let path = dir.join("up.sql");
+        std::fs::write(&path, sql).unwrap();
+        std::fs::write(dir.join("up.toml"), sidecar).unwrap();
+        let mut model = make_model("up", sql);
+        model.file_path = path;
+        model
+    }
+
+    const KEY: &str = "[[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\", \"name\"]\n";
+
+    /// A `[[surrogate_key]]` column is in the model's schema, as in its table
+    /// (#2705), and a plain star passes it on.
+    #[test]
+    fn a_surrogate_key_column_is_in_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = star_schema(vec![keyed_model(dir.path(), KEY)], "up");
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "sk"]);
+        assert!(schema.schema_is_complete());
+
+        let schema = star_schema(
+            vec![
+                keyed_model(dir.path(), KEY),
+                make_model("mid", "SELECT * FROM up"),
+            ],
+            "mid",
+        );
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "sk"]);
+        assert!(schema.schema_is_complete());
+    }
+
+    /// No key column where the run adds none, and no completeness claim where
+    /// the keys cannot be read or repeat a column.
+    #[test]
+    fn a_surrogate_key_the_run_may_not_add_is_not_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ephemeral: inlined into readers without the key wrap.
+        let mut model = keyed_model(dir.path(), KEY);
+        model.config.strategy = StrategyConfig::Ephemeral;
+        let schema = star_schema(vec![model], "up");
+        assert!(!schema.columns.iter().any(|c| c.name == "sk"));
+        // `time_interval` and `microbatch` build from the bare SQL.
+        for strategy in [
+            StrategyConfig::TimeInterval {
+                time_column: "id".into(),
+                granularity: rocky_ir::TimeGrain::Day,
+                lookback: 0,
+                batch_size: std::num::NonZeroU32::new(1).unwrap(),
+                first_partition: None,
+            },
+            StrategyConfig::Microbatch {
+                timestamp_column: "id".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
+            },
+        ] {
+            let mut model = keyed_model(dir.path(), KEY);
+            model.config.strategy = strategy;
+            let schema = star_schema(vec![model], "up");
+            assert!(!schema.columns.iter().any(|c| c.name == "sk"));
+        }
+        // A star Rocky cannot expand: the key would be the only known
+        // column, and a `merge` would update only it.
+        let mut model = keyed_model(dir.path(), KEY);
+        model.sql = "SELECT * FROM source.raw.users".into();
+        let schema = star_schema(vec![model], "up");
+        assert!(schema.columns.is_empty());
+        // A key named like an output column: the table holds both.
+        let repeat = "[[surrogate_key]]\nname = \"NAME\"\ncolumns = [\"id\"]\n";
+        let schema = star_schema(vec![keyed_model(dir.path(), repeat)], "up");
+        assert!(!schema.schema_is_complete());
+        // A spec that does not validate.
+        let bad = "[[surrogate_key]]\nname = \"sk\"\ncolumns = []\n";
+        let schema = star_schema(vec![keyed_model(dir.path(), bad)], "up");
+        assert!(!schema.schema_is_complete());
+    }
+
+    /// A plain star over a complete in-project model expands to a known
+    /// column list, so the reader's schema is complete (#2701).
+    #[test]
+    fn a_plain_star_over_a_complete_model_is_complete() {
+        for sql in [
+            "SELECT * FROM up",
+            "SELECT *, upper(name) AS name_clean FROM up WHERE id > 0",
+            "SELECT * FROM up u",
+        ] {
+            let schema = star_schema(
+                vec![
+                    make_model("up", "SELECT id, name FROM source.raw.users"),
+                    make_model("reader", sql),
+                ],
+                "reader",
+            );
+            assert!(schema.has_star, "{sql}");
+            assert!(schema.star_columns_complete, "{sql}");
+            assert!(schema.schema_is_complete(), "{sql}");
+        }
+        // Transitively: a star over a star over a complete model.
+        let schema = star_schema(
+            vec![
+                make_model("up", "SELECT id, name FROM source.raw.users"),
+                make_model("mid", "SELECT * FROM up"),
+                make_model("reader", "SELECT *, 1 AS one FROM mid"),
+            ],
+            "reader",
+        );
+        assert!(schema.schema_is_complete());
+    }
+
+    /// Every way the star's expansion is not provably the whole output.
+    #[test]
+    fn a_star_stays_incomplete_when_its_expansion_is_not_proven() {
+        let up = || make_model("up", "SELECT id, name FROM source.raw.users");
+        let other = || make_model("other", "SELECT id, total FROM source.raw.orders");
+        let cases: Vec<(&str, Vec<Model>)> = vec![
+            // Over a raw table, with or without a cached schema.
+            ("SELECT * FROM source.raw.users", vec![]),
+            // Over a model whose own star is over a raw table.
+            (
+                "SELECT * FROM mid",
+                vec![make_model("mid", "SELECT * FROM source.raw.users")],
+            ),
+            // Qualified star and star modifiers.
+            ("SELECT u.* FROM up u", vec![up()]),
+            ("SELECT * EXCLUDE (name) FROM up", vec![up()]),
+            ("SELECT * REPLACE (upper(name) AS name) FROM up", vec![up()]),
+            // A name the star repeats: an explicit alias, or a joined column.
+            ("SELECT *, upper(name) AS NAME FROM up", vec![up()]),
+            (
+                "SELECT * FROM up JOIN other USING (id)",
+                vec![up(), other()],
+            ),
+            (
+                "SELECT * FROM up JOIN other ON up.id = other.id",
+                vec![up(), other()],
+            ),
+            // A CTE, a derived table, a set operation.
+            ("WITH c AS (SELECT id FROM up) SELECT * FROM c", vec![up()]),
+            ("SELECT * FROM (SELECT id FROM up) AS d", vec![up()]),
+            ("SELECT * FROM up UNION ALL SELECT * FROM up", vec![up()]),
+            // FROM shapes lineage does not list as star sources (red team).
+            (
+                "SELECT * FROM (up JOIN other ON up.id = other.id)",
+                vec![up(), other()],
+            ),
+            ("SELECT * FROM up, (SELECT 1 AS extra)", vec![up()]),
+            ("SELECT * FROM up AS u(x, y)", vec![up()]),
+            (
+                "SELECT * FROM up PIVOT (count(*) FOR name IN ('a', 'b'))",
+                vec![up()],
+            ),
+            (
+                "SELECT * FROM up LATERAL VIEW explode(array(1)) x AS tag",
+                vec![up()],
+            ),
+            ("SELECT *, * FROM up", vec![up()]),
+            (
+                "SELECT * FROM up LEFT SEMI JOIN other ON up.id = other.id",
+                vec![up(), other()],
+            ),
+            (
+                "SELECT * FROM up LEFT ANTI JOIN other ON up.id = other.id",
+                vec![up(), other()],
+            ),
+            // An upstream whose complete schema hides columns its own SQL adds.
+            (
+                "SELECT * FROM a",
+                vec![
+                    up(),
+                    other(),
+                    make_model(
+                        "a",
+                        "SELECT id FROM up UNION BY NAME SELECT total FROM other",
+                    ),
+                ],
+            ),
+            (
+                "SELECT * FROM a",
+                vec![
+                    up(),
+                    make_model("a", "SELECT id, unnest(name) AS s FROM up"),
+                ],
+            ),
+        ];
+        for (sql, mut models) in cases {
+            models.push(make_model("reader", sql));
+            let schema = star_schema(models, "reader");
+            assert!(!schema.star_columns_complete, "{sql}");
+            assert!(!schema.schema_is_complete(), "{sql}");
+        }
+        // A snapshot's table adds SCD2 columns the graph does not list.
+        let mut snap = make_model("snap", "SELECT id, name, ts FROM source.raw.users");
+        snap.config.strategy = toml::from_str(
+            "type = \"snapshot\"\nunique_key = \"id\"\nstrategy = \"timestamp\"\nupdated_at = \"ts\"",
+        )
+        .unwrap();
+        let schema = star_schema(
+            vec![snap, make_model("reader", "SELECT * FROM snap")],
+            "reader",
+        );
+        assert!(!schema.schema_is_complete());
+        // A model that writes another table: a bare `FROM up` reads table
+        // `up`, which this model does not write.
+        let mut renamed = up();
+        renamed.config.target.table = "users_v2".to_string();
+        let mut reader = make_model("reader", "SELECT * FROM up");
+        reader.config.depends_on = vec!["up".to_string()];
+        let schema = star_schema(vec![renamed, reader], "reader");
+        assert!(!schema.schema_is_complete());
     }
 
     #[test]

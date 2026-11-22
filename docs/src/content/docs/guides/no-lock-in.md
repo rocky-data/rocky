@@ -34,15 +34,17 @@ Rocky emits models in dependency order: a model never appears before one it read
 
 ```bash
 rocky emit-sql --models models/ > build/all.sql
-duckdb mart.db < build/all.sql
+duckdb -bail mart.db < build/all.sql
 ```
+
+Use `-bail` with the DuckDB CLI to stop at the first SQL error. If a statement fails during `delete_insert`, closing the connection rolls back the open transaction.
 
 The `--out-dir` form writes one `<model>.sql` per model, for inspection, editing, or dropping into dbt. To run those files directly, follow the same dependency order. `rocky dag` prints it:
 
 ```bash
 rocky dag --models models/        # execution order
-duckdb mart.db < build/sql/raw_orders.sql
-duckdb mart.db < build/sql/fct_orders.sql
+duckdb -bail mart.db < build/sql/raw_orders.sql
+duckdb -bail mart.db < build/sql/fct_orders.sql
 ```
 
 ## The fallback recipe

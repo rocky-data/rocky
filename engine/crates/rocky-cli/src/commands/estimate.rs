@@ -94,6 +94,10 @@ pub async fn compute_estimate(
     let mut estimates = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut explain_failed: Vec<(String, String)> = Vec::new();
+    let is_duckdb = rocky_cfg
+        .adapters
+        .get(pipeline.target_adapter())
+        .is_some_and(|adapter| adapter.adapter_type.as_str() == "duckdb");
     for model in &models_to_estimate {
         let model_ir = model.to_model_ir();
         let dialect = warehouse_adapter.dialect();
@@ -101,6 +105,20 @@ pub async fn compute_estimate(
         let sql_result = rocky_core::sql_gen::generate_transformation_sql(&model_ir, dialect);
 
         let sql = match sql_result {
+            // DuckDB EXPLAIN applies to one statement. Explain the model
+            // input without creating the scratch table or executing any DML.
+            Ok(_)
+                if is_duckdb
+                    && matches!(
+                        model_ir.materialization,
+                        rocky_ir::MaterializationStrategy::DeleteInsert { .. }
+                    ) =>
+            {
+                format!(
+                    "SELECT * FROM (\n{}\n) AS _rocky_estimate_input",
+                    model_ir.sql
+                )
+            }
             Ok(stmts) => stmts.join(";\n"),
             Err(e) => {
                 debug!(model = %model.config.name, "skipping estimate — SQL gen error: {e}");
@@ -526,5 +544,63 @@ type = "some-future-warehouse"
             .await
             .unwrap_err();
         assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_delete_insert_estimates_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target]\n",
+                dir.path().join("warehouse.duckdb").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("orders.sql"),
+            "SELECT region, amount FROM warehouse.main.incoming",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("orders.toml"),
+            "[strategy]\ntype = \"delete_insert\"\npartition_by = [\"region\"]\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config).unwrap();
+        {
+            let registry = AdapterRegistry::from_config(&cfg).unwrap();
+            let adapter = registry.warehouse_adapter("default").unwrap();
+            adapter
+                .execute_statement(
+                    "CREATE TABLE incoming AS SELECT 7 AS region, 20 AS amount;
+                     CREATE TABLE orders AS SELECT 7 AS region, 10 AS amount;",
+                )
+                .await
+                .unwrap();
+        }
+
+        let report = compute_estimate(&config, &models_dir, Some("p"), Some("orders"))
+            .await
+            .unwrap();
+        assert!(report.explain_failed.is_empty(), "{report:?}");
+        assert_eq!(report.output.total_models, 1);
+        assert!(report.output.estimates[0].raw_explain.contains("incoming"));
+
+        let registry = AdapterRegistry::from_config(&cfg).unwrap();
+        let adapter = registry.warehouse_adapter("default").unwrap();
+        let rows = adapter
+            .execute_query("SELECT amount FROM orders")
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(rows, vec![vec![serde_json::json!("10")]]);
     }
 }

@@ -180,6 +180,27 @@
           "type": "string"
         },
         {
+          "description": "Emitted when the promote was refused (#2609). Either a model's newest test evidence holds an error-severity `[[tests]]` failure, or the evidence is missing: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. `reason` names each cause.",
+          "enum": [
+            "failing_tests_blocked"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emitted when the operator overrode a refusal with `--allow-failing-tests`. The refusal was a failing error-severity test or missing test evidence. `reason` names which.",
+          "enum": [
+            "failing_tests_allowed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. Each such gap refuses the promote, and this event records it when `--allow-failing-tests` overrode the refusal. It is also recorded, with no flag, for what Rocky could not check here, which only warns: no branch run in the local state store under a remote `[state]` backend, or a pipeline whose models directory does not exist. `reason` says which.",
+          "enum": [
+            "test_evidence_missing"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Emitted by `rocky plan promote` when the plan has been successfully written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an audit consumer can correlate plan creation to a subsequent `rocky apply` event without scanning the filesystem.",
           "enum": [
             "promote_plan_created"
@@ -832,6 +853,11 @@
     "allow_breaking": {
       "default": false,
       "description": "Whether `--allow-breaking` was set at plan time.",
+      "type": "boolean"
+    },
+    "allow_failing_tests": {
+      "default": false,
+      "description": "Whether `--allow-failing-tests` was set at plan time.",
       "type": "boolean"
     },
     "approvals_rejected": {

@@ -263,6 +263,25 @@ enum OutputFormat {
     Md,
 }
 
+/// `--tests` mode for `rocky run`. Mirrors `[run] tests_on_run`, kept here so
+/// `clap::ValueEnum` does not need to leak into `rocky-core`.
+#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq, Debug)]
+enum TestsModeArg {
+    Off,
+    Report,
+    Enforce,
+}
+
+impl From<TestsModeArg> for rocky_core::config::TestsOnRun {
+    fn from(arg: TestsModeArg) -> Self {
+        match arg {
+            TestsModeArg::Off => Self::Off,
+            TestsModeArg::Report => Self::Report,
+            TestsModeArg::Enforce => Self::Enforce,
+        }
+    }
+}
+
 /// `--since` window for `rocky brief`.
 #[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq, Debug)]
 enum BriefSinceArg {
@@ -409,6 +428,7 @@ enum PolicyCapabilityArg {
     Gc,
     Restore,
     Retry,
+    Run,
     Quarantine,
     #[value(name = "schema_change.additive")]
     SchemaChangeAdditive,
@@ -430,6 +450,7 @@ impl From<PolicyCapabilityArg> for rocky_core::config::PolicyCapability {
             PolicyCapabilityArg::Gc => C::Gc,
             PolicyCapabilityArg::Restore => C::Restore,
             PolicyCapabilityArg::Retry => C::Retry,
+            PolicyCapabilityArg::Run => C::Run,
             PolicyCapabilityArg::Quarantine => C::Quarantine,
             PolicyCapabilityArg::SchemaChangeAdditive => C::SchemaChangeAdditive,
             PolicyCapabilityArg::SchemaChangeBreaking => C::SchemaChangeBreaking,
@@ -1311,6 +1332,16 @@ enum Command {
         #[arg(long)]
         force_rebuild: bool,
 
+        /// Evaluate each built model's `[[tests]]` against the table the run
+        /// just wrote, before its downstream models build. `off` runs no
+        /// test. `report` records the results in `test_results` and never
+        /// fails a model. `enforce` also fails the model on an error-severity
+        /// test that fails or cannot run, so its downstream does not build;
+        /// the table it wrote stays in place. A warning-severity test never
+        /// fails a model. Overrides `[run] tests_on_run` for this invocation.
+        #[arg(long, value_enum, value_name = "MODE")]
+        tests: Option<TestsModeArg>,
+
         /// Disable content-addressed reuse for this invocation, even when
         /// `[reuse]` is enabled in config.
         ///
@@ -1434,6 +1465,16 @@ enum Command {
             conflicts_with_all = ["source_dir", "format", "target", "pipeline", "truncate"]
         )]
         connector: Option<String>,
+    },
+
+    /// Scaffold and test child connectors.
+    ///
+    /// A child connector is a program `rocky load --connector <name>` runs.
+    /// It writes Parquet files and a result file; Rocky loads the files and
+    /// saves the connector's state.
+    Connector {
+        #[command(subcommand)]
+        subcommand: ConnectorSubcommand,
     },
 
     /// Load CSV seed files into the warehouse
@@ -2518,8 +2559,6 @@ enum Command {
     /// * `preview diff` produces a structural + sampled row-level diff
     ///   between branch and base;
     /// * `preview cost` produces a per-model bytes/duration/USD delta.
-    ///
-    /// See `plans/rocky-pr-preview-and-data-diff.md` for the design.
     Preview {
         #[command(subcommand)]
         action: PreviewAction,
@@ -3030,6 +3069,41 @@ enum ProductSubcommand {
     },
 }
 
+/// Subcommands under `rocky connector`.
+#[derive(Subcommand)]
+enum ConnectorSubcommand {
+    /// Write a new child connector: a manifest, a program and a helper.
+    ///
+    /// The scaffold reads a fixed list of rows and keeps a cursor, so it
+    /// loads as written. Replace its `fetch()` with code that reads your
+    /// source. Prints the `[connector.<name>]` block to add to rocky.toml.
+    Init {
+        /// Connector name: letters, digits and underscores.
+        name: String,
+        /// Directory to create (default: `connectors/<name>`). Must not exist.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Language of the scaffold.
+        #[arg(long, value_enum, default_value_t = rocky_cli::commands::ConnectorLang::Python)]
+        lang: rocky_cli::commands::ConnectorLang,
+    },
+
+    /// Run a connector against recorded input and check what it returns.
+    ///
+    /// Reads `connector-test.toml` beside the manifest: one `[[run]]` per
+    /// run, each with option overrides and the rows it must write. Each run
+    /// gets the state the run before it returned. Every Parquet file must
+    /// have one schema. Loads nothing, saves no state and passes no
+    /// secrets. Exits non-zero when a check fails.
+    Test {
+        /// The `[connector.<name>]` key in rocky.toml.
+        name: String,
+        /// Spec file (default: `connector-test.toml` beside the manifest).
+        #[arg(long)]
+        spec: Option<PathBuf>,
+    },
+}
+
 /// Subcommands under `rocky policy`.
 #[derive(Subcommand)]
 enum PolicySubcommand {
@@ -3139,6 +3213,14 @@ enum PlanSubcommand {
         /// override is auditable.
         #[arg(long)]
         allow_breaking: bool,
+        /// Bypass the failing-tests gate. `promote` refuses a branch when a
+        /// model's newest test evidence on it holds an error-severity
+        /// `[[tests]]` failure (see `rocky run --tests`). It also overrides a
+        /// refusal for missing test evidence (no branch run, a failed newest
+        /// run, a tested model built with no recorded result). An override of
+        /// a real refusal records a `FailingTestsAllowed` audit event.
+        #[arg(long)]
+        allow_failing_tests: bool,
         /// Filter sources by component value (e.g., --filter client=acme).
         /// On transformation pipelines, supported keys are
         /// `table`, `model`, `catalog`, `schema`.
@@ -3250,6 +3332,14 @@ enum BranchAction {
         /// paper trail.
         #[arg(long)]
         allow_breaking: bool,
+        /// Bypass the failing-tests gate. `promote` refuses a branch when a
+        /// model's newest test evidence on it holds an error-severity
+        /// `[[tests]]` failure (see `rocky run --tests`). It also overrides a
+        /// refusal for missing test evidence (no branch run, a failed newest
+        /// run, a tested model built with no recorded result). An override of
+        /// a real refusal records a `FailingTestsAllowed` audit event.
+        #[arg(long)]
+        allow_failing_tests: bool,
         /// Git ref to diff against for the breaking-change gate.
         #[arg(long, default_value = "main")]
         base_ref: String,
@@ -3755,7 +3845,10 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "publish-ir",
         ],
     ),
-    ("Data loading", &["load", "seed", "snapshot", "backfill"]),
+    (
+        "Data loading",
+        &["load", "connector", "seed", "snapshot", "backfill"],
+    ),
     (
         "Governance",
         &[
@@ -4598,6 +4691,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     name,
                     base,
                     allow_breaking,
+                    allow_failing_tests,
                     filter: promote_filter,
                     pipeline: promote_pipeline,
                     models,
@@ -4613,6 +4707,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         promote_filter.as_deref(),
                         promote_pipeline.as_deref(),
                         allow_breaking,
+                        allow_failing_tests,
                         &state_path,
                         resolve_cli_principal(cli.principal)?,
                         json,
@@ -4655,6 +4750,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             defer_run_id,
             skip_unchanged,
             force_rebuild,
+            tests,
             no_reuse,
             no_prune,
             no_sync_trigger,
@@ -4918,6 +5014,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 full_refresh,
                 no_sync_trigger,
                 no_source_sync: false,
+                tests_on_run: tests.map(Into::into),
             };
             // Who is running (RV4-P1): stamped on the drift auto-apply
             // custody rows. Resolved here, once, for all three run shapes.
@@ -5708,6 +5805,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::ci_diff_mode(working_tree),
         ),
         Command::InitAdapter { name } => rocky_cli::commands::run_init_adapter(&name),
+        Command::Connector { subcommand } => match subcommand {
+            ConnectorSubcommand::Init { name, dir, lang } => {
+                rocky_cli::commands::run_connector_init(&name, dir.as_deref(), lang)
+            }
+            ConnectorSubcommand::Test { name, spec } => {
+                let loaded = rocky_core::config::load_rocky_config_fingerprinted(&cli.config)
+                    .with_context(|| {
+                        format!("failed to load config from {}", cli.config.display())
+                    })?;
+                rocky_cli::commands::run_connector_test(
+                    &cli.config,
+                    &loaded,
+                    &name,
+                    spec.as_deref(),
+                    json,
+                )
+                .await
+            }
+        },
         Command::TestAdapter {
             adapter,
             command,
@@ -5921,6 +6037,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 pipeline,
                 skip_approval,
                 allow_breaking,
+                allow_failing_tests,
                 base_ref,
                 models,
             } => {
@@ -5979,6 +6096,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         pipeline.as_deref(),
                         skip_approval,
                         allow_breaking,
+                        allow_failing_tests,
                         runtime_principal,
                         &actor,
                         json,
@@ -6426,6 +6544,44 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::sync::Mutex;
 
+    /// Every policy capability is a `--capability` value (#2651). The match
+    /// is exhaustive over the core enum, so a new capability does not compile
+    /// until it has a CLI value, and the round trip proves each value maps
+    /// back to the capability it names.
+    #[test]
+    fn every_policy_capability_is_a_cli_value() {
+        use clap::ValueEnum;
+        use rocky_core::config::PolicyCapability as C;
+        fn arg_for(c: C) -> PolicyCapabilityArg {
+            match c {
+                C::Read => PolicyCapabilityArg::Read,
+                C::Propose => PolicyCapabilityArg::Propose,
+                C::Apply => PolicyCapabilityArg::Apply,
+                C::Promote => PolicyCapabilityArg::Promote,
+                C::Backfill => PolicyCapabilityArg::Backfill,
+                C::Gc => PolicyCapabilityArg::Gc,
+                C::Restore => PolicyCapabilityArg::Restore,
+                C::Retry => PolicyCapabilityArg::Retry,
+                C::Run => PolicyCapabilityArg::Run,
+                C::Quarantine => PolicyCapabilityArg::Quarantine,
+                C::SchemaChangeAdditive => PolicyCapabilityArg::SchemaChangeAdditive,
+                C::SchemaChangeBreaking => PolicyCapabilityArg::SchemaChangeBreaking,
+                C::ValueChange => PolicyCapabilityArg::ValueChange,
+            }
+        }
+        for arg in PolicyCapabilityArg::value_variants() {
+            let core = C::from(*arg);
+            let wire = serde_json::to_value(core).unwrap();
+            let name = arg.to_possible_value().unwrap();
+            assert_eq!(wire, name.get_name(), "the CLI value is the wire name");
+            assert_eq!(C::from(arg_for(core)), core);
+        }
+        assert!(
+            PolicyCapabilityArg::from_str("run", false).is_ok(),
+            "`run` is accepted"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // resolve_output — `--output` default resolution
     // -----------------------------------------------------------------------
@@ -6766,6 +6922,21 @@ mod tests {
                 .join()
                 .expect("parser thread panicked")
         })
+    }
+
+    #[test]
+    fn connector_init_parses_its_name_dir_and_language() {
+        let cli =
+            try_parse_with_big_stack(&["rocky", "connector", "init", "orders", "--dir", "c/o"]);
+        let Command::Connector {
+            subcommand: ConnectorSubcommand::Init { name, dir, lang },
+        } = cli.command
+        else {
+            panic!("`rocky connector init` parsed as another command");
+        };
+        assert_eq!(name, "orders");
+        assert_eq!(dir, Some(PathBuf::from("c/o")));
+        assert_eq!(lang, rocky_cli::commands::ConnectorLang::Python);
     }
 
     /// Same overflow, same fix, for building the `clap::Command` graph

@@ -194,6 +194,72 @@ pub(super) async fn prepare(
     }))
 }
 
+/// A warning for a `merge` model whose existing target still has columns the
+/// model no longer outputs (#2707), or `None`.
+///
+/// A MERGE does not drop columns, so a column the SQL stopped selecting stays
+/// in the table. On DuckDB new rows hold NULL there; other warehouses are not
+/// verified, and Databricks (`INSERT *`) or BigQuery (`INSERT ROW`) may
+/// refuse the MERGE. This check does not
+/// refuse: `--full-refresh` does not rebuild a `merge` model
+/// ([`rebuilds_on_full_refresh`]), so a refusal would have no remedy.
+///
+/// `target_columns` is the existence probe's describe of the target, so the
+/// usual cost is no extra query. The compiler's `typed_columns` only pick the
+/// candidates: a zero-row probe of the model confirms them before the
+/// warning names any column, because the typed list can be incomplete (an
+/// unknown star, a surrogate key). Any probe failure gives no warning; this
+/// check never fails the run.
+pub(super) async fn merge_stale_columns_note(
+    model_ir: &ModelIr,
+    target_columns: &[ColumnInfo],
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn SqlDialect,
+    target_ref: &str,
+) -> Option<String> {
+    let typed: Vec<String> = model_ir
+        .typed_columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    if ColumnDiff::new(&typed, target_columns).removed.is_empty() {
+        return None;
+    }
+    let model_columns = match probe_output_columns(model_ir, warehouse, dialect, target_ref).await {
+        Ok(columns) => columns,
+        Err(e) => {
+            tracing::debug!(
+                model = &*model_ir.name,
+                error = %format!("{e:#}"),
+                "stale-column check for a merge model skipped"
+            );
+            return None;
+        }
+    };
+    if model_columns.is_empty() {
+        return None;
+    }
+    let stale = ColumnDiff::new(&model_columns, target_columns).removed;
+    if stale.is_empty() {
+        return None;
+    }
+    Some(merge_stale_columns_message(
+        &model_ir.name,
+        target_ref,
+        &stale,
+    ))
+}
+
+fn merge_stale_columns_message(model_name: &str, target_ref: &str, stale: &[String]) -> String {
+    format!(
+        "model '{model_name}': the target {target_ref} still has column(s) {} that the model \
+         no longer outputs. A merge does not drop columns, so the column stays in the table, \
+         and `--full-refresh` does not rebuild a merge model. To keep the column, select it again; \
+         to remove it, drop it from the table in the warehouse (ALTER TABLE ... DROP COLUMN)",
+        stale.join(", ")
+    )
+}
+
 /// The target's `MAX(<watermark>)` as text, `None` for an empty target.
 pub(super) async fn query_max(
     warehouse: &dyn WarehouseAdapter,

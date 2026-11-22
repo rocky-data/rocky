@@ -155,6 +155,9 @@ export type AuditEventKind =
   | "breaking_changes_blocked"
   | "breaking_changes_allowed"
   | "breaking_changes_gate_skipped"
+  | "failing_tests_blocked"
+  | "failing_tests_allowed"
+  | "test_evidence_missing"
   | "promote_plan_created";
 
 /**

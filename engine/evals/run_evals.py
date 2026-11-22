@@ -17,7 +17,7 @@ any of those is missing the suite *skips cleanly* (writes a skip scorecard, exit
 validates the harness plumbing (transcript parsing + scoring + scorecard render)
 against a recorded transcript with no key and no model call.
 
-Exit code: 0 whenever a valid scorecard (or a clean skip) was produced. A
+Exit code: 0 whenever a valid scorecard (or a clean skip) was produced and no live model call failed. A
 non-zero exit means the harness itself failed — never that a scenario scored a
 fail. Scenario pass/fail and the flake rate are recorded on the scorecard, not
 gated here (mirroring `engine-bench`: CI is green if the run completed).
