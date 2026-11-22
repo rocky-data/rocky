@@ -31,7 +31,7 @@ You keep your warehouse and your SQL. Rocky runs on Databricks, Snowflake, BigQu
    rocky apply <plan-id> ....... the reviewed change reaches the warehouse
 ```
 
-The branch run runs each model's `[[tests]]` there, because `[run] tests_on_run` defaults to `enforce`. `rocky plan promote` then refuses a branch with a recorded failing test.
+The branch run runs each model's `[[tests]]` there, because `[run] tests_on_run` defaults to `enforce`. `rocky plan promote` then refuses a branch with a recorded failing test, or with no passing test evidence.
 
 A clean compile finds the problems that your SQL, schemas and config make visible. It does not prove that every query runs or returns correct values.
 

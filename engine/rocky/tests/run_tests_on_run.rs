@@ -1,6 +1,6 @@
 //! `rocky run` evaluates a model's `[[tests]]`, by default under `enforce`
-//! (#2611), and `rocky plan promote` refuses a branch whose newest run recorded a failing
-//! one (#2609).
+//! (#2611), and `rocky plan promote` refuses a branch with a recorded failing
+//! test or with no passing test evidence (#2609).
 //!
 //! The project is the three-model one of `run_policy_gate.rs` plus a
 //! downstream of `customer_orders`:
@@ -403,7 +403,7 @@ fn promote_refuses_a_branch_whose_newest_run_failed_a_test() {
     assert!(!refused.status.success(), "{}", describe(&refused));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("blocked by 1 failing test"),
+        stderr.contains("1 failing test(s) recorded"),
         "{}",
         describe(&refused)
     );
@@ -439,13 +439,46 @@ fn promote_refuses_a_branch_whose_newest_run_failed_a_test() {
     let _ = plan;
 }
 
+/// A refused promote, then the same promote with `--allow-failing-tests`,
+/// which writes a plan carrying the override and the gap.
+fn refused_then_allowed(dir: &Path, needle: &str) {
+    let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no passing test evidence"),
+        "{}",
+        describe(&out)
+    );
+    assert!(stderr.contains(needle), "{}", describe(&out));
+    assert!(
+        plan_texts(dir).is_empty(),
+        "a refused promote writes no plan"
+    );
+
+    let allowed = rocky(
+        dir,
+        &[
+            "--output",
+            "json",
+            "plan",
+            "promote",
+            "pr1",
+            "--allow-failing-tests",
+        ],
+    );
+    assert!(allowed.status.success(), "{}", describe(&allowed));
+    let plans = plan_texts(dir);
+    assert!(plans[0].contains("failing_tests_allowed"), "{}", plans[0]);
+    assert!(plans[0].contains("test_evidence_missing"), "{}", plans[0]);
+}
+
 #[test]
-fn promote_warns_but_proceeds_when_the_newest_run_recorded_no_tests() {
+fn promote_refuses_when_the_newest_run_recorded_no_tests() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     project(dir, "", FAN_OUT, UNIQUE_ERROR);
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
-    // Tests off: the run records none.
     let run = rocky(
         dir,
         &[
@@ -453,27 +486,76 @@ fn promote_warns_but_proceeds_when_the_newest_run_recorded_no_tests() {
         ],
     );
     assert!(run.status.success(), "{}", describe(&run));
-
-    let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
-    assert!(out.status.success(), "{}", describe(&out));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("WARNING"), "{}", describe(&out));
-    assert!(stderr.contains("customer_orders"), "{}", describe(&out));
-    assert!(plan_texts(dir)[0].contains("test_evidence_missing"));
+    refused_then_allowed(dir, "customer_orders (run ");
 }
 
 #[test]
-fn promote_warns_but_proceeds_when_the_branch_has_no_run() {
+fn promote_refuses_when_the_branch_has_no_run() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     project(dir, "", FAN_OUT, UNIQUE_ERROR);
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    refused_then_allowed(dir, "no recorded run");
+}
 
+/// Under a remote `[state]` backend, a branch with no run in the local store
+/// only warns: its runs may live in the backend. This pins the backend the
+/// promote reads to the project's `[state]`, not a constant.
+#[test]
+fn promote_warns_when_the_branch_has_no_local_run_under_remote_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(
+        dir,
+        "\n[state]\nbackend = \"valkey\"\nvalkey_url = \"redis://127.0.0.1:1/\"\n",
+        FAN_OUT,
+        UNIQUE_ERROR,
+    );
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
     assert!(out.status.success(), "{}", describe(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no recorded run"), "{}", describe(&out));
+    assert!(stderr.contains("WARNING"), "{}", describe(&out));
+    assert!(
+        stderr.contains("could not be checked here"),
+        "{}",
+        describe(&out)
+    );
     assert!(plan_texts(dir)[0].contains("test_evidence_missing"));
+}
+
+#[test]
+fn bare_branch_promote_refuses_a_branch_with_no_run_and_prints_the_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir, "", FAN_OUT, UNIQUE_ERROR);
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    let out = rocky(dir, &["--output", "json", "branch", "promote", "pr1"]);
+    assert!(!out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(v["success"], false, "{}", describe(&out));
+    let blocked: Vec<&serde_json::Value> = v["audit"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no audit array\n{}", describe(&out)))
+        .iter()
+        .filter(|e| e["kind"] == "failing_tests_blocked")
+        .collect();
+    assert_eq!(blocked.len(), 1, "{}", describe(&out));
+    let reason = blocked[0]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("no recorded run"), "{}", describe(&out));
+}
+
+#[test]
+fn promote_refuses_when_the_newest_run_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // A run that fails for a reason other than a test: a model's SQL breaks.
+    project(dir, "", CLEAN, "");
+    write_model(dir, "status_counts", "select nope from main.raw_orders", "");
+    assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
+    let run = rocky(dir, &["--output", "json", "run", "--branch", "pr1"]);
+    assert!(!run.status.success(), "{}", describe(&run));
+    refused_then_allowed(dir, "did not succeed");
 }
 
 #[test]
@@ -603,7 +685,7 @@ fn promote_names_an_untested_model_whose_table_has_another_name() {
     assert!(run.status.success(), "{}", describe(&run));
 
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
-    assert!(out.status.success(), "{}", describe(&out));
+    assert!(!out.status.success(), "{}", describe(&out));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("customer_orders (run "),
         "{}",
@@ -646,10 +728,13 @@ fn a_recreated_branch_does_not_inherit_the_old_branch_runs() {
     assert!(deleted.status.success(), "{}", describe(&deleted));
     assert!(rocky(dir, &["branch", "create", "pr1"]).status.success());
 
+    // Refused for want of a run, not for the old incarnation's failure.
     let out = rocky(dir, &["--output", "json", "plan", "promote", "pr1"]);
-    assert!(out.status.success(), "{}", describe(&out));
+    assert!(!out.status.success(), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no recorded run"), "{}", describe(&out));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no recorded run"),
+        !stderr.contains("failing test(s) recorded"),
         "{}",
         describe(&out)
     );

@@ -18,7 +18,7 @@ rocky plan promote pr1          # writes a promote plan and prints its plan_id
 rocky apply <plan-id>           # copies the reviewed branch tables to production
 ```
 
-The branch run runs each model's `[[tests]]` there, because `[run] tests_on_run` defaults to `enforce`. [`rocky plan promote`](#the-failing-tests-gate) then refuses a branch with a recorded failing test.
+The branch run runs each model's `[[tests]]` there, because `[run] tests_on_run` defaults to `enforce`. [`rocky plan promote`](#the-failing-tests-gate) then refuses a branch with a recorded failing test, or with no passing test evidence.
 
 ## Global Flags
 
@@ -457,7 +457,7 @@ rocky plan promote <branch> [flags]
 |------|------|---------|-------------|
 | `--base <ref>` | `string` | `main` | Git ref the breaking-change gate diffs against. |
 | `--allow-breaking` | `bool` | `false` | Bypass the breaking-change gate. Always records a `BreakingChangesAllowed` audit event in the plan, so the override leaves a paper trail. |
-| `--allow-failing-tests` | `bool` | `false` | Bypass the failing-tests gate. Always records a `FailingTestsAllowed` audit event in the plan, and prints a warning. |
+| `--allow-failing-tests` | `bool` | `false` | Bypass the failing-tests gate, including a refusal for missing test evidence. Always records a `FailingTestsAllowed` audit event in the plan, and prints a warning. |
 | `--filter <key=value>` | `string` | | Filter the promote targets. A transformation pipeline supports the keys `table`, `model`, `catalog`, and `schema`. |
 | `--pipeline <NAME>` | `string` | | Pipeline to plan against. Required when `rocky.toml` defines more than one pipeline. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
@@ -474,10 +474,22 @@ run 2  --model status    builds only status
 promote                  refused: orders' newest evidence is run 1
 ```
 
-- **Refused.** A model's newest evidence holds an error-severity `[[tests]]` entry that failed, or whose query could not run. Exit code `1`, no plan written, and a `FailingTestsBlocked` audit event naming each test and its run. Fix the data and re-run `rocky run --branch <name>`, or pass `--allow-failing-tests`.
-- **Warned, not refused.** The branch has no run. Its newest run failed. A model that declares error-severity tests was last built with no recorded test result (for example, the run used `--tests off`); that build replaced the table, so an older failure no longer refuses. Rocky cannot load the models to tell. Rocky prints a `WARNING` line to stderr and records a `TestEvidenceMissing` audit event. The promote goes on.
+Rocky refuses the promote when any of these holds. Exit code `1`, no plan written, and a `FailingTestsBlocked` audit event that names each reason.
 
-`[run] tests_on_run` defaults to `enforce`, so a branch run records its tests unless it used `--tests off` or `tests_on_run = "off"`. Missing evidence still only warns. Refusing on it is a separate decision.
+- A model's newest evidence holds an error-severity `[[tests]]` entry that failed, or whose query could not run.
+- The branch has no run.
+- Its newest run failed.
+- A model that declares error-severity tests was last built with no recorded test result (for example, the run used `--tests off`).
+- Rocky cannot load the models to tell.
+
+Fix the data and re-run `rocky run --branch <name>`, or pass `--allow-failing-tests`. The override prints a `WARNING`, and records a `FailingTestsAllowed` audit event and a `TestEvidenceMissing` event for each gap.
+
+Two cases only warn, because Rocky cannot check them here. The promote goes on, with a `WARNING` on stderr and a `TestEvidenceMissing` audit event.
+
+- The branch has no run in the local state store, and `[state]` uses a remote backend (`s3`, `gcs`, `valkey` or `tiered`). Its runs may be recorded there, so the run history could not be checked here. A run that the local store does hold is still checked, and a bad one refuses. With a local backend, a branch with no run refuses.
+- A transformation pipeline's models directory does not exist, so it has no model to check.
+
+`[run] tests_on_run` defaults to `enforce`, so a branch run records its tests unless it used `--tests off`.
 
 ### Examples
 
