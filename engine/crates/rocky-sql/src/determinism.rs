@@ -401,8 +401,17 @@ fn sql_words(sql: &str) -> Vec<String> {
     while i < chars.len() {
         let c = chars[i];
         if c == '\'' || c == '"' || c == '`' {
+            // `E'…'` (escape-constant) reads `\` as an escape on DuckDB and
+            // Postgres; a plain `'…'` does not (#2693).
+            let escapes = c == '\'' && i >= 1 && matches!(chars[i - 1], 'e' | 'E') && {
+                i < 2 || !(chars[i - 2].is_ascii_alphanumeric() || chars[i - 2] == '_')
+            };
             i += 1;
             while i < chars.len() {
+                if escapes && chars[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
                 if chars[i] == c {
                     // A doubled quote is an escaped quote, not the end.
                     if chars.get(i + 1) == Some(&c) {
@@ -419,11 +428,21 @@ fn sql_words(sql: &str) -> Vec<String> {
                 i += 1;
             }
         } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            // Block comments nest on DuckDB and Databricks (#2693): the comment
+            // ends at the `*/` that closes the outermost `/*`.
             i += 2;
-            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-                i += 1;
+            let mut depth = 1;
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
-            i += 2;
         } else if c.is_ascii_alphabetic() || c == '_' {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
@@ -546,6 +565,37 @@ fn expr_is_deterministic(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2693: DuckDB nests `/* */`. The inner `*/` closes only the inner
+    /// comment, so `, now()` is live SQL after the outer one closes. A scan
+    /// that ends the comment at the first `*/` reads `'x */ , now() …` as a
+    /// string and hides the call, and a model is then judged pure.
+    /// Mutation that must turn this red: stop nesting in `sql_words`.
+    #[test]
+    fn a_volatile_call_after_a_nested_comment_is_still_seen() {
+        assert!(lexical_volatile_scan(
+            "select 1 /* /* */ 'x */ , now() as t from s.t"
+        ));
+    }
+
+    /// #2693: DuckDB reads `e'\''` as one string holding a quote. A scan that
+    /// ends the string at `\'` reads the rest as string text and hides the
+    /// `now()` that follows. Mutation that must turn this red: drop the
+    /// backslash-escape branch for `E'…'` in `sql_words`.
+    #[test]
+    fn a_volatile_call_after_an_escape_constant_string_is_still_seen() {
+        assert!(lexical_volatile_scan(
+            "select e'\\'' as q, now() as t from s.t"
+        ));
+    }
+
+    /// The plain string `'\'` ends at its second quote on DuckDB, so the
+    /// scan must still see the text after it. This pins the other side of the
+    /// E-string rule: backslash escapes apply only to `E'…'`.
+    #[test]
+    fn a_backslash_in_a_plain_string_does_not_escape_its_quote() {
+        assert!(lexical_volatile_scan("select '\\', now() as t from s.t"));
+    }
 
     #[test]
     fn volatile_builtin_scan_flags_clock_random_and_uuid() {

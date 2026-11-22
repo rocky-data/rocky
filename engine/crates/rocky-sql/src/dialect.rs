@@ -63,6 +63,20 @@ impl Dialect for DatabricksDialect {
     fn supports_select_wildcard_replace(&self) -> bool {
         true
     }
+
+    /// `/* /* */ */` is one comment. DuckDB and Databricks nest block
+    /// comments; the sqlparser default ends at the first `*/` (#2693).
+    fn supports_nested_comments(&self) -> bool {
+        true
+    }
+
+    /// Tokenise `E'…'` as one escape-constant literal, so `\'` is never read
+    /// as the end of the string (#2693). The expression parser accepts that
+    /// token only for the Postgres and Generic dialects, so here an `E'…'`
+    /// literal is refused with a parse error instead of being misread.
+    fn supports_string_escape_constant(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +157,74 @@ mod tests {
         // `EXCEPT` as a set operator must not be shadowed by the star form.
         crate::parser::parse_sql("SELECT a FROM t EXCEPT SELECT a FROM u")
             .expect("set-operator EXCEPT");
+    }
+
+    /// The projection count of the leftmost SELECT of a single query.
+    fn leftmost_projection_count(sql: &str) -> usize {
+        use sqlparser::ast::{SetExpr, Statement};
+        let stmts = crate::parser::parse_sql(sql).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+        let Statement::Query(q) = &stmts[0] else {
+            panic!("{sql:?} is not a query")
+        };
+        let mut body = q.body.as_ref();
+        loop {
+            match body {
+                SetExpr::Select(s) => return s.projection.len(),
+                SetExpr::SetOperation { left, .. } => body = left.as_ref(),
+                other => panic!("{sql:?}: unexpected body {other:?}"),
+            }
+        }
+    }
+
+    /// #2693: DuckDB nests `/* */` block comments, and so does Databricks.
+    /// The inner `*/` closes only the inner comment, so `z */` is still
+    /// commented out and the projection is `a`, `b`. Before the fix the first
+    /// `*/` closed the comment and `z */` broke the parse.
+    /// Mutation that must turn this red: drop `supports_nested_comments`.
+    #[test]
+    fn nested_block_comments_close_at_the_matching_delimiter() {
+        assert_eq!(
+            leftmost_projection_count("select a /* x /* y */ z */, b from t"),
+            2
+        );
+    }
+
+    /// #2693, the issue's first sample. The `*/` inside `-- */` closes the
+    /// outer nested comment on DuckDB too, so `, b` is commented out and the
+    /// left branch is the single column `a`. Before the fix the first `*/`
+    /// closed the comment, so the left branch read `a, b`.
+    #[test]
+    fn a_nested_comment_in_a_union_reads_the_column_list_duckdb_reads() {
+        let sql = "select a /* /* */, b -- */\n from t union all select a from u";
+        assert_eq!(leftmost_projection_count(sql), 1);
+    }
+
+    /// #2693, the issue's second sample: `e'\''` is an escape-constant string
+    /// on DuckDB and Postgres. Rocky refuses it with a parse error rather than
+    /// reading `\'` as the end of the string, so a check never judges a column
+    /// list it did not read. Before the fix the base parsed it, reading a
+    /// different column list.
+    /// Mutation that must turn this red: drop `supports_string_escape_constant`.
+    #[test]
+    fn an_escape_constant_string_is_refused_not_misread() {
+        let sql = "select e'\\'' as q, a from t -- '\nunion all select a, b from u";
+        let err = crate::parser::parse_sql(sql).expect_err("E'…' must be refused");
+        assert!(
+            err.to_string().contains("E'"),
+            "the refusal should name the E'…' token: {err}"
+        );
+    }
+
+    /// #2693: a plain string does NOT treat `\'` as an escape on DuckDB, so
+    /// `'\'` is a one-character string holding a backslash, and `, b` is the
+    /// next projection. Databricks, Snowflake and BigQuery read `\'` as an
+    /// escaped quote instead; Rocky has one parser for all of them and keeps
+    /// the DuckDB reading, the project default. Pinned so a change to it is
+    /// deliberate. Warehouses that disagree are a remaining risk (see the
+    /// report for #2693).
+    #[test]
+    fn a_backslash_quote_in_a_plain_string_ends_it_as_duckdb_does() {
+        assert_eq!(leftmost_projection_count("select '\\', b from t"), 2);
     }
 
     #[test]
