@@ -3688,13 +3688,13 @@ pub struct RunConfig {
     /// Run each model's sidecar `[[tests]]` against the table the run just
     /// built (#2611).
     ///
-    /// - `"off"` (default): no test query runs and the run output is
-    ///   unchanged. `rocky test --declarative` is then the only runner.
+    /// - `"off"`: no test query runs and the run output is unchanged.
+    ///   `rocky test --declarative` is then the only runner.
     /// - `"report"`: after each successful build, and before the model's
     ///   downstream builds, the model's tests run and their results are
     ///   recorded on the run (`test_results`). A failing test never fails the
     ///   model.
-    /// - `"enforce"`: as `report`, and an error-severity test that fails, or
+    /// - `"enforce"` (default): as `report`, and an error-severity test that fails, or
     ///   whose query cannot run, fails the model. Downstream models do not
     ///   build, exactly as for a failed build. The table the model wrote stays
     ///   in place: nothing is rolled back.
@@ -3711,12 +3711,12 @@ pub struct RunConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TestsOnRun {
-    /// No test runs during `rocky run`. The default.
-    #[default]
+    /// No test runs during `rocky run`.
     Off,
     /// Run the tests and record the results; never fail a model.
     Report,
-    /// Run the tests; an error-severity failure fails the model.
+    /// Run the tests; an error-severity failure fails the model. The default.
+    #[default]
     Enforce,
 }
 
@@ -10132,13 +10132,13 @@ impl ReplicationPipelineConfig {
 
 #[cfg(test)]
 mod tests {
-    /// `[run] tests_on_run` defaults to `off`, parses its three values and
-    /// refuses anything else (#2611).
+    /// `[run] tests_on_run` defaults to `enforce`, parses its three values
+    /// and refuses anything else (#2611).
     #[test]
-    fn tests_on_run_defaults_off_and_parses_three_modes() {
+    fn tests_on_run_defaults_enforce_and_parses_three_modes() {
         let run = |toml: &str| toml::from_str::<RunConfig>(toml);
-        assert_eq!(run("").unwrap().tests_on_run, TestsOnRun::Off);
-        assert!(!TestsOnRun::default().is_on());
+        assert_eq!(run("").unwrap().tests_on_run, TestsOnRun::Enforce);
+        assert_eq!(TestsOnRun::default(), TestsOnRun::Enforce);
         for (word, mode) in [
             ("off", TestsOnRun::Off),
             ("report", TestsOnRun::Report),
