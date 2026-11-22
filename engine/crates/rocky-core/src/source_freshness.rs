@@ -404,12 +404,18 @@ pub fn evaluate(
         };
         return (status, None);
     };
+    // Compare in milliseconds so a gap of N.9 s is not read as N s.
+    // `age` (whole seconds, truncated) is only the reported value.
+    let delta_ms = (now - max).num_milliseconds();
     let age = (now - max).num_seconds();
-    let exceeds =
-        |limit: Option<u64>| limit.is_some_and(|l| age > i64::try_from(l).unwrap_or(i64::MAX));
+    let exceeds = |limit: Option<u64>| {
+        limit.is_some_and(|l| delta_ms > i64::try_from(l).unwrap_or(i64::MAX).saturating_mul(1000))
+    };
     let status = if exceeds(thresholds.error_after_seconds) {
         FreshnessStatus::Error
-    } else if exceeds(thresholds.warn_after_seconds) || age < -FUTURE_SKEW_TOLERANCE_SECONDS {
+    } else if exceeds(thresholds.warn_after_seconds)
+        || delta_ms < -FUTURE_SKEW_TOLERANCE_SECONDS * 1000
+    {
         FreshnessStatus::Warn
     } else {
         FreshnessStatus::Pass

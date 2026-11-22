@@ -690,7 +690,11 @@ fn evaluate_artifact(
             ),
         });
     }
-    if (age_seconds as u64) > cfg.max_age_seconds {
+    // Exact comparison: a gap of N.9 s past the limit is expired, not N s.
+    let max_age =
+        chrono::TimeDelta::try_seconds(i64::try_from(cfg.max_age_seconds).unwrap_or(i64::MAX))
+            .unwrap_or(chrono::TimeDelta::MAX);
+    if now - artifact.signed_at > max_age {
         return Err(RejectedApproval {
             approval_id: artifact.approval_id.clone(),
             reason: "expired".to_string(),

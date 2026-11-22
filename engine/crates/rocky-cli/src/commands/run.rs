@@ -10030,7 +10030,10 @@ async fn run_batched_checks(
             match readable {
                 Some(fr) => match (fr.max_timestamp, fr.row_count) {
                     (Some(ts), _) => {
-                        let lag = (now - ts).num_seconds().unsigned_abs();
+                        // A timestamp in the future is not lag: it counts as 0.
+                        // A positive gap rounds up, so N.9 s is not read as N s.
+                        let gap_ms = (now - ts).num_milliseconds().max(0) as u64;
+                        let lag = gap_ms.div_ceil(1000);
                         Some((key, checks::grade_freshness(lag, &freshness_levels)))
                     }
                     (None, Some(rows)) if rows > 0 => Some((

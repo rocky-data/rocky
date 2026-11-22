@@ -1548,7 +1548,9 @@ impl Runner {
                         }
                         Some(max) => {
                             let lag = Utc::now() - max;
-                            let ok = lag.num_seconds() <= budget_seconds as i64;
+                            let ok = lag
+                                <= chrono::TimeDelta::try_seconds(budget_seconds as i64)
+                                    .unwrap_or(chrono::TimeDelta::MAX);
                             detail.push(format!(
                                 "MAX({}) = {max}, lag {}s, budget {budget_seconds}s",
                                 freshness.time_column,
