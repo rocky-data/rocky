@@ -17570,6 +17570,8 @@ async fn execute_one_plain_model(
     // This build created the target (first-run bootstrap): every row in it
     // is this build's, which the volume check reads.
     let mut bootstrapped = false;
+    // The existence probe's describe of a target that is already there.
+    let mut existing_target_columns = None;
     if strategy_mutates_existing_target {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
@@ -17586,7 +17588,10 @@ async fn execute_one_plain_model(
         // never classified transient, so first-run bootstrap stays intact on
         // every adapter.
         let target_absent = match warehouse.describe_table(&target_table_struct).await {
-            Ok(_) => false,
+            Ok(columns) => {
+                existing_target_columns = Some(columns);
+                false
+            }
             Err(e) if warehouse.classify_failure(&e).is_retryable() => {
                 return Err(anyhow::Error::from(e).context(format!(
                     "target existence probe for model '{model_name}' failed with a \
@@ -17658,6 +17663,24 @@ async fn execute_one_plain_model(
             }
             skip_strategy_exec = bootstrap_is_the_load;
             bootstrapped = true;
+        }
+    }
+    // A `merge` keeps a column its SQL stopped selecting (#2707). Warn and
+    // name it; never refuse, since `--full-refresh` does not rebuild a merge.
+    let mut merge_stale_note = None;
+    if let rocky_ir::MaterializationStrategy::Merge { .. } = &model_ir.materialization
+        && let Some(columns) = &existing_target_columns
+    {
+        merge_stale_note = super::run_incremental::merge_stale_columns_note(
+            &model_ir,
+            columns,
+            warehouse,
+            dialect,
+            &target_ref,
+        )
+        .await;
+        if let Some(note) = &merge_stale_note {
+            eprintln!("warning: {note}");
         }
     }
 
@@ -18005,6 +18028,7 @@ async fn execute_one_plain_model(
             })
             .into_iter()
             .chain(kind_probe_note)
+            .chain(merge_stale_note)
             .chain(incremental_notes)
             .chain(swap_notes)
             .collect(),
@@ -31402,6 +31426,273 @@ timestamp_column = "ts"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Run the `merge` model `mrg` (`unique_key = ["id"]`, target `tgt.mrg`)
+    /// once through `execute_one_plain_model`, with `typed` as the compiler's
+    /// output columns.
+    #[cfg(feature = "duckdb")]
+    async fn run_merge_model(
+        adapter: &dyn rocky_core::traits::WarehouseAdapter,
+        sql: &str,
+        typed: &[&str],
+    ) -> MaterializationOutput {
+        use rocky_core::models::load_model_pair;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("mrg.toml"),
+            "name = \"mrg\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\n\
+             [target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"mrg\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("mrg.sql"), sql).unwrap();
+        let model = load_model_pair(
+            &dir.path().join("mrg.sql"),
+            &dir.path().join("mrg.toml"),
+            None,
+        )
+        .expect("load merge model");
+        let mut typed_models = indexmap::IndexMap::new();
+        typed_models.insert(
+            "mrg".to_string(),
+            typed
+                .iter()
+                .map(|name| rocky_compiler::types::TypedColumn {
+                    name: (*name).to_string(),
+                    data_type: rocky_compiler::types::RockyType::Unknown,
+                    nullable: true,
+                })
+                .collect(),
+        );
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            product_volumes: None,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
+        super::execute_one_plain_model(
+            &model,
+            adapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "mrg",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("the merge run succeeds")
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn merge_fixture() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        use rocky_core::traits::WarehouseAdapter;
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, legacy VARCHAR, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES (1, 'a', TIMESTAMP '2026-03-01 10:00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        adapter
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn stale_notes(output: &MaterializationOutput) -> Vec<&String> {
+        output
+            .notes
+            .iter()
+            .filter(|n| n.contains("no longer outputs"))
+            .collect()
+    }
+
+    /// #2707: a `merge` model whose SQL stops selecting a column keeps that
+    /// column in its table. The run still succeeds, and warns with the
+    /// column's name. It does not suggest `--full-refresh` as a fix.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_warns_and_names_a_column_its_sql_dropped() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let adapter = merge_fixture().await;
+        let run1 = run_merge_model(
+            &adapter,
+            "SELECT id, legacy, ts FROM src.events",
+            &["id", "legacy", "ts"],
+        )
+        .await;
+        assert!(stale_notes(&run1).is_empty(), "{:?}", run1.notes);
+
+        adapter
+            .execute_statement(
+                "INSERT INTO src.events VALUES (2, 'b', TIMESTAMP '2026-03-02 10:00:00')",
+            )
+            .await
+            .unwrap();
+        let run2 = run_merge_model(&adapter, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+        let stale = stale_notes(&run2);
+        assert_eq!(stale.len(), 1, "{:?}", run2.notes);
+        assert!(
+            stale[0].contains("model 'mrg': the target tgt.mrg still has column(s) legacy that"),
+            "{}",
+            stale[0]
+        );
+        assert!(
+            stale[0].contains("`--full-refresh` does not rebuild a merge model"),
+            "{}",
+            stale[0]
+        );
+
+        // The column is still in the table, NULL in the new row.
+        let rows = adapter
+            .execute_query("SELECT id, legacy FROM tgt.mrg ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 2, "{:?}", rows.rows);
+        assert_eq!(rows.rows[1][1], serde_json::Value::Null, "{:?}", rows.rows);
+    }
+
+    /// #2707: an unchanged `merge` model gets no stale-column warning, also
+    /// when the compiler's typed list misses some of its columns (the zero-row
+    /// probe confirms they are still output).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_without_a_stale_column_does_not_warn() {
+        let adapter = merge_fixture().await;
+        let sql = "SELECT id, legacy, ts FROM src.events";
+        for typed in [&["id", "legacy", "ts"][..], &["id"][..]] {
+            let output = run_merge_model(&adapter, sql, typed).await;
+            assert!(
+                stale_notes(&output).is_empty(),
+                "{typed:?}: {:?}",
+                output.notes
+            );
+        }
+        let output = run_merge_model(&adapter, sql, &["id", "legacy", "ts"]).await;
+        assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+    }
+
+    /// How [`ProbeFault`] answers the stale-column check's zero-row query.
+    #[cfg(feature = "duckdb")]
+    #[derive(Clone, Copy)]
+    enum ProbeFaultMode {
+        /// The query fails.
+        Fail,
+        /// The query succeeds but reports no column names.
+        NoColumns,
+    }
+
+    /// DuckDB, except for the zero-row output probe (`_rocky_probe`), which
+    /// answers as `mode` says. Counts the probes it intercepted.
+    #[cfg(feature = "duckdb")]
+    struct ProbeFault<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        mode: ProbeFaultMode,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for ProbeFault<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            self.inner.execute_statement_with_stats(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            if !sql.contains("_rocky_probe") {
+                return self.inner.execute_query(sql).await;
+            }
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.mode {
+                ProbeFaultMode::Fail => Err(rocky_core::traits::AdapterError::msg(
+                    "injected probe failure",
+                )),
+                ProbeFaultMode::NoColumns => Ok(rocky_core::traits::QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                }),
+            }
+        }
+
+        fn classify_failure(
+            &self,
+            err: &rocky_core::traits::AdapterError,
+        ) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(err)
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// #2707: when the stale-column check's zero-row query fails, or reports
+    /// no column names, the merge run still succeeds and warns about nothing.
+    /// The probe count proves the check reached that query.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_a_failed_probe_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::Fail).await;
+    }
+
+    /// #2707: see [`merge_stale_check_with_a_failed_probe_stays_silent`]; here
+    /// the probe succeeds but reports no column names.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_no_probe_columns_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::NoColumns).await;
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_probe_fault_is_silent(mode: ProbeFaultMode) {
+        {
+            let adapter = merge_fixture().await;
+            run_merge_model(
+                &adapter,
+                "SELECT id, legacy, ts FROM src.events",
+                &["id", "legacy", "ts"],
+            )
+            .await;
+            let faulty = ProbeFault {
+                inner: &adapter,
+                mode,
+                probes: std::sync::atomic::AtomicUsize::new(0),
+            };
+            // `run_merge_model` panics if the run fails.
+            let output =
+                run_merge_model(&faulty, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+            assert_eq!(
+                faulty.probes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the check must reach the probe"
+            );
+            assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+        }
     }
 
     /// Fail-closed bootstrap — transformation path (`execute_one_plain_model`).
