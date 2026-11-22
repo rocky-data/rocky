@@ -369,6 +369,78 @@ class ModelDecisionOutput(BaseModel):
     """
 
 
+class ModelRunStatus1(StrEnum):
+    """
+    The model was materialized this run.
+    """
+
+    built = "built"
+
+
+class ModelRunStatus2(StrEnum):
+    """
+    The model's build or a post-write check failed, or it failed to compile.
+    """
+
+    failed = "failed"
+
+
+class ModelRunStatus3(StrEnum):
+    """
+    The model was not built on purpose. `reason` says why.
+    """
+
+    skipped = "skipped"
+
+
+class ModelRunStatus4(StrEnum):
+    """
+    The run ended before the model started.
+    """
+
+    not_started = "not_started"
+
+
+class ModelRunStatusReason1(StrEnum):
+    """
+    The skip gate proved the model unchanged.
+    """
+
+    unchanged = "unchanged"
+
+
+class ModelRunStatusReason2(StrEnum):
+    """
+    A prior run's bytes were reused instead of running the SQL.
+    """
+
+    reused = "reused"
+
+
+class ModelRunStatusReason3(StrEnum):
+    """
+    An upstream model failed. `blocked_by` names it.
+    """
+
+    upstream_failed = "upstream_failed"
+
+
+class ModelRunStatusReason4(StrEnum):
+    """
+    The run stopped (a fail-fast stop, or an interrupt) before this model.
+    """
+
+    run_stopped = "run_stopped"
+
+
+class ModelRunStatusReason5(StrEnum):
+    """
+    A freeze on the model's scope held it back.
+    """
+
+    frozen = "frozen"
+
+
 class OverrideMatchCountOutput(BaseModel):
     """
     How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
@@ -597,6 +669,37 @@ class RunStatus3(StrEnum):
     """
 
     SkippedInFlight = "SkippedInFlight"
+
+
+class RunTestResultOutput(BaseModel):
+    """
+    One `[[tests]]` outcome on [`RunOutput::test_results`].
+    """
+
+    column: str | None = None
+    """
+    The column the test checks, when it checks one.
+    """
+    detail: str | None = None
+    """
+    What the test found, or why it could not run.
+    """
+    model: str
+    """
+    The model the test belongs to.
+    """
+    severity: str
+    """
+    `error` or `warning`. Only `error` can fail a model.
+    """
+    status: str
+    """
+    `pass`, `fail`, or `error` (the test query could not run).
+    """
+    test_type: str
+    """
+    The test type (`not_null`, `unique`, `accepted_values`, ...).
+    """
 
 
 class Severity(StrEnum):
@@ -1155,6 +1258,38 @@ class Diagnostic(BaseModel):
     """
 
 
+class ModelRunStatusOutput(BaseModel):
+    """
+    One per-model entry on [`RunOutput::model_statuses`].
+
+    A roll-up of the run's other fields. It never changes build behavior.
+    """
+
+    blocked_by: list[str] | None = None
+    """
+    For `upstream_failed`: the failed or withheld upstream models that reach this one. Omitted when empty.
+    """
+    model: str
+    """
+    The model's name (matches the model entry in the project DAG).
+    """
+    reason: (
+        ModelRunStatusReason1
+        | ModelRunStatusReason2
+        | ModelRunStatusReason3
+        | ModelRunStatusReason4
+        | ModelRunStatusReason5
+        | None
+    ) = None
+    """
+    Why the model was skipped or not started. Omitted for `built` and `failed`.
+    """
+    status: ModelRunStatus1 | ModelRunStatus2 | ModelRunStatus3 | ModelRunStatus4
+    """
+    What happened to the model.
+    """
+
+
 class ProductBudgetCheck(BaseModel):
     """
     One limit of a product budget, checked against the product's charge.
@@ -1507,6 +1642,10 @@ class RunOutput(BaseModel):
     """
     Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.
     """
+    model_statuses: list[ModelRunStatusOutput] | None = None
+    """
+    What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`) only: a replication run, with or without models, never has it.
+    """
     override_match_counts: list[OverrideMatchCountOutput] | None = None
     """
     How many discovered tables each `[[table_overrides]]` rule matches, one row per rule in declaration order. Counted after `--filter` and BEFORE the warehouse check that excludes tables missing from the source, by the same function `rocky plan` calls, so the two report the same numbers for the same project. Empty (and omitted) when no rules are declared.
@@ -1567,6 +1706,10 @@ class RunOutput(BaseModel):
     Total number of failed tables/models for the run, **including** pre-execution compile failures: a model that fails to type-check is counted here even though it never reached the execution phase. This is the authoritative failure count — consumers should key overall pass/fail on the top-level `tables_failed` / `status` / `errors`, not on `execution.tables_failed`, which counts only execution-phase (copy / runtime) failures and excludes models excluded before execution.
     """
     tables_skipped: conint(ge=0) | None = None
+    test_results: list[RunTestResultOutput] | None = None
+    """
+    The `[[tests]]` this run evaluated after building models, one entry per test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run --tests`). Omitted when no test ran (`tests_on_run = "off"`, or a run that built no model with a `[[tests]]` entry). The default is `enforce`, so a default run lists its results here. The same list is persisted on the run record, where `rocky plan promote` reads it.
+    """
     verify_after_failed: bool | None = None
     """
     `true` when this run auto-applied additive schema drift whose post-apply `verify_after` gate did not confirm it.

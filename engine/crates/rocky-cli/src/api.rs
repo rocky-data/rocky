@@ -6954,6 +6954,8 @@ mod tests {
                 check_gate_failed: false,
                 verify_after_failed: false,
                 rocky_branch: None,
+                retry_of: None,
+                test_results: Vec::new(),
                 run_scope: Some(rocky_core::state::RunScope::Production),
                 queued_ms: None,
                 source_volumes: Vec::new(),
@@ -14165,6 +14167,7 @@ adapter = "db"
             approvals_rejected: Vec::new(),
             breaking_changes: None,
             allow_breaking: false,
+            allow_failing_tests: false,
             targets: vec![PromoteTargetPlan {
                 target: "warehouse.main.orders".to_string(),
                 source: "warehouse.branch__fix.orders".to_string(),

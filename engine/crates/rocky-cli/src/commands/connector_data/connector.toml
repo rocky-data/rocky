@@ -1,0 +1,15 @@
+# Manifest for the __NAME__ child connector. Rocky refuses unknown keys.
+protocol_version     = 0
+name                 = "__NAME__"
+command              = ["./main.py"]
+state_schema_version = 1
+# The hosts the connector calls, as a statement of intent. Rocky does not
+# enforce it.
+egress_hosts         = []
+
+# The license of the code in this directory, as an SPDX identifier. Rocky
+# reports it in the load output, and warns while it is not set.
+# license            = "..."
+
+[limits]
+wall_time_secs = 600

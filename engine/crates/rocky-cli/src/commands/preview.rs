@@ -3826,6 +3826,8 @@ mod tests {
             // `run_record()` test. `newest_branch_and_base_runs`'s
             // selection tests use `sample_run()` instead.
             rocky_branch: None,
+            retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(rocky_core::state::RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),

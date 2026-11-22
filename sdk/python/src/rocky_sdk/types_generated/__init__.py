@@ -259,7 +259,11 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ListSourceEntry": ("list_sources_schema", "ListSourceEntry"),
     "ListSourcesOutput": ("list_sources_schema", "ListSourcesOutput"),
     "ConnectorLoadInfo": ("load_schema", "ConnectorLoadInfo"),
+    "ConnectorTestOutput": ("connector_test_schema", "ConnectorTestOutput"),
+    "ConnectorTestRunOutput": ("connector_test_schema", "ConnectorTestRunOutput"),
+    "ConnectorTestStateCheck": ("connector_test_schema", "ConnectorTestStateCheck"),
     "ConnectorLoadStatus": ("load_schema", "ConnectorLoadStatus"),
+    "ConnectorSupportTier": ("load_schema", "ConnectorSupportTier"),
     "LoadFileOutput": ("load_schema", "LoadFileOutput"),
     "LoadOutput": ("load_schema", "LoadOutput"),
     "MaterializationMetadata": ("run_schema", "MaterializationMetadata"),
@@ -273,6 +277,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "MetricsSnapshot": ("run_schema", "MetricsSnapshot"),
     "MetricsSnapshotEntry": ("metrics_schema", "MetricsSnapshotEntry"),
     "ModelDecisionOutput": ("run_schema", "ModelDecisionOutput"),
+    "ModelRunStatusOutput": ("run_schema", "ModelRunStatusOutput"),
+    "RunTestResultOutput": ("run_schema", "RunTestResultOutput"),
     "ModelDetail": ("compile_schema", "ModelDetail"),
     "ModelEstimate": ("estimate_schema", "ModelEstimate"),
     "ModelExecutionRecord": ("model_history_schema", "ModelExecutionRecord"),
@@ -911,9 +917,15 @@ if TYPE_CHECKING:
     from .state_schedule_hold_schema import (
         ScheduleHoldOutput,
     )
+    from .connector_test_schema import (
+        ConnectorTestOutput,
+        ConnectorTestRunOutput,
+        ConnectorTestStateCheck,
+    )
     from .load_schema import (
         ConnectorLoadInfo,
         ConnectorLoadStatus,
+        ConnectorSupportTier,
         ContractResult,
         ContractViolation,
         LoadFileOutput,
@@ -1229,6 +1241,8 @@ __all__ = [
     "ContainedModelOutput",
     "ExcludedTableOutput",
     "ModelDecisionOutput",
+    "ModelRunStatusOutput",
+    "RunTestResultOutput",
     "OverrideMatchCountOutput",
     "OverrideWarningOutput",
     "QuarantineOutput",
@@ -1291,7 +1305,11 @@ __all__ = [
     "LoadOutput",
     "LoadFileOutput",
     "ConnectorLoadInfo",
+    "ConnectorTestOutput",
+    "ConnectorTestRunOutput",
+    "ConnectorTestStateCheck",
     "ConnectorLoadStatus",
+    "ConnectorSupportTier",
     # `rocky list pipelines / adapters / models / sources` (#1760).
     "ListPipelinesOutput",
     "ListPipelineEntry",

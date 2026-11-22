@@ -452,10 +452,16 @@ export type { GcPlanOutput } from "./gc_plan";
 export type {
   ConnectorLoadInfo,
   ConnectorLoadStatus,
+  ConnectorSupportTier,
   ContractResult,
   LoadFileOutput,
   LoadOutput,
 } from "./load";
+export type {
+  ConnectorTestOutput,
+  ConnectorTestRunOutput,
+  ConnectorTestStateCheck,
+} from "./connector_test";
 export type { PolicyCheckOutput } from "./policy_check";
 export type { PolicyFreezeOutput } from "./policy_freeze";
 export type { PolicyTestOutput, PolicyTestResult } from "./policy_test";
@@ -471,7 +477,7 @@ export type { RetentionStatusOutput } from "./retention_status";
 export type { ReviewOutput } from "./review";
 export type { ReviewQueueOutput } from "./review_queue";
 export type { ReviewStatusOutput } from "./review_status";
-export type { BudgetBreachOutput, CheckResult, ContainedModelOutput, ExcludedTableOutput, ModelDecisionOutput, OverrideMatchCountOutput, OverrideWarningOutput, QuarantineOutput, SourceVolumeCheckOutput, VolumeCheckOutput } from "./run";
+export type { BudgetBreachOutput, CheckResult, ContainedModelOutput, ExcludedTableOutput, ModelDecisionOutput, ModelRunStatusOutput, OverrideMatchCountOutput, OverrideWarningOutput, QuarantineOutput, RunTestResultOutput, SourceVolumeCheckOutput, VolumeCheckOutput } from "./run";
 export type { SeedOutput, SeedTableOutput } from "./seed";
 export type { RetentionSweepOutput } from "./state_retention_sweep";
 export type { ScheduleHoldOutput } from "./state_schedule_hold";

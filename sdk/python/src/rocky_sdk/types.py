@@ -476,6 +476,46 @@ class MetricsSnapshot(BaseModel):
     query_duration_max_ms: int
 
 
+class ModelRunStatus(BaseModel):
+    """What happened to one model in a transformation run.
+
+    Hand-written to match the engine's ``ModelRunStatusOutput``. Emitted on
+    :attr:`RunResult.model_statuses` only when at least one model did not build.
+    """
+
+    #: The model's name (matches the model entry in the project DAG).
+    model: str
+    #: ``built``, ``failed``, ``skipped`` or ``not_started``.
+    status: Literal["built", "failed", "skipped", "not_started"]
+    #: Why the model was skipped or not started: ``unchanged``, ``reused``,
+    #: ``upstream_failed``, ``frozen`` or ``run_stopped``. Omitted for built and failed.
+    reason: Literal["unchanged", "reused", "upstream_failed", "frozen", "run_stopped"] | None = None
+    #: For ``upstream_failed``: the failed or withheld upstream models.
+    blocked_by: list[str] = Field(default_factory=list)
+
+
+class RunTestResult(BaseModel):
+    """One ``[[tests]]`` outcome of a run.
+
+    Hand-written to match the engine's ``RunTestResultOutput``. Emitted on
+    :attr:`RunResult.test_results` only when the run evaluated tests
+    (``rocky run --tests report|enforce`` or ``[run] tests_on_run``).
+    """
+
+    #: The model the test belongs to.
+    model: str
+    #: The test type (``not_null``, ``unique``, ...).
+    test_type: str
+    #: The column the test checks, when it checks one.
+    column: str | None = None
+    #: ``error`` or ``warning``. Only ``error`` can fail a model.
+    severity: str
+    #: ``pass``, ``fail`` or ``error`` (the test query could not run).
+    status: str
+    #: What the test found, or why it could not run.
+    detail: str | None = None
+
+
 class ContainedModel(BaseModel):
     """A model Rocky withheld this run because an upstream failed.
 
@@ -615,6 +655,13 @@ class RunResult(BaseModel):
     #: ``RunOutput``), so a consumer mapping it — e.g. dagster-rocky surfacing
     #: the containment blast radius — would never see anything.
     contained: list[ContainedModel] = Field(default_factory=list)
+    #: Per-model outcome of a transformation run: built, failed, skipped or
+    #: not started. A roll-up of the other run fields. Empty and omitted on the
+    #: wire when every model was built.
+    model_statuses: list[ModelRunStatus] = Field(default_factory=list)
+    #: The ``[[tests]]`` the run evaluated after building models. Empty and
+    #: omitted on the wire unless tests ran (``--tests report|enforce``).
+    test_results: list[RunTestResult] = Field(default_factory=list)
     #: Tables filtered out before execution because they don't exist in
     #: the source warehouse. Empty when nothing was excluded. The CLI
     #: skips serializing this field when empty, so it remains backwards

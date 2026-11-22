@@ -134,9 +134,10 @@ Error: compilation failed with errors
 
 That is the gate doing its job. Follow the `help` line to clear it: add a
 `COALESCE` in `fct_user_activity.rocky`, give the compiler source schemas, or
-set `nullable = true` for those columns in the contract. A `where ... is not
-null` filter does not clear it, because Rocky does not read the filter when it
-infers nullability.
+set `nullable = true` for those columns in the contract and add a `not_null`
+test for each one to `fct_user_activity.toml`. A `where ... is not null` filter
+does not clear it, because Rocky does not read the filter when it infers
+nullability.
 
 ## What `rocky run` does here
 

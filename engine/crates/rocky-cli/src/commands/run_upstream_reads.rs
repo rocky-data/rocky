@@ -157,6 +157,25 @@ pub(crate) async fn run_model_statement(
     Ok(stats)
 }
 
+/// Preserve per-statement statistics when an adapter batches a partition replacement.
+pub(crate) async fn run_delete_insert(
+    warehouse: &dyn WarehouseAdapter,
+    statements: &[String],
+    acc: &mut UpstreamReadsAcc,
+) -> AdapterResult<Vec<ExecutionStats>> {
+    let measure_reads = !matches!(acc, UpstreamReadsAcc::Off);
+    let reports = warehouse
+        .execute_delete_insert(statements, measure_reads)
+        .await?;
+    Ok(reports
+        .into_iter()
+        .map(|(stats, reads)| {
+            acc.absorb(reads);
+            stats
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

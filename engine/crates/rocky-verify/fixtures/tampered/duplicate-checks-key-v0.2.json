@@ -1,0 +1,10 @@
+{
+  "manifest_version": "0.2",
+  "hash_scheme": "v1",
+  "producer": { "name": "rocky", "version": "1.56.0" },
+  "subject": { "model": "orders_clean", "status": "success" },
+  "program_hash": "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036",
+  "env_hash": "bbf2c2045328f738683a6336df5fa61b5f00076aeaed7c495c04f9d6991d92bd",
+  "checks": { "total": 4, "passed": 4, "failed": 0, "not_evaluated": 0 },
+  "checks": { "total": 9, "passed": 4, "failed": 0, "not_evaluated": 0 }
+}

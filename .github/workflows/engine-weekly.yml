@@ -266,13 +266,12 @@ jobs:
       # `signal 7` and never `No space left`. #1638 replaced the engine
       # rather than the disk. The reclaim stays: it is cheap, and it is what
       # gives the numbers below something to be early warning about.
-      - name: Free disk space and add swap
+      - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/share/boost /usr/share/swift \
                       /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
-          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
       # `apt-get update` exits non-zero when ANY configured source serves a
       # bad index, including the third-party ones the GitHub runner image
       # ships (Google Chrome, Microsoft). On 2026-09-09 Chrome's repo served
@@ -392,10 +391,9 @@ jobs:
       - name: Drop the cached bundled DuckDB sources
         shell: bash
         run: rm -rf "$GITHUB_WORKSPACE"/engine/target/duckdb-sources "$GITHUB_WORKSPACE"/engine/target/*/duckdb-sources
-      - name: Free disk space and add swap
+      - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
       # `apt-get update` exits non-zero when ANY configured source serves a
       # bad index, including the third-party ones the GitHub runner image
       # ships (Google Chrome, Microsoft). On 2026-09-09 Chrome's repo served
@@ -471,6 +469,61 @@ jobs:
         env:
           REQUIRE_DOCKER: "1"
         run: bash examples/playground/pocs/07-adapters/08-postgres-child-connector/run.sh
+
+      # The dlt connector shim with the real dlt. PR CI cannot run it: it
+      # needs dlt from PyPI. Every package comes from requirements.lock, which
+      # pins the whole dependency tree with hashes (pip --require-hashes).
+      # A fresh .venv first: run-all-duckdb.sh above may have made one from
+      # the unhashed requirements.txt. REQUIRE_DLT=1 makes a failed install a
+      # failure, not a skip. Then `rocky connector test` replays its spec.
+      - name: dlt connector shim (real dlt, hash-pinned)
+        if: ${{ !cancelled() }}
+        working-directory: ${{ github.workspace }}/examples/playground/pocs/07-adapters/10-dlt-connector-shim
+        timeout-minutes: 10
+        env:
+          REQUIRE_DLT: "1"
+        # requirements.lock is compiled for Python 3.12 on Linux x86_64.
+        # Known risk: when ubuntu-latest moves to an image with another Python,
+        # the version check below fails every week until the lock is
+        # recompiled for that Python. That is the intended failure. There is no
+        # setup-python step: a new action pin needs the allow-list first.
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), "requirements.lock is for Python 3.12, not " + sys.version'
+          rm -rf .venv
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet --require-hashes --no-deps -r requirements.lock
+          # Fail here if the hashed install is not enough, so run.sh never
+          # falls back to installing the unhashed requirements.txt.
+          .venv/bin/python -c "import dlt; print('dlt', dlt.__version__)"
+          bash run.sh
+          rocky -c rocky.toml connector test shop_orders --output table
+
+      # The Airbyte connector shim with no Docker: the POC's own declarative
+      # manifest run through airbyte-cdk against a local stub. PR CI cannot
+      # run it: it needs airbyte-cdk from PyPI. Every package comes from
+      # cdk/requirements.lock, the whole dependency tree pinned by hash.
+      # The lock is compiled for Python 3.12 on Linux x86_64, so the step
+      # checks for 3.12 first. REQUIRE_AIRBYTE_CDK=1 makes a missing install
+      # a failure, not a skip.
+      # Known risk: when ubuntu-latest moves to an image with another Python,
+      # this assert fails every week until cdk/requirements.lock is
+      # recompiled for that Python. That is the intended failure. There is no
+      # setup-python step: a new action pin needs the allow-list first.
+      - name: Airbyte connector shim, manifest mode (real airbyte-cdk, hash-pinned)
+        if: ${{ !cancelled() }}
+        working-directory: ${{ github.workspace }}/examples/playground/pocs/07-adapters/11-airbyte-connector-shim
+        timeout-minutes: 10
+        env:
+          REQUIRE_AIRBYTE_CDK: "1"
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), "cdk/requirements.lock is for Python 3.12, not " + sys.version'
+          rm -rf cdk/.venv
+          python3 -m venv cdk/.venv
+          cdk/.venv/bin/python -m pip install --quiet --require-hashes --no-deps -r cdk/requirements.lock
+          cdk/.venv/bin/python -m pip check
+          bash run-cdk.sh
 
       # The open-stack acceptance journey: the same connector in one project
       # with a product deadline, volume ranges, a monthly cost split, a

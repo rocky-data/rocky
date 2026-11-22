@@ -357,6 +357,7 @@ pub async fn run_transformation(
         }
     }
 
+    output.roll_up_model_statuses();
     output.duration_ms = start.elapsed().as_millis() as u64;
 
     // Compute per-model cost_usd from accumulated bytes / duration. The
@@ -459,6 +460,7 @@ pub async fn run_transformation(
         for m in &output.materializations {
             crate::status_line!("  {} ({})", m.asset_key.join("."), m.metadata.strategy);
         }
+        output.print_model_status_lines();
     }
 
     // Propagate a hard `[budget]` breach (`on_breach = "error"`) now that the
@@ -2180,6 +2182,7 @@ mod tests {
             full_refresh: false,
             no_sync_trigger: false,
             no_source_sync: false,
+            tests_on_run: None,
         };
         super::super::run::run(
             config_path,

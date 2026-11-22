@@ -165,7 +165,7 @@ pub fn generate_synthetic_project(size: usize, dir: &Path) {
         if use_rocky {
             // Rocky DSL: from + where + group with aggregations + HAVING
             let rocky = format!(
-                "-- Intermediate: aggregate {dep1}\nfrom {dep1}\nwhere rn == 1\ngroup id {{\n    record_count: count(),\n    total_amount: sum(amount),\n    avg_amount: avg(amount),\n    first_seen: min(created_at),\n    last_seen: max(created_at)\n}}\nwhere record_count >= 2\n"
+                "-- Intermediate: aggregate {dep1}\nfrom {dep1}\nwhere rn == 1\ngroup id, name_clean {{\n    record_count: count(),\n    total_amount: sum(amount),\n    avg_amount: avg(amount),\n    first_seen: min(created_at),\n    last_seen: max(created_at)\n}}\nwhere record_count >= 2\n"
             );
             fs::write(models_dir.join(format!("{name}.rocky")), &rocky).unwrap();
         } else {
@@ -179,7 +179,7 @@ pub fn generate_synthetic_project(size: usize, dir: &Path) {
                 ",\n        b.category_clean AS category"
             };
             let sql = format!(
-                "WITH base AS (\n    SELECT\n        a.id,\n        a.name_clean AS name,\n        a.amount,\n        a.created_at{extra_col}\n    FROM {dep1} a\n    JOIN {dep2} b ON a.id = b.id{extra_join}\n    WHERE a.rn = 1\n)\nSELECT\n    id,\n    name,\n    category,\n    COUNT(*) AS record_count,\n    SUM(amount) AS total_amount,\n    AVG(amount) AS avg_amount,\n    MIN(created_at) AS first_seen,\n    MAX(created_at) AS last_seen\nFROM base\nGROUP BY id, name, category"
+                "WITH base AS (\n    SELECT\n        a.id,\n        a.name_clean,\n        a.amount,\n        a.created_at{extra_col}\n    FROM {dep1} a\n    JOIN {dep2} b ON a.id = b.id{extra_join}\n    WHERE a.rn = 1\n)\nSELECT\n    id,\n    name_clean,\n    category,\n    COUNT(*) AS record_count,\n    SUM(amount) AS total_amount,\n    AVG(amount) AS avg_amount,\n    MIN(created_at) AS first_seen,\n    MAX(created_at) AS last_seen\nFROM base\nGROUP BY id, name_clean, category"
             );
             fs::write(models_dir.join(format!("{name}.sql")), &sql).unwrap();
         }
@@ -197,7 +197,7 @@ pub fn generate_synthetic_project(size: usize, dir: &Path) {
             "name = \"{name}\"\ndepends_on = [\"{int_dep}\", \"{stg_dep}\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"marts\"\ntable = \"{name}\"\n"
         );
         let sql = format!(
-            "SELECT\n    i.id,\n    i.name,\n    i.total_amount,\n    i.record_count,\n    i.avg_amount,\n    CASE\n        WHEN i.total_amount > 10000 THEN 'high'\n        WHEN i.total_amount > 1000 THEN 'medium'\n        ELSE 'low'\n    END AS tier,\n    SUM(i.total_amount) OVER (ORDER BY i.first_seen ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_total,\n    RANK() OVER (ORDER BY i.total_amount DESC) AS amount_rank\nFROM {int_dep} i\nLEFT JOIN {stg_dep} s ON i.id = s.id\nWHERE i.record_count >= 2"
+            "SELECT\n    i.id,\n    i.name_clean AS name,\n    i.total_amount,\n    i.record_count,\n    i.avg_amount,\n    CASE\n        WHEN i.total_amount > 10000 THEN 'high'\n        WHEN i.total_amount > 1000 THEN 'medium'\n        ELSE 'low'\n    END AS tier,\n    SUM(i.total_amount) OVER (ORDER BY i.first_seen ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_total,\n    RANK() OVER (ORDER BY i.total_amount DESC) AS amount_rank\nFROM {int_dep} i\nLEFT JOIN {stg_dep} s ON i.id = s.id\nWHERE i.record_count >= 2"
         );
         fs::write(models_dir.join(format!("{name}.sql")), &sql).unwrap();
         fs::write(models_dir.join(format!("{name}.toml")), &toml).unwrap();
@@ -249,7 +249,7 @@ fn durations_to_result(
     }
 }
 
-fn bench_compile(model_count: usize, iterations: usize) -> Vec<BenchResult> {
+fn bench_compile(model_count: usize, iterations: usize) -> Result<Vec<BenchResult>> {
     let dir = tempfile::TempDir::new().unwrap();
     generate_synthetic_project(model_count, dir.path());
 
@@ -268,6 +268,12 @@ fn bench_compile(model_count: usize, iterations: usize) -> Vec<BenchResult> {
         ..Default::default()
     };
 
+    // A benchmark of a failing compile is a false number (#2677): the
+    // compiler still returns `Ok` with error diagnostics, so check them once
+    // before timing anything. The project is deterministic, so one clean
+    // compile stands for every timed one.
+    ensure_compiles_clean(&config)?;
+
     let times = measure(iterations, || {
         compile(&config).unwrap();
     });
@@ -275,12 +281,35 @@ fn bench_compile(model_count: usize, iterations: usize) -> Vec<BenchResult> {
     let mean_ms = times.iter().map(|t| t.as_secs_f64() * 1000.0).sum::<f64>() / times.len() as f64;
     let throughput = format!("{:.0} models/sec", model_count as f64 / (mean_ms / 1000.0));
 
-    vec![durations_to_result(
+    Ok(vec![durations_to_result(
         "cold_compile",
         &format!("{model_count}_models"),
         &times,
         Some(throughput),
-    )]
+    )])
+}
+
+/// Refuse to benchmark a project that does not compile cleanly.
+///
+/// `compile` returns `Ok` with error diagnostics, so `unwrap` alone would
+/// time a project Rocky refuses. Names the first errors so the generator bug
+/// is easy to find.
+fn ensure_compiles_clean(config: &CompilerConfig) -> Result<()> {
+    let result = compile(config).context("benchmark project failed to compile")?;
+    if !result.has_errors {
+        return Ok(());
+    }
+    let errors: Vec<String> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error())
+        .take(3)
+        .map(|d| format!("{}: [{}] {}", d.model, d.code, d.message))
+        .collect();
+    anyhow::bail!(
+        "the benchmark project has compile errors, so its timings would be false; first errors: {}",
+        errors.join("; ")
+    )
 }
 
 fn bench_dag(iterations: usize) -> Vec<BenchResult> {
@@ -393,20 +422,34 @@ fn bench_sql_gen(iterations: usize) -> Result<Vec<BenchResult>> {
     Ok(results)
 }
 
-fn bench_startup(iterations: usize) -> Vec<BenchResult> {
-    let times = measure(iterations.min(5), || {
+fn bench_startup(iterations: usize) -> Result<Vec<BenchResult>> {
+    let version_command = || {
         let mut command = std::process::Command::new("cargo");
         rocky_core::process::strip_dagster_pipes_env(&mut command);
-        let _ = command
-            .args(["run", "-q", "-p", "rocky", "--", "--version"])
-            .output();
+        command.args(["run", "-q", "-p", "rocky", "--", "--version"]);
+        command
+    };
+    // Same rule as `bench_compile` (#2677): never time a command that
+    // fails. Check the exit status once, before the timed runs.
+    let output = version_command()
+        .output()
+        .context("failed to run `cargo run -p rocky -- --version` for the startup benchmark")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`cargo run -p rocky -- --version` exited with {}, so its timings would be false: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let times = measure(iterations.min(5), || {
+        let _ = version_command().output();
     });
-    vec![durations_to_result(
+    Ok(vec![durations_to_result(
         "startup",
         "binary_version",
         &times,
         None,
-    )]
+    )])
 }
 
 // ---------------------------------------------------------------------------
@@ -433,10 +476,10 @@ pub fn run_bench(
 
     for g in &groups {
         match *g {
-            "compile" => results.extend(bench_compile(model_count, iterations)),
+            "compile" => results.extend(bench_compile(model_count, iterations)?),
             "dag" => results.extend(bench_dag(iterations)),
             "sql_gen" => results.extend(bench_sql_gen(iterations)?),
-            "startup" => results.extend(bench_startup(iterations)),
+            "startup" => results.extend(bench_startup(iterations)?),
             other => anyhow::bail!("unknown benchmark group: {other}"),
         }
     }
@@ -543,5 +586,72 @@ fn format_time(us: f64) -> String {
         format!("{:.2}ms", us / 1000.0)
     } else {
         format!("{:.2}s", us / 1_000_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_for(dir: &Path) -> CompilerConfig {
+        CompilerConfig {
+            models_dir: dir.join("models"),
+            contracts_dir: None,
+            source_schemas: HashMap::new(),
+            ..Default::default()
+        }
+    }
+
+    /// #2677: the generated project must compile with no error diagnostic,
+    /// or `bench compile` times a project Rocky refuses. 100 models (the
+    /// default) is already enough for marts to read the DSL intermediates
+    /// that used to lack `name`.
+    #[test]
+    fn the_generated_project_compiles_without_errors() {
+        for size in [10, 100, 1000] {
+            let dir = tempfile::TempDir::new().unwrap();
+            generate_synthetic_project(size, dir.path());
+            ensure_compiles_clean(&config_for(dir.path())).unwrap_or_else(|e| {
+                panic!("the {size}-model benchmark project must compile cleanly: {e:#}")
+            });
+        }
+    }
+
+    #[test]
+    fn a_project_with_a_compile_error_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        generate_synthetic_project(100, dir.path());
+        // Every mart, not the first one `read_dir` returns (#2699). A mart
+        // that also joins a model with an incomplete schema gets no E039 for
+        // `i.no_such_column`: DuckDB could read it as a field of a struct
+        // column `i` in that model (#2701). The marts that join only complete
+        // models do report it.
+        let models = dir.path().join("models");
+        let marts: Vec<_> = fs::read_dir(&models)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "sql")
+                    && p.file_name().unwrap().to_string_lossy().starts_with("fct_")
+            })
+            .collect();
+        assert!(!marts.is_empty(), "the project has marts");
+        for mart in &marts {
+            let sql = fs::read_to_string(mart).unwrap();
+            assert!(sql.contains("i.id,"), "{} reads i.id", mart.display());
+            fs::write(
+                mart,
+                sql.replacen("i.id,", "i.id,\n    i.no_such_column,", 1),
+            )
+            .unwrap();
+        }
+
+        let err = ensure_compiles_clean(&config_for(dir.path()))
+            .expect_err("a project with an E039 must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("compile errors") && rendered.contains("E039"),
+            "the refusal must say why and name the code, got: {rendered}"
+        );
     }
 }

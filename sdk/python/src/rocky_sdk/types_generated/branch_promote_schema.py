@@ -65,6 +65,30 @@ class AuditEventKind5(StrEnum):
 
 class AuditEventKind6(StrEnum):
     """
+    Emitted when the promote was refused (#2609). Either a model's newest test evidence holds an error-severity `[[tests]]` failure, or the evidence is missing: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. `reason` names each cause.
+    """
+
+    failing_tests_blocked = "failing_tests_blocked"
+
+
+class AuditEventKind7(StrEnum):
+    """
+    Emitted when the operator overrode a refusal with `--allow-failing-tests`. The refusal was a failing error-severity test or missing test evidence. `reason` names which.
+    """
+
+    failing_tests_allowed = "failing_tests_allowed"
+
+
+class AuditEventKind8(StrEnum):
+    """
+    Emitted when the promote has no passing test evidence to rely on: the branch has no run, its newest run failed, a model that declares error-severity tests was last built with no recorded test result, or the models could not be loaded to tell. Each such gap refuses the promote, and this event records it when `--allow-failing-tests` overrode the refusal. It is also recorded, with no flag, for what Rocky could not check here, which only warns: no branch run in the local state store under a remote `[state]` backend, or a pipeline whose models directory does not exist. `reason` says which.
+    """
+
+    test_evidence_missing = "test_evidence_missing"
+
+
+class AuditEventKind9(StrEnum):
+    """
     Emitted by `rocky plan promote` when the plan has been successfully written to `.rocky/plans/<plan_id>.json`. Carries the plan_id so an audit consumer can correlate plan creation to a subsequent `rocky apply` event without scanning the filesystem.
     """
 
@@ -499,6 +523,9 @@ class AuditEvent(BaseModel):
         | AuditEventKind4
         | AuditEventKind5
         | AuditEventKind6
+        | AuditEventKind7
+        | AuditEventKind8
+        | AuditEventKind9
     )
     """
     Categorical kind of an [`AuditEvent`] emitted by `branch promote`.

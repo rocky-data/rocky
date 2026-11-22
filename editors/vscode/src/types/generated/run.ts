@@ -132,6 +132,14 @@ export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evalua
  */
 export type ModelDecision = "build" | "skip" | "reused";
 /**
+ * Why a model has status `skipped` or `not_started`.
+ */
+export type ModelRunStatusReason = "unchanged" | "reused" | "upstream_failed" | "run_stopped" | "frozen";
+/**
+ * What happened to one model in a transformation run.
+ */
+export type ModelRunStatus = "built" | "failed" | "skipped" | "not_started";
+/**
  * Which `[product_budget.<name>]` limit a [`ProductBudgetCheck`] tests.
  */
 export type ProductBudgetLimitType = "max_compute_hours" | "max_storage_gb_month" | "max_usd";
@@ -236,6 +244,10 @@ export interface RunOutput {
    */
   model_decisions?: ModelDecisionOutput[];
   /**
+   * What happened to each model this run was asked to build: built, failed, skipped or never started. A roll-up of `materializations`, `errors`, `model_decisions` and `contained`; it changes none of them. Empty (and omitted) when every model was built, so a clean run is unchanged on the wire. Transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`) only: a replication run, with or without models, never has it.
+   */
+  model_statuses?: ModelRunStatusOutput[];
+  /**
    * How many discovered tables each `[[table_overrides]]` rule matches, one row per rule in declaration order. Counted after `--filter` and BEFORE the warehouse check that excludes tables missing from the source, by the same function `rocky plan` calls, so the two report the same numbers for the same project. Empty (and omitted) when no rules are declared.
    */
   override_match_counts?: OverrideMatchCountOutput[];
@@ -295,6 +307,10 @@ export interface RunOutput {
    */
   tables_failed: number;
   tables_skipped?: number;
+  /**
+   * The `[[tests]]` this run evaluated after building models, one entry per test (`[run] tests_on_run = "report" | "enforce"`, or `rocky run --tests`). Omitted when no test ran (`tests_on_run = "off"`, or a run that built no model with a `[[tests]]` entry). The default is `enforce`, so a default run lists its results here. The same list is persisted on the run record, where `rocky plan promote` reads it.
+   */
+  test_results?: RunTestResultOutput[];
   /**
    * `true` when this run auto-applied additive schema drift whose post-apply `verify_after` gate did not confirm it.
    *
@@ -844,6 +860,30 @@ export interface ModelDecisionOutput {
   [k: string]: unknown;
 }
 /**
+ * One per-model entry on [`RunOutput::model_statuses`].
+ *
+ * A roll-up of the run's other fields. It never changes build behavior.
+ */
+export interface ModelRunStatusOutput {
+  /**
+   * For `upstream_failed`: the failed or withheld upstream models that reach this one. Omitted when empty.
+   */
+  blocked_by?: string[];
+  /**
+   * The model's name (matches the model entry in the project DAG).
+   */
+  model: string;
+  /**
+   * Why the model was skipped or not started. Omitted for `built` and `failed`.
+   */
+  reason?: ModelRunStatusReason | null;
+  /**
+   * What happened to the model.
+   */
+  status: ModelRunStatus;
+  [k: string]: unknown;
+}
+/**
  * How many discovered tables one `[[table_overrides]]` rule matches. See [`RunOutput::override_match_counts`] and [`PlanOutput::override_match_counts`].
  */
 export interface OverrideMatchCountOutput {
@@ -1162,5 +1202,35 @@ export interface SourceVolumeCheckOutput {
    * `in_range`, `below_min`, `above_max`, or `not_evaluated`. At `error`, an out-of-range count and a count that could not be taken both refuse the output model; a cancelled run refuses nothing.
    */
   verdict: VolumeVerdict;
+  [k: string]: unknown;
+}
+/**
+ * One `[[tests]]` outcome on [`RunOutput::test_results`].
+ */
+export interface RunTestResultOutput {
+  /**
+   * The column the test checks, when it checks one.
+   */
+  column?: string | null;
+  /**
+   * What the test found, or why it could not run.
+   */
+  detail?: string | null;
+  /**
+   * The model the test belongs to.
+   */
+  model: string;
+  /**
+   * `error` or `warning`. Only `error` can fail a model.
+   */
+  severity: string;
+  /**
+   * `pass`, `fail`, or `error` (the test query could not run).
+   */
+  status: string;
+  /**
+   * The test type (`not_null`, `unique`, `accepted_values`, ...).
+   */
+  test_type: string;
   [k: string]: unknown;
 }

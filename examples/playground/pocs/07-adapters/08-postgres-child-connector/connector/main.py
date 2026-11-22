@@ -22,6 +22,13 @@ that tie at M are never split across two runs. On a quiet source the newest
 rows wait until newer data arrives. The new cursor is the maximum of the
 extracted rows. When no row is extracted, the cursor does not change and no
 file is written.
+
+Replay mode, for `rocky connector test`: when the options set
+`replay_fixture` (a path relative to this file), the connector reads a local
+DuckDB catalog named `pg`, built from that SQL file, instead of Postgres. It
+runs the same two queries. It does not install or load the postgres
+extension, and it reads no PG* variable. A missing fixture fails the run; it
+never falls back to Postgres. The log says the run is a replay.
 """
 
 import json
@@ -85,6 +92,19 @@ def load_source(request):
     for key in ("schema", "table", "cursor_column"):
         if not isinstance(source.get(key), str) or not source[key]:
             fail("[connector.<name>.options] needs a non-empty string %r" % key)
+    if "replay_sql" in source:
+        # The key is internal: it holds the fixture's text.
+        fail("replay_sql is not an option; set replay_fixture to a SQL file")
+    replay = source.get("replay_fixture")
+    if replay is not None:
+        if not isinstance(replay, str) or not replay:
+            fail("replay_fixture must be a non-empty string")
+        path = os.path.join(HERE, replay)
+        if not os.path.isfile(path):
+            fail("replay_fixture %s does not exist" % replay)
+        with open(path, encoding="utf-8") as handle:
+            source["replay_sql"] = handle.read()
+        log("replay: reading %s instead of Postgres" % replay)
     ext_dir = source.get("extension_directory") or ".duckdb-extensions"
     # A relative directory is relative to this file, not to the scratch
     # directory, so the extension downloads once and stays out of the landing.
@@ -111,6 +131,17 @@ def parse_results(stdout):
 
 
 def run_duckdb(source, sql):
+    if "replay_sql" in source:
+        # Each call is a new duckdb process, so the fixture loads every time.
+        preamble = "\n".join(
+            [
+                "SET TimeZone = 'UTC';",
+                "ATTACH ':memory:' AS pg;",
+                "USE pg;",
+                source["replay_sql"],
+            ]
+        )
+        return _run_duckdb(preamble + "\n" + sql + "\n")
     preamble = "\n".join(
         [
             "SET TimeZone = 'UTC';",
@@ -123,10 +154,14 @@ def run_duckdb(source, sql):
             "ATTACH '' AS pg (TYPE postgres, READ_ONLY);",
         ]
     )
+    return _run_duckdb(preamble + "\n" + sql + "\n")
+
+
+def _run_duckdb(script):
     try:
         done = subprocess.run(
             ["duckdb", "-json", "-bail"],
-            input=preamble + "\n" + sql + "\n",
+            input=script,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,

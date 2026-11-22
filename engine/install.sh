@@ -107,18 +107,96 @@ ARCHIVE="rocky-${TARGET}.tar.gz"
 # Capture the full API response before piping through grep — piping directly
 # from curl/wget into grep causes set -o pipefail to abort the script when
 # grep exits 1 (no match found on old/pre-release tags).
-if [[ -z "${ROCKY_VERSION:-}" ]]; then
-    API_RESPONSE="$(download_file "https://api.github.com/repos/${REPO}/releases?per_page=30")"
-    ROCKY_VERSION="$(echo "${API_RESPONSE}" \
-        | grep '"tag_name"' \
-        | sed 's/.*"tag_name": "//;s/".*//' \
+#
+# The API call sends no token. Without one, GitHub allows 60 API requests per
+# hour per IP address, and shared CI runners can use that up, so the call fails
+# with a 403 (#2684). When the API call fails, and only then, read the tags over
+# git instead (resolve_version_from_tags below), which needs no token either.
+
+# Print the HTTP status of a HEAD request to $1, after redirects. Prints an
+# empty string when no response arrives.
+http_status() {
+    local url="$1"
+    if [[ "${DOWNLOADER}" == "curl" ]]; then
+        curl -sIL --retry 3 -o /dev/null -w '%{http_code}' "${url}" || true
+    else
+        # wget prints each response's status line indented; the last is the
+        # status after redirects. wget exits non-zero on a 404.
+        { wget --spider -S "${url}" 2>&1 || true; } \
+            | awk '/^ *HTTP\// { code = $2 } END { print code }'
+    fi
+}
+
+# Resolve the newest engine release from the git tags, for when the API call
+# fails. A tag can exist without release assets (a draft release, or a deleted
+# one), so take the newest of the five highest engine tags whose archive for
+# this platform answers 200. Only a 404 skips a tag. Any other status stops the
+# script, so a transient error never installs an older engine. Prints the tag
+# on stdout; messages go to stderr.
+resolve_version_from_tags() {
+    if ! command -v git >/dev/null 2>&1; then
+        echo "Error: the GitHub API call failed, and git is not installed to read the tags instead." >&2
+        echo "  Set ROCKY_VERSION (for example ROCKY_VERSION=${TAG_PREFIX}1.0.0) and retry." >&2
+        return 1
+    fi
+    # Run git outside any repository and with no user or system config, so it
+    # cannot pick up a checkout's auth header, a credential helper or a URL
+    # rewrite that carries a token. GIT_CONFIG_GLOBAL needs git 2.32 or newer,
+    # so HOME and XDG_CONFIG_HOME also point at a directory that does not
+    # exist, for older git. Config passed through the environment (GIT_DIR,
+    # GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT) and the askpass helpers that
+    # could answer a credential prompt (GIT_ASKPASS, SSH_ASKPASS) are cleared.
+    # stdin is closed because this script is often piped into bash.
+    local refs
+    if ! refs="$(cd / && env -u GIT_DIR -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_ASKPASS -u SSH_ASKPASS \
+            HOME=/nonexistent-rocky-install XDG_CONFIG_HOME=/nonexistent-rocky-install \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+            git ls-remote --tags --refs "https://github.com/${REPO}.git" "${TAG_PREFIX}*" </dev/null)"; then
+        echo "Error: git ls-remote against https://github.com/${REPO}.git failed. Set ROCKY_VERSION and retry." >&2
+        return 1
+    fi
+    local candidates
+    candidates="$(printf '%s\n' "${refs}" \
+        | sed 's#.*refs/tags/##' \
         | grep -E "^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" \
         | sort -V -r \
-        | head -1 \
+        | head -5 \
         || true)"
-    if [[ -z "${ROCKY_VERSION}" ]]; then
-        echo "Error: Failed to determine latest engine version (tag prefix '${TAG_PREFIX}'). Set ROCKY_VERSION manually." >&2
-        exit 1
+    local candidate status
+    for candidate in ${candidates}; do
+        status="$(http_status "https://github.com/${REPO}/releases/download/${candidate}/${ARCHIVE}")"
+        if [[ "${status}" == "200" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+        if [[ "${status}" != "404" ]]; then
+            echo "Error: checking ${candidate} returned HTTP ${status:-none}; refusing to fall back to an older engine." >&2
+            return 1
+        fi
+        echo "  Skipping ${candidate}: no release assets (HTTP 404)." >&2
+    done
+    echo "Error: no engine release with assets for ${TARGET} among the five newest ${TAG_PREFIX}* tags. Set ROCKY_VERSION and retry." >&2
+    return 1
+}
+
+if [[ -z "${ROCKY_VERSION:-}" ]]; then
+    if API_RESPONSE="$(download_file "https://api.github.com/repos/${REPO}/releases?per_page=30")"; then
+        ROCKY_VERSION="$(echo "${API_RESPONSE}" \
+            | grep '"tag_name"' \
+            | sed 's/.*"tag_name": "//;s/".*//' \
+            | grep -E "^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" \
+            | sort -V -r \
+            | head -1 \
+            || true)"
+        if [[ -z "${ROCKY_VERSION}" ]]; then
+            echo "Error: Failed to determine latest engine version (tag prefix '${TAG_PREFIX}'). Set ROCKY_VERSION manually." >&2
+            exit 1
+        fi
+    else
+        echo "The GitHub API call failed (often its rate limit). Reading the engine tags with git ls-remote instead." >&2
+        if ! ROCKY_VERSION="$(resolve_version_from_tags)"; then
+            exit 1
+        fi
     fi
 fi
 

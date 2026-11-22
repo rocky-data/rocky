@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use rocky_verify::{MANIFEST_SCHEMA_V0_1, VerifyError, VerifyReport, verify_file};
+use rocky_verify::{
+    AssertedClaims, MANIFEST_SCHEMA_V0_1, MANIFEST_SCHEMA_V0_2, SchemaVersion, VerifyError,
+    VerifyReport, verify_file,
+};
 
 #[derive(Parser)]
 #[command(
@@ -48,17 +51,31 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Print the embedded rocky-manifest v0.1 JSON Schema to stdout.
-    Schema,
+    /// Print an embedded rocky-manifest JSON Schema to stdout (v0.1 by default).
+    Schema {
+        /// Which schema version to print: `0.1` or `0.2`.
+        #[arg(long, value_name = "VERSION", default_value = "0.1")]
+        version: String,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Schema => {
-            println!("{MANIFEST_SCHEMA_V0_1}");
-            ExitCode::SUCCESS
-        }
+        Command::Schema { version } => match version.as_str() {
+            "0.1" => {
+                println!("{MANIFEST_SCHEMA_V0_1}");
+                ExitCode::SUCCESS
+            }
+            "0.2" => {
+                println!("{MANIFEST_SCHEMA_V0_2}");
+                ExitCode::SUCCESS
+            }
+            other => {
+                eprintln!("rocky-verify: unknown schema version {other:?} (use 0.1 or 0.2)");
+                ExitCode::from(2)
+            }
+        },
         Command::Verify {
             manifest,
             artifacts_dir,
@@ -84,6 +101,48 @@ fn main() -> ExitCode {
     }
 }
 
+const ASSERTED: &str = "(asserted by the producer, not verified)";
+
+/// Escape a claim string so no control character can reach the terminal.
+fn esc(s: &str) -> String {
+    s.escape_debug().to_string()
+}
+
+/// The effect as shown to a person. `require_review` is not an approval.
+fn effect_label(effect: &str) -> String {
+    if effect == "require_review" {
+        "require_review (review was not enforced on this run)".to_string()
+    } else {
+        esc(effect)
+    }
+}
+
+fn print_claims(claims: &AssertedClaims) {
+    if let Some(p) = &claims.policy {
+        let rule = p
+            .rule_id
+            .map_or_else(|| "default".to_string(), |r| r.to_string());
+        println!(
+            "  policy:  {} for {} (rule {rule}, ledger {}) {ASSERTED}",
+            effect_label(&p.effect),
+            esc(&p.principal),
+            esc(&p.ledger_ref)
+        );
+    }
+    for (label, c) in [("checks", &claims.checks), ("tests", &claims.tests)] {
+        if let Some(c) = c {
+            println!(
+                "  {label}:{pad}{} total, {} passed, {} failed, {} not evaluated {ASSERTED}",
+                c.total,
+                c.passed,
+                c.failed,
+                c.not_evaluated,
+                pad = if label == "tests" { "   " } else { "  " }
+            );
+        }
+    }
+}
+
 fn report_error(e: &VerifyError) {
     eprintln!("rocky-verify: {e}");
 }
@@ -91,12 +150,21 @@ fn report_error(e: &VerifyError) {
 fn print_human(manifest: &std::path::Path, report: &VerifyReport) {
     println!("manifest: {}", manifest.display());
     if report.schema_valid {
-        println!("  schema:  OK (rocky-manifest v0.1)");
+        println!(
+            "  schema:  OK (rocky-manifest {})",
+            report.schema_version.label()
+        );
     } else {
         println!("  schema:  FAILED");
         for err in &report.schema_errors {
-            println!("    - {err}");
+            println!("    - {}", esc(err));
         }
+    }
+    if report.schema_valid
+        && report.schema_version == SchemaVersion::V0_2
+        && let Some(claims) = &report.claims
+    {
+        print_claims(claims);
     }
     if report.artifact_checks.is_empty() {
         println!("  bytes:   (not checked — no output artifacts verified)");
@@ -154,13 +222,20 @@ fn print_json(manifest: &std::path::Path, report: &VerifyReport) {
             })
         })
         .collect();
-    let out = serde_json::json!({
+    let mut out = serde_json::json!({
         "manifest": manifest.display().to_string(),
         "passed": report.passed(),
         "schema_valid": report.schema_valid,
         "schema_errors": report.schema_errors,
         "artifact_checks": artifacts,
+        "schema_version": report.schema_version.label().trim_start_matches('v'),
     });
+    if report.schema_valid
+        && let Some(claims) = &report.claims
+        && let Ok(v) = serde_json::to_value(claims)
+    {
+        out["asserted_claims"] = v;
+    }
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
 
@@ -186,6 +261,8 @@ mod tests {
             schema_valid: true,
             schema_errors: Vec::new(),
             artifact_checks: Vec::new(),
+            schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(report.passed(), "JSON `passed` semantics must not change");
         assert_eq!(
@@ -200,6 +277,8 @@ mod tests {
             schema_valid: true,
             schema_errors: Vec::new(),
             artifact_checks: vec![matched_check()],
+            schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(report.passed());
         assert_eq!(verdict_line(&report), "VERIFIED");
@@ -211,6 +290,8 @@ mod tests {
             schema_valid: false,
             schema_errors: vec!["<root>: missing program_hash".into()],
             artifact_checks: Vec::new(),
+            schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(!report.passed());
         assert_eq!(verdict_line(&report), "NOT VERIFIED");
@@ -225,6 +306,8 @@ mod tests {
             schema_valid: true,
             schema_errors: Vec::new(),
             artifact_checks: vec![check],
+            schema_version: rocky_verify::SchemaVersion::V0_1,
+            claims: None,
         };
         assert!(!report.passed());
         assert_eq!(verdict_line(&report), "NOT VERIFIED");

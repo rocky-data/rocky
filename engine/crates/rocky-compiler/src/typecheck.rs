@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 use rayon::prelude::*;
-use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{self, Expr, InTarget, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
@@ -22,7 +22,7 @@ use crate::diagnostic::{
     SourceSpan, W001, W002, W004, W005, W006, W046, W056,
 };
 use crate::operand_check::{OperandDialect, OperandTarget, TargetDialects};
-use crate::semantic::{ModelSchema, SemanticGraph};
+use crate::semantic::{ModelSchema, NamedRead, SemanticGraph};
 use crate::types::{
     DecimalOp, InferredType, RockyType, TypedColumn, arithmetic_result_type, common_supertype_of,
 };
@@ -63,6 +63,154 @@ pub struct TypeCheckResult {
     /// the model wasn't typechecked (e.g., source schemas injected
     /// directly via `source_schemas`).
     pub model_typecheck_ms: HashMap<String, u64>,
+    /// The source schemas whose name a project model also has (#2674). In
+    /// [`Self::typed_models`] the model's columns replace them, but a read of
+    /// that name that does not bind to the model reaches the source table.
+    /// See [`Relations`].
+    pub shadowed_sources: HashMap<String, Vec<TypedColumn>>,
+}
+
+/// The source schemas a project model's name shadows in the typed map
+/// (#2674).
+fn shadowed_sources(
+    graph: &SemanticGraph,
+    source_schemas: &HashMap<String, Vec<TypedColumn>>,
+) -> HashMap<String, Vec<TypedColumn>> {
+    source_schemas
+        .iter()
+        .filter(|(name, _)| graph.models.contains_key(name.as_str()))
+        .map(|(name, columns)| (name.clone(), columns.clone()))
+        .collect()
+}
+
+/// The columns a table read in a model's SQL reaches when it runs (#2674).
+///
+/// The typed map holds every source schema, each replaced by a project model
+/// of the same name once that model is typed. A read spelled with a model's
+/// name reaches that model only when it binds to it: a bare read reaches the
+/// table a model WRITES (#1354), and `depends_on` orders a run without
+/// rewriting a read. Any other read of that name reaches the table of that
+/// name, so it takes the source schema the model's columns replaced. Before
+/// this, the read took whichever the typed map held when the reader's DAG
+/// layer ran.
+///
+/// Every lookup of a table read goes through here, keyed by its READER, so a
+/// lineage edge is resolved with the bindings of the model whose SQL holds it.
+#[derive(Clone, Copy)]
+pub(crate) struct Relations<'a> {
+    graph: &'a SemanticGraph,
+    typed: &'a IndexMap<String, Vec<TypedColumn>>,
+    /// Column positions for `typed`, when the caller keeps them.
+    typed_index: Option<&'a HashMap<String, HashMap<String, usize>>>,
+    shadowed: &'a HashMap<String, Vec<TypedColumn>>,
+    /// The project's models by name, to resolve a qualified read of an
+    /// upstream model's target. `None`: a qualified read is looked up as
+    /// spelled.
+    model_by_name: Option<&'a HashMap<&'a str, &'a rocky_core::models::Model>>,
+}
+
+/// Where a read's columns are.
+enum Reach {
+    /// The typed map, under this key.
+    Typed(String),
+    /// The source schema the same-named model shadows.
+    Shadowed,
+    /// Nothing the type checker can name: the read is not one the bindings
+    /// list.
+    Unknown,
+}
+
+impl<'a> Relations<'a> {
+    pub(crate) fn new(
+        graph: &'a SemanticGraph,
+        typed: &'a IndexMap<String, Vec<TypedColumn>>,
+        typed_index: Option<&'a HashMap<String, HashMap<String, usize>>>,
+        shadowed: &'a HashMap<String, Vec<TypedColumn>>,
+        model_by_name: Option<&'a HashMap<&'a str, &'a rocky_core::models::Model>>,
+    ) -> Self {
+        Relations {
+            graph,
+            typed,
+            typed_index,
+            shadowed,
+            model_by_name,
+        }
+    }
+
+    fn reach(&self, reader: &str, read: &str) -> Reach {
+        let reader_schema = self.graph.model_schema(reader);
+        // A qualified read of an upstream model's own target table
+        // (`FROM analytics.main.customer_ltv`) types from that model.
+        if read.contains('.') {
+            let model = reader_schema
+                .zip(self.model_by_name)
+                .and_then(|(s, by_name)| qualified_upstream_model(read, &s.upstream, by_name));
+            return Reach::Typed(model.unwrap_or(read).to_string());
+        }
+        // A model's read of its own name (the table its last run built, as
+        // the schema cache has it) is typed as before #2674.
+        if read == reader || !self.graph.models.contains_key(read) {
+            return Reach::Typed(read.to_string());
+        }
+        match reader_schema.map_or(NamedRead::NotComputed, |s| s.named_read(read)) {
+            NamedRead::ThatModel | NamedRead::NotComputed => Reach::Typed(read.to_string()),
+            NamedRead::Source => Reach::Shadowed,
+            NamedRead::OtherModel | NamedRead::Local => Reach::Unknown,
+            NamedRead::Unlisted => {
+                debug_assert!(
+                    false,
+                    "#2674: the type checker reads `{read}` in `{reader}`, \
+                     which the read bindings do not list"
+                );
+                Reach::Unknown
+            }
+        }
+    }
+
+    /// The columns `reader`'s read spelled `read` reaches.
+    pub(crate) fn get(&self, reader: &str, read: &str) -> Option<&'a [TypedColumn]> {
+        match self.reach(reader, read) {
+            Reach::Typed(key) => self.typed.get(&key).map(Vec::as_slice),
+            Reach::Shadowed => self.shadowed.get(read).map(Vec::as_slice),
+            Reach::Unknown => None,
+        }
+    }
+
+    /// The column `column` of what `reader`'s read spelled `read` reaches.
+    fn column(&self, reader: &str, read: &str, column: &str) -> Option<&'a TypedColumn> {
+        match self.reach(reader, read) {
+            Reach::Typed(key) => {
+                let columns = self.typed.get(&key)?;
+                match self.typed_index {
+                    Some(index) => index
+                        .get(&key)
+                        .and_then(|i| i.get(column))
+                        .map(|&i| &columns[i]),
+                    None => columns.iter().find(|c| c.name == column),
+                }
+            }
+            Reach::Shadowed => self.shadowed.get(read)?.iter().find(|c| c.name == column),
+            Reach::Unknown => None,
+        }
+    }
+
+    /// The columns of upstream model `upstream`, for checks that walk a
+    /// reader's upstream models (join keys, `E001`): the model's own, as
+    /// before #2674. The walk is keyed by model, not by read, so it cannot
+    /// tell a bare read of the model's name from a read of its target table
+    /// (per-read upstream: #2695).
+    pub(crate) fn upstream(&self, _reader: &str, upstream: &str) -> Option<&'a [TypedColumn]> {
+        self.typed.get(upstream).map(Vec::as_slice)
+    }
+
+    /// Whether `reader`'s read spelled `read` reaches a project model's
+    /// output, rather than a table outside the project.
+    fn reaches_model(&self, reader: &str, read: &str) -> bool {
+        match self.reach(reader, read) {
+            Reach::Typed(key) => self.graph.model_schema(&key).is_some(),
+            Reach::Shadowed | Reach::Unknown => false,
+        }
+    }
 }
 
 /// Scope for resolving column types during expression inference.
@@ -89,6 +237,9 @@ pub(crate) struct TypeScope {
     /// The warehouses the SQL runs on. A `CAST` target whose width differs
     /// between warehouses is typed from them (#2333).
     target: OperandTarget,
+    /// The `SELECT` this scope belongs to groups by a plain key list, so
+    /// every group has at least one row ([`has_plain_group_by`]).
+    plain_group_by: bool,
 }
 
 impl TypeScope {
@@ -105,6 +256,7 @@ impl TypeScope {
             inexact: HashSet::new(),
             qualified_inexact: HashMap::new(),
             target,
+            plain_group_by: false,
         }
     }
 
@@ -223,6 +375,7 @@ pub fn typecheck_project_for_targets(
     for (source_name, cols) in source_schemas {
         typed_models.insert(source_name.clone(), cols.clone());
     }
+    let shadowed = shadowed_sources(graph, source_schemas);
 
     // Compute execution layers from the graph itself so we don't need a Project
     // here (keeps `typecheck_project` callable in test/AI contexts that don't
@@ -261,8 +414,13 @@ pub fn typecheck_project_for_targets(
                     model_name,
                     model_schema,
                     graph,
-                    typed_snapshot,
-                    col_index_snapshot,
+                    Relations::new(
+                        graph,
+                        typed_snapshot,
+                        Some(col_index_snapshot),
+                        &shadowed,
+                        Some(&model_by_name),
+                    ),
                     &model_by_name,
                     &model_names,
                     join_keys_acc,
@@ -296,6 +454,7 @@ pub fn typecheck_project_for_targets(
         diagnostics,
         reference_map,
         model_typecheck_ms,
+        shadowed_sources: shadowed,
     }
 }
 
@@ -398,6 +557,7 @@ pub fn typecheck_project_incremental(
     for (source_name, cols) in source_schemas {
         typed_models.insert(source_name.clone(), cols.clone());
     }
+    let shadowed = shadowed_sources(graph, source_schemas);
 
     // Seed typed_models with non-affected entries from the previous result.
     // Source schemas overlap is fine — we inserted them first, and re-inserting
@@ -441,8 +601,13 @@ pub fn typecheck_project_incremental(
                     model_name,
                     model_schema,
                     graph,
-                    typed_snapshot,
-                    col_index_snapshot,
+                    Relations::new(
+                        graph,
+                        typed_snapshot,
+                        Some(col_index_snapshot),
+                        &shadowed,
+                        Some(&model_by_name),
+                    ),
                     &model_by_name,
                     &model_names,
                     join_keys_acc,
@@ -482,6 +647,7 @@ pub fn typecheck_project_incremental(
         diagnostics,
         reference_map,
         model_typecheck_ms,
+        shadowed_sources: shadowed,
     }
 }
 
@@ -505,8 +671,7 @@ fn compute_model_typecheck(
     model_name: &str,
     model_schema: &ModelSchema,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
+    relations: Relations<'_>,
     model_by_name: &HashMap<&str, &rocky_core::models::Model>,
     model_names: &HashSet<String>,
     join_keys_acc: Option<&Arc<AtomicU64>>,
@@ -532,13 +697,6 @@ fn compute_model_typecheck(
         ReferenceMap::default()
     };
 
-    // A qualified read of an upstream model's own target table
-    // (`FROM analytics.main.customer_ltv`) types from that model.
-    let relation_key = |name: &str| -> String {
-        qualified_upstream_model(name, &model_schema.upstream, model_by_name)
-            .map_or_else(|| name.to_string(), str::to_string)
-    };
-
     // Step 1: Lineage-based type propagation
     let mut typed_cols: Vec<TypedColumn> = Vec::with_capacity(model_schema.columns.len());
 
@@ -546,13 +704,8 @@ fn compute_model_typecheck(
         let producing_edge = graph.producing_edge(model_name, &col_def.name);
 
         let (data_type, nullable) = if let Some(edge) = producing_edge {
-            let source_model = relation_key(&edge.source.model);
-            let upstream_col = typed_models.get(&source_model).and_then(|cols| {
-                col_index
-                    .get(&source_model)
-                    .and_then(|idx| idx.get(&*edge.source.column))
-                    .map(|&i| &cols[i])
-            });
+            let upstream_col =
+                relations.column(model_name, &edge.source.model, &edge.source.column);
             // Whether the source column was found at all. A missing schema
             // and a column of a type Rocky does not model are both `Unknown`;
             // `AVG` tells them apart (#2588). The index lookup is exact, but
@@ -561,10 +714,12 @@ fn compute_model_typecheck(
             // match counts as found, so the two passes agree.
             let resolution = || {
                 let found = upstream_col.is_some()
-                    || typed_models.get(&source_model).is_some_and(|cols| {
-                        cols.iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(&edge.source.column))
-                    });
+                    || relations
+                        .get(model_name, &edge.source.model)
+                        .is_some_and(|cols| {
+                            cols.iter()
+                                .any(|c| c.name.eq_ignore_ascii_case(&edge.source.column))
+                        });
                 if found {
                     ArgResolution::Resolved
                 } else {
@@ -640,17 +795,36 @@ fn compute_model_typecheck(
                 }
                 None => true,
             });
+    // A grouped `SUM` may be non-null, and only inference reads the
+    // `GROUP BY` (#2658). When that is the only reason to infer, a failed
+    // inference leaves lineage's answer as it was, rather than wiping the
+    // model's types below.
+    let sum_only_inference = !needs_inference
+        && typed_cols.iter().any(|col| {
+            col.nullable
+                && graph
+                    .producing_edge(model_name, &col.name)
+                    .is_some_and(|edge| {
+                        matches!(
+                            &edge.transform,
+                            rocky_sql::lineage::TransformKind::Aggregation(func)
+                                if func.eq_ignore_ascii_case("sum")
+                        )
+                    })
+        });
+    let needs_inference = needs_inference || sum_only_inference;
     let inference = model_by_name
         .get(model_name)
         .filter(|_| needs_inference)
         .map(|model| {
             infer_select_types_with_lookup(
                 &model.sql,
-                &|name| typed_models.get(&relation_key(name)).map(Vec::as_slice),
+                &|name| relations.get(model_name, name),
                 target,
             )
             .ok()
-        });
+        })
+        .filter(|answer| answer.is_some() || !sum_only_inference);
     // Inference was needed and could not answer (a query form it does not
     // read, mismatched set-operation branches). Lineage then holds only a
     // guess, so claim nothing it cannot back: every column is nullable, and a
@@ -697,10 +871,11 @@ fn compute_model_typecheck(
                 inferred.count_outputs.contains(&index),
                 inferred.cast_outputs.contains(&index),
                 inferred.coalesce_outputs.contains(&index),
+                inferred.exact_null_outputs.contains(&index),
             ));
         }
         for col in &mut typed_cols {
-            let Some(&(inferred_col, exact_type, count, cast, coalesce)) =
+            let Some(&(inferred_col, exact_type, count, cast, coalesce, exact_null)) =
                 inferred_by_name.get(col.name.as_str())
             else {
                 // Inference ran but names no output like this one: lineage
@@ -722,6 +897,9 @@ fn compute_model_typecheck(
             // the type. Nullability only: the type keeps the rules below
             // (#2553).
             let coalesce_non_null = coalesce && !inferred_col.nullable;
+            // A grouped `SUM` or arithmetic over typed numbers: inference's
+            // non-null answer is exact, though the type may not be (#2658).
+            let exact_non_null = exact_null && !inferred_col.nullable;
             // A cast's output type is its target type, whatever the input
             // is (or whether it has a traceable column at all). Only the
             // type is taken here: nullability keeps following the input
@@ -742,7 +920,7 @@ fn compute_model_typecheck(
                     col.data_type = inferred_col.data_type.clone();
                     col.nullable = inferred_col.nullable;
                 }
-                if coalesce_non_null {
+                if coalesce_non_null || exact_non_null {
                     col.nullable = false;
                 }
                 continue;
@@ -781,12 +959,12 @@ fn compute_model_typecheck(
                 rocky_sql::lineage::TransformKind::Expression => {
                     if exact_type
                         && inferred_col.data_type != RockyType::Unknown
-                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
+                        && edge_input_is_known(edge, relations)
                     {
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
                     }
-                    if coalesce_non_null {
+                    if coalesce_non_null || exact_non_null {
                         col.nullable = false;
                     }
                 }
@@ -808,7 +986,7 @@ fn compute_model_typecheck(
                     } else if col.data_type == RockyType::Unknown
                         && exact_type
                         && inferred_col.data_type != RockyType::Unknown
-                        && edge_input_is_known(edge, typed_models, col_index, &relation_key)
+                        && edge_input_is_known(edge, relations)
                     {
                         // A function over one column that Step 1 cannot type
                         // from its name alone (`COALESCE(id, 0)`): take
@@ -816,8 +994,8 @@ fn compute_model_typecheck(
                         col.data_type = inferred_col.data_type.clone();
                         col.nullable = inferred_col.nullable;
                     }
-                    // `coalesce` is never set for a set operation's output.
-                    if coalesce_non_null {
+                    // Neither flag is ever set for a set operation's output.
+                    if coalesce_non_null || exact_non_null {
                         col.nullable = false;
                     }
                 }
@@ -833,9 +1011,7 @@ fn compute_model_typecheck(
     let enhanced_diags = enhanced_inference(
         model_name,
         graph,
-        typed_models,
-        col_index,
-        &relation_key,
+        relations,
         inferred_cols
             .as_ref()
             .map(|inferred| inferred.columns.as_slice()),
@@ -861,14 +1037,15 @@ fn compute_model_typecheck(
     if let Some(model) = model_by_name.get(model_name) {
         let relation_columns = |name: &str| -> Option<Vec<String>> {
             let columns = if name.contains('.') {
-                typed_models.get(&relation_key(name)).or_else(|| {
-                    typed_models
+                relations.get(model_name, name).or_else(|| {
+                    relations
+                        .typed
                         .iter()
                         .find(|(key, _)| key.contains('.') && key.eq_ignore_ascii_case(name))
-                        .map(|(_, columns)| columns)
+                        .map(|(_, columns)| columns.as_slice())
                 })
             } else if model_schema.upstream.iter().any(|up| up == name) {
-                typed_models.get(name)
+                relations.upstream(model_name, name)
             } else {
                 None
             }?;
@@ -878,6 +1055,15 @@ fn compute_model_typecheck(
             model_name,
             &model.sql,
             &relation_columns,
+        ));
+        // E065 / E066 / E067: an aggregate or window in WHERE, and a
+        // GROUP BY position out of range. Read from the SQL alone.
+        diagnostics.extend(crate::clause_placement::check_clause_placement(
+            model_name, &model.sql,
+        ));
+        // E071: set-operation branches with different column counts.
+        diagnostics.extend(crate::set_operation::check_set_operation_widths(
+            model_name, &model.sql,
         ));
         // E029: a bare column name two joined relations both provably have.
         diagnostics.extend(crate::ambiguous::check_ambiguous_columns(
@@ -894,10 +1080,11 @@ fn compute_model_typecheck(
 
     // Step 3: SELECT * warning
     let schema_incomplete = model_schema.has_star
-        && model_schema
-            .upstream
-            .iter()
-            .any(|up| typed_models.get(up).is_none_or(std::vec::Vec::is_empty));
+        && model_schema.upstream.iter().any(|up| {
+            relations
+                .upstream(model_name, up)
+                .is_none_or(<[_]>::is_empty)
+        });
 
     if model_schema.has_star {
         if schema_incomplete {
@@ -917,7 +1104,7 @@ fn compute_model_typecheck(
 
     // Step 4: Join key compatibility (timed if accumulator provided).
     let jk_start = join_keys_acc.map(|_| Instant::now());
-    let join_diags = check_join_keys(model_name, typed_models, graph);
+    let join_diags = check_join_keys(model_name, relations, graph);
     if let (Some(start), Some(acc)) = (jk_start, join_keys_acc) {
         acc.fetch_add(start.elapsed().as_micros() as u64 / 1000, Ordering::Relaxed);
     }
@@ -953,14 +1140,7 @@ fn compute_model_typecheck(
         // unknown input. That guess must not refuse the model.
         if let rocky_core::models::StrategyConfig::TimeInterval { time_column, .. } =
             &model.config.strategy
-            && !nullability_is_proven(
-                graph,
-                typed_models,
-                col_index,
-                &relation_key,
-                model_name,
-                time_column,
-            )
+            && !nullability_is_proven(graph, relations, model_name, time_column)
         {
             time_interval_diagnostics.retain(|d| &*d.code != E022);
         }
@@ -1044,7 +1224,10 @@ fn check_known_missing_upstream_refs(
         else {
             continue;
         };
-        if !has_provably_fixed_output_names(&upstream_model.sql) {
+        if !has_provably_fixed_output_names(
+            &upstream_model.sql,
+            upstream_schema.star_columns_complete,
+        ) {
             continue;
         }
         let mut output_names = HashSet::with_capacity(upstream_schema.columns.len());
@@ -1101,6 +1284,10 @@ fn check_known_missing_upstream_refs(
                     .map(|c| c.name.as_str())
                     .chain(meta.iter().map(String::as_str))
                     .collect(),
+                merge: matches!(
+                    upstream_model.config.strategy,
+                    rocky_core::models::StrategyConfig::Merge { .. }
+                ),
             }
         })
         .collect();
@@ -1160,8 +1347,10 @@ pub(crate) fn is_warehouse_pseudo_column(name: &str) -> bool {
 /// An alias over a function that can expand into several output columns
 /// (`unnest` of a struct in DuckDB, `explode` of a map in Spark, `COLUMNS`,
 /// `UNPACK`, `json_tuple`, `stack`, `inline`) does not fix the names, and
-/// neither does a set operation, a star, or a string-quoted alias.
-fn has_provably_fixed_output_names(sql: &str) -> bool {
+/// neither does a set operation, a star, or a string-quoted alias. A plain
+/// `*` counts only with `plain_star_is_known`: the semantic graph proved what
+/// it expands to ([`ModelSchema::star_columns_complete`], #2701).
+pub(crate) fn has_provably_fixed_output_names(sql: &str, plain_star_is_known: bool) -> bool {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return false;
     };
@@ -1180,6 +1369,7 @@ fn has_provably_fixed_output_names(sql: &str) -> bool {
             SelectItem::ExprWithAlias { expr, alias } => {
                 alias.quote_style != Some('\'') && !calls_expanding_function(expr)
             }
+            item if plain_star_is_known => crate::semantic::is_plain_star(item),
             _ => false,
         })
 }
@@ -2232,10 +2422,11 @@ fn conjunct_window_bound(conjunct: &Expr, scope: &mut CteScope) -> WindowBound {
             bound.start = placeholder_term(low) == Some(WindowEdge::Start);
             bound.end = placeholder_term(high) == Some(WindowEdge::End);
         }
-        Expr::InSubquery {
+        Expr::In {
             expr,
-            subquery,
+            target: InTarget::Subquery(subquery),
             negated: false,
+            ..
         } if is_column_term(expr) => bound = query_window_bound(subquery, scope),
         _ => {}
     }
@@ -2815,8 +3006,10 @@ fn collect_refs_from_expr(expr: &Expr, file_path: &str, ref_map: &mut ReferenceM
         Expr::Cast { expr: inner, .. } => {
             collect_refs_from_expr(inner, file_path, ref_map);
         }
-        Expr::InList {
-            expr: inner, list, ..
+        Expr::In {
+            expr: inner,
+            target: InTarget::List(list),
+            ..
         } => {
             collect_refs_from_expr(inner, file_path, ref_map);
             for e in list {
@@ -3015,22 +3208,11 @@ fn reconcile_lineage_type(
     }
 }
 
-/// Whether the source column a lineage edge reads has a known type.
-fn edge_input_is_known(
-    edge: &crate::semantic::LineageEdge,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
-    relation_key: &dyn Fn(&str) -> String,
-) -> bool {
-    let source = relation_key(&edge.source.model);
-    typed_models
-        .get(&source)
-        .and_then(|columns| {
-            col_index
-                .get(&source)
-                .and_then(|index| index.get(&*edge.source.column))
-                .map(|&index| &columns[index])
-        })
+/// Whether the source column a lineage edge reads has a known type. The read
+/// is resolved with the bindings of the model whose SQL holds it.
+fn edge_input_is_known(edge: &crate::semantic::LineageEdge, relations: Relations<'_>) -> bool {
+    relations
+        .column(&edge.target.model, &edge.source.model, &edge.source.column)
         .is_some_and(|input| input.data_type != RockyType::Unknown)
 }
 
@@ -3046,9 +3228,7 @@ fn edge_input_is_known(
 /// because the column "is nullable" must ask this first.
 fn nullability_is_proven(
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
-    relation_key: &dyn Fn(&str) -> String,
+    relations: Relations<'_>,
     model: &str,
     column: &str,
 ) -> bool {
@@ -3060,9 +3240,11 @@ fn nullability_is_proven(
     // edge of its own (`SELECT CAST('2024-01-01' AS DATE) AS d`) has typed
     // output and a guessed nullable bit, in an upstream model just as in this
     // one. An external source column has no model in the graph; its type is
-    // checked by `edge_input_is_known`.
+    // checked by `edge_input_is_known`. Whether an edge reaches a model is
+    // the read's binding, not its name (#2674): a read of model `orders`'s
+    // name that reaches the source table `orders` reaches a source column.
     let reaches_edgeless_column = edges.iter().any(|edge| {
-        graph.model_schema(&edge.source.model).is_some()
+        relations.reaches_model(&edge.target.model, &edge.source.model)
             && graph
                 .producing_edge(&edge.source.model, &edge.source.column)
                 .is_none()
@@ -3070,7 +3252,7 @@ fn nullability_is_proven(
     !reaches_edgeless_column
         && edges
             .into_iter()
-            .all(|edge| edge_input_is_known(edge, typed_models, col_index, relation_key))
+            .all(|edge| edge_input_is_known(edge, relations))
 }
 
 /// Refine explicit casts by parsing their target types from the model SQL.
@@ -3105,9 +3287,7 @@ fn nullability_is_proven(
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
-    col_index: &HashMap<String, HashMap<String, usize>>,
-    relation_key: &dyn Fn(&str) -> String,
+    relations: Relations<'_>,
     inferred_cols: Option<&[TypedColumn]>,
     typed_cols: &mut [TypedColumn],
 ) -> Vec<Diagnostic> {
@@ -3125,7 +3305,7 @@ fn enhanced_inference(
             continue;
         }
 
-        if !edge_input_is_known(edge, typed_models, col_index, relation_key) {
+        if !edge_input_is_known(edge, relations) {
             continue;
         }
 
@@ -3239,14 +3419,21 @@ pub(crate) fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, boo
         // IN list → Boolean. Per SQL 3VL the result is NULL only when the
         // operand is NULL, or a list item is NULL and nothing matched; so it is
         // nullable iff the operand or any item is. `NOT IN` is the same.
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => {
             let nullable =
                 infer_expr_type(expr, scope).1 || list.iter().any(|e| infer_expr_type(e, scope).1);
             (RockyType::Boolean, nullable)
         }
 
         // IN subquery → Boolean; the subquery's nullability is not modelled.
-        Expr::InSubquery { .. } => (RockyType::Boolean, true),
+        Expr::In {
+            target: InTarget::Subquery(_),
+            ..
+        } => (RockyType::Boolean, true),
 
         // EXISTS → Boolean
         Expr::Exists { .. } => (RockyType::Boolean, false),
@@ -3585,6 +3772,251 @@ fn args_all_non_null(name: &str, func: &ast::Function, scope: &TypeScope) -> boo
 /// ranking and distribution window functions, value and offset window
 /// functions, string functions, numeric functions, date/time functions,
 /// and conditional functions (IF, NULLIF, GREATEST, LEAST).
+/// Whether `select` groups by a plain, non-empty list of keys, so that every
+/// group it outputs has at least one row (#2658).
+///
+/// An allow-list: anything else may output a row over no input rows, where
+/// `SUM` is NULL. That covers no `GROUP BY` at all (an empty input gives one
+/// row), `GROUP BY ALL` (with no non-aggregate output it groups nothing),
+/// `ROLLUP`, `CUBE` and `GROUPING SETS` (their grand-total set `()` gives a
+/// row over empty input), a `WITH ROLLUP` / `WITH CUBE` / `WITH TOTALS`
+/// modifier, and a parenthesised key list, which may be the empty set `()`.
+fn has_plain_group_by(select: &ast::Select) -> bool {
+    let ast::GroupByExpr::Expressions(keys, modifiers) = &select.group_by else {
+        return false;
+    };
+    !keys.is_empty()
+        && modifiers.is_empty()
+        && keys.iter().all(is_plain_grouping_key)
+        && keys
+            .iter()
+            .any(|key| grouping_key_reads_a_column(key, select))
+}
+
+/// Whether a `GROUP BY` key reads a column of the query, directly or through
+/// a select-list position (`GROUP BY 1`). A key list of constants alone is
+/// not plain: an optimizer may fold it into one global group, which outputs
+/// a row over empty input (Spark had this bug, SPARK-17114).
+fn grouping_key_reads_a_column(key: &Expr, select: &ast::Select) -> bool {
+    fn reads_column(expr: &Expr) -> bool {
+        struct Finder {
+            depth: usize,
+        }
+        impl ast::Visitor for Finder {
+            type Break = ();
+            fn pre_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+                self.depth += 1;
+                std::ops::ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<()> {
+                self.depth -= 1;
+                std::ops::ControlFlow::Continue(())
+            }
+            fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+                if self.depth == 0
+                    && matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                {
+                    return std::ops::ControlFlow::Break(());
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+        ast::Visit::visit(expr, &mut Finder { depth: 0 }).is_break()
+    }
+    if let Expr::Value(value) = strip_nested(key)
+        && let ast::Value::Number(number, _) = &value.value
+    {
+        let Some(item) = number
+            .parse::<usize>()
+            .ok()
+            .and_then(|position| position.checked_sub(1))
+            .and_then(|index| select.projection.get(index))
+        else {
+            return false;
+        };
+        return match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                reads_column(expr)
+            }
+            _ => false,
+        };
+    }
+    // A bare key that names a select-list alias may mean the aliased
+    // expression (DuckDB, Databricks, Snowflake, BigQuery): `SELECT 'a' AS k
+    // ... GROUP BY k` groups by a constant. The aliased expression decides.
+    if let Expr::Identifier(ident) = strip_nested(key) {
+        let aliased = select.projection.iter().find_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias }
+                if alias.value.eq_ignore_ascii_case(&ident.value) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        });
+        if let Some(expr) = aliased {
+            return reads_column(expr);
+        }
+    }
+    reads_column(key)
+}
+
+/// Whether a `GROUP BY` key is one Rocky recognises as a single key: a
+/// column, a position, a literal, a cast, an operator, a `CASE`, one of the
+/// functions sqlparser gives its own shape (`EXTRACT`, `FLOOR`, `CEIL`,
+/// `SUBSTRING`, `TRIM`, `POSITION`), `IS [NOT] NULL`, or a call that is not
+/// `ROLLUP` / `CUBE` / `GROUPING SETS`. A parenthesised `(ROLLUP(n))` parses
+/// as a call named `ROLLUP`, not as [`Expr::Rollup`] (#2566), so a call is
+/// checked by name. Any other shape (a tuple, which may be the empty set, a
+/// grouping construct, a subquery) is not plain.
+fn is_plain_grouping_key(key: &Expr) -> bool {
+    let key = strip_nested(key);
+    match key {
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::Cast { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::Case { .. }
+        | Expr::Extract { .. }
+        | Expr::Floor { .. }
+        | Expr::Ceil { .. }
+        | Expr::Substring { .. }
+        | Expr::Trim { .. }
+        | Expr::Position { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_) => true,
+        Expr::Function(_) => !is_grouping_construct_call(key),
+        _ => false,
+    }
+}
+
+/// Whether `SUM(...)` is never NULL: it aggregates one group of a plain
+/// `GROUP BY` ([`has_plain_group_by`]), so the group has a row, and its
+/// argument is a non-null number (#2658).
+///
+/// - No `FILTER`: a group can have no row that passes it. No `OVER`: a
+///   window frame can be empty.
+/// - The argument's nullable bit is read in the relation scope, so a column
+///   of the null-extended side of an outer join is nullable here.
+/// - An integer or float argument is never NULL on any warehouse: an
+///   integer sum widens (DuckDB `HUGEINT`), wraps (Spark with ANSI off) or
+///   fails, and a float sum overflows to infinity.
+/// - A decimal argument is NOT NULL only when every warehouse the model runs
+///   on is known and none is Databricks. Spark and Databricks with
+///   `ANSI_MODE` off write NULL when a decimal sum overflows, the rule
+///   [`InferredType::over_cap`] follows for arithmetic. Spark is not a ruled
+///   dialect, so a Spark target leaves the dialects unknown.
+///
+/// [`InferredType::over_cap`]: rocky_ir::types::InferredType::over_cap
+fn grouped_sum_is_never_null(func: &ast::Function, scope: &TypeScope) -> bool {
+    if !scope.plain_group_by || func.over.is_some() || func.filter.is_some() {
+        return false;
+    }
+    let ast::FunctionArguments::List(list) = &func.args else {
+        return false;
+    };
+    let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg))] = list.args.as_slice() else {
+        return false;
+    };
+    // The argument's type must be read from the SQL, not guessed: Rocky
+    // types every number literal as `Int64`, so `x * 1.5` would look like
+    // an integer sum, but it is a decimal one (red team, #2658).
+    if !has_exact_type(arg, scope) && !is_exact_null_arithmetic(arg, scope) {
+        return false;
+    }
+    let (arg_type, arg_nullable) = infer_expr_type(arg, scope);
+    if arg_nullable {
+        return false;
+    }
+    match arg_type {
+        RockyType::Int32 | RockyType::Int64 | RockyType::Float32 | RockyType::Float64 => true,
+        RockyType::Decimal { .. } | RockyType::DecimalUnsized { .. } => {
+            let dialects = scope.target.known_dialects();
+            !dialects.is_empty()
+                && dialects.iter().all(|dialect| match dialect {
+                    OperandDialect::Databricks => false,
+                    OperandDialect::DuckDb
+                    | OperandDialect::Snowflake
+                    | OperandDialect::BigQuery
+                    | OperandDialect::Trino
+                    | OperandDialect::SqlServer
+                    | OperandDialect::Postgres
+                    | OperandDialect::Redshift => true,
+                })
+        }
+        RockyType::Boolean
+        | RockyType::String
+        | RockyType::Date
+        | RockyType::Timestamp
+        | RockyType::TimestampNtz
+        | RockyType::Binary
+        | RockyType::Array(_)
+        | RockyType::Map(_, _)
+        | RockyType::Struct(_)
+        | RockyType::Variant
+        | RockyType::Unknown => false,
+    }
+}
+
+/// Whether `expr` is `+`, `-` or `*` over operands whose nullable bit
+/// inference reads exactly, so its non-null answer holds though its type is
+/// not exact (#2658).
+///
+/// Each leaf is a column of a known integer, float or sized decimal type
+/// whose type is exact ([`has_exact_type`]), or an integer literal that fits
+/// in 64 bits. Anything else keeps the
+/// expression out:
+///
+/// - `NULL`, a placeholder, a non-integer literal: `NULL` is NULL, and a
+///   literal Rocky types as `Int64` may need more digits than it claims.
+/// - `/` and `%`: a zero divisor is NULL on several warehouses.
+/// - A cast, which can fail to NULL; any function call.
+/// - An unsized decimal column (`SUM` over a decimal): its digits are not
+///   known, so an overflow to NULL (Databricks with ANSI off) cannot be
+///   ruled out. A sized result over 38 digits is nullable through
+///   [`InferredType::over_cap`].
+///
+/// [`InferredType::over_cap`]: rocky_ir::types::InferredType::over_cap
+fn is_exact_null_arithmetic(expr: &Expr, scope: &TypeScope) -> bool {
+    fn leaf(expr: &Expr, scope: &TypeScope) -> bool {
+        match expr {
+            Expr::Nested(inner) => leaf(inner, scope),
+            Expr::BinaryOp {
+                left,
+                op:
+                    ast::BinaryOperator::Plus
+                    | ast::BinaryOperator::Minus
+                    | ast::BinaryOperator::Multiply,
+                right,
+            } => leaf(left, scope) && leaf(right, scope),
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Minus | ast::UnaryOperator::Plus,
+                expr,
+            } => leaf(expr, scope),
+            // The column's type must be read from the SQL: a CTE or
+            // derived column built from a literal has a guessed type whose
+            // digit bound may be too low to see an overflow (red team).
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                has_exact_type(expr, scope)
+                    && matches!(
+                        infer_expr_type(expr, scope).0,
+                        RockyType::Int32
+                            | RockyType::Int64
+                            | RockyType::Float32
+                            | RockyType::Float64
+                            | RockyType::Decimal { .. }
+                    )
+            }
+            Expr::Value(value) => {
+                matches!(&value.value, ast::Value::Number(n, _) if n.parse::<i64>().is_ok())
+            }
+            _ => false,
+        }
+    }
+    matches!(strip_nested(expr), Expr::BinaryOp { .. }) && leaf(expr, scope)
+}
+
 fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, bool) {
     let name = func.name.to_string().to_uppercase();
 
@@ -3598,7 +4030,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         "COUNT" => (RockyType::Int64, false),
         "SUM" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("SUM", &arg_type, ArgResolution::Resolved, &scope.target)
+            let (ty, nullable) =
+                infer_aggregation_type("SUM", &arg_type, ArgResolution::Resolved, &scope.target);
+            (ty, nullable && !grouped_sum_is_never_null(func, scope))
         }
         "AVG" => {
             let arg_type = first_arg_type(func, scope);
@@ -3609,6 +4043,9 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             };
             infer_aggregation_type("AVG", &arg_type, resolution, &scope.target)
         }
+        // DuckDB's `max(x, n)` / `min(x, n)` is a top-n aggregate that
+        // returns a list, not a value of `x`'s type.
+        "MIN" | "MAX" if !has_one_argument(func) => (RockyType::Unknown, true),
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
             (arg_type, true)
@@ -4248,6 +4685,12 @@ pub(crate) struct SelectInference {
     /// through parentheses. Such an output's nullable bit is exact: it is
     /// NULL only when every argument is (#2553).
     coalesce_outputs: HashSet<usize>,
+    /// Outputs whose inferred non-null answer is exact, though their type
+    /// may not be: a grouped `SUM` ([`grouped_sum_is_never_null`]) or
+    /// arithmetic over typed numbers ([`is_exact_null_arithmetic`]). The
+    /// merge takes a non-null answer for these whatever the lineage edge
+    /// says (#2658).
+    exact_null_outputs: HashSet<usize>,
     /// Outputs with no alias whose name Rocky made up from the expression
     /// (`count` for `COUNT(*)`, `?column?`). The warehouse names them its
     /// own way, so such a name says nothing about a real column of that
@@ -4289,6 +4732,12 @@ impl SelectInference {
         }
         if function_call(expr).is_some_and(is_coalesce_call) {
             self.coalesce_outputs.insert(self.columns.len());
+        }
+        // `SUM` is non-null in inference only by the grouped rule.
+        if !nullable
+            && (function.as_deref() == Some("SUM") || is_exact_null_arithmetic(expr, scope))
+        {
+            self.exact_null_outputs.insert(self.columns.len());
         }
         // The cast's type was read for the model's warehouses
         // ([`cast_target_type`]): a name whose meaning differs between them
@@ -4371,6 +4820,11 @@ fn function_name(expr: &Expr) -> Option<String> {
         Expr::Function(func) => Some(func.name.to_string().to_uppercase()),
         _ => None,
     }
+}
+
+/// Whether `func` is called with exactly one argument.
+fn has_one_argument(func: &ast::Function) -> bool {
+    matches!(&func.args, ast::FunctionArguments::List(list) if list.args.len() == 1)
 }
 
 /// Whether [`infer_expr_type`] reads this expression's type from the SQL
@@ -4515,7 +4969,7 @@ fn has_exact_type(expr: &Expr, scope: &TypeScope) -> bool {
 
 /// Whether the branches of a `CASE` or `COALESCE` fix its type `result`:
 /// every branch is exact (see [`has_exact_type`]), a text or boolean literal,
-/// an integer literal, or `NULL`; at least one branch is neither `NULL` nor a
+/// an integer literal that fits in 64 bits, or `NULL`; at least one branch is neither `NULL` nor a
 /// number; and every branch that is neither infers to `result` exactly.
 ///
 /// An integer literal takes its type from the context in DuckDB
@@ -4532,7 +4986,12 @@ fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> 
         if let Expr::Value(value) = branch {
             match &value.value {
                 ast::Value::Null => continue,
-                ast::Value::Number(text, _) if text.bytes().all(|b| b.is_ascii_digit()) => {
+                // Only a literal that fits in a `BIGINT`: a larger one is a
+                // `DECIMAL(38,0)` on Databricks and Spark, not an integer
+                // (#2658 red team).
+                ast::Value::Number(text, _)
+                    if text.bytes().all(|b| b.is_ascii_digit()) && text.parse::<i64>().is_ok() =>
+                {
                     continue;
                 }
                 // A double-quoted value is an identifier in DuckDB and
@@ -4619,7 +5078,7 @@ pub(crate) fn infer_query_types(
 ) -> Result<SelectInference, String> {
     // Each CTE keeps which of its columns are exact, so an outer expression
     // over one is exact only when the CTE's expression is (#2320).
-    let mut ctes: HashMap<String, (Vec<TypedColumn>, HashSet<usize>)> = HashMap::new();
+    let mut ctes: WithNames<(Vec<TypedColumn>, HashSet<usize>)> = WithNames::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let inferred = {
@@ -4637,10 +5096,7 @@ pub(crate) fn infer_query_types(
             };
             let mut columns = inferred.columns;
             rename_relation_columns(&mut columns, &cte.alias);
-            ctes.insert(
-                cte.alias.name.value.clone(),
-                (columns, inferred.relation_inexact),
-            );
+            ctes.insert(&cte.alias.name, (columns, inferred.relation_inexact));
         }
     }
     let lookup = |name: &str| cte_relation(&ctes, name).or_else(|| (env.lookup)(name));
@@ -4654,13 +5110,56 @@ pub(crate) fn infer_query_types(
 }
 
 fn cte_relation<'c>(
-    ctes: &'c HashMap<String, (Vec<TypedColumn>, HashSet<usize>)>,
+    ctes: &'c WithNames<(Vec<TypedColumn>, HashSet<usize>)>,
     name: &str,
 ) -> Option<RelationRef<'c>> {
     ctes.get(name).map(|(columns, inexact)| RelationRef {
         columns,
         inexact: Some(inexact),
     })
+}
+
+/// The `WITH` names in scope of one query, and what each holds (#2674).
+///
+/// A read matches a `WITH` name spelled exactly as written. It also matches
+/// one that differs only in case when both are unquoted: every warehouse
+/// folds two unquoted names the same way (DuckDB and PostgreSQL to lower
+/// case, Snowflake to upper case), so `WITH Orders AS (...) ... FROM orders`
+/// reads the CTE everywhere. A quoted name keeps its case on some warehouses
+/// and not on others, so it matches only exactly, as before (#2696).
+pub(crate) struct WithNames<V> {
+    entries: Vec<(String, bool, V)>,
+}
+
+impl<V> WithNames<V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Bring the `WITH` name `alias` into scope; a later one of the same
+    /// name hides an earlier one.
+    pub(crate) fn insert(&mut self, alias: &ast::Ident, value: V) {
+        self.entries
+            .push((alias.value.clone(), alias.quote_style.is_some(), value));
+    }
+
+    /// What the read spelled `name` (as SQL text) reaches among these
+    /// `WITH` names, if any.
+    pub(crate) fn get(&self, name: &str) -> Option<&V> {
+        if let Some((_, _, value)) = self.entries.iter().rev().find(|(n, ..)| n == name) {
+            return Some(value);
+        }
+        if name.starts_with(['"', '`', '[']) || name.contains('.') {
+            return None;
+        }
+        self.entries
+            .iter()
+            .rev()
+            .find(|(n, quoted, _)| !quoted && n.eq_ignore_ascii_case(name))
+            .map(|(_, _, value)| value)
+    }
 }
 
 /// Infer the output columns of one query body: a `SELECT`, a parenthesised
@@ -4757,6 +5256,7 @@ fn combine_set_operation(
         // A combined column may be NULL from any branch; the merge does not
         // narrow a set operation's nullability.
         coalesce_outputs: HashSet::new(),
+        exact_null_outputs: HashSet::new(),
         synthesized_names: std::mem::take(&mut left.synthesized_names),
         set_operation: true,
         set_branches,
@@ -5124,9 +5624,24 @@ impl SubtotalKeys {
 
 /// Whether `expr` is a call named `ROLLUP`, `CUBE` or `GROUPING SETS`: how
 /// `GROUP BY (ROLLUP(x))` parses.
+///
+/// The last part of the name is read without its quotes, so a qualified
+/// `builtin.rollup(x)` or a quoted `` `rollup`(x) `` counts too: matching
+/// more calls only makes more outputs nullable.
 fn is_grouping_construct_call(expr: &Expr) -> bool {
-    function_name(expr)
-        .is_some_and(|name| matches!(name.as_str(), "ROLLUP" | "CUBE" | "GROUPING SETS"))
+    let Expr::Function(func) = strip_nested(expr) else {
+        return false;
+    };
+    func.name
+        .0
+        .last()
+        .and_then(ast::ObjectNamePart::as_ident)
+        .is_some_and(|ident| {
+            matches!(
+                ident.value.to_uppercase().as_str(),
+                "ROLLUP" | "CUBE" | "GROUPING SETS"
+            )
+        })
 }
 
 /// Push every key inside a grouping construct, looking through nested
@@ -5164,6 +5679,7 @@ pub(crate) fn select_type_scope(
         from_scope.inexact.extend(joined.inexact);
     }
     let mut type_scope = TypeScope::with_target(env.target.clone());
+    type_scope.plain_group_by = has_plain_group_by(select);
     type_scope.inexact.clone_from(&from_scope.inexact);
     for relation in &from_scope.relations {
         if !relation.inexact.is_empty() {
@@ -5353,7 +5869,7 @@ fn merged_join_columns(
     };
     if !matches!(
         constraint,
-        JoinConstraint::Using(_) | JoinConstraint::Natural
+        JoinConstraint::Using(_) | JoinConstraint::UsingAlias(..) | JoinConstraint::Natural
     ) {
         return HashMap::new();
     }
@@ -5362,7 +5878,7 @@ fn merged_join_columns(
         .map(|col| (CiKey::owned(col.name.clone()), col))
         .collect();
     let using: HashSet<_> = match constraint {
-        JoinConstraint::Using(names) => names
+        JoinConstraint::Using(names) | JoinConstraint::UsingAlias(names, _) => names
             .iter()
             .filter_map(|name| name.0.last().and_then(ast::ObjectNamePart::as_ident))
             .map(|name| CiKey::owned(name.value.clone()))
@@ -5508,7 +6024,7 @@ fn expr_name(expr: &Expr) -> String {
 /// Returns owned diagnostics so this is safe to call from a parallel worker.
 fn check_join_keys(
     model_name: &str,
-    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    relations: Relations<'_>,
     graph: &SemanticGraph,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -5525,7 +6041,7 @@ fn check_join_keys(
     let mut columns_by_name: HashMap<String, Vec<(&str, &RockyType)>> = HashMap::new();
 
     for upstream_name in &model_schema.upstream {
-        if let Some(upstream_cols) = typed_models.get(upstream_name.as_str()) {
+        if let Some(upstream_cols) = relations.upstream(model_name, upstream_name) {
             for col in upstream_cols {
                 columns_by_name
                     .entry(col.name.clone())
@@ -6130,6 +6646,8 @@ mod tests {
     /// an `IS NULL` guard in a `CASE` leave the column nullable, so the help
     /// must not offer them. `COALESCE` to a NOT NULL column or to a literal
     /// makes it non-null, also when it is the model's only column (#2553).
+    /// When the SQL cannot prove it, the help points at a `not_null` test
+    /// (#2662).
     #[test]
     fn e012_help_names_only_remedies_that_change_inference() {
         let t: &[(&str, RockyType, bool)] = &[
@@ -6194,10 +6712,21 @@ mod tests {
         ] {
             assert!(help.contains(remedy), "{remedy}: {help}");
         }
-        assert!(
-            help.contains("`WHERE c IS NOT NULL` filter does not help"),
-            "{help}"
-        );
+        // #2662: a column the SQL cannot prove non-null is checked by a
+        // `not_null` test, which `rocky run --tests enforce` runs and
+        // `rocky plan promote` gates on.
+        for remedy in [
+            "`[[tests]]` block with `type = \"not_null\"` and `column = \"c\"`",
+            "rocky run --tests enforce",
+            "[run] tests_on_run",
+            "set `nullable = true` in the contract",
+            "the rows it wrote stay in the table",
+            "`rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence",
+            "`WHERE c IS NOT NULL` filter does not clear `E012`",
+        ] {
+            assert!(help.contains(remedy), "{remedy}: {help}");
+        }
+        assert!(!help.contains("does not help"), "{help}");
         assert!(!help.contains("filter out NULLs"), "{help}");
         assert!(!help.contains("another column"), "{help}");
     }
@@ -7899,6 +8428,42 @@ mod tests {
                 .map(|(n, t, nl)| (n.to_string(), t, nl))
                 .collect();
             assert_eq!(typecheck_over_t("t", sql), expected, "{sql}");
+        }
+    }
+
+    /// DuckDB's top-n `max(x, n)` / `min(x, n)` returns a list, so inference
+    /// types it `Unknown`, also through a CTE or derived table. A plain
+    /// `max(x)` keeps `x`'s type.
+    #[test]
+    fn a_top_n_min_max_is_unknown() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[("x", RockyType::Int32, false)]),
+        )]);
+        for (sql, want) in [
+            ("SELECT max(x, 2) AS m FROM t", RockyType::Unknown),
+            ("SELECT min(x, 3) AS m FROM t", RockyType::Unknown),
+            (
+                "WITH c AS (SELECT max(x, 2) AS m FROM t) SELECT m FROM c",
+                RockyType::Unknown,
+            ),
+            (
+                "SELECT m FROM (SELECT min(x, 2) AS m FROM t) d",
+                RockyType::Unknown,
+            ),
+            ("SELECT max(x) AS m FROM t", RockyType::Int32),
+            (
+                "WITH c AS (SELECT max(x) AS m FROM t) SELECT m FROM c",
+                RockyType::Int32,
+            ),
+        ] {
+            let inferred = infer_select_types_with_lookup(
+                sql,
+                &|name| sources.get(name).map(Vec::as_slice),
+                &duckdb(),
+            )
+            .unwrap();
+            assert_eq!(inferred.columns[0].data_type, want, "{sql}");
         }
     }
 
@@ -9656,6 +10221,153 @@ mod tests {
             .collect()
     }
 
+    /// #2707: E039 over a `merge` upstream says its table may still hold the
+    /// column, since a merge does not drop columns. The message line stays
+    /// the same, and an upstream of any other strategy gets no such hint.
+    #[test]
+    fn e039_over_a_merge_upstream_hints_at_a_stale_table_column() {
+        let mut merge_up = make_model("mrg", "SELECT id, ts FROM raw.events");
+        merge_up.config.strategy = rocky_core::models::StrategyConfig::Merge {
+            unique_key: vec!["id".into()],
+            update_columns: None,
+        };
+        let result = compile_typechecks(vec![
+            merge_up,
+            make_model("reader", "SELECT legacy FROM mrg"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(
+            &*e039[0].message,
+            "column 'legacy' does not exist in complete upstream model 'mrg'"
+        );
+        let suggestion = e039[0].suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.ends_with(
+                ". Use a column the upstream model produces, or add the intended derivation \
+                 upstream. 'mrg' is a merge model: its table may still hold 'legacy' if the \
+                 model's SQL used to select it, because a merge does not drop columns. The \
+                 column is not in the model's output, so a read of it is refused"
+            ),
+            "{suggestion}"
+        );
+
+        let result = compile_typechecks(vec![
+            make_model("rebuilt", "SELECT id, ts FROM raw.events"),
+            make_model("reader", "SELECT legacy FROM rebuilt"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{:?}", result.diagnostics);
+        let suggestion = e039[0].suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.ends_with(
+                ". Use a column the upstream model produces, or add the intended derivation \
+                 upstream"
+            ),
+            "{suggestion}"
+        );
+        assert!(!suggestion.contains("merge"), "{suggestion}");
+
+        // Two merge upstreams in scope: the hint names both, in plural.
+        let merge = |name: &str| {
+            let mut model = make_model(name, "SELECT id, ts FROM raw.events");
+            model.config.strategy = rocky_core::models::StrategyConfig::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: None,
+            };
+            model
+        };
+        let result = compile_typechecks(vec![
+            merge("m1"),
+            merge("m2"),
+            make_model("reader", "SELECT legacy FROM m1 JOIN m2 ON m1.id = m2.id"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{:?}", result.diagnostics);
+        let suggestion = e039[0].suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.contains(
+                ". 'm1', 'm2' are merge models: their tables may still hold 'legacy' if the \
+                 model's SQL used to select it"
+            ),
+            "{suggestion}"
+        );
+    }
+
+    /// An upstream whose plain star expands over a complete model is complete
+    /// itself (#2701): a missing column read from it is E039, and it no longer
+    /// hides a qualified missing column of another relation it is joined to.
+    #[test]
+    fn a_star_over_a_complete_model_makes_absence_provable() {
+        let models = || {
+            vec![
+                make_model("src", "SELECT id, name FROM raw.orders"),
+                make_model("stg", "SELECT *, upper(name) AS name_clean FROM src"),
+                make_model("int", "SELECT id, name FROM raw.orders"),
+            ]
+        };
+        for (sql, missing) in [
+            ("SELECT nope FROM stg", "nope"),
+            ("SELECT s.nope FROM stg s", "nope"),
+            // The bench mart shape (#2699).
+            (
+                "SELECT i.id, i.no_such_column, s.name_clean FROM int i \
+                 LEFT JOIN stg s ON i.id = s.id",
+                "no_such_column",
+            ),
+        ] {
+            let mut all = models();
+            all.push(make_model("consumer", sql));
+            let result = compile_typechecks(all);
+            let e039 = e039_diagnostics(&result);
+            assert_eq!(e039.len(), 1, "{sql}: {:?}", result.diagnostics);
+            assert!(e039[0].message.contains(&format!("'{missing}'")), "{sql}");
+        }
+        for sql in [
+            "SELECT id, name, name_clean FROM stg",
+            "SELECT i.id, s.name_clean FROM int i LEFT JOIN stg s ON i.id = s.id",
+        ] {
+            let mut all = models();
+            all.push(make_model("consumer", sql));
+            let result = compile_typechecks(all);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "{sql}: {:?}",
+                result.diagnostics
+            );
+        }
+        // A star over a raw table keeps the upstream opaque: no E039.
+        let result = compile_typechecks(vec![
+            make_model("stg", "SELECT *, 1 AS one FROM raw.orders"),
+            make_model("int", "SELECT id FROM raw.orders"),
+            make_model(
+                "consumer",
+                "SELECT i.nope FROM int i LEFT JOIN stg s ON i.id = s.id",
+            ),
+        ]);
+        assert!(
+            e039_diagnostics(&result).is_empty(),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    /// A star modifier over a complete upstream model that names a column
+    /// the model does not output is E039, as a plain read of it is (#2624
+    /// red team, finding 2). A present name is clean.
+    #[test]
+    fn a_star_modifier_naming_a_column_a_complete_model_lacks_is_e039() {
+        let result = compile_typechecks(vec![
+            make_model("stg", "SELECT order_id, status FROM raw.orders"),
+            make_model("bad", "SELECT * EXCLUDE (statsu) FROM stg"),
+            make_model("good", "SELECT * EXCLUDE (status) FROM stg"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{e039:?}");
+        assert_eq!(e039[0].model, "bad");
+        assert!(e039[0].message.contains("'statsu'"), "{}", e039[0].message);
+    }
+
     #[test]
     fn known_missing_direct_projection_refuses() {
         let result = compile_typechecks(vec![
@@ -9843,7 +10555,8 @@ mod tests {
         }
 
         assert!(!has_provably_fixed_output_names(
-            "SELECT id FROM raw.left UNION BY NAME SELECT id FROM raw.right"
+            "SELECT id FROM raw.left UNION BY NAME SELECT id FROM raw.right",
+            true,
         ));
     }
 
@@ -13382,5 +14095,526 @@ mod tests {
                 result.diagnostics
             );
         }
+    }
+
+    /// Typecheck `sql` as model `m` on `target` and return output `c`'s
+    /// nullable bit, and whether a `nullable = false` contract on `c` gives
+    /// `E012`. Sources: `t` (`x INT`, `n STRING`, `f DOUBLE`,
+    /// `d DECIMAL(10,2)`, `big DECIMAL(38,2)`, `p DECIMAL(9,0)`, `b BIGINT`,
+    /// all NOT NULL, and a nullable `y INT`) and `u` (`k INT`, `v INT`, NOT NULL).
+    fn not_null_contract_on_c(sql: &str, target: OperandTarget) -> (bool, bool) {
+        let dec = |precision, scale| RockyType::Decimal { precision, scale };
+        let sources = HashMap::from([
+            (
+                "t".to_string(),
+                source_schema(&[
+                    ("x", RockyType::Int32, false),
+                    ("n", RockyType::String, false),
+                    ("f", RockyType::Float64, false),
+                    ("d", dec(10, 2), false),
+                    ("big", dec(38, 2), false),
+                    ("p", dec(9, 0), false),
+                    ("b", RockyType::Int64, false),
+                    ("y", RockyType::Int32, true),
+                ]),
+            ),
+            (
+                "u".to_string(),
+                source_schema(&[
+                    ("k", RockyType::Int32, false),
+                    ("v", RockyType::Int32, false),
+                ]),
+            ),
+        ]);
+        let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(target),
+        );
+        let columns = &result.typed_models["m"];
+        let c = columns
+            .iter()
+            .find(|col| col.name == "c")
+            .unwrap_or_else(|| panic!("{sql}: no column c in {columns:?}"));
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: None,
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let e012 = validate_contract("m", columns, &contract)
+            .iter()
+            .any(|d| &*d.code == "E012");
+        (c.nullable, e012)
+    }
+
+    fn assert_not_null_contract(rows: &[(&str, bool)], target: &OperandTarget, label: &str) {
+        for &(sql, nullable) in rows {
+            assert_eq!(
+                not_null_contract_on_c(sql, target.clone()),
+                (nullable, nullable),
+                "{label}: {sql} (expected nullable = {nullable}, E012 = {nullable})"
+            );
+        }
+    }
+
+    /// #2658: with a plain `GROUP BY` every group has a row, so `SUM` over a
+    /// NOT NULL number is NOT NULL and passes a `nullable = false` contract.
+    /// Every shape that can sum no rows, or a NULL, keeps `E012`.
+    #[test]
+    fn a_grouped_sum_over_a_not_null_number_is_not_null() {
+        assert_not_null_contract(
+            &[
+                // The issue's repro (DuckDB, a DECIMAL column) and its forms.
+                ("select n, sum(d) as c from t group by n", false),
+                ("select n, sum(x) as c from t group by n", false),
+                ("select n, sum(f) as c from t group by n", false),
+                ("select sum(x) as c from t group by n", false),
+                ("select sum(x) as c from t group by y", false),
+                ("select n, sum(distinct x) as c from t group by n", false),
+                ("select n, sum(t.x) as c from t group by 1", false),
+                (
+                    "select t.n, sum(t.x) as c from t join u on t.x = u.k group by t.n",
+                    false,
+                ),
+                // No GROUP BY: an empty input gives one row, and SUM is NULL.
+                ("select sum(x) as c from t", true),
+                // A nullable argument.
+                ("select n, sum(y) as c from t group by n", true),
+                // A grouping set that holds the empty set () gives a row over
+                // empty input.
+                ("select n, sum(x) as c from t group by rollup (n)", true),
+                ("select n, sum(x) as c from t group by cube (n)", true),
+                (
+                    "select n, sum(x) as c from t group by grouping sets ((n), ())",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by grouping sets ((n))",
+                    true,
+                ),
+                ("select sum(x) as c from t group by ()", true),
+                // A parenthesised ROLLUP or CUBE parses as a function call,
+                // not as the grouping construct (red team, #2566).
+                ("select n, sum(x) as c from t group by (rollup(n))", true),
+                ("select n, sum(x) as c from t group by (cube(n))", true),
+                ("select n, sum(x) as c from t group by n, (rollup(x))", true),
+                // Plain keys of every shape.
+                (
+                    "select sum(x) as c from t group by cast(n as string)",
+                    false,
+                ),
+                ("select sum(x) as c from t group by x + 1", false),
+                ("select sum(x) as c from t group by -x", false),
+                (
+                    "select sum(x) as c from t group by case when x > 0 then 1 else 0 end",
+                    false,
+                ),
+                ("select sum(x) as c from t group by floor(f)", false),
+                (
+                    "select sum(x) as c from t group by substring(n, 1, 2)",
+                    false,
+                ),
+                ("select sum(x) as c from t group by n is null", false),
+                // Accepted arithmetic as the argument.
+                ("select n, sum(x * x) as c from t group by n", false),
+                // A literal above the BIGINT range is a decimal on Databricks
+                // and Spark, not an integer (red team).
+                (
+                    "select n, sum(case when b > 0 then b \
+                     else 99999999999999999999999999999999999999 end) as c from t group by n",
+                    true,
+                ),
+                (
+                    "select n, sum(coalesce(y, 99999999999999999999999999999999999999)) as c \
+                     from t group by n",
+                    true,
+                ),
+                // A qualified or quoted ROLLUP / CUBE call (Opus review).
+                (
+                    "select n, sum(x) as c from t group by builtin.rollup(n)",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by (builtin.cube(n))",
+                    true,
+                ),
+                ("select n, sum(x) as c from t group by `rollup`(n)", true),
+                // A plain key beside a construct or the empty set.
+                (
+                    "select n, sum(x) as c from t group by floor(f), (rollup(n))",
+                    true,
+                ),
+                (
+                    "select n, sum(x) as c from t group by case when x > 0 then 1 end, ()",
+                    true,
+                ),
+                // Constant keys only: an optimizer may fold them into one
+                // global group, which has a row over empty input.
+                ("select sum(x) as c from t group by 'a'", true),
+                (
+                    "select sum(x) as c from t group by floor(1.5), null is null",
+                    true,
+                ),
+                ("select 'k' as k, sum(x) as c from t group by 1", true),
+                ("select 'k' as k, sum(x) as c from t group by k", true),
+                // An alias of a column still reads it.
+                ("select upper(n) as k, sum(x) as c from t group by k", false),
+                // A constant beside a column is still plain.
+                ("select n, sum(x) as c from t group by 'a', n", false),
+                // A tuple key may be the empty set; it is kept nullable.
+                ("select n, sum(x) as c from t group by (n, x)", true),
+                // GROUP BY ALL with no plain output groups nothing.
+                ("select sum(x) as c from t group by all", true),
+                ("select n, sum(x) as c from t group by all", true),
+                // FILTER: a group may have no row that passes.
+                (
+                    "select n, sum(x) filter (where x > 0) as c from t group by n",
+                    true,
+                ),
+                // A window frame can be empty, grouped or not.
+                ("select sum(x) over (partition by n) as c from t", true),
+                (
+                    "select sum(x) over (order by x rows between 1 following and 2 following) \
+                     as c from t",
+                    true,
+                ),
+                (
+                    "select n, sum(sum(x)) over (order by n rows between 1 following and 1 following) as c from t group by n",
+                    true,
+                ),
+                // The null-extended side of an outer join.
+                (
+                    "select t.n, sum(u.v) as c from t left join u on t.x = u.k group by t.n",
+                    true,
+                ),
+                // The grouped flag belongs to one SELECT: a subquery, and a
+                // grouped CTE read by an ungrouped sum.
+                (
+                    "select n, (select sum(v) from u) as c from t group by n",
+                    true,
+                ),
+                (
+                    "select n, (select sum(v) from u group by k limit 1) as c from t group by n",
+                    true,
+                ),
+                // The null-extended side of a RIGHT or FULL join.
+                (
+                    "select u.k, sum(t.x) as c from t right join u on t.x = u.k group by u.k",
+                    true,
+                ),
+                (
+                    "select u.k, sum(t.x) as c from t full join u on t.x = u.k group by u.k",
+                    true,
+                ),
+                (
+                    "select t.n, sum(u.v) as c from t full join u on t.x = u.k group by t.n",
+                    true,
+                ),
+                (
+                    "with g as (select n, sum(x) as s from t group by n) select sum(s) as c from g",
+                    true,
+                ),
+            ],
+            &duckdb(),
+            "duckdb",
+        );
+    }
+
+    /// #2658: a grouped `SUM` over a DECIMAL is NOT NULL only where every
+    /// warehouse is known and none is Databricks, which writes NULL on a
+    /// decimal overflow with `ANSI_MODE` off. Integer and float sums are NOT
+    /// NULL on every target.
+    #[test]
+    fn a_grouped_decimal_sum_is_not_null_only_off_databricks() {
+        let decimal = "select n, sum(d) as c from t group by n";
+        let integer = "select n, sum(x) as c from t group by n";
+        let float = "select n, sum(f) as c from t group by n";
+        let databricks: OperandTarget = Some(OperandDialect::Databricks).into();
+        let spark = OperandTarget::Targets {
+            dialects: Vec::new(),
+            unruled: vec!["spark".to_string()],
+        };
+        let duckdb_and_databricks = OperandTarget::Targets {
+            dialects: vec![OperandDialect::DuckDb, OperandDialect::Databricks],
+            unruled: Vec::new(),
+        };
+        // A literal Rocky types as `Int64` makes `x * 1.5` look like an
+        // integer, but it is a decimal: the sum stays under the decimal rule
+        // (red team).
+        let guessed = "select n, sum(x * 1.5) as c from t group by n";
+        for target in [Some(OperandDialect::Databricks).into(), duckdb()] {
+            assert_not_null_contract(&[(guessed, true)], &target, "guessed argument");
+        }
+        // Accepted arithmetic over a decimal is a decimal sum.
+        let product = "select n, sum(x * d) as c from t group by n";
+        assert_not_null_contract(&[(product, false)], &duckdb(), "duckdb product");
+        assert_not_null_contract(
+            &[(product, true)],
+            &Some(OperandDialect::Databricks).into(),
+            "databricks product",
+        );
+        for (label, target, decimal_nullable) in [
+            ("duckdb", duckdb(), false),
+            ("trino", Some(OperandDialect::Trino).into(), false),
+            ("sqlserver", Some(OperandDialect::SqlServer).into(), false),
+            ("redshift", Some(OperandDialect::Redshift).into(), false),
+            ("snowflake", Some(OperandDialect::Snowflake).into(), false),
+            ("bigquery", Some(OperandDialect::BigQuery).into(), false),
+            ("postgres", Some(OperandDialect::Postgres).into(), false),
+            ("databricks", databricks, true),
+            ("duckdb and databricks", duckdb_and_databricks, true),
+            ("spark", spark, true),
+            ("unconfigured", OperandTarget::Unconfigured, true),
+        ] {
+            assert_not_null_contract(
+                &[
+                    (decimal, decimal_nullable),
+                    (integer, false),
+                    (float, false),
+                ],
+                &target,
+                label,
+            );
+        }
+    }
+
+    /// #2658: `+`, `-` and `*` over NOT NULL typed numbers are NOT NULL,
+    /// though their type stays `Unknown` (#2295). NULL, division, a cast, an
+    /// unknown or nullable operand, a non-integer literal and a product over
+    /// the 38-digit cap keep `E012`.
+    #[test]
+    fn arithmetic_over_not_null_numbers_is_not_null() {
+        let rows = [
+            // The issue's repro: INTEGER * DECIMAL(10,2).
+            ("select x * d as c from t", false),
+            ("select d * x as c from t", false),
+            ("select x * x as c from t", false),
+            ("select d * d as c from t", false),
+            ("select x + d as c from t", false),
+            ("select d - x as c from t", false),
+            ("select d * 2 as c from t", false),
+            ("select (x + 1) * -d as c from t", false),
+            ("select f * x as c from t", false),
+            ("select t.x * u.v as c from t join u on t.x = u.k", false),
+            // A nullable operand, or the null-extended side of an outer join.
+            ("select x * y as c from t", true),
+            (
+                "select t.x * u.v as c from t left join u on t.x = u.k",
+                true,
+            ),
+            // NULL is not a numeric literal.
+            ("select x * null as c from t", true),
+            ("select x + cast(null as int) as c from t", true),
+            // Division, modulo and casts stay out.
+            ("select x / d as c from t", true),
+            ("select x % d as c from t", true),
+            ("select cast(x as int) * d as c from t", true),
+            // A column Rocky has no type for, and a function call.
+            ("select x * missing as c from t", true),
+            ("select abs(x) * d as c from t", true),
+            // A literal Rocky types as Int64 may need more digits.
+            ("select x * 2.5 as c from t", true),
+            ("select x * 99999999999999999999 as c from t", true),
+            // Over the 38-digit cap: Databricks with ANSI off writes NULL.
+            ("select big * x as c from t", true),
+            ("select big + big as c from t", true),
+            // A derived column built from a decimal literal has a guessed
+            // type whose digit bound is too low: Spark types `a` as
+            // DECIMAL(31,3), and `a * p` can overflow (red team).
+            (
+                "select s.a * s.p as c from (select d * 1000000000000000000.5 as a, p from t) s",
+                true,
+            ),
+            (
+                "with s as (select d * 1000000000000000000.5 as a, p from t) select a * p as c from s",
+                true,
+            ),
+            // A CASE with a literal above the BIGINT range is not an exact
+            // BIGINT (red team).
+            (
+                "with s as (select case when b > 0 then b \
+                 else 99999999999999999999999999999999999999 end as a, p from t) \
+                 select a * p as c from s",
+                true,
+            ),
+            // An exact derived column keeps the rule.
+            ("select s.x * s.d as c from (select x, d from t) s", false),
+        ];
+        for (label, target) in [
+            ("duckdb", duckdb()),
+            ("databricks", Some(OperandDialect::Databricks).into()),
+        ] {
+            assert_not_null_contract(&rows, &target, label);
+        }
+    }
+
+    /// #2660: `E065`, `E066` and `E067` reach the project typecheck, which
+    /// `rocky compile` and the compile in `rocky run` both call.
+    #[test]
+    fn clause_placement_errors_reach_the_typecheck() {
+        for (sql, code) in [
+            (
+                "select customer_id from main.orders where sum(amount) > 1 group by customer_id",
+                "E065",
+            ),
+            (
+                "select order_id from main.orders where row_number() over (order by order_id) = 1",
+                "E066",
+            ),
+            (
+                "select customer_id, count(*) as n from main.orders group by 3",
+                "E067",
+            ),
+        ] {
+            let project = Project::from_models(vec![make_model("m", sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            let result = typecheck_project_for_targets(
+                &graph,
+                &HashMap::new(),
+                &project.models,
+                None,
+                &TargetDialects::uniform(duckdb()),
+            );
+            let found: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|d| d.model == "m" && d.is_error())
+                .map(|d| d.code.to_string())
+                .collect();
+            assert_eq!(found, [code], "{sql}");
+        }
+    }
+
+    /// #2658: a cast over a grouped `SUM`. Only `CAST(SUM(int) AS BIGINT)`
+    /// is NOT NULL, on a known warehouse that names `BIGINT` (#2333): the
+    /// sum of an integer is a `BIGINT` on Databricks and Spark, so the cast
+    /// is a no-op there, and on DuckDB a `HUGEINT` cast overflow is an
+    /// error, not NULL. Every cast that can narrow stays nullable on every
+    /// target, and a Spark or unknown target types none of them.
+    #[test]
+    fn a_cast_over_a_grouped_sum_is_not_null_only_when_it_cannot_fail() {
+        let casts = [
+            "select n, cast(sum(x) as bigint) as c from t group by n",
+            "select n, cast(sum(x) as int) as c from t group by n",
+            "select n, cast(sum(d) as bigint) as c from t group by n",
+            "select n, cast(sum(d) as decimal(12,2)) as c from t group by n",
+            "select n, cast(sum(f) as bigint) as c from t group by n",
+        ];
+        let spark = OperandTarget::Targets {
+            dialects: Vec::new(),
+            unruled: vec!["spark".to_string()],
+        };
+        for (label, target, bigint_of_int_nullable) in [
+            ("duckdb", duckdb(), false),
+            ("databricks", Some(OperandDialect::Databricks).into(), false),
+            ("spark", spark, true),
+            ("unconfigured", OperandTarget::Unconfigured, true),
+        ] {
+            let rows: Vec<(&str, bool)> = casts
+                .iter()
+                .enumerate()
+                .map(|(i, sql)| (*sql, if i == 0 { bigint_of_int_nullable } else { true }))
+                .collect();
+            assert_not_null_contract(&rows, &target, label);
+        }
+    }
+
+    /// #2658: inference now also runs for a model whose only reason is a
+    /// nullable `SUM`. When it then fails (a `VALUES` CTE it does not read),
+    /// the model keeps lineage's answer, as before: the sum is still typed
+    /// `Int64`, not wiped to `Unknown`, and stays nullable.
+    #[test]
+    fn a_failed_sum_only_inference_keeps_the_lineage_type() {
+        assert_eq!(
+            typecheck_over_decimal_t("with v as (values (1)) select sum(x) as c from t group by n"),
+            vec![("c".to_string(), RockyType::Int64, true)]
+        );
+    }
+
+    /// #2658: a grouped `SUM` that is NOT NULL stays NOT NULL in a model that
+    /// reads it, so a downstream `nullable = false` contract passes too.
+    #[test]
+    fn a_not_null_grouped_sum_reaches_a_downstream_model() {
+        let sources = HashMap::from([(
+            "t".to_string(),
+            source_schema(&[
+                ("x", RockyType::Int32, false),
+                ("n", RockyType::String, false),
+            ]),
+        )]);
+        let project = Project::from_models(vec![
+            make_model("m1", "select n, sum(x) as c from t group by n"),
+            make_model("m2", "select n, c from m1"),
+        ])
+        .unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_for_targets(
+            &graph,
+            &sources,
+            &project.models,
+            None,
+            &TargetDialects::uniform(duckdb()),
+        );
+        for model in ["m1", "m2"] {
+            let c = result.typed_models[model]
+                .iter()
+                .find(|col| col.name == "c")
+                .unwrap();
+            assert_eq!(
+                (&c.data_type, c.nullable),
+                (&RockyType::Int64, false),
+                "{model}"
+            );
+        }
+    }
+
+    /// #2658: `GROUP BY` modifiers and tuple keys are not plain, in the
+    /// dialects whose parser reads them, even where the lineage parser
+    /// refuses the model first.
+    #[test]
+    fn grouping_modifiers_and_tuples_are_not_a_plain_group_by() {
+        use sqlparser::dialect::{ClickHouseDialect, GenericDialect, MySqlDialect};
+        let select_of = |dialect: &dyn sqlparser::dialect::Dialect, sql: &str| {
+            let statements = Parser::parse_sql(dialect, sql).unwrap();
+            let Statement::Query(query) = &statements[0] else {
+                panic!("{sql}");
+            };
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("{sql}");
+            };
+            has_plain_group_by(select)
+        };
+        assert!(!select_of(
+            &MySqlDialect {},
+            "select n from t group by n with rollup"
+        ));
+        assert!(!select_of(
+            &ClickHouseDialect {},
+            "select n from t group by n with totals"
+        ));
+        assert!(!select_of(
+            &GenericDialect {},
+            "select n from t group by (n, x)"
+        ));
+        assert!(!select_of(
+            &GenericDialect {},
+            "select n from t group by (rollup(n))"
+        ));
+        assert!(!select_of(
+            &GenericDialect {},
+            "select n from t group by grouping sets ((n), ())"
+        ));
+        assert!(select_of(
+            &GenericDialect {},
+            "select n from t group by n, upper(n), 1"
+        ));
     }
 }

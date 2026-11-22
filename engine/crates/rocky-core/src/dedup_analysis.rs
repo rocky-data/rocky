@@ -19,9 +19,9 @@
 //! The `dedup_ratio` and `estimated_savings_pct` this module returns are
 //! **partition-level lower bounds** on true byte-level dedup. Two
 //! partitions that share 99% of their row groups but differ on a single
-//! row will appear fully distinct here. See
-//! `plans/rocky-storage-layer-0.md` §6 for what this implies for the
-//! decision gate.
+//! row will appear fully distinct here. So a low ratio does not by itself
+//! fail the decision gate in `rocky compact --measure-dedup`: it asks for a
+//! byte-level calibration run first.
 
 use std::collections::HashMap;
 

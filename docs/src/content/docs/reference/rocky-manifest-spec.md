@@ -1,12 +1,12 @@
 ---
-title: "rocky-manifest v0.1"
+title: "rocky-manifest"
 description: An open, offline-verifiable format for attesting which program, over which inputs, in which environment produced a table version
 sidebar:
   order: 12
 ---
 
 :::caution[Draft / experimental]
-`rocky-manifest v0.1` is a draft. The field names and shape may change before a stable release. This is published as an open format with a reference verifier so it can be reviewed and used early, not as a finished standard. Feedback is welcome.
+`rocky-manifest` is a draft. The field names and shape may change before a stable release. This is published as an open format with a reference verifier so it can be reviewed and used early, not as a finished standard. Feedback is welcome.
 :::
 
 ## What this is
@@ -54,7 +54,7 @@ Every hash is lowercase hex over 32 BLAKE3 bytes, so each identity field is exac
 
 ## Versioning
 
-`manifest_version` is a constant `"0.1"` at this version. A consumer reads it first and refuses a version it does not understand. `hash_scheme` versions the hashing algorithm family independently of the document shape, so the two can evolve on their own schedules.
+`manifest_version` is `"0.1"` or `"0.2"`. A consumer reads it first and refuses a version it does not understand. `hash_scheme` versions the hashing algorithm family independently of the document shape, so the two can evolve on their own schedules.
 
 ## The document shape
 
@@ -100,7 +100,7 @@ On a content-addressed write path, the manifest also carries the output byte-has
 
 | Field | Required | Meaning |
 |---|---|---|
-| `manifest_version` | yes | The spec version this document conforms to. `"0.1"`. |
+| `manifest_version` | yes | The spec version this document conforms to: `"0.1"` or `"0.2"`. The v0.2 additions are under [v0.2: asserted claims](#v02-asserted-claims). |
 | `hash_scheme` | yes | The hashing-algorithm-family tag in force. `"v1"`. |
 | `producer.name` | yes | The producing tool's name, for example `"rocky"`. |
 | `producer.version` | yes | The producing tool's version string. |
@@ -114,7 +114,7 @@ On a content-addressed write path, the manifest also carries the output byte-has
 | `env_hash` | yes | The environment key (64-hex BLAKE3). |
 | `output_hashes` | no | Byte-hashes of output artifact files, recorded on a content-addressed write path. |
 
-The canonical machine-readable definition is the JSON Schema (draft 2020-12) at `engine/crates/rocky-verify/spec/rocky-manifest-v0.1.schema.json`. It is a standalone schema, deliberately kept out of the CLI's JSON-output schema set: it describes the open format, not a command's wire output. Print it with `rocky-verify schema`.
+The canonical machine-readable definitions are the JSON Schemas (draft 2020-12) at `engine/crates/rocky-verify/spec/rocky-manifest-v0.1.schema.json` and `engine/crates/rocky-verify/spec/rocky-manifest-v0.2.schema.json`. Each is a standalone schema, deliberately kept out of the CLI's JSON-output schema set: each describes the open format, not a command's wire output. `rocky-verify schema` prints the v0.1 schema. Add `--version 0.2` to print the v0.2 schema.
 
 ### The honesty invariant
 
@@ -150,18 +150,39 @@ The same manifest content can travel in more than one place:
 
    The Delta `TBLPROPERTIES` carrier is where this ships today. Managed Iceberg rejects engine-managed property writes (`MANAGED_ICEBERG_OPERATION_NOT_SUPPORTED`), so the documented fallback for an Iceberg table is the snapshot-summary carrier, which remains future work.
 
+## v0.2: asserted claims
+
+`manifest_version` `"0.2"` is v0.1 plus three optional objects. The schema is `engine/crates/rocky-verify/spec/rocky-manifest-v0.2.schema.json`. Print it with `rocky-verify schema --version 0.2`.
+
+| Object | Fields |
+|---|---|
+| `policy` | `effect` (`allow` or `require_review`), `principal` (`human` or `agent`), `rule_id` (optional integer, 0 or more), `ledger_ref` (where the producer recorded the full decision) |
+| `checks` | `total`, `passed`, `failed`, `not_evaluated` (integers, 0 or more) |
+| `tests` | Same shape as `checks`. |
+
+- These objects are unsigned. The producer asserts them. A verifier checks their shape and never treats them as evidence.
+- `rocky-verify` prints each claim marked "asserted by the producer, not verified".
+- A producer writes v0.1 when it has none of them. A v0.1 document that carries any of them fails.
+- `deny` never appears. Rocky writes no manifest for a denied run.
+- `require_review` means the policy asked for review and the run path did not enforce it. It is not an approval. `rocky-verify` prints it as `require_review (review was not enforced on this run)`.
+- Counts and `rule_id` must be written as plain integers, with no fraction or exponent (`4`, not `4.0`). `rocky-verify` rejects `4.0`, although the JSON Schema alone accepts it.
+- `rocky-verify` prints claims only for a document that passes verification and is v0.2. A failed document prints none. Every claim string is printed escaped. With `--json`, the report adds `schema_version` and, for a passing v0.2 document, the claims under `asserted_claims`.
+- `passed + failed + not_evaluated` must equal `total`. The verifier checks this sum.
+- The verifier picks the schema from `manifest_version`. Any value other than `"0.2"` is checked against v0.1.
+- A producer may flatten a manifest into string key/value pairs, for example Databricks table properties under `recipe_manifest.<path>`. It writes integer fields as base-10 strings. A consumer must turn them back into JSON integers before validating. No code does this conversion yet.
+
 ## The reference verifier
 
 `rocky-verify` is a standalone tool that verifies a manifest with no Rocky engine installed. It does two independent things:
 
 ```bash
-# Structure only: validate against the v0.1 schema.
+# Structure only: a "0.2" manifest is checked against the v0.2 schema, any other against v0.1.
 rocky-verify verify manifest.json
 
 # Structure plus bytes: also hash any output artifacts and compare.
 rocky-verify verify manifest.json --artifacts-dir ./artifacts
 
-# Print the embedded schema.
+# Print the embedded v0.1 schema. Add --version 0.2 for v0.2.
 rocky-verify schema
 ```
 
@@ -188,4 +209,5 @@ It does not attest that re-running the program would reproduce the same output. 
 | `output_hashes` populated for a general (non-content-addressed) run | Not yet — output byte-hashes are recorded on the content-addressed write path only |
 | Table-format metadata carrier (Delta `TBLPROPERTIES` under the `recipe_manifest.` namespace) | Shipped for Delta — reconstitutes to a manifest `rocky-verify` validates offline (schema-only on a managed run) |
 | Table-format metadata carrier for Iceberg (snapshot-summary) | Not yet — managed Iceberg rejects engine-managed property writes; snapshot-summary carrier is future work |
+| v0.2 `policy`, `checks` and `tests` claims accepted by `rocky-verify` | Shipped. Rocky does not write v0.2 yet |
 | Signature block for signed custody | Not yet — intentionally unspecified until the signing model lands |

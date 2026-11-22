@@ -316,11 +316,24 @@ fn prepare_preview(
     } else if masked.is_empty() {
         wrap_with_limit(&adapter_type, inner, limit)
     } else {
+        // The typed columns include `[[surrogate_key]]` columns (#2705), which
+        // the run adds around the SQL previewed here. Leave them out; a masked
+        // key is then missing from the list and the preview refuses.
+        let keys: Vec<String> = rocky_core::models::surrogate_keys_for_model_file(&m.file_path)
+            .ok()
+            .flatten()
+            .map(|(_, specs)| specs.into_iter().map(|k| k.name).collect())
+            .unwrap_or_default();
         let ordered: Vec<String> = result
             .type_check
             .typed_models
             .get(model)
-            .map(|cols| cols.iter().map(|c| c.name.clone()).collect())
+            .map(|cols| {
+                cols.iter()
+                    .map(|c| c.name.clone())
+                    .filter(|n| !keys.iter().any(|k| k.eq_ignore_ascii_case(n)))
+                    .collect()
+            })
             .unwrap_or_default();
         build_masking_projection(inner, &ordered, &masked, &adapter_type, limit).map_err(|cols| {
             fail(

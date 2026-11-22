@@ -3870,6 +3870,31 @@ impl RunRecord {
     }
 }
 
+/// One `[[tests]]` outcome recorded on a [`RunRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunTestRecord {
+    pub model: String,
+    pub test_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// `"error"` or `"warning"`.
+    pub severity: String,
+    /// `"pass"`, `"fail"`, or `"error"` (the test query could not run).
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl RunTestRecord {
+    /// Whether this outcome counts against the model: an error-severity test
+    /// that did not pass. A failure, a query that could not run, and any
+    /// status this binary does not know all block (fail closed), as they do
+    /// in the run under `tests_on_run = "enforce"`.
+    pub fn is_blocking(&self) -> bool {
+        self.severity != "warning" && self.status != "pass"
+    }
+}
+
 /// A complete pipeline run record.
 ///
 /// # Governance audit trail (schema v6)
@@ -3979,6 +4004,32 @@ pub struct RunRecord {
     /// must never match a demand to a run by pipeline + time.
     #[serde(default)]
     pub submission_id: Option<String>,
+
+    /// The failed run this run retried, set by `rocky run --retry-failed`.
+    ///
+    /// A retry builds only part of its pipeline, so it is not the pipeline's
+    /// delivery: [`StateStore::latest_successful_run`] and
+    /// [`StateStore::get_pipeline_duration_estimate`] skip it, which keeps a
+    /// retry from satisfying a schedule `after`/`freshness` demand or skewing
+    /// the duration estimate. `--retry-failed` itself still reads it, to see
+    /// that the latest run of the pipeline succeeded.
+    ///
+    /// Serde-defaulted and omitted when `None`, so a record without it is
+    /// byte-identical to an older one and an older record reads back `None` —
+    /// no `CURRENT_SCHEMA_VERSION` bump, as for `rocky_branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<String>,
+
+    /// The `[[tests]]` this run evaluated after building models
+    /// (`[run] tests_on_run` / `rocky run --tests`), one entry per test.
+    /// `rocky plan promote` reads it to refuse a branch when a model's newest
+    /// test evidence holds a failing error-severity test (#2609).
+    ///
+    /// Serde-defaulted and omitted when empty, so a run that evaluated no test
+    /// is byte-identical to an older record and an older record reads back
+    /// empty — no `CURRENT_SCHEMA_VERSION` bump, as for `retry_of`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<RunTestRecord>,
 
     /// The check gate's severity-resolved verdict for this run (schema v25):
     /// `true` when at least one **error-severity** check failed (or could not
@@ -5616,6 +5667,7 @@ impl StateStore {
             self.scan_runs_newest_first(crate::delivery::ESTIMATE_WINDOW, usize::MAX, |run| {
                 if run.pipeline.as_deref() != Some(pipeline)
                     || !matches!(run.status, RunStatus::Success)
+                    || run.retry_of.is_some()
                     || !run.counts_as_production(unrecorded)
                 {
                     return None;
@@ -7858,6 +7910,7 @@ impl StateStore {
             let run: RunRecord = serde_json::from_slice(value.value())?;
             if run.pipeline.as_deref() == Some(pipeline)
                 && run.status == RunStatus::Success
+                && run.retry_of.is_none()
                 && run.counts_as_production(UnrecordedScope::Exclude)
                 && best
                     .as_ref()
@@ -11638,6 +11691,8 @@ pub fn run_with_output_versions(
         check_gate_failed: false,
         verify_after_failed: false,
         rocky_branch: None,
+        retry_of: None,
+        test_results: Vec::new(),
         run_scope: Some(RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),
@@ -12856,12 +12911,32 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            retry_of: None,
+            test_results: Vec::new(),
             run_scope: Some(RunScope::Production),
             queued_ms: None,
             source_volumes: Vec::new(),
             output_volumes: Vec::new(),
             hold: None,
         }
+    }
+
+    /// A run record's `[[tests]]` outcomes survive the stored JSON form.
+    #[test]
+    fn a_run_record_with_test_results_round_trips() {
+        let mut record = minimal_run_record("run-tests", vec![]);
+        record.test_results = vec![RunTestRecord {
+            model: "orders".to_string(),
+            test_type: "unique".to_string(),
+            column: Some("id".to_string()),
+            severity: "error".to_string(),
+            status: "fail".to_string(),
+            detail: Some("2 duplicate value(s) found".to_string()),
+        }];
+        let bytes = serde_json::to_vec(&record).expect("serialize");
+        let back: RunRecord = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(back.test_results, record.test_results);
+        assert!(back.test_results[0].is_blocking());
     }
 
     /// v16 → v17 forward-compat: a `RunRecord` blob written before the
@@ -13262,6 +13337,36 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
         assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
         assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
+    }
+
+    /// `retry_of` is omitted when `None` and reads back `None` from a blob
+    /// without it, so adding it needs no schema bump. A retry is invisible to
+    /// the latest-successful-run and duration-estimate readers.
+    #[test]
+    fn retry_of_is_additive_and_hides_a_retry_from_delivery_readers() {
+        let plain = minimal_run_record("run-plain", vec![]);
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(
+            value.get("retry_of").is_none(),
+            "an unset retry_of is not serialized"
+        );
+        let back: RunRecord = serde_json::from_value(value).unwrap();
+        assert!(back.retry_of.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let mut full = minimal_run_record("run-full", vec![]);
+        full.pipeline = Some("shop".to_string());
+        full.run_scope = Some(RunScope::Production);
+        let mut retry = minimal_run_record("run-retry", vec![]);
+        retry.pipeline = Some("shop".to_string());
+        retry.run_scope = Some(RunScope::Production);
+        retry.retry_of = Some("run-full".to_string());
+        retry.finished_at = full.finished_at + chrono::Duration::hours(1);
+        store.record_run(&full).unwrap();
+        store.record_run(&retry).unwrap();
+        let latest = store.latest_successful_run("shop").unwrap().unwrap();
+        assert_eq!(latest.run_id, "run-full", "a retry is not the delivery");
     }
 
     /// A run record written before `output_volumes` existed, as the literal

@@ -584,6 +584,26 @@ pub trait WarehouseAdapter: Send + Sync {
             .map(|stats| (stats, None))
     }
 
+    /// Execute the statements from [`SqlDialect::delete_insert_sql`], reporting
+    /// each in order. The default preserves the dialect's statement boundaries.
+    /// Adapters can override this to group the writes in one transaction.
+    async fn execute_delete_insert(
+        &self,
+        statements: &[String],
+        measure_reads: bool,
+    ) -> AdapterResult<Vec<(ExecutionStats, Option<crate::state::UpstreamReads>)>> {
+        let mut reports = Vec::with_capacity(statements.len());
+        for sql in statements {
+            let report = if measure_reads {
+                self.execute_statement_with_upstream_reads(sql).await?
+            } else {
+                (self.execute_statement_with_stats(sql).await?, None)
+            };
+            reports.push(report);
+        }
+        Ok(reports)
+    }
+
     /// Execute a kind switch in one transaction when supported. `None` means
     /// unsupported; the caller must not drop the old object. If CREATE fails,
     /// the adapter rolls back the DROP before returning an error. A failed
@@ -1719,12 +1739,27 @@ pub trait SqlDialect: Send + Sync {
     /// The statements a `delete_insert` model executes, from its DELETE and
     /// INSERT.
     ///
-    /// Default: the two as separate statements, run in order — so the
-    /// DELETE commits before the INSERT runs. A dialect whose connector runs
+    /// Default: the two as separate statements, run in order. The adapter
+    /// can group them via [`WarehouseAdapter::execute_delete_insert`].
+    /// A dialect whose connector runs
     /// a `;`-joined string as one transaction (PostgreSQL / Redshift) joins
     /// them, so a failed INSERT leaves the deleted rows in place.
     fn delete_insert_statements(&self, delete_sql: String, insert_sql: String) -> Vec<String> {
         vec![delete_sql, insert_sql]
+    }
+
+    /// Render a complete replacement for a `delete_insert` model.
+    /// The caller has validated the partition column identifiers.
+    fn delete_insert_sql(
+        &self,
+        target: &str,
+        partition_cols: &[std::sync::Arc<str>],
+        source_sql: &str,
+    ) -> Vec<String> {
+        self.delete_insert_statements(
+            self.delete_partitions_sql(target, partition_cols, source_sql),
+            self.insert_into(target, source_sql),
+        )
     }
 
     /// `Some(reason)` when this dialect cannot run the generic SCD2 snapshot

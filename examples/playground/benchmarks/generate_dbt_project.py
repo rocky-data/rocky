@@ -174,7 +174,7 @@ def _intermediate_sql(deps: list[str]) -> str:
         f"WITH base AS (\n"
         f"    SELECT\n"
         f"        a.id,\n"
-        f"        a.name_clean AS name,\n"
+        f"        a.name_clean,\n"
         f"        a.amount,\n"
         f"        a.created_at,\n"
         f"        {extra_col}\n"
@@ -184,7 +184,7 @@ def _intermediate_sql(deps: list[str]) -> str:
         f")\n"
         f"SELECT\n"
         f"    id,\n"
-        f"    name,\n"
+        f"    name_clean,\n"
         f"    category,\n"
         f"    COUNT(*) AS record_count,\n"
         f"    SUM(amount) AS total_amount,\n"
@@ -192,7 +192,7 @@ def _intermediate_sql(deps: list[str]) -> str:
         f"    MIN(created_at) AS first_seen,\n"
         f"    MAX(created_at) AS last_seen\n"
         f"FROM base\n"
-        f"GROUP BY id, name, category"
+        f"GROUP BY id, name_clean, category"
     )
 
 
@@ -201,7 +201,7 @@ def _intermediate_rocky(dep: str) -> str:
         f"-- Intermediate: aggregate {dep}\n"
         f"from {dep}\n"
         f"where rn == 1\n"
-        f"group id {{\n"
+        f"group id, name_clean {{\n"
         f"    record_count: count(),\n"
         f"    total_amount: sum(amount),\n"
         f"    avg_amount: avg(amount),\n"
@@ -216,7 +216,7 @@ def _mart_sql(int_dep: str, stg_dep: str) -> str:
     return (
         f"SELECT\n"
         f"    i.id,\n"
-        f"    i.name,\n"
+        f"    i.name_clean AS name,\n"
         f"    i.total_amount,\n"
         f"    i.record_count,\n"
         f"    i.avg_amount,\n"
@@ -412,7 +412,7 @@ def _dbt_intermediate_sql(deps: list[str]) -> str:
         f"WITH base AS (\n"
         f"    SELECT\n"
         f"        a.id,\n"
-        f"        a.name_clean AS name,\n"
+        f"        a.name_clean,\n"
         f"        a.amount,\n"
         f"        a.created_at,\n"
         f"        {extra_col}\n"
@@ -422,7 +422,7 @@ def _dbt_intermediate_sql(deps: list[str]) -> str:
         f")\n"
         f"SELECT\n"
         f"    id,\n"
-        f"    name,\n"
+        f"    name_clean,\n"
         f"    category,\n"
         f"    COUNT(*) AS record_count,\n"
         f"    SUM(amount) AS total_amount,\n"
@@ -430,7 +430,7 @@ def _dbt_intermediate_sql(deps: list[str]) -> str:
         f"    MIN(created_at) AS first_seen,\n"
         f"    MAX(created_at) AS last_seen\n"
         f"FROM base\n"
-        f"GROUP BY id, name, category"
+        f"GROUP BY id, name_clean, category"
     )
 
 
@@ -440,6 +440,7 @@ def _dbt_intermediate_sql_simple(dep: str) -> str:
         "{{ config(materialized='table') }}\n\n"
         f"SELECT\n"
         f"    id,\n"
+        f"    name_clean,\n"
         f"    COUNT(*) AS record_count,\n"
         f"    SUM(amount) AS total_amount,\n"
         f"    AVG(amount) AS avg_amount,\n"
@@ -447,7 +448,7 @@ def _dbt_intermediate_sql_simple(dep: str) -> str:
         f"    MAX(created_at) AS last_seen\n"
         f"FROM {{{{ ref('{dep}') }}}}\n"
         f"WHERE rn = 1\n"
-        f"GROUP BY id\n"
+        f"GROUP BY id, name_clean\n"
         f"HAVING COUNT(*) >= 2"
     )
 
@@ -457,7 +458,7 @@ def _dbt_mart_sql(int_dep: str, stg_dep: str) -> str:
         "{{ config(materialized='table') }}\n\n"
         f"SELECT\n"
         f"    i.id,\n"
-        f"    i.name,\n"
+        f"    i.name_clean AS name,\n"
         f"    i.total_amount,\n"
         f"    i.record_count,\n"
         f"    i.avg_amount,\n"

@@ -20,10 +20,13 @@ mod compare;
 mod compile;
 mod completions;
 mod compliance;
+pub(crate) mod connector_init;
 mod connector_load;
+mod connector_test;
 mod containment;
 pub(crate) mod cost;
 mod dag;
+mod declarative_test;
 pub mod defer_state;
 mod discover;
 mod docs;
@@ -85,9 +88,11 @@ mod run_incremental;
 mod run_local;
 pub(crate) mod run_output_version;
 mod run_policy_gate;
+mod run_retry;
 mod run_source_sync;
 pub(crate) mod run_source_volume;
 pub(crate) mod run_stored_bytes;
+pub(crate) mod run_tests;
 pub(crate) mod run_upstream_reads;
 pub(crate) mod run_volume;
 mod run_watch;
@@ -155,9 +160,16 @@ pub use compile::{
 };
 pub use completions::run_completions;
 pub use compliance::{compute_compliance, run_compliance};
+pub use connector_init::{
+    ConnectorLang, HELPER_FILE_NAME, HELPER_PY, run_connector_init, scaffold_connector,
+};
 pub use connector_load::{
     ConnectorLoadOutcome, ConnectorLoadParams, claim_key, claim_ttl_hours, execute_connector_load,
     run_connector_load,
+};
+pub use connector_test::{
+    ConnectorTestRun, ConnectorTestSpec, TEST_SPEC_FILE_NAME, execute_connector_test,
+    run_connector_test,
 };
 pub use cost::{CostGroupBy, compute_cost, compute_month_cost, run_cost};
 pub use dag::{dag_output, run_dag};
@@ -245,6 +257,7 @@ pub use run::{
 };
 pub use run_dag_exec::{run_with_dag, run_with_dag_and_contracts};
 pub use run_policy_gate::DirectRunGate;
+pub use run_retry::{RetrySelection, resolve_retry_failed};
 pub use run_watch::run_watch as run_with_watch;
 pub use seed::run_seed;
 pub use serve::{resolve_serve_config_path, run_serve};

@@ -130,6 +130,22 @@ pub enum ValidationError {
         use_: ExpressionUse,
     },
 
+    // ClickHouse reads `x IN t` and `x IN (t)` as a read of table `t` when
+    // `t` names a table (#2713). The parse cannot tell a table from a
+    // column, so one name is refused either way. The one-column comparison
+    // it may have meant is `=`.
+    #[error(
+        "{context}: expression uses `IN` with a single name as its target. On ClickHouse \
+         that name may be a table, and IN then reads that table; {} may only read the \
+         row's own columns. To compare with one column or value, write `=` (for example \
+         `id = other_id`); for a list of values, write `IN (a, b)`",
+        .use_.noun_lowercase()
+    )]
+    ExpressionInSingleName {
+        context: String,
+        use_: ExpressionUse,
+    },
+
     #[error(
         "{context}: expression calls `{function}`, which is not on the allowlist of pure \
          scalar functions {} may use. Warehouse functions can read files, secrets, session \

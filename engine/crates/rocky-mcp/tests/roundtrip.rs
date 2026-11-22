@@ -5687,6 +5687,8 @@ fn seed_run_history(models_dir: &Path) {
         check_gate_failed: false,
         verify_after_failed: false,
         rocky_branch: None,
+        retry_of: None,
+        test_results: Vec::new(),
         run_scope: Some(rocky_core::state::RunScope::Production),
         queued_ms: None,
         source_volumes: Vec::new(),

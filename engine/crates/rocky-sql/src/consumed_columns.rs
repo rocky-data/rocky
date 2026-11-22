@@ -283,7 +283,7 @@ fn join_kind(op: &JoinOperator) -> JoinKind {
     match constraint {
         JoinConstraint::On(_) => JoinKind::On,
         JoinConstraint::None => JoinKind::Cross,
-        JoinConstraint::Using(_) => JoinKind::Using,
+        JoinConstraint::Using(_) | JoinConstraint::UsingAlias(..) => JoinKind::Using,
         JoinConstraint::Natural => JoinKind::Natural,
     }
 }
