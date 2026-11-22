@@ -3764,6 +3764,9 @@ pub(crate) fn assess_branch_test_evidence(
     }
 
     let mut current: BTreeMap<String, Evidence> = BTreeMap::new();
+    // A model whose failing test result an untested build replaced, with the
+    // run that recorded the failure (#2632).
+    let mut superseded: BTreeMap<String, String> = BTreeMap::new();
     for run in runs_newest_first {
         let mut models: BTreeSet<&str> = run
             .models_executed
@@ -3821,18 +3824,36 @@ pub(crate) fn assess_branch_test_evidence(
                 .get(model)
                 .is_none_or(|old| (evidence.at, evidence.tested) > (old.at, old.tested));
             if newer {
+                if let Some(old) = current.get(model)
+                    && !evidence.tested
+                    && !old.failures.is_empty()
+                {
+                    superseded.insert(model.to_string(), old.run_id.clone());
+                }
                 current.insert(model.to_string(), evidence);
+            } else if !evidence.failures.is_empty()
+                && current.get(model).is_some_and(|held| !held.tested)
+            {
+                // The runs are walked newest first, so an older failure can
+                // arrive after the untested build that supersedes it (#2632).
+                superseded.insert(model.to_string(), evidence.run_id.clone());
             }
         }
     }
 
     let mut failures = Vec::new();
     let mut untested = Vec::new();
+    let mut cleared = Vec::new();
     for (model, evidence) in current {
         if evidence.tested {
             failures.extend(evidence.failures);
         } else if error_test_models.contains(&model) {
             untested.push(format!("{model} (run {})", evidence.run_id));
+        } else if let Some(failed_run) = superseded.get(&model) {
+            // Not error-tested, so no later run can test it (#2632: a
+            // content-addressed build or pointer reuse). The failure is not
+            // cleared by a test, so it stays a gap rather than vanishing.
+            cleared.push(format!("{model} (failure from run {failed_run})"));
         }
     }
     if !untested.is_empty() {
@@ -3840,6 +3861,14 @@ pub(crate) fn assess_branch_test_evidence(
             "model(s) that declare error-severity tests were last built with no recorded \
              test result: {}. Run with `--tests report` or `--tests enforce` to record them",
             untested.join(", ")
+        ));
+    }
+    if !cleared.is_empty() {
+        warnings.push(format!(
+            "model(s) whose failing test result was superseded by an untested build, and \
+             which the promote cannot re-test: {}. The failure is not cleared. Rebuild the \
+             model under a strategy whose tests run, or pass `--allow-failing-tests`",
+            cleared.join(", ")
         ));
     }
     PromoteTestEvidence {
@@ -7285,6 +7314,31 @@ mod promote_test_evidence_tests {
         assert!(ev.failures.is_empty(), "{ev:?}");
         assert_eq!(ev.warnings.len(), 1, "{ev:?}");
         assert!(ev.warnings[0].contains("a (run run-2)"), "{ev:?}");
+    }
+
+    /// #2632: a content-addressed model is never tested, so an untested build
+    /// (a fresh write or a pointer reuse) that replaces its failing result must
+    /// not clear the failure silently. It is named as a gap instead.
+    #[test]
+    fn untested_build_of_an_untestable_model_does_not_silently_clear_a_failure() {
+        let runs = [
+            run("run-2", "Success", &[("ca", "success")], &[]),
+            run(
+                "run-1",
+                "Failure",
+                &[("ca", "failed")],
+                &[("ca", "error", "fail")],
+            ),
+        ];
+        // `ca` is content-addressed, so it is not in the error-tested set.
+        let ev = assess_branch_test_evidence("b", &runs, &tested(&[]));
+        assert!(ev.failures.is_empty(), "{ev:?}");
+        assert!(
+            ev.warnings
+                .iter()
+                .any(|w| w.contains("ca") && w.contains("run-1") && w.contains("superseded")),
+            "a superseded failure must be named as a gap: {ev:?}"
+        );
     }
 
     #[test]
