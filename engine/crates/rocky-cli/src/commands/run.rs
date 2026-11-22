@@ -5854,12 +5854,18 @@ pub(crate) async fn run_with_direct_gate(
         // `entry_marker_freezes` is the run-entry durable freeze-marker
         // projection (ONE LIST, taken above) — a marker-only freeze must deny
         // here too; mid-run freezes are the fence's job.
-        ctx.gate_replication_targets(
+        if let Err(e) = ctx.gate_replication_targets(
             &replication_targets,
             &state_store,
             rocky_cfg,
             &entry_marker_freezes,
-        )?;
+        ) {
+            // #2622: the refusal's decision rows must reach remote state.
+            if let Some(session) = session_opt.as_mut() {
+                session.mark_policy_refusal();
+            }
+            return Err(e);
+        }
     }
     // The direct-run counterpart (#2610): the same post-discovery target set,
     // gated under `run` before any warehouse statement. Covers `--resume`
@@ -5880,7 +5886,7 @@ pub(crate) async fn run_with_direct_gate(
                     .flat_map(|t| shadow_gate_target_names(&t.name, shadow_config))
             })
             .collect();
-        super::run_policy_gate::enforce_replication_targets(
+        if let Err(e) = super::run_policy_gate::enforce_replication_targets(
             direct_gate,
             rocky_cfg,
             config_path,
@@ -5889,7 +5895,13 @@ pub(crate) async fn run_with_direct_gate(
             &replication_targets,
             &entry_marker_freezes,
             shadow_config.is_some_and(|c| c.branch.is_some()),
-        )?;
+        ) {
+            // #2622: the refusal's decision rows must reach remote state.
+            if let Some(session) = session_opt.as_mut() {
+                session.mark_policy_refusal();
+            }
+            return Err(e);
+        }
     }
 
     // ONE source-table read per connector, taken here and reused by BOTH the
@@ -9106,7 +9118,7 @@ pub(crate) async fn run_with_direct_gate(
         // should trip the tripwire, not be silently abandoned.
         if let Some(session) = session_opt.take() {
             session
-                .abandon("run exited before terminal state writes")
+                .settle_after_error("run exited before terminal state writes")
                 .await;
         }
     }
@@ -13801,6 +13813,14 @@ async fn execute_models_phase(
     // here, so describe those sources and compile a second time to check the
     // contract types before any write. A governed apply replays its reviewed
     // source snapshot and never takes this path.
+    //
+    // Intended divergence (#2635): a bare `run` may write a model whose
+    // `nullable = false` contract a governed apply refuses with `E012`, when
+    // the reviewed snapshot has no entry for that model's source. The apply
+    // then fails closed; it never writes a model the snapshot does not prove.
+    // Capturing the described sources into the snapshot at plan time would
+    // close the gap, but it adds a warehouse describe to `rocky plan`, so it is
+    // not done here.
     //
     // Only the second compile's `E011` (contract type mismatch) for a type the
     // first compile left unchecked (`I003`) is kept. The first compile stays
