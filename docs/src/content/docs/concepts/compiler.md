@@ -224,7 +224,9 @@ and that the project does not declare in `functions/`:
 SELECT customer_id, SUMM(amount) AS lifetime_value FROM fct_orders GROUP BY customer_id
 ```
 
-The message suggests close names (`did you mean sum?`). Each warehouse has a
+The message suggests close names (`did you mean sum?`). On DuckDB a macro or
+function that the project's `data/seed.sql` creates is not reported, whether or
+not the seed runs. Each warehouse has a
 list of its functions: aggregate, window and table functions, and common
 aliases. How Rocky treats a miss depends on how the list was made:
 
@@ -261,6 +263,27 @@ These calls are never reported:
 - A function declared in `functions/`.
 - A form the SQL parser or the warehouse rewrites, such as `COALESCE`, `IF` or
   `IFNULL`.
+
+#### Argument counts on DuckDB (`E068`, `W068`)
+
+On DuckDB Rocky counts the arguments of a call to a built-in and refuses a
+count DuckDB refuses at bind time:
+
+```sql
+-- E068: DuckDB refuses `lower` with 2 arguments: it takes 1
+SELECT lower(customer_name, 'x') AS name FROM dim_customers
+```
+
+The counts come from the bundled DuckDB, so the check matches the engine
+Rocky ships with. It is an error only where DuckDB always binds the call: the
+main `SELECT` list, `WHERE` or `HAVING`. In a CTE body, a derived table, a
+subquery or an `ORDER BY`, DuckDB can skip the call, so the same refusal is
+the warning `W068`. A call whose count the SQL does not state is never
+refused: `*`, `DISTINCT`, named arguments (`:=`), lambdas, `COLUMNS(...)`,
+dot-call chains, a name a seed or `functions/` declares, and a name an extension
+other than the core build provides (`json_extract`, `timezone`), since an
+extension can add an overload with another count. Argument types are not
+checked yet.
 
 #### Set operations with different column counts (`E071`, `W071`)
 

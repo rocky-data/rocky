@@ -552,6 +552,7 @@ fn compile_inner(
         project_config.as_ref(),
         model_targets.as_ref(),
         target_dialect,
+        project_root,
     );
 
     // Compute DAG-propagated cost estimates for all models.
@@ -826,7 +827,13 @@ pub fn apply_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_dir(config_path),
+    );
     apply_inlined_sql_gates(result, &targets);
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
@@ -842,8 +849,40 @@ pub fn apply_authored_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_dir(config_path),
+    );
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
+}
+
+/// The project root for a config file: the directory that holds
+/// `rocky.toml`, where `data/seed.sql` lives.
+fn config_dir(config_path: &Path) -> &Path {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// The function and macro names the project's seed file creates (#2691),
+/// shared by E057 and E068. Read whether or not the seed runs. A missing
+/// seed gives none.
+fn seed_functions(project_root: &Path) -> std::collections::HashSet<String> {
+    let path = seed_file(project_root);
+    if !path.is_file() {
+        return std::collections::HashSet::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => rocky_compiler::function_check::seed_created_functions(&text),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "cannot read seed file; its functions are judged");
+            std::collections::HashSet::new()
+        }
+    }
 }
 
 /// The check of [`apply_model_target_gates`] that reads the SQL each model
@@ -894,6 +933,7 @@ fn apply_operand_gates(
     project_config: Option<&rocky_config::RockyConfig>,
     targets: Option<&ModelTargets<'_>>,
     target_dialect: Option<Dialect>,
+    project_root: &Path,
 ) {
     let target_for =
         |model: &str| operand_target_for(target_dialect, project_config, targets, model);
@@ -916,6 +956,7 @@ fn apply_operand_gates(
         result.semantic_graph.functions(),
         &target_for,
         written_for,
+        &seed_functions(project_root),
     ));
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
@@ -3875,6 +3916,109 @@ schema_template = "s"
             !whole.diagnostics.iter().any(|d| &*d.code == "E011"),
             "untyped compile: {:?}",
             whole.diagnostics
+        );
+    }
+
+    /// #2691: a macro the project's `data/seed.sql` creates is not judged by
+    /// E057 on DuckDB, whether or not the seed runs.
+    #[test]
+    fn seed_created_macro_is_not_refused_as_unknown_function() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let config = adapter_project(
+            root,
+            "[adapter.wh]\ntype = \"duckdb\"\npath = \":memory:\"\n",
+        );
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(
+            root.join("data").join("seed.sql"),
+            "CREATE TABLE orders AS SELECT 'a' AS status;\n\
+             CREATE MACRO my_fn(x) AS upper(x);\n",
+        )
+        .unwrap();
+        write_model(
+            &root.join("models"),
+            "m",
+            "SELECT my_fn(status) AS s FROM orders",
+        );
+        for with_seed in [false, true] {
+            let out = compile_output(
+                Some(&config),
+                &root.join("state.redb"),
+                &root.join("models"),
+                None,
+                None,
+                false,
+                None,
+                with_seed,
+                None,
+            )
+            .unwrap();
+            let refused: Vec<String> = out
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.to_string() == "E057")
+                .map(|d| d.message.to_string())
+                .collect();
+            assert!(refused.is_empty(), "with_seed={with_seed}: {refused:?}");
+        }
+    }
+
+    /// #2691 on the gate funnels behind the other entry points: `ci` runs
+    /// `apply_authored_model_target_gates`; `serve`, the LSP and `emit-sql`
+    /// run `apply_model_target_gates`. Each judges the seed's macro as
+    /// `compile` does.
+    #[test]
+    fn seed_created_macro_is_not_refused_on_the_gate_funnels() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let config_path = adapter_project(
+            root,
+            "[adapter.wh]\ntype = \"duckdb\"\npath = \":memory:\"\n",
+        );
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(
+            root.join("data").join("seed.sql"),
+            "CREATE TABLE orders AS SELECT 'a' AS status;\n\
+             CREATE MACRO my_fn(x) AS upper(x);\n",
+        )
+        .unwrap();
+        write_model(
+            &root.join("models"),
+            "m",
+            "SELECT my_fn(status) AS s FROM orders",
+        );
+        let project = rocky_config::load_optional_project_config(Some(&config_path))
+            .unwrap()
+            .unwrap();
+        let compiler_config = rocky_compiler::compile::CompilerConfig {
+            models_dir: root.join("models"),
+            ..Default::default()
+        };
+        let refused = |result: &compile::CompileResult| -> Vec<String> {
+            result
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.to_string() == "E057")
+                .map(|d| d.message.to_string())
+                .collect()
+        };
+
+        let mut result = rocky_compiler::compile::compile(&compiler_config).unwrap();
+        apply_authored_model_target_gates(&mut result, &project, &config_path);
+        assert!(refused(&result).is_empty(), "ci: {:?}", refused(&result));
+
+        let mut result = rocky_compiler::compile::compile(&compiler_config).unwrap();
+        apply_model_target_gates(
+            &mut result,
+            &project,
+            &config_path,
+            rocky_server::project_gates::ModelSqlForm::Authored,
+        );
+        assert!(
+            refused(&result).is_empty(),
+            "serve/lsp: {:?}",
+            refused(&result)
         );
     }
 }
