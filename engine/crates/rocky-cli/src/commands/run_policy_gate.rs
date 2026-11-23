@@ -33,6 +33,7 @@ use anyhow::{Result, bail};
 use rocky_core::config::{
     PolicyCapability, PolicyEffect, PolicyPrincipal, PrincipalRef, RockyConfig,
 };
+use rocky_core::policy::scope_matches_every_model;
 use rocky_core::state::StateStore;
 
 use super::apply::{
@@ -146,8 +147,9 @@ fn pre_run_subjects(
         if pipeline_is_replication(cfg, selection.pipeline) {
             // The tables are known only after discovery, and the run starts
             // a vendor sync and claims its idempotency key before that. When
-            // no `run` rule could allow any table, refuse here, before any
-            // of it, under the pipeline's name.
+            // no `run` rule or default could allow any table (an every-table
+            // `deny` or `require_review` rule included), refuse here, before
+            // any of it, under the pipeline's name.
             let mut touched = BTreeMap::new();
             if !run_could_be_allowed(cfg, branch) {
                 let label = crate::registry::resolve_pipeline(cfg, selection.pipeline)
@@ -204,17 +206,46 @@ fn selected_models(
 /// Whether any `run` verdict for an agent could be `allow`: an `allow`
 /// default posture (or a waived one), or an `allow` `run` rule. A run
 /// refuses under both `deny` and `require_review`, so neither counts.
+///
+/// A `run` rule whose scope matches every table decides every verdict, so:
+/// - an every-table `deny` refuses every table (deny overrides);
+/// - the default posture applies only when no rule matched, so it never
+///   applies beside an every-table rule;
+/// - an every-table `allow` ties an every-table `require_review` and the
+///   more restrictive effect wins, so only an `allow` with a real scope
+///   predicate can outrank it.
 fn run_could_be_allowed(cfg: &RockyConfig, branch: bool) -> bool {
     let Some(policy) = cfg.policy.as_ref() else {
         return true;
     };
-    branch
-        || policy.default_agent_effect == PolicyEffect::Allow
-        || policy.rules.iter().any(|rule| {
+    if branch {
+        return true;
+    }
+    let run_rules: Vec<_> = policy
+        .rules
+        .iter()
+        .filter(|rule| {
             rule.principal == PolicyPrincipal::Agent
                 && rule.capability.matches_input(PolicyCapability::Run)
-                && rule.effect == PolicyEffect::Allow
         })
+        .collect();
+    let every_table = |effect: PolicyEffect| {
+        run_rules
+            .iter()
+            .any(|rule| rule.effect == effect && scope_matches_every_model(&rule.scope))
+    };
+    if every_table(PolicyEffect::Deny) {
+        return false;
+    }
+    if every_table(PolicyEffect::RequireReview) {
+        return run_rules.iter().any(|rule| {
+            rule.effect == PolicyEffect::Allow && !scope_matches_every_model(&rule.scope)
+        });
+    }
+    policy.default_agent_effect == PolicyEffect::Allow
+        || run_rules
+            .iter()
+            .any(|rule| rule.effect == PolicyEffect::Allow)
 }
 
 /// A `RunPlan` carrying only the selection fields the shared helpers read.
@@ -600,5 +631,47 @@ mod tests {
             );
         }
         assert!(run_could_be_allowed(&config(""), false));
+    }
+
+    /// The default posture applies only when no rule matched, and a rule
+    /// that matches every table always matches. So an `allow` default does
+    /// not allow a run beside an every-table `require_review` or `deny`
+    /// rule; only an `allow` rule with a real scope predicate can.
+    #[test]
+    fn an_allow_default_does_not_allow_beside_an_every_table_rule() {
+        const ALLOW: &str = "[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n";
+        let rule = |scope: &str, effect: &str| {
+            format!(
+                "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"run\"\n\
+                 scope = {scope}\neffect = \"{effect}\"\n"
+            )
+        };
+        let any = "{ any = true }";
+        let ceiling = "{ max_downstreams = 5 }";
+        let scoped = "{ models = [\"orders\"] }";
+        let cases = [
+            (rule(any, "require_review"), false),
+            (rule(ceiling, "require_review"), false),
+            (rule(any, "deny"), false),
+            (rule(any, "require_review") + &rule(any, "allow"), false),
+            (rule(any, "deny") + &rule(scoped, "allow"), false),
+            // Controls that must still defer to the in-run gate.
+            (rule(scoped, "require_review"), true),
+            (rule(scoped, "deny"), true),
+            (rule(any, "require_review") + &rule(scoped, "allow"), true),
+            (rule(any, "allow"), true),
+        ];
+        for (rules, expected) in &cases {
+            let policy = format!("{ALLOW}{rules}");
+            assert_eq!(
+                run_could_be_allowed(&config(&policy), false),
+                *expected,
+                "{policy}"
+            );
+            assert!(
+                run_could_be_allowed(&config(&policy), true),
+                "a branch run defers to the in-run gate: {policy}"
+            );
+        }
     }
 }

@@ -446,6 +446,47 @@ fn a_require_review_replication_run_refuses_before_its_claim() {
     );
 }
 
+/// An `allow` default does not let a replication run past the pre-run gate
+/// when a `run` rule with `scope.any` requires review: that rule matches
+/// every table, so the default never applies and every table is
+/// `require_review`. The run refuses before its claim, as with no rule.
+#[test]
+fn an_allow_default_beside_an_any_require_review_rule_refuses_before_its_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    replication_project(
+        tmp.path(),
+        "\n[state.idempotency]\ndedup_on = \"any\"\n\n[policy]\nversion = 1\n\
+         default_agent_effect = \"allow\"\n\n[[policy.rules]]\nprincipal = \"agent\"\n\
+         capability = \"run\"\neffect = \"require_review\"\nscope = { any = true }\n",
+    );
+    let key = "k-any-review-replication";
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--idempotency-key", key],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("policy requires review"),
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(written_tables(tmp.path()), Vec::<String>::new());
+    assert_eq!(
+        run_decisions(tmp.path()),
+        [("ingest".to_string(), "require_review".to_string())],
+        "one pre-run decision under the pipeline's name, none per discovered table"
+    );
+
+    let retried = rocky(tmp.path(), &["run", "--idempotency-key", key]);
+    assert!(retried.status.success(), "{}", describe(&retried));
+    assert_eq!(
+        written_tables(tmp.path()),
+        ["staging__orders.orders", "staging__orders.returns"],
+        "the key was never claimed, so the retry runs rather than skips\n{}",
+        describe(&retried)
+    );
+}
+
 #[test]
 fn a_human_run_under_the_same_policy_is_not_gated() {
     let tmp = tempfile::tempdir().unwrap();
