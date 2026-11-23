@@ -2839,6 +2839,27 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Records a passing run of `branch` in the state store, so the promote
+    /// gate (#2609) sees test evidence. These tests are about something other
+    /// than test evidence (principal stamping, pipeline selection, policy
+    /// routes), and their models declare no `[[tests]]`, so a successful
+    /// branch run with no recorded result is exactly the evidence a real
+    /// `rocky run --branch` would leave.
+    fn record_passing_branch_run(state_path: &std::path::Path, branch: &str) {
+        // After the branch was created: the gate only reads this incarnation's runs.
+        let at = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+        let run: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": format!("run-{branch}"), "started_at": at, "finished_at": at,
+            "status": "Success", "models_executed": [], "trigger": "Manual",
+            "config_hash": "c", "rocky_branch": branch, "test_results": [],
+        }))
+        .expect("run record");
+        rocky_core::state::StateStore::open(state_path)
+            .expect("open state store")
+            .record_run(&run)
+            .expect("record branch run");
+    }
+
     /// #2234: promote never replaces a production view that carries a tag,
     /// a row filter or a column mask. Promote re-applies no tags, so even a
     /// tag a model declares refuses here. An absent destination or a table is
@@ -6602,6 +6623,7 @@ auto_create_schemas = true
         // warehouse below to verify rows). Hold `cwd_lock` across the
         // `set_current_dir` window so this test serializes against the other
         // cwd-mutating tests in this binary (cargo runs tests in parallel).
+        record_passing_branch_run(&state_path, legacy_name);
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -6837,6 +6859,7 @@ auto_create_schemas = true
 
         run_branch_create(&state_path, "fix_price", None, false).unwrap();
 
+        record_passing_branch_run(&state_path, "fix_price");
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -6953,6 +6976,7 @@ effect = "deny"
 
         run_branch_create(&state_path, "fix_price", None, false).unwrap();
 
+        record_passing_branch_run(&state_path, "fix_price");
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -7116,6 +7140,7 @@ effect = "deny"
             }
         }
 
+        record_passing_branch_run(&state_path, "fix_price");
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -7365,6 +7390,7 @@ adapter = "default"
             }
         }
 
+        record_passing_branch_run(&state_path, "fix");
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -7549,6 +7575,7 @@ adapter = "default"
             }
         }
 
+        record_passing_branch_run(&state_path, "ci_demo");
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
@@ -7720,6 +7747,7 @@ adapter = "default"
             }
         }
 
+        record_passing_branch_run(&state_path, "fix");
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();

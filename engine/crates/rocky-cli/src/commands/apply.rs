@@ -57,6 +57,38 @@ use crate::plan_store::{PersistedPlan, PlanKind, read_plan};
 use super::archive::run_archive_apply_in;
 use super::compact::run_compact_apply_in;
 
+/// How an apply sets `[run] tests_on_run` for the run it executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyTests {
+    /// Keep the project's `[run] tests_on_run`. Plain `rocky apply`.
+    FromConfig,
+    /// The apply step of `rocky fulfill`. The loop observes the applied model
+    /// itself and routes a red to repair, so the apply must not fail on a
+    /// declared-test red. A project that enforces tests gets `report`: the
+    /// tests run and are recorded, and never fail the model. A project that
+    /// sets `off` or `report` gets `off`, so the loop issues no test query
+    /// the project did not ask to enforce.
+    FulfillLoop,
+}
+
+impl ApplyTests {
+    /// The `--tests` overlay for the applied run, from the project's
+    /// configured mode. `None` keeps the config value.
+    pub(crate) fn resolve(
+        self,
+        configured: rocky_core::config::TestsOnRun,
+    ) -> Option<rocky_core::config::TestsOnRun> {
+        use rocky_core::config::TestsOnRun;
+        match self {
+            Self::FromConfig => None,
+            Self::FulfillLoop => Some(match configured {
+                TestsOnRun::Enforce => TestsOnRun::Report,
+                TestsOnRun::Off | TestsOnRun::Report => TestsOnRun::Off,
+            }),
+        }
+    }
+}
+
 /// Execute `rocky apply <plan-id>`.
 ///
 /// Reads the plan from `.rocky/plans/<plan_id>.json`, dispatches by kind,
@@ -119,6 +151,8 @@ pub(crate) async fn run_apply_in(
         actor,
         expect_spec_digest,
         output_json,
+        // Plain `rocky apply` keeps `[run] tests_on_run`.
+        ApplyTests::FromConfig,
     )
     .await
     .map(|_| ())
@@ -130,6 +164,11 @@ pub(crate) async fn run_apply_in(
 /// façade consumes it, because a resumed apply deflected as
 /// `skipped_in_flight` returns `Ok` here and would otherwise be
 /// mis-journaled as `applied`.
+///
+/// `tests` says how the run that a run plan or an AI-authored plan executes
+/// sets `[run] tests_on_run` (see [`ApplyTests`]). The other plan kinds
+/// ignore it. It is a runtime overlay, not config, so it does not change the
+/// plan's execution fingerprint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_apply_core_in(
     root: &Path,
@@ -140,6 +179,7 @@ pub(crate) async fn run_apply_core_in(
     actor: &PrincipalRef,
     expect_spec_digest: Option<&str>,
     output_json: bool,
+    tests: ApplyTests,
 ) -> Result<ApplyOutcome> {
     // One resolution of the config path for every gate and check below: the
     // policy gate and the models check read the same file. `Path::join`
@@ -213,6 +253,7 @@ pub(crate) async fn run_apply_core_in(
                 runtime_principal,
                 actor,
                 output_json,
+                tests,
             )
             .await
         }
@@ -248,6 +289,7 @@ pub(crate) async fn run_apply_core_in(
                 runtime_principal,
                 actor,
                 output_json,
+                tests,
             )
             .await
         }
@@ -470,6 +512,7 @@ pub(crate) fn refuse_product_bound_alias_apply(
 /// semantics depend on state at apply time (`--missing`,
 /// `--resume-latest`) are passed through as booleans; the actual state-store
 /// lookup happens inside `commands::run::run`.
+#[allow(clippy::too_many_arguments)]
 async fn run_apply_run_plan(
     root: &Path,
     config_path: &Path,
@@ -478,6 +521,7 @@ async fn run_apply_run_plan(
     runtime_principal: PolicyPrincipal,
     actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
+    tests: ApplyTests,
 ) -> Result<ApplyOutcome> {
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read run plan '{plan_id}'"))?;
@@ -656,6 +700,7 @@ async fn run_apply_run_plan(
         &apply_run_id,
         governed.as_ref(),
         actor,
+        tests,
     )
     .await;
     let termination = match termination {
@@ -1111,7 +1156,11 @@ async fn execute_run_plan(
     governed_ctx: Option<&GovernedRunContext<'_>>,
     // Who is applying (RV4-P1), handed to `run()` for its custody rows.
     actor: &PrincipalRef,
+    // How this apply sets `[run] tests_on_run` for the run.
+    tests: ApplyTests,
 ) -> Result<crate::commands::run::RunTermination> {
+    // Resolved against the gate's own snapshot, never a fresh config read.
+    let tests_on_run = tests.resolve(loaded.config.run.tests_on_run);
     // ‼️ Finding #2/#1: preflight the reviewed source-schema snapshot BEFORE any
     // warehouse mutation — this path executes models (and, for a replication
     // pipeline, does replication discovery/DDL first), so a v1/missing-snapshot
@@ -1210,7 +1259,7 @@ async fn execute_run_plan(
             state_path,
             output_json,
             &partition_opts,
-            &crate::commands::run::SkipRunOptions::for_apply(),
+            &crate::commands::run::SkipRunOptions::for_apply(tests_on_run),
             // Shadow routing IS part of a persisted plan's contract: the plan
             // captures `shadow` / `shadow_suffix` / `shadow_schema` / `branch`,
             // and `shadow_config` above is reconstructed from them for exactly
@@ -1325,7 +1374,7 @@ async fn execute_run_plan(
         &crate::commands::run::DeferOptions::default(),
         // The skip gate is a runtime-only `rocky run` overlay, not persisted
         // on the plan; the two-step path builds every planned model.
-        &crate::commands::run::SkipRunOptions::for_apply(),
+        &crate::commands::run::SkipRunOptions::for_apply(tests_on_run),
         // Per-run `--var` values are not persisted on the plan; an
         // `@var()` model would compile-error on a two-step apply.
         &rocky_core::run_vars::RunVars::new(),
@@ -4981,6 +5030,7 @@ fn record_verify_after_custody(store: &StateStore, record: &PolicyDecisionRecord
 ///
 /// The check runs unconditionally, after the policy gate (#1459), so policy
 /// can only tighten it. It verifies the marker, not the approver.
+#[allow(clippy::too_many_arguments)]
 async fn run_apply_ai_authored_plan(
     root: &Path,
     config_path: &Path,
@@ -4989,6 +5039,7 @@ async fn run_apply_ai_authored_plan(
     runtime_principal: PolicyPrincipal,
     actor: &rocky_core::config::PrincipalRef,
     output_json: bool,
+    tests: ApplyTests,
 ) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read AI-authored plan '{plan_id}'"))?;
@@ -5191,6 +5242,7 @@ async fn run_apply_ai_authored_plan(
         &apply_run_id,
         governed.as_ref(),
         actor,
+        tests,
     )
     .await;
     let termination = match termination {
@@ -6064,7 +6116,8 @@ async fn run_apply_replication_plan(
         &crate::commands::run::DeferOptions::default(),
         // The skip gate only applies to transformation models; inert here.
         // The source-sync phase is off: apply never waits for or starts a sync.
-        &crate::commands::run::SkipRunOptions::for_apply(),
+        // No `[[tests]]` override: a replication apply builds no model.
+        &crate::commands::run::SkipRunOptions::for_apply(None),
         // Replication apply runs no transformation models; vars are inert.
         &rocky_core::run_vars::RunVars::new(),
         Some(&apply_run_id),
@@ -6586,6 +6639,30 @@ pub async fn run_apply_inline_for_run(
 
 #[cfg(test)]
 mod tests {
+    /// Plain `rocky apply` keeps `[run] tests_on_run`. The fulfill loop's
+    /// apply records tests only when the project enforces them, and never
+    /// fails a model on one; under `off` or `report` it runs no test.
+    #[test]
+    fn apply_tests_resolves_the_fulfill_mode_from_the_config() {
+        use super::ApplyTests;
+        use rocky_core::config::TestsOnRun;
+        for mode in [TestsOnRun::Off, TestsOnRun::Report, TestsOnRun::Enforce] {
+            assert_eq!(ApplyTests::FromConfig.resolve(mode), None, "{mode:?}");
+        }
+        assert_eq!(
+            ApplyTests::FulfillLoop.resolve(TestsOnRun::Enforce),
+            Some(TestsOnRun::Report)
+        );
+        assert_eq!(
+            ApplyTests::FulfillLoop.resolve(TestsOnRun::Report),
+            Some(TestsOnRun::Off)
+        );
+        assert_eq!(
+            ApplyTests::FulfillLoop.resolve(TestsOnRun::Off),
+            Some(TestsOnRun::Off)
+        );
+    }
+
     #[tokio::test]
     async fn ai_apply_refuses_legacy_plan_before_execution() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -6603,6 +6680,7 @@ mod tests {
             super::PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a fingerprintless AI plan must refuse before config or warehouse work");
@@ -7324,6 +7402,7 @@ mod tests {
             // A human apply: the governed `--dag` refusal above does not apply.
             None,
             &rocky_core::config::PrincipalRef::unnamed(),
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a stored --dag --shadow plan must reach the shadow-aware DAG path");
@@ -7417,6 +7496,7 @@ mod tests {
             // (`for_apply`, the forced run id) can keep the phase off.
             None,
             &rocky_core::config::PrincipalRef::unnamed(),
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await;
         assert_eq!(
@@ -7536,6 +7616,7 @@ mod tests {
             // A human apply: the governed `--dag` refusal does not apply.
             None,
             &rocky_core::config::PrincipalRef::unnamed(),
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect("a stored --dag partition plan must apply cleanly");
@@ -7645,6 +7726,7 @@ mod tests {
             // A human apply: the governed `--dag` refusal does not apply.
             None,
             &rocky_core::config::PrincipalRef::unnamed(),
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect("a stored --dag plan must apply cleanly");
@@ -7826,6 +7908,7 @@ mod tests {
                 &rocky_core::config::PrincipalRef::unnamed(),
                 None,
                 true,
+                crate::commands::apply::ApplyTests::FromConfig,
             )
             .await?;
         }
@@ -7863,6 +7946,7 @@ mod tests {
             &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("current quality pipeline must refuse a stale shadow plan");
@@ -7902,6 +7986,7 @@ mod tests {
                 &actor,
                 None,
                 true,
+                crate::commands::apply::ApplyTests::FromConfig,
             )
         };
 
@@ -8093,6 +8178,7 @@ mod tests {
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .unwrap_err();
@@ -8116,6 +8202,7 @@ mod tests {
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .unwrap_err();
@@ -8153,6 +8240,7 @@ mod tests {
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .unwrap_err();
@@ -8290,6 +8378,7 @@ auto_create_schemas = true
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a legacy ai_authored plan under an empty [policy] must NOT apply unreviewed");
@@ -8337,6 +8426,7 @@ auto_create_schemas = true
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("an allow policy must not let an unreviewed AI plan apply");
@@ -8366,6 +8456,7 @@ auto_create_schemas = true
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("no [policy] block still gates ai_authored on the marker");
@@ -11726,6 +11817,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("an agent --dag apply must be refused");
@@ -11817,6 +11909,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
     }
@@ -12222,6 +12315,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await?;
         Ok(())
@@ -12290,6 +12384,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await?;
         let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
@@ -12417,6 +12512,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await?;
         let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
@@ -12545,6 +12641,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await?;
         let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
@@ -12615,6 +12712,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &rocky_core::config::PrincipalRef::unnamed(),
             None,
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await?;
         let db = rocky_duckdb::DuckDbConnector::open(&root.join("proj.duckdb"))?;
@@ -12691,6 +12789,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a changed AI plan must refuse");
@@ -12791,6 +12890,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             false,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("an agent --dag apply is not policy-gated, so it is refused");
@@ -12826,6 +12926,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a persisted --model + --dag plan must be refused");
@@ -12872,6 +12973,7 @@ autonomy_budget = { failures = 3, window = "7d" }
                 PolicyPrincipal::Human,
                 &rocky_core::config::PrincipalRef::unnamed(),
                 true,
+                crate::commands::apply::ApplyTests::FromConfig,
             )
             .await
             .expect_err("a persisted resume + --dag plan must be refused");
@@ -12914,6 +13016,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             PolicyPrincipal::Human,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a persisted dual-selector plan must be refused");
@@ -12988,6 +13091,7 @@ schema_template = "s__{source}"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a governed replication apply of a deleted reviewed dir must fail closed");
@@ -13033,6 +13137,7 @@ schema_template = "s__{source}"
             PolicyPrincipal::Agent,
             &rocky_core::config::PrincipalRef::unnamed(),
             true,
+            crate::commands::apply::ApplyTests::FromConfig,
         )
         .await
         .expect_err("a governed transformation apply of a deleted reviewed dir must fail closed");
@@ -15235,6 +15340,7 @@ enabled = true
                     PolicyPrincipal::Agent,
                     &actor,
                     true,
+                    crate::commands::apply::ApplyTests::FromConfig,
                 )
                 .await
             } else {
@@ -15246,6 +15352,7 @@ enabled = true
                     PolicyPrincipal::Agent,
                     &actor,
                     true,
+                    crate::commands::apply::ApplyTests::FromConfig,
                 )
                 .await
             };

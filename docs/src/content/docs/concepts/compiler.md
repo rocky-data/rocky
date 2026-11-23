@@ -377,6 +377,12 @@ Rocky reports the name only when absence is a fact:
   not count.
 - No two upstream output names differ only in case.
 
+`E039` checks the upstream model's SQL, not its table. A `merge` model's table
+can still hold a column that its SQL used to select, because a merge does not
+drop columns. When the upstream model is a `merge` model, the `E039`
+suggestion says so. The read is still refused. See
+[Merge strategy](/concepts/incremental/#merge-strategy).
+
 The binding rules are the ones for external sources below. A CTE, derived
 table, unknown relation, `SELECT` alias, struct field read, quoted name or
 warehouse metadata column keeps the name `Unknown`.

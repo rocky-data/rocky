@@ -116,6 +116,7 @@ Rocky contains that failure at the table boundary instead of passing over the mo
 1. Open the model named in the diagnostic. The message names the offending column verbatim.
 2. For `E010` / `E013`, take the LSP code action. It offers a deterministic `Add` / `Restore` fix when an upstream model exposes the column. It falls back to an AI-proposed rewrite when the column needs derivation, when the SQL is multi-statement, or when the model uses `SELECT *`. The fallback needs `ANTHROPIC_API_KEY`.
 3. For `E011` / `E012`, choose one of two fixes. Change the model SQL to produce the contracted type or nullability, which is the common case. Or change the contract, but only when the schema change is intentional and downstream consumers have already migrated.
+   For `E012` on a column the SQL cannot prove non-null (for example, one kept non-null only by a `WHERE col IS NOT NULL` filter), set `nullable = true` and add a `not_null` test in the model sidecar instead. It runs under `rocky run --tests enforce` or `[run] tests_on_run = "enforce"`, and `rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence is that failure. The rows stay in the table. See [When Rocky cannot prove a column is never NULL](/concepts/data-quality-checks/#when-rocky-cannot-prove-a-column-is-never-null).
 4. Re-run `rocky compile` to confirm.
 
 A passing contract is what lets you refactor a model's internals without breaking the consumers that read from it.

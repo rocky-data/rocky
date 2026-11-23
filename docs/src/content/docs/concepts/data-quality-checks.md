@@ -93,6 +93,26 @@ Each `[[columns]]` entry takes `name` (required), `type`, `nullable`, and `descr
 | `W010` | Warning | The contract defines a column that is not in the output and is not required |
 | `W011` | Warning | A contract exists for a model not found in the project |
 
+### When Rocky cannot prove a column is never NULL
+
+`nullable = false` is a compile-time proof. Rocky reads no rows. It passes only when the SQL shows the column is never NULL, for example a `COALESCE` with a value that is never NULL, or a column that is NOT NULL in a source schema Rocky has. A `WHERE col IS NOT NULL` filter does not count, because Rocky does not read the WHERE clause when it infers nullability.
+
+When the data keeps the column non-null but the SQL cannot show it, check the data instead. Set `nullable = true` in the contract, and add a `not_null` test to the model sidecar:
+
+```toml
+# models/orders_summary.toml
+[[tests]]
+type = "not_null"
+column = "customer_id"
+```
+
+With `rocky run --tests enforce`, or `[run] tests_on_run = "enforce"`, a NULL fails the model, and its downstream models do not build. The default is `off`, so set one of them. The test runs after the write, so the rows stay in the model's table. `rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence is that failure. A later run that rebuilds the model without tests replaces that evidence, and promote then only warns. See [Tests during a run](/reference/commands/core-pipeline/#tests-during-a-run) and [Declarative tests](#declarative-tests-tests).
+
+Two cases differ:
+
+- A data-product model gets its contract from the product spec. Edit the spec, not the generated contract. A spec column with `nullable = false` already lowers to a `not_null` test.
+- A `content_addressed` model writes no warehouse table, so its `[[tests]]` do not run.
+
 :::caution
 Contract files ignore unknown keys. Rocky does not reject them.
 
