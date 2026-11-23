@@ -12558,7 +12558,8 @@ fn withheld_model_error(
     if decision.fail_closed {
         return format!(
             "model '{name}' was withheld because {}, so Rocky cannot prove it is \
-             independent of the failed or withheld model(s): {}",
+             independent of this run's failed or withheld model(s), which need not \
+             be its upstreams: {}",
             containment.uncertain_reads(name),
             decision.blocked_by.join(", ")
         );
@@ -12573,10 +12574,11 @@ fn withheld_model_error(
             "model '{name}' was withheld because upstream compile failure(s) affect: {}",
             compile.join(", ")
         ),
-        (true, _) => format!(
+        (true, false) => format!(
             "model '{name}' was withheld because of failed or withheld upstream(s): {}",
             other.join(", ")
         ),
+        (true, true) => format!("model '{name}' was withheld"),
         (false, false) => format!(
             "model '{name}' was withheld because upstream compile failure(s) affect: {}; \
              and because of other failed or withheld upstream(s): {}",
@@ -47141,7 +47143,12 @@ auto_create_schemas = true
         assert_eq!(
             withheld_model_error("u", &decision(&["g", "x"], true), &compile_origin, &ledger),
             "model 'u' was withheld because its reads cannot be fully listed, so Rocky \
-             cannot prove it is independent of the failed or withheld model(s): g, x"
+             cannot prove it is independent of this run's failed or withheld model(s), \
+             which need not be its upstreams: g, x"
+        );
+        assert_eq!(
+            withheld_model_error("r", &decision(&[], false), &compile_origin, &ledger),
+            "model 'r' was withheld"
         );
     }
 
