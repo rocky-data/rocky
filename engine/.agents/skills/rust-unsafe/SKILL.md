@@ -127,5 +127,5 @@ Rocky runs `cargo clippy --all-targets -- -D warnings`. The relevant clippy lint
 ## Related skills
 
 - **`rust-doc`** — public `unsafe fn` needs a `# Safety` section in its doc comment.
-- **`rust-clippy-triage`** — how to react when an unsafe-related lint fires, and why workspace-level lint changes need Hugo review.
+- **`rust-clippy-triage`** — how to react when an unsafe-related lint fires, and why workspace-level lint changes need maintainer review.
 - **`rust-style`** — the wildcard-match rule is load-bearing around unsafe too: every enum variant you forget is one you're silently assuming doesn't exist.
