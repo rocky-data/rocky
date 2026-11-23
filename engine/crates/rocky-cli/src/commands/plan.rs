@@ -1834,6 +1834,12 @@ async fn build_and_persist_run_plan(
     // warehouses, not on `warehouse`, so a describe here could read the wrong
     // table. An agent's apply refuses a `--dag` plan, and a person's apply
     // describes at run time.
+    //
+    // An `E012` (`nullable = false` on a nullable column) the compile over the
+    // described sources does not reproduce is dropped, as in `rocky run`. The
+    // described schemas are stored in the plan, and an agent's apply replays
+    // them to reach the same verdict without describing live. They never seed
+    // the reviewed snapshot or the execution fingerprint.
     let described = if run_options.dag {
         std::collections::HashMap::new()
     } else {
@@ -1847,8 +1853,9 @@ async fn build_and_persist_run_plan(
     };
     if !described.is_empty() {
         let mut typed_config = config.clone();
-        typed_config.source_schemas.extend(described);
+        typed_config.source_schemas.extend(described.clone());
         if let Ok(typed) = compile::compile(&typed_config) {
+            super::run::drop_nullability_errors_the_describe_resolves(&mut result, &typed);
             super::run::adopt_contract_type_errors(&mut result, typed);
         }
     }
@@ -1983,7 +1990,7 @@ async fn build_and_persist_run_plan(
                 None
             }
         };
-        let (capabilities, fill_previews) = capabilities_and_fill_previews(
+        let (mut capabilities, fill_previews) = capabilities_and_fill_previews(
             config_path,
             scope.as_ref(),
             base_ref,
@@ -1992,6 +1999,11 @@ async fn build_and_persist_run_plan(
             bind_masks,
             Some(&config.source_schemas),
         )?;
+        // Name-sorted for a stable `plan_id`; empty is left out of the JSON.
+        capabilities.described_source_schemas = described
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
             .context("failed to write run plan")?;
         Ok((plan_id, Utc::now(), fill_previews))
@@ -2233,6 +2245,7 @@ fn capabilities_and_fill_previews(
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
         // No fingerprint ⇒ apply refuses regardless; the snapshot is moot (`None`).
         reviewed_source_schemas: None,
+        described_source_schemas: std::collections::BTreeMap::new(),
         first_run_fills: std::collections::BTreeSet::new(),
     };
 
@@ -2373,6 +2386,7 @@ fn capabilities_and_fill_previews(
                     config_identity,
                     fingerprint_version: CURRENT_FINGERPRINT_VERSION,
                     reviewed_source_schemas,
+                    described_source_schemas: std::collections::BTreeMap::new(),
                     first_run_fills,
                 },
                 fill_previews,
@@ -2409,6 +2423,7 @@ fn capabilities_and_fill_previews(
             config_identity,
             fingerprint_version: CURRENT_FINGERPRINT_VERSION,
             reviewed_source_schemas,
+            described_source_schemas: std::collections::BTreeMap::new(),
             first_run_fills,
         },
         fill_previews,
