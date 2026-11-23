@@ -402,6 +402,50 @@ fn a_require_review_verdict_refuses_an_agent_run() {
     );
 }
 
+/// A replication run under `require_review` (no `run` rule) is refused at
+/// the pre-run gate, as `deny` is: before discovery, before the idempotency
+/// claim, and so before the vendor sync that runs after the claim.
+///
+/// Under `dedup_on = "any"` a claim that the run then fails leaves a
+/// `Failed` stamp, and a retry with the same key is skipped. So a human retry
+/// that writes tables shows the refused run never claimed the key. A refusal
+/// after discovery would also record a decision per table, not one under the
+/// pipeline's name.
+#[test]
+fn a_require_review_replication_run_refuses_before_its_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    replication_project(
+        tmp.path(),
+        "\n[state.idempotency]\ndedup_on = \"any\"\n\n[policy]\nversion = 1\n",
+    );
+    let key = "k-review-replication";
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--idempotency-key", key],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("policy requires review"),
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(written_tables(tmp.path()), Vec::<String>::new());
+    assert_eq!(
+        run_decisions(tmp.path()),
+        [("ingest".to_string(), "require_review".to_string())],
+        "one pre-run decision under the pipeline's name, none per discovered table"
+    );
+
+    let retried = rocky(tmp.path(), &["run", "--idempotency-key", key]);
+    assert!(retried.status.success(), "{}", describe(&retried));
+    assert_eq!(
+        written_tables(tmp.path()),
+        ["staging__orders.orders", "staging__orders.returns"],
+        "the key was never claimed, so the retry runs rather than skips\n{}",
+        describe(&retried)
+    );
+}
+
 #[test]
 fn a_human_run_under_the_same_policy_is_not_gated() {
     let tmp = tempfile::tempdir().unwrap();

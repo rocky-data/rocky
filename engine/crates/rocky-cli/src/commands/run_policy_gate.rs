@@ -201,18 +201,19 @@ fn selected_models(
     }
 }
 
-/// Whether any `run` verdict for an agent could be other than `deny`: a
-/// non-deny default posture (or a waived one), or a non-deny `run` rule.
+/// Whether any `run` verdict for an agent could be `allow`: an `allow`
+/// default posture (or a waived one), or an `allow` `run` rule. A run
+/// refuses under both `deny` and `require_review`, so neither counts.
 fn run_could_be_allowed(cfg: &RockyConfig, branch: bool) -> bool {
     let Some(policy) = cfg.policy.as_ref() else {
         return true;
     };
     branch
-        || policy.default_agent_effect != PolicyEffect::Deny
+        || policy.default_agent_effect == PolicyEffect::Allow
         || policy.rules.iter().any(|rule| {
             rule.principal == PolicyPrincipal::Agent
                 && rule.capability.matches_input(PolicyCapability::Run)
-                && rule.effect != PolicyEffect::Deny
+                && rule.effect == PolicyEffect::Allow
         })
 }
 
@@ -400,12 +401,19 @@ fn enforce(verdict: PolicyGate, plan_id: &str, branch: bool) -> Result<()> {
             rule_id,
             reason,
         } => {
-            let alternatives = if branch {
-                "Have a human run it, or change the `run` rule"
-            } else {
-                "Build it on a branch (`rocky run --branch <name>`, then `rocky plan promote`), \
-                 use a reviewed plan (`rocky plan`, `rocky review <plan-id> --approve`, \
-                 `rocky apply <plan-id>`), or have a human run it"
+            // A matched `run` rule governs a branch run too, so only a
+            // verdict from the default posture (no rule) can point at one.
+            let alternatives = match (branch, rule_id) {
+                (true, _) => "Have a human run it, or change the `run` rule",
+                (false, Some(_)) => {
+                    "Use a reviewed plan (`rocky plan`, `rocky review <plan-id> --approve`, \
+                     `rocky apply <plan-id>`), have a human run it, or change the `run` rule"
+                }
+                (false, None) => {
+                    "Build it on a branch (`rocky run --branch <name>`, then `rocky plan \
+                     promote`), use a reviewed plan (`rocky plan`, `rocky review <plan-id> \
+                     --approve`, `rocky apply <plan-id>`), or have a human run it"
+                }
             };
             bail!(
                 "policy requires review for agent `rocky run` ({plan_id}): model '{model}'{} — \
@@ -537,4 +545,58 @@ fn dag_subjects<'a>(
         .into_iter()
         .map(|(pipeline, names)| (pipeline, run_subjects(names)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(policy: &str) -> RockyConfig {
+        toml::from_str(policy).expect("policy config parses")
+    }
+
+    const RULE: &str = "\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"run\"\n\
+                        scope = { any = true }\neffect = ";
+
+    /// Only an `allow` can let a run through, so only an `allow` default or
+    /// an `allow` `run` rule defers a replication run to its in-run gate.
+    /// `require_review` refuses a run as `deny` does, at the same point.
+    #[test]
+    fn only_an_allow_could_allow_a_run() {
+        let cases = [
+            ("[policy]\nversion = 1\n".to_string(), false),
+            (
+                "[policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n".to_string(),
+                false,
+            ),
+            (
+                "[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n".to_string(),
+                false,
+            ),
+            (
+                "[policy]\nversion = 1\ndefault_agent_effect = \"allow\"\n".to_string(),
+                true,
+            ),
+            (
+                format!("[policy]\nversion = 1\n{RULE}\"require_review\"\n"),
+                false,
+            ),
+            (
+                format!("[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n{RULE}\"allow\"\n"),
+                true,
+            ),
+        ];
+        for (policy, expected) in &cases {
+            assert_eq!(
+                run_could_be_allowed(&config(policy), false),
+                *expected,
+                "{policy}"
+            );
+            assert!(
+                run_could_be_allowed(&config(policy), true),
+                "a branch run defers to the in-run gate: {policy}"
+            );
+        }
+        assert!(run_could_be_allowed(&config(""), false));
+    }
 }
