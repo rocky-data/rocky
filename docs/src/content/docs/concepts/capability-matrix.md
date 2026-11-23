@@ -99,7 +99,10 @@ Two limits, stated plainly:
   says otherwise, so a `nullable = false` contract on it is `E012`. Before any
   write, `rocky run` also describes each source behind an `E012`. It drops the
   `E012` when the warehouse reports the column as NOT NULL. A nullable column
-  keeps the `E012`.
+  keeps the `E012`. `rocky plan` describes the same sources and stores them in
+  the plan, and an agent's `rocky apply` reuses them instead of describing
+  again. A plan saved by an older Rocky has none stored, so its apply keeps
+  the `E012`.
 - A bare `Decimal` in a contract matches any precision and scale. A contract
   that names the digits — `Decimal(18,2)` — must match the inferred precision
   and scale exactly.

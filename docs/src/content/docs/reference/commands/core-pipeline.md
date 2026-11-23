@@ -777,7 +777,7 @@ A `severity = "warning"` test is listed in every mode and never fails a model. T
 | `reason` | For `skipped` and `not_started`: `unchanged`, `reused`, `upstream_failed`, `frozen` or `run_stopped`. |
 | `blocked_by` | For `upstream_failed`: the failed upstream models. |
 
-A fail-fast run stops at the first failure. Models that had not started are `not_started` with reason `run_stopped`. The text summary lists them and hints at `[resilience] contain_failures = true`, which keeps building models that do not depend on the failure. That setting stays `false` by default.
+A fail-fast run (`[resilience] contain_failures = false`) stops at the first failure. Models that had not started are `not_started` with reason `run_stopped`. The text summary lists them and hints at `[resilience] contain_failures = true`, which keeps building models that do not depend on the failure. The hint only appears when a project sets `false`, because `true` is the default.
 
 ### Recovering replication checkpoints
 

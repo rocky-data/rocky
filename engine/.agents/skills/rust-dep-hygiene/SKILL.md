@@ -61,7 +61,7 @@ rust-version = "1.88"
 
 1. **Don't use features newer than 1.88** in any engine crate. If a stable feature lands in 1.89+, either wait for the next MSRV bump or gate your usage behind something that compiles on 1.88.
 2. **Dependencies can have their own MSRV.** If a dep requires Rust 1.90 and Rocky is on 1.88, you have two choices: pin an older version of the dep (check `cargo tree` and the dep's changelog) or propose an MSRV bump.
-3. **Bumping MSRV is a policy change.** Don't do it unilaterally. Propose to Hugo, note the reason (typically: a dep dropped support for the old MSRV), and bump both the `[workspace.package]` line **and** the CI toolchain installer in `.github/workflows/engine-ci.yml` in the same PR.
+3. **Bumping MSRV is a policy change.** Don't do it unilaterally. Propose it to a maintainer, note the reason (typically: a dep dropped support for the old MSRV), and bump both the `[workspace.package]` line **and** the CI toolchain installer in `.github/workflows/engine-ci.yml` in the same PR.
 4. **Edition bumps** (2024 → 2027 when that exists) are separate from MSRV bumps and even rarer. Don't conflate them.
 
 ## Security audit: `cargo audit`
@@ -93,7 +93,7 @@ cargo audit
 - `low` / informational — note, don't drop everything.
 - `unsound` advisories on a **library** dep are different from vulnerabilities — they indicate soundness bugs in the dep, and the right fix is usually a version bump or a report upstream, not a workspace allowlist.
 
-`cargo audit` does **not** currently have an allow-list for accepted advisories in Rocky. If you want to ignore a specific advisory with a reason, that's a policy change — propose it to Hugo first. (The mechanism is `audit.toml` with `ignore = ["RUSTSEC-YYYY-NNNN"]` and a `reason = "..."` line.)
+`cargo audit` does **not** currently have an allow-list for accepted advisories in Rocky. If you want to ignore a specific advisory with a reason, that's a policy change — propose it to a maintainer first. (The mechanism is `audit.toml` with `ignore = ["RUSTSEC-YYYY-NNNN"]` and a `reason = "..."` line.)
 
 ## License / supply-chain checks: `cargo-deny` (not currently configured)
 
@@ -104,7 +104,7 @@ Rocky does **not** ship a `deny.toml` or run `cargo-deny` in CI as of this skill
 - `advisories`: fail on `unmaintained` + `unsound` (beyond what `cargo audit` already catches).
 - `sources`: restrict to `crates-io` unless explicit git deps are reviewed.
 
-Don't enable this without Hugo's sign-off — it's the kind of change that turns a clean workspace red on day one.
+Don't enable this without a maintainer's sign-off — it's the kind of change that turns a clean workspace red on day one.
 
 ## Unused deps: `cargo-machete`
 
