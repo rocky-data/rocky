@@ -308,7 +308,7 @@ run_suite() {
 # unset one would end the block early.
 EXTRA_ENV=("CONNECTOR_PATHS_RE=$(extract_regex "$ROOT/.github/workflows/engine-ci.yml" CONNECTOR_PATHS_RE)")
 run_suite engine-ci.yml      ENGINE_PATHS_RE  engine  engine \
-    .claude/skills/rocky-ai-workflow/SKILL.md
+    .agents/skills/rocky-ai-workflow/SKILL.md
 EXTRA_ENV=()
 # The four generator pins are listed explicitly: they are the paths #1587 was
 # filed about, and a regex that watches the generated OUTPUT but not the tool

@@ -217,7 +217,7 @@ The engine matrix builds five targets: macOS ARM64, macOS Intel, Linux x86_64, L
 
 Four `just` recipes wrap that same script: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`. Without `--publish`, the sdk, dagster, and vscode paths build the artifact and create the GitHub Release as a draft, but never reach PyPI or the Marketplace; the tag push's CI run publishes the draft after its own registry upload. `just release-engine` takes no `--publish`, because the engine publishes to GitHub Releases only.
 
-Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirrored at `.agents/skills/rocky-release/` and `.claude/skills/rocky-release/`, walks the full checklist.
+Prefer the tag-driven flow for a normal release. The `rocky-release` skill, at `.agents/skills/rocky-release/`, walks the full checklist.
 
 ## Pull requests
 

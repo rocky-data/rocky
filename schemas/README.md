@@ -77,7 +77,7 @@ Every schema file in this directory maps to a typed Rust output struct. The full
 2. Register it in `engine/crates/rocky-cli/src/commands/export_schemas.rs::schemas()`.
 3. From the monorepo root, run `just codegen`.
 4. Review the diff: you should see changes in `schemas/`, `sdk/python/src/rocky_sdk/types_generated/`, and `editors/vscode/src/types/generated/`.
-5. Wire the new command into the SDK and the dagster consumer per the checklist in `.claude/skills/rocky-new-cli-command/SKILL.md`.
+5. Wire the new command into the SDK and the dagster consumer per the checklist in `.agents/skills/rocky-new-cli-command/SKILL.md`.
 6. Commit the Rust source, the schema, and the regenerated bindings in one commit.
 
 CI will fail if the committed bindings drift from what `just codegen` produces locally.

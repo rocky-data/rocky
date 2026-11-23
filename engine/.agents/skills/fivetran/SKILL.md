@@ -8,7 +8,7 @@ description: Fivetran REST API reference for Rocky's source adapter. Use when im
 ## Quick Reference
 
 For complete endpoint details, request/response examples, and parameters:
-- `references/rest_api_collection.json` — Full Postman collection (17k+ lines)
+- `references/rest_api_collection.json` — Full Postman collection (17k+ lines, about 130k tokens). Never read it whole. Grep it for the endpoint path or name (`grep -n '"/v1/connections' references/rest_api_collection.json`), then read only the matching lines.
 
 ## Authentication
 

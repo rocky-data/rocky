@@ -9,6 +9,7 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 - Config authoring → `rocky-config` skill (monorepo root `.agents/skills/`)
 - JSON output schema cascade → `rocky-codegen` skill
 - Engine architecture → `engine/AGENTS.md`
+- CLI verbs, global flags, `rocky.toml` sections, model files, schema pattern, hooks → [`references/user-surface.md`](references/user-surface.md)
 
 ## Commands
 
@@ -32,7 +33,6 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 | `rocky lineage <model> [--column <col>]` | Model/column lineage |
 | `rocky lineage-diff [<base_ref>]` | Per-changed-column downstream impact between two git refs (PR-comment Markdown) |
 | `rocky doctor -c rocky.toml` | Aggregate health checks (config, state, adapters, pipelines, state_sync) |
-| `rocky drift -c rocky.toml` | Schema drift report |
 | `rocky optimize -c rocky.toml` | Cost model + materialization-strategy recommendations |
 | `rocky compare` | Shadow vs production comparison |
 | `rocky compact <fqn>` / `rocky compact --catalog <name>` | OPTIMIZE/VACUUM SQL plan (single table or every Rocky-managed table in a catalog) |
@@ -54,12 +54,11 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 | Flag | Effect |
 |---|---|
 | `--output json` | Emit typed JSON (every command has a JsonSchema-backed struct — see `rocky-codegen`) |
-| `--output table` | Human-readable table (default) |
+| `--output table` | Human-readable table (default on a terminal; piped output defaults to json) |
 | `-c <path>`, `--config <path>` | Config file (default: `rocky.toml` in cwd) |
 | `--state-path <path>` | Override embedded state store location |
 | `--filter <k=v>` | Scope to matching pipelines/sources/groups (e.g. `--filter source=shopify`) |
 | `--resume` / `--resume-latest` | Resume a checkpointed run |
-| `--output-file <path>` | Write JSON output to file instead of stdout |
 
 ## Exit codes
 

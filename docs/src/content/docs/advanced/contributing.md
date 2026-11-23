@@ -43,7 +43,7 @@ The right entry point depends on what you want to change.
 | Column lineage extraction | `engine/crates/rocky-sql/src/lineage.rs` |
 | Skip-unchanged gate / hashing | `engine/crates/rocky-sql/src/determinism.rs` + `rocky-ir/src/ir.rs::skip_hash()` |
 | CLI JSON output shape | `engine/crates/rocky-cli/src/output.rs` — then run `just codegen` |
-| A new CLI subcommand | See the `rocky-new-cli-command` skill in `.agents/skills/` (mirrored in `.claude/skills/`) |
+| A new CLI subcommand | See the `rocky-new-cli-command` skill in `.agents/skills/` |
 | The Rocky DSL (`.rocky` files) | `engine/crates/rocky-lang/src/` — then update VS Code grammar too |
 | The browser UI (`rocky serve --ui`) | `engine/ui/` (React + Vite). Run `just ui-dev` for the dev loop. |
 | The LSP server | `engine/crates/rocky-server/src/lsp.rs` |

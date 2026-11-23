@@ -34,7 +34,7 @@ use crate::result_types::*;
 /// [`WORKER_INSTRUCTIONS_BANNER`] + this (see
 /// [`RockyMcpServer::get_info`]) — the skill file itself stays canonical and
 /// untouched.
-const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
+const INSTRUCTIONS: &str = include_str!("../../../../.agents/skills/rocky-ai-workflow/SKILL.md");
 
 /// What `rocky mcp` calls itself in the `initialize` result's
 /// `serverInfo.name` (#1973).
@@ -158,10 +158,10 @@ fn worker_instructions_banner(excluded: &[String]) -> String {
 /// wider than the old literal and still not the same sentence as "the CLI
 /// is unreachable".
 ///
-/// A PROJECTION, NOT A FORK. The canonical `.claude/skills/rocky-ai-workflow`
+/// A PROJECTION, NOT A FORK. The canonical `.agents/skills/rocky-ai-workflow`
 /// file is untouched — it is correct guidance for the default profile, where
 /// the record/review/apply chain is the real workflow, and it is mirrored
-/// byte-identically into `.agents/skills/` under a CI drift gate. What
+/// byte-identically into `.claude/skills/` under a CI drift gate. What
 /// changes is what the WORKER is served. Twenty-seven passages are rewritten
 /// out of a 74-line document; the authoring loop itself — inspect, sample,
 /// write, compile-loop, preview, read the JSON, the anti-patterns — is
