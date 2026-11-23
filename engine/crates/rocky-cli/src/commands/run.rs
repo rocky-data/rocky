@@ -13796,8 +13796,12 @@ async fn execute_models_phase(
     // (`I003`) was not checked. The usual cause is an external source with no
     // known schema: no seed, no schema cache entry. The warehouse is right
     // here, so describe those sources and compile a second time to check the
-    // contract types before any write. A governed apply replays its reviewed
-    // source snapshot and never takes this path.
+    // contract types before any write.
+    //
+    // A governed apply never describes live. It replays the sources its plan
+    // described (`described_source_schemas`, #2635), so it reaches the verdict
+    // the plan was reviewed with. A plan that described nothing, or one written
+    // before the field existed, replays nothing and keeps its `E012`.
     //
     // Only the second compile's `E011` (contract type mismatch) for a type the
     // first compile left unchecked (`I003`) is kept. The first compile stays
@@ -13812,15 +13816,23 @@ async fn execute_models_phase(
     // for them the `E012` stays, as it was. An adapter must report NOT NULL
     // only where the warehouse enforces it on every row.
     let mut described_sources = std::collections::HashMap::new();
-    if exec_fp_gate.is_none()
-        && let Ok(first) = &mut compile
-        && let described = describe_sources_for_unchecked_contract_types(
-            first,
-            &compile_config.source_schemas,
-            &compile_config.external_dependencies,
-            warehouse,
-        )
-        .await
+    if let Ok(first) = &mut compile
+        && let described = match exec_fp_gate {
+            Some(gate) => gate
+                .described_source_schemas
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            None => {
+                describe_sources_for_unchecked_contract_types(
+                    first,
+                    &compile_config.source_schemas,
+                    &compile_config.external_dependencies,
+                    warehouse,
+                )
+                .await
+            }
+        }
         && !described.is_empty()
     {
         let mut typed_config = compile_config.clone();
@@ -22749,6 +22761,7 @@ max_retries = 0
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -33246,6 +33259,7 @@ table = "fct_daily"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "plan-x".to_string(),
             require: false,
@@ -38364,6 +38378,115 @@ backend = "local"
         }
     }
 
+    /// Run the models as an agent's apply runs them: through a governed gate
+    /// that replays an empty reviewed snapshot and `described`, the sources
+    /// the plan described (#2635).
+    #[cfg(feature = "duckdb")]
+    async fn governed_apply_with_described(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        described: std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
+    ) -> RunOutput {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
+            expected: None,
+            config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
+            exec_control_identity: String::new(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
+            described_source_schemas: described,
+            plan_id: "p".to_string(),
+            require: false,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &PartitionRunOptions::default(),
+            "governed-run",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            None, // shadow_config (test)
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
+            true,
+            Some(&gate),
+            None, // freeze_fence (test)
+            false,
+            false,
+        )
+        .await
+        .expect("the contract verdict is carried in RunOutput");
+        output
+    }
+
+    /// #2635: an agent's apply replays the sources its plan described, never
+    /// the warehouse. The source here is NOT NULL in the warehouse.
+    ///
+    /// - No described sources (a plan that described nothing, or one written
+    ///   before `described_source_schemas` existed): the `E012` stays and
+    ///   nothing is written. A live describe would have cleared it.
+    /// - The plan described the column NOT NULL: the `E012` is dropped and the
+    ///   model is written, as `rocky run` writes it.
+    /// - The plan described the column nullable: the `E012` stays.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn governed_apply_replays_the_plans_described_sources() {
+        use rocky_ir::RockyType;
+        use rocky_ir::types::TypedColumn;
+
+        let described = |nullable: bool| {
+            std::collections::BTreeMap::from([(
+                "src.orders".to_string(),
+                vec![TypedColumn {
+                    name: "order_id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable,
+                }],
+            )])
+        };
+        for (case, replayed, refused) in [
+            ("none described", std::collections::BTreeMap::new(), true),
+            ("described NOT NULL", described(false), false),
+            ("described nullable", described(true), true),
+        ] {
+            let (dir, models) = described_nullability_fixture(None, "NOT NULL");
+            let db_path = dir.path().join("t.duckdb");
+            let output = governed_apply_with_described(&models, &db_path, replayed).await;
+            if refused {
+                assert!(
+                    output.errors.iter().any(|e| e.error.contains("E012")),
+                    "{case}: E012 must stay: {:?}",
+                    output.errors
+                );
+                assert!(output.materializations.is_empty(), "{case}");
+            } else {
+                assert!(
+                    output.errors.is_empty(),
+                    "{case}: no errors: {:?}",
+                    output.errors
+                );
+                assert_eq!(output.materializations.len(), 1, "{case}");
+            }
+        }
+    }
+
     /// Control for the test above: a nullable source column keeps the
     /// `E012`, and the model is not written.
     #[cfg(feature = "duckdb")]
@@ -39282,6 +39405,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
@@ -39603,6 +39727,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: resolved_mask.clone(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
@@ -39848,6 +39973,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(snapshot),
             plan_id: "p".to_string(),
             require: false,
@@ -39940,6 +40066,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: with_b_mask,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
@@ -40001,6 +40128,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None, // v2 governed plan MUST carry Some
             plan_id: "p".to_string(),
             require: true,
@@ -56095,6 +56223,7 @@ timestamp_column = "ts"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: false,
             replication_verify_after: std::sync::Mutex::new(std::collections::BTreeSet::new()),

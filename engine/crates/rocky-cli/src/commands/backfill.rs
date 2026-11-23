@@ -354,6 +354,9 @@ pub(crate) fn run_backfill_in(
         config_identity,
         fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
         reviewed_source_schemas,
+        // A backfill plan describes no source yet (#2635), so its apply keeps
+        // the cache-only contract verdict.
+        described_source_schemas: std::collections::BTreeMap::new(),
     };
     let plan_id = write_plan_governed(
         root,
