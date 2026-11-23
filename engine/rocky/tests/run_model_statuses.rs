@@ -33,6 +33,8 @@ models = "models/**"
 auto_create_schemas = true
 "#;
 
+const FAIL_FAST: &str = "\n[resilience]\ncontain_failures = false\n";
+
 const CONTAIN: &str = "\n[resilience]\ncontain_failures = true\n";
 
 // The broken models must fail when DuckDB runs them, not at compile time:
@@ -159,7 +161,7 @@ fn built(v: &serde_json::Value) -> Vec<String> {
 #[test]
 fn fail_fast_run_reports_failed_and_not_started_models() {
     let dir = tempfile::tempdir().unwrap();
-    project(dir.path(), "", BROKEN_STATUS_COUNTS);
+    project(dir.path(), FAIL_FAST, BROKEN_STATUS_COUNTS);
 
     let out = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(
@@ -475,11 +477,58 @@ fn qualified_name_cycle_is_still_withheld_under_containment() {
 }
 
 #[test]
+fn default_config_contains_a_failure_and_exits_partial_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    // Empty extra config: no `[resilience]` table, so the default applies.
+    project(dir.path(), "", BROKEN_STATUS_COUNTS);
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    let v = json(&out);
+    assert_eq!(status_of(&v, "stg_orders"), "built");
+    assert_eq!(status_of(&v, "customer_orders"), "built");
+    assert_eq!(status_of(&v, "status_counts"), "failed");
+}
+
+/// With no `[resilience]` table, containment is on by default, and a bare
+/// read that would close a cycle keeps the fail-fast policy: it is dropped
+/// from the ordering with one warning, and both models build.
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_under_default_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), "", "orders");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
+    assert_eq!(built(&v), ["orders", "stg_orders"], "{}", describe(&out));
+    assert_eq!(
+        bare_cycle_warnings(&v).len(),
+        1,
+        "exactly one warning for the skipped pair: {}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn bare_name_cycle_is_skipped_with_a_warning_under_fail_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    bare_cycle_project(dir.path(), FAIL_FAST, "orders");
+
+    let out = rocky(dir.path(), &["--output", "json", "run"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let v = json(&out);
+    assert!(!has_cycle_error(&v), "{}", describe(&out));
+    assert_eq!(built(&v), ["orders", "stg_orders"], "{}", describe(&out));
+}
+
+#[test]
 fn retry_failed_reruns_only_failed_and_unbuilt_models() {
     let dir = tempfile::tempdir().unwrap();
     // `zz_counts` sorts after `stg_orders`, so layer 0 builds `stg_orders`
     // first and the run stops on `zz_counts` before layer 1.
-    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    project_with(dir.path(), FAIL_FAST, "zz_counts", BROKEN_STATUS_COUNTS);
     let first = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!first.status.success(), "{}", describe(&first));
     let first = json(&first);
@@ -650,7 +699,7 @@ fn contained_dependent_of_the_failing_model_is_skipped_upstream_failed() {
 #[test]
 fn production_retry_ignores_a_newer_failed_shadow_run() {
     let dir = tempfile::tempdir().unwrap();
-    project_with(dir.path(), "", "zz_counts", BROKEN_STATUS_COUNTS);
+    project_with(dir.path(), FAIL_FAST, "zz_counts", BROKEN_STATUS_COUNTS);
     let prod = rocky(dir.path(), &["--output", "json", "run"]);
     assert!(!prod.status.success(), "{}", describe(&prod));
     assert_eq!(status_of(&json(&prod), "stg_orders"), "built");

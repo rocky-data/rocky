@@ -459,8 +459,9 @@ fn seeds_from_last_run(store: &StateStore, compiled: &CompileResult) -> Result<V
     if seeds.is_empty() {
         bail!(
             "the most recent run '{}' failed, but its failure was not attributed to a \
-             named model (recorded as: {}). Enable `[resilience] contain_failures` so \
-             failures are named, or pass explicit --model names to backfill.",
+             named model (recorded as: {}). `[resilience] contain_failures` is on by default, \
+             and this project set it to false. Remove that setting so failures are named, or pass \
+             explicit --model names to backfill.",
             latest.run_id,
             failed.join(", ")
         );
