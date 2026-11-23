@@ -11,7 +11,15 @@ Whenever analyzing a problem or planning a change, confront these two questions 
 
 A real answer names the weakest assumption, the stale justification, or the hidden prerequisite — and what would settle it. "Nothing" is acceptable only after an actual search, never as a reflex.
 
-These questions are also red-team bait, deliberately. Give every substantive analysis or plan, plus these two answers, to an independent red team — a different model from the author, in a fresh context with no access to the author's reasoning — because an independent reviewer is better placed than the author to see what's missing. Use the first reviewer available, in this order: a different vendor's model; a different model from the author's vendor (for Claude, the model mapping is in `CLAUDE.md`); a fresh agent that did not author the change, preferably on a different model. Client-specific mappings live in that client's file (for Claude Code, `CLAUDE.md`). Never use the authoring agent itself. Substantive means it can change behavior, a decision, or standing policy; a small or docs-only diff never exempts a change, only mechanical, behavior-neutral corrections are exempt. Name the reviewer and address or rebut its findings on the record; that disposition closes the loop (the red-team pass itself doesn't recurse). If no independent red team is available, say so in the output rather than skipping silently. Code changes additionally follow the [`AGENT_REVIEW.md`](AGENT_REVIEW.md) adversarial-review profile.
+These questions are also red-team bait, deliberately. Give every substantive analysis or plan, plus these two answers, to an independent red team — a different model from the author, in a fresh context with no access to the author's reasoning — because an independent reviewer is better placed than the author to see what's missing. Use the first reviewer available, in this order: a different vendor's model; a different model from the author's vendor; a fresh agent that did not author the change, preferably on a different model. Never use the authoring agent itself. Substantive means it can change behavior, a decision, or standing policy; a small or docs-only diff never exempts a change, only mechanical, behavior-neutral corrections are exempt. Name the reviewer and address or rebut its findings on the record; that disposition closes the loop (the red-team pass itself doesn't recurse). If no independent red team is available, say so in the output rather than skipping silently. Code changes additionally follow the [`AGENT_REVIEW.md`](AGENT_REVIEW.md) adversarial-review profile.
+
+How to pick and brief the red team:
+
+- Check which agent types and models you can start, in each session. Check which model you are. It can change mid-session.
+- A reviewer on a different model must be at least as capable as the author's, run at high effort, and be read-only.
+- Give the reviewer the diff, the two answers and `AGENT_REVIEW.md`, never the author's reasoning. For an analysis or plan with no diff, give it the findings or the plan and the files they rest on.
+- A review command run by the authoring agent (such as `/code-review`) does not count as the red team.
+- Name the reviewer and its model in the PR or report.
 
 ## How agents communicate
 
@@ -40,8 +48,9 @@ Each subproject has its own `AGENTS.md` with build commands, coding standards, a
 ## Agent-tool compatibility
 
 - `AGENTS.md` is the canonical, vendor-neutral source for persistent repository guidance. Tool-specific files and directories exist only for discovery compatibility.
-- Root task skills follow the Agent Skills format and are mirrored in `.agents/skills/` and `.claude/skills/`. Keep the two trees byte-identical (CI-checked by `skills-mirror-drift.yml`) and keep workflow text independent of any particular agent client, model, marketplace, or plugin.
-- Subproject-local skills are mirrored the same way: `engine/.agents/skills/` ↔ `engine/.claude/skills/` and `editors/vscode/.agents/skills/` ↔ `editors/vscode/.claude/skills/`. The same CI check keeps each pair byte-identical. Their rules apply to any agent working in those subprojects.
+- Skills follow the Agent Skills format. The source copy lives in `.agents/skills/` (root), `engine/.agents/skills/` or `editors/vscode/.agents/skills/`. Keep workflow text independent of any particular agent client, model, marketplace, or plugin.
+- Each tree has a byte-identical copy in the `.claude/skills/` next to it, for clients that only search there. Edit the `.agents/skills/` copy, then copy the change across. `skills-mirror-drift.yml` fails a PR when a pair differs. The repo tracks no symlinks: `ai-review.yml` refuses them.
+- Subproject skills apply to any agent working in that subproject.
 - If a client does not discover a relevant skill automatically, read its `SKILL.md` directly and follow the nearest applicable `AGENTS.md`.
 
 > **Adversarial / red-team code review** (regardless of agent client): read [`AGENT_REVIEW.md`](AGENT_REVIEW.md) before reviewing engine changes. It is the grounded correctness profile — Rocky's real compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants, and the test-evidence bar.
@@ -64,20 +73,15 @@ examples/playground ──(config)──▶  engine (rocky --config rocky.toml r
 
 DSL changes still touch multiple subprojects in lockstep. The monorepo lets you land them as one PR with one CI run.
 
-**When modifying the CLI's JSON output schema (codegen-driven):**
+**When modifying the CLI's JSON output schema (codegen-driven):** every `--output json` payload is a typed struct in `engine/crates/rocky-cli/src/output.rs` (or `commands/doctor.rs`) that derives `JsonSchema`. The Pydantic models (`sdk/python/src/rocky_sdk/types_generated/`, re-exported by `dagster_rocky.types`) and TypeScript interfaces (`editors/vscode/src/types/generated/`) are generated from it.
 
-Every Rocky CLI command that emits `--output json` is backed by a typed Rust output struct in `engine/crates/rocky-cli/src/output.rs` (or `commands/doctor.rs` for doctor) that derives `JsonSchema`. The Pydantic and TypeScript bindings are autogenerated from those schemas. To change a CLI output:
+1. Edit the `*Output` struct.
+2. Run `just codegen` from the monorepo root.
+3. Commit the schema and the regenerated bindings with the Rust change. `codegen-drift.yml` fails a PR whose committed bindings drift.
+4. Add a new output field by hand to the SDK's runtime models in `rocky_sdk/types.py` (the `parse_rocky_output()` targets). `test_schema_parity.py` checks only their top-level shape.
+5. After a shape change, run `just regen-fixtures` (a separate CI-checked drift surface).
 
-1. Edit the relevant `*Output` struct in `engine/crates/rocky-cli/src/output.rs`.
-2. Run `just codegen` from the monorepo root. This:
-   - exports JSON schemas via `cargo run --bin rocky -- export-schemas schemas/`,
-   - regenerates Pydantic v2 models in `sdk/python/src/rocky_sdk/types_generated/` (re-exported by `dagster_rocky.types` for backward compatibility),
-   - regenerates TypeScript interfaces in `editors/vscode/src/types/generated/`.
-3. Commit the schema and the regenerated bindings together with the Rust change.
-
-The `codegen-drift` CI workflow (`.github/workflows/codegen-drift.yml`) fails any PR where the committed bindings drift from what `just codegen` produces locally.
-
-Every CLI JSON output is covered by an exported schema and generated bindings. The generated Pydantic models live in `rocky-sdk` (`sdk/python/`) and are re-exported by `dagster_rocky.types`; the vscode `rockyJson.ts` is a type-alias shim over the generated TypeScript. The SDK **also** keeps hand-written runtime models in `rocky_sdk/types.py` — the `parse_rocky_output()` dispatch targets; `test_schema_parity.py` guards their top-level shape (not nested or typed parity), so a new output field must be added to them by hand; see [`sdk/python/AGENTS.md`](sdk/python/AGENTS.md) and [`integrations/dagster/AGENTS.md`](integrations/dagster/AGENTS.md). After shape-changing schema edits, `just regen-fixtures` recaptures the dagster test fixtures (a separate CI-checked drift surface). Full workflow and pitfalls: the `rocky-codegen` skill.
+Steps, pitfalls and the per-consumer detail: the `rocky-codegen` skill.
 
 **When modifying Rocky DSL syntax (`.rocky` files):**
 1. `engine/crates/rocky-lang/` (parser + lexer)
@@ -103,18 +107,11 @@ Some environments, cloud agent containers among them, have no `just` and no `car
 
 ## Releases
 
-Tag-namespaced — each artifact ships independently:
-
-- `engine-v0.1.0` → CLI binary on GitHub Releases
-- `sdk-v0.1.0` → `rocky-sdk` wheel on PyPI
-- `dagster-v0.1.0` → `dagster-rocky` wheel on PyPI
-- `vscode-v0.1.0` → Rocky VSIX on VS Code Marketplace
+Each artifact ships on its own tag: `engine-v*` (CLI binaries, GitHub Releases), `sdk-v*` (`rocky-sdk`, PyPI), `dagster-v*` (`dagster-rocky`, PyPI), `vscode-v*` (VSIX, Marketplace). Never tag a bare `v*`: `engine/install.sh` and `engine/install.ps1` filter on the `engine-v*` prefix.
 
 Release **`rocky-sdk` before any `dagster-rocky` release that raises its `rocky-sdk>=…` floor** — the published `dagster-rocky` wheel resolves the SDK from PyPI, not the monorepo path source.
 
-**Release workflow:** Tagging `engine-v*` triggers `engine-release.yml`, which builds all 5 platform targets (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64) via a CI matrix and attaches them to the GitHub Release. `scripts/release.sh` remains as a local-build hotfix fallback. Convenience recipes: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`.
-
-The `engine/install.sh` and `engine/install.ps1` scripts filter releases by the `engine-v*` prefix when fetching the latest version.
+The CI release workflows, `just release-*` recipes and the `scripts/release.sh` fallback: the `rocky-release` skill.
 
 ## Git conventions
 

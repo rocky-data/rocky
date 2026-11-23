@@ -11,7 +11,7 @@ on:
       # what `rocky mcp` serves, and renaming or deleting it fails the build —
       # so it needs engine CI, and without it the five required contexts never
       # run and the PR cannot merge at all (#1557).
-      - '.claude/skills/rocky-ai-workflow/SKILL.md'
+      - '.agents/skills/rocky-ai-workflow/SKILL.md'
       - '.github/workflows/engine-ci.yml'
   # No `paths:` filter on pull_request — deliberately. Four required merge
   # contexts live in this workflow (Test, Clippy, Format, Adapter boundary).
@@ -84,7 +84,7 @@ jobs:
         env:
           # Mirrors the push trigger paths: engine/**, schemas/**, the skill
           # compiled into the binary (#1557), and this workflow itself.
-          ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
+          ENGINE_PATHS_RE: ^(engine/|schemas/|\.agents/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
           # Only the `connector-test` job reads this: the connector code it
           # runs (the manifest, the runner and verifier, and the `rocky
           # connector` commands), this workflow, and the two connector POCs it

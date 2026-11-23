@@ -1,6 +1,6 @@
 ---
 name: tailwind-plus-elements
-description: Using TailwindPlus Elements (@tailwindplus/elements) in the Rocky VS Code webviews. Use when building or upgrading an interactive webview component — a command palette / model search, a confirmation dialog, an autocomplete or select model picker, a dropdown/popover menu, a collapsible disclosure, or tabs. Covers the esbuild-bundle install (no CSP change vs the CDN), the --vscode-* theming + Tailwind v4 data-variant nuance, React 19 custom-element interop (boolean attrs, native events via ref, the elements:ready gate), and which element fits which Rocky surface.
+description: Using TailwindPlus Elements (@tailwindplus/elements) in the Rocky VS Code webviews. Use when building or upgrading an interactive webview component — command palette, dialog, autocomplete/select, dropdown/popover, disclosure or tabs. Covers install, --vscode-* theming and React 19 interop.
 ---
 
 # TailwindPlus Elements in Rocky webviews
