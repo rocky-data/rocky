@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.94.0] — 2026-11-23
+
 ### Upgrade notes
 
 - **[resilience] contain_failures now defaults to true (#2617).** Before, a model that failed while it ran stopped the whole run. Now Rocky withholds the failed model and everything downstream of it. Unrelated models still build. The run reports `PartialFailure`, and `contained[*]` lists the withheld models. An existing project with no `contain_failures` line changes behavior on upgrade. Set `contain_failures = false` under `[resilience]` to restore fail-fast. **One more effect on upgrade.** A stored agent `rocky apply` plan or review-gated `rocky backfill` plan made before the upgrade refuses once, because the plan binds the `[resilience]` config and its default changed. Plan again. A bare table-name read that would close a dependency cycle keeps the fail-fast policy under the new default: Rocky drops that read from the run order with a warning and runs the models (see **Changed** below).
