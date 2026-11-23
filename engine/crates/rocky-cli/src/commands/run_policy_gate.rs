@@ -582,7 +582,9 @@ mod tests {
                 false,
             ),
             (
-                format!("[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n{RULE}\"allow\"\n"),
+                format!(
+                    "[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n{RULE}\"allow\"\n"
+                ),
                 true,
             ),
         ];
