@@ -1,14 +1,29 @@
 # DuckDB function names (lower case), one per line.
-# Generated from DuckDB 2.0.0 (the engine bundled by libduckdb-sys 1.20000.1):
+# Generated from DuckDB 2.0.1 (the engine bundled by libduckdb-sys 1.20001.0):
 # SELECT DISTINCT lower(function_name) FROM duckdb_functions() with
 # core_functions, icu, json and parquet loaded, plus every function an
-# autoloadable extension provides (EXTENSION_FUNCTIONS in DuckDB 2.0.0
+# autoloadable extension provides (EXTENSION_FUNCTIONS in DuckDB 2.0.1
 # src/include/duckdb/main/extension_entries.hpp). Operators (names that are
 # not [a-z0-9_]+) are left out. Lines that start with # are comments.
-__aws__cloudformation__quack_on_ec2__create
-__aws__cloudformation__quack_on_ec2__destroy
-__aws__cloudformation__quack_on_ec2__list
-__aws__cloudformation__quack_on_ec2__status
+__aws__cloudformation__stack__create
+__aws__cloudformation__stack__destroy
+__aws__cloudformation__stack__list
+__aws__cloudformation__stack__resolve
+__aws__cloudformation__stack__status
+__aws__expired
+__aws__s3__bucket__create
+__aws__s3__bucket__destroy
+__aws__s3__bucket__list
+__aws__s3__bucket__status
+__aws__s3tables__bucket__create
+__aws__s3tables__bucket__destroy
+__aws__s3tables__bucket__list
+__aws__s3tables__bucket__resolve
+__aws__s3tables__bucket__status
+__aws__system_table__create
+__aws__system_table__destroy
+__aws__system_table__list
+__aws__system_table__status
 __between
 __cast
 __internal_barrier
@@ -45,6 +60,7 @@ abs
 acos
 acosh
 add
+add_grammar_extension
 add_numbers_together
 add_parquet_key
 age
@@ -123,6 +139,9 @@ atan2
 atanh
 avg
 avro_metadata
+aws_system_table
+aws_system_table_families
+aws_system_tables
 bar
 base64
 bin
@@ -399,6 +418,7 @@ duckdb_functions
 duckdb_grammar_extensions
 duckdb_indexes
 duckdb_keywords
+duckdb_live_query_metrics
 duckdb_log_contexts
 duckdb_logs
 duckdb_logs_parsed
@@ -442,6 +462,7 @@ ducklake_table_changes
 ducklake_table_deletions
 ducklake_table_info
 ducklake_table_insertions
+ducklake_unreadable_macro_default
 editdist3
 element_at
 enable_checkpoint_on_shutdown
@@ -497,6 +518,8 @@ from_hex
 from_json
 from_json_strict
 fsum
+fts_analyze_pattern
+fts_near_tf
 fts_tokenize_opensearch_standard
 functions
 fuzz_all_functions
@@ -520,12 +543,16 @@ glue_add_partition
 glue_alter_table
 glue_drop_partition
 glue_get_database_response
+glue_get_partition_response
 glue_get_table_response
 glue_partitions
 glue_rename_partition
+glue_repair_table
 glue_replace_columns
+glue_requests
 glue_set_partition_location
 glue_set_table_location
+gpu_execution
 grade_up
 greatest
 greatest_common_divisor
@@ -557,6 +584,7 @@ html_escape
 html_unescape
 iceberg_bucket
 iceberg_column_stats
+iceberg_expire_snapshots
 iceberg_files
 iceberg_history
 iceberg_load_table_response
@@ -564,6 +592,7 @@ iceberg_manifests
 iceberg_metadata
 iceberg_partition_specs
 iceberg_partition_stats
+iceberg_partitions
 iceberg_refs
 iceberg_rewrite_data_files
 iceberg_rollback_to_snapshot
@@ -571,6 +600,7 @@ iceberg_scan
 iceberg_scan_plan
 iceberg_scan_tasks
 iceberg_schema_properties
+iceberg_schemas
 iceberg_snapshots
 iceberg_table_properties
 iceberg_to_ducklake
@@ -897,6 +927,7 @@ map_extract_value
 map_from_entries
 map_keys
 map_to_pg_oid
+map_type_id_to_pg_oid
 map_values
 max
 max_by
@@ -944,13 +975,11 @@ nullif
 obj_description
 octet_length
 odbc_begin_transaction
-odbc_bind_params
 odbc_cancel_query
 odbc_close
 odbc_commit
 odbc_connect
 odbc_copy
-odbc_create_params
 odbc_list_data_sources
 odbc_list_drivers
 odbc_query
@@ -962,6 +991,7 @@ parquet_file_metadata
 parquet_full_metadata
 parquet_kv_metadata
 parquet_metadata
+parquet_page_index
 parquet_scan
 parquet_schema
 parse_dirname
@@ -1062,6 +1092,7 @@ read_ndjson_auto
 read_ndjson_objects
 read_parquet
 read_postgres_binary
+read_single_avro_file
 read_single_csv_file
 read_single_json_file
 read_single_parquet_file
@@ -1089,6 +1120,7 @@ regr_sxx
 regr_sxy
 regr_syy
 remap_struct
+remove_grammar_extension
 remove_iceberg_schema_properties
 remove_iceberg_table_properties
 repeat
@@ -1109,6 +1141,23 @@ rpad
 rtree_index_dump
 rtree_index_scan
 rtrim
+s3_bucket_metadata_configuration
+s3_bucket_tags
+s3_buckets
+s3_create_bucket
+s3_create_bucket_metadata_configuration
+s3_delete_bucket
+s3_delete_bucket_metadata_configuration
+s3_get_bucket
+s3_update_bucket
+s3tables_create_table_bucket
+s3tables_delete_table_bucket
+s3tables_get_table_bucket
+s3tables_namespaces
+s3tables_table_bucket_tags
+s3tables_table_buckets
+s3tables_table_metadata_location
+s3tables_tables
 scan_data_from_quack_client
 second
 sem
@@ -1132,6 +1181,7 @@ sign
 signbit
 sin
 sinh
+sirius_status
 skewness
 sleep_ms
 sniff_csv
@@ -1149,6 +1199,7 @@ st_area
 st_area_spheroid
 st_asbinary
 st_asgeojson
+st_asgrid
 st_ashexwkb
 st_asmvt
 st_asmvtgeom

@@ -45,7 +45,7 @@ The steps, in order:
 rocky connector init orders
 ```
 
-It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
+It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [Write a connector](/guides/write-a-connector/) for the full walk-through, and [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
 
 ## Test a connector
 
@@ -283,7 +283,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 
 ## Reference connector
 
-The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete child connector for Postgres. Copy it as a starting point. It is one Python 3.8 file with no packages. It runs its SQL through the `duckdb` CLI and the DuckDB `postgres` extension.
+The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete child connector for Postgres. Its manifest sets `support_tier = "reference"`: the Rocky project maintains it and tests it in CI. Copy it as a starting point, and change or remove `support_tier` in your copy. Or follow [Write a connector](/guides/write-a-connector/) to build your own from a scaffold. It is one Python 3.8 file with no packages. It runs its SQL through the `duckdb` CLI and the DuckDB `postgres` extension.
 
 The connector reads one table and keeps a timestamp cursor in its state.
 
@@ -346,6 +346,7 @@ The POCs run offline once the tool is installed. Each skips with exit 0 when its
 
 ## Related
 
+- [Write a connector](/guides/write-a-connector/) for a step-by-step walk-through
 - [`rocky load`](/reference/cli/#rocky-load) for loading files from a directory
 - [`[connector.NAME]`](/reference/configuration/#connectorname) for the config keys
 - [State management](/concepts/state-management/) for the state backends

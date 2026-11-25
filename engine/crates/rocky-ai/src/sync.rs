@@ -433,6 +433,7 @@ mod tests {
             model_timings: std::collections::HashMap::new(),
             contract_files: std::collections::BTreeMap::new(),
             consumers: vec![],
+            seed_function_names: Default::default(),
         }
     }
 }
