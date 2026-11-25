@@ -218,6 +218,13 @@ pub struct CompileResult {
     /// holds only the `depends_on` entries that name a model; an entry that
     /// does not is an `E060` in [`Self::diagnostics`].
     pub consumers: Vec<rocky_core::consumers::Consumer>,
+    /// The names, as [`crate::function_check::seed_name_key`], of the
+    /// functions and macros the seed that typed this compile created, read
+    /// from the DuckDB that ran it (#2691). The compile leaves it empty; a
+    /// caller that typed [`CompilerConfig::source_schemas`] from a seed it
+    /// ran fills it. On DuckDB, E057 and E068 skip these names, and the
+    /// names a scan of the seed's text finds.
+    pub seed_function_names: std::collections::HashSet<String>,
 }
 
 /// Compile error.
@@ -643,6 +650,7 @@ pub fn compile_project(
         model_timings,
         contract_files,
         consumers,
+        seed_function_names: std::collections::HashSet::new(),
     })
 }
 
@@ -1030,6 +1038,7 @@ pub fn compile_incremental(
         model_timings,
         contract_files,
         consumers,
+        seed_function_names: std::collections::HashSet::new(),
     })
 }
 

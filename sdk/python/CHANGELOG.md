@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-11-23
+
+### Upgrade notes
+
+- **Use 0.34.0 with engine 1.94.0.** Engine 1.94.0 emits policy capability `run` and new audit kinds (`failing_tests_allowed`, `failing_tests_blocked`, `test_evidence_missing`). Rocky SDK 0.33.0 rejects those values, so upgrade the SDK with the engine.
+
 ### Added
 
 - Child connector license and tier (engine, unreleased). The generated `ConnectorLoadInfo` in `load_schema` gains `license` and `support_tier`, with the new enum `ConnectorSupportTier` (`reference`, `community`, `unknown`).

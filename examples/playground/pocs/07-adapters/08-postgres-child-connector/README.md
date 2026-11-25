@@ -20,6 +20,10 @@
 | It needs the standalone `duckdb` CLI on `PATH`. | `main.py` runs all SQL through it, with the DuckDB `postgres` extension. |
 | Egress: `extensions.duckdb.org` and your Postgres host. | The manifest declares only `extensions.duckdb.org`, the one fixed host. Rocky does not enforce the list. |
 
+## Support tier
+
+The manifest sets `support_tier = "reference"`. The Rocky project maintains this connector. `rocky connector test pg_events` runs on each pull request that touches it, with no Docker. `run.sh` runs against Docker every week.
+
 ## What it shows
 
 A complete child connector in about 240 lines of Python. `rocky load --connector pg_events` starts `connector/main.py` once. The program reads the new rows of `public.events` from Postgres and writes one Parquet file. Rocky checks the file, appends the rows to `poc.main.events` in DuckDB, and saves the cursor for the next run.
@@ -114,5 +118,6 @@ POC complete: 3 loads, 24 rows, cursor held back at the source maximum, no passw
 
 ## Related
 
+- [Write a connector](../../../../../docs/src/content/docs/guides/write-a-connector.md): build your own from `rocky connector init`
 - [Child connectors guide](../../../../../docs/src/content/docs/guides/child-connectors.md): the protocol, the checks and the guarantees
 - [`07-trino-docker`](../07-trino-docker/): the same Docker skip pattern

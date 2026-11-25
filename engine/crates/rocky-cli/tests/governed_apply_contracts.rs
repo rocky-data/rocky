@@ -26,15 +26,21 @@ use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 /// Write the project under `root` and seed its warehouse. `contract` is the
 /// body of `contracts/fct.contract.toml`.
 async fn project(root: &Path, contract: &str) -> (PathBuf, PathBuf) {
+    project_with_source(root, contract, "NOT NULL").await
+}
+
+/// [`project`], with `ext.customers.customer_id` declared `source_null`.
+async fn project_with_source(root: &Path, contract: &str, source_null: &str) -> (PathBuf, PathBuf) {
     let db = root.join("wh.duckdb");
     {
         let a = DuckDbWarehouseAdapter::open(&db).expect("open db");
+        let customers = format!("CREATE TABLE ext.customers (customer_id BIGINT {source_null})");
         for sql in [
             "CREATE SCHEMA raw__orders",
             "CREATE TABLE raw__orders.orders (order_id INTEGER NOT NULL)",
             "INSERT INTO raw__orders.orders VALUES (1)",
             "CREATE SCHEMA ext",
-            "CREATE TABLE ext.customers (customer_id BIGINT NOT NULL)",
+            customers.as_str(),
             "INSERT INTO ext.customers VALUES (10)",
         ] {
             a.execute_statement(sql).await.expect(sql);
@@ -218,5 +224,69 @@ async fn the_plan_reaches_runs_contract_type_verdict() -> anyhow::Result<()> {
         fct_exists(&root).await,
         "the agent's apply writes the planned model"
     );
+
+    // NOT NULL (#2635, second half): `rocky run` takes NOT NULL from the
+    // described source and writes the model. The plan must drop the `E012`
+    // the same way and store the described source, and the agent's apply
+    // must replay it and write the model.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    std::env::set_current_dir(&root)?;
+    let not_null = "[[columns]]\nname = \"customer_id\"\nnullable = false\n";
+    let (config, models) = project(&root, not_null).await;
+    let state = root.join("state.redb");
+    let plan_id = agent_plan(&config, &models, &state).await.map_err(|e| {
+        anyhow::anyhow!("a NOT NULL contract on a NOT NULL source must be planned: {e:#}")
+    })?;
+    let plan_file = root
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{plan_id}.json"));
+    let plan: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&plan_file)?)?;
+    let capabilities = &plan["payload"]["policy_capabilities"];
+    assert_eq!(
+        capabilities["described_source_schemas"]["ext.customers"][0]["nullable"],
+        serde_json::json!(false),
+        "the plan stores the described source: {capabilities}"
+    );
+    assert!(
+        capabilities["reviewed_source_schemas"]
+            .get("ext.customers")
+            .is_none(),
+        "the described source stays out of the reviewed snapshot: {capabilities}"
+    );
+    rocky_cli::commands::apply::run_apply(
+        &config,
+        &plan_id,
+        &state,
+        PolicyPrincipal::Agent,
+        &PrincipalRef::unnamed(),
+        None,
+        true,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("the agent's apply must replay the described NOT NULL: {e:#}"))?;
+    assert!(
+        fct_exists(&root).await,
+        "the agent's apply writes the model `rocky run` writes"
+    );
+
+    // Control: a nullable source keeps the `E012`, so no plan is saved.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    std::env::set_current_dir(&root)?;
+    let (config, models) = project_with_source(&root, not_null, "").await;
+    let state = root.join("state.redb");
+    let refusal = match agent_plan(&config, &models, &state).await {
+        Ok(plan_id) => {
+            panic!("a nullable source must keep the E012; the plan was saved as {plan_id}")
+        }
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        refusal.contains("E012"),
+        "the plan refuses with E012: {refusal}"
+    );
+    assert!(!fct_exists(&root).await, "the plan writes nothing");
     Ok(())
 }

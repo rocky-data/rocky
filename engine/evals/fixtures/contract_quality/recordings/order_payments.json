@@ -6,7 +6,7 @@
       "response_text": "[[columns]]\nname = \"payment_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"method\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"paid_at\"\ntype = \"Timestamp\"\nnullable = false\n\n[rules]\nrequired = [\"payment_id\", \"order_id\"]\nprotected = [\"payment_id\", \"order_id\"]\n"
     },
     {
-      "request_sha256": "59924d59230ea56442be7b80cffc3c6e1dcf878a98b176a453ef7beaedf81825",
+      "request_sha256": "dd400539df9fdc09d060c2780d00dcd4d47485ddff64863109ef8c32a8adcd80",
       "response_text": "[[columns]]\nname = \"payment_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"method\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"paid_at\"\ntype = \"Timestamp\"\nnullable = true\n\n[rules]\nrequired = [\"payment_id\", \"order_id\"]\nprotected = [\"payment_id\", \"order_id\"]\n"
     }
   ]

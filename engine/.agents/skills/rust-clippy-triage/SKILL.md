@@ -80,7 +80,7 @@ needless_pass_by_value = "warn"
 
 **Rules:**
 
-- Changing `[workspace.lints]` is a **policy change, not a fix** — propose it to Hugo first. Widening (e.g. demoting a lint to `allow`) affects every crate.
+- Changing `[workspace.lints]` is a **policy change, not a fix** — propose it to a maintainer first. Widening (e.g. demoting a lint to `allow`) affects every crate.
 - Each entry needs a comment explaining why, with at least one example that triggered it.
 - Crate-specific lint policy goes in that crate's `Cargo.toml` under `[lints]`, not in `[workspace.lints]` — workspace-level is for rules that apply to every crate.
 
@@ -119,7 +119,7 @@ cargo fmt -- --check
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-`cargo fmt` has no per-file config in Rocky — it uses the default `rustfmt.toml` behavior. Don't introduce a `rustfmt.toml` without Hugo review for the same reason as `[workspace.lints]`: it's a policy change.
+`cargo fmt` has no per-file config in Rocky — it uses the default `rustfmt.toml` behavior. Don't introduce a `rustfmt.toml` without maintainer review for the same reason as `[workspace.lints]`: it's a policy change.
 
 ## Related skills
 

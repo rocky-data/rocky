@@ -168,6 +168,9 @@ struct KnownSource<'a> {
     columns: HashSet<String>,
     display_columns: Vec<&'a str>,
     origin: Provenance<'a>,
+    /// An upstream `merge` model: its table can still hold a column its SQL
+    /// no longer selects (#2707). Always `false` for a source schema.
+    merge_table: bool,
 }
 
 impl KnownSource<'_> {
@@ -255,6 +258,9 @@ pub(crate) struct UpstreamModelColumns<'a> {
     /// Every output column name, including columns the model's strategy adds
     /// (snapshot metadata).
     pub(crate) columns: Vec<&'a str>,
+    /// Whether the model's strategy is `merge`. Its table keeps a column the
+    /// SQL stopped selecting, so E039 says the column may still be there.
+    pub(crate) merge: bool,
 }
 
 /// E039 for every direct reference in `model` to a column that a complete
@@ -276,6 +282,7 @@ pub(crate) fn check_upstream_model_column_refs(
             columns: up.columns.iter().map(|c| c.to_lowercase()).collect(),
             display_columns: up.columns.clone(),
             origin: Provenance::Model,
+            merge_table: up.merge,
         }
     }
     let bare: HashMap<String, KnownSource<'_>> = upstreams
@@ -318,6 +325,7 @@ fn known_sources<'a>(
                 columns: columns.iter().map(|c| c.name.to_lowercase()).collect(),
                 display_columns: columns.iter().map(|c| c.name.as_str()).collect(),
                 origin: Provenance::Source(origin),
+                merge_table: false,
             },
         );
     }
@@ -429,11 +437,29 @@ fn build_diagnostic(model_name: &str, finding: &Finding<'_, '_>, strict: bool) -
                     .join(", ")
             ),
         };
-        let suggestion = format!(
+        let mut suggestion = format!(
             "{}. Use a column the upstream model produces, or add the intended derivation \
              upstream",
             close_names_hint(column, &sources)
         );
+        let merges: Vec<String> = sources
+            .iter()
+            .filter(|s| s.merge_table)
+            .map(|s| format!("'{}'", s.key))
+            .collect();
+        if !merges.is_empty() {
+            // A merge never drops a column, so the table can still hold one
+            // the SQL used to select (#2707). The compiler reads the SQL.
+            let subject = match merges.as_slice() {
+                [one] => format!("{one} is a merge model: its table"),
+                many => format!("{} are merge models: their tables", many.join(", ")),
+            };
+            suggestion.push_str(&format!(
+                ". {subject} may still hold '{column}' if the model's SQL used to select it, \
+                 because a merge does not drop columns. The column is not in the model's \
+                 output, so a read of it is refused"
+            ));
+        }
         return Diagnostic::error(E039, model_name, message).with_suggestion(suggestion);
     }
     let current = sources.iter().all(|s| s.origin.is_current());

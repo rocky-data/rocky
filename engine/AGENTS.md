@@ -6,7 +6,7 @@ Rocky is a typed-program layer above the warehouse. It owns the DAG: compile-tim
 
 **License:** Apache 2.0
 
-**Engine skills** live in `engine/.agents/skills/` (mirrored in `engine/.claude/skills/`): `rocky` (CLI cheat sheet), `databricks`, `fivetran`, and Rust conventions (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`). If your client does not load them on its own, read the matching `SKILL.md` before that kind of work.
+**Engine skills** live in `engine/.agents/skills/`: `rocky` (CLI cheat sheet), `databricks`, `fivetran`, and Rust conventions (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`). If your client does not load them on its own, read the matching `SKILL.md` before that kind of work.
 
 ## Key Concepts
 
@@ -25,117 +25,35 @@ The legacy `Plan` enum is gone; `ModelIr` is the sole transformation intermediat
 ```
 engine/                         # this directory, inside the rocky monorepo
 ├── Cargo.toml                  # Workspace manifest
-├── crates/                   # Key files shown for core crates only; `ls crates/<name>/src` for the rest
-│   ├── rocky-ir/               # Typed IR (data only — no runtime traits)
-│   │   └── src/
-│   │       ├── ir.rs           # ModelIr, ModelIrVariant, ProjectIr, MaterializationStrategy (FullRefresh, Incremental, Merge, MaterializedView, DynamicTable, TimeInterval), TargetRef, SourceRef, ColumnSelection, governance, grants, masks
-│   │       ├── lakehouse.rs    # LakehouseFormat, LakehouseOptions, LakehouseError (data types — DDL gen lives in rocky-core)
-│   │       ├── lineage.rs      # LineageEdge, QualifiedColumn
-│   │       ├── mask.rs         # MaskStrategy
-│   │       ├── time_grain.rs   # TimeGrain
-│   │       ├── types.rs        # RockyType, StructField, TypedColumn, common_supertype, is_assignable
-│   │       └── dag.rs          # DagNode, topological_sort, execution_layers
-│   ├── rocky-core/             # Generic, warehouse-agnostic SQL transformation engine
-│   │   ├── src/
-│   │   │   ├── breaking_change.rs # Typed-IR semantic breaking-change classifier (BreakingFinding / BreakingChange / BreakingSeverity)
-│   │   │   ├── ci_diff.rs      # Structural diff used by `rocky ci-diff`
-│   │   │   ├── schema.rs       # Configurable schema pattern parsing
-│   │   │   ├── drift.rs        # Schema drift detection + graduated evolution (ALTER TABLE for safe widenings)
-│   │   │   ├── sql_gen.rs      # IR → dialect-specific SQL generation (incl. MV, dynamic table)
-│   │   │   ├── lakehouse.rs    # Dialect-aware lakehouse DDL generator (depends on the SqlDialect trait)
-│   │   │   ├── state.rs        # Embedded state store (redb): watermarks, run history, checkpoint/resume progress
-│   │   │   ├── state_sync.rs   # Remote state persistence (S3, Valkey, tiered)
-│   │   │   ├── catalog.rs      # Catalog/schema lifecycle management
-│   │   │   ├── checks.rs       # Inline data quality checks
-│   │   │   ├── contracts.rs    # Data contracts (required/protected columns)
-│   │   │   ├── unified_dag.rs  # Unified ELT DAG — one graph across all pipeline stages
-│   │   │   ├── dag_executor.rs # DAG-driven execution in dependency order (+ dag_status.rs live status)
-│   │   │   ├── models.rs       # SQL model loading (sidecar .sql + .toml)
-│   │   │   ├── hooks/          # Pipeline lifecycle hooks (commands, webhooks, templates, presets)
-│   │   │   ├── optimize.rs     # Cost model + materialization strategy recommendations
-│   │   │   ├── source.rs       # Source adapter traits + manual source config
-│   │   │   ├── config.rs       # TOML config parsing (incl. [cost], [execution])
-│   │   │   ├── intern.rs       # String interning for reduced allocations
-│   │   │   ├── mmap.rs         # Memory-mapped file access
-│   │   │   ├── poison.rs       # Poison pill helpers
-│   │   │   ├── circuit_breaker.rs # Circuit breaker for flaky adapters
-│   │   │   ├── traits.rs       # Shared trait definitions
-│   │   │   └── unit_test.rs    # In-process test utilities
-│   │   └── tests/
-│   │       └── e2e.rs, …       # Integration tests (DuckDB-backed, no credentials needed); `ls` for the rest
-│   ├── rocky-secret-registry/  # Resolved ${VAR} values -> ${NAME}; no deps, so crates without rocky-core use it too
-│   ├── rocky-sql/              # SQL parsing + typed AST (sqlparser-rs)
+├── crates/                     # `ls crates/<name>/src` for files; grep for symbols
+│   ├── rocky-ir/               # Typed IR, data only: ir.rs (ModelIr, ModelIrVariant, ProjectIr, MaterializationStrategy, TargetRef, SourceRef, governance, grants, masks), types.rs (RockyType, common_supertype, is_assignable), dag.rs, lineage.rs, lakehouse.rs, mask.rs, time_grain.rs
+│   ├── rocky-core/             # Warehouse-agnostic engine: sql_gen.rs, drift.rs, state.rs (redb) + state_sync.rs (S3/Valkey/tiered), unified_dag.rs + dag_executor.rs, models.rs (.sql + .toml), checks.rs, contracts.rs, breaking_change.rs, ci_diff.rs, schema.rs, catalog.rs, config.rs, hooks/, optimize.rs, source.rs, traits.rs (SqlDialect), lakehouse.rs (DDL); tests/e2e.rs (DuckDB, no credentials)
+│   ├── rocky-cli/              # CLI framework: commands/ (one file per subcommand or helper; doctor.rs), output.rs (JSON/table formatters), pipes.rs (Dagster Pipes emitter, active when DAGSTER_PIPES_CONTEXT/MESSAGES are set; docs: `../docs/src/content/docs/dagster/pipes.md`)
+│   ├── rocky-sql/              # SQL parsing + typed AST (sqlparser-rs); validation.rs
 │   ├── rocky-lang/             # Rocky DSL lexer + parser; lower.rs compiles .rocky to a SQL string (not IR)
 │   ├── rocky-compiler/         # Type checking + semantic analysis
-│   ├── rocky-ai/               # AI intent layer
+│   ├── rocky-secret-registry/  # Resolved ${VAR} values -> ${NAME}; no deps, so crates without rocky-core use it too
 │   ├── rocky-server/           # HTTP API + LSP server
-│   ├── rocky-engine/           # Local execution engine
-│   ├── rocky-adapter-sdk/      # Adapter SDK for building custom warehouse adapters
-│   ├── rocky-databricks/       # Databricks warehouse adapter (incl. throttle.rs: AIMD adaptive concurrency)
-│   ├── rocky-fivetran/         # Fivetran source adapter
-│   ├── rocky-cache/            # Three-tier caching (memory → Valkey → API); Valkey tier behind cargo feature `valkey`
-│   ├── rocky-snowflake/        # Snowflake warehouse adapter
-│   ├── rocky-duckdb/           # DuckDB local execution adapter
-│   ├── rocky-bigquery/         # BigQuery warehouse adapter
-│   ├── rocky-trino/            # Trino warehouse adapter (REST /v1/statement polling, Basic + JWT auth); Docker conformance harness behind `trino-conformance`
-│   ├── rocky-postgres/         # PostgreSQL + Amazon Redshift warehouse adapters
-│   ├── rocky-clickhouse/       # ClickHouse warehouse adapter (beta)
-│   ├── rocky-sqlserver/        # SQL Server, Azure SQL and Fabric Warehouse adapter
-│   ├── rocky-spark/            # Apache Spark adapter over Spark Connect (beta)
-│   ├── rocky-airbyte/          # Airbyte source adapter
-│   ├── rocky-iceberg/          # Apache Iceberg table format adapter
-│   ├── rocky-catalog-core/     # Shared catalog primitives across warehouse adapters
-│   ├── rocky-mcp/              # MCP server (rmcp, stdio transport) — backs `rocky mcp` for AI agents
-│   ├── rocky-wasm/             # WebAssembly exports
-│   ├── rocky-observe/          # Observability
-│   ├── rocky-fulfill/          # Fulfillment reconciler behind `rocky fulfill`
-│   ├── rocky-verify/           # Standalone offline verifier for rocky-manifest v0.1 attestations
-│   ├── rocky-core-compiletest/ # trybuild compile-fail guards for rocky-core's #[must_use] boundaries
-│   ├── rocky-cli-compiletest/  # Compile-fail proof that rocky-cli's plan writers stay pub(crate)
-│   └── rocky-cli/              # CLI framework
-│       └── src/
-│           ├── commands/       # init, validate, discover, plan, run, state, doctor, + the rest (about 100 files, one per subcommand or helper; the clap `Command` enum is in `rocky/src/main.rs`)
-│           │   └── doctor.rs   # Aggregate health checks (config, state, adapters, pipelines)
-│           ├── pipes.rs        # Dagster Pipes protocol emitter — activates when DAGSTER_PIPES_CONTEXT/MESSAGES env vars set
-│           └── output.rs       # JSON / table formatters (incl. MaterializationMetadata + sql_fingerprint helper)
+│   ├── rocky-mcp/              # MCP server (rmcp, stdio) behind `rocky mcp`
+│   ├── rocky-fulfill/          # Fulfillment reconciler behind `rocky fulfill`; uses `rocky-cli` only through `commands/fulfill_api.rs`
+│   ├── rocky-verify/           # Offline verifier for rocky-manifest v0.1 attestations
+│   ├── rocky-cache/            # Memory → Valkey → API cache; Valkey tier behind cargo feature `valkey`
+│   ├── rocky-adapter-sdk/, rocky-catalog-core/   # Adapter SDK; shared catalog primitives
+│   ├── adapters:               # rocky-{databricks (throttle.rs: AIMD concurrency), snowflake, bigquery, duckdb, trino (`trino-conformance` feature), postgres (+ Redshift), clickhouse (beta), sqlserver, spark (beta), iceberg}; sources: rocky-{fivetran, airbyte}
+│   ├── other:                  # rocky-{ai, engine, observe, wasm}; rocky-core-compiletest, rocky-cli-compiletest (compile-fail guards)
 ├── rocky/                      # Binary crate (the `rocky` CLI); src/main.rs holds the clap `Command` enum
 ├── rocky-lsp/                  # Binary crate (the standalone LSP server)
 ├── ui/                         # The browser UI `rocky serve --ui` embeds (vite + React + Tailwind Plus); `npm run build` → ui/dist, embedded behind cargo feature `ui`
 └── examples/                   # 15 self-contained example projects (DuckDB, no credentials)
 ```
 
-## User Project Structure
+## User surface
 
-```
-my-project/
-├── rocky.toml          # Pipeline configuration
-└── models/                # Silver layer transformations (optional)
-    ├── dim_customers.sql   # Pure SQL
-    ├── dim_customers.toml  # Config (name, depends_on, strategy, target)
-    ├── fct_orders.sql
-    └── fct_orders.toml
-```
+The CLI verbs, global flags, `rocky.toml` sections and defaults, model file format, schema pattern and hooks are in the engine `rocky` skill: `engine/.agents/skills/rocky/references/user-surface.md`. Read it before you change behavior a user sees. Key facts:
 
-## Model File Format (Silver Layer)
-
-Each model is a pair: `name.sql` (pure SQL) + `name.toml` (config).
-
-**TOML config:**
-```toml
-name = "fct_orders"
-depends_on = ["stg_orders", "dim_customers"]
-
-[strategy]
-type = "merge"           # or "incremental" or "full_refresh"
-unique_key = ["order_id"]
-
-[target]
-catalog = "analytics"
-schema = "marts"
-table = "fct_orders"
-```
-
-**SQL file:** Plain SQL, no templating. Use `{target}` in custom check SQL only.
+- There is no `rocky drift` verb. Drift runs inside `rocky run` and `rocky plan` (`RunOutput.drift`, `drift.rs`).
+- `rocky run` ignores every hook outcome. Only `rocky hooks test` acts on `on_failure = "abort"`.
+- `--state-path` defaults to `models/.rocky-state.redb` beside the config file.
 
 ## Coding Standards
 
@@ -173,59 +91,11 @@ cargo run -- plan --config rocky.toml --filter client=acme
 cargo run -- run --config rocky.toml --filter client=acme
 cargo run -- run --resume-latest --config rocky.toml --filter client=acme  # Resume failed run
 cargo run -- doctor --config rocky.toml --output json   # Health checks
-
-# Release binaries are built by CI (engine-release.yml, 5-target matrix) on engine-v* tags.
-# scripts/release.sh is the local fallback — see the rocky-release skill.
 ```
-
-## CLI Commands
-
-### Core Pipeline
-```bash
-rocky init [path]                    # Scaffold a new project
-rocky validate                       # Check config, schema patterns, models without APIs
-rocky discover                       # Discover available schemas/tables (metadata only, no extraction)
-rocky plan --filter key=value        # Preview SQL without executing (e.g., --filter client=acme)
-rocky run --filter key=value         # Execute full pipeline: discover → drift → create → copy → check
-rocky state                          # Show stored watermarks
-```
-
-### Everything else
-
-Rocky has about 75 top-level verbs: modeling (`compile`, `lineage`, `test`, `ci`), AI (`ai`, `ai-explain`, `ai-sync`, `ai-test`), development (`playground`, `import-dbt`, `serve`, `lsp`, `mcp`, `init-adapter`), administration (`history`, `metrics`, `optimize`, `doctor`, …) and more. This file does not list them. Use `rocky --help` and `rocky <verb> --help`, or the grouped reference pages in `../docs/src/content/docs/reference/commands/`.
-
-### Products (spec-driven fulfillment, gate side)
-```bash
-rocky product verify <name>      # Frozen propose_only posture + tag resolution + collisions (exit 0/1/2)
-rocky product compile <name>     # Verify, then lower: Phase A contract / Phase B sidecar merge (staged commit)
-rocky product approve <name>     # Human authority transition: immutable snapshot + one state-store txn
-rocky product status <name>      # Read-only: spec, lowering, artifact verification, approval, loop state
-rocky product list               # Read-only: one status row per product (spec dir ∪ state-store records), sorted
-rocky product journal <name>     # Read-only: the fulfillment journal, every persisted transition in append order
-rocky product clear-breach <name> --model <m>  # Delete an output's open volume-breach marker by hand (idempotent)
-```
-
-Product specs live at `products/<name>.toml`; `rocky validate` checks them offline (V050–V053). Reference: `../docs/src/content/docs/reference/commands/products.md`.
-
-### Fulfillment (spec-driven fulfillment, loop side — EXPERIMENTAL)
-```bash
-rocky fulfill <name> [--retry]     # Drive the reconciler: elicit → approve → lower → draft (agent) → verify → propose → review → apply → observe
-rocky fulfill approve-spec <name>  # Same authority transition as `rocky product approve` (one implementation, two spellings)
-```
-
-The loop lives in `crates/rocky-fulfill` (state machine + subprocess agent driver) and consumes `rocky-cli` ONLY through `commands/fulfill_api.rs`; configure it via `[fulfill.driver]` in `rocky.toml`. Reference: `../docs/src/content/docs/reference/commands/fulfill.md`.
-
-Schema drift is not a standalone verb — there is no `rocky drift` command. Drift
-detection runs inside `rocky run` / `rocky plan` (surfaced on `RunOutput.drift`);
-see `drift.rs`.
-
-Global flags: `--config` (default: `rocky.toml`), `--output` (`json`|`table`), `--state-path` (default: `models/.rocky-state.redb` beside the config file; an existing `.rocky-state.redb` in the current directory still works and emits a one-time deprecation warning)
 
 ## Git Conventions
 
-- **Never** include `Co-Authored-By` trailers in commit messages
-- Use conventional commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`
-- Scope by subproject and crate, as the root `AGENTS.md` says: `feat(engine/rocky-databricks): add OAuth M2M auth`
+Follow "Git conventions" in the root [`AGENTS.md`](../AGENTS.md): no attribution trailers, conventional commits scoped by subproject and crate (`feat(engine/rocky-databricks): …`), and the changelog gate.
 
 ## Rocky DSL (.rocky files)
 
@@ -256,14 +126,6 @@ GitHub Actions workflows live at the monorepo root in `../.github/workflows/`, p
 - `engine-bench.yml` — Benchmark on PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*`; uploads raw bencher output as an artifact (no baseline comparison — there is deliberately no main-branch bench history).
 - `engine-docs.yml` — Build + deploy Astro docs from `../docs/` to GitHub Pages.
 
-## Schema Pattern
-
-Rocky uses a configurable schema pattern to map source schemas to target catalogs/schemas:
-
-- **Source:** `<source_catalog>.src__{tenant}__{regions...}__{source}.table`
-- **Target:** `{catalog_template}.raw__{regions}__{source}.table`
-- Example: `src__acme__us_west__shopify` -> `acme_warehouse.raw__us_west__shopify`
-
 ## SQL Patterns Rocky Generates
 
 **Incremental copy (the core operation):** watermark-filtered INSERT via `WHERE _fivetran_synced > TIMESTAMP '<prior>'` — the runner reads the prior watermark from the redb state store, threads it into SQL gen as a literal, and after the write records `MAX(ts)` over the **target** as the next watermark (incremental and microbatch; other strategies record the run time). It reads the target, not the source, so a row appended to the source mid-run is never skipped. For `strategy = "incremental"` the runner also reads `MAX(ts)` over the **source** once before the copy and adds `AND ts < <source max>` (the first-run and drift-rebuild CTAS get `WHERE (ts < <source max> OR ts IS NULL)`), so the newest batch waits one run and a late row tied with it is not skipped (#2376); `row_count` then counts the source below that cutoff. `rocky plan` shows the unbounded SQL. See `sql_gen.rs` (`generate_held_back_*`) and `commands/run.rs::resolve_new_watermark` / `query_target_max_timestamp` / `query_source_max_timestamp`.
@@ -287,51 +149,11 @@ Rocky uses a configurable schema pattern to map source schemas to target catalog
 
 Rocky's CLI output is the interface contract with orchestrators (e.g., Dagster). Every command's `--output json` payload is backed by a typed Rust struct in `crates/rocky-cli/src/output.rs` (or `crates/rocky-cli/src/commands/doctor.rs` for doctor) that derives `JsonSchema` via the `schemars` crate. JSON Schemas are exported to `../schemas/` and used to autogenerate Pydantic models for the dagster integration and TypeScript interfaces for the VS Code extension.
 
-To change a CLI output, follow the steps in the root `../AGENTS.md` ("When modifying the CLI's JSON output schema"); the `rocky-codegen` skill has the detail and pitfalls. In short: edit the struct, run `just codegen` from the monorepo root, and commit the schema and bindings with the Rust change, or `codegen-drift.yml` fails the PR. A new command also registers its type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()`; the full checklist is the `rocky-new-cli-command` skill.
-
-Every `--output json` payload has a typed output struct. To find one, open `../schemas/<command>.schema.json` (its `title` is the struct name) or grep `output.rs`. The registry of exported types is `crates/rocky-cli/src/commands/export_schemas.rs::schemas()`. Full workflow and pitfalls: the `rocky-codegen` skill.
+To change a CLI output, follow the root `../AGENTS.md` ("When modifying the CLI's JSON output schema") and the `rocky-codegen` skill. To find a payload's struct, open `../schemas/<command>.schema.json` (its `title` is the struct name) or grep `output.rs`. A new command registers its type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()`; the full checklist is the `rocky-new-cli-command` skill.
 
 Plus one shared schema: `adapter_config.schema.json` — generated from `AdapterConfig` (derives `JsonSchema`). It's embedded in other command outputs rather than emitted standalone.
 
 Test fixtures for the dagster integration are captured from the live binary by `../scripts/regen_fixtures.sh` (runs against `examples/playground/pocs/00-foundations/01-replication-basics/` — the replication-shape POC; `00-playground-default` is now a transformation pipeline).
-
-## Configuration
-
-Rocky reads `rocky.toml`. Env vars substituted at parse time: `${VAR_NAME}` (with defaults: `${VAR:-default}`). Two top-level sections: `[adapter]` (warehouse connection) and `[pipeline.<name>]` (pipeline definition). For the full config reference, schema, and examples, see the `rocky-config` skill at the monorepo root (`.agents/skills/rocky-config/SKILL.md`).
-
-Section reference:
-
-- `[adapter]` — warehouse connection (type: duckdb/databricks/snowflake/bigquery/trino, auth, host, http_path). Unnamed `[adapter]` auto-wraps as `adapter.default`.
-- `[pipeline.<name>]` — pipeline definition (strategy, timestamp_column, metadata_columns)
-  - `[pipeline.<name>.source]` — type (fivetran/manual), API credentials, schema_pattern
-  - `[pipeline.<name>.target]` — catalog_template, schema_template (with `{variable}` placeholders)
-  - `[pipeline.<name>.checks]` — row_count, column_match, freshness, null_rate, anomaly_threshold_pct; plus `fail_on_error`, `[[assertions]]` blocks (DQX parity: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days` — each supports `severity` and `filter`), and `[quarantine]` (`mode = "split" | "tag" | "drop"`)
-  - `[pipeline.<name>.execution]` — concurrency, fail_fast, error_rate_abort_pct, table_retries
-- `[pipeline.<name>.target.governance]` — auto_create_catalogs, auto_create_schemas, tags, isolation, grants (per target; there is no top-level `[governance]` table)
-- `[cost]` — storage_cost_per_gb_month, compute_cost_per_dbu, warehouse_size
-- `[state]` — backend (local/s3/gcs/valkey/tiered)
-- `[cache.schemas]` — the schema cache: enabled, ttl_seconds, replicate, trusted_max_age_seconds, strict_sources (the last two drive the E041/W041 missing-source-column check, and `strict_sources` also escalates the W045 missing-source-table warning to E045; there is no other `[cache]` key)
-
-**Key defaults** (omit when redundant):
-- `pipeline.type` → `"replication"`, unnamed `[adapter]` → `adapter.default`
-- `[state] backend = "local"`, `auto_create_catalogs = false`
-- Model sidecar `name` → filename stem, `target.table` → `name`
-- `models/_defaults.toml` provides directory-level `[target]` defaults
-
-## Hooks System
-
-Rocky supports lifecycle hooks configured in `rocky.toml`. Hooks fire shell commands or webhooks on pipeline events.
-
-```toml
-[hook.on_pipeline_start]
-command = "scripts/notify.sh"
-timeout_ms = 5000
-on_failure = "warn"  # or "abort" or "ignore" (silent); "warn" is the default
-```
-
-`rocky run` ignores every hook outcome: each call site discards the result of `fire`, so a failing hook is logged and the run continues whatever `on_failure` says. Only `rocky hooks test` acts on `abort`. A hook cannot gate a run today.
-
-Implementation in `crates/rocky-core/src/hooks/` (mod.rs, webhook.rs, template.rs, presets.rs).
 
 ## LSP Server
 
@@ -342,20 +164,3 @@ Provides: diagnostics, hover, go-to-definition, find-references, rename, complet
 In `initialized` it registers `workspace/didChangeWatchedFiles` for `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql` with any client that advertises dynamic registration, in a spawned task (awaiting the request there would stall the handshake).
 
 Implementation in `crates/rocky-server/`.
-
-## When Helping Users
-
-- **Config issues** → check `rocky.toml` syntax, env vars, schema pattern
-- **SQL generation** → `rocky plan` shows exactly what SQL will run
-- **New tables not appearing** → check source type, schema prefix, connector status
-- **Check failures** → look at JSON output `check_results` for details
-- **DAG errors** → check `depends_on` in model TOML files for cycles or unknown refs
-- **Drift** → safe type widenings become `ALTER COLUMN TYPE`; unsafe changes trigger full refresh
-
-## Sibling subprojects in the monorepo
-
-- `../integrations/dagster/` — Dagster integration (Python, wraps the Rocky CLI as a `ConfigurableResource`). The CLI also emits the [Dagster Pipes](https://docs.dagster.io/concepts/dagster-pipes) wire protocol when the dagster client sets `DAGSTER_PIPES_CONTEXT` + `DAGSTER_PIPES_MESSAGES` — see `crates/rocky-cli/src/pipes.rs` and `../docs/src/content/docs/dagster/pipes.md`.
-- `../editors/vscode/` — VS Code extension (TypeScript, LSP client over stdio)
-- `../examples/playground/` — Sample DuckDB pipeline used for smoke tests and benchmarks (no credentials needed)
-
-When changing the CLI's JSON output schema or the Rocky DSL syntax, see the cascade rules in `../AGENTS.md` — those changes touch sibling subprojects in lockstep.

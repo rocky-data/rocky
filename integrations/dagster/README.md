@@ -51,8 +51,9 @@ Two behaviors are worth knowing.
 Dagster's. A check that Rocky marks `warning` emits `WARN` when it fails. `WARN`
 does not degrade asset health, so an advisory check does not page anyone.
 
-**Failure containment shows up on the timeline.** Set `contain_failures = true`
-under `[resilience]` in `rocky.toml`. Rocky then withholds the models behind a
+**Failure containment shows up on the timeline.** `contain_failures` under
+`[resilience]` in `rocky.toml` defaults to `true` (set it to `false` for
+fail-fast). With it on, Rocky withholds the models behind a
 failed upstream instead of failing the whole run. Each withheld model gets an
 `AssetObservation` naming what blocked it, so a partial run reads honestly. Only
 the default `execution_mode = "streaming"` emits these. The `pipes` mode and

@@ -354,6 +354,9 @@ pub(crate) fn run_backfill_in(
         config_identity,
         fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
         reviewed_source_schemas,
+        // A backfill plan describes no source yet (#2635), so its apply keeps
+        // the cache-only contract verdict.
+        described_source_schemas: std::collections::BTreeMap::new(),
     };
     let plan_id = write_plan_governed(
         root,
@@ -456,8 +459,9 @@ fn seeds_from_last_run(store: &StateStore, compiled: &CompileResult) -> Result<V
     if seeds.is_empty() {
         bail!(
             "the most recent run '{}' failed, but its failure was not attributed to a \
-             named model (recorded as: {}). Enable `[resilience] contain_failures` so \
-             failures are named, or pass explicit --model names to backfill.",
+             named model (recorded as: {}). `[resilience] contain_failures` is on by default, \
+             and this project set it to false. Remove that setting so failures are named, or pass \
+             explicit --model names to backfill.",
             latest.run_id,
             failed.join(", ")
         );

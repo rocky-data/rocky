@@ -1558,7 +1558,7 @@ fn deferred_externalized_edges_for(
 /// failed compilation. Values are the descendant's direct poisoned inputs.
 ///
 /// The fixed point is deliberately limited to declared model edges. Physical
-/// reads and unknown read sets retain their existing opt-in containment policy.
+/// reads and unknown read sets keep the `[resilience]` containment policy.
 /// A selected model whose inputs were successfully externalized by `--defer`
 /// has no local declared input edge for this execution.
 /// The refusals [`run_with_explicit_contracts`] can make from the config and
@@ -1707,9 +1707,14 @@ pub struct SkipRunOptions {
 impl SkipRunOptions {
     /// The overlay for a run started by `rocky apply`: defaults, with the
     /// source-sync phase off.
-    pub fn for_apply() -> Self {
+    ///
+    /// `tests_on_run` overrides `[run] tests_on_run` for the applied run, as
+    /// `rocky run --tests` does; `None` keeps the config value. The apply
+    /// resolves it from `commands::apply::ApplyTests`.
+    pub fn for_apply(tests_on_run: Option<rocky_core::config::TestsOnRun>) -> Self {
         Self {
             no_source_sync: true,
+            tests_on_run,
             ..Self::default()
         }
     }
@@ -12538,6 +12543,51 @@ fn collect_auto_create_targets(
     targets
 }
 
+/// The `errors[]` message for a model the containment ledger withheld.
+///
+/// The wording follows the cause. A fail-closed withhold names why the
+/// model's reads cannot be proven independent of the failure set. A proven
+/// withhold names its compile-origin upstreams as compile failures, and any
+/// other blocker (a runtime failure, or a model withheld for one) apart.
+fn withheld_model_error(
+    name: &str,
+    decision: &super::containment::ContainmentDecision,
+    compile_origin: &BTreeSet<String>,
+    containment: &super::containment::ContainmentLedger,
+) -> String {
+    if decision.fail_closed {
+        return format!(
+            "model '{name}' was withheld because {}, so Rocky cannot prove it is \
+             independent of this run's failed or withheld model(s), which need not \
+             be its upstreams: {}",
+            containment.uncertain_reads(name),
+            decision.blocked_by.join(", ")
+        );
+    }
+    let (compile, other): (Vec<&str>, Vec<&str>) = decision
+        .blocked_by
+        .iter()
+        .map(String::as_str)
+        .partition(|blocker| compile_origin.contains(*blocker));
+    match (compile.is_empty(), other.is_empty()) {
+        (false, true) => format!(
+            "model '{name}' was withheld because upstream compile failure(s) affect: {}",
+            compile.join(", ")
+        ),
+        (true, false) => format!(
+            "model '{name}' was withheld because of failed or withheld upstream(s): {}",
+            other.join(", ")
+        ),
+        (true, true) => format!("model '{name}' was withheld"),
+        (false, false) => format!(
+            "model '{name}' was withheld because upstream compile failure(s) affect: {}; \
+             and because of other failed or withheld upstream(s): {}",
+            compile.join(", "),
+            other.join(", ")
+        ),
+    }
+}
+
 /// Record a model's runtime failure as a *contained cause*: bump the failure
 /// tally, push an `errors[]` entry keyed by the model, and poison the model in
 /// the containment ledger so its downstream closure is withheld.
@@ -13791,8 +13841,12 @@ async fn execute_models_phase(
     // (`I003`) was not checked. The usual cause is an external source with no
     // known schema: no seed, no schema cache entry. The warehouse is right
     // here, so describe those sources and compile a second time to check the
-    // contract types before any write. A governed apply replays its reviewed
-    // source snapshot and never takes this path.
+    // contract types before any write.
+    //
+    // A governed apply never describes live. It replays the sources its plan
+    // described (`described_source_schemas`, #2635), so it reaches the verdict
+    // the plan was reviewed with. A plan that described nothing, or one written
+    // before the field existed, replays nothing and keeps its `E012`.
     //
     // Only the second compile's `E011` (contract type mismatch) for a type the
     // first compile left unchecked (`I003`) is kept. The first compile stays
@@ -13807,15 +13861,23 @@ async fn execute_models_phase(
     // for them the `E012` stays, as it was. An adapter must report NOT NULL
     // only where the warehouse enforces it on every row.
     let mut described_sources = std::collections::HashMap::new();
-    if exec_fp_gate.is_none()
-        && let Ok(first) = &mut compile
-        && let described = describe_sources_for_unchecked_contract_types(
-            first,
-            &compile_config.source_schemas,
-            &compile_config.external_dependencies,
-            warehouse,
-        )
-        .await
+    if let Ok(first) = &mut compile
+        && let described = match exec_fp_gate {
+            Some(gate) => gate
+                .described_source_schemas
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            None => {
+                describe_sources_for_unchecked_contract_types(
+                    first,
+                    &compile_config.source_schemas,
+                    &compile_config.external_dependencies,
+                    warehouse,
+                )
+                .await
+            }
+        }
         && !described.is_empty()
     {
         let mut typed_config = compile_config.clone();
@@ -14383,7 +14445,7 @@ async fn execute_models_phase(
         }
     }
 
-    // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
+    // Failure-containment ledger (`[resilience] contain_failures`, on by default).
     // Tracks the downstream closure of every failed / withheld model so a
     // disjoint subgraph can continue while a failure's blast radius is withheld.
     // The closure does NOT trust the declared graph (`dag_nodes`) as complete:
@@ -14397,6 +14459,14 @@ async fn execute_models_phase(
     // has a cost); when off the ledger stays empty and unconsulted, and the run
     // keeps its historical fail-fast-at-first-failure behaviour byte-for-byte.
     let mut containment = super::containment::ContainmentLedger::new();
+    // Models poisoned because of a compile failure: the failed and the
+    // compile-blocked models, plus each model withheld by one of them. A
+    // model withheld by one is reported as a compile error, as fail-fast does.
+    let mut compile_origin: BTreeSet<String> = compile_failed_models
+        .iter()
+        .chain(compile_blocked_models.keys())
+        .cloned()
+        .collect();
     if resilience.contain_failures {
         let producers = super::containment::ProducerIndex::build(
             compile_result.project.models.iter().map(|m| {
@@ -14416,6 +14486,14 @@ async fn execute_models_phase(
             .collect();
         for model in &compile_result.project.models {
             let name = model.config.name.as_str();
+            // #1630: a compile-failed model does not run, so its own reads
+            // order nothing, as in `augment_physical_read_edges`. Kept, they
+            // can close a cycle that drops a TRUE read of its target from the
+            // ordering. It stays a producer, so its readers are withheld.
+            if compile_failed_models.contains(name) {
+                containment.add_model(name, &[], &[], true, &producers);
+                continue;
+            }
             let declared_ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
             let externalized = externalized_defer_edges.get(name);
             let filtered_ref_deps: Vec<String>;
@@ -14460,7 +14538,15 @@ async fn execute_models_phase(
                 };
             containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
         }
-        containment.seed_failed(compile_failed_models.iter().cloned());
+        // A compile-blocked model is excluded from the layer loop before
+        // `evaluate` runs, so it is never poisoned there. Seed it here, so a
+        // model that reads its target by name is withheld, as fail-fast does.
+        containment.seed_failed(
+            compile_failed_models
+                .iter()
+                .chain(compile_blocked_models.keys())
+                .cloned(),
+        );
     }
 
     // When containment is on, execution follows layers recomputed over the FULL
@@ -14992,7 +15078,7 @@ async fn execute_models_phase(
             .map(|(idx, (name, model))| (idx, name, model))
             .collect();
 
-        // ---- failure containment (opt-in) ------------------------------
+        // ---- failure containment (on by default) -----------------------
         // Before the skip gate and any build, withhold every model in this
         // layer that `evaluate` deems unsafe: a proven poisoned upstream (ref OR
         // physical-target read), or — fail closed — a model whose reads can't be
@@ -15002,10 +15088,35 @@ async fn execute_models_phase(
         // model is never adjudicated by the skip gate and never built (it would
         // read a failure's stale/missing output) — it is recorded on
         // `output.contained` and poisons its own downstream. Identity no-op when
-        // `contain_failures` is off, keeping the default fail-fast path
+        // `contain_failures` is off, keeping the fail-fast path
         // byte-identical.
         let matched: Vec<(usize, &String, &rocky_core::models::Model)> =
             if resilience.contain_failures {
+                // A model this run does not build (out of scope, or
+                // ephemeral) is not rebuilt either. When a proven upstream of
+                // it is poisoned, poison it too, so an in-scope reader of its
+                // table is withheld, as fail-fast's descendant closure does.
+                // It is never built and never reported. A fail-closed verdict
+                // does not propagate: fail-fast follows proven edges only.
+                let matched_names: std::collections::HashSet<&str> =
+                    matched.iter().map(|(_, name, _)| name.as_str()).collect();
+                for name in layer {
+                    if matched_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    if let Some(decision) = containment.evaluate(name)
+                        && !decision.fail_closed
+                    {
+                        containment.poison(name);
+                        if decision
+                            .blocked_by
+                            .iter()
+                            .any(|blocker| compile_origin.contains(blocker))
+                        {
+                            compile_origin.insert(name.clone());
+                        }
+                    }
+                }
                 let mut buildable = Vec::with_capacity(matched.len());
                 for (_, name, model) in matched {
                     match containment.evaluate(name) {
@@ -15015,6 +15126,34 @@ async fn execute_models_phase(
                         }
                         Some(decision) => {
                             containment.poison(name);
+                            // Withheld because of an upstream compile failure
+                            // or block: report it as fail-fast does, so a
+                            // scoped run that builds nothing is not Success.
+                            // A fail-closed withhold is reported too: with no
+                            // in-scope root error, nothing else fails the run.
+                            // It does not join `compile_origin`, so a proven
+                            // reader of it is not said to be compile-blocked.
+                            let from_compile = decision
+                                .blocked_by
+                                .iter()
+                                .any(|blocker| compile_origin.contains(blocker));
+                            if from_compile && !decision.fail_closed {
+                                compile_origin.insert(name.clone());
+                            }
+                            if from_compile && !root_error_in_scope {
+                                output.tables_failed += 1;
+                                output.errors.push(crate::output::TableErrorOutput {
+                                    asset_key: vec![name.clone()],
+                                    error: withheld_model_error(
+                                        name,
+                                        &decision,
+                                        &compile_origin,
+                                        &containment,
+                                    ),
+                                    failure_kind: crate::output::FailureKind::CompileError,
+                                    cooldown_seconds: None,
+                                });
+                            }
                             info!(
                                 model = name.as_str(),
                                 blocked_by = decision.blocked_by.join(",").as_str(),
@@ -17565,6 +17704,8 @@ async fn execute_one_plain_model(
     // This build created the target (first-run bootstrap): every row in it
     // is this build's, which the volume check reads.
     let mut bootstrapped = false;
+    // The existence probe's describe of a target that is already there.
+    let mut existing_target_columns = None;
     if strategy_mutates_existing_target {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
@@ -17581,7 +17722,10 @@ async fn execute_one_plain_model(
         // never classified transient, so first-run bootstrap stays intact on
         // every adapter.
         let target_absent = match warehouse.describe_table(&target_table_struct).await {
-            Ok(_) => false,
+            Ok(columns) => {
+                existing_target_columns = Some(columns);
+                false
+            }
             Err(e) if warehouse.classify_failure(&e).is_retryable() => {
                 return Err(anyhow::Error::from(e).context(format!(
                     "target existence probe for model '{model_name}' failed with a \
@@ -17653,6 +17797,24 @@ async fn execute_one_plain_model(
             }
             skip_strategy_exec = bootstrap_is_the_load;
             bootstrapped = true;
+        }
+    }
+    // A `merge` keeps a column its SQL stopped selecting (#2707). Warn and
+    // name it; never refuse, since `--full-refresh` does not rebuild a merge.
+    let mut merge_stale_note = None;
+    if let rocky_ir::MaterializationStrategy::Merge { .. } = &model_ir.materialization
+        && let Some(columns) = &existing_target_columns
+    {
+        merge_stale_note = super::run_incremental::merge_stale_columns_note(
+            &model_ir,
+            columns,
+            warehouse,
+            dialect,
+            &target_ref,
+        )
+        .await;
+        if let Some(note) = &merge_stale_note {
+            eprintln!("warning: {note}");
         }
     }
 
@@ -18000,6 +18162,7 @@ async fn execute_one_plain_model(
             })
             .into_iter()
             .chain(kind_probe_note)
+            .chain(merge_stale_note)
             .chain(incremental_notes)
             .chain(swap_notes)
             .collect(),
@@ -22720,6 +22883,7 @@ max_retries = 0
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: true,
             replication_verify_after: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -31399,6 +31563,273 @@ timestamp_column = "ts"
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
     }
 
+    /// Run the `merge` model `mrg` (`unique_key = ["id"]`, target `tgt.mrg`)
+    /// once through `execute_one_plain_model`, with `typed` as the compiler's
+    /// output columns.
+    #[cfg(feature = "duckdb")]
+    async fn run_merge_model(
+        adapter: &dyn rocky_core::traits::WarehouseAdapter,
+        sql: &str,
+        typed: &[&str],
+    ) -> MaterializationOutput {
+        use rocky_core::models::load_model_pair;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("mrg.toml"),
+            "name = \"mrg\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n\n\
+             [target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"mrg\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("mrg.sql"), sql).unwrap();
+        let model = load_model_pair(
+            &dir.path().join("mrg.sql"),
+            &dir.path().join("mrg.toml"),
+            None,
+        )
+        .expect("load merge model");
+        let mut typed_models = indexmap::IndexMap::new();
+        typed_models.insert(
+            "mrg".to_string(),
+            typed
+                .iter()
+                .map(|name| rocky_compiler::types::TypedColumn {
+                    name: (*name).to_string(),
+                    data_type: rocky_compiler::types::RockyType::Unknown,
+                    nullable: true,
+                })
+                .collect(),
+        );
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            record_upstream_reads: false,
+            product_volumes: None,
+            reviewed_first_run_fills: None,
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+            full_refresh: false,
+        };
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect::plain();
+        super::execute_one_plain_model(
+            &model,
+            adapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "mrg",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("the merge run succeeds")
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn merge_fixture() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        use rocky_core::traits::WarehouseAdapter;
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, legacy VARCHAR, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES (1, 'a', TIMESTAMP '2026-03-01 10:00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        adapter
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn stale_notes(output: &MaterializationOutput) -> Vec<&String> {
+        output
+            .notes
+            .iter()
+            .filter(|n| n.contains("no longer outputs"))
+            .collect()
+    }
+
+    /// #2707: a `merge` model whose SQL stops selecting a column keeps that
+    /// column in its table. The run still succeeds, and warns with the
+    /// column's name. It does not suggest `--full-refresh` as a fix.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_warns_and_names_a_column_its_sql_dropped() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let adapter = merge_fixture().await;
+        let run1 = run_merge_model(
+            &adapter,
+            "SELECT id, legacy, ts FROM src.events",
+            &["id", "legacy", "ts"],
+        )
+        .await;
+        assert!(stale_notes(&run1).is_empty(), "{:?}", run1.notes);
+
+        adapter
+            .execute_statement(
+                "INSERT INTO src.events VALUES (2, 'b', TIMESTAMP '2026-03-02 10:00:00')",
+            )
+            .await
+            .unwrap();
+        let run2 = run_merge_model(&adapter, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+        let stale = stale_notes(&run2);
+        assert_eq!(stale.len(), 1, "{:?}", run2.notes);
+        assert!(
+            stale[0].contains("model 'mrg': the target tgt.mrg still has column(s) legacy that"),
+            "{}",
+            stale[0]
+        );
+        assert!(
+            stale[0].contains("`--full-refresh` does not rebuild a merge model"),
+            "{}",
+            stale[0]
+        );
+
+        // The column is still in the table, NULL in the new row.
+        let rows = adapter
+            .execute_query("SELECT id, legacy FROM tgt.mrg ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 2, "{:?}", rows.rows);
+        assert_eq!(rows.rows[1][1], serde_json::Value::Null, "{:?}", rows.rows);
+    }
+
+    /// #2707: an unchanged `merge` model gets no stale-column warning, also
+    /// when the compiler's typed list misses some of its columns (the zero-row
+    /// probe confirms they are still output).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_without_a_stale_column_does_not_warn() {
+        let adapter = merge_fixture().await;
+        let sql = "SELECT id, legacy, ts FROM src.events";
+        for typed in [&["id", "legacy", "ts"][..], &["id"][..]] {
+            let output = run_merge_model(&adapter, sql, typed).await;
+            assert!(
+                stale_notes(&output).is_empty(),
+                "{typed:?}: {:?}",
+                output.notes
+            );
+        }
+        let output = run_merge_model(&adapter, sql, &["id", "legacy", "ts"]).await;
+        assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+    }
+
+    /// How [`ProbeFault`] answers the stale-column check's zero-row query.
+    #[cfg(feature = "duckdb")]
+    #[derive(Clone, Copy)]
+    enum ProbeFaultMode {
+        /// The query fails.
+        Fail,
+        /// The query succeeds but reports no column names.
+        NoColumns,
+    }
+
+    /// DuckDB, except for the zero-row output probe (`_rocky_probe`), which
+    /// answers as `mode` says. Counts the probes it intercepted.
+    #[cfg(feature = "duckdb")]
+    struct ProbeFault<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        mode: ProbeFaultMode,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for ProbeFault<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            self.inner.execute_statement_with_stats(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            if !sql.contains("_rocky_probe") {
+                return self.inner.execute_query(sql).await;
+            }
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.mode {
+                ProbeFaultMode::Fail => Err(rocky_core::traits::AdapterError::msg(
+                    "injected probe failure",
+                )),
+                ProbeFaultMode::NoColumns => Ok(rocky_core::traits::QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                }),
+            }
+        }
+
+        fn classify_failure(
+            &self,
+            err: &rocky_core::traits::AdapterError,
+        ) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(err)
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// #2707: when the stale-column check's zero-row query fails, or reports
+    /// no column names, the merge run still succeeds and warns about nothing.
+    /// The probe count proves the check reached that query.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_a_failed_probe_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::Fail).await;
+    }
+
+    /// #2707: see [`merge_stale_check_with_a_failed_probe_stays_silent`]; here
+    /// the probe succeeds but reports no column names.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn merge_stale_check_with_no_probe_columns_stays_silent() {
+        assert_probe_fault_is_silent(ProbeFaultMode::NoColumns).await;
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_probe_fault_is_silent(mode: ProbeFaultMode) {
+        {
+            let adapter = merge_fixture().await;
+            run_merge_model(
+                &adapter,
+                "SELECT id, legacy, ts FROM src.events",
+                &["id", "legacy", "ts"],
+            )
+            .await;
+            let faulty = ProbeFault {
+                inner: &adapter,
+                mode,
+                probes: std::sync::atomic::AtomicUsize::new(0),
+            };
+            // `run_merge_model` panics if the run fails.
+            let output =
+                run_merge_model(&faulty, "SELECT id, ts FROM src.events", &["id", "ts"]).await;
+            assert_eq!(
+                faulty.probes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the check must reach the probe"
+            );
+            assert!(stale_notes(&output).is_empty(), "{:?}", output.notes);
+        }
+    }
+
     /// Fail-closed bootstrap — transformation path (`execute_one_plain_model`).
     ///
     /// Sibling of the replication regression above, for the second of the three
@@ -32950,6 +33381,7 @@ table = "fct_daily"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "plan-x".to_string(),
             require: false,
@@ -38068,6 +38500,115 @@ backend = "local"
         }
     }
 
+    /// Run the models as an agent's apply runs them: through a governed gate
+    /// that replays an empty reviewed snapshot and `described`, the sources
+    /// the plan described (#2635).
+    #[cfg(feature = "duckdb")]
+    async fn governed_apply_with_described(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        described: std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
+    ) -> RunOutput {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            reviewed_first_run_fills: Default::default(),
+            expected: None,
+            config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
+            exec_control_identity: String::new(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
+            described_source_schemas: described,
+            plan_id: "p".to_string(),
+            require: false,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &PartitionRunOptions::default(),
+            "governed-run",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            None, // shadow_config (test)
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
+            true,
+            Some(&gate),
+            None, // freeze_fence (test)
+            false,
+            false,
+        )
+        .await
+        .expect("the contract verdict is carried in RunOutput");
+        output
+    }
+
+    /// #2635: an agent's apply replays the sources its plan described, never
+    /// the warehouse. The source here is NOT NULL in the warehouse.
+    ///
+    /// - No described sources (a plan that described nothing, or one written
+    ///   before `described_source_schemas` existed): the `E012` stays and
+    ///   nothing is written. A live describe would have cleared it.
+    /// - The plan described the column NOT NULL: the `E012` is dropped and the
+    ///   model is written, as `rocky run` writes it.
+    /// - The plan described the column nullable: the `E012` stays.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn governed_apply_replays_the_plans_described_sources() {
+        use rocky_ir::RockyType;
+        use rocky_ir::types::TypedColumn;
+
+        let described = |nullable: bool| {
+            std::collections::BTreeMap::from([(
+                "src.orders".to_string(),
+                vec![TypedColumn {
+                    name: "order_id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable,
+                }],
+            )])
+        };
+        for (case, replayed, refused) in [
+            ("none described", std::collections::BTreeMap::new(), true),
+            ("described NOT NULL", described(false), false),
+            ("described nullable", described(true), true),
+        ] {
+            let (dir, models) = described_nullability_fixture(None, "NOT NULL");
+            let db_path = dir.path().join("t.duckdb");
+            let output = governed_apply_with_described(&models, &db_path, replayed).await;
+            if refused {
+                assert!(
+                    output.errors.iter().any(|e| e.error.contains("E012")),
+                    "{case}: E012 must stay: {:?}",
+                    output.errors
+                );
+                assert!(output.materializations.is_empty(), "{case}");
+            } else {
+                assert!(
+                    output.errors.is_empty(),
+                    "{case}: no errors: {:?}",
+                    output.errors
+                );
+                assert_eq!(output.materializations.len(), 1, "{case}");
+            }
+        }
+    }
+
     /// Control for the test above: a nullable source column keeps the
     /// `E012`, and the model is not written.
     #[cfg(feature = "duckdb")]
@@ -38820,7 +39361,10 @@ backend = "local"
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
-            rocky_core::config::ResilienceConfig::default(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures: false, // explicit fail-fast (default is true, #2617)
+                ..Default::default()
+            },
             false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
@@ -38986,6 +39530,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
@@ -39307,6 +39852,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: resolved_mask.clone(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
@@ -39552,6 +40098,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(snapshot),
             plan_id: "p".to_string(),
             require: false,
@@ -39644,6 +40191,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: with_b_mask,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
@@ -39705,6 +40253,7 @@ backend = "local"
             governance_identity: String::new(),
             exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None, // v2 governed plan MUST carry Some
             plan_id: "p".to_string(),
             require: true,
@@ -40040,7 +40589,7 @@ backend = "local"
         (output, result)
     }
 
-    /// Drive `execute_models` fail-fast (the default, `contain_failures =
+    /// Drive `execute_models` fail-fast (explicit, `contain_failures =
     /// false`) at the given `--parallel` width.
     async fn run_models_fail_fast(
         models_dir: &std::path::Path,
@@ -40077,7 +40626,10 @@ backend = "local"
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
-            rocky_core::config::ResilienceConfig::default(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures: false, // explicit fail-fast (default is true, #2617)
+                ..Default::default()
+            },
             false,
             true,
             None,
@@ -40891,7 +41443,7 @@ backend = "local"
         );
     }
 
-    /// Default posture (`contain_failures = false`) is byte-identical fail-fast:
+    /// Explicit `contain_failures = false` is byte-identical fail-fast:
     /// `execute_models` returns `Err` at the first failure and withholds
     /// nothing on `contained[]`. This is the §7.6 default-OFF regression guard.
     #[cfg(feature = "duckdb")]
@@ -40903,8 +41455,8 @@ backend = "local"
         write_containment_dag(&models_dir);
 
         let db = tmp.path().join("failfast.duckdb");
-        // `run_models_against_duckdb` uses `ResilienceConfig::default()`
-        // (contain_failures = false) — the default path.
+        // `run_models_against_duckdb` sets `contain_failures = false`
+        // explicitly (the default is `true` since #2617).
         let (out, result) = run_models_against_duckdb(&models_dir, &db, false, 1).await;
 
         result.expect_err("default fail-fast: execute_models returns Err at the first failure");
@@ -44244,7 +44796,10 @@ auto_create_schemas = true
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
-            rocky_core::config::ResilienceConfig::default(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures: false, // explicit fail-fast (default is true, #2617)
+                ..Default::default()
+            },
             false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
@@ -46313,6 +46868,457 @@ auto_create_schemas = true
             "no true edge was skipped as a cycle-closer: {:?}",
             output.scheduling_warnings
         );
+    }
+
+    /// `f` fails compile (E056: its bare read of `t` is ambiguous). `g` has
+    /// `depends_on = ["f"]`, so it is withheld as compile-blocked. `r` reads
+    /// `main.g` by its qualified name. `g` is not rebuilt, so `r` must be
+    /// withheld too, and not build on the stale `main.g` an earlier run left.
+    /// Containment and fail-fast must agree.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_physical_reader_of_a_compile_blocked_model_is_withheld_in_both_modes() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("blocked.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            {
+                let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+                s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
+                    .await
+                    .unwrap();
+                // What an earlier run of `g` left behind.
+                // Two rows: a rebuild of `g` would leave one.
+                s.execute_statement(
+                    "CREATE TABLE main.g AS SELECT * FROM (VALUES (98), (99)) AS v(id)",
+                )
+                .await
+                .unwrap();
+            }
+            let write = |name: &str, sql: &str, header: &str, schema: &str, table: &str| {
+                std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+                std::fs::write(
+                    models_dir.join(format!("{name}.toml")),
+                    format!(
+                        "{header}[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+                         schema = \"{schema}\"\ntable = \"{table}\"\n"
+                    ),
+                )
+                .unwrap();
+            };
+            write("w1", "SELECT 1 AS id\n", "", "main", "t");
+            write("w2", "SELECT 2 AS id\n", "", "other", "t");
+            write("f", "SELECT id FROM t\n", "", "main", "f");
+            write(
+                "g",
+                "SELECT 7 AS id\n",
+                "depends_on = [\"f\"]\n\n",
+                "main",
+                "g",
+            );
+            write("r", "SELECT id FROM main.g\n", "", "main", "r");
+
+            let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let gate_off = SkipGateConfig {
+                feature_enabled: false,
+                force_rebuild: false,
+                rowcount_fallback: false,
+                lag_tolerance_seconds: 0,
+                shadow_or_branch: false,
+                full_refresh: false,
+                tests_on_run: Default::default(),
+            };
+            let res = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-blocked-reader",
+                None,
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                gate_off,
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false,
+                true,
+                None,
+                None,
+                false,
+                false,
+            )
+            .await;
+            drop(adapter);
+            assert!(
+                res.is_ok(),
+                "contain_failures={contain_failures}: {:?}",
+                res.as_ref().err()
+            );
+
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|e| e.asset_key == vec!["f".to_string()] && e.error.contains("[E056]")),
+                "contain_failures={contain_failures}: {:?}",
+                output.errors
+            );
+            for withheld in ["g", "r"] {
+                assert!(
+                    !output
+                        .materializations
+                        .iter()
+                        .any(|m| m.asset_key.last().map(String::as_str) == Some(withheld)),
+                    "contain_failures={contain_failures}: `{withheld}` must not build: {:?}",
+                    output.materializations
+                );
+                assert!(
+                    output.contained.iter().any(|c| c.model == withheld),
+                    "contain_failures={contain_failures}: `{withheld}` is reported as \
+                     withheld: {:?}",
+                    output.contained
+                );
+            }
+            let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+            assert!(
+                !table_exists(&verify, "r").await,
+                "contain_failures={contain_failures}: `r` must not build on the stale `main.g`"
+            );
+            assert_eq!(
+                count_rows(&db, "g").await,
+                2,
+                "contain_failures={contain_failures}: the stale `main.g` is untouched"
+            );
+        }
+    }
+
+    /// Runs the scoped blocked-reader project: `f` fails compile (E056), `g`
+    /// has `depends_on = ["f"]`, `r` reads `main.g` and `d` reads `main.r`,
+    /// both by qualified name. `u` reads only its own CTE, so its read set
+    /// cannot be fully listed and containment withholds it fail-closed.
+    /// `main.g`, `main.r` and `main.u` hold two stale rows each, so a model
+    /// that wrongly builds succeeds instead of failing on a missing table.
+    /// Returns the run output and the database path.
+    #[cfg(feature = "duckdb")]
+    async fn run_scoped_blocked_reader(
+        tmp: &tempfile::TempDir,
+        model_filter: &str,
+        contain_failures: bool,
+    ) -> (RunOutput, std::path::PathBuf) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("scoped.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS other")
+                .await
+                .unwrap();
+            for table in ["g", "r", "u"] {
+                s.execute_statement(&format!(
+                    "CREATE TABLE main.{table} AS SELECT * FROM (VALUES (98), (99)) AS v(id)"
+                ))
+                .await
+                .unwrap();
+            }
+        }
+        let write = |name: &str, sql: &str, header: &str, table: &str, schema: &str| {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "{header}[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\n\
+                     schema = \"{schema}\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("w1", "SELECT 1 AS id\n", "", "t", "main");
+        write("w2", "SELECT 2 AS id\n", "", "t", "other");
+        write("f", "SELECT id FROM t\n", "", "f", "main");
+        write(
+            "g",
+            "SELECT 7 AS id\n",
+            "depends_on = [\"f\"]\n\n",
+            "g",
+            "main",
+        );
+        write("r", "SELECT id FROM main.g\n", "", "r", "main");
+        write("d", "SELECT id FROM main.r\n", "", "d", "main");
+        write(
+            "u",
+            "WITH x AS (SELECT 5 AS id)\nSELECT id FROM x\n",
+            "",
+            "u",
+            "main",
+        );
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let gate_off = SkipGateConfig {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+            full_refresh: false,
+            tests_on_run: Default::default(),
+        };
+        let res = super::execute_models(
+            &models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &PartitionRunOptions::default(),
+            "run-scoped-blocked-reader",
+            Some(model_filter),
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            gate_off,
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig {
+                contain_failures,
+                ..Default::default()
+            },
+            false,
+            true,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await;
+        drop(adapter);
+        assert!(
+            res.is_ok(),
+            "contain_failures={contain_failures}: {:?}",
+            res.as_ref().err()
+        );
+        (output, db)
+    }
+
+    /// `rocky run --model d`, where `d` reads `main.r` and `r` reads the
+    /// compile-blocked `main.g`. `r` is out of scope, so it is not built, but
+    /// it is still downstream of the failure: `d` must be withheld, and not
+    /// build on the stale `main.r`. Containment and fail-fast must agree.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_scoped_reader_of_an_out_of_scope_blocked_reader_is_withheld_in_both_modes() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (output, db) = run_scoped_blocked_reader(&tmp, "d", contain_failures).await;
+
+            assert!(
+                !output
+                    .materializations
+                    .iter()
+                    .any(|m| m.asset_key.last().map(String::as_str) == Some("d")),
+                "contain_failures={contain_failures}: `d` must not build: {:?}",
+                output.materializations
+            );
+            assert!(
+                output.contained.iter().any(|c| c.model == "d"),
+                "contain_failures={contain_failures}: `d` is reported as withheld: {:?}",
+                output.contained
+            );
+            let d_errors: Vec<_> = output
+                .errors
+                .iter()
+                .filter(|e| e.asset_key == vec!["d".to_string()])
+                .collect();
+            assert!(
+                !d_errors.is_empty()
+                    && d_errors.iter().all(|e| matches!(
+                        e.failure_kind,
+                        crate::output::FailureKind::CompileError
+                    )),
+                "contain_failures={contain_failures}: `d` carries only compile errors: {:?}",
+                output.errors
+            );
+            let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+            assert!(
+                !table_exists(&verify, "d").await,
+                "contain_failures={contain_failures}: `d` must not build on the stale `main.r`"
+            );
+            drop(verify);
+            assert_eq!(
+                count_rows(&db, "r").await,
+                2,
+                "contain_failures={contain_failures}: the out-of-scope `main.r` is untouched"
+            );
+        }
+    }
+
+    /// `rocky run --model u`, where `u` reads only its own CTE and `f` fails
+    /// compile out of scope. Containment withholds `u` fail-closed: its read
+    /// set cannot be fully listed, so it cannot be proven independent of
+    /// `f`. The run then built nothing it was asked to build, so it must not
+    /// report Success, and the error must name the uncertain reads, not a
+    /// compile failure. Fail-fast builds `u` and succeeds.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_scoped_fail_closed_withhold_of_an_out_of_scope_failure_fails_the_run() {
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (output, db) = run_scoped_blocked_reader(&tmp, "u", contain_failures).await;
+            let built = output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("u"));
+            let status = output.derive_run_status();
+            if !contain_failures {
+                assert!(built, "fail-fast builds `u`: {:?}", output.errors);
+                assert!(
+                    matches!(status, rocky_core::state::RunStatus::Success),
+                    "fail-fast: {:?}",
+                    output.errors
+                );
+                assert_eq!(count_rows(&db, "u").await, 1, "fail-fast rebuilt `main.u`");
+                continue;
+            }
+            assert!(!built, "`u` must not build: {:?}", output.materializations);
+            assert_eq!(
+                count_rows(&db, "u").await,
+                2,
+                "the stale `main.u` is untouched"
+            );
+            assert!(
+                output.contained.iter().any(|c| c.model == "u"),
+                "`u` is reported as withheld: {:?}",
+                output.contained
+            );
+            assert_eq!(output.tables_failed, 1, "{:?}", output.errors);
+            let u_errors: Vec<_> = output
+                .errors
+                .iter()
+                .filter(|e| e.asset_key == vec!["u".to_string()])
+                .collect();
+            assert_eq!(u_errors.len(), 1, "{:?}", output.errors);
+            assert!(
+                u_errors[0]
+                    .error
+                    .contains("its reads cannot be fully listed")
+                    && !u_errors[0].error.contains("compile failure"),
+                "the error names the uncertain reads: {}",
+                u_errors[0].error
+            );
+            assert!(
+                !matches!(status, rocky_core::state::RunStatus::Success),
+                "a run that withheld its only model is not Success"
+            );
+        }
+    }
+
+    /// The withhold message follows the cause: compile-origin upstreams are
+    /// named as compile failures, any other blocker apart, and a fail-closed
+    /// withhold names why its reads cannot be proven independent.
+    #[test]
+    fn withheld_model_error_words_the_message_by_cause() {
+        use crate::commands::containment::{ContainmentDecision, ContainmentLedger, ProducerIndex};
+        let mut ledger = ContainmentLedger::new();
+        let producers = ProducerIndex::build(std::iter::empty());
+        ledger.add_model("u", &[], &[], false, &producers);
+        let compile_origin: BTreeSet<String> = ["g".to_string()].into_iter().collect();
+        let decision = |blocked_by: &[&str], fail_closed| ContainmentDecision {
+            blocked_by: blocked_by.iter().map(ToString::to_string).collect(),
+            fail_closed,
+        };
+
+        assert_eq!(
+            withheld_model_error("r", &decision(&["g"], false), &compile_origin, &ledger),
+            "model 'r' was withheld because upstream compile failure(s) affect: g"
+        );
+        assert_eq!(
+            withheld_model_error("r", &decision(&["g", "x"], false), &compile_origin, &ledger),
+            "model 'r' was withheld because upstream compile failure(s) affect: g; and \
+             because of other failed or withheld upstream(s): x"
+        );
+        assert_eq!(
+            withheld_model_error("r", &decision(&["x"], false), &compile_origin, &ledger),
+            "model 'r' was withheld because of failed or withheld upstream(s): x"
+        );
+        assert_eq!(
+            withheld_model_error("u", &decision(&["g", "x"], true), &compile_origin, &ledger),
+            "model 'u' was withheld because its reads cannot be fully listed, so Rocky \
+             cannot prove it is independent of this run's failed or withheld model(s), \
+             which need not be its upstreams: g, x"
+        );
+        assert_eq!(
+            withheld_model_error("r", &decision(&[], false), &compile_origin, &ledger),
+            "model 'r' was withheld"
+        );
+    }
+
+    /// `rocky run --model r`, where `r` reads the compile-blocked `main.g`
+    /// and `f` and `g` are out of scope. `r` is withheld, so the run built
+    /// nothing it was asked to build. It must record a compile error for `r`
+    /// and not report Success, in both modes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_scoped_withheld_reader_of_an_out_of_scope_failure_fails_the_run_in_both_modes() {
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (output, _db) = run_scoped_blocked_reader(&tmp, "r", contain_failures).await;
+
+            assert!(
+                output.contained.iter().any(|c| c.model == "r"),
+                "contain_failures={contain_failures}: `r` is reported as withheld: {:?}",
+                output.contained
+            );
+            assert_eq!(
+                output.tables_failed, 1,
+                "contain_failures={contain_failures}: {:?}",
+                output.errors
+            );
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|e| e.asset_key == vec!["r".to_string()]
+                        && matches!(e.failure_kind, crate::output::FailureKind::CompileError)),
+                "contain_failures={contain_failures}: `r` carries a compile error: {:?}",
+                output.errors
+            );
+            assert!(
+                !matches!(
+                    output.derive_run_status(),
+                    rocky_core::state::RunStatus::Success
+                ),
+                "contain_failures={contain_failures}: a run that withheld its only model is \
+                 not Success"
+            );
+        }
     }
 
     /// End to end through `execute_models`: an invalid ephemeral use (here
@@ -55799,6 +56805,7 @@ timestamp_column = "ts"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            described_source_schemas: Default::default(),
             reviewed_source_schemas: None,
             expects_models: false,
             replication_verify_after: std::sync::Mutex::new(std::collections::BTreeSet::new()),

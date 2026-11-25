@@ -198,6 +198,7 @@ async fn drive_run_governed(config_path: &Path, state_path: &Path) -> anyhow::Re
         expected_ir_fingerprint: None,
         expected_config_identity: None,
         require_fingerprint: false,
+        described_source_schemas: Default::default(),
         reviewed_source_schemas: None,
         expects_models: false,
         replication_verify_after: Default::default(),

@@ -344,14 +344,15 @@ fn compile_inner(
     let config_strict_sources = project_config
         .as_ref()
         .is_some_and(|config| config.cache.schemas.strict_sources);
-    let (source_schemas, source_provenance) = if seed_use == SeedUse::Required {
+    let (source_schemas, source_provenance, seed_function_names) = if seed_use == SeedUse::Required
+    {
         // Seed loader: run `data/seed.sql` in in-memory DuckDB, read
         // columns from its `information_schema`. Turns leaf .sql models
         // from `RockyType::Unknown` into concrete types for any project
         // that ships a runnable seed (the entire playground).
-        let schemas = load_source_schemas_from_seed_at(project_root, project_config.as_ref())?;
+        let (schemas, names) = load_seed_at(project_root, project_config.as_ref())?;
         let provenance = SourceProvenance::uniform(schemas.keys(), &SourceSchemaOrigin::Seed);
-        (schemas, provenance)
+        (schemas, provenance, names)
     } else {
         let (mut schemas, mut provenance) = if let Some(config) = &project_config {
             // TTL-filtered load from `state.redb`'s `SCHEMA_CACHE` table.
@@ -369,18 +370,16 @@ fn compile_inner(
         } else {
             (HashMap::new(), SourceProvenance::default())
         };
-        match seed_use {
-            SeedUse::IfPresent => {
-                merge_default_seed_schemas(
-                    project_root,
-                    project_config.as_ref(),
-                    &mut schemas,
-                    &mut provenance,
-                );
-            }
-            SeedUse::Never | SeedUse::Required => {}
-        }
-        (schemas, provenance)
+        let names = match seed_use {
+            SeedUse::IfPresent => merge_default_seed_schemas(
+                project_root,
+                project_config.as_ref(),
+                &mut schemas,
+                &mut provenance,
+            ),
+            SeedUse::Never | SeedUse::Required => std::collections::HashSet::new(),
+        };
+        (schemas, provenance, names)
     };
     let source_provenance = source_provenance.with_strict(strict_sources || config_strict_sources);
     // `--strict-contracts` ORs with `[contracts] strict`; it can turn
@@ -476,6 +475,9 @@ fn compile_inner(
             None => return Err(error.into()),
         },
     };
+    // The seed that typed the compile created these; the E057 / E068 gates
+    // below read them from the result.
+    result.seed_function_names = seed_function_names;
 
     // `--model` may also name a user-defined function (`functions/`), valid
     // or not, to see its own diagnostics.
@@ -552,6 +554,7 @@ fn compile_inner(
         project_config.as_ref(),
         model_targets.as_ref(),
         target_dialect,
+        Some(project_root),
     );
 
     // Compute DAG-propagated cost estimates for all models.
@@ -826,7 +829,13 @@ pub fn apply_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_path.parent(),
+    );
     apply_inlined_sql_gates(result, &targets);
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
@@ -842,7 +851,13 @@ pub fn apply_authored_model_target_gates(
 ) {
     let targets = ModelTargets::resolve(config, config_path);
     apply_adapter_gates(result, &targets);
-    apply_operand_gates(result, Some(config), Some(&targets), None);
+    apply_operand_gates(
+        result,
+        Some(config),
+        Some(&targets),
+        None,
+        config_path.parent(),
+    );
     result.has_errors |= result.diagnostics.iter().any(Diagnostic::is_error);
 }
 
@@ -885,16 +900,43 @@ fn apply_adapter_gates(result: &mut compile::CompileResult, targets: &ModelTarge
 }
 
 /// Aggregate-argument and comparison-operand checks (E042/W042, E043/W043),
-/// and calls to functions the target warehouse does not have (E057, W057).
+/// calls to functions the target warehouse does not have (E057, W057), and
+/// DuckDB calls with an argument count DuckDB refuses (E068, W068).
 /// These judge against the warehouse that will run the SQL, so they need a
 /// dialect the compiler core does not carry; see `operand_target_for` for
-/// the precedence.
+/// the precedence. `project_root` is where the project's `data/seed.sql`
+/// is looked for ([`reachable_seed_files`]).
 fn apply_operand_gates(
     result: &mut compile::CompileResult,
     project_config: Option<&rocky_config::RockyConfig>,
     targets: Option<&ModelTargets<'_>>,
     target_dialect: Option<Dialect>,
+    project_root: Option<&Path>,
 ) {
+    // The functions and macros the project's seed creates are the project's
+    // own: on DuckDB a call to one is not judged against the built-ins (E057,
+    // E068, #2691). A name missed here is a false refusal, a name wrongly
+    // kept only a missed check, so this is the union of every source: the
+    // names the DuckDB that ran the seed reports (when this command ran it),
+    // and a scan of the text of each seed file the gate can find, which
+    // covers a seed that did not run and the entry points that never run
+    // one (`rocky serve`, `rocky lsp`, `rocky emit-sql`).
+    let mut seed_names = result.seed_function_names.clone();
+    for seed in reachable_seed_files(result, project_root) {
+        match std::fs::read_to_string(&seed) {
+            Ok(sql) => seed_names.extend(
+                rocky_compiler::function_check::seed_function_names_in_text(&sql),
+            ),
+            // The file is there but does not read: its names are unknown, so
+            // a call to one of its macros can be refused. Say why.
+            Err(e) => tracing::warn!(
+                path = %seed.display(),
+                error = %e,
+                "could not read the seed file; calls to its functions and macros are judged \
+                 against DuckDB's built-ins (E057, E068)"
+            ),
+        }
+    }
     let target_for =
         |model: &str| operand_target_for(target_dialect, project_config, targets, model);
     let mut operand_diags = rocky_compiler::operand_check::check_operand_types_per_model(
@@ -911,16 +953,64 @@ fn apply_operand_gates(
     let written_for = project_config
         .and_then(|c| c.portability.target_dialect)
         .map(rocky_compiler::operand_check::OperandDialect::from);
-    operand_diags.extend(rocky_compiler::function_check::check_unknown_functions(
-        &result.project.models,
-        result.semantic_graph.functions(),
-        &target_for,
-        written_for,
-    ));
+    operand_diags.extend(
+        rocky_compiler::function_check::check_unknown_functions_with(
+            &result.project.models,
+            result.semantic_graph.functions(),
+            &seed_names,
+            &target_for,
+            written_for,
+        ),
+    );
     if operand_diags.iter().any(|d| d.severity == Severity::Error) {
         result.has_errors = true;
     }
     result.diagnostics.extend(operand_diags);
+}
+
+/// The seed files a compile can have been typed from: `<root>/data/seed.sql`
+/// for `project_root`, and for each model, the first directory above its
+/// file that holds a `data/seed.sql` or a `rocky.toml` (a `--models`
+/// directory beside another project's seed). Every one found is read, since
+/// a name from a seed that is not the project's only loses a check. A path
+/// that is there but cannot be read is kept, so the caller reports it.
+fn reachable_seed_files(
+    result: &compile::CompileResult,
+    project_root: Option<&Path>,
+) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut seeds = std::collections::BTreeSet::new();
+    if let Some(root) = project_root {
+        seeds.insert(seed_file(root));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for model in &result.project.models {
+        for dir in model.file_path.ancestors().skip(1) {
+            if !seen.insert(dir.to_path_buf()) {
+                break;
+            }
+            let seed = seed_file(dir);
+            if may_be_present(&seed) {
+                seeds.insert(seed);
+                break;
+            }
+            if may_be_present(&dir.join("rocky.toml")) {
+                break;
+            }
+        }
+    }
+    seeds.retain(|seed| may_be_present(seed));
+    seeds
+}
+
+/// Whether something is at `path`, or may be: only a path the OS reports as
+/// absent is not. A path that cannot be checked counts as present, so the
+/// caller reads it and reports the failure rather than taking it for "no
+/// seed".
+fn may_be_present(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// SQL Server lifts every CTE to the head of the statement; check that on
@@ -1565,14 +1655,16 @@ pub(crate) fn load_source_schemas_from_seed(
 ///
 /// Never fails the compile. The user did not ask for the seed, so a seed
 /// that does not run is logged and skipped, and the compile goes on with the
-/// schemas it had.
+/// schemas it had. Returns the names of the functions and macros the seed
+/// created (empty when it did not run).
 fn merge_default_seed_schemas(
     project_root: &Path,
     config: Option<&rocky_config::RockyConfig>,
     schemas: &mut HashMap<String, Vec<TypedColumn>>,
     provenance: &mut SourceProvenance,
-) {
-    for (key, inherited_from) in fill_from_default_seed(project_root, config, schemas) {
+) -> std::collections::HashSet<String> {
+    let (added, names) = fill_from_default_seed_with_names(project_root, config, schemas);
+    for (key, inherited_from) in added {
         match inherited_from {
             // The bare key took a higher tier's `main.<key>` types, so it
             // takes that tier's origin too (#2657).
@@ -1586,6 +1678,7 @@ fn merge_default_seed_schemas(
             }
         }
     }
+    names
 }
 
 /// The default seed tier of [`merge_default_seed_schemas`], without the
@@ -1603,13 +1696,26 @@ pub(crate) fn fill_from_default_seed(
     config: Option<&rocky_config::RockyConfig>,
     schemas: &mut HashMap<String, Vec<TypedColumn>>,
 ) -> Vec<(String, Option<String>)> {
+    fill_from_default_seed_with_names(project_root, config, schemas).0
+}
+
+/// [`fill_from_default_seed`], also returning the names of the functions and
+/// macros the seed created, read from the DuckDB that ran it.
+fn fill_from_default_seed_with_names(
+    project_root: &Path,
+    config: Option<&rocky_config::RockyConfig>,
+    schemas: &mut HashMap<String, Vec<TypedColumn>>,
+) -> (
+    Vec<(String, Option<String>)>,
+    std::collections::HashSet<String>,
+) {
     let mut added = Vec::new();
     // A build without DuckDB cannot run a seed; the default tier is silent.
     if cfg!(not(feature = "duckdb")) || !seed_file(project_root).is_file() {
-        return added;
+        return (added, std::collections::HashSet::new());
     }
-    match load_source_schemas_from_seed_at(project_root, config) {
-        Ok(seed) => {
+    match load_seed_at(project_root, config) {
+        Ok((seed, names)) => {
             for (key, columns) in seed {
                 if schemas.contains_key(&key) {
                     continue;
@@ -1629,13 +1735,16 @@ pub(crate) fn fill_from_default_seed(
                 added.push((key.clone(), None));
                 schemas.insert(key, columns);
             }
+            (added, names)
         }
-        Err(e) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "the seed file did not run; continuing without its source schemas"
-        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "the seed file did not run; continuing without its source schemas"
+            );
+            (added, std::collections::HashSet::new())
+        }
     }
-    added
 }
 
 fn seed_file(project_root: &Path) -> std::path::PathBuf {
@@ -1644,11 +1753,28 @@ fn seed_file(project_root: &Path) -> std::path::PathBuf {
 
 /// [`load_source_schemas_from_seed`] for the seed at
 /// `<project_root>/data/seed.sql`.
-#[cfg(feature = "duckdb")]
 pub(crate) fn load_source_schemas_from_seed_at(
     project_root: &Path,
     config: Option<&rocky_config::RockyConfig>,
 ) -> Result<HashMap<String, Vec<TypedColumn>>> {
+    load_seed_at(project_root, config).map(|(schemas, _)| schemas)
+}
+
+/// The source schemas a seed gave, and the names of the functions and macros
+/// it created.
+type SeedTypes = (
+    HashMap<String, Vec<TypedColumn>>,
+    std::collections::HashSet<String>,
+);
+
+/// The source schemas of the seed at `<project_root>/data/seed.sql`, and the
+/// names of the functions and macros it created, both read from the one
+/// DuckDB that ran it.
+#[cfg(feature = "duckdb")]
+fn load_seed_at(
+    project_root: &Path,
+    config: Option<&rocky_config::RockyConfig>,
+) -> Result<SeedTypes> {
     use anyhow::Context;
     use rocky_duckdb::DuckDbConnector;
 
@@ -1673,17 +1799,19 @@ pub(crate) fn load_source_schemas_from_seed_at(
 
     // The same derivation `rocky test` and `rocky ci` type their compile
     // from, on the database they then execute in.
-    rocky_engine::test_runner::source_schemas_from_db(&conn)
+    let schemas = rocky_engine::test_runner::source_schemas_from_db(&conn)?;
+    let names = rocky_engine::test_runner::seed_function_names_from_db(&conn)?;
+    Ok((schemas, names))
 }
 
 /// Stub used when the binary is built without the `duckdb` feature. The
 /// flag exists in the clap definition unconditionally so feature-stripped
 /// builds give a clear error rather than a silent no-op.
 #[cfg(not(feature = "duckdb"))]
-pub(crate) fn load_source_schemas_from_seed_at(
+fn load_seed_at(
     _project_root: &Path,
     _config: Option<&rocky_config::RockyConfig>,
-) -> Result<HashMap<String, Vec<TypedColumn>>> {
+) -> Result<SeedTypes> {
     anyhow::bail!("--with-seed requires the `duckdb` feature; rebuild with `--features duckdb`");
 }
 
@@ -2774,6 +2902,80 @@ schema_template = "s"
                 && rendered.contains(config.to_string_lossy().as_ref()),
             "the refusal must name rocky.toml as the file to fix: {rendered}"
         );
+    }
+
+    /// `rocky serve` and `rocky lsp` install [`apply_model_target_gates`] and
+    /// never run the seed: a call to a macro the seed creates is still not
+    /// judged by E057 or E068, from a scan of the seed's text alone (#2691).
+    /// The seed here would fail to run (its CSV does not exist), and holds
+    /// `$$` and `E'...'` strings before a `CREATE` with comments between the
+    /// words. A built-in the seed does not shadow is still refused.
+    #[test]
+    fn the_serve_and_lsp_gates_skip_a_seed_macro_without_running_the_seed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"warehouse.duckdb\"\n\n\
+             [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.main.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(
+            root.join("data/seed.sql"),
+            "SELECT $$it's$$ AS a, E'it\\'s' AS b;\n\
+             CREATE /* shadows a built-in */ MACRO strip_accents(a, b) AS a || b;\n\
+             CREATE -- a project macro\n MACRO my_fn(x) AS x;\n\
+             CREATE TABLE orders AS SELECT * FROM read_csv('no/such/orders.csv');\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        fs::create_dir_all(&models).unwrap();
+        for (name, sql) in [
+            (
+                "uses_macro",
+                "SELECT strip_accents(status, status) AS x FROM orders",
+            ),
+            ("uses_fn", "SELECT my_fn(status) AS x FROM orders"),
+            ("control", "SELECT upper(status, status) AS x FROM orders"),
+        ] {
+            fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+            fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let config_path = root.join("rocky.toml");
+        let config = rocky_config::load_optional_project_config(Some(&config_path))
+            .unwrap()
+            .expect("config");
+        for form in [ModelSqlForm::Authored, ModelSqlForm::Inlined] {
+            let mut result = compile::compile(&CompilerConfig {
+                models_dir: models.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(result.seed_function_names.is_empty(), "no seed ran");
+            apply_model_target_gates(&mut result, &config, &config_path, form);
+            let mut calls: Vec<(String, String)> = result
+                .diagnostics
+                .iter()
+                .filter(|d| ["E057", "W057", "E068", "W068"].contains(&&*d.code))
+                .map(|d| (d.code.to_string(), d.model.clone()))
+                .collect();
+            calls.sort();
+            assert_eq!(
+                calls,
+                [("E068".to_string(), "control".to_string())],
+                "{form:?}"
+            );
+            assert!(result.has_errors, "{form:?}");
+        }
     }
 
     // ---- --with-seed source-schema loading ----

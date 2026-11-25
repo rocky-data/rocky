@@ -4044,8 +4044,8 @@
           "type": "integer"
         },
         "contain_failures": {
-          "default": false,
-          "description": "Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `false` (fail-fast — the run stops at the first failing model, exactly as before this knob existed).\n\nWhen `true`, a failed model and its downstream closure are *withheld* (never built on the failure's stale/missing output), while unrelated subtrees still materialize; the run reports `PartialFailure` with a containment manifest naming what failed and its blast radius. This changes no data semantics — everything withheld is already withheld by today's fail-fast run; it only *narrows* the withholding to the actual blast radius. The closure is conservative (computed from the resolved dependency graph, contain-more on any doubt).",
+          "default": true,
+          "description": "Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `true`. Set `false` to restore fail-fast: the run stops at the first failing model.\n\nWhen `true`, a failed model and its downstream closure are *withheld* (never built on the failure's stale/missing output), while unrelated subtrees still materialize; the run reports `PartialFailure` with a containment manifest naming what failed and its blast radius. This changes no data semantics — everything withheld is already withheld by today's fail-fast run; it only *narrows* the withholding to the actual blast radius. The closure is conservative (computed from the resolved dependency graph, contain-more on any doubt).",
           "type": "boolean"
         },
         "enabled": {
@@ -4230,8 +4230,8 @@
               "$ref": "#/definitions/TestsOnRun"
             }
           ],
-          "default": "off",
-          "description": "Run each model's sidecar `[[tests]]` against the table the run just built (#2611).\n\n- `\"off\"` (default): no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `\"report\"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `\"enforce\"`: as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.\n\nA `severity = \"warning\"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation."
+          "default": "enforce",
+          "description": "Run each model's sidecar `[[tests]]` against the table the run just built (#2611).\n\n- `\"off\"`: no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `\"report\"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `\"enforce\"` (default): as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.\n\nA `severity = \"warning\"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation."
         }
       },
       "type": "object"
@@ -5104,7 +5104,7 @@
       "description": "`[run] tests_on_run` — whether a run evaluates the `[[tests]]` of the models it builds, and whether a failing one fails the model.",
       "oneOf": [
         {
-          "description": "No test runs during `rocky run`. The default.",
+          "description": "No test runs during `rocky run`.",
           "enum": [
             "off"
           ],
@@ -5118,7 +5118,7 @@
           "type": "string"
         },
         {
-          "description": "Run the tests; an error-severity failure fails the model.",
+          "description": "Run the tests; an error-severity failure fails the model. The default.",
           "enum": [
             "enforce"
           ],
@@ -5610,7 +5610,7 @@
         "auto_apply_additive_drift": false,
         "backoff_multiplier": 2.0,
         "circuit_breaker_threshold": 3,
-        "contain_failures": false,
+        "contain_failures": true,
         "enabled": true,
         "initial_backoff_ms": 500,
         "jitter": true,
@@ -5663,7 +5663,7 @@
         "skip_rowcount_fallback": false,
         "skip_unchanged": false,
         "strict_scheduling": false,
-        "tests_on_run": "off"
+        "tests_on_run": "enforce"
       },
       "description": "Opt-in run-execution tuning for the `--skip-unchanged` model-skip gate. Default-OFF: an absent `[run]` block (or one that leaves every field at its default) keeps `rocky run`'s behavior byte-identical to before the gate existed. See [`RunConfig`]."
     },
