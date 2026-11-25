@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **compiler:** the DuckDB function list now includes four names from DuckDB 2.0.1: `add_grammar_extension`, `map_type_id_to_pg_oid`, `remove_grammar_extension` and `duckdb_live_query_metrics`. A call to any of them is no longer refused with E057. The engine now bundles DuckDB 2.0.1 (`duckdb` 1.20001.0), which accepts these names at run time.
+- **compiler:** the DuckDB function list now matches DuckDB 2.0.1 in full. 53 autoload names are now accepted, for example `iceberg_partitions`, `s3_buckets`, `parquet_page_index` and `st_asgrid`. 6 names that DuckDB 2.0.1 removed are now refused with E057: the four `__aws__cloudformation__quack_on_ec2__*` names, `odbc_bind_params` and `odbc_create_params`. The autoload part of the list came from the 2.0.0 header before.
+
 ## [1.94.0] — 2026-11-23
 
 ### Upgrade notes
