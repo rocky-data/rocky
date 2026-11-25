@@ -77,7 +77,7 @@ Key design decisions:
 uv run pytest -v                                   # all tests
 uv run pytest tests/test_types.py::test_parse_discover -v   # one test
 uv run ruff check src/ tests/                      # lint (--fix to auto-fix)
-uv run ruff format --check src/ tests/             # format check (CI mode)
+uv run ruff format src/ tests/                     # format (--check for CI mode)
 uv build                                           # build distribution
 ```
 

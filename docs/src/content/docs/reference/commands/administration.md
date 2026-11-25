@@ -650,17 +650,9 @@ parallelism: 2 lanes
 
 ## `rocky cost`
 
-Historical cost allocation for a completed run. `rocky cost` reads the same
-`RunRecord` as [`rocky replay`](#rocky-replay) and
-[`rocky trace`](#rocky-trace). It recomputes per-model dollar values from the
-recorded metrics and the current configuration's selected adapter and formula.
+Historical cost allocation for a completed run. `rocky cost` reads the same `RunRecord` as [`rocky replay`](#rocky-replay) and [`rocky trace`](#rocky-trace). It recomputes per-model dollar values from the recorded metrics and the configured adapter and formula. It does not contact the warehouse or read an invoice, so `cost_usd` is an allocation, not a billed amount, and it changes when you change the rates or adapter.
 
-The command does not contact the warehouse or read an invoice. Its dollar
-values can change when you change the configured rates or selected adapter. In
-the output, `cost_usd` is an allocation. It is not a billed amount.
-
-When a model lacks the metrics for its formula, its dollar value is `null`.
-The total includes only models with a dollar value. It is not a complete bill.
+A model that lacks the metrics for its formula has a `null` dollar value. The total counts only models with a value, so it is not a complete bill.
 
 ```bash
 rocky cost <target> [flags]
@@ -691,61 +683,26 @@ Roll up cost for the most recent run:
 rocky cost latest
 ```
 
-The dollar values in this example are illustrative allocations. They are not
-invoice amounts.
+The dollar values are illustrative allocations.
 
 ```json
 {
-  "version": "1.11.0",
   "command": "cost",
   "run_id": "run-20260421-142430-017",
   "status": "success",
-  "trigger": "manual",
-  "started_at": "2026-04-21T14:24:29.881087+00:00",
-  "finished_at": "2026-04-21T14:24:30.031036+00:00",
-  "duration_ms": 149,
   "adapter_type": "databricks",
   "total_cost_usd": 0.101,
   "total_duration_ms": 910000,
   "total_bytes_scanned": 104857600,
   "total_bytes_written": 20971520,
   "per_model": [
-    {
-      "model_name": "stg_orders",
-      "status": "success",
-      "duration_ms": 310000,
-      "rows_affected": 150000,
-      "bytes_scanned": 41943040,
-      "bytes_written": 10485760,
-      "cost_usd": 0.034
-    },
-    {
-      "model_name": "fct_revenue",
-      "status": "success",
-      "duration_ms": 600000,
-      "rows_affected": 8900,
-      "bytes_scanned": 62914560,
-      "bytes_written": 10485760,
-      "cost_usd": 0.067
-    }
+    { "model_name": "stg_orders", "status": "success", "duration_ms": 310000, "rows_affected": 150000,
+      "bytes_scanned": 41943040, "bytes_written": 10485760, "cost_usd": 0.034 }
   ]
 }
 ```
 
-Human-readable table form:
-
-```bash
-rocky cost latest --output table
-```
-
-```
-run: run-20260421-142430-017
-status: success   adapter: databricks   total: $0.101
-
-  model            duration       rows   bytes_scanned  cost
-  stg_orders        5m 10s    150,000           40 MB  $0.034
-  fct_revenue      10m  0s      8,900           60 MB  $0.067
-```
+`--output table` prints the same data as a table with a `run: ... total: $0.101` header.
 
 ### One month, split by product
 
@@ -859,11 +816,7 @@ Rocky finds the events by splitting the month again after each production run, o
 - **DuckDB / local**: the cost model reports `$0.00`. This excludes machine and infrastructure costs. DuckDB `EXPLAIN` supplies no numeric byte, row, or compute estimate.
 - **Discovery adapters (Fivetran, Airbyte, etc.)**: skipped; cost is `None`.
 
-If the configuration file is missing, the command keeps recorded duration and
-bytes but leaves `cost_usd` as `null`. A discovery-only adapter also has no
-dollar allocation. A configured DuckDB adapter reports the local `$0.00`
-model. An unreadable configuration is an error. Missing BigQuery bytes is
-`null`, not zero.
+If the configuration file is missing, the command keeps recorded duration and bytes but leaves `cost_usd` as `null`. An unreadable configuration is an error. Missing BigQuery bytes is `null`, not zero.
 
 ### Stored bytes
 
@@ -916,7 +869,7 @@ Rocky reads this from the DuckDB query profile of each statement of the build. T
 
 ## `rocky state`
 
-Inspect or manage the embedded state store. `rocky state` is a subcommand group. The bare form still shows watermarks, for backwards compatibility.
+Inspect or manage the embedded state store. The bare form `rocky state` shows watermarks.
 
 ```bash
 rocky state                                # show watermarks (default)
@@ -942,20 +895,16 @@ rocky state schedule spool                 # list queued webhook demands
 
 ### State-path resolution
 
-When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::state::resolve_state_path`. `<models>` is the `models/` directory beside the config file: `models` with the default `--config rocky.toml`, and `sub/models` for `rocky --config sub/rocky.toml`, wherever you run it from. `rocky mcp`, `rocky lsp`, and `rocky serve` and `rocky watch` without `--models` use the same directory, so every command reads one store.
+When `--state-path` is omitted, Rocky resolves the state file with `rocky_core::state::resolve_state_path`. `<models>` is the `models/` directory beside the config file (`sub/models` for `rocky --config sub/rocky.toml`, wherever you run it). `rocky mcp`, `rocky lsp`, and `rocky serve` and `rocky watch` without `--models` use the same directory.
 
-1. `<models>/.rocky-state.redb`: canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
-2. Legacy CWD `.rocky-state.redb`: still works; emits a one-time deprecation warning on stderr.
-3. Both present: CWD wins (preserves existing watermarks, branches, and partition bookkeeping); a louder warning asks you to reconcile. Merge is lossy, so delete one copy to silence the warning.
-4. Neither present: fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists; otherwise it falls back to CWD (keeps replication-only pipelines working without inventing a `models/` directory just to hold state).
+1. `<models>/.rocky-state.redb`: the canonical location. It matches the LSP convention.
+2. Legacy `.rocky-state.redb` in the working directory: still works, with a one-time deprecation warning on stderr. To silence it, move the file into `models/`.
+3. Both present: the working-directory file wins and a louder warning asks you to reconcile. Merge is lossy, so delete one copy.
+4. Neither present: a new project uses `<models>/.rocky-state.redb` when `models/` exists, else the working directory.
 
-Explicit `--state-path <PATH>` always wins; no resolver logic is applied.
+An explicit `--state-path <PATH>` always wins.
 
-Up to 1.93, the CLI looked for `<models>` under the working directory whatever `--config` said. If `--config` points elsewhere, the store beside it does not exist yet, and `./models/.rocky-state.redb` (or `./models/.rocky-state/<key>.redb`) does, Rocky keeps using that file and warns you to move it beside the config. Until you move it, `rocky mcp` and `rocky lsp` do not see it.
-
-:::note[A legacy state file in the working directory]
-To silence the deprecation warning, move a `.rocky-state.redb` from the working directory into `models/`. Left where it is, it still works.
-:::
+If `--config` points elsewhere, the store beside it does not exist yet, and `./models/.rocky-state.redb` (or `./models/.rocky-state/<key>.redb`) does, Rocky keeps using that file and warns you to move it beside the config. Until you move it, `rocky mcp` and `rocky lsp` do not see it.
 
 ### Related Commands
 
@@ -1001,7 +950,7 @@ It also refuses a connector-specific override when it cannot identify the target
 
 ## `rocky state clear-schema-cache`
 
-Flush the `DESCRIBE TABLE` schema cache. Complement to the TTL-driven eviction on the read path; use this when the project needs a fresh typecheck *now* (e.g., after a manual warehouse DDL change, before a strict-CI run, while debugging a suspected stale-cache mismatch).
+Flush the `DESCRIBE TABLE` schema cache when you need a fresh type-check now: after a manual warehouse DDL change, before a strict CI run, or while debugging a stale cache.
 
 ```bash
 rocky state clear-schema-cache
@@ -1016,26 +965,10 @@ rocky state clear-schema-cache --dry-run
 
 ### Behavior
 
-- Removes every row from the `SCHEMA_CACHE` redb table. The cache is cheap to rebuild; the next `rocky apply` (write tap) or `rocky discover --with-schemas` warms it back up.
-- **No prompt.** Entries are disposable; explicit opt-in by running the command is sufficient.
-- **Missing state store is a no-op.** A fresh CI runner with no `.rocky-state.redb` yet exits zero with `entries_deleted: 0`. This keeps "flush before build" safe to run unconditionally on ephemeral runners.
-- Uninitialised cache tables return `entries_deleted: 0` without touching redb.
-- JSON output is `ClearSchemaCacheOutput` (`entries_deleted`, `dry_run`).
-
-### Example
-
-```bash
-rocky state clear-schema-cache --dry-run --output json
-```
-
-```json
-{
-  "version": "1.16.0",
-  "command": "state-clear-schema-cache",
-  "entries_deleted": 12,
-  "dry_run": true
-}
-```
+- Removes every row from the `SCHEMA_CACHE` redb table. The next `rocky apply` or `rocky discover --with-schemas` warms it again.
+- There is no prompt.
+- A missing state store or an uninitialised cache table is a no-op: exit `0` with `entries_deleted: 0`. "Flush before build" is safe on ephemeral runners.
+- JSON output is `ClearSchemaCacheOutput` (`entries_deleted`, `dry_run`), for example `{"command": "state-clear-schema-cache", "entries_deleted": 12, "dry_run": true}`.
 
 ### Related Commands
 
@@ -1123,7 +1056,7 @@ A pause reaches a running scheduler immediately. Editing `[schedule] enabled` in
 
 `rocky state schedule spool` lists the webhook demands the ingress accepted and no tick has consumed yet. Read it when a webhook was delivered and its pipeline never ran.
 
-`GET /api/v1/schedule` cannot answer that question. It reports *claims*, and a claim exists only once a tick has picked a demand up, so a demand still sitting in the queue appears nowhere in it. (That route is API-only; there is no `rocky state schedule status` verb.)
+`GET /api/v1/schedule` cannot answer that question. It reports claims, and a claim exists only after a tick picks a demand up. That route is API-only: there is no `rocky state schedule status` verb.
 
 ```
    POST /api/v1/hooks/trigger/<pipeline>
@@ -1131,7 +1064,7 @@ A pause reaches a running scheduler immediately. Editing `[schedule] enabled` in
                 ▼  accepted, written to .rocky/pending-demands
    ┌──────────────────────────┐
    │  the spool  ────────────────▶  rocky state schedule spool
-   └────────────┬─────────────┘        (this command: what is WAITING)
+   └────────────┬─────────────┘        (what is WAITING)
                 │ a tick claims it
                 ▼
    ┌──────────────────────────┐
@@ -1139,23 +1072,11 @@ A pause reaches a running scheduler immediately. Editing `[schedule] enabled` in
    └──────────────────────────┘        (what is IN FLIGHT)
 ```
 
-Consumed demands are excluded: a `.done` tombstone is the 24-hour duplicate-suppression window for `kind = id`, not outstanding work.
+Consumed demands are excluded: a `.done` tombstone is the 24-hour duplicate-suppression window for `kind = id`, not outstanding work. An entry the command cannot read is reported under `skipped` with a reason. `counts.corrupt` reports files a previous tick quarantined.
 
-An entry the command cannot read is reported under `skipped` with a reason, never dropped -- it is still a demand blocking the queue. `counts.corrupt` reports files a previous tick quarantined.
-
-A spool directory that is **present but unreadable is an error**, not an empty list. "Nothing is queued" and "we cannot tell" must never look the same: that conflation once let every wrapper see a healthy tick while webhook demand was silently not firing. A spool that is simply absent is fine and reports an empty queue -- no webhook has ever been accepted for that project.
+A spool directory that is present but unreadable is an error, not an empty list, so "nothing is queued" never looks like "we cannot tell". An absent spool reports an empty queue.
 
 `token` is the duplicate-suppression key. For `kind = id` it is caller-supplied text, taken verbatim from the delivery header and never interpreted by Rocky, so anything rendering it must treat it as inert text. It is listed because it is what you match against your provider's own delivery log.
-
-```bash
-rocky state schedule spool --output table
-```
-
-```
-Webhook spool: /srv/analytics/.rocky/pending-demands
-
-  4f1c...  orders  id  token 8a72-delivery  received 2026-09-10T10:00:00+00:00
-```
 
 ### Related Commands
 
@@ -1207,7 +1128,7 @@ rocky tick --dry-run --output json
 
 ## `rocky compliance`
 
-Governance rollup over classification sidecars plus the project `[mask]` policy. Static resolver: answers *"are all classified columns masked wherever policy says they should be?"* without issuing a single warehouse call.
+Governance rollup over classification sidecars and the `[mask]` policy. It answers "are all classified columns masked wherever policy says?" with no warehouse call.
 
 ```bash
 rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
@@ -1229,7 +1150,6 @@ rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
 - `MaskStrategy::None` ("explicit identity") counts as masked: the project has deliberately opted out, which is a conscious policy decision, not an enforcement gap.
 - Tags listed on `[classifications] allow_unmasked` suppress exception emission but still report `enforced = false` in the per-column breakdown; the allow list doesn't pretend the column is masked.
 - Exit `1` with `--fail-on exception` when any exception is emitted; otherwise exit `0` regardless of exception count (the JSON payload still reports them).
-- **Static rollup, no warehouse calls.** Fast enough to run in every PR.
 - JSON output is `ComplianceOutput` (`summary`, `per_column`, `exceptions`).
 
 ### Example
@@ -1248,14 +1168,6 @@ rocky compliance --env prod --fail-on exception
     "total_exceptions": 1
   },
   "per_column": [
-    {
-      "model": "users",
-      "column": "email",
-      "classification": "pii",
-      "envs": [
-        { "env": "prod", "masking_strategy": "hash", "enforced": true }
-      ]
-    },
     {
       "model": "users",
       "column": "ssn",
@@ -1330,44 +1242,3 @@ rocky retention-status [--model NAME] [--drift]
 }
 ```
 
-:::caution[This is a behavior change]
-Earlier engine versions exited `0` for an unknown `--model` and returned an empty `models` array. A misspelled or renamed model therefore looked like a project with nothing to report. A CI job that treated the empty array as a pass now fails on a bad selector. `rocky test` and `rocky estimate` gained the same refusal.
-:::
-
-### Example
-
-```bash
-rocky retention-status --output json
-```
-
-```json
-{
-  "version": "1.16.0",
-  "command": "retention-status",
-  "models": [
-    { "model": "fct_revenue",   "configured_days": 90, "in_sync": true },
-    { "model": "dim_customers",                        "in_sync": true },
-    { "model": "events",        "configured_days": 30, "in_sync": true }
-  ]
-}
-```
-
-Text mode is a fixed-width table:
-
-```bash
-rocky -o table retention-status
-```
-
-```
-MODEL                                    CONFIGURED       WAREHOUSE        IN SYNC
-----------------------------------------------------------------------------------
-fct_revenue                              90 days          -                yes
-dim_customers                            -                -                yes
-events                                   30 days          -                yes
-```
-
-### Related Commands
-
-- [`rocky compliance`](#rocky-compliance) -- sibling governance rollup for classification + masking
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- applies retention policies inline during the post-DAG governance pass
-- [Model sidecar `retention`](/reference/model-format/) -- configure `retention = "<N>[dy]"`
