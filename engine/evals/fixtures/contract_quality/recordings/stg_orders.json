@@ -6,7 +6,7 @@
       "response_text": "[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"amount\"\ntype = \"Decimal\"\nnullable = false\n\n[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"coupon\"\ntype = \"String\"\nnullable = true\n\n[rules]\nrequired = [\"order_id\", \"customer_id\"]\nprotected = [\"order_id\", \"customer_id\"]\n"
     },
     {
-      "request_sha256": "dfbc5a202ee689d33d9b506280dc49b5f954a71cf700540801ee39353abe89f1",
+      "request_sha256": "7eecc6b78d80319cbdc2b005288e9496d848d3dd3f877f1c93c276687eb5929b",
       "response_text": "[[columns]]\nname = \"order_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"customer_id\"\ntype = \"Int64\"\nnullable = false\n\n[[columns]]\nname = \"amount\"\ntype = \"Float64\"\nnullable = false\n\n[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = false\n\n[[columns]]\nname = \"coupon\"\ntype = \"String\"\nnullable = true\n\n[rules]\nrequired = [\"order_id\", \"customer_id\"]\nprotected = [\"order_id\", \"customer_id\"]\n"
     }
   ]
