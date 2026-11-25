@@ -1,5 +1,5 @@
 # DuckDB function names (lower case), one per line.
-# Generated from DuckDB 2.0.0 (the engine bundled by libduckdb-sys 1.20001.0):
+# Generated from DuckDB 2.0.1 (the engine bundled by libduckdb-sys 1.20001.0):
 # SELECT DISTINCT lower(function_name) FROM duckdb_functions() with
 # core_functions, icu, json and parquet loaded, plus every function an
 # autoloadable extension provides (EXTENSION_FUNCTIONS in DuckDB 2.0.0
