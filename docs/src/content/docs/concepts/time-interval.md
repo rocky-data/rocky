@@ -5,26 +5,14 @@ sidebar:
   order: 10.5
 ---
 
-The `time_interval` materialization strategy partitions a model by a time
-column at a fixed granularity: `hour`, `day`, `month`, or `year`. A run targets
-named partitions instead of appending past a watermark. Three things follow from
-that. Re-running the same partition is idempotent. A late-arriving row is picked
-up on the next run of its partition. A backfill walks the range in order.
+The `time_interval` strategy partitions a model by a time column at a fixed granularity: `hour`, `day`, `month`, or `year`. A run targets named partitions instead of appending past a watermark. So a re-run of one partition is idempotent, a late-arriving row is picked up on the next run of its partition, and a backfill walks the range in order.
 
-Use it when the model aggregates by date and a day must be recomputed as a whole, or when you want cost and row counts per partition. A transformation `incremental` model loads the rows newer than the target's watermark and needs no partition column. See [Incremental](/reference/model-format/#incremental).
+Use it when the model aggregates by date and a day must be recomputed as a whole, or when you want cost and row counts per partition. A transformation `incremental` model needs no partition column. See [Incremental](/reference/model-format/#incremental).
 
 ## TOML reference
 
 ```toml
 # models/fct_daily_orders.toml
-name = "fct_daily_orders"
-depends_on = ["stg_orders"]
-
-[[sources]]
-catalog = "warehouse"
-schema = "raw"
-table = "stg_orders"
-
 [strategy]
 type = "time_interval"
 time_column = "order_date"        # column on the model output
@@ -32,11 +20,6 @@ granularity = "day"               # hour | day | month | year
 lookback = 0                      # optional: recompute the previous N partitions
 batch_size = 1                    # optional: combine N partitions per SQL statement
 first_partition = "2024-01-01"    # required if you use --missing
-
-[target]
-catalog = "warehouse"
-schema = "marts"
-table = "fct_daily_orders"
 ```
 
 | Field | Type | Default | Meaning |
@@ -66,8 +49,7 @@ GROUP BY 1, 2
 ```
 
 Each window is **half-open**. A row at exactly `@start_date` is in the window. A
-row at exactly `@end_date` belongs to the next partition. This matches Spark,
-BigQuery, and Postgres `tsrange` conventions.
+row at exactly `@end_date` belongs to the next partition. 
 
 ```
   granularity = "day"
@@ -87,52 +69,29 @@ BigQuery, and Postgres `tsrange` conventions.
        @end_date   → '2026-04-08 00:00:00'   a row here is excluded
 ```
 
-The same rule applies at every grain. For `granularity = "hour"`, partition key
-`2026-04-07T13` substitutes:
-- `@start_date` → `'2026-04-07 13:00:00'`
-- `@end_date` → `'2026-04-07 14:00:00'`
+The same rule applies at every grain. For `granularity = "hour"`, key `2026-04-07T13` substitutes `@start_date` → `'2026-04-07 13:00:00'` and `@end_date` → `'2026-04-07 14:00:00'`.
 
-The compiler emits `E024` if either placeholder does not filter the rows. A
-partition window must have both bounds. Each placeholder must appear in a
-`WHERE`, `HAVING` or `QUALIFY` clause, or in the `ON` of an inner join. A
-placeholder in a comment, in a longer string or only in the `SELECT` list
-does not count. The compiler also emits `E024` when it cannot parse the SQL.
+The compiler emits `E024` if either placeholder does not filter the rows, or when it cannot parse the SQL. Each placeholder must appear in a `WHERE`, `HAVING` or `QUALIFY` clause, or in the `ON` of an inner join. A placeholder in a comment, in a longer string or only in the `SELECT` list does not count.
 
-Inside that clause, a placeholder counts only in a comparison that bounds a
-column and is joined to the rest of the clause by `AND`:
+Inside that clause, a placeholder counts only in a comparison that bounds a column and is joined to the rest of the clause by `AND`.
 
-- `<col> >= @start_date` (or `>`, `=`) and `<col> < @end_date` (or `<=`, `=`).
-  Either operand order works, so `@start_date <= <col>` counts too.
-- `<col> BETWEEN @start_date AND @end_date`.
-- The column may be cast or wrapped in a function, such as `DATE(ts)`. The
-  placeholder may be cast or shifted by a constant, such as
-  `@start_date - INTERVAL 1 DAY`.
-- `<col> IN (SELECT ...)` counts when that subquery's rows are bounded.
-- An `OR` counts when every branch is bounded by these same rules, for example
-  `(a >= @start_date AND a < @end_date) OR (b >= @start_date AND b < @end_date)`.
-
-Anything that can let rows outside the window through does not count: an
-`OR` with an unbounded branch, a comparison under `NOT`
-(`ts >= @start_date OR 1 = 1`, `@start_date IS NULL OR ...`), a bound that faces the wrong way
-(`ts <= @start_date`), `NOT BETWEEN`, `NOT IN` and `EXISTS`. A placeholder
-inside a subquery bounds that subquery's rows, not the clause around it.
+| Counts | Does not count |
+|---|---|
+| `<col> >= @start_date` (or `>`, `=`) and `<col> < @end_date` (or `<=`, `=`), either operand order | An `OR` with an unbounded branch, for example `ts >= @start_date OR 1 = 1` or `@start_date IS NULL OR ...` |
+| `<col> BETWEEN @start_date AND @end_date` | A bound that faces the wrong way (`ts <= @start_date`) |
+| A cast or function on the column (`DATE(ts)`), or a cast or constant shift on the placeholder (`@start_date - INTERVAL 1 DAY`) | `NOT BETWEEN`, `NOT IN`, `EXISTS`, any comparison under `NOT` |
+| `<col> IN (SELECT ...)` when the subquery's rows are bounded | A placeholder inside a subquery bounds that subquery's rows, not the clause around it |
+| An `OR` where every branch is bounded by these rules | |
 
 The filter must reach every row the model emits:
 
-- **Set operations.** Each `UNION` / `UNION ALL` branch needs its own filter,
-  or one filter must wrap the whole union. `INTERSECT` needs one filtered
-  side. `EXCEPT` needs a filtered left side.
-- **CTEs and subqueries.** A filter inside a CTE or derived table counts only
-  when the output reads it. A filter in a CTE nothing reads counts for
-  nothing. So does a filter inside a scalar subquery in the `SELECT` list.
-- **Joins.** An inner or semi join is bounded when either side is. A `LEFT`
-  join is bounded only by its left side, a `RIGHT` join by its right side. A
-  `FULL OUTER` join needs both sides bounded.
-- **Date spines.** A table function such as
-  `GENERATE_SERIES(@start_date, @end_date, INTERVAL 1 DAY)` does not count on
-  its own. Its end is inclusive in most warehouses, so it emits a row that
-  belongs to the next partition. Add
-  `WHERE d >= @start_date AND d < @end_date` on the spine column.
+| Shape | Rule |
+|---|---|
+| `UNION` / `UNION ALL` | Each branch needs its own filter, or one filter wraps the whole union. |
+| `INTERSECT` / `EXCEPT` | `INTERSECT` needs one filtered side. `EXCEPT` needs a filtered left side. |
+| CTE or subquery | A filter counts only when the output reads it. A filter in a CTE nothing reads, or in a scalar subquery in the `SELECT` list, counts for nothing. |
+| Join | An inner or semi join is bounded when either side is. `LEFT` is bounded by its left side, `RIGHT` by its right side. `FULL OUTER` needs both. |
+| Date spine | `GENERATE_SERIES(@start_date, @end_date, INTERVAL 1 DAY)` does not count on its own. Its end is inclusive in most warehouses, so it emits a row of the next partition. Add `WHERE d >= @start_date AND d < @end_date` on the spine column. |
 
 ## Partition key format
 
@@ -147,15 +106,11 @@ JSON output:
 | `month` | `%Y-%m` | `2026-04` |
 | `year` | `%Y` | `2026` |
 
-Rocky restricts the format on purpose. It rejects `2026-04-7`, which drops the
-zero padding, even though `chrono` would parse it.
+Rocky rejects `2026-04-7`, which drops the zero padding.
 
 ## CLI flags
 
-> Note: the canonical, auditable form is `rocky plan` followed by `rocky apply <plan-id>`. The `rocky run` single-step alias fuses plan + apply into one invocation for local iteration and automation. Every partition-selection flag below is accepted on both `rocky plan` and `rocky run`.
-
-Seven flags select and modify which partitions to compute. The selection flags
-are mutually exclusive:
+Every flag below is accepted on both `rocky plan` and `rocky run`. The selection flags (`--partition`, `--from/--to`, `--latest`, `--missing`) are mutually exclusive:
 
 | Flag | Behavior |
 |---|---|
@@ -168,116 +123,58 @@ are mutually exclusive:
 
 ### The first run
 
-A model that sets `first_partition` and has no recorded partition has never run. With no selection flag, its first run fills every partition from `first_partition` up to now, as if you had passed `--missing`. A dbt microbatch model fills from `begin` the same way. The fill adds no `lookback` partitions before `first_partition`.
+A model that sets `first_partition` and has no recorded partition has never run. With no selection flag, its first run fills every partition from `first_partition` up to now, as if you had passed `--missing`. The fill adds no `lookback` partitions before `first_partition`.
 
-The fill has a limit of 1000 partitions. If `first_partition` is further back than that (an hourly model that starts years ago), the first run builds only the latest partition and logs a warning. Pass `--missing`, or `--from` and `--to`, to fill the history. Every later run, with at least one partition recorded, builds the latest partition as before. A model with no `first_partition` always builds the latest partition. So does a first run whose `first_partition` is after the current partition: there is nothing to fill yet.
+The fill has a limit of 1000 partitions. If `first_partition` is further back, the first run builds only the latest partition and logs a warning. Pass `--missing`, or `--from` and `--to`, to fill the history. A model with no `first_partition` always builds the latest partition. So does a first run whose `first_partition` is after the current partition.
 
-`rocky plan` reports each fill before it runs. The JSON field `first_run_fills` has one row per model: `model`, `partitions`, `from`, `to`, and `fills` (`false` when the range is over the limit, so the run builds only the latest partition). The text output prints a `-- first-run fills --` block, and the cost preview adds a note, because its estimate is for one run of the model, not the fill. A plan with a partition flag or `--lookback` starts no fill and reports none.
+`rocky plan` reports each fill before it runs, in the JSON field `first_run_fills` (`model`, `partitions`, `from`, `to`, and `fills`, which is `false` when the range is over the limit). The text output prints a `-- first-run fills --` block. A plan with a partition flag or `--lookback` reports none.
 
-The plan also records which models fill. An agent's `rocky apply` refuses a fill that its plan did not record, for example when the state store lost the model's partitions after the plan was made. It refuses before any model in the run writes. Plan again and review the new plan. A plan written by an older Rocky records no fill, so an agent's apply of it refuses a never-run model that sets `first_partition`. The recorded fill does not fix its end: a fill applied on a later day reaches that day's partition. An agent's apply of a `--dag` plan is refused outright, so this check does not apply to it.
+The plan also records which models fill. An agent's `rocky apply` refuses a fill its plan did not record, before any model writes. Plan again and review the new plan. A plan from an older Rocky records no fill, so an agent's apply refuses a never-run model that sets `first_partition`. A recorded fill does not fix its end: applied on a later day, it reaches that day's partition. An agent's apply of a `--dag` plan is refused outright.
 
 ```bash
-# Run today's partition
-rocky run --filter client=acme
-
-# Run a specific historical partition
-rocky run --filter client=acme --partition 2026-04-07
-
-# Backfill a closed range
-rocky run --filter client=acme --from 2026-04-01 --to 2026-04-07
-
-# Find and run gaps in the state store
-rocky run --filter client=acme --missing
-
-# Re-run today + the previous 3 days (for late-arriving data)
-rocky run --filter client=acme --lookback 3
+rocky run --partition 2026-04-07                          # one partition
+rocky run --from 2026-04-01 --to 2026-04-07               # closed range
+rocky run --missing                                       # gaps in the state store
+rocky run --lookback 3                                    # today + previous 3 (late data)
 ```
 
 ## Per-warehouse SQL
 
-Each adapter implements `insert_overwrite_partition` in its own way. Each one
-returns a `Vec<String>`, so the runtime can issue more than one statement.
-Atomicity holds per partition. If a statement fails mid-batch, the runtime
-issues `ROLLBACK` and marks the partition `Failed` in the state store.
+Each adapter implements `insert_overwrite_partition` and returns a `Vec<String>`, so the runtime can issue more than one statement. Atomicity holds per partition. If a statement fails mid-batch, the runtime issues `ROLLBACK` and marks the partition `Failed` in the state store.
 
-Before it runs any partition, Rocky checks that the target table exists. If
-not, it creates it by running the model SQL over an empty window. The empty
-window means the model reads no upstream rows. A model with an ungrouped
-aggregate still writes one row; every other shape writes none. The table's
-columns come from that query. The partitions then run as below.
+Before it runs any partition, Rocky checks that the target table exists. If not, it creates it by running the model SQL over an empty window, so the model reads no upstream rows. A model with an ungrouped aggregate still writes one row; every other shape writes none. The table's columns come from that query.
 
-### Databricks (Delta Lake)
+| Adapter | Statements |
+|---|---|
+| Databricks | One `INSERT INTO ... REPLACE WHERE`. It works on un-partitioned tables too. |
+| Snowflake, DuckDB | `BEGIN`, `DELETE` the window, `INSERT`, `COMMIT`. Snowflake's REST API runs one statement per call, so each is a separate `POST /api/v2/statements`. |
+| BigQuery | One `BEGIN TRANSACTION` / `COMMIT TRANSACTION` script in a single job. BigQuery's REST API is stateless, so separate `BEGIN` and `COMMIT` statements fail with "Transaction control statements are supported only in scripts or sessions." |
+| PostgreSQL, Redshift | `DELETE` then `INSERT` in one transaction. |
 
-Single statement using Delta's atomic `REPLACE WHERE`:
+Databricks example, with Delta's atomic `REPLACE WHERE`:
 
 ```sql
 INSERT INTO `warehouse`.`marts`.`fct_daily_orders`
 REPLACE WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00'
-SELECT
-    DATE_TRUNC('day', order_at) AS order_date,
-    customer_id,
-    COUNT(*) AS order_count,
-    SUM(amount) AS revenue
-FROM `warehouse`.`raw`.`stg_orders`
+SELECT ... FROM `warehouse`.`raw`.`stg_orders`
 WHERE order_at >= '2026-04-07 00:00:00'
   AND order_at <  '2026-04-08 00:00:00'
 GROUP BY 1, 2
 ```
 
-Works on un-partitioned tables too; `REPLACE WHERE` doesn't require physical
-partitioning.
-
-### Snowflake and DuckDB
-
-An explicit transaction of delete then insert. Snowflake's REST API runs one statement per call, so the runtime issues each as a separate `POST /api/v2/statements`. DuckDB uses the same shape.
-
-```sql
-BEGIN;
-DELETE FROM "warehouse"."marts"."fct_daily_orders"
-WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00';
-INSERT INTO "warehouse"."marts"."fct_daily_orders"
-SELECT ... ;
-COMMIT;
-```
-
-### BigQuery
-
-One `BEGIN TRANSACTION` / `COMMIT TRANSACTION` script joins the delete and the insert into a single job. BigQuery's REST API is stateless, so separate `BEGIN` and `COMMIT` statements fail with "Transaction control statements are supported only in scripts or sessions."
-
-```sql
-BEGIN TRANSACTION;
-DELETE FROM `warehouse`.`marts`.`fct_daily_orders`
-WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00';
-INSERT INTO `warehouse`.`marts`.`fct_daily_orders`
-SELECT ... ;
-COMMIT TRANSACTION
-```
-
-PostgreSQL and Redshift run `DELETE` then `INSERT` in one transaction.
-
 ## State store
 
-Per-partition state lives in its own `PARTITIONS` table in the redb
-[state store](/concepts/state-management/) (`<models>/.rocky-state.redb` by
-default). There is one row per `(model_name, partition_key)`:
+Per-partition state lives in its own `PARTITIONS` table in the redb [state store](/concepts/state-management/) (`<models>/.rocky-state.redb` by default), one row per `(model_name, partition_key)`.
 
-```rust
-PartitionRecord {
-    model_name: String,
-    partition_key: String,
-    status: PartitionStatus,   // Computed | Failed | InProgress | Interrupted
-    computed_at: DateTime<Utc>,
-    row_count: u64,
-    duration_ms: u64,
-    run_id: String,
-    checksum: Option<u64>,
-}
-```
+| Field | Type |
+|---|---|
+| `model_name`, `partition_key`, `run_id` | `String` |
+| `status` | `Computed`, `Failed`, `InProgress` or `Interrupted` |
+| `computed_at` | `DateTime<Utc>` |
+| `row_count`, `duration_ms` | `u64` |
+| `checksum` | `Option<u64>` |
 
-`--missing` reads this table to compute the gap between expected and actual.
-`RUN_HISTORY` stays the source of truth for whole-run success. `PARTITIONS` is
-the source of truth for per-partition success. The `run_id` field
-cross-references the two when you investigate a failure.
+`--missing` reads this table to compute the gap between expected and actual. `RUN_HISTORY` stays the source of truth for whole-run success. `PARTITIONS` is the source of truth for per-partition success. The `run_id` field cross-references the two.
 
 ## Timezone
 
@@ -288,33 +185,13 @@ partition boundaries. The strategy has no `timezone` field.
 
 ## JSON output
 
-After a `time_interval` run, `rocky run --output json` includes per-partition
-materialization entries and a per-model summary:
+After a `time_interval` run, `rocky run --output json` adds a `partition` object (`key`, `start`, `end`, `batched_with`) to each materialization and a `partition_summaries` list:
 
 ```json
-{
-  "materializations": [
-    {
-      "asset_key": ["warehouse", "marts", "fct_daily_orders"],
-      "duration_ms": 1234,
-      "metadata": { "strategy": "time_interval", "watermark": null },
-      "partition": {
-        "key": "2026-04-07",
-        "start": "2026-04-07T00:00:00Z",
-        "end": "2026-04-08T00:00:00Z",
-        "batched_with": []
-      }
-    }
-  ],
-  "partition_summaries": [
-    {
-      "model": "fct_daily_orders",
-      "partitions_planned": 1,
-      "partitions_succeeded": 1,
-      "partitions_failed": 0
-    }
-  ]
-}
+"partition_summaries": [
+  { "model": "fct_daily_orders", "partitions_planned": 1,
+    "partitions_succeeded": 1, "partitions_failed": 0 }
+]
 ```
 
 The dagster-rocky integration maps the strategy to a Dagster `DailyPartitionsDefinition` (or `Hourly`, `Monthly`, or `TimeWindow` for year) through the generated `PartitionInfo` and `PartitionSummary` models. See [the dagster partitions guide](/dagster/partitions/).

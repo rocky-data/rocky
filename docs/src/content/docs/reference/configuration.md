@@ -140,9 +140,7 @@ A worked example covering all three layers lives in `examples/playground/pocs/00
 
 ### Where a resolved value is shown
 
-Rocky prints the placeholder, not the value. A field can print `${DATABRICKS_TOKEN}`, never the token. Rocky matches the value, not the field. A value of 8 bytes or more is rewritten wherever it appears, even inside a longer string. With `BUCKET=analytics_prod`, the hook command `upload.sh s3://analytics_prod/out` prints as `upload.sh s3://${BUCKET}/out`.
-
-A value shorter than 8 bytes prints as itself. So does the literal in `${VAR:-default}`. A value that a TOML basic string unescapes (`\u0041`, `\t`) is matched in its unescaped form too.
+Rocky prints the placeholder, not the value. A value of 8 bytes or more is rewritten to `${NAME}` wherever it appears, even inside a longer string. With `BUCKET=analytics_prod`, the hook command `upload.sh s3://analytics_prod/out` prints as `upload.sh s3://${BUCKET}/out`. A value shorter than 8 bytes prints as itself, and so does the literal in `${VAR:-default}`. A value that a TOML basic string unescapes (`A`, `\t`) is matched in its unescaped form too.
 
 | Surface | What prints `${NAME}` |
 |---|---|
@@ -151,19 +149,16 @@ A value shorter than 8 bytes prints as itself. So does the literal in `${VAR:-de
 | `rocky compile`, `rocky dag` | `models_detail` (`strategy`, `freshness`, `tags`, `depends_on`, `name`), diagnostics text; a node's `strategy`, `freshness` and `partition_shape`. |
 | `rocky list models` / `adapters` / `sources`, `rocky catalog` | `depends_on`; an adapter's `host`; a source's `catalog`, `schema_prefix` and `components`; an asset's `intent` and column descriptions. |
 | `rocky validate`, `rocky doctor` | A pipeline's `strategy`, `catalog_template` and `schema_template`; every message, detail and suggestion. |
-| `rocky hooks list`, `rocky hooks test` | A hook's `command`, and the abort reason (it quotes a command or webhook URL). |
-| `GET /api/v1/schedule`, `rocky audit` | `timezone`, `cron`, `after`, config error; a decision's `model` and `reason`; a verification's `checks` and `reason`. |
-| Policy-decision ledger | A `verify_after` check name and its outcome text. |
+| `rocky hooks list`, `rocky hooks test` | A hook's `command`, and the abort reason. |
+| `GET /api/v1/schedule`, `rocky audit`, policy-decision ledger | `timezone`, `cron`, `after`, config error; a decision's `model` and `reason`; a verification's `checks` and `reason`; a `verify_after` check name and outcome. |
 | `rocky plan` (replication) plan files | `config_snapshot` holds `${NAME}`. A keyed digest of each config section sits beside it, so `rocky apply` refuses when an environment value changed. The key is `.rocky/plan-digest.key`; without it, apply refuses. |
 | Config errors and model-file errors | Every quoted value of 8 bytes or more, including TOML parse errors in a sidecar, `_defaults.toml` or frontmatter. |
 | Adapter connection fields | DuckDB `path`, `extension_directory`; Databricks `host`, `http_path`, `client_id`; Snowflake `account`, `warehouse`, `username`, `private_key_path`, `role`, `database`; BigQuery `project_id`, `location`; Fivetran `destination_id`. Only the adapter connect path reads the value. |
 
-Some outputs show a resolved value:
+These outputs show a resolved value:
 
-- **Target coordinates, on purpose.** A target catalog, schema and table print resolved wherever they appear as a target: `rocky compile` and `rocky dag` `target`, `rocky list models` `target`, `rocky catalog` `fqn`, `rocky lineage` `target_schema`, `rocky ci-diff` `resolved_target`, `rocky history --audit` `target_catalog`. `dagster-rocky` matches the asset key from `rocky compile`'s `target` against `rocky run`'s `asset_key`. A placeholder on one side would silently drop materializations. A target prints resolved even when the same value is a secret elsewhere.
-- SQL that Rocky generates (`rocky plan`, `rocky run`, `rocky preview`).
-- `rocky run` and `rocky discover` results, including each `asset_key`.
-- The `config_identity` in a governed plan file, `rocky docs` HTML, and log lines.
+- **Target coordinates, on purpose.** A target catalog, schema and table print resolved wherever they appear as a target: `rocky compile` and `rocky dag` `target`, `rocky list models` `target`, `rocky catalog` `fqn`, `rocky lineage` `target_schema`, `rocky ci-diff` `resolved_target`, `rocky history --audit` `target_catalog`. `dagster-rocky` matches the asset key from `rocky compile`'s `target` against `rocky run`'s `asset_key`, so a placeholder on one side would drop materializations.
+- SQL that Rocky generates (`rocky plan`, `rocky run`, `rocky preview`), `rocky run` and `rocky discover` results (including each `asset_key`), the `config_identity` in a governed plan file, `rocky docs` HTML, and log lines.
 
 Never put a secret in a target catalog, schema or table name, or in any other field these outputs carry.
 
@@ -215,9 +210,7 @@ Two types have no page yet. They read these top-level fields:
 
 ### `type = "manual"`
 
-A discovery adapter that lists source schemas and tables inline in `rocky.toml` instead of discovering them from an API. Use it when the source has no discovery adapter of its own, such as a Databricks or Snowflake source with no Fivetran in front of it, for tests, and for small sources whose shape does not change.
-
-It is discovery-only, so `kind = "discovery"` is required. List each schema as an `[[adapter.NAME.schemas]]` block:
+A discovery adapter that lists source schemas and tables inline instead of calling an API. Use it for a source with no discovery adapter of its own, for tests, and for small stable sources. It is discovery-only, so `kind = "discovery"` is required.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -238,19 +231,16 @@ tables = ["orders", "order_items"]
 adapter = "local_discovery"
 ```
 
-The adapter discovers exactly what it lists, with no network call, and does not check that the tables exist. `rocky plan` plans every listed table, so a missing table fails at `rocky run`. `rocky discover` differs: when the pipeline sets `source.catalog`, it asks the source warehouse which tables exist and drops the missing ones, as for every discovery adapter.
+The adapter makes no network call and does not check that the tables exist. `rocky plan` plans every listed table, so a missing table fails at `rocky run`. `rocky discover` with `source.catalog` set drops missing tables, as for every discovery adapter. Rocky uses a listed schema only when the pipeline's `schema_pattern` parses it: the name starts with `prefix` (case-sensitive) and the rest splits into the declared `components`.
 
-Rocky uses a listed schema only when the pipeline's `schema_pattern` parses it: the name starts with `prefix` (case-sensitive) and the rest splits into the declared `components`. It skips other schemas.
+`rocky validate` reports `V057`, and every command that loads the config refuses it, for:
 
-`rocky validate` reports each of these as `V057`, and every command that loads the config refuses it:
-
-- a manual adapter with no `schemas`;
-- a schema with no `tables`;
+- a manual adapter with no `schemas`, or a schema with no `tables`;
 - a schema or table name that is not a plain identifier (`[a-zA-Z0-9_]+`);
 - a schema listed twice, or a table listed twice in one schema (compared ignoring case);
 - `schemas` on an adapter whose type is not `manual`.
 
-When the `schema_pattern` of a pipeline that uses the adapter parses none of the listed schemas, `rocky validate` warns with `V058`: `plan` and `run` would find no table.
+`V058` warns when the `schema_pattern` of a pipeline that uses the adapter parses none of the listed schemas.
 
 ### `[adapter.NAME.retry]`
 
@@ -683,38 +673,9 @@ s3_bucket = "${ROCKY_STATE_BUCKET}"
 
 ### Concurrent writers
 
-Two concurrent runs that share one `[state]` prefix both download the ledger, change it, and upload. Without protection the second upload erases the first: its watermarks, run records and policy rows vanish with no error.
+`concurrency_control = "cas"` (compare-and-swap) makes each upload conditional on the remote object still carrying the generation this run downloaded. A run that loses the race exits non-zero with a conflict and the winner's state stands. Rocky does not merge the runs or roll back warehouse writes: re-run the loser. `"off"` uploads unconditionally, so the last writer wins silently. `local` and `valkey` offer no conditional write, so there an explicit `"cas"` downgrades to `off` with a warning. Set `"off"` only for a deployment with one writer per prefix.
 
-Compare-and-swap (CAS: a write that commits only if the object is unchanged since you read it) prevents this. It is the default on `s3`, `gcs` and `tiered`. A run that loses the race exits non-zero with a conflict instead of overwriting the winner. Rocky does not merge the runs or roll back warehouse writes. Re-run the loser. A non-merge strategy can duplicate rows on that re-run, so prefer merge-style strategies for contended pipelines.
-
-`local` and `valkey` offer no conditional write. There an unset mode is `off`, and an explicit `"cas"` downgrades to `off` with a warning. `cas` also stops the mid-run periodic uploader, so a crashed run leaves the remote ledger at its last committed generation.
-
-```
-concurrency_control unset ──► backend default
-                               s3 / gcs / tiered → cas    local / valkey → off
-            │
-  cas on s3 / gcs / tiered ──► conditional-write probe
-            ├─ supported     → cas
-            ├─ unsupported   → unset: warn, use off     explicit "cas": error, writer stops
-            └─ inconclusive  → cas  (never fall back to unconditional on a guess)
-```
-
-Some S3-compatible stores accept conditional-write headers and ignore them. So each writer probes the store once per process. The probe writes a uniquely named object under `<prefix>/cas-probe/`, checks that the store refuses a create over an existing object and a stale-generation write, then deletes it. It never touches the state object. It needs put and delete access under the prefix. `rocky doctor` runs the same probe (check `state_concurrency`). An inconclusive probe (network error, timeout, no write access) keeps `cas` and warns. That is not confirmed protection. Fix the access problem and run `rocky doctor`.
-
-Set `concurrency_control = "off"` for a deployment with one writer per prefix.
-
-**The `cas-required` marker.** The first CAS upload creates a `cas-required` object beside the state object (for example `<prefix>/v9/state.redb.cas-required`, create-once). A writer on `off` checks for it at start and before each upload. If it exists, the writer stops with an error that names the fix: set `concurrency_control = "cas"` or remove the explicit `"off"`. Reads are not affected. The check also looks in each older schema-version folder, so a marker from before an upgrade still blocks. Delete the marker, in every version folder that has one, only when every writer deliberately moves to `"off"`. `rocky doctor` warns when the mode and the marker disagree. Two limits:
-
-- **The check and the upload are separate steps.** A first CAS upload that creates the marker between them does not stop that one `off` upload. Every later one is refused.
-- **A marker can exist on a store that ignores conditional writes.** If the probe was inconclusive, the `cas` writers are not protected from each other, yet the marker still blocks `off` writers. Run `rocky doctor` until the probe passes.
-
-**Upgrading to the `cas` default.** Engine 1.77.0 changed the default on `s3`, `gcs` and `tiered` from `off` to `cas`. Older binaries do not know the marker and keep uploading unconditionally. Upgrade every writer that shares a `[state]` prefix together, or keep one writer per prefix until all run 1.77.0 or later. To keep the old behaviour, set `concurrency_control = "off"` before you upgrade.
-
-**What `cas` covers.** Every write of the shared state object. The end-of-run upload fails closed when it loses a race. The ledger-seam commands retry: `rocky policy freeze` / `unfreeze`, `rocky gc`, `rocky restore` (and a restore-shaped `rocky apply <plan-id>`), and the policy rows a run-shaped `rocky apply` writes when a `[policy]` rule sets `verify_after`. A seam that loses a race downloads the winner and replays its change on top. A change that rests on a policy decision is re-decided against the winner first. After three attempts it fails with a conflict error and leaves the winner in place. It never falls back to an unconditional upload. A restore re-proves each artifact on every attempt, and with a `[policy]` block re-checks freezes before each object write.
-
-**On `tiered`,** `cas` also keeps the Valkey tier coherent. The compare-and-swap runs against S3 first. Only after it commits does Rocky write the Valkey copy, together with its generation. A read uses the cached copy only after it confirms that generation is still the durable object's. A failed Valkey write, a crash between the two writes, or a stale cache entry cannot shadow durable state. Cached copies use a separate key from the `off` path, so a fleet can move from `off` to `cas` one pod at a time. With `off`, the tiered backend keeps its old behaviour, including the stale-cache window.
-
-**Upload failures.** Replication publishes recovery intent before it copies, on supported atomic adapters. With `on_upload_failure = "fail"`, a failed pre-copy upload stops before the `INSERT`. With `"skip"` it warns and continues. A fresh pod cannot recover unpublished intent after the local ledger disappears. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication). A failed watermark flush keeps the available progress and tries its upload. Ordinary `"skip"` runs keep their normal exit policy. Explicit `"fail"` and governed runs exit non-zero after they preserve the available state.
+Mechanism, the conditional-write probe, the `cas-required` marker, the 1.77.0 default change, and what `cas` covers: [State management](/concepts/state-management/#concurrent-writers). The backend matrix is in the [deployment contract](/advanced/deployment-contract/#when-two-processes-overlap).
 
 ### `[state.retry]`
 
@@ -743,83 +704,12 @@ Tune how `rocky plan --idempotency-key <KEY>` deduplicates a retried run (the `r
 | `dedup_on` | string | `"success"` | Which terminal statuses count as "already processed". `"success"` only stamps successful runs (failures stay claimable for retries); `"any"` stamps every terminal status. |
 | `in_flight_ttl_hours` | integer | `24` | Hours after which an `InFlight` claim is treated as a crashed-pod corpse and adopted by a fresh caller. Read when a run takes the claim and stamped on it: lowering the value later does not shorten a claim already made. On `valkey` and `tiered` it sets the key's expiry on the server (`EX`), and the server decides when the claim is gone. |
 
-Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backends so sibling pods see the same entry. See [`rocky plan --idempotency-key`](/reference/cli/#rocky-run) for the three possible outcomes (`fresh_run`, `skipped_idempotent`, `skipped_in_flight`).
+Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backends so sibling pods see the same entry. See [`rocky plan --idempotency-key`](/reference/cli/#rocky-run) for the three outcomes (`fresh_run`, `skipped_idempotent`, `skipped_in_flight`). Bucket lifecycle rules for `s3` and `gcs`: [State management](/concepts/state-management/#idempotency-stamps-in-a-bucket).
 
-#### Bucket-native lifecycle for object-store backends
-
-Rocky's sweep deletes expired idempotency stamps only from the local `state.redb`. It never sweeps an `s3` / `gcs` bucket, because a delete there cannot be conditional and could remove a claim that a run just took over. Add a bucket lifecycle rule instead. It also keeps GC running when no Rocky process is active.
-
-The rule age must be at least one day more than `retention_days`, and larger than `in_flight_ttl_hours` in days. A shorter rule can delete a live `InFlight` claim, and then two runs with the same key proceed. An age equal to `retention_days` is not enough. The examples use 31 days, which fits the defaults (30 days, 24 hours). Both match the default prefix `rocky/state/`; adjust it if you set `s3_prefix` / `gcs_prefix`.
-
-```json
-{
-  "Rules": [
-    {
-      "ID": "rocky-idempotency-stamps-31d",
-      "Status": "Enabled",
-      "Filter": { "Prefix": "rocky/state/" },
-      "Expiration": { "Days": 31 }
-    }
-  ]
-}
-```
-
-```bash
-aws s3api put-bucket-lifecycle-configuration \
-  --bucket "$ROCKY_STATE_BUCKET" \
-  --lifecycle-configuration file://rocky-lifecycle.json
-```
-
-GCS lifecycle JSON:
-
-```json
-{
-  "lifecycle": {
-    "rule": [
-      {
-        "action": { "type": "Delete" },
-        "condition": {
-          "age": 31,
-          "matchesPrefix": ["rocky/state/"]
-        }
-      }
-    ]
-  }
-}
-```
-
-```bash
-gcloud storage buckets update "gs://$ROCKY_STATE_BUCKET" \
-  --lifecycle-file=rocky-lifecycle.json
-```
-
-The rule applies to every object under `rocky/state/`, state-store snapshots included. To keep snapshots longer than stamps, use separate prefixes via `state.s3_prefix` and two rules.
-
-A bucket rule does not replace `retention_days`: the local redb copy on each pod still needs Rocky's sweep. On `tiered` backends Valkey's own TTL evicts the hot copy long before the cold copy expires.
 ### State namespacing
 
-Let independent runs proceed at the same time instead of queueing behind one lock. redb permits **one writer per state file**. Run one `rocky run` process per pipeline or client against the single global file (`<models>/.rocky-state.redb`) and those runs serialize on one advisory lock. Namespacing gives each pipeline, or each client, its own state file with its own lock, its own redb handle, and its own remote object key.
+`namespacing = "none"` keeps one global `<models>/.rocky-state.redb`. `"pipeline"` gives each pipeline its own `<models>/.rocky-state/<pipeline>.redb`, so concurrent runs do not wait on one writer lock. `--state-namespace <key>` (a `^[a-zA-Z0-9_]+$` identifier) fans out by client instead and overrides the config. An explicit `--state-path` disables namespacing. Namespaced files start fresh. See [State management](/concepts/state-management/#per-namespace-state-files).
 
-Namespacing is **opt-in and default-off**.
-
-| Mode | Behavior |
-|---|---|
-| `"none"` (default) | One global `<models>/.rocky-state.redb` for the whole project. |
-| `"pipeline"` | One state file per pipeline, under `<models>/.rocky-state/<pipeline>.redb`. |
-
-```toml
-[state]
-backend = "local"
-namespacing = "pipeline"   # each pipeline gets its own state file
-```
-
-To fan out by **client/tenant** rather than by pipeline name, use the per-invocation [`--state-namespace <key>`](/reference/commands/core-pipeline/#global-flags) flag instead. Its precedence:
-
-1. An explicit `--state-path <path>` is a hard override that **disables** namespacing for that invocation.
-2. Otherwise `--state-namespace <key>` wins over the `[state] namespacing` config.
-3. Neither set ⇒ the single global state file (default).
-
-`<key>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`): it becomes a path segment. Namespaced files start fresh; the legacy global file is never moved or auto-seeded, so carry watermarks forward manually if needed (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run).
 
 ---
 
@@ -951,25 +841,19 @@ on_breach = "warn"           # the only value
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_compute_hours` | float | | Most model time the product may be charged this month, in hours. |
-| `max_storage_gb_month` | float | | Most stored data the product may be charged this month, in GB-months (1 GB = 2^30 bytes). Each storage basis (`data_files`, `allocated_blocks`) is checked on its own; they are never added together. |
-| `max_usd` | float | | Most USD the product may be charged this month. Rocky prices the charge from your [`[cost]`](#cost) prices only, the same money that `rocky cost --month --by product` shows. With no price, this limit is not evaluated. |
+| `max_storage_gb_month` | float | | Most stored data the product may be charged this month, in GB-months (1 GB = 2^30 bytes). Each storage basis (`data_files`, `allocated_blocks`) is checked on its own, never added together. |
+| `max_usd` | float | | Most USD the product may be charged this month, priced from your [`[cost]`](#cost) prices only. With no price, this limit is not evaluated. |
 | `on_breach` | string | `"warn"` | Only `"warn"`. A breach is reported and fires the hook. The run's exit code does not change. |
 
 Each limit must be a finite number, 0 or more. A limit left unset is not checked. Rocky rejects an unknown field here.
 
-**What is tested.** The figure the product is **charged** in `rocky cost --month <YYYY-MM> --by product`: `kept` plus `allocated_upstream`. When another product reads a table this product builds, that build is charged to the reader, so this product's budget does not see it. `built` shows own spend beside it and is not tested. The month is cut in the project's `[schedule].timezone`.
-
-**When.** At the end of every production `rocky run`, after the run record is written, Rocky checks **every** product that has a budget, not only those whose models ran. A new reader of a shared table changes every reader's share, and stored data accrues with time. Shadow and branch runs check nothing. An interrupted run and a backfill do not check either, but their builds count: if one moves a product over, its event names that run and the next run fires no hook.
-
-**Verdict.** `in_budget`, `breached` or `not_evaluated`. `breached` when any limit is over (more than the limit, not equal). Otherwise `not_evaluated` when any limit cannot be checked: `max_usd` has no price, or the month has no model time or no stored size. When run history does not cover the whole month, the verdict is always `not_evaluated`. Rocky never reports `in_budget` by default.
-
-**Breach events.** Rocky records an event each time a product goes from not over to over, by re-checking after each production run of the month in finish order. Each event names the run (`run_id`), the limit and the figure. An event is never withdrawn. A `not_evaluated` run neither ends nor starts a breach. Stored data accrues between runs, so `rocky cost --month` can show `breached` with no event yet. The next production run records it and fires the hook.
-
-**The hook.** `on_budget_breach` fires once per exceeded limit, only at the run that made the change. A `max_storage_gb_month` over on both storage bases fires twice. Its metadata has `scope = "product_month"`, `product` and `month` beside `limit_type`, `limit` and `actual`. See [Hooks](/concepts/hooks/).
-
-**Large months.** The end-of-run check costs one month split for the current run and one per earlier run it needs, at most 8 (usually 2 in all). Past 8 earlier runs with no verdict, a breach counts as the product's first. `rocky cost --month` and `rocky product status` list breach events only below a work cap (750 runs of 21 executions). Above it they say so in `breach_events_skipped`. The hook and the end-of-run verdicts are not affected.
-
-**Where to read it.** `rocky run --output json` has `product_budgets` on replication, transformation and model-only runs. A quality or snapshot run prints its JSON before its record is written, so it checks and fires the hook but has no `product_budgets`. `rocky cost --month <YYYY-MM> --by product` has `budget` and `breach_events` per product. `rocky product status` has `cost_month`.
+- **What is tested.** The figure the product is **charged** in `rocky cost --month <YYYY-MM> --by product`: `kept` plus `allocated_upstream`. A table this product builds that another product reads is charged to the reader. `built` is not tested. The month is cut in the project's `[schedule].timezone`.
+- **When.** At the end of every production `rocky run`, after the run record is written, for **every** product that has a budget. Shadow and branch runs check nothing. An interrupted run and a backfill do not check either, but their builds count: if one moves a product over, its event names that run and the next run fires no hook.
+- **Verdict.** `in_budget`, `breached` or `not_evaluated`. `breached` when any limit is over (more than the limit, not equal). Otherwise `not_evaluated` when any limit cannot be checked (`max_usd` has no price, or the month has no model time or no stored size), or when run history does not cover the whole month. Rocky never reports `in_budget` by default.
+- **Breach events.** Rocky records an event each time a product goes from not over to over, by re-checking after each production run of the month in finish order. Each names the run (`run_id`), the limit and the figure, and is never withdrawn. Stored data accrues between runs, so `rocky cost --month` can show `breached` with no event yet. The next production run records it and fires the hook.
+- **The hook.** `on_budget_breach` fires once per exceeded limit, only at the run that made the change. A `max_storage_gb_month` over on both bases fires twice. Its metadata has `scope = "product_month"`, `product` and `month` beside `limit_type`, `limit` and `actual`. See [Hooks](/concepts/hooks/).
+- **Large months.** The end-of-run check splits at most 8 earlier runs (usually 2 in all). Past 8 earlier runs with no verdict, a breach counts as the product's first. `rocky cost --month` and `rocky product status` list breach events only below a work cap (750 runs of 21 executions); above it they say so in `breach_events_skipped`.
+- **Where to read it.** `rocky run --output json` has `product_budgets` on replication, transformation and model-only runs. A quality or snapshot run checks and fires the hook but has no `product_budgets`. `rocky cost --month <YYYY-MM> --by product` has `budget` and `breach_events` per product. `rocky product status` has `cost_month`.
 
 `rocky validate` warns with **V065** when `NAME` matches no file in `products/`, and with **V066** when `[product_budget]` is set and `[state.retention] max_age_days` is below 62.
 
@@ -1189,15 +1073,7 @@ A block that mixes an old key (`severity` included) with `warn_after` or `error_
 
 ## `[schema_evolution]` (removed)
 
-This block is gone. A config that still declares it fails to load, and the error says what to delete.
-
-```
-the `[schema_evolution]` section was removed because nothing ever read it: drift detection never reported a column that disappeared from the source, so Rocky never dropped one and `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; removing it changes no behaviour. A source-side column removal alone never schedules a DROP COLUMN, and there is no opt-in for that; a full refresh or a drift-driven table recreation can still discard a target-only column. See https://github.com/rocky-data/rocky/issues/1616.
-```
-
-Delete the section. Nothing about your pipeline changes, because Rocky never dropped a column on the strength of that key. A source-side column removal alone never schedules `ALTER TABLE ... DROP COLUMN`, and there is no opt-in. A full refresh or a drift-driven table recreation can still discard a target-only column, because both rebuild the table from the source's current columns.
-
-See [Schema drift](/concepts/schema-drift/) for the changes Rocky does detect and act on.
+A config that declares this block fails to load, and the error says to delete it. Nothing read the block, so removing it changes no behaviour. A source-side column removal alone never schedules `ALTER TABLE ... DROP COLUMN`, and there is no opt-in. A full refresh or a drift-driven table recreation can still discard a target-only column. See [Schema drift](/concepts/schema-drift/) and issue #1616.
 
 ---
 
@@ -1289,34 +1165,22 @@ Control what `rocky gc` is allowed to delete. Eviction is recorded, not destruct
 
 ## `[policy]`
 
-State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one of three effects. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) — `rocky apply`, branch promote, the MCP write tools, `rocky run` run by an agent, and drift auto-apply in `rocky run` when [`auto_apply_additive_drift`](#resilience) is on — and records every decision in the audit ledger. A run started by the native scheduler is a plain `rocky run` and is governed exactly like one.
+State who may change what, and let Rocky enforce it. Each rule maps a `(principal, capability, scope)` triple to one effect. Rocky evaluates the rules at the mutating [seams](/reference/glossary/#seam) (`rocky apply`, branch promote, the MCP write tools, `rocky run` run by an agent, and drift auto-apply when [`auto_apply_additive_drift`](#resilience) is on) and records every decision in the audit ledger. A run started by the native scheduler is a plain `rocky run` and is governed the same way. Evaluation rules, the `run` capability, the table names the gate sees, and an example: [Writing and testing policies](/guides/testing-policies/).
 
 :::caution[An absent block does not gate agents]
-With no `[policy]` block, the gate returns `NotConfigured` and allows the action whoever the principal is. Two surfaces differ. `rocky policy check` *predicts* against the safe default posture: agents on mutating actions require review, and humans are never gated. With no block, its prediction is stricter than what enforcement actually does. Drift auto-apply with `auto_apply_additive_drift = true` also governs as `require_review` with no block, so it refuses every drift change.
+With no `[policy]` block, the gate returns `NotConfigured` and allows the action whoever the principal is. `rocky policy check` *predicts* against the safe default posture (agents on mutating actions require review, humans never gated), so with no block its prediction is stricter than enforcement. Drift auto-apply with `auto_apply_additive_drift = true` governs as `require_review` with no block, so it refuses every drift change.
 :::
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `version` | integer | Yes | Schema version. Must be `1`. |
 | `default_agent_effect` | string | No | Effect for an `agent` on a mutating capability when no rule matches. Defaults to `"require_review"`. |
-| `rules` | list of tables | No | The rules themselves, written as `[[policy.rules]]`. |
+| `rules` | list of tables | No | The rules, written as `[[policy.rules]]`. |
 | `tests` | list of tables | No | Scenario assertions run by `rocky policy test`, written as `[[policy.tests]]`. Never read by enforcement. |
 
-**Effects.** `"allow"` permits the action. `"require_review"` permits it only after a human signs off. `"deny"` refuses it, and no `allow` overturns a `deny`.
-
-**Principals.** `"human"` is a person. `"agent"` is a non-human caller. In this version you supply the principal explicitly, for example `rocky policy check --principal agent`.
-
-**Capabilities.** `read` (always allowed), `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, plus three refinements of apply and promote: `schema_change.additive`, `schema_change.breaking`, and `value_change`. A rule naming `apply` or `promote` also matches those three refinements. Every other capability matches only itself, and a rule naming a refinement matches only that refinement.
-
-**The `run` capability.** An agent's `rocky run` is evaluated under `run`, one decision per model it builds and per replication table it copies, recorded under the ledger id `run:<run_id>`. Only a rule naming `run` matches it: an `apply` rule was written for the reviewed two-step path and never allows a one-step run. A human's run, or a project with no `[policy]` block, is not evaluated.
-
-| Verdict | What `rocky run` does |
-|---|---|
-| `allow` | Runs. |
-| `deny` | Refuses before any write, and exits 1. |
-| `require_review` | Records the verdict, warns, and runs. A one-step run has no plan to review, so this verdict is not enforced yet. Use `rocky plan` and `rocky apply <plan-id>` for a reviewed run. |
-
-A `rocky run --branch <name>` writes branch schemas, not production. `default_agent_effect` is not applied to it: only an explicit `run` rule governs it, so an agent can still build a branch and propose it with `rocky plan promote` under `default_agent_effect = "deny"`. A `run` rule cannot set `verify_after`: a one-step run has no post-apply check (V046).
+- **Effects.** `"allow"`; `"require_review"` (permitted only after a human signs off); `"deny"` (no `allow` overturns it).
+- **Principals.** `"human"` or `"agent"` (a non-human caller). You supply the principal explicitly, for example `rocky policy check --principal agent`.
+- **Capabilities.** `read` (always allowed), `propose`, `apply`, `promote`, `backfill`, `gc`, `restore`, `retry`, `run`, `quarantine`, plus the refinements `schema_change.additive`, `schema_change.breaking` and `value_change`. A rule naming `apply` or `promote` also matches those three refinements. Every other capability, and each refinement, matches only itself.
 
 ### `[[policy.rules]]`
 
@@ -1326,75 +1190,37 @@ A `rocky run --branch <name>` writes branch schemas, not production. `default_ag
 | `capability` | string | Yes | One of the capabilities above. |
 | `effect` | string | Yes | `"allow"`, `"require_review"`, or `"deny"`. |
 | `scope` | table | No | Which models the rule covers. See below. |
-| `verify_after` | list of strings | No | Named checks that must pass after a mutation this rule governed lands. A failing **or absent** check halts the apply and raises an alert. Empty means no post-apply gate. |
-| `autonomy_budget` | table | No | `{ failures = <n>, window = "<N>d" \| "<N>h" }`. When verify-after failures inside the rolling window reach `failures`, the rule degrades to `require_review`. It only ever tightens, never widens, and it recovers on its own as old failures age out. |
+| `verify_after` | list of strings | No | Named checks that must pass after a mutation this rule governed lands. A failing **or absent** check halts the apply and raises an alert. Empty means no post-apply gate. A `run` rule cannot set it (`V046`). |
+| `autonomy_budget` | table | No | `{ failures = <n>, window = "<N>d" \| "<N>h" }`. When verify-after failures inside the rolling window reach `failures`, the rule degrades to `require_review`. It only tightens, and recovers as old failures age out. |
 | `conditions` | table | No | Parsed and ignored. Reserved so a config written against a later version still loads. |
 
 ### `[policy.rules.scope]`
 
-A model matches the scope only when it satisfies **every** key you set.
+A model matches only when it satisfies **every** key you set. A scope with neither `any = true` nor a real predicate is rejected at config load.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `any` | bool | Match every model. Mutually exclusive with every other key. |
-| `models` | list of strings | Glob patterns (`*`, `?`) over the model name. Matches when the name matches at least one. |
-| `tags` | table | Required `key = value` tags. Matches when the model carries all of them. |
-| `classifications` | list of strings | Matches when the model has at least one column with any listed classification. |
-| `exclude_classifications` | list of strings | Matches when the model has **no** column with any listed classification. |
-| `contracted` | bool | Matches when the model's contracted status equals this value. |
-| `layer` | string | Matches when the model's `layer` tag equals this value. |
-| `max_downstreams` | integer | Blast-radius ceiling. Not a match predicate: the rule still matches, but an `allow` degrades to `require_review` when the transitive downstream count exceeds the ceiling **or cannot be computed**. `deny` and `require_review` rules are unaffected. |
+| `models` | list of strings | Glob patterns (`*`, `?`) over the model name. |
+| `tags` | table | Required `key = value` tags. The model must carry all of them. |
+| `classifications` | list of strings | At least one column carries any listed classification. |
+| `exclude_classifications` | list of strings | No column carries any listed classification. |
+| `contracted` | bool | The model's contracted status equals this value. |
+| `layer` | string | The model's `layer` tag equals this value. |
+| `max_downstreams` | integer | Blast-radius ceiling. Not a match predicate: an `allow` degrades to `require_review` when the transitive downstream count exceeds it **or cannot be computed**. `deny` and `require_review` rules are unaffected. |
 
-A scope with neither `any = true` nor any real predicate is rejected at config load, so an empty scope can never silently match everything.
-
-#### Pipelines that run no models
-
-A replication, snapshot, load or quality pipeline writes tables, not models. The `apply` gate names each table it writes, and `models` globs match that name. Use the **bare table name**, with no catalog or schema:
-
-| Pipeline | Name the gate sees |
-|----------|--------------------|
-| `replication` | Each target table (and `<table><suffix>` for a suffix shadow run). |
-| `snapshot` | `target.table`, the history table. |
-| `load` | `target.table`, and `<table>__rocky_stg`, the staging table a load with a contract writes first. With no `table`, Rocky loads one table per file, known only at run time, so the gate sees `catalog.schema`. |
-| `quality` with `[checks.quarantine]` on | Per listed table, what the mode writes: `split` writes `<table><suffix_valid>` and `<table><suffix_quarantine>` (`t__valid`, `t__quarantine` by default) and a working table `_quarantine_labels_<token>` (the token is random per run, so the gate sees `_quarantine_labels_`; match it with `_quarantine_labels_*`), `drop` writes `<table><suffix_valid>`, `tag` rewrites `<table>`. A table entry with no `table` is seen as `catalog.schema`. |
-| `quality` without quarantine | Nothing. It only reads, so no rule applies. |
-
-These names carry no tags, layer, classifications or contract, so a rule scoped by those keys does not match them. `any = true` does. One exception: a table named like a compiled model of the project takes that model's attributes.
-
-```toml
-[policy]
-version = 1
-default_agent_effect = "require_review"
-
-# Agents may add columns to staging models on their own.
-[[policy.rules]]
-principal = "agent"
-capability = "schema_change.additive"
-effect = "allow"
-scope = { models = ["stg_*"], max_downstreams = 20 }
-
-# Nobody drops a column from a model that carries PII without review.
-[[policy.rules]]
-principal = "agent"
-capability = "schema_change.breaking"
-effect = "deny"
-scope = { classifications = ["pii"] }
-```
-
-Pin the behaviour you just wrote with `[[policy.tests]]` scenarios, and run `rocky policy test` in CI. A later policy edit then cannot open a hole unnoticed. See [Testing policies](/guides/testing-policies/) for the scenario fields, and [Operating Rocky with agents](/concepts/operating-rocky-with-agents/) for where the gates sit.
+Pin a policy with `[[policy.tests]]` scenarios and run `rocky policy test` in CI ([Writing and testing policies](/guides/testing-policies/)). Where the gates sit: [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
 
 ---
 
 ## `[residency]`
 
-Say which region each pipeline and the AI endpoint is in, and stop a plan or an AI request that moves data from one region to another.
-
-A region is a label, such as `"eu-west-1"` or `"eu"`. It uses only lowercase letters, digits and hyphens, and starts with a letter or digit. Rocky compares labels as exact text, so `"eu"` and `"eu-west-1"` are two different regions. Pick one spelling and keep it. Rocky does not correct a label: `"EU"` or `" eu"` is a `V060` error, whether or not `enforce` is on.
+Say which region each pipeline and the AI endpoint is in, and stop a plan or an AI request that moves data between regions. A region is a label of lowercase letters, digits and hyphens that starts with a letter or digit (`"eu-west-1"`, `"eu"`). Rocky compares labels as exact text and never corrects one: `"EU"` or `" eu"` is a `V060` error, whether or not `enforce` is on. How the checks work and which AI features carry which data: [Data residency](/guides/governance/#data-residency).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enforce` | bool | `false` | Require a `region` label on every source, target and the `[ai]` block. |
-| `allow` | array of `{ from, to }` | `[]` | Cross-region moves you mean to make. Each entry lets data move from the `from` region to the `to` region, in that direction only. |
+| `allow` | array of `{ from, to }` | `[]` | Cross-region moves you mean to make. Each entry lets data move from `from` to `to`, in that direction only. |
 
 ```toml
 [residency]
@@ -1411,99 +1237,13 @@ region = "eu-west-1"
 region = "eu-west-1"
 ```
 
-### Cross-region pipelines (`V061`)
+| Code | Raised when |
+|---|---|
+| `V060` | `enforce = true` and a required `region` is missing or empty (replication and snapshot: `source` and `target`; transformation, quality and load: `target`; any: `[ai]`), or a label is malformed. |
+| `V061` | A replication or snapshot pipeline's `source.region` and `target.region` differ with no matching `allow` entry. Checked whether or not `enforce` is on. |
+| `V062` | An AI request carries data from a region that differs from `[ai] region` with no matching `allow` entry. `rocky validate` also warns for each pipeline label that differs from `[ai] region`. |
 
-A replication or snapshot pipeline reads its `source` and writes its `target`. When both blocks set `region` and the labels differ, Rocky refuses the pipeline with a `V061` error. The check runs whether or not `enforce` is on, because two labels that differ already say the data moves.
-
-```text
-[pipeline.bronze.source] region = "eu"   ──▶   [pipeline.bronze.target] region = "us"
-                                         V061 unless allow has { from = "eu", to = "us" }
-```
-
-`rocky validate` reports `V061` offline, with no warehouse access. Rocky runs the check when it loads the config, so every command that loads it (`plan`, `run`, `apply`, `discover`) refuses the project, not only `plan` and `run`. To let one direction through, add it to `allow`. The reverse direction needs its own entry.
-
-Rocky checks only a pipeline's own source and target. These carry no region, so Rocky does not check them:
-
-- the SQL inputs of a transformation pipeline's models,
-- the `tables` of a quality pipeline,
-- the `source_dir` of a load pipeline,
-- a `source.discovery` block (for example Fivetran),
-- a pipeline-level `depends_on`. It orders pipelines, but it does not say that one reads the other's tables.
-
-So a transformation in `"us"` that reads a table another pipeline wrote in `"eu"` is not refused.
-
-### AI requests (`V062`)
-
-Rocky compares `[ai] region` with the region of the data that an AI request carries. The rule is the same as for `V061`, with the AI endpoint as the target:
-
-```text
-data in region "eu"   ──▶   [ai] region = "us"
-                      V062 unless allow has { from = "eu", to = "us" }
-```
-
-- Data and endpoint in the same region: the request goes.
-- Different regions: Rocky refuses the request with a `V062` error, unless `allow` has an entry from the data's region to the `[ai]` region. The check runs whether or not `enforce` is on.
-- No label on the data or on `[ai]`, and `enforce` is off: the request goes.
-
-Rocky makes the check when it builds the AI client. That is before it profiles the warehouse and before it sends any request, so a refused request sends nothing. `rocky ai-sync` also makes the check before it writes its upstream schema baseline, so a refused run writes no file.
-
-One command builds one AI client for all the data its requests carry, so one refused item stops the whole command. `rocky ai-explain --all` over an `"eu"` and a `"us"` model, with `[ai] region = "us"`, sends nothing. Name one model (`rocky ai-explain <model>`, `rocky ai-test <model>`, `rocky ai-sync --model <model>`) to run the models that may go.
-
-Data means the schema (column names and types), statistics or values of a table. The SQL, `.rocky` source and `rocky.toml` text you wrote are not data. Each AI feature carries this data:
-
-| Feature | What the request carries | Region of that data |
-|---------|--------------------------|---------------------|
-| `rocky ai-contract`, MCP `ai_contract` | Statistics of the model's table (row, null and distinct counts; with `--with-data`, also min, max and sample values) | The `target` of the project's pipeline, and its `source` for a replication or snapshot pipeline |
-| `rocky ai-explain`, `rocky ai-sync`, MCP `explain_model`, the editor's contract fix | The model's schema and the schemas of its direct upstreams | The model's region |
-| `rocky ai-test`, MCP `ai_test` | The model's schema | The model's region |
-| `rocky ai "<intent>"` | The schema of every compiled model and source table | The model's region |
-| MCP `suggest_freshness_block`, the editor's freshness and classification fixes | The model's column names | The model's region |
-| The editor's `.rocky` syntax fix | The `.rocky` source and the parse error only | No data, so no check |
-
-**Region of a model.** The `target` region of each transformation pipeline whose `models` glob loads it. A model that no transformation pipeline loads is in the `target` region of every pipeline.
-
-**Region of a table that is not a model** (for example, one from the schema cache). It comes from the pipelines that write it or read it. Rocky reads the name as `<schema>.<table>`, with an optional leading catalog.
-
-| Pipeline | Tables it writes (target side) | Tables it reads (source side) |
-|---|---|---|
-| `replication` | Every table in a schema that `target.schema_template` makes. Each `{placeholder}` stands for text without a dot: `raw__{source}` matches `raw__crm.orders`, not `raw__a.b.orders`. | Every table in a schema that `source.schema_pattern` accepts: it starts with `prefix` and the rest splits on `separator` into at least one part per component. Rocky ignores case and catalog, so the match is at least as wide as discovery's. |
-| `snapshot` | The table `target.schema` and `target.table` name. | The table `source.schema` and `source.table` name. |
-| `load` | The table `target.schema` and `target.table` name; with no `table`, every table in `target.schema`. | None: it reads files. |
-
-A table a pipeline writes takes that pipeline's `target` region. For a replication or snapshot it takes the `source` region too, because the target holds data copied from the source. A table a pipeline reads takes only its `source` region. `rocky discover --with-schemas` and `rocky run` put read tables in the schema cache.
-
-For both sides:
-
-- Rocky compares schema and table names without regard to case, because the schema cache stores them in lowercase. It does not compare the catalog. A table that two pipelines match takes the regions of both.
-- A `source` or `target` block with no `region` adds "no region" to the table's regions. Without `enforce`, the labels that exist decide. With `enforce = true`, the missing label refuses the request with `V062`.
-- A `source.schema_pattern` whose `components` Rocky cannot parse (an empty entry) matches every table, because Rocky cannot say which tables it reads.
-- Rocky takes the last dot-separated part as the table and tries every tail of the earlier parts as the schema. For `a.b.c.orders` the schemas are `a.b.c`, `b.c` and `c`. A wrong split can only add regions.
-
-A table that no pipeline writes or reads has no region. Without `enforce`, a request that carries it goes. With `enforce = true`, Rocky refuses it with `V062`, because it cannot show that the data may go to the AI endpoint. Under `enforce`:
-
-- `rocky ai "<intent>"` is refused when the source schema cache holds such a table.
-- `rocky ai-explain` and `rocky ai-sync` are refused for a model whose `depends_on` lists such a table. Rocky also derives upstreams from SQL, but only from a bare table name that binds to a model. A table the SQL reads but `depends_on` does not list is not an upstream, and its schema is not sent.
-
-`rocky validate` warns with `V062` for each pipeline `source` or `target` label that differs from `[ai] region` with no `allow` entry. It is a hint: it does not check that any AI feature carries that data, and `rocky run` never makes an AI request. The check that refuses a request runs when Rocky builds the AI client.
-
-`ROCKY_AI_BASE_URL` changes where requests go, not `[ai] region`. Keep the label in step with the endpoint.
-
-### Required labels (`V060`)
-
-With `enforce = true`, Rocky requires `region` on each of these blocks:
-
-| Pipeline type | Blocks that need `region` |
-|---------------|---------------------------|
-| `replication` | `source`, `target` |
-| `snapshot` | `source`, `target` |
-| `transformation` | `target` |
-| `quality` | `target` |
-| `load` | `target` |
-| (any) | `[ai]` |
-
-Rocky requires `[ai] region` even when the project never runs `rocky ai`. An empty string counts as missing. A missing label is a `V060` error in `rocky validate`. Every command that loads the config (`plan`, `run`, `discover`) refuses it with the same message.
-
-The `regions...` component in a `schema_pattern` is a different thing: it names part of a source schema, not where the data lives.
+`rocky validate` reports `V060` and `V061` offline, and every command that loads the config refuses them.
 
 ---
 
@@ -1549,12 +1289,9 @@ page_size = 100
 
 ## Full Example
 
-A complete Fivetran → Databricks pipeline with governance. The [minimal config](#config-at-a-glance) at the top of this page is the credential-free DuckDB version.
+A Fivetran → Databricks replication pipeline with governance. The [minimal config](#config-at-a-glance) at the top of this page is the credential-free DuckDB version.
 
 ```toml
-# ──────────────────────────────────────────────────
-# Adapters: connections to source and warehouse
-# ──────────────────────────────────────────────────
 [adapter.fivetran]
 type = "fivetran"
 kind = "discovery"
@@ -1568,16 +1305,10 @@ host = "${DATABRICKS_HOST}"
 http_path = "${DATABRICKS_HTTP_PATH}"
 token = "${DATABRICKS_TOKEN}"
 
-# ──────────────────────────────────────────────────
-# Pipeline: bronze layer replication
-# ──────────────────────────────────────────────────
 [pipeline.bronze]
 type = "replication"
 strategy = "incremental"
 timestamp_column = "_fivetran_synced"
-metadata_columns = [
-    { name = "_loaded_by", type = "STRING", value = "NULL" },
-]
 
 [pipeline.bronze.source]
 adapter = "prod"
@@ -1601,41 +1332,21 @@ auto_create_schemas = true
 
 [pipeline.bronze.target.governance.tags]
 managed_by = "rocky"
-environment = "production"
 
 [[pipeline.bronze.target.governance.grants]]
 principal = "group:data_engineers"
 permissions = ["USE CATALOG", "MANAGE"]
 
-[[pipeline.bronze.target.governance.schema_grants]]
-principal = "group:data_engineers"
-permissions = ["USE SCHEMA", "SELECT", "MODIFY"]
-
-[pipeline.bronze.target.governance.isolation]
-enabled = true
-
-[[pipeline.bronze.target.governance.isolation.workspace_ids]]
-id = 123456789
-binding_type = "READ_WRITE"
-
 [pipeline.bronze.checks]
 enabled = true
 row_count = true
-column_match = true
 freshness = { error_after = "24h" }
 
 [pipeline.bronze.execution]
 concurrency = 8
-fail_fast = false
-table_retries = 1
 
-# ──────────────────────────────────────────────────
-# State: persistence backend for watermarks
-# ──────────────────────────────────────────────────
 [state]
 backend = "${ROCKY_STATE_BACKEND:-local}"
-# s3_bucket = "${ROCKY_STATE_BUCKET}"
-# valkey_url = "${VALKEY_URL}"
 ```
 
 ---

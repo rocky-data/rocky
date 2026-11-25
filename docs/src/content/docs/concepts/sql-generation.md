@@ -5,62 +5,24 @@ sidebar:
   order: 7.5
 ---
 
-Rocky builds every statement it sends to a warehouse. A model's statements come out of the compiler's typed IR. The IR (intermediate representation) is one typed record per model: its SQL, its columns, its target table, and its materialization strategy.
-
-A replication pipeline needs no model. Rocky renders its catalog, schema, copy and other replication statements from the pipeline config instead. Both paths end in the dialect the target warehouse speaks. See the [glossary](/reference/glossary/) for both terms.
+Rocky builds every statement it sends to a warehouse. A model's statements come from the compiler's typed IR: one record per model with its SQL, columns, target table and materialization strategy. A replication pipeline needs no model: Rocky renders its catalog, schema and copy statements from the pipeline config. Both paths end in the dialect the target warehouse speaks.
 
 ```
-  models/fct_orders.sql  +  models/fct_orders.toml
-                     │
-                     │ compile: parse, resolve the DAG, type check
-                     ▼
-          ┌──────────────────────┐
-          │ typed IR             │  one record per model:
-          │                      │  its SQL, columns, target, strategy
-          └──────────┬───────────┘
-                     │
-  rocky.toml ────────┤  replication needs no model: its catalog,
-  (a replication     │  schema, copy and other statements are
-   pipeline)         │  rendered from the pipeline config
-                     │
-                     │ generate, in the target warehouse's dialect
-     ┌───────────┬───┴────────┬────────────┬───────────┐
-     ▼           ▼            ▼            ▼           ▼
-  Databricks  Snowflake   BigQuery      Trino      DuckDB
-                  the SQL below, ready to execute
+  models/*.sql + *.toml ──▶ compile ──▶ typed IR ──┐
+                                                   ├──▶ generate in the target dialect ──▶ SQL
+  rocky.toml (replication pipeline) ───────────────┘
 ```
 
-The diagram shows five dialects. PostgreSQL, Redshift, SQL Server, ClickHouse
-and Spark have their own dialects too. This page shows the Databricks form
-unless it names another warehouse.
+Every warehouse has its own dialect. This page shows the Databricks form unless it names another warehouse. Rocky validates every identifier before it reaches a statement: see [SQL Safety](#sql-safety).
 
-The rest of this page is the catalog of statements Rocky emits. Rocky validates every identifier before it reaches a statement — see [SQL Safety](#sql-safety) at the end.
-
-## Catalog Lifecycle
+## Catalog and Schema Lifecycle
 
 ```sql
 CREATE CATALOG IF NOT EXISTS <catalog>
-```
-
-```sql
 ALTER CATALOG <catalog> SET TAGS ('managed_by' = 'rocky', 'tenant' = 'acme')
-```
-
-```sql
 DESCRIBE CATALOG <catalog>
-```
-
-## Schema Lifecycle
-
-```sql
 CREATE SCHEMA IF NOT EXISTS <catalog>.<schema>
-```
-
-```sql
 ALTER SCHEMA <catalog>.<schema> SET TAGS ('managed_by' = 'rocky', 'source' = 'shopify')
-```
-
-```sql
 SHOW SCHEMAS IN <catalog>
 ```
 
@@ -84,7 +46,7 @@ WHERE _fivetran_synced > TIMESTAMP '<last watermark>'
   AND _fivetran_synced < TIMESTAMP '<newest source timestamp>'
 ```
 
-Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and writes it in as a literal. There is no correlated subquery against the target table. Just before the copy, Rocky reads `MAX(_fivetran_synced)` over the source and writes it in as the second literal. The newest batch waits for a later run, so a late row with the same timestamp is not skipped. `rocky plan` shows the statement without the second bound. See [Incremental Processing](/concepts/incremental/#how-rocky-advances-the-watermark).
+Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and writes it in as a literal, with no correlated subquery against the target. Just before the copy, it reads `MAX(_fivetran_synced)` over the source and writes that in as the second literal. The newest batch waits for a later run, so a late row with the same timestamp is not skipped. `rocky plan` shows the statement without the second bound. See [Incremental Processing](/concepts/incremental/#how-rocky-advances-the-watermark).
 
 On DuckDB, each literal is a string with a UTC offset and no `TIMESTAMP` keyword: `'2026-03-02 10:00:00.123456789+00:00'`. DuckDB converts it to the column's type. So it keeps all nine digits on a `TIMESTAMP_NS` column, and it means the same instant on a `TIMESTAMPTZ` column in any session time zone.
 
@@ -121,14 +83,22 @@ WHEN NOT MATCHED THEN INSERT *
 
 ## Transformation SQL
 
-Rocky wraps the SQL you wrote in a statement chosen by the model's materialization strategy:
+Rocky wraps the SQL you wrote in a statement chosen by the model's materialization strategy (`rocky-ir::ir::MaterializationStrategy`, one per model). SQL generation lives in `rocky-core::sql_gen`.
 
-- **Table**: `CREATE OR REPLACE TABLE ... AS <user_sql>`
-- **Incremental**: `INSERT INTO ... <user_sql>`
-- **Merge**: `MERGE INTO ... USING (<user_sql>) ...`
-- **Materialized View**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS <user_sql>` (Databricks, Snowflake, BigQuery; PostgreSQL and Redshift drop and re-create the view)
-- **Dynamic Table**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '<lag>' WAREHOUSE = <warehouse> AS <user_sql>` (Snowflake)
-- **Time Interval**: Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` substitution (see below)
+| Strategy | Behavior | Statement |
+|---|---|---|
+| `FullRefresh` | Rebuilds the whole table every run | `CREATE OR REPLACE TABLE ... AS <user_sql>` |
+| `Incremental` | Inserts rows newer than the watermark. The state store supplies it at generation time, so recipe-hash inputs stay free of runtime state | `INSERT INTO ... <user_sql>` |
+| `Merge` | Upserts on a unique key | `MERGE INTO ... USING (<user_sql>) ...` |
+| `View` | No storage. Every read re-runs the `SELECT`. Every warehouse supports it | `CREATE OR REPLACE VIEW` |
+| `MaterializedView` | Databricks, Snowflake, BigQuery. PostgreSQL and Redshift drop and re-create the view. Other warehouses refuse it | `CREATE OR REPLACE MATERIALIZED VIEW ... AS <user_sql>` |
+| `DynamicTable` | Snowflake only | `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '<lag>' WAREHOUSE = <warehouse> AS <user_sql>` |
+| `TimeInterval` | Partition-keyed. `@start_date` and `@end_date` take per-partition timestamps. Flags: `--partition`, `--from/--to`, `--latest`, `--missing` | Per-partition `INSERT OVERWRITE` (see below) |
+| `DeleteInsert` | Deletes rows matching the partition key, then inserts. Cheaper than `Merge` when the key identifies the rewritten rows | |
+| `Microbatch` | Alias for `TimeInterval` with `hour` granularity (dbt-compatible name) | |
+| `Ephemeral` | Never materialized. The compiler inlines its SQL as a CTE in each reader | |
+| `Snapshot` | SCD Type 2 history. Each run closes changed versions and inserts new ones | |
+| `ContentAddressed` | Content-addressed Parquet plus a Delta log commit, written by `rocky-iceberg` for cross-engine reads. SQL generation does not run. See [Content-Addressed Materialization](/concepts/content-addressed/) | |
 
 ## Surrogate Key Columns
 
@@ -165,13 +135,7 @@ Each warehouse gets its own partition statement: Databricks `INSERT INTO ... REP
 
 ## Drift Detection
 
-Rocky reads both schemas before it copies a table:
-
-```sql
-DESCRIBE TABLE <catalog>.<schema>.<table>
-```
-
-When it finds a change it cannot apply in place, it rebuilds the target with a [full refresh](#full-refresh). The old table stays until the new one exists.
+Rocky runs `DESCRIBE TABLE <catalog>.<schema>.<table>` on both sides before it copies a table. A change it cannot apply in place triggers a [full refresh](#full-refresh). See [Schema Drift](/concepts/schema-drift/).
 
 ## Permission Grants
 
@@ -179,9 +143,6 @@ When it finds a change it cannot apply in place, it rebuilds the target with a [
 
 ```sql
 GRANT <PERMISSION> ON CATALOG <catalog> TO `<principal>`
-```
-
-```sql
 GRANT <PERMISSION> ON SCHEMA <catalog>.<schema> TO `<principal>`
 ```
 

@@ -5,22 +5,18 @@ sidebar:
   order: 6
 ---
 
-`rocky preview` runs only the models a PR's diff actually changes. It runs them against a per-PR branch schema and copies every other model from the base ref, rather than rebuilding it. It then reports a structural and row-level diff, plus the cost difference against base. This guide walks you through running it locally on a feature branch.
+`rocky preview` runs only the models a PR's diff changes, against a per-PR branch schema. It copies every other model from the base ref instead of rebuilding it. It then reports a diff and the cost difference against base. This guide runs it locally on a feature branch. The mechanisms (prune set, run pairing, algorithms, coverage) are in [How Preview Works](/concepts/preview-internals/). The output schemas are in the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
 
-For the design, see [How Preview Works](/concepts/preview-internals/). It explains the prune set, adapter copy methods, and diff coverage. For the output schemas, see the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
-
-Preview surfaces the data and cost shape of a PR. It does not detect breaking schema changes. For that, pair it with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) on the same PR. A hard semantic gate then fires when the branch is promoted through `rocky plan promote` and `rocky apply` (or the legacy `rocky branch promote` alias). The [CI/CD integration guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) documents the full flow: PR-time detection, then the promote-time gate, then an audited override.
+Preview shows the data and cost shape of a PR. It does not detect breaking schema changes. Pair it with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff). A hard semantic gate then fires when the branch is promoted through `rocky plan promote` and `rocky apply` (or the legacy `rocky branch promote` alias). See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate).
 
 ## Prerequisites
 
-You need:
-
-- Rocky installed and on `$PATH` (the [Getting Started guide](/getting-started/introduction/) has install instructions).
+- Rocky installed and on `$PATH` ([Getting Started](/getting-started/introduction/)).
 - A repo with a `rocky.toml` and a `models/` directory.
 - A git working tree on a feature branch, with at least one model change against the base ref.
-- The base schema's tables already materialized. `preview create` copies them into the per-PR branch schema, so they have to exist. Running `rocky run` once on `main` is enough.
+- The base schema's tables already materialized, because `preview create` copies them. One `rocky run` on `main` is enough.
 
-The walkthrough below uses `--base main`, but any git ref works.
+The walkthrough uses `--base main`. Any git ref works.
 
 ## Step 1: Create the preview branch
 
@@ -28,19 +24,15 @@ The walkthrough below uses `--base main`, but any git ref works.
 rocky preview create --base main
 ```
 
-This does five things:
+`preview create` finds the changed models, computes the **prune set** (changed models plus everything downstream via `depends_on`) and the **copy set** (every other model), registers a branch like `rocky branch create`, and copies each copy-set table from the base schema.
 
-1. Runs `git diff --name-only main HEAD` against the models directory to find changed model files.
-2. Scans the models directory into a DAG and computes the **prune set**: every changed model, plus everything transitively downstream of it via each model's `depends_on`.
-3. Computes the **copy set**: every working-DAG model not in the prune set.
-4. Registers a branch in the state store, mirroring `rocky branch create`.
-5. Issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` for each copy-set model.
+It does **not** run the prune set. It emits `run_status: "planned"` with an empty `run_id`. Run the prune set yourself before `preview diff` or `preview cost`:
 
-`preview create` does **not** run the prune-set models itself. It emits `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` before `preview diff` or `preview cost`. That gives them a branch run to compare against.
+```bash
+rocky run --branch pr_preview_fix_price
+```
 
-`preview diff` and `preview cost` find the branch run by the name it recorded. `rocky run --branch pr_preview_fix_price` stores that literal name on the run as `rocky_branch`. The git branch you have checked out does not matter, so it can have a different name.
-
-`rocky run` has no selector for a set of models. Without `--model`, it builds every model in the pipeline, including the copy set. `--model <name>` builds one model. `preview diff` and `preview cost` read only the newest branch run. So a prune set of one model can run alone. For a larger prune set, run the whole pipeline once: separate `--model` runs leave only the last model in the comparison.
+`rocky run --branch` stores that literal name on the run as `rocky_branch`. The checked-out git branch can have another name. `rocky run` has no selector for a set of models: without `--model` it builds the whole pipeline. A one-model prune set can run alone with `--model`. For a larger set, run the whole pipeline once, because `preview diff` and `preview cost` read only the newest branch run. See [How Preview Works](/concepts/preview-internals/#the-prune-and-copy-substrate).
 
 The output is a `PreviewCreateOutput` JSON document:
 
@@ -67,63 +59,29 @@ The output is a `PreviewCreateOutput` JSON document:
 }
 ```
 
-`run_id` comes back empty and `run_status` is `"planned"`, because `preview create` only registers the branch and copies the base tables. `preview diff` and `preview cost` do not key off this `run_id` anyway: they pair the latest run tagged to the branch name against base, over run history. So run `rocky run --branch pr_preview_fix_price` before either one.
-
 ## Step 2: Diff the branch against base
 
 ```bash
 rocky preview diff --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
-This combines two layers into one report.
+Rocky pairs the newest branch run with a base run from the state store (pairing rules: [How Preview Works](/concepts/preview-internals/#how-diff-and-cost-pair-the-runs)). `--base` takes a branch name, a full commit sha, or a sha prefix of at least seven characters. With no base run, the diff stays empty and `base_note` in the JSON says why. Run the pipeline once on the base branch against this state store to record one.
 
-Rocky compares two runs from the state store. The branch run is the newest run recorded with `rocky run --branch pr_preview_fix_price`. The base run is the newest run made without `--branch` on the git branch or commit that `--base` names. `--base` takes a branch name, a full commit sha, or a sha prefix of at least seven characters. If the state store holds no such base run, the diff stays empty and `base_note` in the JSON says why. To record one, run the pipeline once on the base branch against this state store.
+| Layer | Content |
+|---|---|
+| `structural` | Per model: `added_columns`, `removed_columns`, `type_changes`. Always empty today, because the `RunRecord` stores no column lists. Use `rocky ci-diff` for schema changes. |
+| Row-level | `--algorithm sampled` (default): a delta of the `rows_affected` the two runs recorded. It reads no rows, so every model reports `coverage: "not_yet_sampled"` and `coverage_warning: true`. `--algorithm bisection`: a checksum search over the whole table for a `Merge` model with a single integer or numeric `unique_key`. |
 
-**Structural diff.** One `structural` block per model, with `added_columns`, `removed_columns`, and `type_changes`. These arrays are placeholders today: the `RunRecord` does not persist column lists, so they are always empty on the wire. Typed schema-level detection lives in `rocky ci-diff`.
+When a run recorded no row count for a model, `rows_added` is `null`, never `0`. The Markdown shows `?`, and `summary.models_unknown` counts the model. An ordinary transformation run records no row count, so this is the usual case.
 
-**Row-level diff.** A per-model row delta, produced by one of two algorithms. A discriminator on the JSON output tells you which one ran.
-
-- `kind: "sampled"` (default): a row-count delta computed off the two `RunRecord`s. It does not read row content yet, so it always reports `coverage: "not_yet_sampled"` and `coverage_warning: true`. A change that does not shift row counts will not surface here.
-- `kind: "bisection"`: checksum-bisection over a single-column integer or numeric `unique_key`. It walks the chunk lattice, recurses into mismatched chunks, and surfaces the row-level diffs. It covers the whole table, including rows with a NULL key. It can miss a change only on a 64-bit hash collision or on duplicate key-and-value rows. See the [How Preview Works](/concepts/preview-internals/) page for the algorithm. It runs only on Merge-strategy models with a single integer PK; other models stay on sampled, and the skip reason is logged via `tracing::warn`.
-
-**Unknown counts.** When a run recorded no row count for a model, Rocky cannot compute that model's delta. It reports `rows_added` as `null`, never as `0`. If the model ran on both sides, `rows_removed` is `null` too. The Markdown shows `?`, and `summary.models_unknown` counts the model. An ordinary transformation run records no row count, so this is the usual case for those models.
-
-The full `PreviewDiffOutput` shape (`--output json`) carries the rendered PR-comment-ready snippet in a top-level `markdown` field. Pipe it through `jq -r .markdown` to print just that snippet to stdout. There is no `--output markdown` mode: the valid values are `json`, `table`, and `md`, and `md` only logs a one-line status. The Markdown always lives in the JSON `markdown` field.
-
-### Choosing the algorithm
+`--output json` carries the PR-comment Markdown in the top-level `markdown` field: pipe it through `jq -r .markdown`. The valid `--output` values are `json`, `table` and `md`. `md` only logs a one-line status.
 
 ```bash
-# Default — sampled (compares the row counts the two runs recorded)
-rocky preview diff --name pr_preview_fix_price
-
-# Checksum-bisection (covers the whole table)
-rocky preview diff --name pr_preview_fix_price --algorithm bisection
+rocky preview diff --name pr_preview_fix_price                          # sampled
+rocky preview diff --name pr_preview_fix_price --algorithm bisection    # whole table
 ```
 
-`--algorithm` is currently hidden from `rocky preview diff --help`, but it is accepted and stable.
-
-Per-model output uses a tagged `algorithm` discriminator:
-
-```jsonc
-"models": [
-  {
-    "model_name": "fct_revenue",
-    "structural": { /* ... */ },
-    "algorithm": {
-      "kind": "bisection",
-      "diff": { "rows_added": 0, "rows_removed": 0, "rows_changed": 1, "samples": [...] },
-      "bisection_stats": {
-        "chunks_examined": 64, "leaves_materialized": 1,
-        "depth_max": 2, "depth_capped": false,
-        "split_strategy": "int_range",
-        "null_pk_rows_base": 0, "null_pk_rows_branch": 0
-      }
-    }
-  }
-]
-```
-
-A direct JSON consumer should read `model.algorithm.kind` first, then unpack the matching variant. The Dagster typed-resource layer absorbs this automatically.
+`--algorithm` is hidden from `--help` but accepted and stable. A direct JSON consumer reads `model.algorithm.kind` first (`sampled` or `bisection`), then unpacks that variant. The `bisection_stats` shape is in [How Preview Works](/concepts/preview-internals/#--algorithm-bisection).
 
 ## Step 3: Compare cost vs. base
 
@@ -131,20 +89,18 @@ A direct JSON consumer should read `model.algorithm.kind` first, then unpack the
 rocky preview cost --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
-This is a diff layer over [`rocky cost latest`](/reference/commands/administration/#rocky-cost). Rocky looks up two `RunRecord`s in the state store: the branch run and a base run. The branch run is the newest run recorded with `rocky run --branch pr_preview_fix_price`. The base run is the newest run other than the branch's own. A run made without `--branch` on a git branch with the same name counts as the branch's own. Any other run can be the base, including a run made with another `--branch` name.
+This is a diff layer over [`rocky cost latest`](/reference/commands/administration/#rocky-cost). `preview cost` has no `--base` flag. It pairs the models of the branch run and a base run by name, then subtracts per-model duration, bytes scanned and USD cost. The base run is the newest run other than the branch's own.
 
-`preview cost` has no `--base` flag. Rocky pairs the models of the two runs by name, then subtracts the per-model duration, bytes scanned, and USD cost.
-
-The summary fields tell you:
-
-- `delta_usd`: total branch cost minus base cost. A positive value means the branch run cost more than the base run. Read it as the cost change on `main` only after you check that `base_run_id` is an ordinary run of `main`.
-- `total_branch_duration_ms` and `total_branch_bytes_scanned`: run-level totals, used for the budget projection below.
-- `savings_from_copy_usd`: what the preview itself saved by copying instead of re-running.
-- `models_skipped_via_copy`: how many models did not run on the branch because they were copy-set.
+| Summary field | Meaning |
+|---|---|
+| `delta_usd` | Branch cost minus base cost. Positive means the branch cost more. Read it as the cost change on `main` only after you check that `base_run_id` is an ordinary run of `main`. |
+| `total_branch_duration_ms`, `total_branch_bytes_scanned` | Run-level totals, used for the budget projection |
+| `savings_from_copy_usd` | What copying instead of re-running saved |
+| `models_skipped_via_copy` | Models that did not run on the branch because they were copy-set |
 
 ### Pre-merge budget projection
 
-When the project declares a `[budget]` block in `rocky.toml`, `preview cost` projects breaches against the branch totals before merge. A reviewer, and the CI gate, then sees `this PR would breach max_usd / max_duration_ms / max_bytes_scanned if merged` *before* the merge happens. The output field:
+With a `[budget]` block in `rocky.toml`, `preview cost` projects breaches against the branch totals before merge: `this PR would breach max_usd / max_duration_ms / max_bytes_scanned if merged`.
 
 ```jsonc
 "projected_budget_breaches": [
@@ -153,49 +109,30 @@ When the project declares a `[budget]` block in `rocky.toml`, `preview cost` pro
 ]
 ```
 
-It is empty when no budget is configured, or when the projected totals stay within every limit. It mirrors the `RunOutput.budget_breaches` shape, so the same downstream consumers (PR-comment templates, JSON listeners) can process both with one code path.
+The field is empty with no budget or no breach. It mirrors `RunOutput.budget_breaches`. The Markdown shows a "Budget projection" section only when breaches exist, worded by `[budget].on_breach` (advisory "would breach", or "would fail the run").
 
-The Markdown rendering shows a "Budget projection" section only when breaches exist. Its wording follows `[budget].on_breach`: either advisory ("would breach") or "would fail the run".
+## Reading the output
 
-## What the prune set means
-
-The prune set is the models that re-execute against the branch: every changed model plus everything downstream of it via `depends_on`. The copy set is every other model in the working DAG. `preview create` copies those from the base schema. You run the prune set with `rocky run --branch <name>`.
-
-- `reason: "changed"`: the model file changed in the diff. Rocky leaves `changed_columns` empty and omits it from JSON.
-- `reason: "downstream_of_changed"`: the model did not change, but it sits downstream of one that did.
-
-`skipped_set` is reserved and always empty on the wire. If the prune set is empty, your PR changes no model output (a whitespace-only edit, for example). `preview diff` and `preview cost` then report no branch run, which is expected. See [How Preview Works](/concepts/preview-internals/).
-
-## What `coverage_warning: true` means
-
-The default `--algorithm sampled` reads no row content. It computes a row-count delta from the two `RunRecord`s, so every model carries `coverage: "not_yet_sampled"` and `coverage_warning: true` in `sampling_window`. See [How Preview Works](/concepts/preview-internals/).
-
-The aggregate `summary.any_coverage_warning` fires on either of two conditions: a sampled diff with `coverage_warning: true`, or a bisection diff with `bisection_stats.depth_capped: true`. The second means the recursion hit the depth cap on a pathologically skewed PK distribution before it reached leaf size. Either way, the per-model findings might be incomplete.
-
-When you see the warning on a sampled diff, you have two options:
-
-- **Re-run with `--algorithm bisection`.** It covers the whole table, with the limits listed on the [How Preview Works](/concepts/preview-internals/) page. It works for any Merge model with a single-column integer or numeric `unique_key`.
-- **Inspect the changed columns directly** with `rocky compile --model <name>`, and reason about the change yourself.
-
-A clean sample with `coverage_warning: true` is **not** evidence the PR is a no-op for that model.
+- `prune_set` entries carry `reason: "changed"` or `reason: "downstream_of_changed"`. `skipped_set` is reserved and always empty. An empty prune set means the PR changes no model output (a whitespace-only edit, for example): `preview diff` and `preview cost` then report no branch run.
+- `coverage_warning: true` means the findings can be incomplete. A clean sampled diff is **not** evidence that the PR is a no-op for that model. Re-run with `--algorithm bisection`, or inspect with `rocky compile --model <name>`. `summary.any_coverage_warning` also fires on a bisection `depth_capped: true`. See [How Preview Works](/concepts/preview-internals/#coverage-warning-roll-up).
 
 ## Troubleshooting
 
 **`base ref not found`.** `rocky preview create --base <ref>` needs the ref to exist locally. Run `git fetch origin <ref>` first if you are working against a remote-only ref such as `origin/main`.
 
-**`preview diff` returns no models.** Rocky found no pair of runs. Read `base_note` in the JSON, or the text in the `markdown` field, to see which run is missing. If no run carries the branch name, run `rocky run --branch <name>`. If the base has no run, run the pipeline once on the base branch against this state store. A base run is one made without `--branch` on the `--base` branch or commit.
+**`preview diff` returns no models.** Rocky found no pair of runs. Read `base_note` or the `markdown` field to see which is missing. With no run on the branch name, run `rocky run --branch <name>`. With no base run, run the pipeline once on the base branch against this state store.
 
 **`preview cost` reports no deltas.** Cost needs a base run: any run in the state store other than the branch's own. With none, `base_run_id` is missing from the output and `per_model` is empty. The Markdown then says "No branch run yet", even when `branch_run_id` is set. Run `rocky run` once on `main` to record a base run, then re-run `preview cost`.
 
 **`preview cost` reports `null` for the branch.** Check that Rocky found both the branch and base runs. An unknown adapter can also leave USD cost unset. DuckDB reports `0.0` USD when both runs exist. Configure `[cost]` in `rocky.toml` to price Databricks or Snowflake runs.
 
-**Copy step is slow.** The copy substrate dispatches per adapter, through `WarehouseAdapter::clone_table_for_branch`. Databricks (`SHALLOW CLONE`), BigQuery (`CREATE TABLE … COPY`), and Snowflake (zero-copy `CREATE TABLE … CLONE`) all ship metadata-only overrides, so the per-PR branch table is effectively zero-cost at create time. Only DuckDB falls through to the portable CTAS default, which physically copies bytes. On large tables that is the dominant cost of `preview create`.
+**Copy step is slow.** Databricks, BigQuery and Snowflake copy metadata only. DuckDB copies bytes with CTAS, which dominates `preview create` on large tables. See [How each warehouse copies a table](/concepts/preview-internals/#how-each-warehouse-copies-a-table).
 
-**The diff finds no changes but the model definitely changed.** Check `summary.any_coverage_warning` and `summary.models_unknown` in the JSON output. If `any_coverage_warning` is `true`, the default comparison read no row content, so a change that keeps the row count does not show. If `models_unknown` is above zero, a run recorded no row count for a model, so Rocky could not compare it. See the sections above.
+**The diff finds no changes but the model changed.** Check `summary.any_coverage_warning` and `summary.models_unknown`. A `true` warning means the default comparison read no rows, so a change that keeps the row count does not show. A `models_unknown` above zero means a run recorded no row count for a model.
 
 ## Posting to a PR
 
-`rocky preview` ships a composite GitHub Action. It runs all three commands on every push to a pull request. It upserts a single Markdown comment for the prune/copy/skip plan, the structural diff, and the cost delta. The action lives at `.github/actions/rocky-preview/` in the [rocky-data repo](https://github.com/rocky-data/rocky/tree/main/.github/actions/rocky-preview). It is drop-in for any repo with a `rocky.toml` and a `models/` directory.
+`rocky preview` ships a composite GitHub Action at `.github/actions/rocky-preview/` in the [rocky-data repo](https://github.com/rocky-data/rocky/tree/main/.github/actions/rocky-preview). On every push to a pull request it runs the three commands and upserts one Markdown comment with the plan, the diff and the cost delta.
 
 :::caution[The action runs the pull request's config]
 The action runs `preview create`, then `rocky run --branch <name> --models <dir>`, then `preview diff` and `preview cost`. The branch run executes the pull request's `rocky.toml` and SQL. By default the action passes `rocky run --refuse-hooks`, so a config that defines `[hook]` commands or `[hook.webhooks]` refuses the branch run instead of firing them. Set `allow_hooks: true` only for a trusted config. Do not give the preview job secrets that a fork's pull request can reach: the config also controls the SQL and the `${VAR}` values it reads. `--refuse-hooks` needs engine 1.77.0 or later. With an older `rocky_version`, the action does not start the branch run, and the comment says why.

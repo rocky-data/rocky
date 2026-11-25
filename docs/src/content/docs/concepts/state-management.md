@@ -7,13 +7,11 @@ sidebar:
 
 Rocky keeps watermarks and run history in an embedded key-value store. You do not run a database for it. Rocky creates and manages a single local file.
 
-A watermark is the timestamp of the newest row Rocky has already loaded. It is what lets the next run read only new rows. See the [glossary](/reference/glossary/) for the other terms on this page.
+A watermark is the timestamp of the newest row Rocky has already loaded. It lets the next run read only new rows. See the [glossary](/reference/glossary/) for the other terms on this page. Every `[state]` key is in the [configuration reference](/reference/configuration/#state).
 
 ## The redb store
 
-Rocky uses [redb](https://github.com/cberner/redb), an embedded key-value store written in Rust. Think of it as SQLite for key-value data: one file, no server process, ACID transactions, no configuration.
-
-Each kind of record lives in its own table inside that one file.
+Rocky uses [redb](https://github.com/cberner/redb), an embedded key-value store written in Rust: one file, no server process, ACID transactions, no configuration. Each kind of record lives in its own table inside that file.
 
 ```
   rocky run / rocky apply
@@ -30,11 +28,7 @@ Each kind of record lives in its own table inside that one file.
   └────────────────────────────────────────────────────────────────┘
 ```
 
-## State file
-
-By default, Rocky stores state in `<models>/.rocky-state.redb`, where `<models>` is the `models/` directory beside the config file. A legacy `.rocky-state.redb` in the current directory keeps working. Rocky prints a one-time deprecation warning on stderr when it uses that path.
-
-Override the location with the `--state-path` flag:
+The default path is `<models>/.rocky-state.redb`, where `<models>` is the `models/` directory beside the config file. A legacy `.rocky-state.redb` in the current directory keeps working, with a one-time deprecation warning on stderr. Override the path with `--state-path`:
 
 ```bash
 plan_id=$(rocky --config rocky.toml --state-path /var/lib/rocky/state.redb plan --output json | jq -r .plan_id)
@@ -43,85 +37,66 @@ rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 
 ## Schema version
 
-The store carries a schema version. A newer engine migrates an older store forward on first open. An older engine refuses a newer store. On a remote backend, or with `[state] on_schema_mismatch = "recreate"`, `rocky run` instead moves the newer file to `<file>.v<N>.bak`, starts from a fresh local store and does one full refresh. This schema-mismatch path never deletes the newer file, and it refuses when that `.bak` already exists. The start-of-run download from a remote backend is unchanged: it can still replace the local file with the remote copy before the store is opened. See [Mixed versions during an upgrade](/advanced/deployment-contract/#mixed-versions-during-an-upgrade).
+A newer engine migrates an older store forward on first open. An older engine refuses a newer store. On a remote backend, or with `[state] on_schema_mismatch = "recreate"`, `rocky run` instead moves the newer file to `<file>.v<N>.bak`, starts from a fresh local store and does one full refresh. It never deletes the newer file, and it refuses when that `.bak` exists. See [Mixed versions during an upgrade](/advanced/deployment-contract/#mixed-versions-during-an-upgrade).
 
-The version moves when an older engine would misread a newer record. A newer engine opens an older store, adds the new tables or stamp, and keeps every record. A read-only command (`rocky state`, `rocky history`, `rocky serve`) reads a table that a store stamped below the version lacks as empty. A store stamped at the version that lacks the table is refused. An older engine refuses the newer store when it opens it. During a rolling upgrade, an older process keeps reading and writing its own `v<N>/` remote key. It does not see rows that newer processes record under the newer key.
+The version moves when an older engine would misread a newer record. A read-only command (`rocky state`, `rocky history`, `rocky serve`) reads a table that a store stamped below the version lacks as empty. During a rolling upgrade, an older process keeps its own `v<N>/` remote key and does not see rows that newer processes record under the newer key.
 
 | Version | Change |
 |---|---|
 | v31 | A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and would skip those checks. |
 | v32 | Adds `environments` and `publish_history`. |
-| v33 | Marks a `rocky review --approve` row in the policy-decision ledger as an approval. No table changes. A v32 engine would read that row as a policy `allow` and count it in the scorecard and the brief. |
+| v33 | Marks a `rocky review --approve` row in the policy-decision ledger as an approval. No table changes. A v32 engine would read that row as a policy `allow`. |
 | v34 | Adds `connector_state`: the saved state and committed batch count of each [child connector](/guides/child-connectors/). Replicates with the shared state. |
-| v35 | Adds `ai_usage`: one row for each AI call that returned a response (command, Rocky model, provider model, input and output tokens). `rocky cost --month <YYYY-MM> --by product` reads it. |
+| v35 | Adds `ai_usage`: one row for each AI call that returned a response. `rocky cost --month <YYYY-MM> --by product` reads it. |
 | v36 | Adds `product_volume_breaches`: one marker for each product output model whose `error` volume range was breached and not yet rebuilt. Replicates with the shared state. |
 
-`ai_usage` is local-only: it never goes to remote state, so a call counts in the store of the machine that made it. It also holds two reserved rows: `ai_usage_since` (when recording started) and `ai_usage_dropped` (spooled lines that could not be read). A month that began before the stamp reports its AI part as `partial`. `rocky ai` does not upgrade an older store in place: it spools its calls until `rocky run` upgrades the store. The LSP and MCP servers never write the store. They append calls to `<state file>.ai-usage.jsonl`, and the next process that holds the writer moves the lines in.
+`ai_usage` is local-only, so a call counts in the store of the machine that made it. It holds two reserved rows: `ai_usage_since` (when recording started) and `ai_usage_dropped` (spooled lines that could not be read). A month that began before the stamp reports its AI part as `partial`. `rocky ai` spools its calls until `rocky run` upgrades an older store. The LSP and MCP servers never write the store: they append to `<state file>.ai-usage.jsonl`, and the next process that holds the writer moves the lines in.
 
 While a `product_volume_breaches` marker is open, `rocky run` fails that model. `rocky product clear-breach` deletes a marker, and `rocky product status` lists them. See [product volume ranges](/reference/commands/products/).
 
-### Environments (state only, preview)
+### Environments and Delta table publish (engine API only, preview)
 
-From v32, the engine API can record **environments**: named sets of pointers, such as `staging` or `prod`. Each pointer names a model and the output version that one run recorded for it. A publish moves pointers and appends one row to the publish history. There is no CLI verb yet.
+From v32, the engine API can record **environments**: named sets of pointers (`staging`, `prod`). Each pointer names a model and the output version one run recorded for it. A publish moves pointers and appends a row to the publish history. There is no CLI verb yet. A pointer changes no warehouse object and does not pin data: `rocky gc`, run-history retention and Delta `VACUUM` can remove a version it names.
 
 ```
   run history ──▶ publish(staging, expected head staging#1) ──┬──▶ head staging#2 + history row 2
                                                               └──▶ head moved? refused, nothing written
 ```
 
-- A publish names the head it expects. When another publish moved the head first, the publish is refused with a publish conflict. Over remote state with `concurrency_control = "cas"`, two pods that publish from the same head get one success and one conflict.
-- Over remote state, a publish needs compare-and-swap. With `concurrency_control = "off"` (or a store without conditional writes), two publishes could both report success and one would be lost with no error. So the publish is refused with `PublishRequiresCas`, before any download. A local state store is allowed: its writer lock serializes publishes.
-- A publish takes a model's version only from a run that can vouch for it. The publish is refused when:
-  - the run did not write production (a `--shadow` or `--branch` run, or an older record with no recorded scope);
-  - the run status is not `Success` or `PartialFailure`;
-  - the run failed its check gate or its `verify_after` gate;
-  - the model's own execution in that run did not succeed (this is how a `PartialFailure` run refuses its failed models);
-  - the run recorded no output version for the model, or recorded it as `unversioned`.
-- **Partitioned and replicated outputs cannot be published yet.** Run history names an execution by the last part of its asset key. A `time_interval` model records one execution per partition. A replication run can record one table name from two schemas. Both give more than one execution for one model name, and the publish is refused with a message that names the cause. How to combine partition versions into one pointer is a later decision (RV1-P3).
-- A `delta_observed` pointer names an observation, not a unique identity. A `DROP` + `CREATE` starts a new Delta table at version 0, so an earlier table with the same name can carry the same `(table, version)` pair.
-- A publish and a run on the same remote state contend like two runs. A publish replays on a fresh download when the blob moved. A run does not: under `cas` its finalize makes one conditional upload with no replay. A publish that lands between a run's start and its finalize makes that run fail with `CasConflict`. Two runs behave the same way today.
-- **A pointer does not pin data yet.** `rocky gc`, run-history retention and Delta `VACUUM` can remove a version that an environment points to. Pinning comes in a later phase.
-- A pointer changes no warehouse object. It is state only. The table publish below is the exception.
+- A publish names the head it expects. When another publish moved it first, it is refused with a publish conflict.
+- Over remote state it needs compare-and-swap. With `concurrency_control = "off"` it is refused with `PublishRequiresCas`. A local store is allowed. A publish that lands mid-run makes that run fail with `CasConflict`.
+- It takes a model's version only from a run that wrote production, ended `Success` or `PartialFailure`, passed its check gate and `verify_after` gate, ran that model successfully, and recorded a versioned output for it.
+- Partitioned and replicated outputs are refused, because one model name can map to several executions (RV1-P3).
 
-### Delta table publish (experimental)
-
-**On Delta, a publish moves one table at a time. It is not atomic across tables.** Readers can see some tables at the new version and others at the old one until the last commit lands. Rocky reports which tables moved. It never claims an environment-wide switch.
-
-The engine API `table_publish::publish_tables` moves each model's Delta table to the output version its pointer names. Each table gets one Delta commit. The commit makes the table's live files equal the files of that earlier output again. No data is copied. There is no CLI verb yet.
+**On Delta (experimental), a publish moves one table at a time. It is not atomic across tables.** `table_publish::publish_tables` makes each table's live files equal the files of the named earlier output with one Delta commit. No data is copied.
 
 ```
   begin   CAS on the head        prod#1  started   (environment marked "publishing")
     │ head moved? refused, no table touched
     ▼
   fence ─▶ commit table a ─▶ commit table b ─▶ ... ─▶ fence ─▶ ...   stop at the first failure
-    │ another publish took over? stop, no more tables
+    │ another publish took over? stop (`Fenced`), no more tables
     ▼
   finish                         prod#2  finished  (one outcome per table)
 ```
 
-- The begin step claims the environment before any table moves. When two publishers start from the same head, one gets a publish conflict and moves no table.
-- While a publish is in progress, every other publish to that environment is refused with `PublishInProgress`. That includes a state-only publish.
-- A failure stops the publish. The finished row names one outcome per table:
-  - `moved`: one commit moved it (with its commit version), and the Iceberg sync ran;
-  - `already_current`: it already served the version, so no commit was written;
-  - `sync_failed`: the Delta table serves the version, but the Iceberg sync failed;
-  - `failed`: no commit was written (with the error);
-  - `unknown`: the commit write returned an error that does not say whether the commit was stored (for example a timeout);
-  - `not_attempted`: an earlier table failed or ended `unknown`.
-- The head's pointers move only for `moved`, `already_current` and `sync_failed`. The other tables keep their old version, so the environment is part published until you publish again. A publish is complete only when every table is `moved` or `already_current`.
-- After `unknown`, the table may already serve the new version while the head still names the old one. Rollback planning reads the head, so it sees the old version until a retry reconciles.
-- Publish again to reconcile. A table whose `unknown` commit did land is then `already_current`. A table that is `sync_failed` is synced again, because the sync also runs on an already-current table.
-- If the process dies between two commits, nothing records which tables moved. The environment stays `publishing`. A new publish that names that head and asks to take over moves every table again. A table already at its version gets no new commit.
-- Take over only when the first publisher is dead. A publish reads the head again (a fence) before every table. If another publish took over, it stops with `Fenced` and moves no more tables, so a wrongly taken-over publisher that is still alive moves at most the table already in flight. On S3, GCS or Valkey each fence downloads the whole state blob; a caller can space the fence (for example every eighth table) to save that cost, and then such a publisher can move up to that many tables first. A fence that cannot read the head fails closed: the table is not moved.
-- Only `content_addressed` outputs of unpartitioned tables can be published. A partitioned output, a `delta_observed` version (it names a table version, not files Rocky wrote), and a table with no configured writer are refused before anything is written.
-- The publish refuses, with no commit, a version whose files are gone (for example after `VACUUM`), a version written before the table's protocol, schema, partitioning or `delta.columnMapping.mode` changed, and a version whose `add` carries a deletion vector.
-- A run is not ordered with a publish. If another commit changes the table's files after the publish read them and before it commits, the publish fails for that table and writes nothing. It never removes files it did not see. Otherwise the later commit wins.
-- The publish moves the model's own table, which every environment that holds the model shares. So it refuses when another environment's head, or the plan of its unfinished table publish, points the same table at a different version. The error names that environment. The `allow_shared_tables` option publishes anyway. Then the other environment's head is no longer true: it names the old version, but the shared table serves the new one. Rocky does not update that head.
-- The shared-table check runs once, when the publish begins. A state-only publish into another environment after that can still point the same table at a different version. Rocky does not stop it.
+| Outcome | Meaning |
+|---|---|
+| `moved` | One commit moved it (with its commit version), and the Iceberg sync ran. |
+| `already_current` | It already served the version, so no commit was written. |
+| `sync_failed` | The Delta table serves the version, but the Iceberg sync failed. |
+| `failed` | No commit was written (with the error). |
+| `unknown` | The commit write returned an error that does not say whether the commit was stored (for example a timeout). |
+| `not_attempted` | An earlier table failed or ended `unknown`. |
+
+- Another publish to the environment is refused with `PublishInProgress`, state-only publishes included.
+- The head moves only for `moved`, `already_current` and `sync_failed`. Publish again to reconcile. If the process dies mid-publish, the environment stays `publishing`: a publish that names that head and asks to take over moves every table again, so take over only when the first publisher is dead.
+- Only `content_addressed` outputs of unpartitioned tables can be published. The publish refuses, with no commit, a version whose files are gone, a version written before the protocol, schema, partitioning or `delta.columnMapping.mode` changed, and a version whose `add` carries a deletion vector.
+- It refuses when another environment's head, or its unfinished publish plan, points the same table at a different version. `allow_shared_tables` overrides that, and Rocky does not update the other head.
 
 ## Per-namespace state files
 
-redb permits **one writer per state file**. Fan out one `rocky run` per pipeline or per client, and every run competes for the same lock on the global `.rocky-state.redb`. They serialize even though they touch unrelated watermarks. Namespacing gives each run its own state file, so the runs proceed at the same time.
+redb permits **one writer per state file**. Runs fanned out per pipeline or client compete for one lock on the global file and serialize, even when they touch unrelated watermarks. Namespacing gives each run its own file. It is opt-in and default-off: with neither knob set, Rocky uses the single global file.
 
 ```
   without namespacing              with namespacing
@@ -134,135 +109,57 @@ redb permits **one writer per state file**. Fan out one `rocky run` per pipeline
   … stands for the models directory
 ```
 
-This is **opt-in and default-off**. With neither knob set, Rocky uses the single global state file, byte-identical to before.
+| Mode | Set with | State file |
+|---|---|---|
+| none (default) | | `<models>/.rocky-state.redb` |
+| per pipeline | `[state] namespacing = "pipeline"` | `<models>/.rocky-state/<pipeline>.redb` |
+| per client or tenant | `rocky --state-namespace <key> run` | `<models>/.rocky-state/<key>.redb` |
 
-Per invocation, route a run to its own state file with `--state-namespace <key>`:
+`<key>` becomes a path segment, so it must match `^[a-zA-Z0-9_]+$`. Precedence:
 
-```bash
-rocky --state-namespace acme run       # writes/reads <models>/.rocky-state/acme.redb
-rocky --state-namespace globex run      # independent file, independent lock — runs concurrently
-```
+1. An explicit `--state-path` is a hard override. It disables namespacing for that invocation.
+2. Otherwise `--state-namespace <key>` wins over `[state] namespacing`.
+3. Neither set: the single global file.
 
-`<key>` becomes a path segment, so it must be a SQL identifier (`^[a-zA-Z0-9_]+$`). Rocky rejects anything else.
+A new namespace starts empty. Rocky never moves or seeds from the legacy global file. To carry watermarks forward, copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run.
 
-Or make each pipeline namespace itself by default in `rocky.toml`:
-
-```toml
-[state]
-namespacing = "pipeline"   # each pipeline → <models>/.rocky-state/<pipeline>.redb
-```
-
-The per-invocation `--state-namespace` flag overrides the config. Use it to fan out by client or tenant rather than by pipeline name. An explicit `--state-path` is a hard override: it **disables** namespacing for that invocation and always wins. A `--state-namespace` typo therefore cannot break a run whose state file the explicit path already pins.
-
-:::note[Namespaced files start fresh]
-A new namespace's file starts empty. Rocky never moves the legacy global file or seeds the new one from it. Carry watermarks forward yourself if you need them. Copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run. See the [`[state]` configuration reference](/reference/configuration/#state) for the full field.
-:::
+<span id="state-namespacing"></span>
 
 ## What it stores
 
-### Watermarks
+| Table | Key | Value |
+|---|---|---|
+| Watermarks | `catalog.schema.table` | `last_value` (the maximum timestamp-column value, such as `_fivetran_synced`, seen in the last successful run) and `updated_at` |
+| Check history | `catalog.schema.table` | A list of `{ count, timestamp }` row counts, recorded when the pipeline enables the `row_count` check |
 
-Each table's watermark tracks the last successfully replicated timestamp:
-
-```
-Key:   "acme_warehouse.staging__us_west__shopify.orders"
-Value: {
-    last_value: "2025-03-15T14:30:00Z",
-    updated_at: "2025-03-15T14:35:12Z"
-}
-```
-
-- **last_value** — The maximum value of the timestamp column (e.g., `_fivetran_synced`) seen in the last successful run
-- **updated_at** — When the watermark was last written
-
-Watermarks are keyed by the fully qualified table name: `catalog.schema.table`.
-
-### Check history
-
-Rocky records a table's row count when the pipeline enables the `row_count` check. Anomaly detection reads that history:
-
-```
-Key:   "acme_warehouse.staging__us_west__shopify.orders"
-Value: [
-    { count: 150432, timestamp: "2025-03-13T10:00:00Z" },
-    { count: 151200, timestamp: "2025-03-14T10:00:00Z" },
-    { count: 152100, timestamp: "2025-03-15T10:00:00Z" }
-]
-```
-
-## Watermark lifecycle
-
-At the start of each table's replication, Rocky reads the watermark from the state store.
+At the start of each table's replication Rocky reads the watermark:
 
 1. **No watermark (first run).** Rocky copies every source row except the newest batch, which waits for a later run.
-2. **Watermark exists.** Rocky copies only rows newer than the watermark and older than the newest source timestamp. [Incremental Processing](/concepts/incremental/#what-the-hold-back-changes) explains the hold-back, and [SQL Generation](/concepts/sql-generation/#incremental-copy) shows the statement.
+2. **Watermark exists.** Rocky copies only rows newer than the watermark and older than the newest source timestamp. See [Incremental Processing](/concepts/incremental/#what-the-hold-back-changes) and [SQL Generation](/concepts/sql-generation/#incremental-copy).
 3. **Update.** After a successful copy, Rocky reads `MAX(<timestamp_column>)` from the target and stores it as the new watermark.
 
-## Inspecting state
-
-`rocky state` prints every stored watermark and its value. Use it to debug an incremental run.
+`rocky state` prints every stored watermark. Anomaly detection reads the check history: see [Data Quality Checks](/concepts/data-quality-checks/#anomaly-detection).
 
 ## Deleting watermarks
 
-Clear the state and the next run does a full refresh. Do this to backfill data or to recover from a bad load. No CLI command removes a single table's watermark. You have two options:
+Clear the state and the next run does a full refresh. No CLI command removes one table's watermark. You have two options:
 
-- **Delete the state file** to clear *all* watermarks (and run history) at once, then re-run:
+- **Delete the state file** to clear all watermarks and run history, then re-run: `rm <models>/.rocky-state.redb`
+- **Route the run to a fresh namespace**: `rocky --state-namespace backfill run`
 
-  ```bash
-  rm <models>/.rocky-state.redb
-  ```
-- **Route the run to a fresh namespace** so it starts from an empty state file without touching the global one:
+For a scoped, review-gated re-run of specific models, use [`rocky backfill`](/reference/commands/governance-reclamation/#rocky-backfill).
 
-  ```bash
-  rocky --state-namespace backfill run
-  ```
+## Remote state persistence
 
-For a scoped, review-gated re-run of specific models, use [`rocky backfill`](/reference/commands/governance-reclamation/#rocky-backfill) instead.
+Rocky writes state to local disk by default. A container or CI runner throws that disk away between runs, which loses every watermark. A remote backend keeps state across machines. It carries watermarks and history, never the scheduler's own cursors and claims: see the [deployment contract](/advanced/deployment-contract/).
 
-## Anomaly detection
-
-Rocky compares each table's row count with a moving average of its history. If the deviation exceeds the threshold (default `50` percent), Rocky flags an anomaly in the run output. It catches a truncated source, a duplicated sync, and a connector that stopped syncing. It needs the `row_count` check:
-
-```toml
-[pipeline.bronze.checks]
-enabled = true
-row_count = true
-anomaly_threshold_pct = 50
-```
-
-[Data Quality Checks](/concepts/data-quality-checks/#anomaly-detection) lists every condition the detector needs.
-
-## Remote State Persistence
-
-Rocky writes state to local disk by default. A container or a CI runner throws that disk away between runs, which loses every watermark. Point Rocky at a remote backend and the state survives the machine.
-
-A remote backend carries the watermarks and the history, never the scheduler's own cursors and claims. What that means for a process that dies, two that overlap, or a rollout, per backend, is on the [deployment contract](/advanced/deployment-contract/).
-
-### Backends
-
-| Backend | Config | Use Case |
+| Backend | Required keys | Use case |
 |---------|--------|----------|
-| `local` | Default | Development, persistent VMs |
+| `local` (default) | | Development, persistent VMs |
 | `s3` | `s3_bucket` | Durable storage, multi-region |
 | `gcs` | `gcs_bucket` | Durable storage on Google Cloud |
 | `valkey` | `valkey_url` | Low-latency, shared state |
-| `tiered` | Both | Valkey for speed, S3 for durability |
-
-### Configuration
-
-```toml
-[state]
-backend = "s3"
-s3_bucket = "${ROCKY_STATE_BUCKET}"
-s3_prefix = "rocky/state/"        # default
-```
-
-```toml
-[state]
-backend = "valkey"
-valkey_url = "${VALKEY_URL}"
-valkey_prefix = "rocky:state:"    # default
-```
+| `tiered` | `valkey_url` and `s3_bucket` | Valkey for speed, S3 for durability |
 
 ```toml
 [state]
@@ -271,22 +168,9 @@ valkey_url = "${VALKEY_URL}"
 s3_bucket = "${ROCKY_STATE_BUCKET}"
 ```
 
-### How Tiered State Works
+**Tiered.** A download tries Valkey first and falls back to S3. An upload writes both: Valkey best-effort, S3 required. With `concurrency_control = "off"`, a failed Valkey write leaves a stale cached copy that the next read serves. With `"cas"` (the default on `tiered`), the upload commits to S3 first. Rocky then stores the cached copy stamped with its generation, and a read uses the cache only after it confirms that generation is still the durable object's. Cached copies use a separate key from the `off` path, so a fleet can move from `off` to `cas` one pod at a time.
 
-The `tiered` backend combines Valkey (fast) with S3 (durable):
-
-- **Download**: try Valkey first (sub-millisecond reads); on miss or error, fall back to S3.
-- **Upload**: write to both Valkey (best-effort) and S3 (required).
-
-With `concurrency_control = "off"`, Rocky trusts the cached copy as it finds it. A Valkey write that fails while the S3 write succeeds therefore leaves a stale copy in the cache, and the next read serves it.
-
-`concurrency_control = "cas"` closes that gap, and it is the default on `tiered`. The upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. The ledger-seam commands (`policy`, `gc`, `restore`, `apply`) commit the same way.
-
-At startup each writer probes the store once to confirm it really enforces conditional writes. The first compare-and-swap upload then creates a `cas-required` marker beside the state object. A writer set to `"off"` that finds the marker refuses to upload, so it cannot overwrite the others. See [Concurrent writers](/reference/configuration/#concurrent-writers).
-
-### Sync Lifecycle
-
-When `backend` is not `local`, Rocky syncs the state file around each run.
+### Sync lifecycle
 
 ```
    ┌────────────────────────┐
@@ -307,13 +191,38 @@ When `backend` is not `local`, Rocky syncs the state file around each run.
    └────────────────────────┘
 ```
 
-If the download fails, Rocky logs a warning and starts fresh from target-table metadata. The [retry + failure policy](#retry-and-failure-policy) below governs what an upload failure does.
+If the download fails, Rocky logs a warning and starts fresh from target-table metadata. Run `rocky doctor --check state_rw` at cold start to catch IAM and reachability problems before they show up as upload failures.
 
-### What a Schema Upgrade Does to Remote State
+### Concurrent writers
 
-This section says which remote state a new engine reads after a schema upgrade. Rocky stores remote state under a key that names the state schema version (the format version of the state file). The key looks like `<s3_prefix>v36/state.redb` on S3 or GCS and `<valkey_prefix>v36:state.redb` on Valkey. An engine release that changes the schema version therefore looks for a key that does not exist yet.
+Two concurrent runs that share one `[state]` prefix both download the ledger, change it, and upload. Without protection the second upload erases the first: its watermarks, run records and policy rows vanish with no error.
 
-When the current key is absent, Rocky looks for an older key. It probes older versions newest first, down to `v22`, and restores the first one it finds. The run then opens that state, migrates it in place, and uploads it under the current key. The policy ledger, the run history, and the watermarks all carry over.
+Compare-and-swap (CAS: a write that commits only if the object is unchanged since you read it) prevents this. It is the default on `s3`, `gcs` and `tiered`. A run that loses the race exits non-zero with a conflict. Rocky does not merge the runs or roll back warehouse writes. Re-run the loser, and prefer merge-style strategies for contended pipelines, because a non-merge strategy can duplicate rows on the re-run. `local` and `valkey` offer no conditional write: an unset mode is `off`, and an explicit `"cas"` downgrades to `off` with a warning. `cas` also stops the mid-run periodic uploader.
+
+```
+concurrency_control unset ──► backend default
+                               s3 / gcs / tiered → cas    local / valkey → off
+            │
+  cas on s3 / gcs / tiered ──► conditional-write probe
+            ├─ supported     → cas
+            ├─ unsupported   → unset: warn, use off     explicit "cas": error, writer stops
+            └─ inconclusive  → cas  (never fall back to unconditional on a guess)
+```
+
+Some S3-compatible stores accept conditional-write headers and ignore them, so each writer probes the store once per process. The probe writes a uniquely named object under `<prefix>/cas-probe/`, checks that the store refuses a create over an existing object and a stale-generation write, then deletes it. It needs put and delete access under the prefix. `rocky doctor` runs the same probe (check `state_concurrency`). An inconclusive probe keeps `cas` and warns. That is not confirmed protection: fix the access problem and run `rocky doctor`.
+
+**The `cas-required` marker.** The first CAS upload creates a create-once `cas-required` object beside the state object (for example `<prefix>/v9/state.redb.cas-required`). A writer on `off` checks for it at start and before each upload, including in older schema-version folders, and stops with an error that names the fix: set `concurrency_control = "cas"` or remove the explicit `"off"`. Reads are not affected. Delete the marker, in every version folder that has one, only when every writer deliberately moves to `"off"`. `rocky doctor` warns when the mode and the marker disagree. Two limits:
+
+- The check and the upload are separate steps. A first CAS upload that creates the marker between them does not stop that one `off` upload.
+- A marker can exist on a store that ignores conditional writes. If the probe was inconclusive, the `cas` writers are not protected from each other, yet the marker still blocks `off` writers.
+
+**Upgrading to the `cas` default.** Engine 1.77.0 changed the default on `s3`, `gcs` and `tiered` from `off` to `cas`. Older binaries do not know the marker and keep uploading unconditionally. Upgrade every writer that shares a `[state]` prefix together, or keep one writer per prefix. To keep the old behaviour, set `concurrency_control = "off"` before you upgrade.
+
+**What `cas` covers.** Every write of the shared state object. The end-of-run upload fails closed when it loses a race. The ledger-seam commands retry: `rocky policy freeze` / `unfreeze`, `rocky gc`, `rocky restore` (and a restore-shaped `rocky apply <plan-id>`), and the policy rows a run-shaped `rocky apply` writes when a `[policy]` rule sets `verify_after`. A seam that loses a race downloads the winner and replays its change on top, re-deciding any policy decision first. After three attempts it fails with a conflict error and leaves the winner in place. It never falls back to an unconditional upload.
+
+### Schema upgrade and remote state
+
+Remote state lives under a key that names the schema version: `<s3_prefix>v36/state.redb` on S3 or GCS, `<valkey_prefix>v36:state.redb` on Valkey. When the current key is absent, Rocky probes older versions newest first, down to `v22`, and restores the first it finds. The run migrates it in place and uploads it under the current key. The policy ledger, run history and watermarks carry over.
 
 ```
    download: v36 key? ── present ──▶ restore v36
@@ -327,24 +236,22 @@ When the current key is absent, Rocky looks for an older key. It probes older ve
                ...  down to v22, then start fresh
 ```
 
-- Rocky never writes or deletes an older key. It stays in the bucket as your pre-upgrade copy.
-- Rocky never probes a newer key. An older engine never reads state that a newer engine wrote.
-- Under `concurrency_control = "cas"`, the first upload creates the current key. It does not compare against the older object.
-- The Valkey cache of the `tiered` backend reads only the current key. The S3 tier does the lookup for older keys.
-- The download logs `outcome = "carried_forward"` and names the version it restored in `carried_forward_from`.
-
-This assumes that every process that shares the backend runs the same engine version, as the [deployment contract](/advanced/deployment-contract/#mixed-versions-during-an-upgrade) requires. An older engine that keeps writing its own key after the upgrade writes state that the new engine never reads again.
+- Rocky never writes or deletes an older key. It stays in the bucket as your pre-upgrade copy. Rocky never probes a newer key.
+- Under `cas`, the first upload creates the current key without comparing against the older object.
+- The Valkey cache of `tiered` reads only the current key. The S3 tier does the lookup.
+- The download logs `outcome = "carried_forward"` and names the version in `carried_forward_from`.
+- Every process that shares the backend must run the same engine version, as the [deployment contract](/advanced/deployment-contract/#mixed-versions-during-an-upgrade) requires. An older engine that keeps writing its own key writes state the new engine never reads.
 
 Four effects to know before you upgrade or reset:
 
-- **Deleting only the current key does not reset state.** The next download restores the newest older key instead. To reset, delete every version key under the prefix, or point `s3_prefix`, `gcs_prefix` or `valkey_prefix` at a new prefix.
-- **A rollback reads the older key as it was.** If you go back to the older engine, it reads its own frozen key. Nothing written after the upgrade is in it, and nothing is merged back.
-- **A fresh start makes up to 11 existence checks, not 1.** All of them share `transfer_timeout_seconds`. A check that fails stops the download. An IAM policy that allows only the current version's path refuses the older paths, so the first run after an upgrade fails. Grant read access to the whole prefix.
-- **Fields added since the older version read as empty.** For example, a run recorded before v25 does not carry the `check_gate_failed` flag, so it reads as `false`. Treat `--resume` of a run from before the upgrade with care.
+- **Deleting only the current key does not reset state.** To reset, delete every version key under the prefix, or point `s3_prefix`, `gcs_prefix` or `valkey_prefix` at a new prefix.
+- **A rollback reads the older key as it was.** Nothing written after the upgrade is in it, and nothing is merged back.
+- **A fresh start makes up to 11 existence checks, not 1.** All share `transfer_timeout_seconds`, and a failed check stops the download. An IAM policy that allows only the current version's path fails the first run after an upgrade. Grant read access to the whole prefix.
+- **Fields added since the older version read as empty.** A run recorded before v25 has no `check_gate_failed` flag, so it reads as `false`. Treat `--resume` of a run from before the upgrade with care.
 
-### Retry and Failure Policy
+### Retry and failure policy
 
-Every remote transfer runs inside a wall-clock budget, for uploads and downloads alike. Retries back off exponentially, and a three-state circuit breaker stops a failing backend from being hammered. This is the same machinery the Databricks and Snowflake adapters use. Configure it under `[state.retry]` in `rocky.toml`. The [configuration reference](/reference/configuration/#stateretry) lists every field.
+Every remote transfer runs inside a wall-clock budget (`transfer_timeout_seconds`). Retries back off exponentially and a three-state circuit breaker stops a failing backend from being hammered, the same machinery the Databricks and Snowflake adapters use. Configure it under [`[state.retry]`](/reference/configuration/#stateretry).
 
 ```toml
 [state]
@@ -352,41 +259,56 @@ backend = "s3"
 s3_bucket = "${ROCKY_STATE_BUCKET}"
 transfer_timeout_seconds = 300       # total wall-clock ceiling — retries share this budget
 on_upload_failure = "skip"           # "skip" (default) or "fail"
-
-[state.retry]
-max_retries = 3                       # defaults shown; omit the block to use them
-circuit_breaker_threshold = 5
 ```
 
-**`on_upload_failure`** controls what happens when retries *and* the circuit breaker are both exhausted:
+`on_upload_failure` controls what happens when retries and the circuit breaker are both exhausted:
 
 | Mode | Behaviour | When to use |
 |---|---|---|
 | `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers. Trades state durability for run liveness. |
-| `"fail"` | Propagate a `StateSyncError::RetryBudgetExhausted` or `CircuitOpen` to the caller; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive (long-running backfills, multi-hour syncs). |
+| `"fail"` | Propagate `StateSyncError::RetryBudgetExhausted` or `CircuitOpen`; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive. |
 
-**A lost run record follows the same rule.** A run can succeed and still fail to write its run record, for example on a full disk. Rocky still uploads the run's other state, such as watermarks, because discarding them would make the next run re-copy data. Under `"skip"` the run warns and exits 0. Under `"fail"`, or on a governed run (`rocky apply`), it exits non-zero after the upload. Either way the uploaded ledger keeps evidence of the run, and [`rocky history`](/reference/commands/administration/#rocky-history) lists it under `unrecorded_runs`.
+Replication publishes recovery intent before it copies, on supported atomic adapters. With `"fail"`, a failed pre-copy upload stops before the `INSERT`. With `"skip"` it warns and continues, and a fresh pod cannot recover unpublished intent after the local ledger disappears. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication). A failed watermark flush keeps the available progress and tries its upload. Explicit `"fail"` and governed runs exit non-zero after they preserve the available state.
 
-**Terminal outcomes are structured.** Every `state.upload` and `state.download` event carries an `outcome` field. Alert on it instead of matching log messages with a regular expression:
+**A lost run record follows the same rule.** A run can succeed and still fail to write its run record, for example on a full disk. Rocky still uploads the other state, because discarding watermarks would make the next run re-copy data. Under `"skip"` the run warns and exits 0. Under `"fail"`, or on a governed run (`rocky apply`), it exits non-zero after the upload. [`rocky history`](/reference/commands/administration/#rocky-history) lists such a run under `unrecorded_runs`.
+
+**Terminal outcomes are structured.** Every `state.upload` and `state.download` event carries an `outcome` field. Alert on it, not on log text:
 
 | `outcome` | Meaning |
 |---|---|
 | `ok` | Transfer completed successfully. |
-| `absent` | Remote state was empty — first run against this backend. |
+| `absent` | Remote state was empty: first run against this backend. |
 | `carried_forward` | The current schema version had no remote state. Rocky restored the newest older version's state. |
-| `timeout` | Hit `transfer_timeout_seconds` wall-clock cap. |
+| `timeout` | Hit the `transfer_timeout_seconds` cap. |
 | `error_then_fresh` | Existence check failed; Rocky started fresh. |
 | `transient_exhausted` | `max_retries` exhausted on transient errors. |
 | `budget_exhausted` | `max_retries_per_run` exhausted across transfers. |
 | `circuit_open` | Breaker is open; transfer skipped without attempting. |
 | `skipped_after_failure` | Upload failed, `on_upload_failure = "skip"` applied. |
 
-Run `rocky doctor --check state_rw` at cold start to catch IAM / reachability problems before they show up as end-of-run upload failures.
+### Idempotency stamps in a bucket
 
-## State Per Environment
+`rocky plan --idempotency-key <KEY>` stamps terminal runs. Rocky sweeps expired stamps only from the local `state.redb`, never from an `s3` or `gcs` bucket, because a delete there cannot be conditional and could remove a claim that a run just took over. Add a bucket lifecycle rule instead. Its age must be at least one day more than `retention_days`, and larger than `in_flight_ttl_hours` in days. A shorter rule can delete a live `InFlight` claim, and then two runs with the same key proceed. The examples use 31 days, which fits the defaults (30 days, 24 hours), and the default prefix `rocky/state/`.
 
-Each environment (dev, staging, prod) keeps its own state. Rocky does not coordinate between them.
+```json
+{ "Rules": [ { "ID": "rocky-idempotency-stamps-31d", "Status": "Enabled",
+               "Filter": { "Prefix": "rocky/state/" }, "Expiration": { "Days": 31 } } ] }
+```
 
-- A fresh deployment starts with no watermarks, so the first run is a full refresh
-- Delete the state file to reset one environment without touching the others
-- A remote backend keeps state alive across pod restarts
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket "$ROCKY_STATE_BUCKET" \
+  --lifecycle-configuration file://rocky-lifecycle.json
+```
+
+GCS lifecycle JSON, applied with `gcloud storage buckets update "gs://$ROCKY_STATE_BUCKET" --lifecycle-file=rocky-lifecycle.json`:
+
+```json
+{ "lifecycle": { "rule": [ { "action": { "type": "Delete" },
+    "condition": { "age": 31, "matchesPrefix": ["rocky/state/"] } } ] } }
+```
+
+The rule covers every object under the prefix, state snapshots included. To keep snapshots longer than stamps, use separate prefixes via `s3_prefix` and two rules. A bucket rule does not replace `retention_days`: the local copy on each pod still needs Rocky's sweep. On `tiered`, Valkey's own TTL evicts the hot copy long before the cold copy expires.
+
+## State per environment
+
+Each environment (dev, staging, prod) keeps its own state, and Rocky does not coordinate between them. A fresh deployment starts with no watermarks, so its first run is a full refresh. A remote backend keeps state across pod restarts.

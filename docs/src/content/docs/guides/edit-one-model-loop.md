@@ -5,7 +5,7 @@ sidebar:
   order: 22
 ---
 
-You edit one model. Rocky rebuilds only that model and the models that read it. The loop uses three existing flags of `rocky run`. The [runnable POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/22-edit-one-model-loop) proves every step below from the JSON output.
+You edit one model. Rocky rebuilds that model and the models that read it. The loop uses three flags of `rocky run`. The [runnable POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/22-edit-one-model-loop) proves every step from the JSON output.
 
 ## The pieces
 
@@ -15,7 +15,7 @@ You edit one model. Rocky rebuilds only that model and the models that read it. 
 | `--watch` | Runs the pipeline again each time you save a file. |
 | `--defer` | Builds only the model you pick. Reads its upstream models from production. |
 
-A model that reads a rebuilt model is always rebuilt. The [safety contract](/guides/skip-and-defer/#the-skip-unchanged-safety-contract) lists the models that never skip. A model that calls a user-defined function, or sets `[skip] eligible = false`, also always rebuilds.
+A model that reads a rebuilt model is always rebuilt. The [safety contract](/guides/skip-and-defer/#the-skip-unchanged-safety-contract) lists the models that never skip, including a model that calls a user-defined function or sets `[skip] eligible = false`.
 
 ## The example project
 
@@ -28,7 +28,7 @@ raw orders ──► stg_orders ──┬──► daily_revenue
                                                           └──► region_summary
 ```
 
-Each model is a plain `SELECT` over bare table names, with no CTE and no sub-query, so Rocky can prove its inputs are unchanged. A model with a CTE or a non-deterministic function always rebuilds.
+Each model is a plain `SELECT` over bare table names, so Rocky can prove its inputs are unchanged. A model with a CTE or a non-deterministic function always rebuilds.
 
 ## Step 1: turn on the skip gate
 
@@ -40,9 +40,9 @@ skip_unchanged = true
 skip_rowcount_fallback = true
 ```
 
-Rocky probes `MAX(<timestamp>)` only for an `incremental` or `microbatch` model that sets a timestamp column. All five models here are `full_refresh`, so without the second line the two staging models never skip, and nothing downstream skips.
+Rocky probes `MAX(<timestamp>)` only for an `incremental` or `microbatch` model with a timestamp column. All five models here are `full_refresh`, so without the second line the staging models never skip, and nothing downstream skips.
 
-With it, Rocky compares the raw table's row count instead. That is a weaker signal: it can miss an `UPDATE` that keeps the row count. You do not need it for `incremental` models with a `timestamp_column`.
+With it, Rocky compares the raw table's row count. That is a weaker signal: it can miss an `UPDATE` that keeps the count. `incremental` models with a `timestamp_column` do not need it.
 
 ## Step 2: build once, then edit one model
 
@@ -75,18 +75,18 @@ You changed one model. Three models built. Two skipped.
 rocky run --watch --models models
 ```
 
-Rocky runs once when it starts. Then it runs again about 200 ms after each save. Edit `models/daily_revenue.sql` and save. The next run builds only `daily_revenue`, because no other model reads it.
+Rocky runs once at start, then again about 200 ms after each save. Edit `models/daily_revenue.sql` and save: the next run builds only `daily_revenue`, because no other model reads it.
 
 Two limits apply:
 
-- `--watch` always watches `rocky.toml`. With `--models`, it also watches that directory. Without `--models`, it watches the models directory of each transformation pipeline, or only of the pipeline named by `--pipeline`. That directory is the part of the pipeline's `models` glob before the first wildcard. A directory that does not exist when `--watch` starts is watched only after a restart. A replication pipeline's models directory is watched only with `--all` (`models` under the working directory) or `--models`. Otherwise, and for a quality, snapshot or load pipeline, only an edit to `rocky.toml` re-runs it, and `--watch` says so at startup.
+- `--watch` always watches `rocky.toml`. With `--models`, it also watches that directory. Without `--models`, it watches the models directory of each transformation pipeline, or only of the pipeline named by `--pipeline`. That directory is the part of the pipeline's `models` glob before the first wildcard. A directory that does not exist at start is watched only after a restart. A replication pipeline's directory is watched only with `--all` (`models` under the working directory) or `--models`. For a quality, snapshot or load pipeline, only an edit to `rocky.toml` re-runs it, and `--watch` says so at startup.
 - `--watch` cannot be combined with `--model`, `--select`, `--exclude`, `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, `--contracts`, `--keep-shadow`, `--refuse-hooks` or `--assume-fresh-state`. The skip gate does the narrowing instead.
 
 With `-o json`, each run prints one JSON object to stdout. Banner lines go to stderr.
 
 ## Step 4: read upstream models from production
 
-When you work in a fresh checkout, you may have no local copy of the upstream tables. Build one model and read its upstream from another schema:
+In a fresh checkout you may have no local upstream tables. Build one model and read its upstream from another schema:
 
 ```bash
 rocky run --model daily_revenue --defer --defer-to prod
@@ -94,36 +94,24 @@ rocky run --model daily_revenue --defer --defer-to prod
 
 Rocky builds `daily_revenue`. It reads `stg_orders` from the `prod` schema. It does not build `stg_orders`. Without `--defer`, the same command fails, because the local `stg_orders` does not exist.
 
-If production writes to different schemas than your development config, point Rocky at a copy of production's state file instead. The state file records where each model was written:
+If production writes to different schemas than your config, point Rocky at a copy of production's state file, which records where each model was written:
 
 ```bash
 rocky run --model daily_revenue --defer --defer-to-state ./prod-state.redb
 ```
 
-The POC builds a copy of the project into the `prod` schema, keeps its state file, and checks that the command fails without `--defer-to-state` and works with it. `--defer-to` and `--defer-to-state` cannot be used together. `--defer` does nothing without `--model`. Read the [defer section](/guides/skip-and-defer/#--defer-develop-against-production-upstreams) for the SQL constructs that `--defer` cannot rewrite.
+`--defer-to` and `--defer-to-state` cannot be used together. `--defer` does nothing without `--model`. Read the [defer section](/guides/skip-and-defer/#--defer-develop-against-production-upstreams) for the SQL constructs that `--defer` cannot rewrite.
 
 ## How much time it saves
 
-The time you save is the build time of the models Rocky skips. A small project saves nothing, because the fixed cost of starting Rocky is about 140 ms.
+You save the build time of the models Rocky skips. A small project saves nothing: starting Rocky costs about 140 ms. Medians of 10 runs on a laptop, release build, local DuckDB. The baseline is `--force-rebuild`, which turns the skip gate off.
 
-Measured on a laptop with a release build and a local DuckDB file. Each figure is the median of 10 runs. The full-run baseline uses `--force-rebuild`, which turns the skip gate off. The command was:
-
-```bash
-rocky --state-path state.redb -c rocky.toml -o json run [--force-rebuild]
-```
-
-| Orders in the raw table | Full run (`--force-rebuild`, 5 of 5 build) | No edit (0 of 5 build) | Edit `stg_orders` (3 of 5 build) | Edit `daily_revenue` (1 of 5 build) |
+| Orders in the raw table | Full run (5 of 5 build) | No edit (0 of 5) | Edit `stg_orders` (3 of 5) | Edit `daily_revenue` (1 of 5) |
 |---|---|---|---|---|
 | 500 (the POC seed) | 148 ms | 140 ms | 150 ms | 144 ms |
-| 20,000,000 (one-off scratch run) | 351 ms | 142 ms | 350 ms | 159 ms |
+| 20,000,000 (scratch run) | 351 ms | 142 ms | 350 ms | 159 ms |
 
-The 500-row figures use the POC seed. The 20-million-row figures come from one scratch copy of the POC, with `generate_series(1, 500)` in `data/seed.sql` changed to `generate_series(1, 20000000)`. The POC does not ship that variant.
-
-- At 500 rows, no run saves time. All the time is start-up.
-- At 20 million rows, an edit to a leaf model is 2.2 times faster than a full run. An edit to `stg_orders` saves nothing, because the expensive models read `stg_orders` and must rebuild.
-- The skip gate saves most when you edit a model near the end of the graph.
-
-Your numbers will differ.
+The 20-million figures come from a scratch copy with `generate_series(1, 20000000)` in `data/seed.sql`. The POC does not ship it. The gate saves most when you edit a model near the end of the graph: a leaf edit is 2.2 times faster than a full run, and an edit to `stg_orders` saves nothing because the expensive models read it. Your numbers will differ.
 
 ## Related
 

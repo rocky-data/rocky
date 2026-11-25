@@ -5,13 +5,13 @@ sidebar:
   order: 3
 ---
 
-These commands use an AI model to draft, reconcile, explain and test models, and to draft contracts. They read `ANTHROPIC_API_KEY` from the environment. `rocky mcp` serves the same abilities to an agent. None of them materializes anything: a person runs `rocky apply`.
+These commands use an AI model to draft, reconcile, explain and test models, and to draft contracts. They read `ANTHROPIC_API_KEY` from the environment, never from `rocky.toml`. The token budget is [`[ai]`](/reference/configuration/#ai). None of them materializes anything: a person runs `rocky apply`. Task steps: [AI Features](/guides/ai-features/).
 
 ---
 
 ## `rocky ai`
 
-Generate a model from a natural language description. Rocky writes the body file and a matching `.toml` sidecar (strategy and target) to the models directory, so the next `rocky apply` loads it with no manual edit.
+Generate a model from a natural language description. Rocky writes the body file and a matching `.toml` sidecar (strategy and target) to the models directory.
 
 ```bash
 rocky ai <intent> [flags]
@@ -28,11 +28,11 @@ rocky ai <intent> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--format <FORMAT>` | `string` | `rocky` | Output format: `rocky` (`.rocky` body + `.toml` sidecar) or `sql` (`.sql` body + `.toml` sidecar). |
-| `--models <PATH>` | `string` | `models` | Models directory. Used both to ground the prompt in real schemas and as the destination directory for the emitted body + sidecar. |
+| `--models <PATH>` | `string` | `models` | Models directory. Grounds the prompt in real schemas and receives the body and sidecar. |
 | `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh` or `merge`. Two values fail before any LLM call: `incremental`, because on a transformation model it re-inserts every row on each run (`E037`), and `ephemeral`, because a new model has no consumer to inline it into. |
-| `--unique-key <COLUMNS>` | `string` | | Upsert key for `--materialization=merge`. Maps to `[strategy].unique_key` (an array) in the sidecar. Accepts a comma-separated list (`--unique-key id,created_at`) or repeated flags. Required with `merge`: without it the sidecar is incomplete and `rocky run` rejects it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table` and `content_addressed` are not offered. |
+| `--unique-key <COLUMNS>` | `string` | | Upsert key for `merge`. Maps to `[strategy].unique_key` (an array) in the sidecar. Takes a comma-separated list (`--unique-key id,created_at`) or repeated flags. Required with `merge`: without it `rocky run` rejects the sidecar. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table` and `content_addressed` are not offered. |
 | `--target <FQN>` | `string` | `generated.ai.<name>` | Target table coordinates as `catalog.schema.table`. Written into the sidecar `[target]` block. |
-| `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
+| `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar. Without it the command fails. |
 
 ### Examples
 
@@ -64,30 +64,15 @@ rocky ai "daily order facts from stg_orders" \
   --target analytics.marts.fct_orders_daily
 ```
 
-The emitted sidecar (`models/fct_orders_daily.toml`) carries the parsed materialization, key and target:
+The sidecar carries the parsed materialization, key and target. The result is shown in [AI Features](/guides/ai-features/#pick-a-materialization--target). `--materialization incremental` and `--materialization ephemeral` fail before any LLM call, with the reasons in the flag table. `--watermark` does not exist: passing it is an argument error.
 
-```toml
-name = "fct_orders_daily"
-
-[strategy]
-type = "merge"
-unique_key = ["order_date"]
-
-[target]
-catalog = "analytics"
-schema = "marts"
-table = "fct_orders_daily"
-```
-
-`--materialization incremental` and `--materialization ephemeral` fail before any LLM call, with the reasons in the flag table. `--watermark` does not exist: passing it is an argument error.
-
-Generate raw SQL instead (still emits both `.sql` body and `.toml` sidecar):
+Generate raw SQL instead:
 
 ```bash
 rocky ai "top 10 customers by lifetime value" --format sql
 ```
 
-With `--format sql`, `source` holds plain SQL (no Jinja, no templating) with bare model references that the compiler resolves against project models.
+With `--format sql`, `source` holds plain SQL with bare model references that the compiler resolves.
 
 ### Related Commands
 
@@ -137,9 +122,9 @@ rocky ai-sync
 }
 ```
 
-Each proposal carries a unified `diff` and the full `proposed_source`. The command is a dry run by default.
+Each proposal carries a unified `diff` and the full `proposed_source`.
 
-`--model fct_revenue --apply` syncs one model and writes `proposed_source` to disk after the proposal passes the compile-verify loop. `--with-intent --models src/models` checks only models that have intent metadata.
+`--model fct_revenue --apply` syncs one model and writes `proposed_source` after the proposal passes the compile-verify loop.
 
 ### Related Commands
 
@@ -246,7 +231,6 @@ rocky ai-test fct_revenue
           "name": "net_revenue_is_not_negative",
           "description": "Net revenue should never be negative after refunds",
           "sql": "SELECT COUNT(*) FROM fct_revenue WHERE net_revenue < 0"
-        },
         }
       ]
     }
@@ -254,21 +238,19 @@ rocky ai-test fct_revenue
 }
 ```
 
-Each test is an assertion query: it passes when the query returns 0 rows. Rocky's test SQL references models by bare name (no Jinja), matching how the compiler resolves refs.
+Each test is an assertion query that passes when it returns 0 rows. It references models by bare name.
 
-With `--all --save`, each model's assertions are written as one `.sql` file under `tests/`, and `rocky test` picks them up. `--models <PATH>` selects another directory.
+With `--all --save`, each assertion is written as a `.sql` file under `tests/`. `rocky test` and `rocky ci` do not read that directory: see [AI Features](/guides/ai-features/#run-the-generated-tests).
 
 ### Related Commands
 
-- [`rocky test`](/reference/commands/modeling/#rocky-test) -- run the generated tests via DuckDB
 - [`rocky ai-explain`](#rocky-ai-explain) -- generate intent that improves test quality
-- [`rocky ci`](/reference/commands/modeling/#rocky-ci) -- compile + test in CI
 
 ---
 
 ## `rocky ai-contract`
 
-Draft a data contract from a model's observed data, instead of writing the column list by hand. Rocky profiles the target table, sends the shape to Anthropic, and prints the draft. It works on any configured warehouse. The profile reads the whole table, once per column, which costs money on a metered warehouse such as Snowflake, BigQuery or Databricks.
+Draft a data contract from a model's observed data. Rocky profiles the target table, sends the shape to Anthropic, and prints the draft. It works on any configured warehouse. The profile reads the whole table, once per column, which costs money on a metered warehouse such as Snowflake, BigQuery or Databricks.
 
 ```bash
 rocky ai-contract <model> [flags]
@@ -288,8 +270,6 @@ rocky ai-contract <model> [flags]
 | `--with-data` | `bool` | `false` | Also send observed cell **values** (min/max and samples of low-cardinality columns). Without it, only the schema and the row, null and distinct counts leave the machine. |
 | `--models <PATH>` | `string` | `models` | Models directory, and the destination for `--save`. |
 
-Rocky reads the API key from the `ANTHROPIC_API_KEY` environment variable, never from `rocky.toml`. See [`[ai]`](/reference/configuration/#ai) for the token budget.
-
 ### Examples
 
 ```bash
@@ -306,7 +286,7 @@ rocky ai-contract fct_orders --save    # write models/fct_orders.contract.toml
 
 ## `rocky mcp`
 
-Run a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server over stdio, exposing Rocky's verification, data-grounding, and draft-generation surface to any MCP-capable agent harness (Claude Desktop, Claude Code, your own client). The server is long-running: it serves until the client disconnects.
+Run a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server over stdio. It exposes Rocky's verification, grounding and draft-generation tools to any MCP-capable agent harness. The server is long-running: it serves until the client disconnects.
 
 ```bash
 rocky mcp [flags]
@@ -316,123 +296,12 @@ rocky mcp [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--config <PATH>` | `PathBuf` | `rocky.toml` | Pipeline config file the server resolves the project from. The models directory is resolved as `<config-dir>/models`. |
-| `--profile <PROFILE>` | `default` \| `approver` \| `worker` | `default` | Which tool surface to serve. `default` serves all 31 tools but refuses `review_queue`'s approve action (listing the queue still works). `approver` serves the same 31 tools and allows that action, so the server can write approval markers. `worker` serves the minimal drafting allowlist for an untrusted worker. |
+| `--config <PATH>` | `PathBuf` | `rocky.toml` | Pipeline config the server resolves the project from. The models directory is `<config-dir>/models`. |
+| `--profile <PROFILE>` | `default` \| `approver` \| `worker` | `default` | Tool surface to serve. `default`: all 31 tools, approve refused. `approver`: the same 31 tools, approve allowed. `worker`: a minimal drafting allowlist. See [Profiles](/concepts/mcp-authoring/#profiles). |
 
-The server is **stateless**: every tool call resolves the project from the config + models dir and compiles fresh, so it always reflects the current on-disk files. Logging goes to stderr (stdout is reserved for the MCP wire protocol).
+The server is **stateless**: every tool call compiles the current on-disk files. Logging goes to stderr. Stdout is reserved for the MCP wire protocol.
 
-### Local and bring-your-own-key
-
-`rocky mcp` runs locally. There is no Rocky-hosted service.
-
-- Warehouse-touching tools use the credentials in your `rocky.toml`.
-- The draft generators call the Anthropic API with your own `ANTHROPIC_API_KEY` from the server environment. Without it, those tools return an empty draft and a `message` that says why.
-- The generators send your model's SQL and schema to your key. `ai_contract` sends only aggregate column counts (row, null, distinct), never raw cell values.
-
-### Safety model: the server does not materialize
-
-The server **never materializes anything**. No tool runs SQL that changes your warehouse. An agent can write project files and record a plan. One tool, `review_queue`, can also write the approval marker for a plan that is already in the pending review queue — but only on `rocky mcp --profile approver`. The default server refuses that call.
-
-```
-   through rocky mcp                       through the CLI
-   ─────────────────                       ───────────────
-   draft_model     ──writes──► models/<name>.sql + sidecar
-   draft_contract  ──writes──► models/<model>.contract.toml
-   draft_check     ──writes──► [[tests]] in the sidecar
-        │
-        ▼
-   propose         ──writes──► .rocky/plans/<plan-id>.json
-                                        │
-                                        ▼
-                              rocky review <plan-id> --approve
-                              writes the approval marker. The
-                              review_queue MCP tool writes it
-                              too, with confirm: true — but ONLY
-                              on --profile approver. The default
-                              server refuses (approve_not_enabled).
-                                        │
-                                        ▼
-                              rocky apply <plan-id> ──► warehouse
-                              no MCP tool runs this step
-```
-
-Three rules keep that boundary in place:
-
-- The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to `draft_contract` or `draft_check`. After review and apply, run sidecar checks with `test` and `declarative = true`.
-- `governance_preview` and `drift_preview` are **read-only** previews.
-- The server does not apply. `rocky apply` is the only step that WRITES to the warehouse, and no MCP tool runs it. Some tools do read the warehouse: `sample_rows`, `profile_column`, `inspect_schema`, and `drift_preview` issue queries against it. `review_queue` can write a plan's approval marker, but only on `rocky mcp --profile approver` — the default server refuses the call with `approve_not_enabled` and writes nothing. Where it is served it still needs `confirm: true` from the caller, and it still refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve `review_queue` at all. So treat approval as a step the server can take **only on a server you started for that purpose**; the profile is chosen at launch and an agent cannot change it mid-session.
-
-### Tools
-
-**Verify and ground** (read-only; the typed surface a raw shell can't reproduce):
-
-| Tool | What it does |
-|---|---|
-| `compile` | Type-check the project and return diagnostics (errors / warnings). |
-| `plan_preview` | Render the SQL Rocky generates, offline, with no warehouse I/O. Not the whole plan: a model it cannot render offline is skipped and is not named in the result. Skipped by construction: Snowflake dynamic tables, time-interval models, and content-addressed models. |
-| `lineage` | Column-level lineage for a model (or a single column). |
-| `test` | Run local model and fixture tests by default. Set `declarative = true` to run sidecar `[[tests]]` against the configured warehouse after apply. |
-| `list` | List project entities (`models`, `pipelines`, `adapters`, `sources`). |
-| `inspect_schema` | Typed columns of every model and source table — works at cold start, before anything is materialized. |
-| `catalog` | The project-wide asset catalog (every model + source) in one call. |
-| `breaking_change` | Classify semantic breaking changes between the working tree and a base ref. |
-| `dependents` | List the downstream models that depend on a given model. |
-| `history` | Read run history from the state store. |
-| `metrics` | Read a model's quality-metric snapshots from the state store. |
-| `optimize` | Cost-model materialization recommendations from run history. |
-| `sample_rows` | Sample real rows from a model's target table or a qualified `schema.table`. Hits your warehouse. |
-| `profile_column` | Profile one column of a target table or qualified `schema.table`. Hits your warehouse. |
-| `governance_preview` | DRY-RUN of the classification / masking / retention actions a `rocky run` would reconcile. Computed offline; no warehouse I/O. |
-| `drift_preview` | Source-vs-target schema drift between two warehouse tables. Hits your warehouse. |
-
-**LLM generators** (mutate nothing; require `ANTHROPIC_API_KEY`; named for the `rocky ai-*` verbs):
-
-| Tool | What it does |
-|---|---|
-| `ai_contract` | Draft a `.contract.toml` from a model's aggregate per-column profile, compile-verified against its inferred schema. Sends only aggregate statistics — never raw cell values. |
-| `ai_test` | Draft SQL test assertions (not-null, grain uniqueness, ranges, referential integrity) for a model. |
-| `explain_model` | Draft an intent description for a model from its SQL and schema. |
-| `suggest_freshness_block` | Draft a `[freshness]` TOML block for a model with temporal columns. |
-
-**Write path** (write into `models/`, compile in the same call, policy-gated; no Anthropic key required):
-
-| Tool | What it does |
-|---|---|
-| `draft_model` | Write `models/<name>.sql` + sidecar and compile it. |
-| `draft_contract` | Write `models/<model>.contract.toml` (your `spec`) and compile-validate it against the model's schema. |
-| `draft_check` | Merge declarative `[[tests]]` checks (your `spec`) into the model's sidecar and compile. |
-| `draft_metadata` | Parse-merge a structured freshness / classification patch into the model's sidecar and compile. The policy check runs against the sidecar as patched. |
-
-A `draft_*` call made without its content `spec` returns an actionable error pointing at the matching `ai_*` generator.
-
-**Governor** (read the ledger and the scheduler; one safe-direction write):
-
-| Tool | What it does |
-|---|---|
-| `estate_brief` | The governor's digest, as [`rocky brief`](/reference/commands/governance-reclamation/#rocky-brief) prints it. Read-only. |
-| `audit_query` | The custody chain for a model, a run id or a plan id, as `rocky audit --for`. Read-only. |
-| `scorecard` | Acceptance, denial and review rates per principal, rule or scope, as `rocky audit --scorecard`. Read-only. |
-| `schedule_status` | The scheduler's stored state per pipeline and the queued webhook demands. Read-only: it does not evaluate demand. |
-| `pause_schedule` | Pause a pipeline's schedule. Requires `confirm: true`. There is no resume tool: resume is human-only. |
-| `review_queue` | List the pending-review queue. On `--profile approver` only, it can also write an approval marker. See the safety model above. |
-
-**Propose** (the one plan write: not a materialization; no Anthropic key required):
-
-| Tool | What it does |
-|---|---|
-| `propose` | Record an **AI-authored plan** for materializing a model. Writes a plan only — it compiles the project and records the plan offline (no LLM call, no warehouse write). `rocky apply <plan_id>` then runs it only once `rocky review <plan_id> --approve` has written the approval marker. |
-
-### Prompts (guided trajectories)
-
-The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose step**; it never applies.
-
-| Prompt | What it guides |
-|---|---|
-| `build_model` | Author one model from a plain-language intent through Rocky's inspect → sample → write → compile-loop → propose authoring loop. |
-| `find_untested_models` | Catalog the project, find models with no declarative tests, and draft tests for them. |
-| `add_tests_to_pks` | Add uniqueness + not-null tests to a model's primary-key / unique columns. |
-| `summarize_project` | Produce a structured, read-only summary of the project (uses only read-only tools). |
-| `fix_failing_test` | Run `test`, then for each failure diagnose and draft a fix — stopping at the proposal. |
+The server never materializes anything. No tool runs SQL that changes your warehouse, and no tool runs `rocky apply`. Tool list, bring-your-own-key and data egress: [MCP Authoring](/concepts/mcp-authoring/). Gates and the approval marker: [Operating Rocky with Agents](/concepts/operating-rocky-with-agents/).
 
 ### Examples
 
@@ -444,5 +313,5 @@ claude mcp add rocky -- rocky mcp --config rocky.toml   # register with Claude C
 
 ### Related Commands
 
-- [`rocky ai`](#rocky-ai) -- one-shot model generation from the CLI (no MCP client needed)
+- [`rocky ai`](#rocky-ai) -- one-shot model generation from the CLI
 - [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute an AI-authored plan (`rocky review <plan_id> --approve` writes the marker it requires first)

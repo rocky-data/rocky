@@ -9,16 +9,7 @@ These commands cover a pipeline's life: create the project, check the config, se
 
 A plan command plus `rocky apply` is the production path. `rocky plan` prints the SQL and writes a plan file with an id. For a `run` plan the file holds the settings the run needs, not the SQL. `rocky apply` recompiles the project and runs it. [`rocky run`](#rocky-run) fuses both steps for local work.
 
-`rocky plan` needs a replication pipeline. A transformation project reviews its changes through a branch:
-
-```bash
-rocky branch create pr1
-rocky run --branch pr1          # builds into a branch schema, not production
-rocky plan promote pr1          # writes a promote plan and prints its plan_id
-rocky apply <plan-id>           # copies the reviewed branch tables to production
-```
-
-The branch run runs each model's `[[tests]]` because `[run] tests_on_run` defaults to `enforce`. [`rocky plan promote`](#the-failing-tests-gate) refuses a branch with a recorded failing test or with no passing test evidence.
+`rocky plan` needs a replication pipeline. A transformation project reviews changes through a branch: `rocky run --branch <name>`, then `rocky plan promote <name>`, then `rocky apply <plan-id>`. The branch run runs each model's `[[tests]]` because `[run] tests_on_run` defaults to `enforce`. [`rocky plan promote`](#the-failing-tests-gate) refuses a branch with a recorded failing test or no passing test evidence.
 
 ## Global Flags
 
@@ -63,30 +54,11 @@ rocky init [path] [--template <NAME>]
 ### Examples
 
 ```bash
-rocky init
-```
-
-```
-Initialized Rocky project in .
-
-  rocky.toml           — pipeline config (DuckDB)
-  models/_defaults.toml — shared model defaults
-  models/stg_orders.*  — sample transformation model
-  seeds/seed.sql       — sample data
-
-Quick start:
-  duckdb playground.duckdb < seeds/seed.sql
-  rocky validate
-  rocky compile --models models/
-```
-
-Create a Trino project in a new directory:
-
-```bash
+rocky init                                  # DuckDB project in .
 rocky init acme-trino --template trino
 ```
 
-The Trino `rocky.toml` reads `${TRINO_HOST}`, `${TRINO_USER}` and `${TRINO_PASSWORD}` (HTTP Basic), or `${TRINO_JWT}` (a JWT bearer token). Comments in the file describe both modes.
+The Trino `rocky.toml` reads `${TRINO_HOST}`, `${TRINO_USER}` and `${TRINO_PASSWORD}` (HTTP Basic), or `${TRINO_JWT}` (a JWT bearer token).
 
 ### Related Commands
 
@@ -193,25 +165,14 @@ Use `-o table` for a table, and `--pipeline <name>` when the project defines sev
 
 ### Emitting the Fivetran state envelope
 
-`--emit-fivetran-state-to <PATH>` writes one state envelope per Fivetran adapter declared in `rocky.toml`. The file layout depends on how many Fivetran adapters the config declares.
+`--emit-fivetran-state-to <PATH>` writes one envelope per Fivetran adapter, each with a `.blake3` content-hash sibling.
 
-```
-one Fivetran adapter          two or more Fivetran adapters
-──────────────────────        ─────────────────────────────────────────────
-<PATH>                        <STEM>.<account_hash>.<destination_id>.json
-<PATH>.blake3                 <STEM>.<account_hash>.<destination_id>.json.blake3
-   │                                        │            │
-   │ content hash                           │            │ Fivetran
-   │ of the envelope                        │            │ destination id
-   └─ rewritten only when                   └─ short token derived from the
-      the hash changes                         account, so two adapters that
-                                               share a destination id name do
-                                               not race on the same file
-```
+| Fivetran adapters | Files written |
+|---|---|
+| One | `<PATH>` and `<PATH>.blake3` |
+| Two or more | `<STEM>.<account_hash>.<destination_id>.json` and `.json.blake3` |
 
-`<STEM>` is `<PATH>` without a trailing `.json`, so `--emit-fivetran-state-to state.json` writes `state.<account_hash>.<destination_id>.json`.
-
-The write is idempotent. Rocky leaves the JSON file alone when its content hash matches the `.blake3` sibling, so a `stat(2)` watcher fires only when Fivetran state changed.
+`<STEM>` is `<PATH>` without a trailing `.json`. `<account_hash>` is a short token derived from the account, so two adapters that share a destination id do not race on one file. Rocky rewrites a file only when its hash differs from the `.blake3` sibling, so a `stat(2)` watcher fires only when state changed.
 
 A connector whose `connectors/{id}/schemas` endpoint returns 404 is left out of the `schemas` map and logged at WARN. It still appears under `connectors`. Discover exits non-zero only when every connector returns 404.
 
@@ -221,17 +182,6 @@ Two opt-in signals catch onboarding problems before any catalog is created. Set 
 
 - **`new_sources`**: set `report_new_sources = true` to diff the inventory against the prior snapshot. The first discover records the baseline and reports nothing.
 - **`collision_candidates`**: set `on_collision = "warn"` (or `"error"`) to flag the same external object onboarded under more than one schema. Each entry pairs `external_object_id` with its `sources`. With `"error"`, discover also exits non-zero. Only adapters that resolve external object ids (such as Fivetran) fill it.
-
-```json
-{
-  "command": "discover",
-  "new_sources": ["src__acme__ca_central__shopify"],
-  "collision_candidates": [
-    { "external_object_id": "act_1234567890",
-      "sources": ["src__acme__us_west__shopify", "src__acme__eu_central__shopify"] }
-  ]
-}
-```
 
 `collision_candidates` is the preventive half of duplicate detection. [`cross_source_overlap`](/concepts/data-quality-checks/#cross-source-overlap) is the detective half, at `rocky run` time.
 
@@ -282,9 +232,7 @@ rocky plan promote <branch> [flags]
                                                warehouse
 ```
 
-The gate is optional for `run`, `replication` and `promote` plans. A `[policy]` rule that resolves to `require_review` turns it on. Without `[policy]`, these plans go straight from `rocky plan` to `rocky apply`.
-
-Four plan kinds are always gated: `ai_authored`, `backfill`, `gc` and `restore`. They come from the MCP `propose` tool, `rocky backfill`, `rocky gc --derivable` and `rocky restore`. See [`rocky review`](/reference/commands/governance-reclamation/#rocky-review).
+The gate is optional for `run`, `replication` and `promote` plans: a `[policy]` rule that resolves to `require_review` turns it on. `ai_authored`, `backfill`, `gc` and `restore` plans are always gated. They come from the MCP `propose` tool, `rocky backfill`, `rocky gc --derivable` and `rocky restore`. See [`rocky review`](/reference/commands/governance-reclamation/#rocky-review).
 
 ### Flags
 
@@ -301,22 +249,12 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
-| `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
-| `--model <NAME>` | `string` | | Plan one compiled model and skip replication. |
-| `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` | `string` | | [Node selection](/reference/node-selection/). It must resolve to exactly one model, planned like `--model`. |
-| `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
-| `--all` | `bool` | `false` | Plan both replication and compiled models. |
-| `--governance-override <JSON>` | `string` | | Governance config as inline JSON or `@file.json`, merged with the defaults. Stored in the plan. |
-| `--resume <RUN_ID>` / `--resume-latest` | `string` / `bool` | | Resume a failed replication run from its last checkpoint. Rocky mints a new `run_id` and records the prior one as `resumed_from`. `--resume-latest` picks the run at apply time. Rejected with `--dag` at parse time. |
-| `--shadow`, `--shadow-suffix <SUFFIX>`, `--shadow-schema <NAME>`, `--branch <NAME>` | | | Same as [`rocky run`](#rocky-run). `--branch` is `--shadow --shadow-schema <branch.schema_prefix>`. `--shadow-suffix` defaults to `_rocky_shadow`. `--branch` conflicts with the three shadow flags. |
-| `--partition <KEY>`, `--from <KEY>`, `--to <KEY>`, `--latest`, `--missing`, `--lookback <N>` | | | Same as `rocky run`. `--missing` resolves against the state store at apply time. |
+| `--filter`, `--pipeline`, `--model`, `--models`, `--all`, `--governance-override`, `--dag`, `--env` | | | Same as [`rocky run`](#rocky-run), except: `--select`, `-s`, `--exclude` and `--state-ref` ([node selection](/reference/node-selection/)) must resolve to exactly one model, planned like `--model`. `--env` scopes the governance preview (`mask_actions`) only. `--dag` is rejected with `--resume` / `--resume-latest`. With `--principal agent`, the plan's fingerprint and review cover every pipeline's models. |
+| `--resume <RUN_ID>` / `--resume-latest` | `string` / `bool` | | Resume a failed replication run from its last checkpoint. Rocky mints a new `run_id` and records the prior one as `resumed_from`. `--resume-latest` picks the run at apply time. |
+| `--shadow`, `--shadow-suffix <SUFFIX>`, `--shadow-schema <NAME>`, `--branch <NAME>` | | | Same as `rocky run`. `--branch` conflicts with the three shadow flags. |
+| `--partition`, `--from`, `--to`, `--latest`, `--missing`, `--lookback <N>` | | | Same as `rocky run`. `--missing` resolves against the state store at apply time. |
 | `--parallel <N>` | `integer` | `1` | Run N partitions at a time. Warehouse queries only: state writes serialize through the state store. |
-| `--dag` | `bool` | `false` | Plan all pipelines as one DAG in dependency order. Rejected with `--resume` / `--resume-latest`. With `--principal agent`, the plan's fingerprint and review cover every pipeline's models. |
-| `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Opaque key that dedups this run against prior runs with the same key, on every state backend. See [`rocky run`](#rocky-run). Never put a secret in a key. |
-| `--env <NAME>` | `string` | | Scope the governance preview (`mask_actions`) to one environment, so `[mask.<env>]` overrides overlay the `[mask]` defaults. |
+| `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Dedup key, as for `rocky run`. Never put a secret in a key. |
 | `--semantic` | `bool` | `false` | Run the breaking-change classifier against `--base` and attach the verdict as `breaking_verdict`. Decision support only: it never gates the plan or changes the exit code. |
 | `--intent <INTENT>` | `string` | | **Experimental.** State what the change does and check it on the data. The only value is `refactor`. See [Check a refactor with `--intent`](#check-a-refactor-with---intent). |
 | `--base <ref>` | `string` | `main` | Git ref the working tree is compared against. `--semantic`, `--intent` and the change classification of every run plan use it. |
@@ -324,21 +262,19 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 
 ### Cost preview
 
-When the plan covers transformation models, the JSON output has a `cost_preview` object. It shows what applying the plan would rebuild, and roughly what it would cost, before any model runs.
+A plan that covers transformation models carries a `cost_preview` object: what applying the plan would rebuild, and roughly what it costs. It is report-only. It never changes the planned models, the budget check or the exit code, and it is not part of `plan_id`.
 
 | Field | Meaning |
 |---|---|
-| `is_estimate` | Always `true`. Every figure is an estimate. |
-| `source` | `heuristic`, `adapter`, or `mixed` when the adapter could not estimate some models. Each row in `models` has its own `source`. |
-| `models_to_rebuild` | The rebuild scope: the number of models the plan rebuilds. |
-| `estimated_bytes_scanned`, `estimated_cost_usd` | Sums over every model. A total is absent when any model lacks the figure. |
-| `previous_cost_usd` | The observed cost of the same models in the last successful production run, priced from the state store. Absent when any model has no such run. |
-| `cost_delta_usd` | `estimated_cost_usd - previous_cost_usd`. Set only when every model has an adapter estimate and a previous cost. |
+| `is_estimate` | Always `true`. |
+| `source` | `heuristic`, `adapter`, or `mixed`. Each row in `models` has its own `source`. |
+| `models_to_rebuild` | Number of models the plan rebuilds. |
+| `estimated_bytes_scanned`, `estimated_cost_usd` | Sums over every model. Absent when any model lacks the figure. |
+| `previous_cost_usd` | Observed cost of the same models in the last successful production run. Absent when any model has no such run. |
+| `cost_delta_usd` | `estimated_cost_usd - previous_cost_usd`. Set only when every model has both. |
 | `notes` | Why a figure is missing, for example a failed `EXPLAIN`. |
 
-The default `heuristic` uses the cost model of `cost_hint` in `rocky compile`, with placeholder source statistics, so its confidence is always `low`. Use it to compare plans, not to set a budget. A DuckDB target costs `0`. `--cost-estimate adapter` runs `EXPLAIN` per model, as [`rocky estimate`](/reference/cli/#rocky-estimate) does. A model the adapter cannot estimate falls back to the heuristic, with a note.
-
-The preview is report-only. It never changes the planned models, the budget check or the exit code, and it is not part of `plan_id`.
+`heuristic` uses the `cost_hint` model of `rocky compile` with placeholder statistics, so confidence is always `low`. Compare plans with it. Do not set a budget with it. A DuckDB target costs `0`. `adapter` runs `EXPLAIN` per model, as [`rocky estimate`](/reference/cli/#rocky-estimate) does, and falls back to the heuristic with a note.
 
 > The `--semantic` verdict diffs output schema only. It cannot see a `WHERE`, `JOIN`-key or `CASE` rewrite that changes values but not the schema, so an empty `findings` list is not a safety signal. The `caveat` field says so. See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) for the full flow and the [`plan` schema](https://github.com/rocky-data/rocky/blob/main/schemas/plan.schema.json) for the `SemanticPlanVerdict` shape.
 
@@ -370,14 +306,12 @@ The check passes when the schema is the same and the two outputs hold the same r
 
 Limits of a `match`:
 
-- It means no difference on the current data, not a proof for other data. A `WHERE` change that no current row reaches still gives `match`. When both outputs are empty, `detail` says so.
-- Rocky checks the `SELECT` output only, not masks, classifications, targets, strategy or other config. When the target or strategy also changed, `detail` says so.
-- Each model reads the upstream tables that already exist in the warehouse. A changed upstream is listed in `upstream_changed`, and per-model matches do not add up to a match for the chain.
-- The verdict is report-only. It relaxes no gate and never changes the exit code. The flag itself can fail the command: with `--dag`, with no models directory, or when the working tree does not compile.
-- The check needs a replication pipeline in `rocky.toml`. It pays for the extra builds on your DuckDB database.
-- The plan records `intent: refactor` as the author's claim, never the verdict.
-
-The `--intent` flag is not the free-text `intent = "..."` key in a model sidecar, which describes a model for the AI commands.
+- It means no difference on the current data, not a proof for other data. When both outputs are empty, `detail` says so.
+- Rocky checks the `SELECT` output only, not masks, classifications, targets, strategy or other config. `detail` says when the target or strategy also changed.
+- Each model reads the upstream tables that already exist in the warehouse. A changed upstream is listed in `upstream_changed`. Per-model matches do not add up to a match for the chain.
+- The verdict is report-only and never changes the exit code. The flag itself fails with `--dag`, with no models directory, or when the working tree does not compile.
+- The check needs a replication pipeline in `rocky.toml` and runs its extra builds on your DuckDB database.
+- The plan records `intent: refactor` as the author's claim, never the verdict. The flag is not the `intent = "..."` key in a model sidecar.
 
 ```bash
 rocky plan --intent refactor --base main --output json
@@ -412,13 +346,7 @@ On success the output is a `PlanOutput` with `plan_kind: "promote"` and the `pla
 
 #### The failing-tests gate
 
-After the breaking-change gate, Rocky reads the runs of the branch (`rocky run --branch <name>`) since its creation. Each model's newest evidence decides: a run that recorded a test result for the model, or a run in which every execution of the model succeeded. A run that did not touch a model, or failed any part of its build, leaves that model's evidence as it was.
-
-```
-run 1  --tests enforce   orders FAILS a test
-run 2  --model status    builds only status
-promote                  refused: orders' newest evidence is run 1
-```
+After the breaking-change gate, Rocky reads the runs of the branch (`rocky run --branch <name>`) since its creation. Each model's newest evidence decides: a run that recorded a test result for the model, or a run in which every execution of the model succeeded. A run that did not touch a model, or failed any part of its build, leaves that evidence as it was.
 
 Rocky refuses the promote (exit `1`, no plan, a `FailingTestsBlocked` audit event naming each reason) when:
 
@@ -427,12 +355,7 @@ Rocky refuses the promote (exit `1`, no plan, a `FailingTestsBlocked` audit even
 - A model with error-severity tests was last built with no recorded test result (for example `--tests off`).
 - Rocky cannot load the models.
 
-Fix the data and re-run `rocky run --branch <name>`, or pass `--allow-failing-tests`. The override prints a `WARNING` and records `FailingTestsAllowed` and one `TestEvidenceMissing` event per gap.
-
-Two cases only warn, with a `WARNING` on stderr and a `TestEvidenceMissing` event:
-
-- The branch has no run in the local store and `[state]` uses a remote backend (`s3`, `gcs`, `valkey` or `tiered`). A local run is still checked. With a local backend, a branch with no run refuses.
-- A transformation pipeline's models directory does not exist.
+Fix the data and re-run `rocky run --branch <name>`, or pass `--allow-failing-tests` (a `WARNING`, a `FailingTestsAllowed` event and one `TestEvidenceMissing` event per gap). Two cases only warn, with a `TestEvidenceMissing` event: the branch has no run in the local store and `[state]` uses a remote backend (`s3`, `gcs`, `valkey` or `tiered`; a local run is still checked), or a transformation pipeline's models directory does not exist.
 
 ### Examples
 
@@ -467,18 +390,7 @@ rocky plan --filter client=acme
 }
 ```
 
-A model excluded from the preview or refused by compilation is listed in `skipped`:
-
-```json
-  "skipped": [
-    {
-      "model": "stg_events",
-      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` renders no statement of its own — it is inlined as a CTE into each model that reads it, so there is nothing to build (E038 when selected directly)"
-    }
-  ]
-```
-
-The `reason` gives the compiler diagnostic or SQL generation error. An `ephemeral` model is always there: its SQL appears inside each consumer's statement instead. A model that needs a live warehouse, such as a Snowflake dynamic table, is there too. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
+A model excluded from the preview or refused by compilation is listed in `skipped` (`model`, `reason`). The `reason` holds the compiler diagnostic or SQL generation error. An `ephemeral` model is always there (E038 when selected directly): its SQL appears inside each consumer. A model that needs a live warehouse, such as a Snowflake dynamic table, is there too. The key is absent when nothing was skipped.
 
 Plan one model, then execute the stored plan:
 
@@ -550,7 +462,7 @@ Each plan kind compares different things.
 | An agent (`--principal agent` or `ROCKY_PRINCIPAL=agent`) | The models and the config. It also checks the routing identity and repeats the fingerprint check when the models execute. `ai_authored` and `backfill` plans always apply as an agent. | `plan_config_changed` when only the config changed |
 | `rocky review --approve` | The models only, for every plan kind. A plan approved from another environment (such as `rocky serve`) passes when its models did not change. | "the models changed since this plan was written" |
 
-A `${VAR}` inside a model's SQL or sidecar is part of the models: a different value refuses with `plan_models_changed`. A plan whose models did not compile at plan time has no fingerprint and is not checked, nor is a snapshot, load, quality or replication-only plan. A plan made before this fingerprint existed refuses with `plan_snapshot_missing`: plan it again.
+A `${VAR}` inside a model's SQL or sidecar is part of the models. A plan whose models did not compile at plan time has no fingerprint and is not checked, nor is a snapshot, load, quality or replication-only plan. A plan made before the fingerprint existed refuses with `plan_snapshot_missing`: plan it again.
 
 A review-gated `--dag` plan is checked across the whole DAG: every pipeline's models, from that pipeline's own directory and file glob, plus the project's seeds (data, sidecar and seed hooks). Apply refuses if any model or seed was added, removed or changed, and with `plan_config_changed` if the config changed. A credential such as `token` or `password` is not checked. A connection field such as `host` or `path` is, by its resolved `${VAR}` value. An agent applying a `--dag` plan is still refused, because the DAG's sub-runs are not yet policy-gated.
 
@@ -562,17 +474,9 @@ A review-gated `--dag` plan is checked across the whole DAG: every pipeline's mo
 
 ### Examples
 
-Plan, read the SQL, then apply:
-
 ```bash
-rocky plan --filter client=acme
-rocky apply <plan-id>
-```
-
-Apply an AI-authored plan. The bare apply is refused until an approval marker names that plan:
-
-```bash
-rocky review <plan-id> --approve
+rocky plan --filter client=acme && rocky apply <plan-id>
+rocky review <plan-id> --approve    # an AI-authored plan needs its approval marker first
 rocky apply <plan-id>
 ```
 
@@ -622,10 +526,9 @@ rocky run [flags]
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
-| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
-| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
+| `--resume <RUN_ID>` / `--resume-latest` | `string` / `bool` | | Resume a failed replication run (a given run, or the latest) from its last checkpoint. Mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag` or `--shadow`. |
 | `--tests <MODE>` | `off`, `report`, `enforce` | config, else `enforce` | Evaluate each built model's `[[tests]]` after it builds. See [Tests during a run](#tests-during-a-run). |
-| `--retry-failed [<RUN_ID>]` | `string` | | Rerun the failed and never-built models of a failed transformation run, and the models downstream of them. Without a value, the run is the latest production run of the pipeline (or of `--branch`). A model is not rerun when that run built it with the SQL it has now. Refuses when the run succeeded, is not found, is not a production run of this pipeline, nothing is left to retry, or `[state]` uses a remote backend. Rejected with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model`, `--select`, `--exclude`, `--filter`, `--all`, `--shadow`, `--shadow-schema` and the `--defer` flags. See [Retrying a failed run](#retrying-a-failed-run). |
+| `--retry-failed [<RUN_ID>]` | `string` | | Rerun the failed and never-built models of a failed transformation run, and the models downstream of them. Without a value, the run is the latest production run of the pipeline (or of `--branch`). Refuses when the run succeeded, is not found, is not a production run of this pipeline, nothing is left to retry, or `[state]` uses a remote backend. Rejected with `--resume`, `--resume-latest`, `--watch`, `--dag`, `--model`, `--select`, `--exclude`, `--filter`, `--all`, `--shadow`, `--shadow-schema` and the `--defer` flags. See [Retrying a failed run](#retrying-a-failed-run). |
 | `--shadow` | `bool` | `false` | Write to shadow targets, compare them with production, then drop them after any completed verdict. A failed threshold exits non-zero. |
 | `--keep-shadow` | `bool` | `false` | Requires `--shadow` and conflicts with `--watch`. Keep shadow objects for a separate `rocky compare`. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
@@ -637,22 +540,22 @@ rocky run [flags]
 | `--missing` | `bool` | `false` | Run the partitions missing from the state store, from the model's `first_partition` up to now. Errors if `first_partition` is unset. |
 | `--lookback <N>` | `integer` | | Also recompute the previous N partitions, for late-arriving data. Overrides the model's TOML `lookback`. |
 | `--dag` | `bool` | `false` | Run all pipelines as one DAG in dependency order. Each pipeline is a node, cross-pipeline `depends_on` edges set the order, and layers run in parallel. Rejected with `--resume` and `--resume-latest`. |
-| `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Skip this run when a run with the same key already succeeded (`status = "skipped_idempotent"`) or holds the key now (`skipped_in_flight`). Both exit `0`. Works on every state backend (`local`, `valkey`, `tiered`, `s3`, `gcs`), and only one caller can claim a key or adopt a stale claim. `valkey` and `tiered` need a server that allows `EVAL`. Rejected with `--resume` and `--resume-latest`. Keys are stored as given: never put a secret in one. See [`[state.idempotency]`](/reference/configuration/). |
+| `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Skip this run when a run with the same key already succeeded (`status = "skipped_idempotent"`) or holds the key now (`skipped_in_flight`). Both exit `0`. Works on every state backend; one caller claims a key. `valkey` and `tiered` need a server that allows `EVAL`. Rejected with `--resume` and `--resume-latest`. Never put a secret in a key. See [`[state.idempotency]`](/reference/configuration/). |
 | `--env <NAME>` | `string` | | Apply the `[mask.<env>]` overrides on top of the `[mask]` defaults in the post-run governance pass. Classification tags and retention are the same in every environment. |
-| `--watch` | `bool` | `false` | Re-run the pipeline on every change to `rocky.toml` or a file under the watched models directories, debounced to 200 ms. A failed run does not exit the loop. Ctrl-C exits between runs. Rejected at parse time with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
+| `--watch` | `bool` | `false` | Re-run on every change to `rocky.toml` or a watched models directory, debounced to 200 ms. A failed run does not exit the loop. Rejected with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key` and `--model`. |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models, resolving unbuilt upstream models to an existing (production) schema. Inert without `--model`. Transformation models only. Rejected with `--dag`. See the note below. |
 | `--defer-to <SCHEMA>` | `string` | | Requires `--defer`. Schema every deferred upstream resolves to (catalog and table are kept). Default: each upstream's own target schema. |
-| `--defer-to-state <PATH>` | `PathBuf` | | Saved production state store file the deferred upstreams resolve from. Requires `--defer`; conflicts with `--defer-to`. Each unbuilt upstream a selected model reads resolves to the table the newest successful production run recorded for it. Opened read-only. Refuses before any write when the store is missing, has an incompatible state schema version, or has no recorded table for a needed upstream. See [Defer to a saved production state](/guides/skip-and-defer/#defer-to-a-saved-production-state). |
+| `--defer-to-state <PATH>` | `PathBuf` | | Saved production state store file the deferred upstreams resolve from: the table the newest successful production run recorded for each. Requires `--defer`; conflicts with `--defer-to`. Opened read-only. Refuses before any write when the store is missing, has an incompatible state schema version, or has no recorded table for a needed upstream. See [Defer to a saved production state](/guides/skip-and-defer/#defer-to-a-saved-production-state). |
 | `--defer-run-id <RUN_ID>` | `string` | | Read deferred upstreams only from this production run in the `--defer-to-state` store. Requires `--defer-to-state`. |
-| `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this run, whatever `[run] skip_unchanged` says: skip a transformation model whose logic and every upstream's data appear unchanged. Best effort, not an equivalence guarantee. Non-deterministic SQL and models without provably complete lineage (CTEs, subqueries, `PIVOT`/`UNNEST`, set operations) always rebuild. See [`[run]`](/reference/configuration/#run) for the full eligibility rules. |
+| `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this run, whatever `[run] skip_unchanged` says: skip a transformation model whose logic and every upstream's data appear unchanged. Best effort. Non-deterministic SQL and models without provably complete lineage always rebuild. See [`[run]`](/reference/configuration/#run). |
 | `--force-rebuild` | `bool` | `false` | Force every selected model to build. Bypasses the `--skip-unchanged` gate and the content-addressed column-level skip. Use it after a change the IR hash cannot see, such as a UDF redefinition or a session setting. |
 | `--no-reuse` | `bool` | `false` | Turn off content-addressed reuse for this run, even when `[reuse]` is on. Every content-addressed model builds. Also turns off the `[reuse] column_level` skip. |
 | `--no-prune` | `bool` | `false` | Force a full replication pass: turn off `prune_unchanged` for this run, so every table is copied again. Use it after a manual change to a target. No effect when `prune_unchanged` is off. |
-| `--no-sync-trigger` | `bool` | `false` | Do not start a source sync for this run, even when `[pipeline.NAME.source.discovery.sync] trigger = true`. The run still waits for a sync that is already running. It does not change `sync_trigger` in `rocky discover`; set `trigger = false` in the config for that. See [Fivetran adapter](/reference/adapters/fivetran/#start-a-sync). |
-| `--full-refresh` | `bool` | `false` | Rebuild transformation `incremental` models with `CREATE OR REPLACE TABLE ... AS`. Every `@incremental_filter` becomes `TRUE`, so the table holds the model's full result. Other strategies are unaffected: a `merge` or `delete_insert` model's SQL often selects only recent rows, and rebuilding from it would drop history. The flag also turns off the `--skip-unchanged` gate. |
+| `--no-sync-trigger` | `bool` | `false` | Do not start a source sync for this run, even when `[pipeline.NAME.source.discovery.sync] trigger = true`. The run still waits for a sync already running. See [Fivetran adapter](/reference/adapters/fivetran/#start-a-sync). |
+| `--full-refresh` | `bool` | `false` | Rebuild transformation `incremental` models with `CREATE OR REPLACE TABLE ... AS`. Every `@incremental_filter` becomes `TRUE`. Other strategies are unaffected: a `merge` or `delete_insert` model's SQL often selects only recent rows, and a rebuild would drop history. Also turns off the `--skip-unchanged` gate. |
 | `--refuse-hooks` | `bool` | `false` | Refuse the run when the config defines any `[hook]` command or `[hook.webhooks]` entry that would fire, before anything fires or any model builds. For CI jobs that run a config they do not trust, such as a pull request's `rocky.toml`. Not supported with `--watch`. |
-| `--var <name=value>` | `string` (repeatable) | | Bind a per-run variable for the `@var(name)` / `@var(name, default)` markers in model SQL. Repeat for several. `@var()` resolves at compile time. `${ENV}` resolves while parsing `rocky.toml`. A `@var(name)` with no binding and no default fails to compile, naming the variable. Works with `--dag` and `--watch`. See [`@var()` run variables](/reference/model-format/#var-run-variables). |
-| `--assume-fresh-state` | `bool` | `false` | Disaster recovery only, and audited. Treat a failed download of remote state as a deliberate fresh start, so the run proceeds with an empty ledger and uploads turned back on. Requires a remote `[state]` backend (`s3`, `gcs`, `valkey` or `tiered`). Rejected with `--dag` and `--watch`. Without it, a failed download refuses auto-applies and suppresses the run's state uploads. |
+| `--var <name=value>` | `string` (repeatable) | | Bind a per-run variable for the `@var(name)` / `@var(name, default)` markers in model SQL. A `@var(name)` with no binding and no default fails to compile, naming the variable. Works with `--dag` and `--watch`. See [`@var()` run variables](/reference/model-format/#var-run-variables). |
+| `--assume-fresh-state` | `bool` | `false` | Disaster recovery only, and audited. Treat a failed download of remote state as a deliberate fresh start: the run proceeds with an empty ledger and uploads on. Requires a remote `[state]` backend (`s3`, `gcs`, `valkey` or `tiered`). Rejected with `--dag` and `--watch`. Without it, a failed download refuses auto-applies and suppresses the run's state uploads. |
 | `--parallel <N>` | `integer` | `4` without `--dag` | Models in a topological layer (and partitions of a `time_interval` model) run up to N at a time. Under `--dag` it bounds the pipeline nodes that run at once, with no default (unbounded). It does not bound a replication pipeline's table fan-out, which is `[execution] concurrency` (default 32). DuckDB always runs serially. Snowflake and Databricks parallelize up to N. |
 
 :::caution[`--defer` SQL-rewrite limitation]
@@ -661,24 +564,20 @@ rocky run [flags]
 
 ### Retrying a failed run
 
-`--retry-failed` reruns a failed transformation run. It picks the models again. It keeps no checkpoint, so it is not `--resume`, which stays replication-only.
+`--retry-failed` picks the models again and keeps no checkpoint, so it is not `--resume` (replication only).
 
 ```bash
 rocky run --pipeline shop                 # status_counts fails, customer_orders never starts
 rocky run --pipeline shop --retry-failed  # reruns status_counts and customer_orders
 ```
 
-A model stays out of the retry when the run holds a `success` row for it with the same `sql_hash` as the SQL the model generates now. Every model downstream of a rerun model is rerun too, because it must read the rebuilt table. Rocky rebuilds when it is in doubt:
+A model stays out of the retry when the run holds a `success` row for it with the same `sql_hash` as the SQL it generates now. Every model downstream of a rerun model is rerun too. Rocky rebuilds when in doubt:
 
-- A model whose SQL depends on the warehouse (an incremental model), on `--var` or on a Snowflake warehouse name is always rerun.
-- A model the failed run skipped as unchanged or reused has no `success` row, so it is rebuilt.
-- A retry of a failed retry looks only at the rows of that retry. Models the first run built are rebuilt.
+- A model whose SQL depends on the warehouse (an incremental model), on `--var` or on a Snowflake warehouse name.
+- A model the failed run skipped as unchanged or reused, because it has no `success` row.
+- Models the first run built, when you retry a failed retry.
 
-The retry is recorded under the same pipeline with `retry_of` set to the run it retried. A second `--retry-failed` after a good retry refuses. A retry never counts as the pipeline's latest successful run for `after` and `freshness` schedules, and it does not feed the duration estimate.
-
-`--retry-failed` reads run history from the local state store. With a remote `[state]` backend, run the failed models with `--select`.
-
-### Per-model status
+The retry is recorded under the same pipeline with `retry_of` set. A second `--retry-failed` after a good retry refuses. A retry never counts as the pipeline's latest successful run for `after` and `freshness` schedules, and does not feed the duration estimate. It reads run history from the local state store: with a remote `[state]` backend, use `--select`.
 
 ### Tests during a run
 
@@ -692,7 +591,9 @@ The retry is recorded under the same pipeline with `retry_of` set to the run it 
 
 A `severity = "warning"` test is listed in every mode and never fails a model. The table a failed model wrote stays in place. Nothing is rolled back. Tests run on the table the run wrote, so a `--shadow` or `--branch` run tests the shadow or branch table. A `relationships` test's `to_table` is used as written, so on such a run it checks the branch or shadow table against the `to_table` you named, usually the production parent. `content_addressed` models write no warehouse table and are not tested. The results are saved on the run record, where [`rocky plan promote`](#the-failing-tests-gate) reads them. `rocky test --declarative` is unchanged.
 
-`--output json` carries `model_statuses` when at least one model did not build. It covers transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`). A replication run never has it, even with `--all`. It is a roll-up of `materializations`, `errors`, `model_decisions` and `contained`.
+### Per-model status
+
+`--output json` carries `model_statuses` when at least one model did not build. It covers transformation pipelines and model-only runs (`--model`, `--select`, `--retry-failed`), never a replication run. It rolls up `materializations`, `errors`, `model_decisions` and `contained`.
 
 | Field | Meaning |
 |---|---|
@@ -705,11 +606,11 @@ A fail-fast run (`[resilience] contain_failures = false`) stops at the first fai
 
 ### Recovering replication checkpoints
 
-`--resume` and `--resume-latest` refuse a checkpoint whose planned tables all copied but whose terminal run record is missing, because resuming it would skip the post-copy checks. Incomplete crash checkpoints stay resumable.
+`--resume` and `--resume-latest` refuse a checkpoint whose planned tables all copied but whose terminal run record is missing, because resuming would skip the post-copy checks. Incomplete crash checkpoints stay resumable.
 
-Follow the refusal's route. A matching fresh run copies the targets again, runs the checks and writes a new run record. Rocky then marks the old checkpoint superseded. Matching needs the same target endpoint and a plan that holds every checkpoint target. An old checkpoint alone never fails a fresh run. #2235 stays open for remaining recovery gaps.
+Follow the refusal's route. A matching fresh run copies the targets again, runs the checks, writes a new run record and marks the old checkpoint superseded. Matching needs the same target endpoint and a plan that holds every checkpoint target. #2235 stays open for remaining recovery gaps.
 
-For checkpoints from Rocky 1.75.0 or earlier, set `strategy = "full_refresh"` for the affected tables and run `rocky run --pipeline <name> --no-prune` with no resume flag. Keep full refresh until `rocky state reconcile-watermark --pipeline <name>` sets the cursor from the replacement target's maximum timestamp (`--dry-run` previews it, repeat `--table catalog.schema.table` to select targets). A crash under 1.75.0 or earlier may leave a stale cursor after an INSERT, so the first run after an upgrade may append those rows again. Repair the cursor before that run. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication) for routes, adapters and remote durability limits.
+For checkpoints from Rocky 1.75.0 or earlier, set `strategy = "full_refresh"` for the affected tables and run `rocky run --pipeline <name> --no-prune` with no resume flag. Keep full refresh until `rocky state reconcile-watermark --pipeline <name>` sets the cursor from the replacement target's maximum timestamp (`--dry-run` previews it, repeat `--table catalog.schema.table`). A crash under 1.75.0 or earlier may leave a stale cursor after an INSERT, so repair the cursor before the first run after an upgrade. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication).
 
 ### Contracts on every run
 
@@ -721,19 +622,17 @@ The run checks each contract in the compile that supplies the model SQL, for `--
 - Rocky does not run the models downstream of it.
 - The run exits non-zero. Under `--dag`, the failed node's `error` names the code.
 
-When the source table has no known schema, Rocky cannot infer a declared column type, and the compile reports `I003`. The run reads that source's columns from the warehouse and compiles again. If the warehouse cannot describe the source, the type stays unchecked. With `[contracts] strict = true`, that is `E059` and the run refuses before it writes. A `nullable = false` contract on a column from such a source is `E012`, because Rocky reads an unknown source column as nullable. The run drops the `E012` when the warehouse reports the column as NOT NULL.
+When the source table has no known schema, the compile reports `I003`: Rocky reads that source's columns from the warehouse and compiles again. If the warehouse cannot describe the source, the type stays unchecked, or is `E059` with `[contracts] strict = true` (the run refuses before it writes). A `nullable = false` contract on such a column is `E012`, because an unknown source column reads as nullable. The run drops it when the warehouse reports NOT NULL.
 
 `--contracts <DIR>` replaces the project directory for one run. In the project directory, a contract for a model the compile omits is skipped. In an explicit `--contracts` directory, it is the `W011` warning.
 
 ### Guard one model with a contract
 
-To build one `full_refresh` transformation model and require its contract:
-
 ```bash
 rocky run --pipeline transform --model int_order_lines --contracts contracts -o json
 ```
 
-The directory must hold `int_order_lines.contract.toml`. An error such as `E010` fails the run before Rocky replaces the table, and the failure JSON has no materialization for that model. The guard does not cover a branch or deferred run. It refuses models whose strategy is not `full_refresh`, models that add a `surrogate_key` after compilation, and idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state sync. `I003` means the declared type was not checked. Required-column checks still run.
+The directory must hold `int_order_lines.contract.toml`. An error such as `E010` fails the run before Rocky replaces the table. The guard does not cover a branch or deferred run. It refuses models whose strategy is not `full_refresh`, models that add a `surrogate_key` after compilation, and idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state sync. `I003` means the declared type was not checked. Required-column checks still run.
 
 ### Pipeline Stages
 
@@ -794,35 +693,15 @@ rocky run --filter client=acme
 }
 ```
 
-Run with a governance override file:
+Other forms:
 
 ```bash
 rocky run --filter client=acme --governance-override @overrides/acme.json
-```
-
-Run both replication and model transformations:
-
-```bash
-rocky run --filter client=acme --models models/ --all
-```
-
-Resume the most recent failed replication run from its last checkpoint:
-
-```bash
-rocky run --filter client=acme --resume-latest
-```
-
-Run in [shadow mode](/reference/glossary/). Rocky compares each shadow target with production before it drops the shadow object:
-
-```bash
-rocky run --filter client=acme --shadow
-```
-
-Keep the shadow objects when you need a separate comparison:
-
-```bash
-rocky run --filter client=acme --shadow --keep-shadow
-rocky compare --filter client=acme
+rocky run --filter client=acme --models models/ --all     # replication and models
+rocky run --filter client=acme --resume-latest            # from the last checkpoint
+rocky run --filter client=acme --shadow                   # compare with production, then drop
+rocky run --filter client=acme --shadow --keep-shadow     # keep objects for `rocky compare`
+rocky run --filter client=acme --branch fix_price         # after `rocky branch create fix_price`
 ```
 
 `--keep-shadow` retains objects after a failed verdict too. A write or comparison query error may leave an object whose state Rocky cannot confirm.
@@ -837,29 +716,21 @@ Shadow mode must isolate the run from production. Rocky refuses a shadow or bran
 
 `--shadow` and `--branch` isolate `rocky run` for transformation and replication pipelines. Rocky refuses both on `rocky run --dag` and on quality, snapshot and load pipelines, before it opens an adapter, writes state or claims an idempotency key. See [Shadow mode](/concepts/shadow-mode/).
 
-Or run against a named branch:
-
-```bash
-rocky branch create fix_price --description "testing reprice migration"
-rocky run --filter client=acme --branch fix_price
-```
-
-Run in watch mode for the inner-loop developer workflow, where every save re-materializes the pipeline against the local DuckDB warehouse:
+Watch mode re-materializes the pipeline on every save, for the inner loop on a local DuckDB warehouse:
 
 ```bash
 rocky run --watch
 ```
 
-`--watch` watches the parent directory of `rocky.toml` (filtered to that file) and the models directories recursively:
+`--watch` watches `rocky.toml` and the models directories recursively:
 
-- With `--models <dir>`, it watches that directory when it exists.
-- Without `--models`, it watches each transformation pipeline's models directory, or only the `--pipeline` one. The directory is the part of the `models` glob before the first wildcard, so `models/**` and `models/*.sql` both give `models/`.
-- A directory is watched once. If the pipeline's directory is the `rocky.toml` directory (`models = "./*.sql"`), it is watched once, recursively. If that watch fails (for example the Linux inotify limit), Rocky warns and watches `rocky.toml` only.
-- A file under a directory that starts with `.` (`.git`, `.venv`), or is `target` or `node_modules`, does not start a re-run.
+- With `--models <dir>`, that directory if it exists. Otherwise each transformation pipeline's models directory (or only the `--pipeline` one): the part of the `models` glob before the first wildcard, so `models/**` and `models/*.sql` both give `models/`.
+- A directory is watched once. If the watch fails (for example the Linux inotify limit), Rocky warns and watches `rocky.toml` only.
+- A file under a directory that starts with `.`, or is `target` or `node_modules`, does not start a re-run.
 - A directory that does not exist at startup, or a pipeline added later, is watched only after a restart.
-- A replication pipeline runs models only with `--all` or `--models`. Otherwise, and for a quality or snapshot pipeline, only an edit to `rocky.toml` re-runs it. A load pipeline's `source_dir` is not watched. At startup, `--watch` prints a line saying so.
+- A replication pipeline runs models only with `--all` or `--models`. Otherwise, and for a quality or snapshot pipeline, only an edit to `rocky.toml` re-runs it. A load pipeline's `source_dir` is not watched. `--watch` prints a line saying so.
 
-Atomic-rename saves (vim's `:w`, VSCode) trigger correctly on macOS. Banner lines go to `stderr`. With `--output json`, each iteration emits one `RunOutput` object on `stdout` (newline-delimited).
+Banner lines go to `stderr`. With `--output json`, each iteration emits one `RunOutput` object on `stdout` (newline-delimited).
 
 ### Related Commands
 
@@ -945,8 +816,8 @@ A model can inherit `time_column` from `_defaults.toml` or the project `[freshne
 - Run history records a model build under its bare target table name. Two models whose targets share a name in different schemas share history, so for a model with no `time_column` the newer build can hide a stale one. Set a `time_column`.
 - With `[state] namespacing = "pipeline"`, the state-store fallback reads the global state file and may find no build.
 - Exit `1` covers a stale check and a command failure (such as a config that does not load). A command failure prints no JSON report.
-- A load time with no time zone is read as UTC. A SQL Server `DATETIME` filled with `GETDATE()` is off by the zone offset: fill it with `SYSUTCDATETIME()` or use `DATETIMEOFFSET`.
-- Snowflake temporal cells arrive as epoch numbers and are decoded as such, following the documented SQL API format. This is not yet verified against a live account.
+- A load time with no time zone is read as UTC. Fill a SQL Server `DATETIME` with `SYSUTCDATETIME()`, not `GETDATE()`, or use `DATETIMEOFFSET`.
+- Snowflake temporal cells arrive as epoch numbers and are decoded as such. This is not yet verified against a live account.
 
 ### Flags
 
@@ -1012,15 +883,7 @@ rocky branch promote <name> --plan <plan-id> [--pipeline <name>]   # canonical: 
 
 Branch names accept 1–64 `[A-Za-z0-9_]` characters. Rocky refuses other characters at the command entry point and suggests underscores. The default schema prefix is `branch__<name>`. Deleting a branch removes its state-store entry but leaves its warehouse tables.
 
-**Target names.** `branch promote` quotes each name in the strategy's `CREATE OR REPLACE TABLE` or `VIEW` statement. Quoting is not escaping, so promote refuses a name that contains the warehouse's identifier quote and names the character.
-
-| Warehouse | Identifier quote | Also refused |
-|---|---|---|
-| DuckDB, Snowflake, Trino | `"` | |
-| Databricks | `` ` `` | |
-| BigQuery | `` ` `` | `\` (BigQuery reads escape sequences, so a trailing backslash consumes the closing quote) |
-
-A hyphen or a dot passes this check. Two limits sit outside it. A transformation model that takes its schema from its group's `schema_template` must follow `[A-Za-z0-9_]`, and a hyphen or dot is refused while Rocky builds the plan. Promote also refuses a plan in which two steps replace the same production table. The check runs when a promote plan is built and when it is applied.
+**Target names.** `branch promote` refuses a name that contains the warehouse's identifier quote, and names the character: `"` for DuckDB, Snowflake and Trino, `` ` `` for Databricks, `` ` `` and `\` for BigQuery (a trailing backslash consumes the closing quote). A hyphen or a dot passes. A transformation model whose schema comes from its group's `schema_template` must follow `[A-Za-z0-9_]`: Rocky refuses a hyphen or dot while it builds the plan. Promote also refuses a plan in which two steps replace the same production table, when it builds and when it applies the plan.
 
 ### `branch compare` flags
 
@@ -1079,16 +942,8 @@ rocky branch create fix_price --description "testing reprice migration"
 
 ```bash
 rocky run --filter client=acme --branch fix_price
-rocky branch delete fix_price
+rocky branch compare fix_price [--pipeline shopify_us]   # row counts and schemas against production
 ```
-
-Diff a branch's materialized tables against production (row counts + schemas):
-
-```bash
-rocky branch compare fix_price
-rocky branch compare fix_price --pipeline shopify_us   # multi-pipeline project
-```
-
 This is `rocky compare` pointed at the branch's `schema_prefix`, the same mechanism `rocky run --branch` uses for writes.
 
 When Rocky confirms that production has no target, it reports `verdict: "no_baseline"`. That target does not fail the run. An uncertain metadata read reports `verdict: "error"` and fails the command. Its unreadable row count is `null`, never `0`. See [`rocky compare`](/reference/cli/#rocky-compare).
