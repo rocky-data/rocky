@@ -905,6 +905,34 @@ mod tests {
             "regenerate data/duckdb_functions.txt; missing: {missing:?}"
         );
     }
+    /// The list follows the 2.0.1 autoload table, both ways: names 2.0.1 added
+    /// are accepted and names 2.0.1 removed are refused.
+    #[test]
+    fn the_duckdb_list_tracks_the_autoload_table_of_2_0_1() {
+        for name in [
+            "iceberg_partitions",
+            "s3_buckets",
+            "parquet_page_index",
+            "st_asgrid",
+            "__aws__cloudformation__stack__create",
+        ] {
+            assert!(FunctionDialect::DuckDb.knows(name), "{name} must be known");
+        }
+        for name in [
+            "__aws__cloudformation__quack_on_ec2__create",
+            "__aws__cloudformation__quack_on_ec2__destroy",
+            "__aws__cloudformation__quack_on_ec2__list",
+            "__aws__cloudformation__quack_on_ec2__status",
+            "odbc_bind_params",
+            "odbc_create_params",
+        ] {
+            assert!(
+                !FunctionDialect::DuckDb.knows(name),
+                "{name} must be refused"
+            );
+        }
+    }
+
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
     use std::path::PathBuf;
 
