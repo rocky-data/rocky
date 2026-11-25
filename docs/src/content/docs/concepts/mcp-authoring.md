@@ -129,7 +129,7 @@ One case sits below the envelope. A request that fails to parse before the tool 
 
 ## What leaves your environment
 
-- `ai_contract` sends aggregate statistics only (null rates, distinct counts, ranges), never raw cell values.
+- `ai_contract` over MCP sends counts only (null rate, distinct count). It never sends min/max or sample values. The CLI's `--with-data` opt-in, which sends them, is not exposed over MCP.
 - The other generators send the model's SQL and schema to the model behind your key.
 - `governance_preview`, `drift_preview` and the verify-and-ground tools never call a language model. `sample_rows` and `profile_column` read your warehouse to inform the *agent*. Whether that reaches a model depends on your client and prompts.
 

@@ -172,7 +172,7 @@ region = "emea"         # fills {region} -> schema "mart_emea"
 
 Three layers can set the same field. The nearest one to the model wins: the model's sidecar, then `models/groups/<name>.toml`, then `models/_defaults.toml`.
 
-A `group` naming no definition fails the load, and so does a `schema_template` placeholder the model does not supply. A model that pins its own `schema` bypasses the template, so it must **not** also supply `[args]`: pin a schema *or* supply args, never both.
+A `group` naming no definition fails the load, and so does a `schema_template` placeholder the model does not supply. A group owns a model's `schema` only when the group sets `schema_template`. A model that pins its own `schema` bypasses the template, so it must **not** also supply `[args]`: pin a schema *or* supply args, never both.
 
 A group file may carry `schema_template`, `strategy`, `tags`, `governance`, `enforce`, and `[owner]` (`name`, `email`; see [Model governance](/concepts/model-governance/#ownership-groups-and-owners)). Rocky rejects an unrecognized key at load. The model loader does not recurse, so it never reads `models/groups/` as model files.
 

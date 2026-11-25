@@ -256,7 +256,7 @@ A plan file cut part-way is refused at apply. Cancel reaches only jobs this serv
 - **It cannot apply or run an archive plan.** Archive deletes rows and then vacuums with no retention window, so it cannot be undone. The plan screen shows no Apply button for an archive plan, and the server answers `409 archive_apply_terminal_only` to `POST /api/v1/jobs/apply` for one. `rocky archive` stays in a terminal. Apply the plan there with `rocky apply <plan-id>`.
 - **It cannot sign a branch approval.** Sign it in a terminal with `rocky branch approve <branch>`.
 - **It cannot know the spec digest for you.** A product-bound plan applies only with a digest you type, and the digest must come from the approval.
-- **It cannot change policy.** The Governance screens report decisions, and `/api/v1/policy` reads the rules back. The rules live in the `[policy]` block of `rocky.toml`. `rocky policy freeze` and `rocky policy unfreeze` are the CLI's only policy writes.
+- **It cannot edit policy rules.** The Governance screens report decisions, and `/api/v1/policy` reads the rules back. The rules live in the `[policy]` block of `rocky.toml`. The only policy writes are `rocky policy freeze` and `rocky policy unfreeze`. In operator mode the page runs them for you (see [Freeze and unfreeze](#freeze-and-unfreeze)).
 
 ## How the server protects the page
 
