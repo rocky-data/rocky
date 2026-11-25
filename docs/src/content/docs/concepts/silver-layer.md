@@ -5,39 +5,21 @@ sidebar:
   order: 3
 ---
 
-The silver layer is where you write your own SQL transformations. A model is one SQL query plus a TOML file. The TOML declares the model's dependencies, its materialization strategy, and its target table.
-
-:::tip[Models are plain SQL]
-Rocky models are plain SQL files. Dependencies and materialization live in a sidecar TOML file. Your `.sql` is what the warehouse sees.
-:::
+The silver layer is where you write your own SQL transformations. A model is one SQL file plus a TOML file that declares its dependencies, materialization strategy and target table. Your `.sql` is what the warehouse sees.
 
 ```
-  models/fct_orders.sql     the query you wrote
-  models/fct_orders.toml    name, depends_on, strategy, target
-            │
-            │ rocky run
-            ▼
-  ┌─────────────────────────────────────────────────────┐
-  │ the strategy decides the statement                  │
-  │   full_refresh → CREATE OR REPLACE TABLE …          │
-  │   merge        → MERGE INTO … USING (…)             │
-  │   … and the other strategies listed below           │
-  └──────────────────────────┬──────────────────────────┘
-                             ▼
-           acme_warehouse.analytics.fct_orders
+  models/fct_orders.sql   the query you wrote
+  models/fct_orders.toml  name, depends_on, strategy, target
+       │ rocky run: the strategy decides the statement (full_refresh → CREATE OR REPLACE TABLE …, merge → MERGE INTO …)
+       ▼
+  acme_warehouse.analytics.fct_orders
 ```
 
 ## Model formats
 
 ### Sidecar format (recommended)
 
-Each model is two files with the same base name:
-
-```
-models/
-├── fct_orders.sql    # Pure SQL; opens cleanly in any SQL editor
-└── fct_orders.toml   # Configuration
-```
+Each model is two files with the same base name: `models/fct_orders.sql` (pure SQL) and `models/fct_orders.toml` (configuration).
 
 ### Inline format (legacy)
 
@@ -85,11 +67,10 @@ unique_key = ["customer_id"]
 update_columns = ["name", "email", "updated_at"]
 ```
 
-## Example: sidecar model
-
-**models/fct_orders.toml**
+## Examples
 
 ```toml
+# models/fct_orders.toml
 name = "fct_orders"
 depends_on = ["stg_orders", "dim_customers"]
 
@@ -102,51 +83,25 @@ schema = "analytics"
 table = "fct_orders"
 ```
 
-**models/fct_orders.sql**
-
 ```sql
-SELECT
-    o.order_id,
-    o.customer_id,
-    c.customer_name,
-    o.total_amount,
-    o.order_date
+-- models/fct_orders.sql
+SELECT o.order_id, o.customer_id, c.customer_name, o.total_amount, o.order_date
 FROM acme_warehouse.staging__us_west__shopify.orders o
-JOIN acme_warehouse.analytics.dim_customers c
-    ON o.customer_id = c.customer_id
+JOIN acme_warehouse.analytics.dim_customers c ON o.customer_id = c.customer_id
 WHERE o.order_date >= '2024-01-01'
 ```
 
-## Example: merge model
-
-```toml
-# models/dim_customers.toml
-name = "dim_customers"
-depends_on = ["stg_customers"]
-
-[strategy]
-type = "merge"
-unique_key = ["customer_id"]
-
-[target]
-catalog = "acme_warehouse"
-schema = "analytics"
-table = "dim_customers"
-```
-
-Rocky wraps the model's `SELECT` in `MERGE INTO ... USING (...) AS source ON target.customer_id = source.customer_id`. See [SQL Generation](/concepts/sql-generation/#merge-upsert).
+For a merge model, set `type = "merge"` and `unique_key = ["customer_id"]`. Rocky wraps the `SELECT` in `MERGE INTO ... USING (...) AS source ON target.customer_id = source.customer_id`. See [SQL Generation](/concepts/sql-generation/#merge-upsert).
 
 ## Materialization strategies
 
-A model takes one of these `[strategy] type` values. The
-[strategy examples](/reference/model-format/#strategy-examples) in the model
-format reference show each one in full.
+A model takes one `[strategy] type`. The [strategy examples](/reference/model-format/#strategy-examples) show each in full.
 
 | Strategy | When to use | Known warehouse limits |
 |---|---|---|
-| [`full_refresh`](#full_refresh-default) | Small tables, complex transforms, guaranteed consistency | — |
-| [`incremental`](#incremental) | Append only the rows newer than the watermark | — |
-| [`merge`](#merge) | SCDs, upserts by key | Not on Trino or ClickHouse |
+| `full_refresh` (default) | Small tables, complex transforms, guaranteed consistency | — |
+| `incremental` | Append only the rows newer than the watermark | — |
+| `merge` | SCDs, upserts by key | Not on Trino or ClickHouse |
 | `delete_insert` | Rewrite the rows that match a partition key | — |
 | [`time_interval`](/concepts/time-interval/) | Partition-keyed reprocessing with `@start_date` / `@end_date` | — |
 | `microbatch` | `time_interval` with hourly defaults | — |
@@ -157,17 +112,9 @@ format reference show each one in full.
 | [`content_addressed`](/concepts/content-addressed/) | Hash-named Parquet files with a Delta log commit | See its page |
 | `snapshot` | Keep row history (SCD Type 2) | See the model format reference |
 
-### full_refresh (default)
+`full_refresh` rebuilds the table every run with `CREATE OR REPLACE TABLE target AS SELECT ...`. Each strategy's statement is in [SQL Generation](/concepts/sql-generation/#transformation-sql).
 
-Rocky rebuilds the whole table on every run with `CREATE OR REPLACE TABLE target AS SELECT ...`.
-
-### incremental
-
-A silver model loads only rows newer than its target's watermark. Declare the watermark column with `timestamp_column`, and put `@incremental_filter` where the filter belongs in the SQL. Rocky resolves the placeholder to `TRUE` on the first run and on `rocky run --full-refresh`. On every later run it becomes a comparison with `MAX(<watermark>)` read from the target. A model with no watermark is refused with `E037`. See [Incremental](/reference/model-format/#incremental). In the [bronze layer](/concepts/bronze-layer/), `incremental` copies source tables and filters on a watermark in the state store.
-
-### merge
-
-Rocky upserts by unique key. See [SQL Generation](/concepts/sql-generation/#merge-upsert).
+**incremental.** A silver model loads only rows newer than its target's watermark. Declare the column with `timestamp_column` and put `@incremental_filter` where the filter belongs in the SQL. Rocky resolves it to `TRUE` on the first run and on `rocky run --full-refresh`. Later it becomes a comparison with `MAX(<watermark>)` read from the target. A model with no watermark is refused with `E037`. See [Incremental](/reference/model-format/#incremental). In the [bronze layer](/concepts/bronze-layer/), `incremental` filters on a watermark in the state store instead.
 
 ## Validation
 

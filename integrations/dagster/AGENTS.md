@@ -58,8 +58,7 @@ tests/
 - Python 3.11+, `from __future__ import annotations` in all modules
 - Pydantic `BaseModel` for data structures (not dataclasses/TypedDicts)
 - Type hints on public functions
-- Line length: 100 characters
-- Ruff rules: E, F, I, N, UP, B, SIM
+- Line length 100. Ruff rules: E, F, I, N, UP, B, SIM
 
 ### Dependencies
 
@@ -68,27 +67,12 @@ The version floors are in `pyproject.toml`. Read them there; do not copy them he
 - `rocky-sdk` — the typed client this package wraps (release it first when the floor rises)
 - `dagster`, `pydantic`, `pygments` (error display). Dev: `pytest`, `ruff`
 
-## Common Commands
+## Commands
 
-```bash
-# Setup
-uv sync --dev
-git config core.hooksPath .git-hooks
+Setup, hooks, lint, format and build commands: [`DEVELOPMENT.md`](DEVELOPMENT.md#common-commands). Two rules:
 
-# Test
-uv run pytest -v                              # All tests
-uv run pytest tests/test_types.py -v          # Single file
-uv run pytest tests/test_types.py::test_parse_discover -v  # Single test
-
-# Lint & Format
-uv run ruff check src/ tests/                 # Lint
-uv run ruff check --fix src/ tests/           # Auto-fix
-uv run ruff format src/ tests/                # Format
-uv run ruff format --check src/ tests/        # Own CI gate (pytest green ≠ format green)
-
-# Build
-uv build                                      # Build wheel + sdist
-```
+- Run one test with `uv run pytest tests/test_types.py::test_parse_discover -v`.
+- Run `uv run ruff format --check src/ tests/` before you push. It is its own CI gate: pytest green does not mean format green.
 
 ## Testing
 
@@ -100,7 +84,7 @@ All tests run without the Rocky binary or credentials. They use hand-crafted dic
 
 ## Git Conventions
 
-Follow "Git conventions" in the root `../../AGENTS.md`. Scope: `feat(dagster)`. Hooks in `.git-hooks/`: pre-commit (ruff), commit-msg (conventional commit validation), pre-push (pytest).
+Follow "Git conventions" in the root `../../AGENTS.md`. Scope: `feat(dagster)`. Install the shared hooks from the monorepo root with `just install-hooks` (see [`DEVELOPMENT.md`](DEVELOPMENT.md#git-hooks)).
 
 ## Key Design Decisions
 

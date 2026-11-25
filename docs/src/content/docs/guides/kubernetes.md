@@ -9,7 +9,7 @@ The repository ships a Helm chart at [`deploy/helm/rocky/`](https://github.com/r
 
 ## Install
 
-You create the Secret. The chart never creates one and accepts no secret value, so nothing secret reaches `helm template` output, the release state, or your shell history.
+You create the Secret. The chart creates none and accepts no secret value, so no secret reaches `helm template` output, release state or shell history.
 
 ```bash
 kubectl create namespace rocky
@@ -30,11 +30,9 @@ kubectl port-forward -n rocky svc/rocky 8080:8080
 
 ## Put your project on the volume
 
-The chart does not deliver your project. The image mounts it at `/data`, so `/data/rocky.toml` and `/data/models/` must exist. The state store is written to `/data/models/.rocky-state.redb` and the scheduler's files to `/data/.rocky/`, so both live on the volume by construction.
+The chart does not deliver your project. `/data/rocky.toml` and `/data/models/` must exist. The state store (`/data/models/.rocky-state.redb`) and the scheduler's files (`/data/.rocky/`) live on the volume by construction.
 
-Two ways. Pick one.
-
-**An init container that clones it.** The right answer when the project lives in git, because a new pod always starts from the repository.
+**An init container that clones it.** Use this when the project lives in git: a new pod always starts from the repository.
 
 ```yaml
 initContainers:
@@ -49,14 +47,7 @@ initContainers:
 **A pre-populated volume.** Copy the project in once, before the server needs it.
 
 :::caution
-`kubectl cp` into the Rocky pod does not work. `kubectl cp` runs `tar` inside the target container, and the Rocky image is distroless — it has no `tar`, no shell, and no package manager.
-
-```
-$ kubectl cp ./my-project rocky/rocky-0:/data
-OCI runtime exec failed: exec: "tar": executable file not found in $PATH
-```
-
-Copy through a throwaway pod that mounts the same claim and does have `tar`:
+`kubectl cp` into the Rocky pod fails (`exec: "tar": executable file not found`): it runs `tar` in the target container, and the distroless image has no `tar` or shell. Copy through a throwaway pod that mounts the same claim and does have `tar`:
 
 ```bash
 kubectl run loader -n rocky --image=busybox:1.36 --restart=Never \
@@ -72,12 +63,12 @@ kubectl delete pod loader -n rocky
 kubectl rollout restart deploy/rocky -n rocky
 ```
 
-The `chown` matters. The copy arrives owned by root, and the server runs as uid 65532 and must write the state store under `models/`.
+The `chown` matters: the copy arrives owned by root, and the server runs as uid 65532.
 :::
 
 ## What the chart refuses
 
-Every refusal prints the reason. A schema can say a value is wrong; it cannot say why, so each rule lives in one place — the template that can explain itself.
+Every refusal prints its reason.
 
 | Setting | Refused | Why |
 |---|---|---|
@@ -93,19 +84,11 @@ Every refusal prints the reason. A schema can say a value is wrong; it cannot sa
 
 ### The stop grace must cover the kill grace
 
-On shutdown the server waits `--drain-timeout-seconds` (default 60) for a running scheduled child. A child still running then is **not** killed at once: it gets its own `SIGTERM` and a **further fixed 60 seconds** before `SIGKILL`.
-
-```
-  drain the child   --drain-timeout-seconds, default 60
-  then SIGTERM it   a further 60s, fixed, not configurable
-  worst case        120s with the defaults
-```
-
-The chart defaults to 125 and refuses anything at or below `drainTimeoutSeconds + 60`, printing the arithmetic for your value.
+On shutdown the server waits `--drain-timeout-seconds` (default 60) for a scheduled child, then sends it `SIGTERM` and waits a **further fixed 60 seconds** before `SIGKILL`. See [Stop and drain](/guides/run-the-image/#stop-and-drain). The chart defaults to 125 and refuses anything at or below `drainTimeoutSeconds + 60`, printing the arithmetic.
 
 ### Name the storage class yourself
 
-The contract's locking claims hold on **block** storage. An advisory `flock` on NFS or other network storage is unprobed, and `ReadWriteOnce` is an access mode, not proof of the filesystem underneath. The chart will not guess from the cluster default. Name a block-backed class, or point `persistence.existingClaim` at a claim you made deliberately.
+The contract's locking claims hold on **block** storage. An advisory `flock` on NFS or other network storage is unprobed, and `ReadWriteOnce` does not prove the filesystem. Name a block-backed class, or point `persistence.existingClaim` at a claim you made deliberately.
 
 ### One scheduler, chosen once
 
@@ -117,41 +100,31 @@ The contract's locking claims hold on **block** storage. An advisory `flock` on 
   disabled   neither
 ```
 
-The advisory lock on `.rocky/tick.lock` does not make two of them safe. That lock is contention avoidance, not the correctness boundary: correctness lives in the claim state machine, and the contract's rule stands regardless.
-
-In `cron` mode the CronJob mounts the same claim as the Deployment. On a multi-node cluster a `ReadWriteOnce` claim pins both to one node.
+The advisory lock on `.rocky/tick.lock` does not make two safe: it avoids contention, and correctness lives in the claim state machine. In `cron` mode the CronJob mounts the same claim as the Deployment, so on a multi-node cluster a `ReadWriteOnce` claim pins both to one node.
 
 ## The health probe is shallow
 
-Both probes use `/api/v1/health`, which is exempt from the bearer token and from the host check. It answers as soon as the listener is bound, which happens after the startup sweep **attempt**.
-
-It does **not** prove the sweep succeeded, that the project compiled, that the state store is readable, or that the scheduler is making progress. A project that fails to compile still answers `ok`. The chart's probe thresholds are conservative on purpose: a failed liveness probe restarts the pod, and a restart during a scheduled run is the loss window the contract describes.
+Both probes use `/api/v1/health`, exempt from the bearer token and the host check. It answers once the listener is bound, after the startup sweep **attempt**. It does **not** prove the sweep succeeded, the project compiled, the state store is readable or the scheduler is progressing: a project that fails to compile still answers `ok`. The thresholds are conservative on purpose, because a restart during a scheduled run is the loss window the contract describes.
 
 ## The browser UI
 
-`serve.ui.enabled` defaults to `true`. The chart's default image is its `appVersion`, so it serves the page at `/ui/`. Set it to `false` for the API alone. With `scheduling.mode=resident` the UI also needs `existingSecret.webhookSecretKey`: the page is handed a read-only token, and the scheduler's webhook route must not be reachable with it.
+`serve.ui.enabled` defaults to `true` and serves the page at `/ui/` (the default image is the chart's `appVersion`). Set it to `false` for the API alone. With `scheduling.mode=resident` the UI also needs `existingSecret.webhookSecretKey`, so the scheduler's webhook route is not reachable with the page's read-only token.
 
-With the UI on, the Ingress host is passed as `--allowed-host` and a request carrying any other `Host` is refused `421`. Note that a foreign host usually never reaches Rocky at all: it matches no Ingress rule, so the controller's own default backend answers `404` first.
+With the UI on, the Ingress host is passed as `--allowed-host` and any other `Host` is refused `421`. A foreign host usually never reaches Rocky: it matches no Ingress rule and the controller's default backend answers `404`.
 
 ## Upgrade and roll back
 
-`helm upgrade` replaces the pod in place on the same claim. The volume carries the run history, the watermarks and the scheduler's cursors, so they survive the replacement. The PVC the chart creates is annotated `helm.sh/resource-policy: keep`, so uninstalling the release does not delete your project or its history.
+`helm upgrade` replaces the pod in place on the same claim, which carries the run history, watermarks and scheduler cursors. The chart's PVC is annotated `helm.sh/resource-policy: keep`, so uninstalling does not delete your project or its history.
 
 :::caution[A reinstall adopts the old volume]
-That annotation cuts both ways. `helm uninstall` leaves the claim behind, so installing again with the same release name in the same namespace **adopts it**, with the previous project and the previous state store still on it.
-
-That is usually what you want — it is why the annotation is there. It is a surprise when you meant to start clean. To start clean, delete the claim yourself:
+`helm uninstall` leaves the claim, so installing again with the same release name and namespace **adopts it**, with the old project and state store. To start clean, delete the claim (the run history goes with it):
 
 ```bash
 helm uninstall rocky -n rocky
-kubectl delete pvc rocky -n rocky     # the run history goes with it
+kubectl delete pvc rocky -n rocky
 ```
 
-Check what is there before you reinstall:
-
-```bash
-kubectl get pvc -n rocky
-```
+Run `kubectl get pvc -n rocky` before you reinstall.
 :::
 
 Rolling back across a state-schema change follows the same rules as any other deployment. The [deployment contract](/advanced/deployment-contract/) and the [image guide](/guides/run-the-image/) cover what the engine does and does not promise.

@@ -21,7 +21,7 @@ Only `rocky_source_sensor` sets a `run_key`. Dagster uses it to collapse repeat 
 
 ## Schedules
 
-`build_rocky_schedule()` wraps Dagster's [`ScheduleDefinition`](https://docs.dagster.io/api/dagster/schedules-sensors#dagster.ScheduleDefinition). It takes the same `target=` shape as `rocky_source_sensor()`.
+`build_rocky_schedule()` wraps Dagster's [`ScheduleDefinition`](https://docs.dagster.io/api/dagster/schedules-sensors#dagster.ScheduleDefinition). It takes the same `target=` shape as `rocky_source_sensor()`. The snippets on this page share this setup:
 
 ```python
 import dagster as dg
@@ -29,6 +29,8 @@ from dagster_rocky import (
     RockyResource,
     build_rocky_schedule,
     load_rocky_assets,
+    rocky_eager_automation,
+    rocky_source_sensor,
 )
 
 rocky = RockyResource(config_path="rocky.toml")
@@ -41,11 +43,7 @@ daily_marts = build_rocky_schedule(
     timezone="America/Los_Angeles",
 )
 
-defs = dg.Definitions(
-    assets=rocky_assets,
-    schedules=[daily_marts],
-    resources={"rocky": rocky},
-)
+defs = dg.Definitions(assets=rocky_assets, schedules=[daily_marts], resources={"rocky": rocky})
 ```
 
 ### `build_rocky_schedule(name, cron_schedule, target, ...)`
@@ -72,22 +70,10 @@ Dagster 1.12+ decides when to materialize an asset with an
 Returns `dg.AutomationCondition.eager()`. The asset materializes whenever an upstream dependency updates, after every upstream dependency finishes. Attach it to source replication assets so they refresh when a Fivetran sync completes.
 
 ```python
-import dagster as dg
-from dagster_rocky import (
-    RockyResource,
-    load_rocky_assets,
-    rocky_eager_automation,
-)
-
-rocky = RockyResource(config_path="rocky.toml")
-specs = load_rocky_assets(rocky)
-
 eager_specs = [
     spec.replace_attributes(automation_condition=rocky_eager_automation())
-    for spec in specs
+    for spec in load_rocky_assets(rocky)
 ]
-
-defs = dg.Definitions(assets=eager_specs, resources={"rocky": rocky})
 ```
 
 ### `rocky_cron_automation(cron_schedule, timezone="UTC")`
@@ -105,31 +91,13 @@ spec = dg.AssetSpec(
 
 ## Sensors
 
-`rocky_source_sensor()` builds a Dagster
-[`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition).
-It polls `rocky discover` and emits a `RunRequest` for any source whose connector produced new data since the last tick.
+`rocky_source_sensor()` builds a Dagster [`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition). It polls `rocky discover` and emits a `RunRequest` for any source whose connector produced new data since the last tick.
 
 ```python
-import dagster as dg
-from dagster_rocky import (
-    RockyResource,
-    load_rocky_assets,
-    rocky_source_sensor,
-)
-
-rocky = RockyResource(config_path="rocky.toml")
-rocky_assets = load_rocky_assets(rocky)
-
 # The sensor resolves the resource key "rocky" at evaluation time.
 fivetran_sync_sensor = rocky_source_sensor(
     target=dg.AssetSelection.assets(*[s.key for s in rocky_assets]),
     minimum_interval_seconds=300,  # poll every 5 minutes
-)
-
-defs = dg.Definitions(
-    assets=rocky_assets,
-    sensors=[fivetran_sync_sensor],
-    resources={"rocky": rocky},
 )
 ```
 
@@ -194,21 +162,7 @@ The cursor is JSON-encoded `{source_id: ISO 8601 timestamp}`. State is per sourc
 
 ### Resource injection
 
-`rocky_resource` accepts either form:
-
-- **String key** (default `"rocky"`): Dagster resolves the resource from `context.resources` at evaluation time. Per-deployment overrides and `dg.build_sensor_context(resources={...})` mocks work.
-- **`RockyResource` instance**: the legacy form. The sensor captures it at build time. Use the keyed form in new code.
-
-```python
-# String-key form (recommended)
-sensor = rocky_source_sensor(target=...)
-
-# Custom resource key
-sensor = rocky_source_sensor(rocky_resource="my_rocky", target=...)
-
-# Instance form (legacy, still supported)
-sensor = rocky_source_sensor(rocky_resource=rocky, target=...)
-```
+`rocky_resource` accepts a **string key** (default `"rocky"`), which Dagster resolves from `context.resources` at evaluation time so per-deployment overrides and `dg.build_sensor_context(resources={...})` mocks work, or a **`RockyResource` instance** (legacy: captured at build time). Use the keyed form in new code: `rocky_source_sensor(rocky_resource="my_rocky", target=...)`.
 
 ### Backlog cap
 
@@ -226,42 +180,17 @@ sensor = rocky_source_sensor(
 )
 ```
 
-Before each emit, the sensor counts the in-flight runs tagged `tag_key=<value>`. By default it counts the non-terminal statuses: `QUEUED`, `NOT_STARTED`, `STARTING`, and `STARTED`. Override that set with `BacklogCap.statuses`. If the count is at or above `max_in_flight`, the sensor suppresses the `RunRequest`.
-
-The count covers **this sensor's own runs** only, filtered on the `rocky/sensor=<name>` tag. Pass `BacklogCap(scope_tags={...})` to add exact-match tag filters.
+Before each emit, the sensor counts the in-flight runs tagged `tag_key=<value>`. By default it counts `QUEUED`, `NOT_STARTED`, `STARTING` and `STARTED`. Override that set with `BacklogCap.statuses`. At or above `max_in_flight`, the sensor suppresses the `RunRequest`. The count covers **this sensor's own runs** only (the `rocky/sensor=<name>` tag). Pass `BacklogCap(scope_tags={...})` to add exact-match tag filters.
 
 **The cursor still advances on suppression.** The in-flight run picks up the latest data through Rocky's per-source state. A frozen cursor would retry the same suppressed emit on every tick until the queue drained.
 
 ### Lifecycle hooks
 
-Three optional best-effort callbacks attach metrics, alerts, or audit logs without wrapping the sensor:
+Three optional best-effort callbacks attach metrics, alerts, or audit logs without wrapping the sensor. Each takes a context object: `on_run_request_emitted` gets `EmitContext` (`run_request`, `sources`, `granularity`, `sensor_context`), `on_failed_sources` gets `FailedSourcesContext` (`failed_sources`, `sensor_context`), and `on_skip` gets `SkipContext` (`reason`, `cursor_size`, `sensor_context`).
 
 ```python
-from dagster_rocky import (
-    EmitContext,
-    FailedSourcesContext,
-    SkipContext,
-    rocky_source_sensor,
-)
-
-def record_emit(ec: EmitContext) -> None:
-    # ec.run_request, ec.sources, ec.granularity, ec.sensor_context
-    ...
-
-def alert_failed(fc: FailedSourcesContext) -> None:
-    # fc.failed_sources, fc.sensor_context
-    ...
-
-def gauge_idle(sc: SkipContext) -> None:
-    # sc.reason, sc.cursor_size, sc.sensor_context
-    ...
-
-sensor = rocky_source_sensor(
-    target=...,
-    on_run_request_emitted=record_emit,
-    on_failed_sources=alert_failed,
-    on_skip=gauge_idle,
-)
+sensor = rocky_source_sensor(target=..., on_run_request_emitted=record_emit,
+                             on_failed_sources=alert_failed, on_skip=gauge_idle)
 ```
 
 - **Best-effort.** Raised exceptions are caught and logged at WARN. A misbehaving hook never blocks an emit.

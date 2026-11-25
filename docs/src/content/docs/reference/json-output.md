@@ -201,49 +201,12 @@ Returns a complete summary of the pipeline execution.
     "catalogs_created": 1,
     "schemas_created": 2
   },
-  "drift": {
-    "tables_checked": 20,
-    "tables_drifted": 1,
-    "actions_taken": [
-      {
-        "table": "acme_warehouse.staging__us_west__shopify.line_items",
-        "action": "drop_and_recreate",
-        "reason": "column 'status' changed STRING -> INT"
-      }
-    ]
-  },
-  "execution": {
-    "concurrency": 8,
-    "tables_processed": 20,
-    "tables_failed": 0
-  },
-  "metrics": {
-    "tables_processed": 20,
-    "tables_failed": 0,
-    "statements_executed": 45,
-    "retries_attempted": 1,
-    "retries_succeeded": 1,
-    "anomalies_detected": 0,
-    "table_duration_p50_ms": 1200,
-    "table_duration_p95_ms": 4500,
-    "table_duration_max_ms": 8200,
-    "query_duration_p50_ms": 800,
-    "query_duration_p95_ms": 3200,
-    "query_duration_max_ms": 7100
-  },
+  "drift": { "tables_checked": 20, "tables_drifted": 1, "actions_taken": [ { "table": "acme_warehouse.staging__us_west__shopify.line_items", "action": "drop_and_recreate", "reason": "column 'status' changed STRING -> INT" } ] },
+  "execution": { "concurrency": 8, "tables_processed": 20, "tables_failed": 0 },
+  "metrics": { "tables_processed": 20, "statements_executed": 45, "retries_attempted": 1, "table_duration_p50_ms": 1200 /* percentiles, retries, query timings */ },
   "errors": [],
   "anomalies": [],
-  "anomaly_evaluated": [
-    {
-      "table": "acme_warehouse.staging__us_west__shopify.orders",
-      "evaluated": true
-    },
-    {
-      "table": "acme_warehouse.staging__us_west__shopify.line_items",
-      "evaluated": false,
-      "not_evaluated_reason": "no row count was measured for this table, so there is nothing to compare against its history"
-    }
-  ]
+  "anomaly_evaluated": [ { "table": "acme_warehouse.staging__us_west__shopify.orders", "evaluated": true } ]
 }
 ```
 
@@ -300,24 +263,7 @@ A transformation model that fails to compile during a run counts as a failure, n
 
 The schema also carries `attempts`, `bytes_scanned`, `bytes_written`, `started_at` and `tenant` on each entry. See `run.schema.json`.
 
-#### Cross-checking BigQuery cost against `bq show -j`
-
-`job_ids` lets operators reconcile rocky's reported `bytes_scanned` against BigQuery's own job statistics.
-
-```sh
-# Capture the first job id from a run.
-rocky --config rocky.toml run --output json \
-  | jq -r '.materializations[].job_ids[]' \
-  | head -1
-# → bquxjob_5f3c4e2a_19a1b6d3e21
-
-# Fetch the same job via the BigQuery REST API and read the billed bytes.
-bq show -j --location=EU --format=prettyjson bquxjob_5f3c4e2a_19a1b6d3e21 \
-  | jq '.statistics.query.totalBytesBilled'
-# → "10485760"
-```
-
-The number returned by `bq show -j` is the same value the BigQuery console displays under "Bytes billed" and matches `materializations[].bytes_scanned` in rocky's JSON output. `--location` must match the dataset's region (`EU`, `US`, `us-east1`, …): BigQuery jobs are region-scoped and `bq show -j` returns `Not found: Job` if the location is wrong.
+`job_ids` lets operators reconcile `bytes_scanned` against the warehouse console (for BigQuery, `bq show -j --location=<dataset region> <job_id>` and read `statistics.query.totalBytesBilled`).
 
 **`check_results[]`:**
 

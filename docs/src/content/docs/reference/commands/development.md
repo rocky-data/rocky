@@ -278,143 +278,33 @@ The lockfile records the build mode: `compile-only`, `build-empty` or `compiled`
 
 ## `rocky serve`
 
-Start an HTTP server for the project. It answers under `/api/v1` with typed, schema-backed payloads: models, lineage and the DAG, runs and schedules, products, the review queue, and the governor's brief, audit and custody reads. A route that matches a CLI command returns what that command's `--output json` prints. The routes with no CLI counterpart, such as `/models` and `/dag/layers`, have their own shapes. It also runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](#the-browser-ui), and `--scheduler` adds the resident scheduler. The [Embedding guide](/guides/embedding/#serve-api) covers the routes, and the [OpenAPI document](/openapi.json) lists every one.
+Start an HTTP server for the project. It answers under `/api/v1` with typed payloads and runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](/guides/browser-ui/), and `--scheduler` adds the resident scheduler (experimental). Routes, jobs, error codes and the security rules (binding, tokens, host and origin checks, webhook) are in the [Embedding guide](/guides/embedding/#serve-api). The [OpenAPI document](/openapi.json) lists every route.
 
 ```bash
 rocky serve [flags]
 ```
 
-### Security defaults
-
-`rocky serve` binds **`127.0.0.1` (loopback) by default**. Whether a request needs a Bearer token depends on one thing: whether a token is configured.
-
-- **No token configured (the loopback default)** — nothing checks a Bearer token: the middleware passes every request to its handler. Any process on the machine can read model SQL, run history and the governor ledger, and can call the mutating routes. A handler's own checks still apply — a body it cannot parse is `400`, a second `run` while one is in flight is `409`, and the webhook route still verifies its HMAC when `ROCKY_WEBHOOK_SECRET` is set. This is the development posture. It is refused on a non-loopback bind, so a misconfigured network cannot expose the server this way. A web page in a browser on the machine cannot use it either: the host check below refuses its requests.
-- **A token configured** — `--token <secret>`, or the `ROCKY_SERVE_TOKEN` env var. The Bearer check runs on every request whose path is not exempt. Two paths are exempt, whatever the method: `/api/v1/health`, and `/api/v1/hooks/trigger/{pipeline}` (exactly one path segment after the prefix), where the handler verifies an `X-Rocky-Signature` HMAC instead — and accepts an unsigned `POST` only on a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET` (the edge below). Two more things carry no token by design: a CORS preflight (`OPTIONS`) is answered before the check runs, and the browser UI's own files under `/ui/` are public — they carry no data.
-- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires a token**; `rocky serve` refuses to start otherwise. `--ui` requires a read-only token on a non-loopback bind. On a loopback bind with no token configured, `--ui` generates one for the process (see [the browser UI](#the-browser-ui)).
-- **The host check** — on every loopback bind, with or without `--ui`, and on every `--ui` bind, a request whose `Host` is not a loopback name (`localhost`, `127.0.0.1`, `[::1]`, any port), the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. This stops DNS rebinding: a web page cannot point its own domain at `127.0.0.1` and then call `POST /api/v1/jobs/run` on a server with no token. `GET /api/v1/health` skips the check. A non-loopback bind without `--ui` runs no host check: it is reached by names it cannot know, such as a container's service name or a pod IP, and it must carry a token. To reach a loopback server through a reverse proxy that sends its own name as `Host`, pass that name with `--allowed-host`.
-
-A token is full-scope by default: it reaches every route. `--token-scope read-only` narrows it. A read-only token authenticates the same way, then gets `403` on any non-exempt request that is not `GET`, `HEAD`, or `OPTIONS`. Give that token to a browser UI on a shared server, so a leaked token cannot start a run:
-
-```text
-read-only token
-  ├─ GET  /api/v1/dag        → 200
-  ├─ GET  /api/v1/compile    → 200
-  ├─ POST /api/v1/jobs/run   → 403 forbidden_read_only_token
-  └─ POST /api/v1/compile    → 403 forbidden_read_only_token
-```
-
-The check reads the HTTP method, not a list of paths, so a later route with a mutating method is refused at once. It classifies the method, not the handler, so a `GET` that mutates would pass. It covers only routes inside the authenticated router. It does not touch two paths: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
-
-The webhook exemption has three more clauses:
-
-- On a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET`, the route accepts an unsigned `POST` and queues work for the scheduler. No token is involved, so a read-only token does not stop it. This is the dev-convenience path.
-- On a non-loopback bind with no secret, the route is refused: `404 webhook_disabled`. Widening the bind closes the unsigned path.
-- `rocky serve --ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`, because a browser can reach the webhook route.
-
-```text
---scheduler, no ROCKY_WEBHOOK_SECRET:
-  loopback bind          → unsigned POST ACCEPTED   (dev convenience)
-  non-loopback bind      → 404 webhook_disabled     (refused, not unsigned)
-  loopback bind + --ui   → refuses to START
-```
-
-Set `ROCKY_WEBHOOK_SECRET` whenever a browser or an untrusted process can reach the server.
-
-CORS is empty-by-default. Browser apps must declare every allowed origin via `--allowed-origin <ORIGIN>`. Permitted methods: `GET`, `POST`, `OPTIONS`. Permitted headers: `Authorization`, `Content-Type`. CORS authenticates nothing: it decides what a browser may read from a response, and it answers `OPTIONS` before the token check runs.
+The server binds `127.0.0.1` and, with no token, asks no request for one. A non-loopback `--host` requires `--token`. See [Security defaults](/guides/embedding/#security-defaults).
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. When omitted and `rocky.toml` declares a transformation pipeline, the server compiles every transformation pipeline's own `models` set, the same set `GET /api/v1/dag` and `rocky dag` read. If those models cannot be loaded (for example two files with one model name in two pipelines, or a malformed sidecar), the server compiles `models/` alone and reports the load error as a `W014` warning that names the pipeline and file; `/models` and `/dag` then show only `models/` until the error is fixed. If `models/` is absent or has no model, the server answers `engine_not_ready` with the load error instead. A pipeline whose models directory does not exist is not a load error: the other pipelines are still served, and the server adds a `W014` warning naming that pipeline unless it sets `allow_empty_models = true`. When given, only this directory is compiled. |
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. When omitted and `rocky.toml` declares a transformation pipeline, the server compiles every transformation pipeline's own `models` set, the same set `GET /api/v1/dag` and `rocky dag` read. If those models cannot be loaded (for example two files with one model name in two pipelines, or a malformed sidecar), the server compiles `models/` alone and reports the load error as a `W014` warning that names the pipeline and file. If `models/` is absent or has no model, the server answers `engine_not_ready` with the load error. A pipeline whose models directory does not exist is not a load error: the others are still served, with a `W014` warning unless the pipeline sets `allow_empty_models = true`. When given, only this directory is compiled. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
-| `--token <SECRET>` | `String` | | Bearer token. When set, the check runs on every request whose path is not exempt (`/api/v1/health`, and the HMAC-checked webhook route); the UI's own files are public. When unset, no request is asked for a token — see Security defaults. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback, including with `--ui`.** With `--ui` on loopback and no token, the server generates a per-process token: full scope (operator mode), or read-only with `--read-only` or when `--allowed-host`/`--allowed-origin` is given. |
-| `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. The one exception is `--ui` on loopback, which generates a token with that scope. With `--ui` on loopback and `--allowed-host` or `--allowed-origin`, `full` is refused. |
-| `--read-only` | `bool` | `false` | Alias for `--token-scope read-only`. Conflicts with `--token-scope full`. Use it for a view-only UI. |
-| `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
-| `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. On loopback with no token, the server generates one for the process: full scope (operator mode), or read-only with `--read-only`. On any other host, pass `--token` with `--read-only`. A server with `--allowed-host` or `--allowed-origin` is shared, so it stays read-only. Requires `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
-| `--allowed-host <HOST>` | `String` (repeatable) | `[]` | An extra `Host` header value to accept, for a reverse proxy in front of the server. Loopback names and the bind host are always accepted; any other `Host` is refused `421` on a loopback bind or a `--ui` bind (see Security defaults). A non-loopback bind without `--ui` checks no `Host`. With `--ui`, makes the server count as shared, so the UI token stays read-only. |
-| `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. Without `--models`, also watch each transformation pipeline's models directory that exists at startup. A pipeline root that does not exist at startup, or a pipeline added to `rocky.toml` later, is compiled but watched only after a restart. A missing default `models/` is skipped when pipeline roots exist. |
+| `--token <SECRET>` | `String` | | Bearer token. Falls back to `ROCKY_SERVE_TOKEN`. **Required when `--host` is non-loopback, including with `--ui`.** With `--ui` on loopback and no token, the server generates a per-process token: full scope, or read-only with `--read-only` or when `--allowed-host` / `--allowed-origin` is given. |
+| `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD` and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. A scope without a token is an error, except `--ui` on loopback, which generates a token with that scope. With `--ui` on loopback and `--allowed-host` or `--allowed-origin`, `full` is refused. |
+| `--read-only` | `bool` | `false` | Alias for `--token-scope read-only`. Conflicts with `--token-scope full`. |
+| `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist (e.g. `--allowed-origin http://localhost:5173`). With `--ui`, makes the server count as shared, so the UI token stays read-only. |
+| `--allowed-host <HOST>` | `String` (repeatable) | `[]` | An extra `Host` header value to accept, for a reverse proxy in front of the server. With `--ui`, makes the server count as shared. |
+| `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. On loopback with no token, the server generates one for the process: full scope (operator mode), or read-only with `--read-only`. On any other host, pass `--token` with `--read-only`. A shared server stays read-only. Requires `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. See [Open the UI](/guides/browser-ui/#open-the-ui). |
+| `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. Without `--models`, also watch each transformation pipeline's models directory that exists at startup. A pipeline root that does not exist at startup, or a pipeline added later, is compiled but watched only after a restart. A missing default `models/` is skipped when pipeline roots exist. |
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
-| `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only meaningful with `--scheduler`. |
-| `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only meaningful with `--scheduler`. |
-| `--open` | `bool` | `false` | With `--ui`: open the printed address in the default browser once the listener is bound — after the startup sweep, never before. The address, token included, is handed to the system opener (`open`, `xdg-open`, `rundll32`) as an argument, so it is visible in the process list while the opener runs. At full scope, another local OS user could act with it. On a shared machine, pass `--token` and `--read-only`. A missing opener, or one that exits non-zero, is a warning; the server still starts and still prints the address. Refused without `--ui`. |
-
-### The browser UI
-
-`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries (cargo feature `ui`; a plain `cargo build` has no UI and refuses the flag with the build command to run).
-
-On your own machine, `--ui` alone is enough:
-
-```bash
-rocky serve --ui
-# Rocky UI: http://127.0.0.1:8080/login?t=<64 hex characters>
-```
-
-With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a per-process token. It works for every request until the server stops, and each start makes a new one. Once the listener is bound, the server prints the `Rocky UI:` address with the token on stdout, and a note on stderr.
-
-The generated token has full scope. This is operator mode: the UI can run, plan, test, run CI, approve, apply, freeze or unfreeze policy, create a preview, promote a branch (only when `[branch.approval] required = true`), approve a product's spec, and plan and apply a compaction as the OS user who started the server, like the VS Code extension. The stderr note says so. A plan bound to a data product applies only with a spec digest the person types into the page. The page never reads that digest from the plan. For a view-only UI, add `--read-only`. A server with `--allowed-host` or `--allowed-origin` is shared, so it generates a read-only token and refuses `--token-scope full`.
-
-An SSH `-L` tunnel or `kubectl port-forward` to a loopback port cannot be detected: the server still looks local. Use `--read-only` whenever someone else can reach your port. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. The address is also printed on stdout, so it lands in anything that captures stdout (a terminal log, `docker logs`, a service journal) and in browser history. On a shared host, choose the token yourself. Do the same to keep one token across restarts, or to serve on any other host:
-
-```bash
-rocky serve --ui --token s3cret --read-only
-# Rocky UI: http://127.0.0.1:8080/login?t=s3cret
-```
-
-```text
---ui, no --token and no ROCKY_SERVE_TOKEN:
-  loopback, not fronted                 → generates a full token (operator mode)
-  loopback, not fronted, --read-only    → generates a read-only token
-  loopback, fronted                     → generates a read-only token
-  loopback, fronted, scope full         → refuses to start
-  non-loopback bind                     → refuses to start
-("fronted" = --allowed-host or --allowed-origin given)
-```
-
-The rules, each refused at start with its fix:
-
-- `--ui` needs a token. On a non-loopback bind, the token must be read-only and you must pass it. On loopback, a server with a token you gave accepts `full` (or no scope, which means full) unless it is fronted. A fronted server refuses a full-scope token, because writes from the UI need a token for each person. One token can plan, approve and apply, as the CLI user can: approving in the UI is not a second person's sign-off.
-- The printed address is `/login?t=<token>`. The server checks the token and answers `303` to `/ui/` with a session cookie, `rocky_ui_<tag>` (the tag differs per server; `HttpOnly`, `SameSite=Strict`, a session cookie; `Secure` behind a TLS proxy that sends `X-Forwarded-Proto: https`). The cookie holds a keyed hash of the token, so a restart ends every session. The server logs no request URIs, and the answers send `no-store` and `no-referrer`. A reverse proxy may log the query of `/login`: configure it not to. A bad token gets a `401` page with a token field that posts to `POST /login`, which needs an allowed `Origin`.
-- The page and its files are public: they carry no data. Every API call the page makes carries the cookie. A route accepts `Authorization: Bearer <token>` or the cookie. A write by cookie must also carry an `Origin` that names this server exactly (or an `--allowed-origin` entry) and `X-Rocky-UI: 1`, or the answer is `403 ui_write_not_from_ui`. The read-only scope applies to cookie sessions too.
-- With `--ui`, a request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. Both refusals carry the error envelope. The same checks run on a loopback bind without `--ui`; only a non-loopback bind without `--ui` skips them (see Security defaults). `GET /api/v1/health` skips both checks, so a load balancer or a Kubernetes probe that sends the pod IP as `Host` still gets `200`. The route carries no data.
-- Every UI response carries a Content Security Policy that allows scripts, styles, images, fonts and connections from this server only and forbids framing. The page loads nothing from any other host.
-- `--ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`: a browser can reach the webhook route.
-
-A reverse proxy in front of the UI names itself with `--allowed-host proxy.internal`; a page served from another origin lists it with `--allowed-origin https://app.example`.
-
-The [browser UI guide](/guides/browser-ui/) shows what each screen displays.
-
-### Ask the server what it is doing
-
-`GET /api/v1/settings` reports what a running server enforces, not what its start command looked like.
-
-```bash
-curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/v1/settings
-```
-
-It reports the bind host, the CORS allowlist, the `Host` values the host check accepts, whether the scheduler and the UI are on, the token's scope and the state backend. It holds no secret: the token appears as its name and scope, and the webhook secret as `webhook_secret`:
-
-| `webhook_secret` | Meaning |
-|---|---|
-| `present` | Webhook requests must carry a signature. |
-| `absent` | Loopback accepts unsigned requests. Non-loopback answers `404`. |
-| `set_but_unusable` | Blank or not valid UTF-8. `--scheduler` refuses to start. |
-
-The field is reported even when the scheduler is off, so you see what happens when you turn it on.
-
-`state_backend` and `concurrency_control` come from `rocky.toml`. Rocky reads them once, on the first request to this route, and they stay fixed for the life of the process. A plain `rocky serve` reads no file before it binds the listener. The read runs one at a time under a 5 second deadline:
-
-| Status | Meaning |
-|---|---|
-| `503 engine_busy` | Another settings read is in flight. Retry. |
-| `504 settings_config_timeout` | The read blew its deadline, usually a file that will not return. Retrying will not help. |
-
-Both fields are `null` when there was no readable config. `config_status` says why: `loaded`, `absent` (no `rocky.toml`, not a failure) or `unreadable` (present but would not parse; the scheduler skips every tick until it does). A config edited after the first request is not reflected here, but the scheduler re-reads the file every tick.
-
-`allowed_hosts` and `allowed_origins` report what is enforced, not what was typed. `--allowed-host` is a check only on a loopback or `--ui` bind, so the list is empty on a non-loopback bind without `--ui`. An `--allowed-origin` value that is not a valid header value is dropped when the CORS layer is built, and grants nothing.
+| `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only with `--scheduler`. |
+| `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only with `--scheduler`. |
+| `--open` | `bool` | `false` | With `--ui`: open the printed address in the default browser once the listener is bound. The address, token included, goes to the system opener (`open`, `xdg-open`, `rundll32`) as an argument, so other local users can read it in the process list. On a shared machine, pass `--token` and `--read-only`. A missing or failing opener is a warning. Refused without `--ui`. |
 
 ### Examples
 

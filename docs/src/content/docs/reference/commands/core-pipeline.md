@@ -142,24 +142,7 @@ Discover all sources with JSON output:
 rocky discover
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "discover",
-  "sources": [
-    {
-      "id": "connector_abc123",
-      "components": { "tenant": "acme", "regions": ["us_west"], "source": "shopify" },
-      "source_type": "fivetran",
-      "last_sync_at": "2026-03-30T10:00:00Z",
-      "tables": [
-        { "name": "orders", "row_count": null },
-        { "name": "customers", "row_count": null }
-      ]
-    }
-  ]
-}
-```
+The output lists each source (`id`, `components`, `source_type`, `last_sync_at`, `tables`) under `sources`. The full shape is in [JSON output](/reference/json-output/#rocky-discover).
 
 Use `-o table` for a table, and `--pipeline <name>` when the project defines several pipelines.
 
@@ -668,30 +651,7 @@ Run the pipeline for a specific tenant:
 rocky run --filter client=acme
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "run",
-  "filter": "client=acme",
-  "duration_ms": 45200,
-  "tables_copied": 20,
-  "tables_failed": 0,
-  "materializations": [
-    {
-      "asset_key": ["fivetran", "acme", "us_west", "shopify", "orders"],
-      "duration_ms": 2300,
-      "metadata": { "strategy": "incremental", "watermark": "2026-03-30T10:00:00Z" }
-    }
-  ],
-  "check_results": [],
-  "errors": [],
-  "excluded_tables": [],
-  "permissions": { "grants_added": 3, "grants_revoked": 0, "catalogs_created": 0, "schemas_created": 1 },
-  "drift": { "tables_checked": 20, "tables_drifted": 1, "actions_taken": [] },
-  "anomalies": [],
-  "partition_summaries": []
-}
-```
+The output is a `RunOutput`: see [JSON output](/reference/json-output/#rocky-run) for the full shape.
 
 Other forms:
 

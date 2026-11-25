@@ -5,11 +5,7 @@ sidebar:
   order: 7
 ---
 
-Two functions turn the result of a Rocky run into Dagster events. The events
-then appear on the asset in the Dagster UI.
-
-The diagram below maps three `RunResult` fields to the Dagster events they
-produce.
+Two functions turn the result of a Rocky run into Dagster events, which appear on the asset in the Dagster UI. The diagram maps three `RunResult` fields to the events they produce.
 
 ```
 RunResult
@@ -78,10 +74,17 @@ Each event carries whatever metadata the check populated:
 - `not_evaluated`, the reason the check did not run. When it is set, the numbers above are placeholders, not readings.
 - `severity`, a marker present when the check is advisory
 
-Engine check names such as `null_rate:<col>` contain `:` and `.`, which Dagster
-refuses in a check name. `emit_check_results` sanitizes each name. Declare your
-own `AssetCheckSpec` with the sanitized name too. The function is
-`dagster_rocky.contracts.sanitize_check_name`.
+Engine check names such as `null_rate:<col>` contain `:` and `.`, which Dagster refuses in a check name. `emit_check_results` sanitizes each name with `dagster_rocky.contracts.sanitize_check_name`. Declare your own `AssetCheckSpec` with the sanitized name too.
+
+### Freshness checks that Rocky did not measure
+
+Rocky does not always measure freshness (see [Freshness](/concepts/data-quality-checks/#freshness)). In Pipes mode the check is absent, as in the JSON. Outside Pipes mode a configured check has a declared spec, so Dagster adds a placeholder:
+
+| Cause | Placeholder |
+|---|---|
+| The table was pruned (`prune_unchanged`) | It carries forward the last verdict, or passes with a note that it was never checked. |
+| The table was checked and produced no freshness result | It fails at `WARN` severity, marked `not produced by rocky`. |
+| The table was never materialized | It fails at `WARN` severity, with its own reason. |
 
 ## Example
 

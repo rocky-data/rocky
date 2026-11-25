@@ -147,11 +147,7 @@ The groups and their order match `rocky --help`. The core commands come first.
 
 These flags apply to every command. Put `--config`, `--state-path` and `--state-namespace` **before** the subcommand. The other four work before or after it.
 
-```
-rocky --config prod.toml run      # works
-rocky run --config prod.toml      # error: unexpected argument '--config' found
-rocky run --output json           # works: --output is accepted anywhere
-```
+Put the flags before the subcommand where noted: `rocky --config prod.toml run` works, `rocky run --config prod.toml` is an error. `--output` is accepted anywhere.
 
 | Flag | Short | Placement | Default | Description |
 |------|-------|-----------|---------|-------------|
@@ -171,14 +167,6 @@ Rules for `--principal-id`:
 - Precedence: the flag, then `ROCKY_PRINCIPAL_ID`, then `mcp-<profile>` for `rocky mcp`, then `unnamed`. An empty `ROCKY_PRINCIPAL_ID` counts as unset. Any other invalid value is an error.
 - Rocky never reads `$USER` or a CI variable for it.
 - The id is self-asserted. Nothing verifies it, and it does not change what a gate decides.
-
-```bash
-# A custom config and table output
-rocky -c pipelines/prod.toml -o table discover
-
-# A fresh type-check against warehouse metadata
-rocky --cache-ttl 0 compile
-```
 
 ---
 
@@ -240,26 +228,14 @@ rocky load [flags]
 | `--truncate` | off | Empty the target table before each file loads. Read the warning below first. |
 | `--connector <NAME>` | | Run the [child connector](/guides/child-connectors/) `[connector.NAME]` once and load the Parquet files it writes. Cannot be combined with `--source-dir`, `--format`, `--target`, `--pipeline` or `--truncate`. |
 
-```bash
-rocky load --source-dir data/dropbox/ --format parquet
-```
-
 ### Column mapping
 
-Into a table that already exists, the DuckDB loader maps file columns to table columns by name, not by position. Column order in the file does not matter. This holds for Parquet, JSONL and CSV with a header. A header CSV loads with `COPY t ("col", ...)` and the names from its header row, so DuckDB still detects date and timestamp formats. Names match without regard to case.
-
-- A table column the file lacks gets its default, or `NULL`.
-- A file column the table lacks is an error. The message names the column.
-- A CSV with no header has no names. It maps by position: column 1 of the file goes to column 1 of the table.
+Into an existing table, the DuckDB loader maps file columns to table columns by name, not position, without regard to case. This holds for Parquet, JSONL and CSV with a header. A table column the file lacks gets its default, or `NULL`. A file column the table lacks is an error that names the column. A CSV with no header maps by position.
 
 Other warehouses may map differently. Check that adapter's page.
 
 :::caution[`--truncate` empties the target once per file, not once per command]
-Rocky loads the files one at a time, in sorted filename order. `--truncate` deletes every row of the target before each file. When several files share one target table, **only the last file's rows survive**.
-
-Files share one target when you pass `--target <NAME>`, or when the pipeline config sets `target.table`. With neither, each file goes to a table named after the file, and the truncates do not erase each other.
-
-To combine several files into one table, leave `--truncate` off. Empty that table yourself first if you need a clean replacement.
+Rocky loads files one at a time, in sorted filename order, and `--truncate` deletes every row of the target before each file. When several files share one target (`--target <NAME>`, or `target.table` in the pipeline config), **only the last file's rows survive**. To combine several files into one table, leave `--truncate` off and empty the table yourself first.
 :::
 
 A `load` pipeline reads every file it finds on each run. It does not track what it already read. So a `load` pipeline cannot join the [`[pipeline.NAME.schedule]`](/reference/configuration/#pipelinenameschedule) graph, because each scheduled run would duplicate data. `rocky validate` refuses that config with `V044`.
@@ -279,10 +255,6 @@ rocky seed [flags]
 | `--seeds <PATH>` | `seeds` | Directory of `.csv` seed files. |
 | `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
 | `--filter <NAME>` | (all) | Load only the seed with this name. |
-
-```bash
-rocky seed --filter dim_date
-```
 
 An optional `.toml` sidecar beside a CSV sets the target, overrides inferred types, and adds SQL hooks:
 
@@ -426,9 +398,7 @@ rocky completions <shell>
 | `shell` | `bash`, `elvish`, `fish`, `powershell` or `zsh`. |
 
 ```bash
-rocky completions zsh  > ~/.zsh/completions/_rocky
-rocky completions bash > /etc/bash_completion.d/rocky
-rocky completions fish > ~/.config/fish/completions/rocky.fish
+rocky completions zsh > ~/.zsh/completions/_rocky
 ```
 
 ---
@@ -483,27 +453,6 @@ How it behaves:
 | `contracts.parquet` | contract constraint | `model`, `kind` (`column`, `required`, `protected`, `no_new_nullable`, `no_extra_columns`), `column_name`, `type_name`, `nullable` |
 | `sources.parquet` | external table | `name`, `columns_read`, `used_by_count` |
 | `consumers.parquet` | downstream consumer and model it reads | `consumer`, `kind`, `owner`, `url`, `description`, `model` |
-
-```sql
--- Which models read raw.orders.amount, directly or through other models?
-WITH RECURSIVE reach(model, col) AS (
-  SELECT target_model, target_column
-  FROM 'meta/column_lineage.parquet'
-  WHERE source_model = 'raw.orders' AND source_column = 'amount'
-  UNION
-  SELECT l.target_model, l.target_column
-  FROM 'meta/column_lineage.parquet' l JOIN reach r
-    ON l.source_model = r.model AND l.source_column = r.col
-)
-SELECT DISTINCT model FROM reach;
-
--- Columns tagged pii that no test covers.
-SELECT c.model, c.name
-FROM 'meta/columns.parquet' c
-LEFT JOIN 'meta/tests.parquet' t
-  ON t.model = c.model AND t.column_name = c.name
-WHERE c.classification = 'pii' AND t.model IS NULL;
-```
 
 The JSON output reports what was written. `format` is `site`, `html` or `parquet`. `files` lists the files relative to `output_path`.
 

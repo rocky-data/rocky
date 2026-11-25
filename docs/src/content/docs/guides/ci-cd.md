@@ -18,20 +18,7 @@ With no `--models`, the command covers the models of every transformation pipeli
 1. **Compile**: type-check every model, resolve the DAG, validate contracts. When the project has `data/seed.sql`, the types come from the tables it makes.
 2. **Test**: execute each model's SQL against DuckDB in dependency order, on the seed's tables
 
-```
-Rocky CI Pipeline
-
-  Compile: PASS (12 models)
-  Test:    PASS (12 passed, 0 failed)
-
-  Exit code: 0
-```
-
-Exit codes:
-- **0** -- every check passed
-- **1** -- a compilation or test failure
-
-Compile catches type mismatches, missing dependencies and contract violations. Test catches faults that show only when the SQL runs: syntax errors, division by zero, invalid casts.
+Exit `0` means every check passed. Exit `1` means a compilation or test failure. Compile catches type mismatches, missing dependencies and contract violations. Test catches faults that show only when the SQL runs: syntax errors, division by zero, invalid casts.
 
 ### Structural diff against a base ref
 
@@ -109,15 +96,8 @@ rocky apply "$plan_id"
 :::
 
 ```bash
-# PR-time: detect (informational)
-rocky ci-diff --semantic
-
-# Promote-time: gate (blocks on `breaking` findings)
+# Promote-time gate (blocks on `breaking` findings); add --allow-breaking to override (audited)
 plan_id=$(rocky plan promote fix_price --base main --output json | jq -r .plan_id)
-rocky apply "$plan_id"
-
-# Promote-time override (audited)
-plan_id=$(rocky plan promote fix_price --base main --allow-breaking --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 
@@ -176,7 +156,7 @@ rocky-ci:
         - rocky.toml
 ```
 
-To report a compile failure without waiting for tests, split `rocky compile` and `rocky test` into two jobs (stages `compile` and `test`, with `needs: [rocky-compile]` on the second).
+To report a compile failure early, split `rocky compile` and `rocky test` into two jobs (stages `compile` and `test`, `needs: [rocky-compile]` on the second).
 
 ## 4. Using rocky compile for PR Checks
 
@@ -186,12 +166,7 @@ To report a compile failure without waiting for tests, split `rocky compile` and
 rocky compile --models models --contracts contracts
 ```
 
-The compiler catches:
-- **Type mismatches**: a column used as `Int64` in one model and `String` in another
-- **Missing dependencies**: a `depends_on` that names a model which does not exist
-- **Contract violations**: a missing required column, a wrong type, or a removed protected column
-- **DAG cycles**: model A depends on B, and B depends on A
-- **Unresolved references**: SQL that names a table or column Rocky cannot find
+The compiler catches type mismatches (a column `Int64` in one model and `String` in another), a `depends_on` that names a missing model, contract violations, DAG cycles, and SQL that names a table or column Rocky cannot find.
 
 To check one model while you work on it:
 
@@ -217,15 +192,11 @@ rocky ai-test --all --save --models models
 
 This writes one standalone `.sql` assertion per file into `tests/`, a sibling of `models/`. `rocky ci` and `rocky test` do **not** pick them up: they execute your models and any `[[test]]` sidecar blocks, never loose `tests/*.sql` files. Commit them and run them in your own CI step against DuckDB. For gating that Rocky runs itself, declare `[[tests]]` in the model sidecars and run `rocky test --declarative`.
 
-### Generate tests for a single model
-
-```bash
-rocky ai-test revenue_summary --save --models models
-```
+`rocky ai-test revenue_summary --save --models models` generates tests for one model.
 
 ### CI workflow with AI test generation
 
-Generate the tests on a schedule, and open a PR with the result:
+Generate the tests on a schedule and open a PR. Use the same install step as in [Basic setup](#basic-setup):
 
 ```yaml
 name: Update AI Tests
@@ -238,19 +209,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rocky
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
+      # ...install Rocky as in Basic setup...
       - name: Generate Tests
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           rocky ai-explain --all --save --models models
           rocky ai-test --all --save --models models
-
       - name: Create PR
         uses: peter-evans/create-pull-request@v6
         with:
@@ -285,9 +250,6 @@ Every CI command emits structured JSON. The [JSON output reference](/reference/j
 Parse the payload with `jq`:
 
 ```bash
-# Check if any tests failed
 rocky ci -o json | jq -e '.tests_failed == 0'
-
-# Extract error messages
 rocky compile -o json | jq '.diagnostics[] | select(.severity == "Error") | .message'
 ```

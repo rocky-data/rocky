@@ -96,11 +96,6 @@ With both opt-ins set, `rocky run` starts a sync on each selected connector befo
 
 ```toml
 [adapter.fivetran]
-type = "fivetran"
-kind = "discovery"
-destination_id = "${FIVETRAN_DESTINATION_ID}"
-api_key = "${FIVETRAN_API_KEY}"
-api_secret = "${FIVETRAN_API_SECRET}"
 allow_sync_trigger = true            # the key owner's opt-in
 
 [pipeline.bronze.source.discovery.sync]

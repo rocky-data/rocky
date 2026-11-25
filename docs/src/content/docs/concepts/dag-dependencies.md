@@ -5,16 +5,12 @@ sidebar:
   order: 5
 ---
 
-Rocky builds a DAG from your model dependencies, then runs the models in that
-order. A DAG is a directed acyclic graph: nodes with one-way edges and no cycles.
-
-Edges come from two places, merged:
+Rocky builds a DAG from your model dependencies and runs the models in that order. Edges come from two places, merged:
 
 - An explicit `depends_on` list in a model's TOML.
-- A bare table name in the model's SQL that another model writes as its `[target]` table. Rocky infers that edge and reports it as diagnostic `I001`. The read can be anywhere in the query: `FROM` or `JOIN`, a CTE body, a subquery in `FROM`, or a subquery in the `SELECT` list, `WHERE`, `HAVING`, `QUALIFY`, `GROUP BY`, `ORDER BY` or a join condition (`customer_id IN (SELECT customer_id FROM customer_ltv)`). A bare read of a model's name whose target table is spelled differently is not an edge; Rocky reports it as `D012`. A binding by table alone that would close a cycle is dropped and reported as `D013`.
+- A bare table name in the model's SQL that another model writes as its `[target]` table. Rocky infers the edge and reports it as `I001`. The read can be anywhere in the query: `FROM`, `JOIN`, a CTE body, or a subquery in `FROM`, the `SELECT` list, `WHERE`, `HAVING`, `QUALIFY`, `GROUP BY`, `ORDER BY` or a join condition. A bare read of a model's name whose target table is spelled differently is not an edge (`D012`). A binding by table alone that would close a cycle is dropped (`D013`).
 
-Rocky then topologically sorts the merged set. The result is an execution plan
-with layers that run in parallel.
+Rocky then topologically sorts the merged set into layers that run in parallel.
 
 ## Declaring dependencies
 
@@ -29,15 +25,11 @@ depends_on = ["stg_orders", "dim_customers"]
 
 ## Topological sort
 
-Rocky sorts with Kahn's algorithm. The order is deterministic: when several
-models are ready at the same time, Rocky sorts those alphabetically.
+Rocky sorts with Kahn's algorithm. The order is deterministic: models that are ready together sort alphabetically.
 
 ## Execution layers
 
-Rocky groups models into layers. Every model in a layer can run at the same time,
-because earlier layers already satisfied its dependencies.
-
-Take this graph:
+Every model in a layer can run at the same time, because earlier layers satisfied its dependencies. Rocky runs a whole layer at once, waits, then runs the next. Take this graph:
 
 ```
 stg_customers ──→ dim_customers ──┐
@@ -58,19 +50,9 @@ so on.
 
 ### What `--parallel N` bounds
 
-`--parallel N` caps how many nodes run at once. On `rocky run` it defaults to 4.
+`--parallel N` caps how many nodes run at once. On `rocky run` it defaults to 4. Under `rocky run --dag` it applies **only when you pass it**: without it, every node in a layer runs at once.
 
-Under `rocky run --dag` it applies **only when you pass it**. Leave it off and
-every node in a layer runs at once, as it always has.
-
-The flag bounds *nodes*, not warehouse queries. A `--dag` sub-run builds one
-partition at a time, so the number is not multiplied inside a node. But it is
-also not a ceiling on every query. A replication node takes its table fan-out
-from that pipeline's `[execution] concurrency`, which defaults to 32, and
-`--parallel` does not govern that on either path.
-
-So `rocky run --dag --parallel 1` runs one node at a time, and the replication
-node inside it may still copy several tables at once.
+The flag bounds *nodes*, not warehouse queries. A replication node takes its table fan-out from that pipeline's `[execution] concurrency` (default 32), and `--parallel` does not govern that on either path. So `rocky run --dag --parallel 1` runs one node at a time, and the replication node inside it may still copy several tables at once.
 
 ## Validation
 
@@ -79,10 +61,7 @@ connection.
 
 ### Cycle detection
 
-Rocky reports a circular dependency as the set of models in the cycle.
-Models that only read from the cycle are not listed. `rocky compile` reports
-it as [`E058`](/concepts/compiler/#dependency-cycles-e058) and exits `1`. `rocky run --dag` refuses before it runs any node, so no table is
-written.
+Rocky reports a cycle as the set of models in it. Models that only read from the cycle are not listed. `rocky compile` reports [`E058`](/concepts/compiler/#dependency-cycles-e058) and exits `1`. `rocky run --dag` refuses before it runs any node, so no table is written.
 
 ```toml
 # model_a.toml
@@ -111,8 +90,7 @@ depends_on = ["stg_orders", "nonexistent_model"]
 Error: DAG error: unknown dependency 'nonexistent_model' referenced by 'fct_orders'
 ```
 
-When the unknown name is close to a real model name, the message adds a
-`— did you mean '<model>'?` suggestion.
+A close match adds `— did you mean '<model>'?`.
 
 ## External table references
 
@@ -128,11 +106,7 @@ reference is qualified in the SQL.
 
 Rocky reads from an external table. It does not manage, build, or schedule it.
 
-That split is what makes hybrid projects work. A Rocky model can read a table
-another tool produced (a dbt package, a Fivetran connector, a hand-written ETL
-job) without converting or importing it. External tables still show up in
-column-level [lineage](/reference/glossary/#lineage). They are left out of
-execution planning.
+A Rocky model can read a table another tool produced (a dbt package, a Fivetran connector, a hand-written ETL job) without importing it. External tables still appear in column-level [lineage](/reference/glossary/#lineage) and are left out of execution planning.
 
 ```sql
 -- stg_orders is a Rocky model -> DAG dependency
@@ -145,5 +119,4 @@ JOIN dbt_fivetran.stg_facebook_ads__ad_history f
     ON o.campaign_id = f.campaign_id
 ```
 
-See [Read dbt Package Tables](/guides/using-dbt-packages/) for the full
-guide to this pattern.
+See [Read dbt Package Tables](/guides/using-dbt-packages/).

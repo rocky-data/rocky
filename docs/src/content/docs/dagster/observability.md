@@ -5,16 +5,16 @@ sidebar:
   order: 13
 ---
 
-`dagster-rocky` surfaces what Rocky notices while it runs, and records what a run applied. Where each signal lands:
+`dagster-rocky` surfaces what Rocky notices while it runs, and records what a run applied:
 
-- **Schema drift** → `dg.AssetObservation` events on the asset timeline
-- **Row-count anomalies** → `dg.AssetCheckResult` with severity `WARN`
-- **Optimization recommendations** → `AssetSpec.metadata` (load-time)
-- **Plan artifact trail** → `.rocky/plans/<plan-id>.json` per `run_pipes` materialization
+| Signal | Lands as |
+|---|---|
+| Schema drift | `dg.AssetObservation` events on the asset timeline |
+| Row-count anomalies | `dg.AssetCheckResult` with severity `WARN` |
+| Optimization recommendations | `AssetSpec.metadata` (load-time) |
+| Plan artifact trail | `.rocky/plans/<plan-id>.json` per `run_pipes` materialization |
 
-`RockyComponent` emits drift and anomaly events for you. There is nothing
-to wire up. If you hand-roll your own `multi_asset`, call the standalone
-helpers described below.
+`RockyComponent` emits drift and anomaly events for you. If you hand-roll your own `multi_asset`, call the standalone helpers below.
 
 ## Plan artifact per materialization
 
@@ -37,27 +37,11 @@ survives to disk.
   no plan file on disk               audit record kept
 ```
 
-`RockyResource.run_pipes()` is the only mode that keeps the two-step
-shape. `RockyComponent` with `execution_mode="pipes"` uses it too. Both
-write the typed plan to `.rocky/plans/<plan-id>.json` before the apply
-phase starts. `run()` and `run_streaming()`, the default
-`execution_mode="streaming"`, spawn a single fused `rocky run` subprocess
-and write no plan artifact.
+`RockyResource.run_pipes()` is the only mode that keeps the two-step shape, and `RockyComponent` with `execution_mode="pipes"` uses it. Both write the typed plan to `.rocky/plans/<plan-id>.json` before the apply phase starts. `run()` and `run_streaming()` (the default `execution_mode="streaming"`) spawn one fused `rocky run` subprocess and write no plan artifact.
 
-The plan file records exactly what Rocky tried to apply: the
-materialization list, the governance plan, and the drift actions. Compact
-and archive plans also carry the typed
-[IR](/reference/glossary/#ir-intermediate-representation), the graph the
-apply path regenerates SQL from. See the [Upgrade Notes](/advanced/upgrade-notes/).
+The plan file records what Rocky tried to apply: the materialization list, the governance plan and the drift actions. Compact and archive plans also carry the typed [IR](/reference/glossary/#ir-intermediate-representation), the graph the apply path regenerates SQL from. See the [Upgrade Notes](/advanced/upgrade-notes/).
 
-`run_pipes` also attaches the plan id as `extras={"plan_id": plan_id}`.
-Dagster then shows it as run metadata in the run viewer, one click from a
-failed materialization back to the plan that produced it.
-
-Every supported engine (1.35.0 and newer) writes a plan for every project
-shape, including replication-only projects with no `models/` directory. If
-the engine emits no `plan_id`, `run_pipes` raises `dg.Failure` rather than
-falling back to `rocky run`.
+`run_pipes` attaches the plan id as `extras={"plan_id": plan_id}`, so Dagster shows it as run metadata, one click from a failed materialization back to its plan. Every supported engine (1.35.0 and newer) writes a plan for every project shape, replication-only projects included. If the engine emits no `plan_id`, `run_pipes` raises `dg.Failure` rather than falling back to `rocky run`.
 
 ## Drift events as `AssetObservation`
 
@@ -125,15 +109,7 @@ anomaly_evaluated: []   ─┴►  row_count_anomaly: WARN  (no evidence)
 a pipeline where the detector was not running, and against an engine too old
 to send the per-table report.
 
-The detector runs for a table only when all of these are true:
-
-- Row-count checks are on for the pipeline (`row_count` under `[pipeline.<name>.checks]`).
-- At least one table in the batch was checked for row counts.
-- Anomaly detection is not switched off (`anomaly_threshold_pct = 0` switches it off).
-- The run has a state store, which holds the row-count history.
-- This table's row count was measured, and its history could be read.
-
-When one is missing, `rocky/reason` names which one.
+The detector runs for a table only under the conditions listed in [Anomaly detection](/concepts/data-quality-checks/#anomaly-detection). When one is missing, `rocky/reason` names which one.
 
 `compliance_exception` keeps the old rule. Its producer is unconditional: a
 scan that crashes yields an explicit not-evaluated result rather than

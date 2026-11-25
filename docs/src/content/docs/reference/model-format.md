@@ -169,42 +169,25 @@ Sidecar files and `models/_defaults.toml` get the same `${VAR}` and `${VAR:-defa
 
 ### `@var()` run variables
 
-Parameterize a model per run. Write `@var(name)` or `@var(name, default)` in the model body. Bind it with `rocky run --var name=value`, which you can repeat. Rocky substitutes the value into the SQL before it reaches the warehouse:
+Parameterize a model per run. Write `@var(name)` or `@var(name, default)` in the model body and bind it with a repeatable `rocky run --var name=value`. Rocky substitutes the value into the SQL before it reaches the warehouse:
 
 ```sql
 -- models/orders.sql
-SELECT *
-FROM raw.orders
-WHERE region = '@var(region)'
-  AND status = '@var(status, shipped)'
+SELECT * FROM raw.orders
+WHERE region = '@var(region)' AND status = '@var(status, shipped)'
 ```
 
 ```bash
 rocky run --var region=emea --var status=delivered
 ```
 
-`@var(region)` has no default, so you must supply it. `@var(status, shipped)` falls back to `shipped` when you omit `--var status=…`.
+`@var(region)` has no default, so you must supply it. A `@var(name)` with no binding and no default is a **compile error** naming the variable. The substitution is **textual**: you own the quoting and casting around the marker. Rocky validates only the variable *name*, as a SQL identifier. `rocky import-dbt` maps dbt's `{{ var('name') }}` and `{{ var('name', default) }}` onto these markers.
 
-The substitution is **textual**. Rocky replaces the marker with your string verbatim, so you own the quoting and the casting around it. The example quotes the marker because the value is a string literal. Rocky validates only the variable *name*, as a SQL identifier.
-
-`@var()` and `${ENV}` solve different problems and run at different times:
-
-```
-   ${ENV}                             @var(name)
-   ──────                             ──────────
-   resolves while Rocky parses        resolves at compile/render time,
-   rocky.toml and the sidecars,       after the model is read
-   before any model is read
-                                      stays visible in the model source
-   sets config values                 sets a run's logical inputs
-   (target catalog, credentials)      (a region, a status)
-```
-
-A `@var(name)` with no `--var` binding and no inline default is a **compile error** naming the missing variable. A forgotten value fails before anything runs. `rocky import-dbt` maps dbt's `{{ var('name') }}` and `{{ var('name', default) }}` onto these markers.
+`${ENV}` resolves while Rocky parses `rocky.toml` and the sidecars, before any model is read, and sets config values (target catalog, credentials). `@var(name)` resolves at compile time, stays visible in the model source, and sets a run's logical inputs (a region, a status).
 
 ### Config groups
 
-Write the shared settings once when a fan-out of models routes and materializes the same way. A **config group** lives in `models/groups/<name>.toml`, where the file stem is the group name, and supplies a `schema_template` and a `strategy`:
+Write shared settings once when a fan-out of models routes and materializes the same way. A **config group** lives in `models/groups/<name>.toml` (the file stem is the group name) and supplies a `schema_template` and a `strategy`. A model joins with `group = "<name>"` and fills the template's placeholders from its own `[args]`:
 
 ```toml
 # models/groups/daily_marts.toml
@@ -215,8 +198,6 @@ type = "merge"
 unique_key = ["id"]
 update_columns = ["amount", "status"]
 ```
-
-A model joins the group with `group = "<name>"` and fills the template's placeholders from its own `[args]`:
 
 ```toml
 # models/fct_orders.toml
@@ -229,46 +210,23 @@ catalog = "warehouse"   # schema comes from the group template
 region = "emea"         # fills {region} -> schema "mart_emea"
 ```
 
-Three layers can set the same field. The nearest one to the model wins:
+Three layers can set the same field. The nearest one to the model wins: the model's sidecar, then `models/groups/<name>.toml`, then `models/_defaults.toml`.
 
-```
-   models/fct_orders.toml    ◄── highest: the model's own sidecar
-            ▲
-   models/groups/<name>.toml     the group it opted into
-            ▲
-   models/_defaults.toml     ◄── lowest: directory defaults
-```
+A `group` naming no definition fails the load, and so does a `schema_template` placeholder the model does not supply. A model that pins its own `schema` bypasses the template, so it must **not** also supply `[args]`: pin a schema *or* supply args, never both.
 
-A `group` naming no definition fails the load. So does a `schema_template` placeholder the model does not supply. A model that pins its own `schema` bypasses the group's template, so it must **not** also supply `[args]`: pin a schema *or* supply args, never both. Rocky fails the load rather than mask a routing mistake.
+A group file may carry `schema_template`, `strategy`, `tags`, `governance`, `enforce`, and `[owner]` (`name`, `email`; see [Model governance](/concepts/model-governance/#ownership-groups-and-owners)). Rocky rejects an unrecognized key at load. The model loader does not recurse, so it never reads `models/groups/` as model files.
 
 #### Enforced groups
 
-Make the group's fields binding. Set `enforce = true` in the group file (opt-in; without it a group is overridable defaults). A member model that pins a field the group owns, its target `schema` or its `strategy`, then fails the load. It still supplies its own `[args]` and any field the group leaves unset, such as `target.catalog`. Use it when models must share routing and materialization as a governance guarantee. The model loader does not recurse into subdirectories, so it never reads `models/groups/` as model files.
+Set `enforce = true` in the group file (opt-in; otherwise a group is overridable defaults). A member that pins a field the group owns, its target `schema` or its `strategy`, then fails the load with `GroupOverride`. It may still supply its own `[args]` and any field the group leaves unset, such as `target.catalog`. Use it when models must share routing and materialization as a governance guarantee.
 
 #### Group tags
 
-Apply a governance attribute once and have it land on the whole fan-out. A group can declare a `[tags]` block, and every member model inherits it as a baseline:
-
-```toml
-# models/groups/finance.toml
-schema_template = "mart_{region}"
-
-[tags]
-domain = "finance"
-tier = "gold"
-```
-
-A model's own `[tags]` override the group key by key, without dropping the rest. One model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags) for how the resolved tags surface on `models_detail[].tags` and project onto Dagster assets.
-
-A group file may carry `schema_template`, `strategy`, `tags`, `governance`, `enforce`, and `[owner]` (`name`, `email`; see [Model governance](/concepts/model-governance/#ownership-groups-and-owners)). Rocky rejects an unrecognized key at load, so a typo surfaces immediately.
+A group can declare a `[tags]` block that every member inherits as a baseline. A model's own `[tags]` override it key by key: a model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags).
 
 ### `[classification]`
 
-Label a column as sensitive so the [masking policy](/reference/glossary/#masking-policy) can act on it. Keys are column names; values are free-form classification strings. Rocky resolves each value against `[mask]` and `[mask.<env>]` in `rocky.toml` to pick a strategy. It then applies both the column tag and the mask through the governance adapter, after a successful DAG run.
-
-| Key pattern | Value type | Description |
-|---|---|---|
-| `<column_name>` | string | Free-form classification tag (e.g. `"pii"`, `"confidential"`, `"internal"`). Matched case-insensitively against `[mask]` keys in `rocky.toml`. Tags without a matching strategy emit the W004 compiler warning unless listed in [`[classifications] allow_unmasked`](/reference/configuration/#classifications). |
+Label a column as sensitive so the [masking policy](/reference/glossary/#masking-policy) can act on it. Keys are column names. Values are free-form classification strings (`"pii"`, `"confidential"`, `"internal"`), matched case-insensitively against `[mask]` and `[mask.<env>]` in `rocky.toml` to pick a strategy. Rocky applies the column tag and the mask through the governance adapter after a successful DAG run. A tag without a matching strategy emits `W004` unless listed in [`[classifications] allow_unmasked`](/reference/configuration/#classifications).
 
 ```toml
 # models/customers.toml
@@ -276,36 +234,27 @@ name = "customers"
 
 [classification]
 email = "pii"
-phone = "pii"
 ssn = "confidential"
 ```
 
-Tags are free-form strings (no enum), so teams can coin new classifications without touching the engine. See [Governance](/guides/governance/) for the end-to-end story (classify → mask → audit → compliance rollup) and [`[mask]`](/reference/configuration/#mask) for the resolver semantics.
-
-:::note[Adapter support]
-Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Other adapters do not support them yet. Best-effort: a failure logs a warning and does not abort the run.
-:::
+Masking works today on **Databricks** Unity Catalog only (column tags plus `CREATE MASK` / `SET MASKING POLICY`, one statement per column), best-effort. End-to-end story: [Governance](/guides/governance/). Resolver semantics: [`[mask]`](/reference/configuration/#mask).
 
 ### `[tags]`
 
-Describe the model **as a whole**: its `domain`, its `tier`, its `owner`, or anything else your governance model needs. This differs from `[classification]`, which is keyed by column and drives masking.
+Describe the model **as a whole**: its `domain`, `tier`, `owner`, or anything else your governance model needs. `[classification]`, by contrast, is keyed by column and drives masking.
 
 | Key pattern | Value type | Description |
 |---|---|---|
-| `<tag_name>` | string | Free-form governance attribute, such as `domain`, `tier` or `owner`. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar > group). |
+| `<tag_name>` | string | Free-form attribute. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar wins). |
 
-`rocky compile --output json` reports the resolved tags as `models_detail[].tags`. The `dagster-rocky` integration projects them onto the derived asset's Dagster tags, so one attribute drives both Rocky's view of the model and the orchestrator's. A model in a config group inherits that group's tags too — see [Group tags](#group-tags).
-
-`[tags]` never touches the warehouse. To put a tag on the warehouse object itself, use [`[governance.tags]`](#governancetags).
+`rocky compile --output json` reports the resolved tags as `models_detail[].tags`, and `dagster-rocky` projects them onto the derived asset's Dagster tags. `[tags]` never touches the warehouse: use [`[governance.tags]`](#governancetags) for that.
 
 ### `[governance.tags]`
 
-Put a tag on the warehouse object itself. After the model materializes, Rocky writes these as Unity Catalog tags on its **own target table or view**. The [DDL](/reference/glossary/#ddl-data-definition-language) matches the shape: `ALTER VIEW … SET TAGS (…)` for a view-format model, `ALTER TABLE … SET TAGS (…)` otherwise.
+Put a tag on the warehouse object itself. After the model materializes, Rocky writes these as Unity Catalog tags on its **own target table or view**: `ALTER VIEW … SET TAGS (…)` for a view-format model, `ALTER TABLE … SET TAGS (…)` otherwise.
 
 ```toml
 # models/fct_orders.toml
-name = "fct_orders"
-
 [governance.tags]
 domain = "finance"
 tier = "gold"
@@ -313,64 +262,45 @@ tier = "gold"
 
 | Key pattern | Value type | Description |
 |---|---|---|
-| `<tag_name>` | string | Unity Catalog tag applied to this model's target table or view. Keys and values are used verbatim — no prefix. |
+| `<tag_name>` | string | Unity Catalog tag on this model's target table or view. Keys and values are used verbatim, with no prefix. |
 
-This is the per-model counterpart to the pipeline-level [tagging strategy](/guides/governance/#9-tagging-strategy) (`[pipeline.*.target.governance.tags]`), which tags catalogs and schemas during replication. Application is best-effort: a failure warns but never aborts the run, matching the classification and retention governance posture. An empty block is skipped (Unity Catalog rejects `SET TAGS ()`). Distinct from `[tags]`, which is projected onto Dagster asset metadata and never written to the warehouse.
+This is the per-model counterpart to the pipeline-level [tagging strategy](/guides/governance/#9-tagging-strategy). It is best-effort (a failure warns and never aborts the run), and an empty block is skipped because Unity Catalog rejects `SET TAGS ()`.
 
 ### `[[surrogate_key]]`
 
-Add a stable key column without writing the hash expression yourself. Rocky injects a deterministic hash over the columns you list into the model's SELECT.
+Add a stable key column without writing the hash expression. Rocky injects a deterministic hash over the columns you list into the model's SELECT.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `name` | string | Yes | Output column name for the injected key. Must be a valid SQL identifier (`^[a-zA-Z0-9_]+$`). |
+| `name` | string | Yes | Output column name. A valid SQL identifier (`^[a-zA-Z0-9_]+$`). |
 | `columns` | list of strings | Yes | Input columns to hash. At least one, each a valid SQL identifier. |
 
 ```toml
 # models/dim_customers.toml
-name = "dim_customers"
-
 [[surrogate_key]]
 name = "customer_sk"
 columns = ["tenant_id", "customer_id"]
-
-[target]
-catalog = "warehouse"
-schema = "marts"
-table = "dim_customers"
 ```
 
-At `rocky run` (and on the emit-SQL path), Rocky appends `CAST(md5(...) AS <string_type>) AS <name>` to the projection. The expression is dialect-correct: `STRING` on Databricks and BigQuery, `VARCHAR` on Snowflake, DuckDB and Trino, and BigQuery's `to_hex(...)` / `concat(...)` form. The hash matches `dbt_utils.generate_surrogate_key` over the same columns on the same warehouse, so keys join across Rocky and dbt models. NULL inputs coalesce to a fixed sentinel first, as in dbt-utils.
-
-The block refuses an unknown key (`colums = [...]` fails the load), an empty `columns` list, and a `name` or column that is not a valid identifier. Declare several blocks for several key columns.
+At `rocky run` (and on the emit-SQL path), Rocky appends `CAST(md5(...) AS <string_type>) AS <name>` to the projection, in the dialect's form (`STRING` on Databricks and BigQuery, `VARCHAR` on Snowflake, DuckDB and Trino; BigQuery uses `to_hex(...)` / `concat(...)`). The hash matches `dbt_utils.generate_surrogate_key` over the same columns on the same warehouse, so keys join across Rocky and dbt models. NULL inputs coalesce to a fixed sentinel first. The block refuses an unknown key (`colums = [...]` fails the load), an empty `columns` list, and a name or column that is not a valid identifier. Declare several blocks for several key columns.
 
 ### `[[tests]]`
 
-Assert a property of the model's output. Each `[[tests]]` block is one assertion, and it runs against the target table. You write TOML, not a SQL macro: Rocky generates the assertion SQL for whichever dialect the run targets.
+Assert a property of the model's output. Each `[[tests]]` block is one assertion that runs against the target table. Rocky generates the SQL for the target dialect.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `type` | string | Yes | Assertion kind. Common types: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`. (More are available, including `in_range`, `regex_match`, `aggregate`, and composite-key uniqueness.) |
+| `type` | string | Yes | Assertion kind. Common types: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`. Others: `in_range`, `regex_match`, `aggregate`, composite-key uniqueness. |
 | `column` | string | Sometimes | Column under test. Required for `not_null`, `unique`, `accepted_values`, `relationships`. Ignored for `expression` and `row_count_range`. |
 | `severity` | string | No | `"error"` (default) fails the run; `"warning"` records the failure and continues. |
-| `filter` | string | No | SQL boolean predicate that scopes the assertion to a subset of rows. Only rows where the filter is `TRUE` are checked; rows where it's `FALSE` or `NULL` pass unconditionally. |
+| `filter` | string | No | SQL boolean predicate that scopes the assertion. Rows where it is `FALSE` or `NULL` pass unconditionally. |
 
-Type-specific fields: `accepted_values` takes `values` (a list of allowed string literals), `relationships` takes `to_table` and `to_column` (referential integrity against another table), `expression` takes an `expression` (a SQL boolean that must hold for every row), and `row_count_range` takes `min` and/or `max` (inclusive bounds on the total row count).
+Type-specific fields: `accepted_values` takes `values`, `relationships` takes `to_table` and `to_column`, `expression` takes an `expression` (a SQL boolean that must hold for every row), `row_count_range` takes `min` and/or `max` (inclusive).
 
 ```toml
-# models/fct_orders.toml
-name = "fct_orders"
-
 [[tests]]
 type = "not_null"
 column = "order_id"
-
-
-[[tests]]
-type = "accepted_values"
-column = "status"
-values = ["pending", "shipped", "delivered"]
-severity = "warning"
 
 [[tests]]
 type = "expression"
@@ -378,7 +308,7 @@ expression = "amount >= 0"
 filter = "status != 'cancelled'"
 ```
 
-`expression` and `filter` share one gate. Rocky parses them under the target dialect and refuses, before anything runs, a subquery, a qualified function name (`schema.fn(...)`) or a function outside its allowlist of pure scalar functions. Comparisons, `CASE`, `CAST`, `coalesce`, `length`, `lower` and `date_trunc` pass. Anything that can read a file, a secret, session state or a remote endpoint does not. The refusal names the function (and, for `filter`, the field and table). See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter).
+`expression` and `filter` share one gate. Rocky parses them under the target dialect and refuses, before anything runs, a subquery, a qualified function name (`schema.fn(...)`) or a function outside its allowlist of pure scalar functions. Comparisons, `CASE`, `CAST`, `coalesce`, `length`, `lower` and `date_trunc` pass. The refusal names the function. See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter).
 
 ### `[[use_test]]`
 
@@ -477,23 +407,13 @@ Write one table per column, for example `[columns.order_id]` with `description =
 
 ### Retention
 
-Declare how long this model's data should be kept. The top-level `retention` key on the sidecar carries the policy, and Rocky parses it at load time into a typed `RetentionPolicy { duration_days: u32 }`.
+Declare how long this model's data should be kept with the top-level `retention` key. Rocky parses it at load into a typed `RetentionPolicy { duration_days: u32 }`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `retention` | string \| null | `null` (disabled) | Grammar `^\d+[dy]$`. `"d"` = days verbatim, `"y"` = years flattened at 365 days per year (no leap-year semantics). Zero (`"0d"`, `"0y"`) is rejected — use `null` to disable. |
+| `retention` | string \| null | `null` (disabled) | Grammar `^\d+[dy]$`. `"d"` is days, `"y"` is years flattened at 365 days. Zero (`"0d"`, `"0y"`) is rejected: use `null` to disable. |
 
-Example: `retention = "90d"` at the top level of the sidecar.
-
-Applied by `GovernanceAdapter::apply_retention_policy` after a successful DAG run:
-
-| Adapter | SQL emitted |
-|---|---|
-| **Databricks (Delta)** | `ALTER TABLE ... SET TBLPROPERTIES ('delta.logRetentionDuration' = '{N} days', 'delta.deletedFileRetentionDuration' = '{N} days')` — both keys written together. |
-| **Snowflake** | `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = {N}`. |
-| **Other adapters** | Not supported. Rocky emits nothing. |
-
-Rocky rejects a malformed value when it parses the sidecar: `"abc"`, `"90"`, `"-3d"`, `"1.5d"`, a leading sign, an exponent. The `ModelError::InvalidRetention` diagnostic names what it saw. Inspect the resolved policies with [`rocky retention-status`](/reference/cli/#rocky-retention-status).
+Example: `retention = "90d"`. Rocky applies it through `GovernanceAdapter::apply_retention_policy` after a successful DAG run: Delta table properties on Databricks, `DATA_RETENTION_TIME_IN_DAYS` on Snowflake, nothing on other adapters (see [Governance](/guides/governance/#7-data-retention-pillar-5-of-5)). A malformed value (`"abc"`, `"90"`, `"-3d"`, `"1.5d"`, a sign, an exponent) fails the sidecar parse with `ModelError::InvalidRetention`. Inspect resolved policies with [`rocky retention-status`](/reference/cli/#rocky-retention-status).
 
 ---
 
