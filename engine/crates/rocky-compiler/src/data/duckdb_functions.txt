@@ -1,5 +1,5 @@
 # DuckDB function names (lower case), one per line.
-# Generated from DuckDB 2.0.0 (the engine bundled by libduckdb-sys 1.20000.1):
+# Generated from DuckDB 2.0.0 (the engine bundled by libduckdb-sys 1.20001.0):
 # SELECT DISTINCT lower(function_name) FROM duckdb_functions() with
 # core_functions, icu, json and parquet loaded, plus every function an
 # autoloadable extension provides (EXTENSION_FUNCTIONS in DuckDB 2.0.0
@@ -45,6 +45,7 @@ abs
 acos
 acosh
 add
+add_grammar_extension
 add_numbers_together
 add_parquet_key
 age
@@ -399,6 +400,7 @@ duckdb_functions
 duckdb_grammar_extensions
 duckdb_indexes
 duckdb_keywords
+duckdb_live_query_metrics
 duckdb_log_contexts
 duckdb_logs
 duckdb_logs_parsed
@@ -897,6 +899,7 @@ map_extract_value
 map_from_entries
 map_keys
 map_to_pg_oid
+map_type_id_to_pg_oid
 map_values
 max
 max_by
@@ -1089,6 +1092,7 @@ regr_sxx
 regr_sxy
 regr_syy
 remap_struct
+remove_grammar_extension
 remove_iceberg_schema_properties
 remove_iceberg_table_properties
 repeat
