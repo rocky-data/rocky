@@ -126,21 +126,21 @@ On the raw path, the other Jinja in the file must convert too. From a manifest, 
 
 On the raw path, an incremental model that uses `is_incremental()` in any other way is still imported. The block is commented out under a `-- TODO: dbt is_incremental() block not translated:` line, and the sidecar has no watermark. `rocky compile` refuses the model with `E037` until you add `timestamp_column` and the placeholder.
 
-Any other append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. The fallback covers four cases:
+Any other append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. This covers:
 
 - `incremental` with no `unique_key`
 - `incremental_strategy = 'append'`, even with a `unique_key`
 - `incremental_strategy = 'merge'` with no `unique_key`
-- an `incremental_strategy` the importer does not recognise, even with a `unique_key`
+- an unrecognised `incremental_strategy`, even with a `unique_key`
 
-A `unique_key` maps a model to `merge` only when `incremental_strategy` is unset or `'merge'`. An explicit `'append'` keeps the fallback.
+A `unique_key` maps to `merge` only when `incremental_strategy` is unset or `'merge'`.
 
-Where the fallback is reported depends on the import path. From a manifest, each model is listed in `MIGRATION-NOTES.md` under "Items to translate manually", and under "Warnings". With `--no-manifest`, the importer keeps only the warning text, so the model appears under "Warnings" alone. That includes a model with no `config()` block that inherits `materialized = 'incremental'` from `dbt_project.yml`.
+The fallback is reported in `MIGRATION-NOTES.md` under "Items to translate manually" and "Warnings" for a manifest import, and under "Warnings" alone with `--no-manifest`. That includes a model that inherits `materialized = 'incremental'` from `dbt_project.yml`.
 
-Some fallbacks are refused instead. A manifest import keeps dbt's compiled SQL, and dbt compiles `is_incremental()` as true against an existing table. So the compiled SQL can keep an incremental filter, and as `full_refresh` each run would replace the table with only the recent rows. When an `incremental` or `microbatch` model would fall back to `full_refresh` and its raw SQL uses `is_incremental()`, the importer does not import it. The model is listed under `failed_details`. Rewrite it by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key`, or a `time_interval` model.
+Some fallbacks are refused instead. A manifest import keeps dbt's compiled SQL, and dbt compiles `is_incremental()` as true against an existing table. As `full_refresh`, each run would replace the table with only the recent rows. When an `incremental` or `microbatch` model would fall back and its raw SQL uses `is_incremental()`, the importer does not import it and lists it under `failed_details`. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key`, or `time_interval`.
 
 :::caution[A keyed model has the same filter problem]
-An `incremental` model with a `unique_key` is imported as `merge` from the same compiled SQL. `merge` creates its table from that SQL on the first run, and so does `delete_insert`. If the SQL kept an `is_incremental()` filter, that first run goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). The common filter, `MAX(...)` over the model's own table, fails because that table does not exist yet. A literal cutoff loads only the recent rows. The importer does not refuse this case. Remove the filter from the model's SQL before the first run.
+An `incremental` model with a `unique_key` imports as `merge` from the same compiled SQL. `merge` (like `delete_insert`) creates its table from that SQL on the first run. A kept `is_incremental()` filter then goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). A `MAX(...)` over the model's own table fails because that table does not exist yet. A literal cutoff loads only recent rows. The importer does not refuse this case. Remove the filter before the first run.
 :::
 
 Apart from the incremental conversion above, Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.

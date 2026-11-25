@@ -207,33 +207,7 @@ rocky run --filter tenant=acme --shadow --keep-shadow
 rocky compare --filter tenant=acme --thresholds '{"row_count_diff_pct_fail": 0.02}'
 ```
 
-```json
-{
-  "version": "1.80.0",
-  "command": "compare",
-  "filter": "tenant=acme",
-  "tables_compared": 1,
-  "tables_passed": 1,
-  "tables_warned": 0,
-  "tables_no_baseline": 0,
-  "tables_failed": 0,
-  "results": [
-    {
-      "production_table": "warehouse.staging.orders",
-      "shadow_table": "warehouse.staging.orders_rocky_shadow",
-      "row_count_match": true,
-      "production_count": 15000,
-      "shadow_count": 15000,
-      "row_count_diff_pct": 0.0,
-      "schema_match": true,
-      "schema_diffs": [],
-      "verdict": "pass",
-      "reasons": []
-    }
-  ],
-  "overall_verdict": "pass"
-}
-```
+The JSON has `tables_compared`, `tables_passed`, `tables_warned`, `tables_no_baseline`, `tables_failed`, `overall_verdict`, and a `results` entry per table: `production_table`, `shadow_table`, `row_count_match`, `production_count`, `shadow_count`, `row_count_diff_pct`, `schema_match`, `schema_diffs`, `verdict` and `reasons`.
 
 Each `verdict` is one of these. `reasons` explains each one.
 
@@ -328,19 +302,7 @@ date_key = "DATE"
 
 `pre_hook` statements run in order before the seed writes anything. `post_hook` statements run after the table loads. A failing `pre_hook` stops the seed before any data is written. So a guard such as `SELECT 1 / COUNT(*) FROM warehouse.reference.dim_date` stops the load when the source is empty. These SQL hooks are not the pipeline [lifecycle hooks](/concepts/hooks/), which run shell commands and webhooks on run events.
 
-```json
-{
-  "version": "1.80.0",
-  "command": "seed",
-  "seeds_dir": "seeds",
-  "tables_loaded": 1,
-  "tables_failed": 0,
-  "tables": [
-    { "name": "dim_date", "target": "warehouse.reference.dim_date", "rows": 365, "columns": 4, "duration_ms": 42 }
-  ],
-  "duration_ms": 55
-}
-```
+The JSON has `tables_loaded`, `tables_failed`, and a `tables` entry per seed with `name`, `target`, `rows`, `columns` and `duration_ms`.
 
 ---
 
@@ -387,23 +349,7 @@ Rocky finds changed rows in one of two ways. The **timestamp** strategy compares
   IF NOT EXISTS     is_current = FALSE      just closed              from the source (optional)
 ```
 
-```json
-{
-  "version": "1.80.0",
-  "command": "snapshot",
-  "pipeline": "customers_history",
-  "source": "main.raw.customers",
-  "target": "warehouse.history.customers_history",
-  "dry_run": false,
-  "steps_total": 4,
-  "steps_ok": 4,
-  "steps": [
-    { "step": "initial_load", "sql": "...", "status": "ok", "duration_ms": 12 },
-    { "step": "merge_1", "sql": "...", "status": "ok", "duration_ms": 45 }
-  ],
-  "duration_ms": 120
-}
-```
+The JSON has `steps_total`, `steps_ok`, and a `steps` entry per step (`initial_load`, `merge_1`, ...) with `sql`, `status` and `duration_ms`.
 
 ---
 
@@ -559,21 +505,9 @@ LEFT JOIN 'meta/tests.parquet' t
 WHERE c.classification = 'pii' AND t.model IS NULL;
 ```
 
-The JSON output reports what was written. `format` is `site`, `html` or `parquet`. `files` lists the files, relative to `output_path`.
+The JSON output reports what was written. `format` is `site`, `html` or `parquet`. `files` lists the files relative to `output_path`.
 
-```json
-{
-  "version": "1.80.0",
-  "command": "docs",
-  "output_path": "docs/site",
-  "models_count": 12,
-  "pipelines_count": 2,
-  "duration_ms": 15,
-  "format": "site",
-  "sources_count": 3,
-  "files": ["index.html", "lineage.html", "assets/site.css", "models/orders.html"]
-}
-```
+The JSON also has `output_path`, `models_count`, `pipelines_count`, `sources_count` and `duration_ms`.
 
 ---
 
@@ -626,10 +560,6 @@ rocky estimate --model fct_orders --verbose
 |---|---|
 | The project has no models to estimate | `no models found to estimate` |
 | SQL generation or `EXPLAIN` failed for every selected model | `no model produced an estimate` |
-
-:::caution[This is a behavior change]
-Earlier engine versions exited `0` for an unknown `--model` and returned an empty `estimates` array with no `message`. A CI job that treated the empty array as a pass now fails on a bad selector.
-:::
 
 ---
 

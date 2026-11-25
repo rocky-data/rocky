@@ -57,9 +57,9 @@ The server generates a token only on a loopback host (`127.0.0.1`, `::1` or `loc
 
 The token travels in the query of one request, `GET /login?t=<token>`. The server checks it in constant time. If it matches, the server answers `303` to `/ui/` and sets a session cookie, `rocky_ui_<tag>` (the tag differs per server). The cookie is `HttpOnly` and `SameSite=Strict`. It usually ends when the browser closes. The server adds `Secure` when a TLS proxy sends `X-Forwarded-Proto: https`.
 
-The cookie holds a keyed hash of the token, not the token. The key is new for each server process, so a restart ends every browser session. The page never holds the token. Its API calls carry the cookie.
+The cookie holds a keyed hash of the token, not the token. The key is new for each server process, so a restart ends every browser session. The page never holds the token.
 
-The server logs no request URIs and never echoes the token. The `/login` answers send `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. The redirect takes the token out of the address bar. A reverse proxy may log the query string of `/login`. Configure it not to, or rotate the token.
+The server logs no request URIs and never echoes the token. The `/login` answers send `Cache-Control: no-store` and `Referrer-Policy: no-referrer`, and the redirect takes the token out of the address bar. A reverse proxy may log the query string of `/login`: configure it not to, or rotate the token.
 
 A cookie session can also write, but only from the page. A write must carry an `Origin` header that names this server exactly (the same host and port), or an `--allowed-origin` entry, and the header `X-Rocky-UI: 1`. Another page on the same machine shares the cookie, because cookies do not separate ports, so it is refused. Otherwise the answer is `403 ui_write_not_from_ui`. A read-only token stays read-only in a cookie session. Scripts and embedders keep using `Authorization: Bearer <token>`.
 
@@ -71,9 +71,7 @@ To run the UI somewhere other than your own machine, use the [container image](/
 
 The sidebar shows a badge on Needs you and on Review when decisions wait on you. The number is the count Needs you lists. The page reads it again on each navigation, and every 30 seconds while the tab is visible. No badge means nothing waits, or the count could not be read (for example, while a run holds the state store).
 
-The page shows the estate digest that `rocky brief` prints, for a window you pick (7 days by default). A summary line comes first: how many decisions wait on you, how the runs went, and whether a freeze or a degraded rule is in force. Then there is a card for each part of the digest.
-
-The first card is what needs you. Each pending plan is its own row, with a **Review plan** button that opens it in Review. The other cards are policy decisions, runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler. A bar over the policy decisions shows how many were allowed, needed review, or were denied.
+The page shows the estate digest that `rocky brief` prints, for a window you pick (7 days by default). A summary line comes first: decisions waiting, how the runs went, and whether a freeze or degraded rule is in force. Cards follow. The first lists each pending plan as a row with a **Review plan** button. The others are policy decisions (with a bar of allowed, needs-review and denied), runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler.
 
 ![The Needs you screen: a badge of 1 on Needs you and on Review, a summary line saying one decision waits and two runs succeeded, one pending plan for revenue_daily with a Review plan button, and a bar over ten agent decisions, five allowed and five needing review](/ui-governor-brief.png)
 
@@ -212,7 +210,7 @@ One kind of row is the exception. A durable freeze marker whose body cannot be r
 
 The buttons run `rocky policy freeze` and `rocky policy unfreeze` on the server. A result can succeed and still need your attention, so the page shows the result's notes under the button. A freeze with no `[policy]` block in `rocky.toml` is recorded but enforced nowhere, and the page shows it as a warning, not as done.
 
-Both commands open the local state store, even on a remote `[state]` backend, and a run holds that store for its whole run. So a browser freeze answers `409 mutation_in_progress` while a run, apply or approve is in progress. To stop a running run, use **Cancel** on that job. A run this server did not start (from a terminal or an orchestrator) also holds the local store but not the server's slot. A freeze then fails on the store lock. On a remote `[state]` backend with durable markers, its marker is already written and the run stops at its next fence, but a retry writes a second marker. Retry after that run ends.
+Both commands open the local state store, even on a remote `[state]` backend, and a run holds that store for its whole run. So a browser freeze answers `409 mutation_in_progress` while a run, apply or approve is in progress. To stop a running run, use **Cancel**. A run this server did not start (from a terminal or an orchestrator) holds the store but not the server's slot, so a freeze then fails on the store lock. On a remote `[state]` backend with durable markers, the marker is already written and the run stops at its next fence, but a retry writes a second marker. Retry after that run ends.
 
 The ledger row names the server's principal id, not the person at the page. The server reads it from `ROCKY_PRINCIPAL_ID` in its own environment, else `unnamed`. A `--principal-id` flag on `rocky serve` does not reach these jobs. The row does not record that the freeze came from the browser.
 
@@ -220,11 +218,16 @@ The ledger row names the server's principal id, not the person at the page. The 
 
 The **Estate** screen has a **Preview** panel. Give a branch name (optional) and a base ref (optional, default `main`). The page asks you to confirm, then runs `rocky preview create` on the server. The name takes letters, digits and underscores, up to 64. With no name, the server derives one from the current branch of its git checkout, so every click from the same checkout gives the same name. A name already in use fails the job, so give a new name each time.
 
-The command registers the branch in the local state store file on the server. It does not upload that file to a remote `[state]` backend. The record names the server's OS user as its creator, not the person at the page. The command then copies each unchanged model from its production schema into the warehouse schema `branch__<name>`, using the warehouse credentials in `rocky.toml`. Production tables are only read. Depending on the warehouse, each copy is a metadata-only clone or a full copy of the table, which costs compute and storage. The confirm text says this before you start.
+The command registers the branch in the local state store file on the server (not uploaded to a remote `[state]` backend), and records the server's OS user as creator. It then copies each unchanged model from its production schema into the warehouse schema `branch__<name>`, using the warehouse credentials in `rocky.toml`. Production tables are only read. Depending on the warehouse, each copy is a metadata-only clone or a full copy, which costs compute and storage. The confirm text says this before you start.
 
-The command does not re-run the changed models. The page lists them as "planned but not re-run". A copy that fails for one model does not fail the job, so the page shows a warning that names the model, not a plain "done". A model planned but not copied shows as "planned but not copied", and the server log says why. A preview with no changed models copies nothing, and the page shows a warning for that too. If the job fails after it registered the branch (for example, when the warehouse cannot be reached), the branch stays registered, so a retry needs a new name. The page shows only model names, the schema name and fixed words from the result, never warehouse error text.
+The command does not re-run the changed models. The page lists them as "planned but not re-run".
 
-The command finds the changed models with `git diff` between the base ref and `HEAD`. The project folder must be inside a git repository, and it may be a subfolder of it. A project in a subfolder works, with a relative or an absolute `--models`.
+- A copy that fails for one model does not fail the job. The page shows a warning that names the model, and "planned but not copied" for a model that was not copied. The server log says why.
+- A preview with no changed models copies nothing, and the page shows a warning.
+- If the job fails after it registered the branch (for example, the warehouse is unreachable), the branch stays registered, so a retry needs a new name.
+- The page shows only model names, the schema name and fixed words from the result, never warehouse error text.
+
+The command finds the changed models with `git diff` between the base ref and `HEAD`. The project folder must be inside a git repository, and may be a subfolder of it.
 
 ### Promote a branch
 
@@ -281,7 +284,7 @@ Cancel ─▶ SIGTERM to the job's process group (handled like Ctrl-C) ─▶ th
 Force stop ─▶ SIGKILL to the job's process group                ─▶ the job stops at once
 ```
 
-The engine answers only once the signal reached the job. The job then ends `cancelled`. If it exits 0 anyway, it ends `succeeded`. A job that exited before the signal reached it answers `409 job_not_running`. A cancelled run, apply or approve keeps the single write slot until its process has exited, so a new one waits (`409 mutation_in_progress`).
+The engine answers only once the signal reached the job. The job then ends `cancelled`. If it exits 0 anyway, it ends `succeeded`. A job that exited before the signal reached it answers `409 job_not_running`. A cancelled job keeps the write slot until its process has exited.
 
 What a cancelled job leaves:
 
@@ -289,7 +292,7 @@ What a cancelled job leaves:
 - **Any other job, after Cancel** (models, a plan, an approval), stops at once. Rocky has no clean-stop step for these yet ([#1606](https://github.com/rocky-data/rocky/issues/1606)). A warehouse statement in flight is cut, and the warehouse keeps or drops it whole. A state write in flight is all or nothing. Models that finished stay built. Run the job again to finish.
 - **After Force stop**, any job stops like a crash. An incremental replication table can have its rows landed before its watermark was saved. On DuckDB, Databricks, Snowflake and BigQuery, the next run of that table reads the watermark back from the target table first, so it does not copy the same rows twice. On other warehouses, prefer Cancel.
 
-A plan file cut part-way no longer reads as its plan id, so Rocky refuses to apply it.
+A plan file cut part-way is refused at apply.
 
 Cancel reaches only jobs this server process started. A scheduled run (`--scheduler`) answers `409 job_not_cancellable`. On Windows there is no SIGTERM, so Cancel kills the job at once. Stopping `rocky serve` with Ctrl-C or `SIGTERM` sends each running job the same SIGTERM as Cancel, and waits up to 5 seconds for it to be sent.
 
@@ -305,7 +308,7 @@ Cancel reaches only jobs this server process started. A scheduled run (`--schedu
 
 With `--ui`, the server adds checks that a plain `rocky serve` does not run:
 
-- On a host that is not loopback, `--ui` refuses to start without a token, and refuses a full-scope token. On a loopback host with no token, it generates a per-process token: full scope, or read-only when `--read-only` or `--allowed-host`/`--allowed-origin` is set. A loopback server with `--allowed-host` or `--allowed-origin` refuses a full-scope token.
+- `--ui` refuses to start on a non-loopback host without a token, and refuses a full-scope token there. See [Open the UI](#open-the-ui).
 - A request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry gets `421 host_not_allowed`. This defends against DNS rebinding, where an attacker's domain is made to resolve to `127.0.0.1`. The check also runs on a loopback `rocky serve` without `--ui`. `GET /api/v1/health` skips this check, so a load balancer probe still works.
 - A request whose `Origin` is neither the server's own nor an `--allowed-origin` entry gets `403 origin_not_allowed`. The check reads the origin's host, not the whole origin, so an `http` or `https` origin on an allowed host passes whatever its port. On a loopback server that includes `http://localhost:5173`, a local dev server. `GET /api/v1/health` skips this check too.
 - Every UI file response carries a Content Security Policy. The page loads scripts and fonts from this server only, and styles from this server or inline. Nothing may frame it.
@@ -318,4 +321,4 @@ rocky serve --ui --host 0.0.0.0 --token "$TOKEN" --read-only \
   --allowed-host rocky.internal
 ```
 
-The [`rocky serve` reference](/reference/commands/development/#rocky-serve) lists every flag. The [Embedding guide](/guides/embedding/) covers the HTTP API behind the page.
+The [`rocky serve` reference](/reference/commands/development/#rocky-serve) lists every flag. The [Embedding guide](/guides/embedding/) covers the HTTP API.
