@@ -261,6 +261,59 @@ These calls are never reported:
 - A function declared in `functions/`.
 - A form the SQL parser or the warehouse rewrites, such as `COALESCE`, `IF` or
   `IFNULL`.
+- On DuckDB, a function or macro the project's `data/seed.sql` creates. Rocky
+  takes the names from the DuckDB that ran the seed and from a scan of the
+  seed's text, so a seed that does not run still counts, and so do
+  `rocky serve` and `rocky lsp`, which never run it. Other warehouses still
+  check the call: the seed runs only in DuckDB. A macro the seed brings in
+  with `IMPORT DATABASE` or `ATTACH` is not in its text, so only the commands
+  that run the seed (`rocky compile`, `rocky ci`, `rocky test`) skip it.
+
+#### Calls with an argument count DuckDB refuses (`E068`, `W068`)
+
+When a model runs on DuckDB, Rocky reports a call to a DuckDB built-in with
+a number of arguments DuckDB refuses before it reads any data:
+
+```sql
+-- E068: DuckDB has no `lower` that takes 2 arguments
+SELECT lower(customer_name, 'x') AS n FROM customers
+```
+
+Rocky does not guess the counts. A test probes the bundled DuckDB 2.0 and
+writes them to `engine/crates/rocky-compiler/src/data/duckdb_signatures.txt`.
+Each count is probed with every argument `NULL`, and with every argument a
+column of one type from each type group. Another test replays every probe
+and fails if DuckDB accepts one, or if the bundled version changes.
+
+It is the error `E068` only in the places `E071` treats as checked (see
+[the list below](#set-operations-with-different-column-counts-e071-w071)): the
+select list, `WHERE`, `HAVING` or a join's `ON` of the model's query, a
+set-operation branch, a derived table, or a subquery reached from them,
+through comparisons, `AND`, `OR`, `NOT`, `CASE`, casts, `IN`, `EXISTS` or
+parentheses. Anywhere else it is the warning `W068`: a CTE body, a named
+`WINDOW`, `ORDER BY`, `GROUP BY`, `QUALIFY`, an operand of `+` or `||`, an
+argument of another call, or anywhere in an ephemeral model, whose SQL
+DuckDB sees only as a CTE in the models that read it. DuckDB skips a CTE nothing reads and a window
+nothing uses, and a macro drops an argument its body does not use (the
+built-in `pg_table_is_visible` does), so the model may still run. To fail on
+the warning, run `rocky compile --deny-warnings W068`.
+
+These are not reported:
+
+- The same calls as for `E057`: schema-qualified, quoted, declared in
+  `functions/`, a rewritten form, or a function or macro the seed creates.
+- A call with named arguments (`name := value` too), `*`, `DISTINCT`,
+  `ORDER BY` inside the parentheses, a lambda, an argument that expands to
+  several (`UNPACK(COLUMNS(...))`), `FILTER`, `WITHIN GROUP` or `OVER`.
+- A name DuckDB also has as a macro, window or table function, and a
+  function such as `struct_pack`, which treats a `NULL` argument differently
+  from a column.
+- A call in a dot-call chain, as in `upper(status).lower()`: the value
+  before the dot is the call's first argument.
+
+A DuckDB macro created outside the project that reuses a built-in name is a
+known false refusal: Rocky checks the call against the built-in. Call the
+macro schema-qualified (`main.lower(...)`), which Rocky does not check.
 
 #### Set operations with different column counts (`E071`, `W071`)
 
@@ -705,6 +758,7 @@ span, and sometimes a suggested fix.
 | `E065` | A `WHERE` clause contains an aggregate (`WHERE SUM(amount) > 1`). Move the condition to `HAVING` |
 | `E066` | A `WHERE` clause contains a window function, a call with `OVER`. Filter on it with `QUALIFY`, or in a subquery |
 | `E067` | A `GROUP BY` position names no output column (`GROUP BY 3` over two columns, or `GROUP BY 0`) |
+| `E068` | A call to a DuckDB built-in passes a number of arguments it does not take, in a place tests show DuckDB checks. Only when the model runs on DuckDB. See [Calls with an argument count DuckDB refuses](#calls-with-an-argument-count-duckdb-refuses-e068-w068) |
 | `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, in a place tests show DuckDB checks. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
@@ -733,6 +787,7 @@ span, and sometimes a suggested fix.
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
 | `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
+| `W068` | The warning form of `E068`, for a wrong argument count in a place DuckDB may skip, such as a CTE body, a named `WINDOW` or an argument of another call. See [Calls with an argument count DuckDB refuses](#calls-with-an-argument-count-duckdb-refuses-e068-w068) |
 | `W071` | The warning form of `E071`, for a set-operation mismatch in a place the warehouse may skip, such as a CTE body or a named `WINDOW` nothing uses. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some, but not all, output columns have unknown types — provide source schemas for more type checking |
