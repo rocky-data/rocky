@@ -190,7 +190,7 @@ Read the scorecard before you refresh a golden: a live set that turns from
 PASS to FAIL is a finding, not drift to accept.
 
 (Splitting "wrong" by direction was an advisor ruling of 2026-11-11. The
-key-omission gate is a Fable ruling of 2026-11-13. Both are Hugo to confirm.)
+key-omission gate is a Fable ruling of 2026-11-13. Both need a maintainer to confirm.)
 
 There are two recording sets. CI replays both.
 
