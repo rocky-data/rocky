@@ -25,17 +25,6 @@ The project is the POC [`05-orchestration/13-open-stack-acceptance`](https://git
                                          rocky serve ──▶ GET /api/v1/...
 ```
 
-| Feature | Where it is set | What you check |
-|---|---|---|
-| Child connector | `[connector.pg_events]` in `rocky.toml` | Rows loaded and the commit sequence |
-| Delivery deadline | `deliver_by` in `products/events_by_type.toml` | `on_time`, `late_by_seconds`, `at_risk` |
-| Source volume range | `[[product.source.volume]]` | `in_range`, then `above_max` |
-| Output volume range | `[product.output.volume]` | `in_range` |
-| Schedule | `[pipeline.events.schedule]` | The scheduler warns that the cron starts too late |
-| Prices | `[cost]` | Money is model time times your price |
-| Monthly budget | `[product_budget.events_by_type]` | `breached`, one breach event, one hook call |
-| HTTP API | `rocky serve` | The API returns the same facts as the CLI |
-
 The deadline is every minute (`deliver_by = "* * * * *"`), so you see an on-time and a late delivery in minutes. The budget limit is 0.72 ms of model time, so the first run breaches it.
 
 ## Before you start

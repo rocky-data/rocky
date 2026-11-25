@@ -94,29 +94,8 @@ A close match adds `— did you mean '<model>'?`.
 
 ## External table references
 
-Not every table reference becomes a dependency. Rocky decides from how the
-reference is qualified in the SQL.
+Not every table reference becomes a dependency. Rocky classifies a reference by how it is qualified (see [Resolve dependencies](/concepts/compiler/#2-resolve-dependencies)): a bare name that matches a Rocky model is an execution edge. A bare name with no matching model, and any two-part or three-part name, is an external reference that the DAG ignores. Rocky reads an external table but does not manage, build or schedule it.
 
-| SQL reference | Classification | DAG behavior |
-|---|---|---|
-| `stg_orders` (matches a Rocky model) | Model dependency | Execution edge in DAG |
-| `stg_orders` (no matching model) | External reference | Ignored by DAG |
-| `dbt_fivetran.stg_facebook_ads__ad_history` | Two-part external | Ignored by DAG |
-| `analytics.dbt_fivetran.stg_facebook_ads__ad_history` | Three-part external | Ignored by DAG |
-
-Rocky reads from an external table. It does not manage, build, or schedule it.
-
-A Rocky model can read a table another tool produced (a dbt package, a Fivetran connector, a hand-written ETL job) without importing it. External tables still appear in column-level [lineage](/reference/glossary/#lineage) and are left out of execution planning.
-
-```sql
--- stg_orders is a Rocky model -> DAG dependency
--- dbt_fivetran.stg_facebook_ads__ad_history is external -> no dependency
-SELECT
-    o.order_id,
-    f.ad_name
-FROM stg_orders o
-JOIN dbt_fivetran.stg_facebook_ads__ad_history f
-    ON o.campaign_id = f.campaign_id
-```
+A Rocky model can therefore read a table another tool produced (a dbt package, a Fivetran connector, a hand-written ETL job) without importing it. External tables still appear in column-level [lineage](/reference/glossary/#lineage) and are left out of execution planning.
 
 See [Read dbt Package Tables](/guides/using-dbt-packages/).

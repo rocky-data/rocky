@@ -163,17 +163,16 @@ SELECT customer_id, SUMM(amount) AS lifetime_value FROM fct_orders GROUP BY cust
 
 The message suggests close names (`did you mean sum?`). Each warehouse has a list of aggregate, window and table functions and common aliases. Each file under `engine/crates/rocky-compiler/src/data/` names its source. The lists were built and checked on 2026-10-09.
 
-| Warehouse | List | Checked against a live engine | Code |
-|---|---|---|---|
-| DuckDB | `duckdb_functions()` of DuckDB 2.0, plus functions its extensions load on first use | yes | `E057` |
-| PostgreSQL | The PostgreSQL 17 built-in catalog (`pg_proc`), plus SQL-standard forms it lacks | yes, 17.11 | `W057`: extensions add functions |
-| Snowflake | Vendor function reference | no | `W057` |
-| Databricks | Vendor function reference and the Spark list | no | `W057` |
-| Spark | `SHOW FUNCTIONS` of Spark 4.0.1 with Delta Lake 4.0.0 | yes | `W057`: UDFs and session extensions add functions |
-| BigQuery | Vendor function reference | no | `W057` |
-| Trino | `SHOW FUNCTIONS` of Trino 483, plus the names it hides (`version`, `format`, SQL special forms) | yes | `W057`: connectors add functions |
-| Redshift | Vendor function reference and the PostgreSQL list | no | `W057` |
-| SQL Server, ClickHouse | none yet | | not checked |
+| Warehouse | List (live = checked against a live engine) | Code |
+|---|---|---|
+| DuckDB | `duckdb_functions()` of DuckDB 2.0, plus functions its extensions load on first use (live) | `E057` |
+| PostgreSQL | The PostgreSQL 17 built-in catalog (`pg_proc`) plus SQL-standard forms it lacks (live, 17.11) | `W057`: extensions add functions |
+| Spark | `SHOW FUNCTIONS` of Spark 4.0.1 with Delta Lake 4.0.0 (live) | `W057`: UDFs and session extensions add functions |
+| Trino | `SHOW FUNCTIONS` of Trino 483, plus the names it hides (`version`, `format`, SQL special forms) (live) | `W057`: connectors add functions |
+| Snowflake, BigQuery | Vendor function reference (docs) | `W057` |
+| Databricks | Vendor function reference and the Spark list (docs) | `W057` |
+| Redshift | Vendor function reference and the PostgreSQL list (docs) | `W057` |
+| SQL Server, ClickHouse | none yet | not checked |
 
 A false refusal of a real function costs more than a missed typo, so only DuckDB gets the error. A documentation-built list can lag a release. A live-checked list holds one version's built-in catalog only. A warning never fails a compile alone: run `rocky compile --deny-warnings W057`. A model that runs on several warehouses is checked against each. When `[portability] target_dialect` names a warehouse, only that one is checked.
 
@@ -244,11 +243,7 @@ Rocky reports `E039` when a model reads a column that an upstream model does not
 SELECT order_id FROM int_order_lines WHERE stats = 'completed'
 ```
 
-Rocky reports the name only when absence is a fact:
-
-- The model depends on the upstream model and reads it by its bare name. A qualified read of its target (`main.int_order_lines`) is not checked.
-- The upstream output is complete: every projection item is a column or has an alias, with no `SELECT *` and no set operation. An alias over a function that can return several columns (`unnest`, `explode`, `COLUMNS`) does not count.
-- No two upstream output names differ only in case.
+Rocky reports the name only when absence is a fact: the model depends on the upstream and reads it by its bare name (a qualified read of its target, `main.int_order_lines`, is not checked); the upstream output is complete (every projection item is a column or has an alias, with no `SELECT *` and no set operation, and no alias over a function that can return several columns such as `unnest`, `explode`, `COLUMNS`); and no two upstream output names differ only in case.
 
 `E039` checks the upstream model's SQL, not its table. A `merge` model's table can still hold a column its SQL used to select, so the suggestion says so for a `merge` upstream, and the read is still refused. See [Merge strategy](/concepts/incremental/#merge-strategy). The binding rules are those for external sources below. A CTE, derived table, unknown relation, `SELECT` alias, struct field read, quoted name or warehouse metadata column keeps the name `Unknown`.
 
@@ -258,9 +253,8 @@ A name in a star's `EXCEPT`, `EXCLUDE` or `REPLACE` that the star's relation doe
 
 An external source is a table such as `raw.orders` that Rocky reads but does not build. Rocky knows its columns only from a seed file (`rocky compile --with-seed`) or the schema cache. A reference to a column the schema lacks is `E041` or `W041`, by how far Rocky trusts the schema:
 
-| Where the schema came from | Without strict sources | With strict sources |
+| Where the schema came from (a warehouse read in the same invocation is `E041` too, for embedding callers) | Without strict sources | With strict sources |
 |---|---|---|
-| Read from the warehouse during this invocation (embedding callers only; no CLI compile does this yet) | `E041` | `E041` |
 | Schema cache, younger than `trusted_max_age_seconds` | `E041` | `E041` |
 | Schema cache, older (or the key is unset) | `W041` | `E041` |
 | Seed file (`--with-seed`) | `W041` | `E041` |
@@ -284,18 +278,17 @@ Rocky reports the name only when it binds to known sources and nothing else. Eve
 
 A two-part read such as `FROM staging.orderz` may name a table that does not exist when Rocky has source schemas for other tables in `staging` but none for `orderz`.
 
-| Where the table list came from | Without strict sources | With strict sources |
+| Where the table list came from (a full warehouse read in the same invocation is `E045`, for embedding callers) | Without strict sources | With strict sources |
 |---|---|---|
-| Every table read from the warehouse during this invocation (embedding callers only) | `E045` | `E045` |
 | Seed file (`--with-seed`) or schema cache | `W045` | `E045` |
 
 A seed or the cache lists only the tables it was given, so by default these warn and the compile exits `0`. `--strict-sources` and `[cache.schemas] strict_sources = true` turn every `W045` into `E045`. The message suggests a close table name or lists the schema's known tables. `rocky run` logs a `W045` and the model runs.
 
 These reads stay silent: a schema Rocky has no source schema in; a schema a model of the project writes to; a one-part name; a three-part name (its catalog may hold a different schema of that name); a name bound by `WITH`.
 
-During `rocky run`, a selected model with an `Error` diagnostic records a `compile-error`. Rocky withholds that model's declared DAG descendants. Healthy branches can still run. `RunOutput.contained` lists the withheld descendants. Retained target tables are old output, not validated output.
+During `rocky run`, a model with an `Error` diagnostic records a `compile-error` and Rocky withholds its declared DAG descendants (`RunOutput.contained`). Healthy branches still run. See [Failure containment](/advanced/failure-modes/#failure-containment-across-the-model-graph).
 
-With `rocky run --model <name> --defer`, a successful external rewrite suppresses local `E039` only for the rewritten reference. A qualified local reference or an unrewritten input keeps its normal blocking rules. The exemption needs a complete plain `SELECT` `FROM` or `JOIN` read set: CTEs, subqueries and set operations keep local failure dependencies. An invalid external schema still fails when the warehouse runs the SQL.
+With `rocky run --model <name> --defer`, a successful external rewrite suppresses local `E039` only for the rewritten reference. The exemption needs a complete plain `SELECT` `FROM` or `JOIN` read set: CTEs, subqueries and set operations keep local failure dependencies, as do qualified local references and unrewritten inputs. An invalid external schema still fails when the warehouse runs the SQL.
 
 ### GROUP BY validity
 

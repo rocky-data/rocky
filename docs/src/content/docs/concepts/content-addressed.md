@@ -76,23 +76,7 @@ Rocky also refuses the write, and writes no commit, in these cases:
 
 ## Configuration
 
-A content-addressed sidecar carries the strategy, a `storage_prefix`, and an
-optional `partition_columns` list:
-
-```toml
-# models/fct_events.toml
-name = "fct_events"
-
-[strategy]
-type = "content_addressed"
-storage_prefix = "s3://${ROCKY_BUCKET}/marts/fct_events"
-partition_columns = ["event_date"]
-
-[target]
-catalog = "analytics"
-schema  = "marts"
-table   = "fct_events"
-```
+A content-addressed sidecar carries `[strategy] type = "content_addressed"`, a `storage_prefix` (for example `s3://${ROCKY_BUCKET}/marts/fct_events`) and an optional `partition_columns` list (for example `["event_date"]`), beside the usual `name` and `[target]` (see [Model Format](/reference/model-format/#content-addressed)):
 
 | Field | Required | Description |
 |---|---|---|

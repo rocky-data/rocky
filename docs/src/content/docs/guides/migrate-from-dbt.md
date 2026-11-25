@@ -56,7 +56,7 @@ imported/
     └── fct_revenue.toml
 ```
 
-`stg_orders.toml`: `view` maps to Rocky's `view` strategy, the model `description` becomes `intent`, and the `schema.yml` generic tests become `[[tests]]` blocks:
+`stg_orders.toml`: `view` maps to the `view` strategy, the `description` becomes `intent`, and `schema.yml` generic tests become `[[tests]]` blocks:
 
 ```toml
 name = "stg_orders"
@@ -270,13 +270,7 @@ unique_key = ["id"]
 domain = "finance"
 ```
 
-```toml
-# models/fct_orders.toml
-group = "daily_marts"
-
-[args]
-region = "emea"
-```
+A member model sets `group = "daily_marts"` and `[args] region = "emea"` in its sidecar.
 
 A dbt folder default applies to every model in the directory. A group applies only to models that name it. Precedence: per-model sidecar over group over `models/_defaults.toml`. A group with `enforce = true` makes a member that pins a field the group controls (its target schema or strategy) fail to load.
 
@@ -338,46 +332,24 @@ Run both projects and compare their output before you move production traffic.
 
 ### Run on a test catalog
 
-Add a second pipeline. Reuse the `prod` and `fivetran` adapters and change only these keys:
-
-```toml
-[pipeline.bronze_test]
-type = "replication"
-strategy = "full_refresh"
-# source, source.discovery and source.schema_pattern: same as [pipeline.bronze]
-
-[pipeline.bronze_test.target]
-adapter = "prod"
-catalog_template = "test_warehouse"
-schema_template = "staging"
-```
+Add a second pipeline `[pipeline.bronze_test]` that copies `[pipeline.bronze]` (same `source`, `source.discovery` and `source.schema_pattern`) with `strategy = "full_refresh"` and `[pipeline.bronze_test.target]` set to `adapter = "prod"`, `catalog_template = "test_warehouse"`, `schema_template = "staging"`. Then:
 
 ```bash
 plan_id=$(rocky plan --pipeline bronze_test --filter tenant=acme --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 
-Then compare row counts, column types and values between the dbt tables and the Rocky tables.
+Compare row counts, column types and values between the dbt tables and the Rocky tables.
 
 ### Select models the way you did in dbt
 
-Rocky accepts dbt's node selection syntax on `--select` and `--exclude`. See [Node selection](/reference/node-selection/) for the grammar.
+`--select` and `--exclude` accept dbt's node selection syntax (`+model`, `model+`, `2+model`, `@model`, `tag:`, `path:`, `config.materialized:`, `source:`). The command map: `dbt ls` is `rocky list`, `dbt compile` is `rocky compile` (or `rocky emit-sql` for the SQL), `dbt run` is `rocky run`, `dbt test` is `rocky test`, `dbt docs generate` is `rocky docs`. Differences:
 
-| dbt | Rocky |
-|---|---|
-| `dbt ls --select <sel>` | `rocky list --select <sel>` |
-| `dbt compile --select <sel>` | `rocky compile --select <sel>`, or `rocky emit-sql --select <sel>` for the SQL |
-| `dbt run --select <sel>` | `rocky run --select <sel>` |
-| `dbt test --select <sel>` | `rocky test --select <sel>` |
-| `dbt docs generate --select <sel>` | `rocky docs --select <sel>` |
-| `--select +model`, `model+`, `2+model`, `@model` | The same graph operators |
-| `--select tag:nightly` | The same. Rocky matches a `[tags]` key or value. |
-| `--select path:models/staging` | The same |
-| `--select config.materialized:incremental` | The same. `table` matches Rocky's `full_refresh`. |
-| `--select source:raw+` | The same. Rocky matches the external tables a model reads. |
-| `--select state:modified+ --state path/to/artifacts` | `--select state:modified+ --state-ref main`. Rocky compares against a git ref, not a manifest. |
-| `--exclude <sel>` | The same |
-| `--defer --state path/to/artifacts` | `--defer`, optionally `--defer-to <schema>` |
+- `tag:nightly` matches a `[tags]` key or value. `config.materialized:table` matches Rocky's `full_refresh`. `source:raw+` matches the external tables a model reads.
+- `--select state:modified+ --state path/to/artifacts` becomes `--select state:modified+ --state-ref main`: Rocky compares against a git ref, not a manifest.
+- `--defer --state path/to/artifacts` becomes `--defer`, optionally `--defer-to <schema>`.
+
+See [Node selection](/reference/node-selection/) for the grammar.
 
 ## 9. Convert dbt Tests to Rocky Tests and Contracts
 
@@ -476,13 +448,8 @@ name = "order_id"
 type = "Int64"
 nullable = false
 
-[[columns]]
-name = "total_amount"
-type = "Decimal"
-nullable = false
-
 [rules]
-required = ["order_id", "total_amount"]
+required = ["order_id"]
 protected = ["order_id"]
 ```
 

@@ -94,25 +94,7 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 
 ## Output
 
-Drift detection runs inline on a replication run. Rocky reports what it did in the `drift` section of the run JSON output:
-
-```json
-{
-  "drift": {
-    "tables_checked": 45,
-    "tables_drifted": 1,
-    "actions_taken": [
-      {
-        "table": "acme_warehouse.staging__us_west__shopify.events",
-        "action": "drop_and_recreate",
-        "reason": "column 'status' changed STRING -> INT"
-      }
-    ]
-  }
-}
-```
-
-Run `rocky plan --filter client=acme --output json` to preview the SQL, drops included, without executing it.
+Drift detection runs inline on a replication run. The `drift` section of the run JSON reports `tables_checked`, `tables_drifted` and `actions_taken` (each with `table`, `action` and `reason`, for example `"column 'status' changed STRING -> INT"`). Run `rocky plan --filter client=acme --output json` to preview the SQL, drops included, without executing it. The actions:
 
 | Action | What Rocky did |
 |---|---|

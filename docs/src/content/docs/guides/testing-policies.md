@@ -89,36 +89,13 @@ expect                = "require_review"
 
 A scenario describes the target model directly, rather than pointing at a model in your project. Its fields are the exact attributes the evaluator reads at a real enforcement seam: `model` (the name, matched against a rule's `scope.models` globs), `tags`, `classifications`, `contracted`, `layer`, `downstreams`, and `reachable_downstreams`.
 
-One evaluator serves both the scenario and the live change:
+One evaluator serves both the scenario and the live change (`rocky apply`, promote, or an MCP write tool): the scenario declares the attributes, the evaluator resolves an effect, and the runner compares it with `expect` (PASS, or FAIL and a non-zero exit).
 
-```
-              scenario                    live change
-        [[policy.tests]] block       rocky apply, promote, or
-        declares the attributes      an MCP write tool
-                  │                            │
-                  └─────────────┬──────────────┘
-                                ▼
-                    ┌───────────────────────┐
-                    │   policy evaluator    │  one code path
-                    └───────────┬───────────┘
-                                ▼
-              effect: allow | require_review | deny
-                  │                            │
-                  ▼                            ▼
-        compare with `expect`          gate the live change
-        PASS, or FAIL and a
-        non-zero exit code
-```
-
-One convenience mirrors production. A live seam reads a model's layer from its `layer` tag. So if you set `tags = { layer = "gold" }` and leave `layer` unset, the runner fills `layer` from that tag. A rule scoped with `layer = "gold"` then matches the scenario just as it would match the real model. Set `layer` explicitly only when you want to model a value that differs from the tag.
-
-Declaring the attributes, rather than resolving them from a live model, is deliberate. A scenario pins the behaviour of the *policy*, not the current state of your graph. It keeps its meaning whether or not the project compiles today. And it lets you assert cases your project does not happen to contain right now: a model with forty downstream consumers, a table classified `pii`, a change to something behind a contract.
+If you set `tags = { layer = "gold" }` and leave `layer` unset, the runner fills `layer` from the tag, as a live seam does. Set `layer` explicitly only to model a value that differs from the tag. Declaring attributes, rather than resolving them from a live model, pins the behaviour of the *policy*, not the state of your graph. It stays valid when the project does not compile, and it lets you assert cases the project does not contain: forty downstream consumers, a `pii` table, a change behind a contract.
 
 ### The blast-radius ceiling
 
-The last scenario above is the one worth dwelling on. A rule can carry a `max_downstreams` ceiling, and that ceiling fails closed. An additive change that would ripple past the limit is degraded from `allow` to `require_review`. So is a change whose blast radius cannot be computed at all.
-
-Leave `reachable_downstreams` out of a scenario to model that uncomputable case, and assert that the policy still stops for review:
+A rule can carry a `max_downstreams` ceiling, and that ceiling fails closed: an additive change that would ripple past the limit, or whose blast radius cannot be computed, degrades from `allow` to `require_review`. Leave `reachable_downstreams` out of a scenario to model the uncomputable case:
 
 ```toml
 [[policy.tests]]
@@ -128,8 +105,6 @@ capability = "schema_change.additive"
 tags   = { layer = "bronze" }
 expect = "require_review"
 ```
-
-A ceiling that quietly stops firing is exactly the kind of regression a green unit-test suite can miss and a live incident cannot. That is why it is worth a scenario of its own.
 
 ## Run the scenarios
 

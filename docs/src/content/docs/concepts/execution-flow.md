@@ -121,27 +121,9 @@ Rocky fires `pipeline_complete` on success and `pipeline_error` on failure. The 
 
 ## Step 9: Emit JSON output
 
-Rocky serializes `RunOutput` to JSON on stdout. The top-level fields are stable. The full shape is in [JSON output](/reference/json-output/).
+Rocky serializes `RunOutput` to JSON on stdout. The top-level fields are stable (`version`, `command`, `status`, `tables_copied`, `tables_failed`, `materializations`, `errors`, `check_results`, `drift`, `permissions`, `anomalies`). The full shape is in [JSON output](/reference/json-output/).
 
-```json
-{
-  "version": "1.80.0",
-  "command": "run",
-  "status": "PartialFailure",
-  "tables_copied": 3,
-  "tables_failed": 1,
-  "materializations": [
-    { "asset_key": ["analytics", "main", "orders_summary"], "rows_copied": 1200, "duration_ms": 45,
-      "metadata": { "strategy": "full_refresh", "target_table_full_name": "analytics.main.orders_summary", "sql_hash": "..." } }
-  ],
-  "errors": [
-    { "asset_key": ["analytics", "main", "customer_totals"], "failure_kind": "query-rejected", "error": "..." }
-  ],
-  "check_results": [...], "drift": [...], "permissions": [...], "anomalies": [...]
-}
-```
-
-A successful model is one entry in `materializations`. A failed model is an entry in `errors` with its `failure_kind`. Run status is the top-level `status` (`Success`, `PartialFailure`, `Failure`). `tables_skipped` counts skipped and reused models, and `model_decisions` details them.
+A successful model is one entry in `materializations`. A failed model is an entry in `errors` with its `failure_kind` (for example `query-rejected`). Run status is the top-level `status` (`Success`, `PartialFailure`, `Failure`). `tables_skipped` counts skipped and reused models, and `model_decisions` details them.
 
 Exit code:
 - `0`: all models succeeded

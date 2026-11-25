@@ -18,18 +18,15 @@ If you already run Dagster or Airflow, keep them. See [`dagster-rocky`](/dagster
 
 ## What one `rocky run` already does
 
-A timer adds only the trigger. The run's behavior stays in `rocky.toml` and the engine.
+A timer adds only the trigger. A `rocky run` already does the rest, from `rocky.toml` and the engine: it runs models in DAG order (independent branches concurrently), retries a failed statement up to `max_retries` (see [retry settings](/reference/configuration/#retry)), keeps models that materialized when others fail (exit `2`, see [per-table error containment](/advanced/per-table-error-containment/)), writes runs to the embedded [state store](/reference/glossary/#state-store), and fires lifecycle [hooks](/concepts/hooks/) (failure hooks fire most reliably on the replication path).
 
-| Behavior | What it does |
+Resume and re-run options:
+
+| Flag | What it does |
 |---|---|
-| DAG order | Runs models in dependency order. Independent branches run concurrently. |
-| Retry | Retries a failed statement up to `max_retries`. On Databricks and Snowflake a circuit breaker trips after consecutive failures. See [retry settings](/reference/configuration/#retry). |
-| Keep good work | Keeps models that materialized when others fail. Exits `2` and lists the failures. See [per-table error containment](/advanced/per-table-error-containment/). |
-| Local records | Writes runs to the embedded [state store](/reference/glossary/#state-store). `rocky history` needs no external database. Persistence is best-effort, most complete for replication and transformation runs. |
-| Resume | `rocky run --resume-latest` or `--resume <run_id>` resumes a failed replication run. A complete checkpoint with no terminal run record refuses resume: follow its recovery guidance. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication). |
-| Retry a failed run | `rocky run --retry-failed [<run_id>]` reruns the failed and never-built models of a failed transformation run, and their downstream models. It needs a local `[state]` backend. See [Retrying a failed run](/reference/commands/core-pipeline/#retrying-a-failed-run). |
-| Idempotency key | `rocky run --idempotency-key <key>` skips a run whose key is in flight or already *successful*. A *failed* run leaves the key claimable. Set `dedup_on = "any"` to skip after a failure too. You cannot combine a key with resume. |
-| Hooks | Fires lifecycle [hooks](/concepts/hooks/). Failure hooks fire most reliably on the replication path. |
+| `--resume-latest`, `--resume <run_id>` | Resume a failed replication run. A complete checkpoint with no terminal run record refuses resume: follow its recovery guidance. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication). |
+| `--retry-failed [<run_id>]` | Rerun the failed and never-built models of a failed transformation run, and their downstream models. Needs a local `[state]` backend. See [Retrying a failed run](/reference/commands/core-pipeline/#retrying-a-failed-run). |
+| `--idempotency-key <key>` | Skip a run whose key is in flight or already *successful*. A *failed* run leaves the key claimable. `dedup_on = "any"` skips after a failure too. You cannot combine a key with resume. |
 
 ## The exit-code contract
 
@@ -145,37 +142,26 @@ If GitHub's runners can reach your warehouse, a scheduled workflow needs no infr
 
 ```yaml
 # .github/workflows/rocky-nightly.yml
-name: Rocky nightly
-
 on:
   schedule:
     - cron: "0 3 * * *"   # 03:00 UTC daily
   workflow_dispatch: {}
-
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rocky
-        run: curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-      - name: Pre-flight
-        run: rocky doctor
+      - run: curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+      - run: rocky doctor
       - name: Run pipeline
-        id: rocky
         run: |
           set +e
           rocky run --output json | tee run.json
-          # PIPESTATUS[0] is rocky's code, not tee's.
-          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-      - name: Classify outcome
-        if: always()
-        run: |
-          case "${{ steps.rocky.outputs.exit_code }}" in
-            0)   echo "Run succeeded." ;;
-            2)   echo "::warning::Partial success: some models failed."; exit 0 ;;
-            130) echo "Interrupted."; exit 0 ;;
-            *)   echo "::error::Run failed."; exit 1 ;;
+          code=${PIPESTATUS[0]}   # rocky's code, not tee's
+          case "$code" in
+            0|130) exit 0 ;;
+            2)     echo "::warning::Partial success: some models failed."; exit 0 ;;
+            *)     echo "::error::Run failed."; exit "$code" ;;
           esac
 ```
 
@@ -192,7 +178,7 @@ rocky doctor
 rocky run --output json
 ```
 
-If the scheduler distinguishes exit codes, wire exit `2` to a warning and the rest to a failure. Snowflake Tasks, Airflow's `BashOperator` and cloud cron services follow the same shape.
+Wire exit `2` to a warning and the rest to a failure if the scheduler distinguishes them. Snowflake Tasks, Airflow's `BashOperator` and cloud cron follow the same shape.
 
 ## Failure notification without a platform
 
@@ -241,7 +227,7 @@ cron and systemd start with a nearly empty environment. A `${VAR}` in config tha
 
 ### rocky doctor as a pre-flight
 
-`rocky doctor` runs config, state, adapter and auth checks. It **exits `3` if any check is Critical**. A bad config or an unreachable warehouse is Critical. A degraded or unreadable local state store is a Warning and exits `0`.
+`rocky doctor` runs config, state, adapter and auth checks and **exits `3` if any is Critical** (a bad config, an unreachable warehouse). A degraded or unreadable local state store is a Warning and exits `0`.
 
 ```bash
 rocky doctor                   # all checks, exits 3 on any Critical
@@ -282,19 +268,13 @@ Scheduling works on `replication`, `transformation`, `quality` and `snapshot` pi
 
 ### Words this section uses
 
-| Term | What it means |
-|---|---|
-| Demand | A recorded request to run one pipeline. A `cron` slot, an `after` dependency, a `freshness` budget or a webhook each create one. |
-| Tick | One pass that looks at all standing demand and runs what is due. |
-| Reconciler | The code that performs a tick. `rocky tick` runs it once. `rocky serve --scheduler` loops it. |
-| Claim | The marker written when the reconciler takes a demand. It stops a second tick taking the same one. |
-| Stuck-claim resolver | When a due demand finds its claim still `submitted` from an earlier tick, Rocky resolves it from the child's run record. |
-| Orphan sweep | A pass at the end of a tick. It finishes each `submitted` claim an earlier tick left, if its run record is terminal. |
-| Spool file | The file that holds an accepted webhook demand. Rocky writes and `fsync`s it before it answers. |
-| Fail-closed | Rocky refuses to act when it cannot confirm the conditions. |
-| At-most-once | Rocky attempts the work once and never retries. The work can be lost, never duplicated. |
-| `failure_backoff` | The state a pipeline enters after a scheduled run fails. Later ticks skip it until its `resume_at`. |
-| Incident bundle | One JSON file under `.rocky/incidents/` for one failed scheduled run. |
+- **Demand:** a recorded request to run one pipeline, from a `cron` slot, an `after` dependency, a `freshness` budget or a webhook.
+- **Tick:** one pass over all standing demand that runs what is due. The **reconciler** performs it: `rocky tick` once, `rocky serve --scheduler` in a loop.
+- **Claim:** the marker written when the reconciler takes a demand, so a second tick cannot take it. The **stuck-claim resolver** settles a claim still `submitted` from an earlier tick using the child's run record. The **orphan sweep** at the end of a tick finishes each `submitted` claim whose run record is terminal.
+- **Spool file:** holds an accepted webhook demand. Rocky writes and `fsync`s it before it answers.
+- **Fail-closed:** Rocky refuses to act when it cannot confirm the conditions. **At-most-once:** attempted once, never retried: lost at worst, never duplicated.
+- **`failure_backoff`:** the state after a scheduled run fails. Later ticks skip the pipeline until its `resume_at`.
+- **Incident bundle:** one JSON file under `.rocky/incidents/` for one failed scheduled run.
 
 ### The demand lifecycle
 
@@ -356,21 +336,7 @@ after = ["raw"]             # run once raw has a newer success than staging's la
 * * * * *  analytics  cd /srv/analytics && flock -n /var/lock/rocky-tick.lock rocky tick --output json >> /var/log/rocky/tick.log 2>&1
 ```
 
-Or a systemd timer with a `oneshot` service as above:
-
-```ini
-# rocky-tick.timer
-[Timer]
-OnCalendar=*:0/1
-AccuracySec=1s
-
-# rocky-tick.service
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/analytics
-ExecStart=/usr/local/bin/rocky tick --output json
-SuccessExitStatus=2
-```
+Or a systemd timer (`OnCalendar=*:0/1`, `AccuracySec=1s`) with a `oneshot` service that runs `/usr/local/bin/rocky tick --output json` with `SuccessExitStatus=2`, as above.
 
 `rocky tick` takes its own non-blocking lock, `.rocky/tick.lock`, so two ticks never reconcile at once. The outer `flock` is a cheap early skip.
 
@@ -503,9 +469,7 @@ Every *accepted* demand is at-most-once. Whether the same *event* runs at most o
 freshness = true        # re-runs if it goes stale, even if a webhook is lost
 ```
 
-A webhook run records `trigger: "webhook"` in `rocky history`, and a cron, `after` or freshness run records `schedule`. A demand whose pipeline was removed from config after acceptance is finalized without running, and logged.
-
-Between acceptance and the next tick, a demand is in no claim and no history row. To see that queue:
+A webhook run records `trigger: "webhook"` in `rocky history`, and a cron, `after` or freshness run records `schedule`. A demand whose pipeline left the config after acceptance is finalized without running, and logged. Between acceptance and the next tick, a demand is in no claim and no history row. To see that queue:
 
 ```
 GET /api/v1/schedule/spool          # or: rocky state schedule spool
@@ -556,17 +520,9 @@ A tick can also exit `0` having done nothing because another `rocky` process hel
 
 ### Incident bundles
 
-When a scheduled run finalizes as a failure (full or partial, both trip backoff), the reconciler writes one JSON file under `.rocky/incidents/`. It holds facts only:
+When a scheduled run finalizes as a failure (full or partial, both trip backoff), the reconciler writes one JSON file under `.rocky/incidents/` with facts only: the pipeline, the demand source (`cron`, `after`, `freshness`, `webhook`), the outcome and occurrence, the submission id and exit code, the attempt count and consecutive-failure count after this failure, and retrieval pointers (a `rocky history` command, plus `/api/v1/jobs/{id}` and `/api/v1/schedule` under the resident scheduler). A fact the path cannot know is `null`, never a guessed zero, such as the exit code of a run recovered from a crashed owner.
 
-- the pipeline and the demand source (`cron`, `after`, `freshness`, `webhook`);
-- the outcome and the occurrence it was for;
-- the submission id and the exit code;
-- the attempt count and the consecutive-failure count after this failure;
-- retrieval pointers: a `rocky history` command, plus `/api/v1/jobs/{id}` and `/api/v1/schedule` under the resident scheduler.
-
-A fact the path cannot know is `null`, never a guessed zero. The exit code of a run recovered from a crashed owner is one.
-
-The stuck-claim resolver and the orphan sweep also write bundles. The sweep catches a cron occurrence whose child never recorded a run (a power loss, a kill). It waits 5 minutes after first seeing the claim, records the occurrence as a lost failure, writes the bundle, and does not re-run it. A child the spawner terminated for a shutdown drain gets no bundle: a graceful shutdown is not an incident. A run that failed on its own during a drain still gets one.
+The stuck-claim resolver and the orphan sweep also write bundles. The sweep catches a cron occurrence whose child never recorded a run (a power loss, a kill): after 5 minutes it records a lost failure, writes the bundle and does not re-run it. A child the spawner terminated for a shutdown drain gets no bundle, because a graceful shutdown is not an incident. A run that failed on its own during a drain still does.
 
 Rocky keeps the newest 50 bundles. The sweep deletes only files the writer named, and refuses to work through a symlinked `incidents` directory.
 

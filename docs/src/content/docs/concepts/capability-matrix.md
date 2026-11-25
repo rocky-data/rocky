@@ -130,7 +130,3 @@ the mutation has already landed).
 
 Test kinds: `engine/crates/rocky-core/src/tests.rs`. Workflow:
 [Checks and Tests](/concepts/data-quality-checks/).
-
-## How to read a gap
-
-Build controls on the Rocky-guaranteed rows, name the adapter when you rely on an adapter-dependent row, and own the external rows in your runbook.

@@ -83,10 +83,6 @@ Replay means two things.
 
 Content-addressed materialization ships for single-writer Delta and UniForm. Multi-writer concurrency, broad schema evolution and deletion vectors are not covered. See [Content-Addressed Materialization](/concepts/content-addressed/).
 
-### VS Code trust overlays
-
-The VS Code extension paints five trust signals on the lineage graph: **Cost** (compile-time estimate), **Freshness** (declared policy), **Breaking** (semantic CI diff), **Last run** and **Governance** (classified columns and unmasked exceptions). There is no drift overlay: Rocky has no `rocky drift` command and detects drift inside `rocky run` and `rocky plan`.
-
 ## The honesty grade
 
 Every load-bearing claim, in one table. The partial rows are where teams get surprised.

@@ -15,57 +15,11 @@ The silver layer is where you write your own SQL transformations. A model is one
   acme_warehouse.analytics.fct_orders
 ```
 
-## Model formats
+## Model formats and configuration
 
-### Sidecar format (recommended)
+Each model is a `.sql` file with a same-named `.toml` sidecar (recommended). A legacy inline format puts the TOML in `---toml` frontmatter at the top of the SQL file: prefer the sidecar, because embedded TOML breaks SQL editor tooling. The sidecar fields (`name`, `depends_on`, `[strategy]`, `[target]`, `[[sources]]`) and their defaults are in [Model Format](/reference/model-format/). A sidecar declares at most one `[strategy]`. With none, Rocky takes one from the config group, then the directory defaults, then `full_refresh`.
 
-Each model is two files with the same base name: `models/fct_orders.sql` (pure SQL) and `models/fct_orders.toml` (configuration).
-
-### Inline format (legacy)
-
-A single SQL file with TOML frontmatter at the top. Rocky still reads it. Prefer the sidecar format, because embedded TOML breaks SQL editor tooling.
-
-```sql
----toml
-name = "fct_orders"
-depends_on = ["stg_orders"]
-
-[strategy]
-type = "full_refresh"
-
-[target]
-catalog = "acme_warehouse"
-schema = "analytics"
-table = "fct_orders"
----
-
-SELECT ...
-```
-
-## Configuration
-
-Model TOML fields (full reference: [Model Format](/reference/model-format/)):
-
-| Field | Required | Description |
-|---|---|---|
-| `name` | No | Model identifier, used in `depends_on` references; defaults to the file name |
-| `depends_on` | No | List of upstream model names (execution order) |
-| `[strategy]` | No | Materialization config (see below); defaults to `full_refresh` |
-| `[target]` | Yes | Output table: `{ catalog, schema, table }`. A config group or `_defaults.toml` can supply `catalog` and `schema`; `table` defaults to the model name |
-| `[[sources]]` | No | Input tables (for documentation and lineage) |
-
-### `[strategy]`
-
-A sidecar declares at most one `[strategy]`. If it declares none, Rocky takes one from the config group, then from the directory defaults, and otherwise uses `full_refresh`. Pick the block that matches what you need.
-
-**Merge.** `update_columns` is optional. Without it, a matched row updates every column, the keys included. DuckDB, Snowflake and BigQuery have no `UPDATE SET *`. When Rocky cannot resolve the column list for them, the run fails and asks you to declare `update_columns`.
-
-```toml
-[strategy]
-type = "merge"
-unique_key = ["customer_id"]
-update_columns = ["name", "email", "updated_at"]
-```
+For a `merge` strategy, `update_columns` is optional. Without it a matched row updates every column, keys included. DuckDB, Snowflake and BigQuery have no `UPDATE SET *`: when Rocky cannot resolve the column list for them, the run fails and asks you to declare `update_columns`.
 
 ## Examples
 
@@ -118,14 +72,4 @@ A model takes one `[strategy] type`. The [strategy examples](/reference/model-fo
 
 ## Validation
 
-Run `rocky validate` to load every model and check the dependency graph before you execute anything:
-
-```bash
-rocky validate
-```
-
-It checks that:
-- Every model file parses
-- Every `depends_on` reference points to a model that exists
-- No model depends on itself, directly or through a cycle
-- Every target table identifier passes SQL validation
+`rocky validate` loads every model and checks the dependency graph before anything executes: every file parses, every `depends_on` points to an existing model, no model depends on itself or through a cycle, and every target table identifier passes SQL validation.

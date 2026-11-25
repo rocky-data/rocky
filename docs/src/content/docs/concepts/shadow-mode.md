@@ -84,15 +84,7 @@ A half-quoted reference such as `"main".orders` needs both. A reserved word (`OR
 
 ### CTE names on Snowflake
 
-A CTE can hide a bare table name. Rocky folds an unquoted CTE alias and an unquoted reference to upper case before comparing them, and leaves a quoted one as written (Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`). With `TRUE`, a quoted identifier folds to upper case too. Rocky cannot observe the setting, so it refuses the pairs that differ between settings:
-
-| CTE alias | Reference | `FALSE` (default) | `TRUE` | Rocky |
-|---|---|---|---|---|
-| `orders` | `orders` | hidden | hidden | hidden |
-| `Orders` | `orders` | hidden | hidden | hidden |
-| `"orders"` | `orders` | free | hidden | refuses |
-| `orders` | `"orders"` | free | hidden | refuses |
-| `"Orders"` | `"orders"` | free | hidden | refuses |
+A CTE can hide a bare table name. Rocky folds an unquoted CTE alias and an unquoted reference to upper case before comparing them, and leaves a quoted one as written (Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`; with `TRUE` a quoted identifier folds too). Rocky cannot observe the setting, so it refuses the pairs that differ between settings: a quoted alias against an unquoted reference (`"orders"` / `orders`), an unquoted alias against a quoted reference (`orders` / `"orders"`), and `"Orders"` / `"orders"`. Pairs that agree (`orders` / `orders`, `Orders` / `orders`) are hidden under both settings.
 
 The refusal applies only when the reference would otherwise name an upstream the command redirects: a deferred model on `--defer`, a routed upstream on a shadow or branch run, an upstream on `branch promote`, or a recorded upstream on `rocky replay --execute`. Spell the CTE alias and the reference alike, or rename the CTE.
 
@@ -168,7 +160,4 @@ JSON, for example `--thresholds '{"row_count_diff_pct_fail": 0.10}'`.
 
 ## Use cases
 
-- **Schema migrations**: check that a column rename does not change the output
-- **Logic changes**: compare the old and the new calculation, row for row
-- **Adapter testing**: run a new warehouse adapter beside the production one
-- **dbt migration**: compare Rocky's output against dbt's output with `rocky validate-migration`
+Schema migrations (does a column rename change the output), logic changes (old against new, row for row), adapter testing (a new warehouse adapter beside the production one), and dbt migration (`rocky validate-migration`).
