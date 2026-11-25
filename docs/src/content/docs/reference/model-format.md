@@ -58,11 +58,11 @@ models/
 └── dim_products.toml
 ```
 
-The split matters because it keeps the `.sql` file readable by anything that reads SQL. You can open it in a query editor, run it by hand, or hand it to a colleague who has never heard of Rocky.
+The `.sql` file stays readable by any SQL tool: open it in a query editor or run it by hand.
 
 ### SQL File
 
-The `.sql` file holds a plain SQL query. No templating, no Jinja, no special markers.
+The `.sql` file holds a plain SQL query. It has no templating and no Jinja.
 
 ```sql
 -- models/fct_orders.sql
@@ -239,17 +239,11 @@ Three layers can set the same field. The nearest one to the model wins:
    models/_defaults.toml     ◄── lowest: directory defaults
 ```
 
-So a model can pin its own `schema` or `strategy` and override the group, and the group in turn overrides the directory defaults. A `group` naming no definition fails the load with a clear error. So does a `schema_template` placeholder the model does not supply. Rocky refuses rather than routing the model somewhere wrong.
-
-One combination is rejected. A model that pins its own `schema` bypasses the group's template completely, so it must **not** also supply `[args]`. Those args could only fill a template nothing now reads. Rocky fails the load rather than let the args sit there doing nothing and masking a routing mistake. Pin a schema *or* supply args, never both.
+A `group` naming no definition fails the load. So does a `schema_template` placeholder the model does not supply. A model that pins its own `schema` bypasses the group's template, so it must **not** also supply `[args]`: pin a schema *or* supply args, never both. Rocky fails the load rather than mask a routing mistake.
 
 #### Enforced groups
 
-Make the group's fields binding instead of overridable. Set `enforce = true` in the group file. A member model that pins a field the group owns, its target `schema` or its `strategy`, then fails the load. It cannot quietly route or materialize itself differently from the rest of the group:
-
-Enforcement is opt-in. Without `enforce`, a group stays a set of overridable defaults. A model under an enforced group still supplies its own `[args]`, and any field the group leaves unset such as `target.catalog`. It simply cannot override what the group owns. Use enforcement when a set of models must share routing and materialization as a governance guarantee.
-
-The model loader does not recurse into subdirectories, so it never mistakes `models/groups/` for model files.
+Make the group's fields binding. Set `enforce = true` in the group file (opt-in; without it a group is overridable defaults). A member model that pins a field the group owns, its target `schema` or its `strategy`, then fails the load. It still supplies its own `[args]` and any field the group leaves unset, such as `target.catalog`. Use it when models must share routing and materialization as a governance guarantee. The model loader does not recurse into subdirectories, so it never reads `models/groups/` as model files.
 
 #### Group tags
 
@@ -346,9 +340,9 @@ schema = "marts"
 table = "dim_customers"
 ```
 
-At `rocky run` (and on the emit-SQL path), Rocky appends `CAST(md5(...) AS <string_type>) AS <name>` to the model's projection, computed over the input columns. The hash expression is dialect-correct: it uses the warehouse's variable-length string type (`STRING` on Databricks and BigQuery, `VARCHAR` on Snowflake, DuckDB, and Trino) and BigQuery's `to_hex(...)` / `concat(...)` form where the default `||` concatenation doesn't apply. On a given warehouse the hash value matches what `dbt_utils.generate_surrogate_key` produces over the same columns, so keys join across Rocky and dbt models either way. NULL inputs coalesce to a fixed sentinel before hashing, matching dbt-utils.
+At `rocky run` (and on the emit-SQL path), Rocky appends `CAST(md5(...) AS <string_type>) AS <name>` to the projection. The expression is dialect-correct: `STRING` on Databricks and BigQuery, `VARCHAR` on Snowflake, DuckDB and Trino, and BigQuery's `to_hex(...)` / `concat(...)` form. The hash matches `dbt_utils.generate_surrogate_key` over the same columns on the same warehouse, so keys join across Rocky and dbt models. NULL inputs coalesce to a fixed sentinel first, as in dbt-utils.
 
-A `[[surrogate_key]]` block uses `deny_unknown_fields`: a typo such as `colums = [...]` fails the load rather than silently hashing nothing. An empty `columns` list or a `name` / column that isn't a valid identifier is rejected at load with a clear diagnostic. Declare multiple blocks to inject more than one key column.
+The block refuses an unknown key (`colums = [...]` fails the load), an empty `columns` list, and a `name` or column that is not a valid identifier. Declare several blocks for several key columns.
 
 ### `[[tests]]`
 
@@ -384,9 +378,7 @@ expression = "amount >= 0"
 filter = "status != 'cancelled'"
 ```
 
-`expression` is bounded. Rocky parses it under the target dialect and refuses anything that is not one boolean expression over the model's own columns: a subquery, a qualified function name (`schema.fn(...)`), or a function outside its allowlist of pure scalar functions is refused when the test SQL is generated, before anything runs. Comparisons, `CASE`, `CAST`, and functions such as `coalesce`, `length`, `lower` and `date_trunc` pass; anything that can read a file, a secret, session state or a remote endpoint does not. The refusal names the function.
-
-`filter` is bounded by the same gate. A subquery, a qualified function name or an off-allowlist function is refused when the test SQL is generated. The refusal names the field and the table. See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter) for the full rule, including the extra rule for a key expression.
+`expression` and `filter` share one gate. Rocky parses them under the target dialect and refuses, before anything runs, a subquery, a qualified function name (`schema.fn(...)`) or a function outside its allowlist of pure scalar functions. Comparisons, `CASE`, `CAST`, `coalesce`, `length`, `lower` and `date_trunc` pass. Anything that can read a file, a secret, session state or a remote endpoint does not. The refusal names the function (and, for `filter`, the field and table). See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter).
 
 ### `[[use_test]]`
 
@@ -428,7 +420,7 @@ name = "known_status"
 column = "order_status"   # override the definition's default column
 ```
 
-Resolved references are appended to the model's `[[tests]]` at load. A `[[use_test]]` block uses `deny_unknown_fields`, so a mistyped key (`colum =`, `filer =`) is rejected at load rather than silently applying the test with the wrong binding.
+Rocky appends resolved references to the model's `[[tests]]` at load. It rejects a mistyped key (`colum =`, `filer =`) at load.
 
 ### `[[test]]`
 
@@ -481,7 +473,7 @@ Write one table per column, for example `[columns.order_id]` with `description =
 
 `rocky catalog --output json` reports each description as the asset's `CatalogColumn.description`. Rocky attaches a description only when `<name>` matches a column the model actually projects. It drops a description for a column the SELECT does not produce, silently, so keep these keys in step with your output columns. `rocky docs` shows each description next to its column on the model page. It takes the column list from the offline compile, so it needs no warehouse connection.
 
-The singular `[columns.<name>]` table documents columns, and is distinct from the plural `[[columns]]` array used to declare a contract's column schema. The two look similar but do different jobs.
+`[columns.<name>]` documents columns. It differs from the `[[columns]]` array that declares a contract's column schema.
 
 ### Retention
 
@@ -556,19 +548,7 @@ schema = "warehouse"
 table = "dim_products"
 ```
 
-Generated SQL, for a model whose SQL file selects from `raw_catalog.src__acme__us_west__shopify.products`:
-
-```sql
-CREATE OR REPLACE TABLE analytics.warehouse.dim_products AS
-SELECT
-    product_id,
-    product_name,
-    category,
-    price,
-    is_active
-FROM raw_catalog.src__acme__us_west__shopify.products
-WHERE _fivetran_deleted = false
-```
+Rocky runs `CREATE OR REPLACE TABLE analytics.warehouse.dim_products AS <model SELECT>`.
 
 ---
 
@@ -671,32 +651,7 @@ schema = "warehouse"
 table = "dim_customers"
 ```
 
-Generated SQL:
-
-```sql
-MERGE INTO analytics.warehouse.dim_customers AS target
-USING (
-    SELECT
-        customer_id,
-        customer_name,
-        email,
-        segment,
-        lifetime_value,
-        updated_at
-    FROM raw_catalog.src__acme__us_west__shopify.customers
-    WHERE _fivetran_deleted = false
-) AS source
-ON target.customer_id = source.customer_id
-WHEN MATCHED THEN UPDATE SET
-    target.customer_name = source.customer_name,
-    target.email = source.email,
-    target.segment = source.segment,
-    target.lifetime_value = source.lifetime_value,
-    target.updated_at = source.updated_at
-WHEN NOT MATCHED THEN INSERT *
-```
-
-When `update_columns` is omitted, Rocky updates all non-key columns.
+Rocky runs `MERGE INTO <target> AS target USING (<model SELECT>) AS source ON target.customer_id = source.customer_id`. It sets each `update_columns` column on `WHEN MATCHED` and inserts the row on `WHEN NOT MATCHED`. When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ---
 
@@ -730,12 +685,12 @@ GROUP BY customer_id
 
 How the inlining works:
 
-- The CTE is named `__rocky_ephemeral__<model>`. If that name is already used in the statement, Rocky adds `_2`, `_3`, and so on.
-- A reference with no alias keeps the model name as its alias. So `eph_paid_orders.amount` still works.
-- The CTE goes in front of any `WITH` clause the consumer already has.
-- An ephemeral model that reads another ephemeral model works. Each one becomes one CTE, in dependency order, once per consumer.
-- Only a bare model name is a reference. A CTE of the same name in the consumer wins, and the model is not inlined.
-- The rewrite works on the parsed SQL, not on the text. The consumer's executed SQL loses its comments and original spacing.
+- The CTE is named `__rocky_ephemeral__<model>`. Rocky adds `_2`, `_3` if the name is taken.
+- A reference with no alias keeps the model name as its alias, so `eph_paid_orders.amount` still works.
+- The CTE goes in front of any `WITH` clause the consumer has.
+- An ephemeral model that reads another works: one CTE each, in dependency order, once per consumer.
+- Only a bare model name is a reference. A CTE of the same name in the consumer wins.
+- The rewrite works on parsed SQL, so the consumer's executed SQL loses its comments and spacing.
 
 What each command does with an ephemeral model:
 
@@ -782,9 +737,7 @@ table = "fct_daily_activity"
 
 An alias for `time_interval` that defaults to `hour` granularity. The name matches dbt's for partition-based incremental processing.
 
-The model SQL must use both `@start_date` and `@end_date` to bound each partition. Missing either is a compile error (`E024`). A placeholder that is only in a comment, a string or the `SELECT` list counts as missing. So does one that does not bound a column in an `AND`-joined comparison, such as `ts >= @start_date OR 1 = 1` or `NOT (ts >= @start_date)`. So does a filter that misses some emitted rows: an unfiltered `UNION ALL` branch, a filter in a CTE the output never reads, or a filter inside a scalar subquery in the `SELECT` list. See [Time interval](/concepts/time-interval/#sql-placeholders). Each run replaces its selected partitions instead of appending the full result again.
-
-The SQL bounds each partition with `WHERE event_at >= @start_date AND event_at < @end_date`, as in [Time Interval](#time-interval).
+The SQL must use both `@start_date` and `@end_date` to bound each partition (`WHERE event_at >= @start_date AND event_at < @end_date`, as in [Time Interval](#time-interval)). A missing placeholder is compile error `E024`. A placeholder counts as missing when it appears only in a comment, a string or the `SELECT` list, when it does not bound a column in an `AND`-joined comparison (`ts >= @start_date OR 1 = 1`, `NOT (ts >= @start_date)`), or when the filter misses emitted rows (an unfiltered `UNION ALL` branch, a filter in a CTE the output never reads, a filter in a scalar subquery in the `SELECT` list). See [Time interval](/concepts/time-interval/#sql-placeholders). Each run replaces its selected partitions instead of appending.
 
 **Config** (`models/fct_hourly_events.toml`):
 
@@ -894,26 +847,24 @@ later runs  1. MERGE   close the current version of each changed key
                new_record  INSERT a deletion marker, then UPDATE: close the version it replaces
 ```
 
-The statements run one after the other, without a transaction. Not every warehouse has multi-statement transactions. Instead, each step is safe to repeat:
+The statements run in sequence, without a transaction, because not every warehouse has multi-statement transactions. Each step is safe to repeat:
 
 - A run that stops after step 1 leaves some keys with no current version. The next run's step 2 opens them.
-- Step 2 only inserts where no current version exists.
-- A deletion marker is not inserted twice.
-- A run over an unchanged source matches nothing, so it writes nothing.
-
-All statements in one run use one timestamp for "now". A version closed at step 1 and its successor from step 2 meet exactly.
+- Step 2 inserts only where no current version exists, and a deletion marker is not inserted twice.
+- A run over an unchanged source matches nothing and writes nothing.
+- All statements in one run use one timestamp for "now", so a closed version and its successor meet exactly.
 
 **Limits:**
 
-- `unique_key`, `updated_at` and `check_cols` must name output columns. To key on an expression, compute it in the model SQL and name it.
-- A row whose key is NULL is not snapshotted. A NULL key never matches its earlier version, so it would be inserted again on every run.
+- `unique_key`, `updated_at` and `check_cols` must name output columns. To key on an expression, compute it in the model SQL.
+- A row with a NULL key is not snapshotted: it never matches its earlier version, so it would be inserted on every run.
 - `is_deleted` is a metadata column only under `hard_deletes = "new_record"`. Under the other modes a model column with that name is ordinary data. If you leave `new_record`, keys whose current version is a deletion marker still reopen when they return.
-- The target keeps the columns it was created with. A column added to the model later is not captured, and `rocky run` reports it in the model's `notes`. Drop the target to rebuild the history with the new column.
-- The key must be unique in the model's result. Databricks and Snowflake refuse the MERGE when it is not.
-- `rocky plan` and `rocky emit-sql` show the steady-state statements, built from the compile-time column list. `rocky run` reads the column list from the target.
-- A `branch` promotion and a shadow run refuse a snapshot model, like the other strategies that build on rows the target already holds.
-- Each statement reads the model SELECT again, so a source that changes during a run can be seen differently by two statements. The next run reconciles it.
-- Databricks and Snowflake have not run these statements live yet. On Databricks, the run timestamp is a session-time-zone `TIMESTAMP`, and a model whose SELECT contains a subquery may be refused inside the hard-delete `UPDATE`.
+- The target keeps the columns it was created with. A column added later is not captured, and `rocky run` reports it in the model's `notes`. Drop the target to rebuild the history with it.
+- The key must be unique in the result. Databricks and Snowflake refuse the MERGE when it is not.
+- `rocky plan` and `rocky emit-sql` show steady-state statements built from the compile-time column list. `rocky run` reads the column list from the target.
+- A `branch` promotion and a shadow run refuse a snapshot model.
+- Each statement reads the model SELECT again, so a source that changes mid-run can look different to two statements. The next run reconciles it.
+- Databricks and Snowflake have not run these statements live yet. On Databricks the run timestamp is a session-time-zone `TIMESTAMP`, and a SELECT with a subquery may be refused inside the hard-delete `UPDATE`.
 
 `rocky compile` reports an invalid config as `E049` and a risky one as `W049`. See the [diagnostic codes](/concepts/compiler/).
 
@@ -954,20 +905,16 @@ schema = "warehouse"
 table = "fct_daily_events"
 ```
 
-**CLI flags** for time-interval models. Every flag below is accepted on both `rocky plan` and the `rocky run` single-step alias, which fuses plan + apply into one invocation for local iteration and automation. The canonical, auditable form is `rocky plan` followed by `rocky apply <plan-id>`.
+**CLI flags.** Every flag is accepted on `rocky plan` and on the single-step `rocky run` alias. The auditable form is `rocky plan <flag>` then `rocky apply <plan-id>`.
 
 | Flag | Effect |
 |---|---|
 | `--partition 2026-04-01` | Process one partition. |
 | `--from 2026-03-01 --to 2026-04-01` | Process a date range. |
 | `--latest` | Process the latest partition. |
-| `--missing` | Discover and process missing partitions. |
+| `--missing` | Discover and process missing partitions from the stored partition records. |
 | `--lookback 7` | Set the lookback window. |
 | `--parallel 4` | Parallelize partition processing. |
-
-Run each as `rocky plan <flag> && rocky apply <plan-id>`.
-
-Per-partition state is tracked in the state store. The `--missing` flag consults stored partition records to discover gaps.
 
 ---
 

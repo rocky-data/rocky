@@ -45,17 +45,20 @@ rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 
 The store carries a schema version. A newer engine migrates an older store forward on first open. An older engine refuses a newer store. On a remote backend, or with `[state] on_schema_mismatch = "recreate"`, `rocky run` instead moves the newer file to `<file>.v<N>.bak`, starts from a fresh local store and does one full refresh. This schema-mismatch path never deletes the newer file, and it refuses when that `.bak` already exists. The start-of-run download from a remote backend is unchanged: it can still replace the local file with the remote copy before the store is opened. See [Mixed versions during an upgrade](/advanced/deployment-contract/#mixed-versions-during-an-upgrade).
 
-The version moves when an older engine would misread a newer record. Schema v31 is one such move. A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and treats a recorded run as owing nothing, so it would skip those checks. From v31 on, an older engine never reaches that checkpoint.
+The version moves when an older engine would misread a newer record. A newer engine opens an older store, adds the new tables or stamp, and keeps every record. A read-only command (`rocky state`, `rocky history`, `rocky serve`) reads a table that a store stamped below the version lacks as empty. A store stamped at the version that lacks the table is refused. An older engine refuses the newer store when it opens it. During a rolling upgrade, an older process keeps reading and writing its own `v<N>/` remote key. It does not see rows that newer processes record under the newer key.
 
-Schema v32 adds two tables, `environments` and `publish_history`. A v31 store opened for writing gets the two empty tables and the v32 stamp, and keeps every record. A read-only command (`rocky state`, `rocky history`, `rocky serve`) on a store stamped below v32 reads the two tables as empty. A store stamped v32 that lacks one of them is refused. An engine at v31 refuses a v32 store when it opens it, as above.
+| Version | Change |
+|---|---|
+| v31 | A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and would skip those checks. |
+| v32 | Adds `environments` and `publish_history`. |
+| v33 | Marks a `rocky review --approve` row in the policy-decision ledger as an approval. No table changes. A v32 engine would read that row as a policy `allow` and count it in the scorecard and the brief. |
+| v34 | Adds `connector_state`: the saved state and committed batch count of each [child connector](/guides/child-connectors/). Replicates with the shared state. |
+| v35 | Adds `ai_usage`: one row for each AI call that returned a response (command, Rocky model, provider model, input and output tokens). `rocky cost --month <YYYY-MM> --by product` reads it. |
+| v36 | Adds `product_volume_breaches`: one marker for each product output model whose `error` volume range was breached and not yet rebuilt. Replicates with the shared state. |
 
-Schema v33 marks a `rocky review --approve` row in the policy-decision ledger as an approval. An engine at v32 would read that row as a policy `allow` and count it in the scorecard and the brief, so v33 is a bump. A v32 store opened for writing gets the v33 stamp and keeps every record; no table changes. During a rolling upgrade, a v32 process keeps reading and writing the `v32/` remote key. After the first v33 upload, a row that a v32 process records there, such as a freeze, is not seen by the v33 processes until that process upgrades.
+`ai_usage` is local-only: it never goes to remote state, so a call counts in the store of the machine that made it. It also holds two reserved rows: `ai_usage_since` (when recording started) and `ai_usage_dropped` (spooled lines that could not be read). A month that began before the stamp reports its AI part as `partial`. `rocky ai` does not upgrade an older store in place: it spools its calls until `rocky run` upgrades the store. The LSP and MCP servers never write the store. They append calls to `<state file>.ai-usage.jsonl`, and the next process that holds the writer moves the lines in.
 
-Schema v34 adds one table, `connector_state`. It holds the saved state and the committed batch count of each [child connector](/guides/child-connectors/). A v33 store opened for writing gets the empty table and the v34 stamp, and keeps every record. A read-only command on a store stamped below v34 reads the table as empty. A store stamped v34 that lacks it is refused. The table replicates with the rest of the shared state. An engine at v33 refuses a v34 store when it opens it, as above. During a rolling upgrade, a v33 process keeps reading and writing the `v33/` remote key.
-
-Schema v35 adds one table, `ai_usage`. It holds one row for each AI call that returned a response: the command, the Rocky model, the provider's model, and the input and output tokens. `rocky cost --month <YYYY-MM> --by product` reads it. The table also holds two reserved rows: `ai_usage_since` stamps when the store started recording, and `ai_usage_dropped` counts spooled lines that could not be read. They live in this local-only table, not in the replicated metadata. A v34 store opened for writing gets the empty table and the stamp, and keeps every record. A month that began before the stamp reports its AI part as `partial`. `rocky ai` does not upgrade an older store in place: it spools its calls until `rocky run` upgrades the store. A read-only command on a store stamped below v35 reads the table as empty. A store stamped v35 that lacks it is refused. The table is local-only: it never goes to remote state, so a call is counted in the store of the machine that made it. The LSP and MCP servers never write the store. They append calls to `<state file>.ai-usage.jsonl`, and the next process that holds the store's writer moves the lines in. An engine at v34 refuses a v35 store when it opens it. During a rolling upgrade, a v34 process keeps reading and writing the `v34/` remote key.
-
-Schema v36 adds one table, `product_volume_breaches`. It holds one marker for each product output model whose `error` volume range was breached and not yet rebuilt. While a marker is open, `rocky run` fails that model. `rocky product clear-breach` deletes a marker, and `rocky product status` lists them. See [product volume ranges](/reference/commands/products/). A v35 store opened for writing gets the empty table and the v36 stamp, and keeps every record. A read-only command on a store stamped below v36 reads the table as empty. A store stamped v36 that lacks it is refused. The table replicates with the rest of the shared state. An engine at v35 refuses a v36 store when it opens it. During a rolling upgrade, a v35 process keeps reading and writing the `v35/` remote key, and does not see a breach recorded under `v36/`.
+While a `product_volume_breaches` marker is open, `rocky run` fails that model. `rocky product clear-breach` deletes a marker, and `rocky product status` lists them. See [product volume ranges](/reference/commands/products/).
 
 ### Environments (state only, preview)
 
@@ -206,13 +209,7 @@ At the start of each table's replication, Rocky reads the watermark from the sta
 
 ## Inspecting state
 
-Run `rocky state` to view the current state:
-
-```bash
-rocky state
-```
-
-It prints every stored watermark and its value. Use it to debug an incremental run.
+`rocky state` prints every stored watermark and its value. Use it to debug an incremental run.
 
 ## Deleting watermarks
 
@@ -233,14 +230,7 @@ For a scoped, review-gated re-run of specific models, use [`rocky backfill`](/re
 
 ## Anomaly detection
 
-Rocky compares each table's current row count against a moving average of its history. If the deviation exceeds the configured threshold (for example 50%), Rocky flags an anomaly in the run output.
-
-This catches problems like:
-- Someone truncated a source table, so the count drops to near zero
-- A bad sync duplicated data, so the count spikes
-- A connector stopped syncing, so the count stays flat when it should grow
-
-Set the threshold per pipeline in `rocky.toml`. It needs the `row_count` check, and defaults to `50`:
+Rocky compares each table's row count with a moving average of its history. If the deviation exceeds the threshold (default `50` percent), Rocky flags an anomaly in the run output. It catches a truncated source, a duplicated sync, and a connector that stopped syncing. It needs the `row_count` check:
 
 ```toml
 [pipeline.bronze.checks]

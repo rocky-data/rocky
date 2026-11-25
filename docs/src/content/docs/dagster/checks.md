@@ -102,5 +102,3 @@ def replicate(context, rocky: RockyResource):
     return result.tables_copied
 ```
 
-Both functions return lists. You can inspect or filter the events before you log
-them.

@@ -19,12 +19,6 @@ sidebar:
    └─────────────────┘                                └──────────────────┘
 ```
 
-You get:
-
-- a Rocky repo from one command, with models, sidecars, tests and contracts converted;
-- a `MIGRATION-NOTES.md` that lists every construct the importer could not translate;
-- a checked result: the repo compiles, validates, and matches the dbt project before cutover.
-
 Rocky has no Jinja runtime, so some dbt constructs have no automatic translation. The importer reports or refuses each one instead of guessing. ["What translates cleanly today, and what doesn't"](#what-translates-cleanly-today-and-what-doesnt) is the full list.
 
 | Step | Command | Section |
@@ -39,155 +33,46 @@ Rocky has no Jinja runtime, so some dbt constructs have no automatic translation
 
 ## Prerequisites
 
-You need three things before you start:
-
-1. **Rocky installed** -- see [Installation](/getting-started/installation/)
-2. **An existing dbt project** with models in a `models/` directory
-3. **Credentials for your warehouse**, for example a Databricks host, HTTP path and token. See [Connect to a warehouse](/guides/connect-a-warehouse/).
-
-You do not need dbt installed. The importer reads `.sql` files directly and parses Jinja expressions with its own regex-based extractor.
+- Rocky installed. See [Installation](/getting-started/installation/).
+- A dbt project with models in a `models/` directory. You do not need dbt installed.
+- Credentials for your warehouse. See [Connect to a warehouse](/guides/connect-a-warehouse/).
 
 ## Walkthrough: end-to-end against a tiny dbt project
 
-This section runs the whole path against a small runnable example. It mirrors the POC at [`examples/playground/pocs/06-developer-experience/03-import-dbt-validate/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/03-import-dbt-validate). Every command and every snippet below came from that POC, run against the current `rocky` build.
-
-### Setup: the input dbt project
-
-The POC ships a small dbt project: two models, one source, and a `schema.yml` of generic tests.
-
-```
-dbt_project/
-├── dbt_project.yml      # name: ecommerce, profile: ecommerce, +materialized: table
-└── models/
-    ├── sources.yml      # source 'raw' / table 'orders'
-    ├── schema.yml       # generic tests: unique, not_null, accepted_values, relationships, dbt_utils.accepted_range
-    ├── stg_orders.sql   # {{ config(materialized='view') }} + {{ source('raw', 'orders') }}
-    └── fct_revenue.sql  # {{ config(materialized='table') }} + {{ ref('stg_orders') }}
-```
-
-`stg_orders.sql`:
-
-```sql
-{{ config(materialized='view') }}
-
-SELECT
-    order_id,
-    customer_id,
-    amount,
-    LOWER(status) AS status
-FROM {{ source('raw', 'orders') }}
-WHERE status != 'cancelled'
-```
-
-`fct_revenue.sql`:
-
-```sql
-{{ config(materialized='table') }}
-
-SELECT
-    customer_id,
-    SUM(amount) AS total_revenue,
-    COUNT(*) AS order_count
-FROM {{ ref('stg_orders') }}
-GROUP BY customer_id
-```
-
-The POC has no `profiles.yml` and no compiled `target/manifest.json`. It therefore exercises the regex-based importer, and needs no warehouse credentials.
-
-### Run the importer
+This section runs the whole path against the POC at [`examples/playground/pocs/06-developer-experience/03-import-dbt-validate/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/03-import-dbt-validate). The dbt project has two models (`stg_orders`, a view over `{{ source('raw', 'orders') }}`, and `fct_revenue`, a table over `{{ ref('stg_orders') }}`), one source, and a `schema.yml` of generic tests. It has no `profiles.yml` and no `target/manifest.json`, so it uses the regex importer and needs no credentials.
 
 ```bash
-rocky import-dbt \
-    --dbt-project dbt_project \
-    --output-dir imported \
-    --no-manifest \
-    --overwrite
+rocky import-dbt --dbt-project dbt_project --output-dir imported --no-manifest --overwrite
 ```
 
-Output (table mode):
-
 ```
-dbt Migration Report
-====================
-
 Project: ecommerce
 Method:  regex
-
 Models:  2 total
   2 imported successfully  (view: 1, full_refresh: 1)
-
 Sources: 1 tables from 1 sources
-  1 mapped to Rocky
-
 Tests:   8 total
   8 converted to contracts
-    (1 of them composite / multi-column)
-
-Next Steps:
-  1. rocky compile
-  2. rocky test
 Output:  2 models translated, 0 seeds copied → imported
-         rocky.toml         → imported/rocky.toml
-         MIGRATION-NOTES.md → imported/MIGRATION-NOTES.md
 ```
 
 ### What gets emitted
 
-The importer writes a self-contained Rocky repo. Here is the full layout:
+The importer writes a self-contained Rocky repo:
 
 ```
 imported/
 ├── MIGRATION-NOTES.md
-├── rocky.toml
+├── rocky.toml            # DuckDB stub: no profiles.yml was found
 └── models/
-    ├── _defaults.toml
-    ├── stg_orders.sql
+    ├── _defaults.toml    # directory-level [target] defaults
+    ├── stg_orders.sql    # Jinja resolved to bare references
     ├── stg_orders.toml
     ├── fct_revenue.sql
     └── fct_revenue.toml
 ```
 
-`imported/rocky.toml` (the importer wrote a DuckDB stub because no `profiles.yml` was found):
-
-```toml
-# rocky.toml — generated by `rocky import-dbt`
-# Connection fields use ${VAR} env-var substitution. Set the env vars
-# listed in MIGRATION-NOTES.md before running `rocky run`.
-# Default per-model target: catalog=warehouse, schema=main (see models/_defaults.toml).
-
-[adapter]
-type = "duckdb"
-path = "warehouse.duckdb"
-
-[pipeline.default]
-type = "transformation"
-models = "models/**"
-
-[pipeline.default.target]
-adapter = "default"
-```
-
-`imported/models/_defaults.toml` (directory-level target defaults):
-
-```toml
-[target]
-catalog = "warehouse"
-schema = "main"
-```
-
-`imported/models/stg_orders.sql` (Jinja resolved to bare references):
-
-```sql
-SELECT
-    order_id,
-    customer_id,
-    amount,
-    LOWER(status) AS status
-FROM raw.orders
-WHERE status != 'cancelled'
-```
-
-`imported/models/stg_orders.toml`. The `view` materialization maps to Rocky's own `view` strategy. The model `description` becomes `intent`. The `schema.yml` generic tests become `[[tests]]` blocks:
+`imported/models/stg_orders.toml`: the `view` materialization maps to Rocky's own `view` strategy. The model `description` becomes `intent`. The `schema.yml` generic tests become `[[tests]]` blocks:
 
 ```toml
 name = "stg_orders"
@@ -215,55 +100,28 @@ type = "not_null"
 column = "order_id"
 
 [[tests]]
-type = "not_null"
-column = "customer_id"
-
-[[tests]]
 type = "accepted_values"
 values = ["pending", "completed", "shipped"]
 column = "status"
 ```
 
-`imported/models/fct_revenue.toml` follows the same shape. It carries `full_refresh`, plus `relationships` and `in_range` tests (see [Generic test mapping](#generic-test-mapping)).
-
 `imported/MIGRATION-NOTES.md` records everything that did not translate: counts of skipped tests and macros, the environment variables each adapter needs, and a "Known limitations" list. Read it first.
 
 ### Verify the emitted repo loads
 
-Compiling the new repo is the cheapest end-to-end check:
+Compile and validate the new repo:
 
 ```bash
 cd imported
 rocky compile --models models
-```
-
-```
-  ✓ stg_orders (4 columns)
-  ✓ fct_revenue (3 columns)
-  Compiled: 2 models, 0 errors, 0 warnings
-```
-
-Validate the generated `rocky.toml`:
-
-```bash
 rocky -c rocky.toml validate
 ```
 
-```
-  ok  Config syntax valid (v2 format)
-  ok  adapter.default: duckdb (local)
-  ok  pipeline.default: transformation / models='models/**'
-  ok  2 transformation models loaded
-  ok  DAG valid (2 nodes, no cycles)
-
-Validation complete.
-```
-
-A clean `rocky compile` plus a clean `rocky validate` is the success criterion. The POC's `run.sh` stops here, then runs `rocky validate-migration` as a separate cross-check that every dbt model has a matching Rocky model.
+A clean `rocky compile` plus a clean `rocky validate` is the success criterion. The POC's `run.sh` then runs `rocky validate-migration` to check that every dbt model has a matching Rocky model.
 
 ### Running the emitted repo against real data
 
-`rocky -c rocky.toml plan` and then `rocky apply <plan-id>` work once the source data exists in the warehouse. That is the one precondition the importer cannot supply. The dbt project references `{{ source('raw', 'orders') }}`, and the importer translates that to `FROM raw.orders`. It neither creates nor populates the source. Load the source rows into the configured warehouse before you run `rocky apply`: into `warehouse.duckdb` for the DuckDB stub, or into your real Databricks or Snowflake target.
+`rocky -c rocky.toml plan` and `rocky apply <plan-id>` need the source data in the warehouse. The importer translates `{{ source('raw', 'orders') }}` to `FROM raw.orders`. It neither creates nor populates that table. Load it first: into `warehouse.duckdb` for the DuckDB stub, or into your real target.
 
 ### What translates cleanly today, and what doesn't
 
@@ -292,41 +150,30 @@ It translates the rest of the project like this:
 - `<dbt_project>/seeds/` → copied verbatim into `<out>/seeds/`
 - `profiles.yml` adapter type → a Rocky `[adapter]` block (DuckDB, Databricks, Snowflake, or BigQuery), or a DuckDB stub when the type is absent or unrecognised. In the `type` field, the parser resolves YAML anchors and aliases (`&anchor` / `*alias`) and `{{ env_var('VAR', 'default') }}`. A profile that templates its adapter type therefore detects the right warehouse instead of falling back to the DuckDB stub.
 
-The importer does not translate the items below, by design. Rocky has no Jinja runtime, so each one needs a manual pass. Some models are refused. Other unsupported expressions are reported in `MIGRATION-NOTES.md` and marked in the emitted SQL:
+The importer does not translate the items below, by design. Rocky has no Jinja runtime, so each one needs a manual pass. The importer refuses some models. It reports other unsupported expressions in `MIGRATION-NOTES.md` and marks them in the emitted SQL.
 
-- **dbt tests with no native Rocky equivalent.** Beyond the canonical four, the importer converts several `dbt_utils` and `dbt_expectations` tests to native Rocky assertions: `unique_combination_of_columns`, `accepted_range` / `expect_column_values_to_be_between` (→ `in_range`), `expect_column_values_to_match_regex` (→ `regex_match`), `expect_column_values_to_be_in_set` (→ `accepted_values`), and `dbt_utils.expression_is_true` (→ `expression`). See [Generic test mapping](#generic-test-mapping). Anything outside that set — other `dbt_utils.*` and `dbt_expectations.*` tests, project-defined generics, other model-level tests — becomes a structured `UnsupportedTest` warning per occurrence. The emitted TOML carries no stub for it. Rewrite those as a Rocky `expression` test or a quality-pipeline check.
-- **Singular tests** in `tests/` (custom SQL): copy and rewrite them yourself.
-- **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so no macro body expands.
-- **Incremental models on the raw path:** converted when the model uses dbt's standard `{% if is_incremental() %} WHERE <col> > (SELECT MAX(<col>) FROM {{ this }}) {% endif %}` filter. The block becomes Rocky's `@incremental_filter`, which loads every row on the first run. Another `is_incremental()` use is kept as a commented TODO with no watermark, so `rocky compile` refuses the model (`E037`) until you finish it. An incremental model with no `is_incremental()` block is **refused**, including models configured in `dbt_project.yml` or a model properties YAML file. Run `dbt compile --full-refresh` and import the artifact pair. See [`rocky import-dbt`](/reference/commands/development/#rocky-import-dbt). A non-incremental raw model that calls `is_incremental()` is also refused. Versioned models are refused because raw import cannot resolve their per-version settings.
-- **Jinja control flow** (`{% if %}`, `{% for %}`, `{% macro %}`, `{% call %}`, and whitespace-control forms) on the no-manifest path: **refused**. Raw conversion cannot evaluate these statements and would keep a conditional body without its guard. Run `dbt compile --full-refresh` and import with the manifest, or rewrite the model. `{{ var() }}` still converts to an `@var()` run-variable marker when used outside a config expression.
-- **Unmapped `materialized` values** (`dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`. `materialized_view` is not in this group; it maps to Rocky's own `materialized_view` strategy.
-- **Profile types the importer does not map** (Postgres, Redshift, and others): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block with the matching one — Rocky has [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/) and [SQL Server](/reference/adapters/sqlserver/) adapters — or pass `--target-adapter <kind>` to skip detection.
-- **Custom Jinja macros that emit SQL** (`{{ generate_schema_name() }}`, a dynamic `UNION ALL` macro): reported as failed models, with the macro name in the reason.
-- **Python dbt models** (`.py` files): not SQL. Rewrite them yourself.
-- **Snapshots** convert to [`type = "snapshot"` models](/reference/model-format/#snapshot). Both legacy `{% snapshot %}` blocks and YAML snapshots (dbt 1.9+) convert, from a manifest or from the `snapshot-paths` directories. The model keeps dbt's column names (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) and writes no `is_current` column, so `rocky run` can continue a table dbt built. Two differences: new versions get Rocky's `dbt_scd_id` hash, not dbt's, and `dbt_is_deleted` is a BOOLEAN, not a string. A snapshot with a custom strategy macro, no `unique_key`, an expression as `unique_key`, or Jinja control flow in its body is reported as a failure with the reason. Without a manifest, a project-level `snapshots:` block in `dbt_project.yml` also fails the import, and the target schema is the configured one: dbt's `generate_schema_name` may have built the table elsewhere, so check the target before the first run. With a manifest, Rocky targets the relation dbt resolved.
-- **MetricFlow metrics and semantic models**: not translated, but **detected and counted**. Each one raises a `DroppedConstruct` warning and increments `constructs_dropped` in the JSON output, so an import is never silently lossy.
-- **Exposures**: each one becomes a [downstream consumer](/concepts/downstream-consumers/), a file at `consumers/<name>.toml`. The dbt `type`, `owner`, `url` and `description` carry over. A consumer keeps a dependency only when it names a model the import wrote, so the emitted project compiles. Sources, seeds and models that failed to import are not carried over. Each exposure that lost something raises a `DroppedConstruct` warning, increments `constructs_dropped`, and is listed in `MIGRATION-NOTES.md`. `consumers_imported` in the JSON output counts the files written.
-- **dbt model contracts** (`contract: {enforced: true}`): converted. The importer writes `<model>.contract.toml` next to the model. Each declared column becomes a `[[columns]]` entry and is listed in `[rules] required`. `data_type` maps to a Rocky type (a decimal maps to `Decimal`, with any precision and scale). Some names mean different types on different warehouses, so the importer reads the dbt adapter from the manifest: `float` is `Float64` on BigQuery, PostgreSQL and Redshift and `Float32` on DuckDB, Databricks and Spark, and a bare `timestamp` is `Timestamp` on those six. On Snowflake, `float` and the other floating-point names (`double`, `double precision`, `real`, `float4`, `float8`, which all land as `FLOAT`), a bare `timestamp` and the integer names stay unchecked, as do `float` and `timestamp` when the manifest names no adapter. A `not_null` or `primary_key` constraint is not checked: Rocky cannot prove NOT NULL for a column read from a source, so `nullable = false` would refuse a valid model (`E012`). The file marks each such column with a comment; add a `not_null` test to check the data. A column type Rocky has no name for stays required and unchecked. The constraints `unique`, `check`, `foreign_key` and `custom` have no contract check. A model with such a part raises a warning and increments `contracts_dropped`, so you know which files to review. See [Column-level contracts](#column-level-contracts).
+- **dbt tests with no native Rocky equivalent.** The importer converts the tests in [Generic test mapping](#generic-test-mapping). Any other `dbt_utils.*` or `dbt_expectations.*` test, project-defined generic or model-level test becomes an `UnsupportedTest` warning per occurrence, with no stub in the TOML. Rewrite it as a Rocky `expression` test or a quality-pipeline check.
+- **Singular tests** in `tests/` (custom SQL): rewrite them yourself.
+- **dbt macros and `dbt_packages/`**: no macro body expands. Custom macros that emit SQL (`{{ generate_schema_name() }}`, a dynamic `UNION ALL`) are reported as failed models, with the macro name in the reason.
+- **Python dbt models** (`.py` files): rewrite them yourself.
+- **Incremental models on the raw path.** The importer converts a model that uses dbt's standard `{% if is_incremental() %} WHERE <col> > (SELECT MAX(<col>) FROM {{ this }}) {% endif %}` filter. The block becomes `@incremental_filter`, which loads every row on the first run. Another `is_incremental()` use stays as a commented TODO with no watermark, and `rocky compile` refuses the model (`E037`) until you finish it. The importer refuses an incremental model with no `is_incremental()` block, a non-incremental model that calls it, and versioned models. Run `dbt compile --full-refresh` and import the artifact pair. See [`rocky import-dbt`](/reference/commands/development/#rocky-import-dbt).
+- **Jinja control flow** (`{% if %}`, `{% for %}`, `{% macro %}`, `{% call %}`, whitespace-control forms) on the no-manifest path: refused. Raw conversion cannot evaluate these statements. Import with the manifest, or rewrite the model. `{{ var() }}` still converts to `@var()` outside a config expression.
+- **Unmapped `materialized` values** (`dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`. `materialized_view` maps to Rocky's own `materialized_view` strategy.
+- **Profile types the importer does not map** (Postgres, Redshift and others): the repo stubs DuckDB so the project loads. Replace the `[adapter]` block ([PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/), [SQL Server](/reference/adapters/sqlserver/)) or pass `--target-adapter <kind>` to skip detection.
+- **Snapshots** convert to [`type = "snapshot"` models](/reference/model-format/#snapshot), from legacy `{% snapshot %}` blocks or YAML snapshots (dbt 1.9+), with a manifest or from the `snapshot-paths` directories. The model keeps dbt's column names (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`, `dbt_is_deleted`) and writes no `is_current` column, so `rocky run` can continue a table dbt built. Two differences: new versions get Rocky's `dbt_scd_id` hash, and `dbt_is_deleted` is a BOOLEAN. The importer reports a failure for a custom strategy macro, no `unique_key`, an expression as `unique_key`, or Jinja control flow in the body. Without a manifest, a project-level `snapshots:` block in `dbt_project.yml` also fails the import, and the target schema is the configured one. Check the target before the first run, because `generate_schema_name` may have built the table elsewhere.
+- **MetricFlow metrics and semantic models**: not translated, but detected and counted. Each raises a `DroppedConstruct` warning and increments `constructs_dropped` in the JSON output.
+- **Exposures**: each becomes a [downstream consumer](/concepts/downstream-consumers/) at `consumers/<name>.toml`. The dbt `type`, `owner`, `url` and `description` carry over. A consumer keeps a dependency only when it names a model the import wrote. Each exposure that lost something raises a `DroppedConstruct` warning, increments `constructs_dropped`, and appears in `MIGRATION-NOTES.md`. `consumers_imported` counts the files written.
+- **dbt model contracts** (`contract: {enforced: true}`): converted to `<model>.contract.toml`. Each declared column becomes a `[[columns]]` entry and is listed in `[rules] required`. `data_type` maps to a Rocky type; the importer reads the dbt adapter from the manifest because some names differ by warehouse (`float` is `Float64` on BigQuery, PostgreSQL and Redshift, and `Float32` on DuckDB, Databricks and Spark; a bare `timestamp` is `Timestamp` on those six). On Snowflake, the floating-point names, a bare `timestamp` and the integer names stay unchecked, as do `float` and `timestamp` when the manifest names no adapter. A `not_null` or `primary_key` constraint is not checked, because Rocky cannot prove NOT NULL for a source column and `nullable = false` would refuse a valid model (`E012`). The file marks each such column with a comment; add a `not_null` test. A column type Rocky has no name for stays required and unchecked. The constraints `unique`, `check`, `foreign_key` and `custom` have no contract check. A model with such a part raises a warning and increments `contracts_dropped`. See [Column-level contracts](#column-level-contracts).
 
 :::caution[Run `dbt compile --full-refresh` first]
-Run `dbt compile --full-refresh` before import, including any required `--vars`. Keep `manifest.json` and `run_results.json` in the same target directory. Every dbt incremental model needs matching invocation IDs and `args.full_refresh = true`. It also needs `compiled_code`, and a successful result for its `unique_id`. dbt 2 writes no per-model results for `compile` (`results` is empty). Rocky then accepts the `compiled_code` of the same invocation as the evidence. `dbt run --full-refresh` writes per-model results on dbt 1 and dbt 2, but it rebuilds the tables.
+Run `dbt compile --full-refresh` before import, with any required `--vars`. Keep `manifest.json` and `run_results.json` in the same target directory. Every dbt incremental model needs matching invocation IDs, `args.full_refresh = true`, `compiled_code`, and a successful result for its `unique_id`. dbt 2 writes no per-model results for `compile`, so Rocky accepts the `compiled_code` of the same invocation as the evidence. `dbt run --full-refresh` also works, but it rebuilds the tables.
 
-A selective compile leaves unselected models without that evidence. Compile without `--select` or include each model you want to import. This rule applies without a key or a direct `is_incremental()` call. Remove any effective `full_refresh=false` config and compile again. That config overrides the command flag.
-
-A custom macro can hide the `is_incremental()` call. Rocky's first run then fails or omits old rows.
+Compile without `--select`, or include each model you import. Remove any effective `full_refresh=false` config, because it overrides the command flag. A custom macro can hide the `is_incremental()` call, and Rocky's first run then fails or omits old rows.
 :::
 
 ### Snapshots: use the model strategy
 
-Rocky has two snapshot (SCD Type 2) forms. A dbt snapshot maps to the model form. The importer emits that form, and you should use it when you port a snapshot by hand.
-
-| | Snapshot model | Snapshot pipeline |
-|---|---|---|
-| Declared as | `[strategy] type = "snapshot"` in a model sidecar | `[pipeline.<name>] type = "snapshot"` in `rocky.toml` |
-| Runs with | `rocky run`, in the model DAG of a transformation pipeline | `rocky snapshot` or `rocky run --pipeline <name>`. `rocky snapshot` refuses any other pipeline type |
-| Reads | the model's SQL | one source table named in the pipeline |
-| History columns | `valid_from`, `valid_to`, `is_current`, `snapshot_id` by default. `snapshot_id` is unique per version | `valid_from`, `valid_to`, `is_current`, `snapshot_id`. `snapshot_id` is shared by the rows of one run |
-| dbt's column names | `snapshot_meta_column_names` renames them, and `is_current = false` drops the flag column | not configurable |
+Rocky has two snapshot (SCD Type 2) forms. A dbt snapshot maps to the model form (`[strategy] type = "snapshot"` in a model sidecar, run by `rocky run`). The importer emits it, and you should use it when you port a snapshot by hand. The other form, `[pipeline.<name>] type = "snapshot"` in `rocky.toml`, runs with `rocky snapshot` and reads one source table. The [Snapshot](/reference/model-format/#snapshot) reference compares the two.
 
 To continue a snapshot table that dbt built, keep dbt's names (`dbt_valid_from`, `dbt_valid_to`, `dbt_scd_id`, `dbt_updated_at`) and set `is_current = false`. Without it, Rocky looks for an `is_current` column that dbt never wrote, and the run fails. Add `dbt_is_deleted` when you use `hard_deletes = "new_record"`. The [Snapshot](/reference/model-format/#snapshot) reference shows the settings.
 
@@ -338,21 +185,7 @@ Point `rocky import-dbt` at your dbt project directory:
 rocky import-dbt --dbt-project ./my-dbt-project --output-dir ./rocky-models
 ```
 
-It scans `my-dbt-project/models/` for `.sql` files and writes a body file and a sidecar per model into `./rocky-models/`:
-
-```
-rocky-models/
-├── stg_orders.sql
-├── stg_orders.toml
-├── stg_customers.sql
-├── stg_customers.toml
-├── fct_orders.sql
-├── fct_orders.toml
-├── dim_customers.sql
-└── dim_customers.toml
-```
-
-Every conversion is listed in [What translates cleanly today](#what-translates-cleanly-today-and-what-doesnt). Tests land as `[[tests]]` blocks (see [Section 9](#9-convert-dbt-tests-to-rocky-tests-and-contracts)).
+It scans `my-dbt-project/models/` for `.sql` files and writes a body file (`<model>.sql`) and a sidecar (`<model>.toml`) per model into `./rocky-models/`. Every conversion is listed in [What translates cleanly today](#what-translates-cleanly-today-and-what-doesnt). Tests land as `[[tests]]` blocks (see [Section 9](#9-convert-dbt-tests-to-rocky-tests-and-contracts)).
 
 ### JSON output
 
@@ -397,11 +230,10 @@ Two flags override that choice:
 
 ## 2. Review the Imported Models
 
-Read each generated pair of files after the import. The walkthrough above shows one in full. Three points to check:
+Read each generated pair of files after the import. Check these points:
 
-- `{{ config(materialized='incremental', unique_key='id') }}` with no explicit `incremental_strategy` becomes a `merge` strategy keyed on `unique_key`, not a bare `incremental` block.
-- The `[[sources]]` block comes from the `sources.yml` entry. Without a matching entry, the importer emits a warning and no `[[sources]]` block.
-- `{{ ref() }}` and `{{ source() }}` become bare and fully qualified references.
+- `{{ config(materialized='incremental', unique_key='id') }}` with no explicit `incremental_strategy` becomes a `merge` strategy keyed on `unique_key`.
+- The `[[sources]]` block comes from the `sources.yml` entry. Without a matching entry, the importer warns and emits no `[[sources]]` block.
 
 ## 3. Handle Unsupported Jinja
 
@@ -477,16 +309,7 @@ concurrency = 8
 backend = "local"
 ```
 
-Set the environment variables:
-
-```bash
-export DATABRICKS_HOST="your-workspace.cloud.databricks.com"
-export DATABRICKS_HTTP_PATH="/sql/1.0/warehouses/abc123"
-export DATABRICKS_TOKEN="dapi..."
-export FIVETRAN_API_KEY="..."
-export FIVETRAN_API_SECRET="..."
-export FIVETRAN_DESTINATION_ID="..."
-```
+Set the `${...}` environment variables before you run Rocky. See [Connect to a warehouse](/guides/connect-a-warehouse/).
 
 ### Mapping dbt config to Rocky
 
@@ -564,18 +387,7 @@ Run the compiler to type-check every imported model:
 rocky compile --models ./rocky-models
 ```
 
-The compiler does three things:
-- Resolves `depends_on` references into a DAG
-- Type-checks column references across model boundaries
-- Reports type mismatches, contract violations, and missing dependencies
-
-```
-  ✓ stg_orders (5 columns)
-  ✓ stg_customers (4 columns)
-  ✓ fct_orders (7 columns)
-  ✓ dim_customers (6 columns)
-  Compiled: 4 models, 0 errors, 0 warnings
-```
+The compiler resolves `depends_on` into a DAG, type-checks columns across models, and reports type mismatches, contract violations and missing dependencies.
 
 A bare table reference the importer left unresolved, one whose name matches no model in the project, is **not** a compile error. Rocky treats it as an external reference: it appears in lineage and creates no DAG dependency. See [Read dbt Package Tables](/guides/using-dbt-packages/). The diagnostics you *will* see after an import come from the type checker and from contracts:
 
@@ -589,14 +401,6 @@ Once the compile passes, run the tests locally on DuckDB:
 
 ```bash
 rocky test --models ./rocky-models
-```
-
-```
-Testing 4 models...
-
-  All 4 models passed
-
-  Result: 4 passed, 0 failed
 ```
 
 `rocky test` executes each model's SQL against DuckDB in dependency order. It catches SQL syntax errors and runtime errors, and it needs no warehouse connection.
@@ -729,20 +533,7 @@ column = "status"
 
 If your dbt project has compiled to a `manifest.json` and declares `unit_tests:` blocks (dbt 1.8 and later), run `rocky import-dbt --manifest target/manifest.json`. The importer walks `manifest.unit_tests` and writes each entry as a `[[test]]` block in the matching model's sidecar TOML. It strips the `ref('upstream_model')` and `source('s', 't')` wrappers on `given.input` down to bare references.
 
-```yaml
-# dbt: models/fct_orders.yml
-unit_tests:
-  - name: stamps_status_when_completed
-    model: fct_orders
-    given:
-      - input: ref('stg_orders')
-        rows:
-          - { order_id: 1, status: 'completed' }
-    expect:
-      format: dict
-      rows:
-        - { order_id: 1, status: 'completed' }
-```
+For example, a dbt `unit_tests:` entry on `fct_orders` with one `given` row for `ref('stg_orders')` becomes:
 
 ```toml
 # Rocky: models/fct_orders.toml — emitted by `rocky import-dbt`
@@ -769,7 +560,7 @@ The importer reports three counters on the `--output json` payload and in `MIGRA
 - `OrphanUnitTest`: the unit test targets a model the importer did not pick up. Skipped, and counted as skipped.
 - `UnsupportedUnitTestFormat`: `expect.format = "csv"` or `"sql"`, a fixture reference, or any other shape Rocky's `UnitTestDef` does not model yet. Skipped.
 
-CSV and SQL fixtures, and `overrides:` blocks, wait until Rocky's runtime test runner supports them. The `[[test]]` blocks the importer does emit execute under `rocky test`, as of engine-v1.52.0. The runner seeds a fresh in-memory DuckDB with each `given` fixture, materializes the model against it, and compares the output to `expect`. The comparison treats the rows as a multiset by default, and as an ordered list when `expect.ordered` is set.
+Rocky does not import CSV and SQL fixtures or `overrides:` blocks. The `[[test]]` blocks the importer emits run under `rocky test`. The runner seeds a fresh in-memory DuckDB with each `given` fixture, materializes the model against it, and compares the output to `expect`. The comparison treats the rows as a multiset by default, and as an ordered list when `expect.ordered` is set.
 
 ### Column-level contracts
 
@@ -816,23 +607,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 rocky ai-explain --all --save --models ./rocky-models
 ```
 
-Rocky reads each model's SQL, writes a plain-English description, and saves it to the TOML config:
-
-```toml
-# stg_orders.toml (after ai-explain --save)
-name = "stg_orders"
-intent = "Stage raw Shopify orders with order_id, customer, date, and amount columns"
-depends_on = []
-
-[strategy]
-type = "merge"
-unique_key = ["order_id"]
-
-[target]
-catalog = "warehouse"
-schema = "staging"
-table = "stg_orders"
-```
+Rocky reads each model's SQL, writes a plain-English description, and saves it as `intent` in the sidecar.
 
 ## 11. Move a Large Project in Stages
 
@@ -860,20 +635,7 @@ Leaf first means the models at the downstream edge of the DAG go first, because 
 
 You can run both tools on the same project while you migrate. Keep the dbt `models/` directory and the Rocky `rocky-models/` directory separate, and run both in CI:
 
-```yaml
-# GitHub Actions example
-steps:
-  - name: dbt compile
-    run: dbt compile
-
-  - name: Rocky compile
-    run: rocky compile --models ./rocky-models --contracts ./contracts
-
-  - name: Rocky test
-    run: rocky test --models ./rocky-models
-```
-
-Remove the dbt steps once Rocky covers every model.
+Run `dbt compile` and `rocky compile --models ./rocky-models --contracts ./contracts` in the same CI job. Run `rocky test --models ./rocky-models` too. Remove the dbt steps once Rocky covers every model.
 
 ### Keeping dbt packages without converting them
 
@@ -899,9 +661,7 @@ Each one appears as a warning. To keep incremental behaviour, give the model a `
 
 Any of these is refused when its dbt SQL uses `is_incremental()` in a form other than the standard watermark filter. The compiled SQL can keep a delta filter. As `full_refresh`, every run would replace the table with only recent rows. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key` or a `time_interval` model.
 
-:::caution[Incremental models need a full-refresh compile]
-Follow the caution "Run `dbt compile --full-refresh` first" in the walkthrough above. A selective or plain compile leaves a manifest incremental model without evidence, and its first Rocky run fails or omits old rows.
-:::
+Run `dbt compile --full-refresh` first, as the caution above explains.
 
 The raw and no-manifest importer refuses every effectively incremental model it resolves from inline, project, or model properties config. It has no compiled SQL or per-model run result.
 It also refuses Jinja control flow, versioned models, and config expressions it cannot resolve.

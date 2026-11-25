@@ -83,21 +83,7 @@ This is the core loop. Rocky runs these seven steps for each model, in parallel 
 
 ### 6a. Drift detection
 
-Rocky calls `describe_table(target)` to read the current column list and types from the warehouse, then compares them against the source schema.
-
-```
-Source column: amount  type: DOUBLE
-Target column: amount  type: INT     ← target too narrow for source
-
-Is this a safe widening? No → DROP target table, let it be recreated.
-
-Source column: region  (new, not in target yet)
-→ ALTER TABLE target ADD COLUMN region STRING
-```
-
-Some type changes are safe to apply in place. The allowlist covers integer widenings (`TINYINT`/`SMALLINT`/`INT`/`INTEGER → BIGINT`), `FLOAT → DOUBLE`, and widening to `STRING` (`BIGINT → STRING`, `DOUBLE → STRING`). It also covers `DECIMAL` precision widening and `VARCHAR` length widening. Everything else triggers a full recreate. The default lives in `default_is_safe_type_widening`, and a dialect can override `SqlDialect::is_safe_type_widening`.
-
-If the target does not exist yet, Rocky creates it from scratch on the first run.
+Rocky calls `describe_table(target)` and compares the target columns with the source schema. A new column gets `ALTER TABLE target ADD COLUMN`. A safe widening applies in place. Any other type change drops the target so the run recreates it. If the target does not exist, Rocky creates it. The widening allowlist and the policy are in [Schema Drift](/concepts/schema-drift/).
 
 ### 6b. Skip-unchanged gate
 
@@ -126,41 +112,22 @@ The watermark value is passed to the SQL generator rather than carried in the IR
 
 ### 6d. Generate SQL
 
-`rocky-core::sql_gen` produces the SQL string. It takes the `ModelIr`, the `SqlDialect` for the target warehouse, and, where they apply, the watermark value or the partition timestamps.
-
-For `TimeInterval` models, it replaces the `@start_date` and `@end_date` placeholders in your SQL with concrete partition timestamps from the `PartitionWindow`.
+`rocky-core::sql_gen` builds the SQL from the `ModelIr`, the target's `SqlDialect`, and, where they apply, the watermark or the partition timestamps (`@start_date`, `@end_date` from the `PartitionWindow`). See [SQL Generation](/concepts/sql-generation/).
 
 ### 6e. Execute SQL
 
-Rocky calls `WarehouseAdapter::execute_statement(sql)`. The adapter owns connection pooling, retries on transient errors, and warehouse-specific quirks.
+Rocky calls `WarehouseAdapter::execute_statement(sql)`. The adapter owns connection pooling, retries on transient errors, and warehouse quirks. See [AIMD adaptive concurrency](#aimd-adaptive-concurrency) for rate limits.
 
-Databricks, for example, calls `POST /api/2.0/sql/statements` and polls for the result. Adaptive concurrency control backs Rocky off when the warehouse signals a rate limit; see [AIMD adaptive concurrency](#aimd-adaptive-concurrency) below.
+A failed statement produces a `failure_kind`. The `FailureKind` enum in `output.rs` has eight variants, serialized in kebab-case: `AuthFailed`, `ConnectionFailed`, `QueryRejected`, `QuotaExceeded`, `NotFound`, `Transient`, `CompileError`, `Unknown`. Rocky branches on the kind:
+- `Transient`: retry with backoff
+- `AuthFailed`: stop immediately, surface the error
+- `QuotaExceeded`: surface the error and back off (a 429 or tripped circuit breaker maps here)
 
-A failed statement produces a `failure_kind`. The `FailureKind` enum in `output.rs` has eight variants: `AuthFailed`, `ConnectionFailed`, `QueryRejected`, `QuotaExceeded`, `NotFound`, `Transient`, `CompileError`, `Unknown`. They serialize to kebab-case on the wire, for example `auth-failed` and `compile-error`. Rocky branches on the kind:
-- `Transient` → retry with backoff
-- `AuthFailed` → stop immediately, surface the error
-- `QuotaExceeded` → surface the error and back off (a 429 or tripped circuit breaker maps here)
-
-A model that fails to compile when its turn comes (`CompileError`) never reaches the warehouse. Rocky counts it in `tables_failed` and reports it as a failed model rather than skipping it quietly, so the run exits non-zero.
+A model that fails to compile when its turn comes (`CompileError`) never reaches the warehouse. Rocky counts it in `tables_failed`, so the run exits non-zero.
 
 ### 6f. Quality checks
 
-After the SQL executes, Rocky runs the pipeline's checks against the target
-table: the `[pipeline.<name>.checks]` settings and their `[[assertions]]`
-blocks. [Data Quality Checks](/concepts/data-quality-checks/) lists them.
-
-```toml
-[[pipeline.silver.checks.assertions]]
-type = "not_null"
-column = "order_id"
-```
-
-Each check runs a `SELECT` against the freshly written target table. Rocky
-collects the results into `check_results` in the JSON output. A
-`check_result` hook can react to each one.
-
-The `[[tests]]` blocks in a model sidecar do not run here. Run them with
-`rocky test --declarative`.
+After the SQL executes, Rocky runs the pipeline's checks (`[pipeline.<name>.checks]` and its `[[assertions]]`) as `SELECT`s against the new target table. See [Data Quality Checks](/concepts/data-quality-checks/). Results go to `check_results` in the JSON output, and a `check_result` hook can react to each one. The `[[tests]]` blocks in a model sidecar do not run here. Run them with `rocky test --declarative`.
 
 ### 6g. Defer the watermark write
 
@@ -199,7 +166,7 @@ Command hooks run as shell subprocesses. Webhook hooks fire as HTTP POSTs, async
 
 ## Step 9: Emit JSON output
 
-Rocky serializes the `RunOutput` struct to JSON on stdout. The shape below is illustrative: the top-level fields are stable, and the per-entry fields are shown for orientation.
+Rocky serializes `RunOutput` to JSON on stdout. The top-level fields are stable. The full shape is in [JSON output](/reference/json-output/).
 
 ```json
 {
@@ -209,33 +176,22 @@ Rocky serializes the `RunOutput` struct to JSON on stdout. The shape below is il
   "tables_copied": 3,
   "tables_failed": 1,
   "materializations": [
-    {
-      "asset_key": ["analytics", "main", "orders_summary"],
-      "rows_copied": 1200,
-      "duration_ms": 45,
-      "metadata": {
-        "strategy": "full_refresh",
-        "target_table_full_name": "analytics.main.orders_summary",
-        "sql_hash": "..."
-      }
-    }
+    { "asset_key": ["analytics", "main", "orders_summary"], "rows_copied": 1200, "duration_ms": 45,
+      "metadata": { "strategy": "full_refresh", "target_table_full_name": "analytics.main.orders_summary", "sql_hash": "..." } }
   ],
   "errors": [
     { "asset_key": ["analytics", "main", "customer_totals"], "failure_kind": "query-rejected", "error": "..." }
   ],
-  "check_results": [...],
-  "drift": [...],
-  "permissions": [...],
-  "anomalies": [...]
+  "check_results": [...], "drift": [...], "permissions": [...], "anomalies": [...]
 }
 ```
 
-Read the output like this. A successful materialization is one entry in `materializations`, identified by its `asset_key` and `metadata.target_table_full_name`. There is no `model` or `status` field per entry. A failed model appears in the top-level `errors` array with its `failure_kind`. Run-level status lives in the top-level `status` field (`Success` / `PartialFailure` / `Failure`). Skipped and reused models are counted in `tables_skipped` and detailed in `model_decisions`.
+A successful model is one entry in `materializations`. A failed model is an entry in `errors` with its `failure_kind`. Run status is the top-level `status` (`Success`, `PartialFailure`, `Failure`). `tables_skipped` counts skipped and reused models, and `model_decisions` details them.
 
 Exit code:
-- `0` — all models succeeded
-- `1` — hard failure (config error, adapter unreachable, compile error)
-- `2` — partial success — some models succeeded and some failed, or the data landed and an error-severity check then failed (`check_gate_failed: true`). **JSON is still valid and fully emitted.** The Dagster integration handles this via `allow_partial=True`. A quality pipeline copies no data, so its failed check gate exits `1`.
+- `0`: all models succeeded
+- `1`: hard failure (config error, adapter unreachable, compile error)
+- `2`: partial success. Some models failed, or the data landed and an error-severity check then failed (`check_gate_failed: true`). **JSON is still fully emitted.** The Dagster integration handles this with `allow_partial=True`. A quality pipeline copies no data, so its failed check gate exits `1`.
 
 ## Checkpoint and resume
 

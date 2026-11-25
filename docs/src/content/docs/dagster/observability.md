@@ -5,11 +5,7 @@ sidebar:
   order: 13
 ---
 
-Rocky notices things while it runs. A source column changed type. A table
-came back far smaller than yesterday. A model would be cheaper under a
-different strategy. `dagster-rocky` surfaces each of those in Dagster
-instead of leaving it in the log. It also records what a run applied.
-Where each one lands:
+`dagster-rocky` surfaces what Rocky notices while it runs, and records what a run applied. Where each signal lands:
 
 - **Schema drift** → `dg.AssetObservation` events on the asset timeline
 - **Row-count anomalies** → `dg.AssetCheckResult` with severity `WARN`
@@ -78,9 +74,7 @@ asset. The metadata describes the action Rocky took:
 | `rocky/drift_tables_checked` | int | Total tables inspected for drift this run |
 | `rocky/drift_tables_drifted` | int | Total tables that drifted this run |
 
-Why an observation and not a check result? Drift is a change, not a pass or
-a fail. The event lands on the asset timeline as its own entry and leaves
-every check status alone.
+Drift is a change, not a pass or a fail, so it is an observation and leaves every check status alone.
 
 ## Anomalies as `AssetCheckResult` (severity WARN)
 
@@ -99,9 +93,7 @@ The check spec is declared at load time, before anything runs. The Dagster
 UI therefore shows the `row_count_anomaly` slot on every asset from the
 start.
 
-Severity is `WARN`, not `ERROR`. Rocky's anomaly detection is a heuristic,
-and a row-count swing is often real business behavior. To treat an anomaly
-as a hard failure, post-process the check evaluation events yourself.
+Severity is `WARN`, not `ERROR`, because a row-count swing is often real business behavior. To treat an anomaly as a hard failure, post-process the check evaluation events yourself.
 
 ### A green check means the detector ran
 
@@ -141,9 +133,7 @@ The detector runs for a table only when all of these are true:
 - The run has a state store, which holds the row-count history.
 - This table's row count was measured, and its history could be read.
 
-When one of these is missing, `rocky/reason` names which one. The remedies
-differ: two are a line in `rocky.toml`, one is how the run was invoked, and
-two are about the table.
+When one is missing, `rocky/reason` names which one.
 
 `compliance_exception` keeps the old rule. Its producer is unconditional: a
 scan that crashes yields an explicit not-evaluated result rather than
@@ -260,5 +250,4 @@ lineage = build_column_lineage(result, model_to_key={
 yield dg.MaterializeResult(metadata={"dagster/column_lineage": lineage})
 ```
 
-The asset detail page renders this as a column-level dependency graph. It
-shows which upstream columns feed each output column.
+The asset detail page renders it as a column-level dependency graph.

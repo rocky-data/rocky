@@ -7,13 +7,13 @@ sidebar:
 
 `RockyResource` is a `dagster.ConfigurableResource`. It runs the Rocky CLI in a subprocess and parses the JSON output into typed Pydantic models. There is roughly one Python method per Rocky CLI command.
 
-This page documents the main methods in detail. [Other methods](#other-methods) lists the rest. Every one follows the same shape: run a subprocess, return a typed result.
+[Other methods](#other-methods) lists the rest. Every method runs a subprocess and returns a typed result.
 
 ## Configuration
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `binary_path` | `str` | `"rocky"` | Path to the `rocky` binary. Accepts an absolute path, a relative path, or just `"rocky"` to resolve from `PATH`. For deployment, point this at a vendored binary (e.g. `"vendor/rocky"`). |
+| `binary_path` | `str` | `"rocky"` | Path to the `rocky` binary. Absolute path, relative path, or `"rocky"` to resolve from `PATH`. For deployment, point it at a vendored binary (e.g. `"vendor/rocky"`). |
 | `config_path` | `str` | `"rocky.toml"` | Path to the pipeline config file. |
 | `state_path` | `str` | `".rocky-state.redb"` | Path to the state store file. |
 | `state_namespace` | `str \| None` | `None` | Optional per-namespace state file (engine `--state-namespace`). Mutually exclusive with `state_path`: when set, `--state-namespace` is sent and `--state-path` is omitted, so independent fan-out runs don't serialize on a single writer lock. |
@@ -21,18 +21,18 @@ This page documents the main methods in detail. [Other methods](#other-methods) 
 | `contracts_dir` | `str \| None` | `None` | Optional directory containing contract files. Passed to `compile`, `test`, and `ci` when set. |
 | `server_url` | `str \| None` | `None` | Optional URL for a running `rocky serve` instance. When set, `compile()`, `lineage()`, and `metrics()` use the HTTP API instead of spawning a subprocess. |
 | `timeout_seconds` | `int` | `3600` | Subprocess timeout for any single CLI invocation (in seconds). |
-| `strict_doctor` | `bool` | `False` | When `True`, runs `rocky doctor` once at resource startup and gates execution on the result. Defaults to `False` so startup cost stays zero for users who don't opt in. |
+| `strict_doctor` | `bool` | `False` | When `True`, runs `rocky doctor` once at resource startup and gates execution on the result. |
 | `strict_doctor_checks` | `list[str]` | `[]` | Per-check allowlist for the strict-doctor gate (only meaningful with `strict_doctor=True`). Empty list fails on any critical check; a non-empty list fails only when a listed critical check fires. |
 
 The resource also accepts four optional **resolver** fields: `shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn`, and `timeout_fn`. Each one is a callable. It produces a value for a run when the caller did not supply one. These are `resource_dependency` attributes, not Dagster config schema entries.
 
 ## Behavior
 
-- All methods return typed Pydantic models. See the [Type Reference](/dagster/types/).
+- Methods return typed Pydantic models. See the [Type Reference](/dagster/types/).
 - On CLI failure, raises `dagster.Failure` with stderr attached as metadata.
 - If the binary is not found on `PATH`, raises `Failure` with a link to the installation instructions.
 - **Partial success**: Rocky can exit non-zero and still print valid JSON. That happens when some tables succeed and others fail, and when every table copies and then an error-severity check fails (exit 2, `check_gate_failed: true`). `run()`, `compile()`, `test()`, and `ci()` handle it for you. They return the parsed result, so you can tell the successes from the failures. Read `check_gate_failed` as well as `tables_failed`: a run stopped by a check has no failed table to look at.
-- **Execution paths**: `run()` and `run_streaming()` invoke a single fused `rocky run` and write no plan file. Only `run_pipes()` runs `rocky plan`, then `rocky apply <plan-id>`, and keeps the plan in `.rocky/plans/<plan-id>.json`. See [Plan artifact per materialization](/dagster/observability/#plan-artifact-per-materialization).
+- **Execution paths**: `run()` and `run_streaming()` run one fused `rocky run` and write no plan file. Only `run_pipes()` runs `rocky plan` then `rocky apply <plan-id>`. See [Three execution modes](/dagster/pipes/#three-execution-modes).
 
 ---
 
@@ -95,9 +95,9 @@ A resolver (`shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn`, 
 
 ### `run_streaming(context, filter, governance_override=None, *, ...) -> RunResult`
 
-Pipes-style execution with live stderr streaming to `context.log`. Same semantics as `run()`, but it spawns the binary via `subprocess.Popen`. It forwards Rocky's stderr, the engine's tracing output, to `context.log.info` line by line as the run progresses. Use it inside a Dagster `@multi_asset` or `@op` for runs longer than a few seconds.
+Same semantics as `run()`, plus live streaming of engine stderr to `context.log.info`, line by line. Use it inside a `@multi_asset` or `@op` for runs longer than a few seconds. See [Live log streaming](/dagster/pipes/).
 
-**Wraps**: `rocky run --filter <filter> --output json`, the same fused plan+apply subprocess as `run()`. All engine stderr streams to `context.log` in a single pass from process start: discover, drift, and copy progress. An operator watching the run viewer sees progress lines from the very beginning of the run.
+**Wraps**: the same fused `rocky run --filter <filter> --output json` subprocess as `run()`.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -114,7 +114,7 @@ def replicate(context: dg.AssetExecutionContext, rocky: RockyResource):
 
 ### `run_pipes(context, filter, governance_override=None, *, ..., pipes_client=None, asset_key_fn=None, include_keys=None, declared_checks=None) -> PipesClientCompletedInvocation`
 
-Full Dagster Pipes execution with structured events. Runs `rocky plan`, then runs `rocky apply <plan-id>` through `PipesSubprocessClient`. The engine emits Pipes messages for materializations, asset checks, and log lines. The plan id is attached as `extras={"plan_id": plan_id}`. If `rocky plan` emits no `plan_id`, the call raises `dagster.Failure`; it does not fall back to `rocky run`.
+Full Dagster Pipes execution with structured events. Runs `rocky plan`, then `rocky apply <plan-id>` through `PipesSubprocessClient`. The plan id is attached as `extras={"plan_id": plan_id}`. If `rocky plan` emits no `plan_id`, the call raises `dagster.Failure`.
 
 **Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json`, over the Dagster Pipes protocol.
 
@@ -162,9 +162,7 @@ Runs `rocky state` and returns the current [watermark](/reference/glossary/#wate
 
 ### `compile(model_filter=None) -> CompileResult`
 
-Runs `rocky compile` and returns compiler diagnostics: errors, warnings, and info. When `server_url`
-is configured, it fetches from the HTTP API instead of spawning a subprocess. The HTTP endpoint
-compiles the whole project only, so passing `model_filter` raises `ValueError` instead of ignoring it.
+Runs `rocky compile` and returns compiler diagnostics: errors, warnings, and info. See [HTTP fallback](#http-fallback).
 
 **Wraps**: `rocky compile --models <models_dir> --output json` or `GET /api/v1/compile`
 
@@ -174,7 +172,7 @@ compiles the whole project only, so passing `model_filter` raises `ValueError` i
 
 ### `lineage(target, column=None) -> ModelLineageResult | ColumnLineageResult`
 
-Runs `rocky lineage` and returns the dependency graph for a model or a single column trace. When `server_url` is configured, fetches from the HTTP API instead.
+Runs `rocky lineage` and returns the dependency graph for a model or a single column trace. See [HTTP fallback](#http-fallback).
 
 **Wraps**: `rocky lineage --models <models_dir> <target> [--column <column>] --output json` or `GET /api/v1/models/<target>/lineage[/<column>]`
 
@@ -187,7 +185,7 @@ Runs `rocky lineage` and returns the dependency graph for a model or a single co
 
 Runs `rocky test` to execute models locally via DuckDB without warehouse credentials.
 
-`TestResult` is an import-compatible alias of the generated `TestOutput`. Its `.failures` field is a list of `TestFailure` objects, each with a `name` and an `error` field.
+`TestResult` aliases the generated `TestOutput`. See [Type Reference](/dagster/types/#test-and-ci-types).
 
 **Wraps**: `rocky test --models <models_dir> --output json`
 
@@ -199,7 +197,7 @@ Runs `rocky test` to execute models locally via DuckDB without warehouse credent
 
 Runs `rocky ci` (compile + test) and returns the combined result.
 
-`CiResult` is an import-compatible alias of the generated `CiOutput`. Its `.failures` field is a list of `TestFailure` objects, each with a `name` and an `error` field.
+`CiResult` aliases the generated `CiOutput`.
 
 **Wraps**: `rocky ci --models <models_dir> --output json`
 
@@ -271,9 +269,7 @@ Retrieve pipeline run history. Returns `ModelHistoryResult` when filtered to a s
 
 ### `metrics(model, *, trend=False, column=None, alerts=False) -> MetricsResult`
 
-Retrieve quality metrics for a model. When `server_url` is configured, it fetches from the HTTP API
-instead. The HTTP endpoint serves the default metrics only, so passing `trend`, `column`, or `alerts`
-raises `ValueError` instead of ignoring the option.
+Retrieve quality metrics for a model. See [HTTP fallback](#http-fallback).
 
 **Wraps**: `rocky metrics <model> --output json` or `GET /api/v1/models/<model>/metrics`
 
@@ -290,9 +286,7 @@ Analyze materialization strategies and return cost optimization recommendations.
 
 **Wraps**: `rocky optimize --models <models_dir> --output json`
 
-`--models` is forwarded so the engine computes each model's `downstream_references`
-against the configured layout. Without it, a custom `models_dir` yields
-`downstream_references: 0` for every model, which skews the recommendation.
+`--models` is forwarded so the engine computes `downstream_references` against the configured `models_dir`. Without it, every model gets `downstream_references: 0`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -393,19 +387,13 @@ These methods follow the same pattern. Each one wraps the CLI command of the sam
 | `product_verify(product)`, `product_compile(product)`, `product_approve(product)`, `product_status(product)`, `product_list()`, `product_journal(product)` | `rocky product <verb>` |
 | `package_list()` | `rocky package list` |
 
-The three ways to run `rocky run` (`run()`, `run_streaming()`, `run_pipes()`) are compared in [Live log streaming](/dagster/pipes/#three-execution-modes).
-
 ## HTTP fallback
 
-When `server_url` is configured, the following methods use the `rocky serve` HTTP API instead of spawning a subprocess:
+When `server_url` is set, these methods call the `rocky serve` HTTP API instead of spawning a subprocess. Use it when a Rocky server already runs, for example in development or beside the LSP.
 
-- `compile()` -- `GET /api/v1/compile`
-- `lineage()` -- `GET /api/v1/models/<target>/lineage[/<column>]`
-- `metrics()` -- `GET /api/v1/models/<model>/metrics`
-
-These endpoints serve each command's default output. `lineage`'s `column` works, because it has its own route. `compile`'s `model_filter` and `metrics`'s `trend`, `column`, and `alerts` raise `ValueError` instead of being ignored.
-
-Use this when a Rocky server is already running, for example in a development environment or alongside the LSP.
+- `compile()`: `GET /api/v1/compile`. `model_filter` raises `ValueError`, because the endpoint compiles the whole project.
+- `lineage()`: `GET /api/v1/models/<target>/lineage[/<column>]`. `column` works.
+- `metrics()`: `GET /api/v1/models/<model>/metrics`. `trend`, `column` and `alerts` raise `ValueError`, because the endpoint serves default metrics only.
 
 ## Example
 
@@ -426,20 +414,8 @@ def replicate(context: dg.AssetExecutionContext, rocky: RockyResource):
     result = rocky.run_streaming(context, filter="tenant=acme")
     return result.tables_copied
 
-@dg.asset
-def compile_check(rocky: RockyResource):
-    result = rocky.compile()
-    if result.has_errors:
-        raise dg.Failure(description=f"{len(result.diagnostics)} compiler errors")
-    return result.models
-
-@dg.asset
-def health(rocky: RockyResource):
-    result = rocky.doctor()
-    return result.overall
-
 defs = dg.Definitions(
-    assets=[replicate, compile_check, health],
+    assets=[replicate],
     resources={"rocky": rocky},
 )
 ```

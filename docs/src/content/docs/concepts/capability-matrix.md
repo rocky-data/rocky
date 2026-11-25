@@ -5,34 +5,20 @@ sidebar:
   order: 2.5
 ---
 
-Rocky makes promises with three different owners. Some promises the engine
-enforces itself, the same way on every warehouse. Some depend on which
-warehouse adapter you run. Some belong to your warehouse or your operations,
-and Rocky only observes or records.
+Rocky makes promises with three owners. Read this page before you build a
+compliance story, an approval workflow or an incident plan on Rocky. It says who
+runs each check. [Architecture of Trust](/concepts/architecture-of-trust/) grades
+the same primitives by maturity.
 
-This page classifies each capability by its owner. Read it before you build a
-compliance story, an approval workflow, or an incident plan on top of Rocky.
-Each section names the file or the page where you can check the claim. The
-[Architecture of Trust](/concepts/architecture-of-trust/) page grades the same
-primitives by maturity. This page answers a different question: when this
-check matters, who actually runs it?
+- **Rocky-guaranteed.** The engine enforces it at compile or apply time, the same on every warehouse.
+- **Adapter-dependent.** The engine asks the warehouse adapter. The result depends on the adapter.
+- **External control.** Your warehouse or operations own it. Rocky records what it saw.
 
-The three classes:
+Four words keep one meaning on this page:
 
-- **Rocky-guaranteed.** The engine enforces it at compile time or apply time.
-  It behaves the same on DuckDB, Databricks, Snowflake, and BigQuery.
-- **Adapter-dependent.** The engine asks the warehouse adapter to do it. What
-  happens depends on the adapter, so the section names the warehouses.
-- **External control.** Your warehouse or your operations own it. Rocky
-  records what it saw, and nothing more.
-
-Four more words appear across the rows, always with the same meaning:
-
-- **Enforced.** The build or the apply fails when the condition does not
-  hold.
+- **Enforced.** The build or apply fails when the condition does not hold.
 - **Attempted.** Best-effort: Rocky tries, warns on failure, and continues.
-- **Recorded when available.** Rocky writes the value when the execution
-  path supplies it. A missing value is normal, not an error.
+- **Recorded when available.** Rocky writes the value when the execution path supplies it. A missing value is normal.
 - **Durable.** The write must persist, or the operation fails closed.
 
 ## The matrix
@@ -68,44 +54,15 @@ runs, and fails on any of these errors:
 
 Every `rocky run` reads the project `contracts/` directory and checks each contract in the compile that supplies the model SQL. A contract error keeps that model's existing table and withholds its downstream models. `rocky run --pipeline <NAME> --model <NAME> --contracts <DIR>` also requires the selected model to have a contract. A failed run can still record state and history.
 
-Two limits, stated plainly:
+Limits:
 
-- The type check (`E011`) applies only when Rocky infers a concrete type for
-  the column. When inference returns `Unknown` the check does not run, so an
-  unresolvable expression never fails its contract. Rocky reports each such
-  column as `I003` at info severity, naming the column and the type the
-  contract declares. Info changes no exit code: `rocky compile`, `rocky test`
-  and `rocky ci` all still pass. To make the check run, give the compiler
-  source schemas. `rocky compile`, `rocky test` and `rocky ci` read them from
-  `data/seed.sql` when the project has one, for every pipeline type. For a
-  replication pipeline, `rocky discover --with-schemas` (or `rocky run`)
-  fills the schema cache that `rocky compile` reads. `discover` refuses a
-  transformation-only pipeline, so for those use a seed. One limit on that:
-  an expression whose result type depends on the warehouse — `AVG` over a
-  `DECIMAL` column — stays `Unknown` either way. A `CAST` over an input
-  Rocky cannot type clears an `I003` only for some target types, such as
-  `DATE` or `DECIMAL(18, 2)`. `INT`, `BIGINT` and `TIMESTAMP` stay `Unknown`,
-  because their width differs by warehouse. The full list is in
-  [The Rocky Compiler](/concepts/compiler/#4-type-check).
-- To refuse a declared type Rocky cannot check, run `rocky compile
-  --strict-contracts` or `rocky ci --strict-contracts`, or set
-  `[contracts] strict = true` in `rocky.toml` (which `rocky run` and
-  `rocky test` also read). Each `I003` is then the `E059` error. It names the
-  model and the column, says why the type is unknown, and says how to fix it:
-  give the compiler source schemas, or cast the column to one of those targets
-  in the SELECT. `rocky run` first describes the sources in the
-  warehouse, so it refuses only what stays unknown after that.
-- `rocky compile` reads a source column as nullable when no source schema
-  says otherwise, so a `nullable = false` contract on it is `E012`. Before any
-  write, `rocky run` also describes each source behind an `E012`. It drops the
-  `E012` when the warehouse reports the column as NOT NULL. A nullable column
-  keeps the `E012`. `rocky plan` describes the same sources and stores them in
-  the plan, and an agent's `rocky apply` reuses them instead of describing
-  again. A plan saved by an older Rocky has none stored, so its apply keeps
-  the `E012`.
-- A bare `Decimal` in a contract matches any precision and scale. A contract
-  that names the digits — `Decimal(18,2)` — must match the inferred precision
-  and scale exactly.
+- `E011` runs only when Rocky infers a concrete type. For an `Unknown` type the check does not run. Rocky reports the column as `I003` (info, no exit-code change). Give the compiler source schemas to make the check run:
+  - `rocky compile`, `rocky test` and `rocky ci` read `data/seed.sql` when the project has one, for every pipeline type.
+  - For a replication pipeline, `rocky discover --with-schemas` (or `rocky run`) fills the schema cache that `rocky compile` reads. `discover` refuses a transformation-only pipeline: use a seed there.
+  - A warehouse-dependent result, such as `AVG` over a `DECIMAL`, stays `Unknown` either way. A `CAST` over an input Rocky cannot type clears `I003` only for some target types. `INT`, `BIGINT` and `TIMESTAMP` stay `Unknown`, because their width differs by warehouse. See [The Rocky Compiler](/concepts/compiler/#4-type-check).
+- `rocky compile --strict-contracts`, `rocky ci --strict-contracts`, or `[contracts] strict = true` (also read by `rocky run` and `rocky test`) turns each `I003` into `E059`. `rocky run` describes the sources in the warehouse first, so it refuses only what stays unknown.
+- `rocky compile` reads a source column as nullable unless a source schema says otherwise, so a `nullable = false` contract on it is `E012`. Before any write, `rocky run` describes each source behind an `E012` and drops the `E012` when the warehouse reports NOT NULL. `rocky plan` stores those descriptions in the plan, and `rocky apply` reuses them. A plan saved by an older Rocky has none, so its apply keeps the `E012`.
+- A bare `Decimal` in a contract matches any precision and scale. `Decimal(18,2)` must match exactly.
 
 Checked in `validate_contract` and `type_name_matches`,
 `engine/crates/rocky-compiler/src/contracts.rs`. Workflow:
@@ -139,11 +96,7 @@ masks today. On Databricks, Rocky writes Unity Catalog column tags and
 issues masking DDL, one statement per column. On DuckDB, Snowflake, and
 BigQuery the masking hooks do nothing today.
 
-Attempted means: when a masking statement fails, Rocky logs a warning and
-the run continues. A masking failure is not a build error and does not roll
-anything back. Do not state a compliance guarantee on top of this on any
-warehouse. On warehouses other than Databricks, masking is an external
-control: apply it with the warehouse's own tools.
+When a masking statement fails, Rocky logs a warning and the run continues. A masking failure is not a build error and rolls nothing back. Do not state a compliance guarantee on this on any warehouse. Elsewhere, masking is an external control: use the warehouse's own tools.
 
 Described, with the same caveats, in [Governance](/guides/governance/),
 section "How apply works", and graded in the
@@ -154,13 +107,8 @@ section "How apply works", and graded in the
 **Checked on demand by `rocky freshness`; not a gate on `rocky run`.** Two
 declarations describe how stale data may get:
 
-- A model's `[freshness]` block (`warn_after`, `error_after`,
-  `time_column`).
-- A transformation pipeline's `[[pipeline.<name>.sources]]` entry with a
-  `freshness` block (`loaded_at_field`, `warn_after`, `error_after`,
-  `filter`). A source is a table the models read but do not build.
-
-`rocky freshness` measures both against the warehouse:
+- A model's `[freshness]` block (`warn_after`, `error_after`, `time_column`).
+- A transformation pipeline's `[[pipeline.<name>.sources]]` entry with a `freshness` block (`loaded_at_field`, `warn_after`, `error_after`, `filter`). A source is a table the models read but do not build.
 
 ```
   source  MAX(loaded_at_field) [WHERE filter]   ─┐
@@ -170,37 +118,17 @@ declarations describe how stale data may get:
                                                      else               pass
 ```
 
-The command exits 1 on any `error` or `runtime_error`. A `warn` alone exits 0.
-An empty source counts as never loaded, so the worst threshold applies.
-A model's one TTL is its warn threshold, or its error threshold under
-`severity = "error"`.
+The command exits 1 on any `error` or `runtime_error`. A `warn` alone exits 0. An empty source counts as never loaded. A model's one TTL is its warn threshold, or its error threshold under `severity = "error"`.
 
-Other consumers of the declarations:
+Other consumers:
 
-- The scheduler (`rocky tick`, `rocky serve --scheduler`) turns a model's
-  budget into demand: a pipeline with a freshness schedule runs again once
-  too much time passes since its last successful run.
-- `rocky validate` checks the model declaration is well-formed.
-- The compiler warns (`W005`) when a model has a temporal column but no
-  freshness declaration in scope. It raises `E050` for a declaration that
-  cannot be evaluated, and `W050` for a column that is not a date or time.
+- The scheduler (`rocky tick`, `rocky serve --scheduler`) reruns a pipeline with a freshness schedule once too much time passes since its last successful run.
+- `rocky validate` checks the declaration is well-formed.
+- The compiler warns `W005` for a temporal column with no declaration in scope, raises `E050` for a declaration it cannot evaluate, and `W050` for a column that is not a date or time.
 
-What the declarations do **not** do: `rocky run` does not check them and
-does not skip a model downstream of a stale source. To gate a run, call
-`rocky freshness` first and stop on a non-zero exit. `rocky test` does not
-evaluate them.
+`rocky run` does not check the declarations and does not skip a model downstream of a stale source. `rocky test` does not evaluate them. To gate a run, call `rocky freshness` first and stop on a non-zero exit.
 
-One separate, opt-in run-time check exists, for replication pipelines only:
-`[checks] freshness = { error_after = "..." }` measures the real lag with
-SQL after the pipeline runs, and records the check as failed when the lag
-exceeds the threshold. Other pipeline types do not execute that check today;
-`rocky validate` flags it there as inert (V034). It is a pipeline check with
-its own key, not the model's `[freshness]` declaration.
-
-That recorded failure is advisory. The replication runner does not stop on it.
-The run's status comes from copied and failed tables, never from check results,
-so the exit code does not change. Rocky reports the outcome and leaves the
-decision to your orchestrator.
+One opt-in run-time check exists, for replication pipelines only: `[checks] freshness = { error_after = "..." }`. It measures lag with SQL after the run and records a failed check when the lag exceeds the threshold. Other pipeline types do not run it; `rocky validate` flags it there as inert (V034). The failure is advisory: run status comes from copied and failed tables, so the exit code does not change.
 
 Declarations: `ModelFreshnessConfig`, `engine/crates/rocky-core/src/models.rs`;
 `PipelineSourceConfig`, `engine/crates/rocky-core/src/source_freshness.rs`.
@@ -230,10 +158,7 @@ today:
   machine, not who wrote the bytes. Signed approvals are a planned
   hardening, not a shipped one.
 
-The first two properties arrived in engine v1.71.0. Releases up to and
-including v1.70.1 check only that a marker file exists, and skip even that
-when a `[policy]` rule resolves to `allow`. Upgrade to v1.71.0 or later before
-you rely on the floor.
+Engine v1.70.1 and earlier check only that a marker file exists, and skip even that when a `[policy]` rule resolves to `allow`. Use v1.71.0 or later for the floor.
 
 Gate: `run_apply_ai_authored_plan`,
 `engine/crates/rocky-cli/src/commands/apply.rs`. Marker shape and the
@@ -245,24 +170,12 @@ three gates".
 ## Audit ledger
 
 **Rocky recording: attempted for ordinary rules, durable for the two gating kinds.**
-Policy-decision recording is best-effort for ordinary rules. The mutating seams are `rocky apply`, promote, an agent's `rocky run`, and the
-`draft_*` and `propose` tools, which run the same evaluator into the same sink.
-At each seam, Rocky writes each evaluated decision to
-a `policy_decisions` table in the embedded redb state store, and when that write
-fails it warns and continues. Some refusals never reach the table at all,
-because the gate can return a verdict before any rule is evaluated. Decisions
-relevant to an autonomy budget or to `verify_after` are durable instead: when
-they cannot be persisted, the apply fails closed. Treat the ledger as a
-best-effort record rather than proof that a decision happened. `rocky audit` lists the decisions.
-`rocky audit --for <table|run|plan>` assembles the custody chain for one
-subject: who proposed, what policy decided, what the plan changed, which runs
-materialized it, and what verification found. A link with no recorded signal
-renders as `unavailable`. Rocky does not fabricate a value to complete the
-chain.
+The mutating seams are `rocky apply`, promote, an agent's `rocky run`, and the `draft_*` and `propose` tools. They run the same evaluator into the same sink.
+Rocky writes each evaluated decision to a `policy_decisions` table in the embedded redb state store. For ordinary rules a failed write warns and continues. Some refusals never reach the table, because the gate can return a verdict before any rule runs. Decisions tied to an autonomy budget or to `verify_after` are durable: when they cannot persist, the apply fails closed. Treat the ledger as a best-effort record, not proof that a decision happened.
 
-The ledger records what Rocky did. It is evidence, not enforcement: it stops
-nothing by itself, and it lives in whatever state store you configure. The
-ledger is only as safe as that store.
+`rocky audit` lists the decisions. `rocky audit --for <table|run|plan>` assembles the custody chain for one subject: who proposed, what policy decided, what the plan changed, which runs materialized it, and what verification found. A link with no recorded signal renders as `unavailable`. Rocky never fabricates a value.
+
+The ledger is evidence, not enforcement. It lives in your configured state store and is only as safe as that store.
 
 Ledger tables: `engine/crates/rocky-core/src/state.rs`. Command:
 `engine/crates/rocky-cli/src/commands/audit.rs`. Reading the ledger without
@@ -276,14 +189,7 @@ the BLAKE3 hash of its own bytes and records the hash in the ledger. An
 engine test pins that the writer is byte-stable across runs. On that path,
 `rocky replay --execute --verify` re-derives a past run and compares hashes.
 
-A general run against DuckDB, Databricks, Snowflake, or BigQuery records
-less. When persistence succeeds, successful materializations record recipe
-identity; SQL hashes and row counts are recorded only when the execution
-path supplies them (a replication copy, for example, supplies neither). A
-general run emits no hash-named artifacts, so there is no byte-level replay
-proof on those targets. Treat any byte-identical claim as unverified on a
-given adapter until you have run the verification against that adapter
-yourself.
+A general run against DuckDB, Databricks, Snowflake or BigQuery records less. Successful materializations record recipe identity. SQL hashes and row counts appear only when the execution path supplies them (a replication copy supplies neither). A general run emits no hash-named artifacts, so there is no byte-level replay proof. Treat a byte-identical claim as unverified on an adapter until you have run the verification there.
 
 Scope and walkthrough: [Verify a Run Without Rocky](/guides/verify-a-run/).
 Byte-stability test: `build_parquet_is_byte_stable_across_runs`,
@@ -292,18 +198,9 @@ grading: [Architecture of Trust](/concepts/architecture-of-trust/).
 
 ## Rollback after a bad apply
 
-**Does not exist.** When a post-apply verification check
-(`verify_after` in a policy rule) fails, Rocky halts and reports. The
-mutation has already landed in the warehouse and it stays there. Rocky has
-no automatic restoration after a failed `verify_after` check; transactional
-statement failures may still roll back an uncommitted partition. That
-narrower mechanism is mid-run hygiene on transactional warehouses, not a
-restore. No restore substrate exists, because a plain warehouse table has
-no engine-owned prior version.
+**Does not exist.** When a post-apply check (`verify_after` in a policy rule) fails, Rocky halts and reports. The mutation has already landed and stays. A transactional statement failure may roll back an uncommitted partition, but that is mid-run hygiene, not a restore. A plain warehouse table has no engine-owned prior version to restore.
 
-Recovery after a bad apply is an external control. Plan for it with the
-warehouse's own tools: time travel, snapshots, or a re-run from upstream
-data. Rocky's role ends at halting loudly and recording what happened.
+Plan recovery with the warehouse's own tools: time travel, snapshots, or a re-run from upstream data.
 
 Halt-only behavior and its rationale: the `verify_after` gate in
 `engine/crates/rocky-cli/src/commands/apply.rs` (the failure message states
@@ -323,7 +220,4 @@ Test kinds: `engine/crates/rocky-core/src/tests.rs`. Workflow:
 
 ## How to read a gap
 
-A row that says "adapter-dependent" or "external control" is not a defect
-list. It is the boundary of what the engine can honestly promise. Build your
-controls on the rows marked Rocky-guaranteed, name the adapter when you rely
-on an adapter-dependent row, and own the external rows in your runbook.
+"Adapter-dependent" and "external control" mark the boundary of what the engine can honestly promise. Build controls on the Rocky-guaranteed rows, name the adapter when you rely on an adapter-dependent row, and own the external rows in your runbook.

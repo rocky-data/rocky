@@ -77,22 +77,12 @@ type = "Date"
 nullable = false
 
 [[columns]]
-name = "category"
-type = "String"
-nullable = false
-
-[[columns]]
 name = "revenue"
 type = "Decimal"
 nullable = false
 
-[[columns]]
-name = "order_count"
-type = "Int64"
-nullable = false
-
 [rules]
-required = ["order_date", "category", "revenue", "order_count"]
+required = ["order_date", "revenue"]
 protected = ["order_date", "revenue"]
 ```
 
@@ -116,11 +106,11 @@ A violation is a compiler error:
   error[E011]: column 'revenue' type mismatch: contract expects Decimal, got String
     = help: CAST `revenue` to Decimal in the SELECT, or update the contract's expected type
 
-  error[E013]: protected column 'order_count' has been removed
-    = help: restore `order_count` in the SELECT, or remove it from `[rules] protected`
+  error[E013]: protected column 'revenue' has been removed
+    = help: restore `revenue` in the SELECT, or remove it from `[rules] protected`
 ```
 
-Run the same check in CI with `rocky ci --models models --contracts contracts`. The PR then fails on a violation, before the code reaches production.
+Run the same check in CI with `rocky ci --models models --contracts contracts`.
 
 ## 3. Grants (Pillar 1 of 5)
 
@@ -160,17 +150,7 @@ permissions = ["USE SCHEMA", "SELECT"]
 
 ### How Rocky applies grants
 
-`rocky apply` runs this loop for each catalog and schema it manages:
-
-```
-  1. read desired    [pipeline.<name>.target.governance.grants]
-                     [pipeline.<name>.target.governance.schema_grants]
-                                   │
-                                   ▼
-  2. apply           one GRANT per declared permission
-```
-
-Rocky does not read the grants that already exist. A grant that `rocky.toml` does not declare stays in place.
+For each catalog and schema it manages, `rocky apply` issues one `GRANT` per declared permission:
 
 ```sql
 GRANT SELECT ON CATALOG `acme_warehouse` TO `analysts`;
@@ -198,15 +178,11 @@ Rocky never grants a skipped permission. It therefore cannot disturb ownership o
 
 ### Principal validation
 
-A principal name must match the pattern `^[a-zA-Z0-9_ \-\.@]+$`. Rocky wraps every principal in backticks in the SQL it generates, so spaces and other special characters survive:
-
-```sql
-GRANT USE CATALOG ON CATALOG acme_warehouse TO `data engineers`
-```
+A principal name must match the pattern `^[a-zA-Z0-9_ \-\.@]+$`. Rocky wraps every principal in backticks in the SQL it generates, so ``GRANT USE CATALOG ON CATALOG acme_warehouse TO `data engineers` `` works.
 
 ## 4. Column Classification and Masking (Pillar 2 of 5)
 
-A classification tag marks a column as sensitive. A masking strategy decides how Rocky obscures that column in the warehouse. Rocky keeps the two apart, so you can tag a column for discovery and lineage without deciding its masking policy yet. One project-level block then maps every tag to a strategy, with per-environment overrides:
+A classification tag marks a column as sensitive. A masking strategy decides how Rocky obscures it. The two are separate, so you can tag a column before you pick a policy. One project-level block maps every tag to a strategy, with per-environment overrides:
 
 ```
   models/customers.toml            rocky.toml
@@ -222,7 +198,7 @@ Implemented on Databricks today. Other adapters do nothing.
 
 ### Tag columns in the model sidecar
 
-Classification tags live in a `[classification]` block in the model's `.toml` sidecar. Each key is a column name. Each value is a free-form tag string, because Rocky enforces no fixed vocabulary:
+A `[classification]` block in the model's `.toml` sidecar maps each column name to a free-form tag string. Rocky enforces no fixed vocabulary:
 
 ```toml
 # models/customers.toml
@@ -235,11 +211,11 @@ ssn = "confidential"
 home_address = "pii"
 ```
 
-Rocky matches each tag string (`pii`, `confidential`, and so on) against the project-level `[mask]` block to pick a strategy. Coin new tags such as `financial`, `health`, or `internal` whenever you need them. The engine does not need to know about them.
+Rocky matches each tag string against the project-level `[mask]` block to pick a strategy.
 
 ### Map tags to masking strategies
 
-The `[mask]` block in `rocky.toml` binds each classification tag to a masking strategy. A scalar value sets the workspace default. A nested `[mask.<env>]` table overrides the strategy for one environment:
+The `[mask]` block in `rocky.toml` binds each tag to a strategy. A scalar sets the workspace default. A `[mask.<env>]` table overrides it for one environment:
 
 ```toml
 [mask]
@@ -251,7 +227,7 @@ pii = "none"             # prod override: do not mask pii
 confidential = "partial" # keep first/last 2 chars, mask the middle
 ```
 
-`RockyConfig::resolve_mask_for_env` resolves the masks for one environment. It takes the top-level scalars as defaults, then overlays the same keys from the matching `[mask.<env>]` table. Pass no environment and only the defaults apply.
+`RockyConfig::resolve_mask_for_env` takes the top-level scalars as defaults, then overlays the matching `[mask.<env>]` table. With no environment, only the defaults apply.
 
 ### Supported strategies
 
@@ -264,32 +240,32 @@ confidential = "partial" # keep first/last 2 chars, mask the middle
 
 `rocky preview rows` applies `hash` and `partial` on Databricks, Snowflake and DuckDB only. On other adapters it refuses with `unmaskable_column` and returns no rows. `redact` works everywhere. See [`rocky preview rows`](/reference/commands/modeling/#rocky-preview-rows).
 
-An unknown strategy name, such as `"mask"` or `"obfuscate"`, fails at config-load time. Rocky never accepts a strategy it cannot emit SQL for.
+An unknown strategy name, such as `"mask"` or `"obfuscate"`, fails at config-load time.
 
 ### Allowed unmasked tags
 
-Some tags exist only for discovery and lineage, and are never meant to have a `[mask]` strategy. List those in the `[classifications]` block:
+List tags that are only for discovery and lineage, and need no `[mask]` strategy, in the `[classifications]` block:
 
 ```toml
 [classifications]
 allow_unmasked = ["internal", "public"]
 ```
 
-A tag listed there silences the `W004` "tag has no masking strategy" compiler warning. The list is advisory. It does not enforce anything on those columns; it only stops the warning.
+A tag listed there silences the `W004` "tag has no masking strategy" compiler warning. The list is advisory: it enforces nothing.
 
 ### How apply works
 
-Once the DAG completes successfully, `rocky apply` walks each model's `[classification]` block. For each one it calls the governance adapter's `apply_column_tags` and `apply_masking_policy` hooks. Both are best-effort: a failure emits `warn!` and the pipeline continues, exactly as `apply_grants` does.
+After the DAG completes, `rocky apply` walks each model's `[classification]` block and calls the governance adapter's `apply_column_tags` and `apply_masking_policy` hooks. Both are best-effort: a failure emits `warn!` and the pipeline continues.
 
-On Databricks, Rocky writes Unity Catalog column tags and issues `CREATE MASK` / `SET MASKING POLICY`, **one statement per column**. Unity Catalog rejects masking DDL that covers several columns in one statement. BigQuery, Snowflake, and DuckDB do nothing here until their adapters grow the support.
+On Databricks, Rocky writes Unity Catalog column tags and issues `CREATE MASK` / `SET MASKING POLICY`, **one statement per column**, because Unity Catalog rejects multi-column masking DDL. BigQuery, Snowflake, and DuckDB do nothing here.
 
-See the [configuration reference](/reference/configuration/) for the full schema of the `[mask]` and `[classifications]` blocks.
+The [configuration reference](/reference/configuration/) has the full schema of the `[mask]` and `[classifications]` blocks.
 
 ## 5. Compliance Rollup (Pillar 3 of 5)
 
 `rocky compliance` answers one question: **is every classified column masked wherever policy says it should be?**
 
-It resolves the classifications against the masks in your configuration and reports the result. It makes no warehouse call and no network round-trip.
+It resolves the classifications against the masks in your configuration. It makes no warehouse call.
 
 ### Basic usage
 
@@ -321,9 +297,7 @@ EXCEPTIONS:
 
 ### How `none` counts
 
-`MaskStrategy::None`, the explicit identity strategy, counts as **masked**. Choosing "do not mask" is a policy decision, not a gap. The gap that produces an exception is a tag with no entry in `[mask]` at all.
-
-The `[classifications] allow_unmasked = [...]` list suppresses exceptions for the tags you deliberately left out of the mask policy. It does not claim those columns are protected.
+`MaskStrategy::None`, the explicit identity strategy, counts as **masked**. "Do not mask" is a policy decision, not a gap. An exception means a tag has no entry in `[mask]` at all. `[classifications] allow_unmasked = [...]` suppresses exceptions for tags you left out on purpose. It does not claim those columns are protected.
 
 ### JSON output
 
@@ -331,13 +305,11 @@ The `[classifications] allow_unmasked = [...]` list suppresses exceptions for th
 rocky compliance --env prod --output json
 ```
 
-The payload follows the `ComplianceOutput` schema: a `summary` block of counters, a `per_column` array, and an `exceptions` array. Feed it to a dashboard, a CI step summary, or a policy engine. The schema stays stable across minor versions, so point your tooling at the JSON and not at the text table.
+The payload follows the `ComplianceOutput` schema: a `summary` block of counters, a `per_column` array, and an `exceptions` array. Point tooling at the JSON, not the text table.
 
 ## 6. Role-Graph Reconciliation (Pillar 4 of 5)
 
-You declare roles that inherit from other roles. Rocky flattens that hierarchy into one resolved permission set per role. It rejects cycles and unknown parents at config-load time.
-
-What happens next depends on your Databricks setup. With a SCIM client configured, the adapter creates a `rocky_role_*` SCIM group per role and emits per-catalog `GRANT` statements from the flattened graph. It only adds: it deletes no group and revokes no grant, so removal needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the flattened graph and emits `debug!` events, and touches nothing in the warehouse.
+You declare roles that inherit from other roles. Rocky flattens the hierarchy into one resolved permission set per role. It rejects cycles and unknown parents at config-load time, on every adapter.
 
 ### Declare roles in `rocky.toml`
 
@@ -359,31 +331,29 @@ Each `[role.<name>]` block takes two keys:
 - `inherits` -- the immediate parent roles. Rocky walks them transitively.
 - `permissions` -- canonical Rocky permission strings (`"SELECT"`, `"USE CATALOG"`, `"MODIFY"`, `"MANAGE"`, and so on).
 
-A role may declare an empty `permissions` list. It then acts as a grouping node that exists only so other roles can inherit from it.
+An empty `permissions` list makes a role a grouping node that other roles inherit from.
 
 ### Resolution semantics
 
-At reconcile time Rocky calls `RockyConfig::role_graph()`. That flattens the `[role.*]` map into a deterministic `name → ResolvedRole` map:
+`RockyConfig::role_graph()` flattens the `[role.*]` map into a deterministic `name → ResolvedRole` map:
 
 1. Walk the `inherits` DAG depth-first, detecting cycles.
 2. Union this role's `permissions` with the `permissions` of every ancestor.
 3. Reject an unknown parent, such as `inherits = ["nonexistent_role"]`.
 4. Reject an unknown permission string.
 
-Rocky catches cycles and unknown parents at config-load time, whether or not the target adapter reconciles role graphs at all. So the resolver still catches your mistake on a warehouse whose adapter does nothing.
-
 ### Databricks reconcile
 
-`reconcile_role_graph` on Databricks first validates each flattened role's `rocky_role_<name>` principal syntax. With a SCIM client configured, it then runs two passes:
+`reconcile_role_graph` on Databricks validates each flattened role's `rocky_role_<name>` principal syntax. With a SCIM client configured, it then runs two passes:
 
 - **Pass 1** — create one `rocky_role_<name>` SCIM group per role, best-effort per role.
 - **Pass 2** — emit `GRANT <permission> ON CATALOG ...` for every `(role, catalog, permission)` triple.
 
-Both passes only add. Rocky revokes no grant and deletes no group. Removing a role or a permission from `rocky.toml` leaves the warehouse untouched until you clean it up by hand. Without a SCIM client, the adapter validates and logs the resolved permission set and emits no `GRANT`. Every other adapter does nothing here.
+Both passes only add. Rocky revokes no grant and deletes no group, so removing a role or a permission from `rocky.toml` needs manual cleanup. Without a SCIM client, the adapter runs **log-only**: it validates the graph, emits `debug!` events and touches nothing in the warehouse. Every other adapter does nothing here.
 
 ## 7. Data Retention (Pillar 5 of 5)
 
-A retention policy tells the warehouse how long to keep a table's historical data. You write one sidecar key. Each adapter translates it into the warehouse's own TBLPROPERTIES or session parameter.
+A retention policy sets how long the warehouse keeps a table's historical data. You write one sidecar key. Each adapter translates it into the warehouse's own property.
 
 ### Declare retention on a model
 
@@ -395,14 +365,7 @@ name = "events_daily"
 retention = "90d"   # grammar: \d+[dy] -- days or years
 ```
 
-Grammar:
-
-- `<N>d` -- N days
-- `<N>y` -- N years; flat-multiplied to 365 days each (no leap-year math)
-
-Rocky rejects a malformed value such as `"abc"`, `"90"`, or `"-3d"` when it parses the sidecar, with `ModelError::InvalidRetention`.
-
-Omit the `retention` key, or set it to null, and Rocky manages no retention for that model. The warehouse keeps its own default behaviour.
+`<N>d` is N days. `<N>y` is N years, flat-multiplied to 365 days each. Rocky rejects a malformed value such as `"abc"`, `"90"`, or `"-3d"` with `ModelError::InvalidRetention`. With no `retention` key, Rocky manages no retention for that model.
 
 ### Adapter translation
 
@@ -413,7 +376,7 @@ Omit the `retention` key, or set it to null, and Rocky manages no retention for 
 | **BigQuery** | Default-unsupported. No built-in retention setting; sidecar ignored with a `warn!`. |
 | **DuckDB** | Default-unsupported. Sidecar ignored with a `warn!`. |
 
-Rocky applies retention after the DAG completes, in the same post-run reconcile loop as classification and masking. A failure emits `warn!` and never aborts the run.
+Rocky applies retention after the DAG completes, in the same best-effort loop as masking. A failure emits `warn!` and never aborts the run.
 
 ### Inspecting configured retention: `rocky retention-status`
 
@@ -429,7 +392,7 @@ orders             365 days     -           yes
 customers          -            -           yes
 ```
 
-Without `--drift`, Rocky does not probe the warehouse. The `WAREHOUSE` column stays `-`, and `IN SYNC` compares the configured value against nothing.
+Without `--drift`, Rocky does not probe the warehouse, and the `WAREHOUSE` column stays `-`.
 
 Flags:
 
@@ -441,7 +404,7 @@ Flags:
 
 ### `--drift` probes the warehouse
 
-With `--drift`, Rocky resolves a governance adapter per model and reads the retention the warehouse currently applies. It fills `warehouse_days` and recomputes `in_sync`, so you can see where `rocky.toml` and the live table disagree. The probe works on Databricks and Snowflake only. DuckDB and BigQuery inherit the default no-observation implementation, so `--drift` leaves `warehouse_days` empty there. A probe error prints per model on stderr and does not fail the command.
+With `--drift`, Rocky reads the retention the warehouse currently applies, fills `warehouse_days` and recomputes `in_sync`. The probe works on Databricks and Snowflake only. On DuckDB and BigQuery `warehouse_days` stays empty. A probe error prints per model on stderr and does not fail the command.
 
 ## 8. Workspace Isolation
 
@@ -469,13 +432,7 @@ With isolation enabled, Rocky does two things:
 
 No other workspace can then reach the catalog. Only a listed workspace can read it, and only a `READ_WRITE` one can write to it.
 
-### When to use isolation
-
-- **Multi-workspace environments**: teams or environments have separate workspaces
-- **Compliance requirements**: the data must not be reachable from an unapproved workspace
-- **Development and production separation**: a dev workspace must not touch a production catalog
-
-Isolation is best-effort. If the API call fails, because the workspace ID does not exist for example, Rocky logs a warning and continues the run.
+Use isolation when separate workspaces must not reach each other's catalogs, for example dev against production. Isolation is best-effort. If the API call fails, Rocky logs a warning and continues the run.
 
 ## 9. Tagging Strategy
 
@@ -521,31 +478,15 @@ ALTER SCHEMA acme_warehouse.staging__us_west__shopify SET TAGS (
 
 ### Using tags for discovery
 
-Rocky finds its own catalogs by tag. It queries the `managed_by = "rocky"` tag like this:
-
-```sql
-SELECT catalog_name
-FROM system.information_schema.catalog_tags
-WHERE tag_name = 'managed_by' AND tag_value = 'rocky'
-```
-
-So you can deploy Rocky across many catalogs and still find every managed catalog by its tag.
-
-### Tagging best practices
-
-- Always set `managed_by = "rocky"`, so Rocky can find its own catalogs
-- Use `environment` to tell dev, staging, and prod apart
-- Use `data_owner` to record who is responsible
-- Use `cost_center` for chargeback
-- Add your own tags for compliance, such as `pii = "true"` or `data_classification = "internal"`
+Rocky finds its own catalogs by the tag `managed_by = "rocky"`, which it reads from `system.information_schema.catalog_tags`. Always set it.
 
 ## 10. Config Groups and Enforcement
 
-A [config group](/reference/glossary/#config-group) is one definition that a set of models opts into by name, with `group = "<name>"` in each sidecar. It supplies shared routing (`schema_template`) and a shared `strategy`, so those models route and materialize the same way without repeating the config. [The model format guide](/reference/model-format/#config-groups) is the full reference. This section covers the governance angle.
+A [config group](/reference/glossary/#config-group) is one definition that models opt into with `group = "<name>"` in each sidecar. It supplies shared routing (`schema_template`) and a shared `strategy`. [The model format guide](/reference/model-format/#config-groups) is the full reference.
 
 ### Enforced config groups
 
-A group is an overridable default. A member model can pin its own `target.schema` or `strategy`, and the local value wins. Set `enforce = true` and the group becomes an [enforced group](/reference/glossary/#enforced-group): its fields are binding. A member that pins a field the group controls then fails to load. It does not quietly route or materialize itself differently from the rest of the group:
+A group is an overridable default: a member can pin its own `target.schema` or `strategy`, and the local value wins. Set `enforce = true` and the group becomes an [enforced group](/reference/glossary/#enforced-group). A member that pins a field the group controls then fails to load:
 
 ```toml
 # models/groups/regulated.toml
@@ -557,15 +498,13 @@ type = "merge"
 unique_key = ["id"]
 ```
 
-Enforcement covers exactly the two fields the group owns: the target `schema`, when the group sets `schema_template`, and the `strategy`. A member that sets either one fails the load with a `GroupOverride` error. The model may still supply its own `[args]` to fill the template. It may still set any field the group does not own, such as `target.catalog`. It only loses the schema routing and the materialization the group governs.
+Enforcement covers two fields: the target `schema` (when the group sets `schema_template`) and the `strategy`. A member that sets either fails the load with a `GroupOverride` error. A member may still supply its own `[args]` to fill the template, and set any other field, such as `target.catalog`.
 
-This is a load-time guarantee, in the same family as a data contract. The check runs when the model graph loads. Rocky rejects an off-policy override before any SQL reaches the warehouse, instead of surfacing it as drift later. Enforcement is opt-in. Without `enforce`, a group stays an overridable default.
-
-Enforcement covers every model in the group, whether you wrote it in SQL or in the `.rocky` DSL. The group governs routing and materialization, never the model body.
+The check runs when the model graph loads, before any SQL reaches the warehouse. It covers every member, in SQL or in the `.rocky` DSL. The group governs routing and materialization, never the model body. Enforcement is opt-in.
 
 ## 11. Model Tags
 
-A model tag is a free-form attribute that describes a model as a whole: `domain`, `tier`, `owner`, or whatever your governance model needs. Model tags are not the [tagging strategy](#9-tagging-strategy) of the previous section. Those tags live under `[pipeline.*.target.governance.tags]`, land on Unity Catalog catalogs, schemas, and tables through `ALTER ... SET TAGS`, and drive catalog discovery. Model tags live in the model sidecar or its config group, and flow into Rocky's model graph, the orchestrator's asset tags, and the `rocky compile` JSON.
+A model tag is a free-form attribute for a whole model: `domain`, `tier`, `owner`. Model tags are not the [tagging strategy](#9-tagging-strategy). They live in the model sidecar or its config group, and flow into the model graph, the orchestrator's asset tags and the `rocky compile` JSON.
 
 ### Sidecar `[tags]`
 
@@ -583,7 +522,7 @@ owner = "data-eng"
 
 ### Config-group `[tags]` baseline
 
-A config group can declare its own `[tags]` block. Every member model inherits those tags, so one attribute set on the group reaches every model in it:
+A config group can declare a `[tags]` block. Every member inherits it:
 
 ```toml
 # models/groups/finance.toml
@@ -596,15 +535,15 @@ tier = "gold"
 
 ### Sidecar over group, per key
 
-For a model in a group, Rocky merges the model's own `[tags]` on top of the group's `[tags]`, key by key. A member can override one inherited key and keep the rest: a model in the `finance` group above can set `tier = "silver"` in its sidecar and still inherit `domain = "finance"`. Precedence matches the rest of group resolution, sidecar over group.
+Rocky merges the model's own `[tags]` over the group's `[tags]`, key by key. A model in the `finance` group above can set `tier = "silver"` and still inherit `domain = "finance"`.
 
 ### Projection to Dagster
 
-`rocky compile --output json` emits the resolved tags as `models_detail[].tags`. The `dagster-rocky` integration projects them onto each derived asset as Dagster tags, so you can select assets by them, for example `tag:domain=finance`. The translator adds its own `rocky/`-namespaced tags for the model name, the target catalog, the target schema, and the strategy. The `rocky/` prefix keeps those from ever colliding with one of your keys. A tag you set once in a sidecar or a group is therefore visible end to end: in the typed model graph, in `rocky compile`, and in the orchestrator.
+`rocky compile --output json` emits the resolved tags as `models_detail[].tags`. The `dagster-rocky` integration projects them onto each derived asset as Dagster tags, so you can select assets with, for example, `tag:domain=finance`. The translator adds its own `rocky/`-namespaced tags for the model name, target catalog, target schema and strategy, so they never collide with your keys.
 
 ### Per-model warehouse tags: `[governance.tags]`
 
-Model `[tags]` face the orchestrator and never reach the warehouse. To write a tag onto a model's **own** target table or view in Unity Catalog, declare a `[governance.tags]` block in the model sidecar:
+Model `[tags]` never reach the warehouse. To write a tag onto a model's own target table or view in Unity Catalog, declare a `[governance.tags]` block in the sidecar:
 
 ```toml
 # models/fct_orders.toml
@@ -615,9 +554,7 @@ domain = "finance"
 tier = "gold"
 ```
 
-Once the model materializes, `rocky apply` emits tag DDL against its target securable. It uses `ALTER VIEW ... SET TAGS (...)` for a view-format model, and `ALTER TABLE ... SET TAGS (...)` otherwise. It writes your keys and values verbatim, with no prefix. This is the per-model counterpart to the catalog- and schema-level [tagging strategy](#9-tagging-strategy) above (`[pipeline.*.target.governance.tags]`).
-
-The three tag surfaces are independent, and each reaches a different consumer. Keep them apart:
+After the model materializes, `rocky apply` emits `ALTER VIEW ... SET TAGS (...)` for a view-format model and `ALTER TABLE ... SET TAGS (...)` otherwise. It writes your keys and values verbatim, with no prefix. The three tag surfaces are independent:
 
 | Block | Where it lives | What it does |
 |---|---|---|
@@ -629,7 +566,7 @@ The three tag surfaces are independent, and each reaches a different consumer. K
 
 ## 12. Quality Checks
 
-Rocky runs data quality checks inside a replication run. Each check executes as soon as its table is copied. The run output carries the results. [Data quality checks](/concepts/data-quality-checks/) has the JSON result shapes, the anomaly rules, and the freshness edge cases.
+Rocky runs quality checks inside a replication run, as soon as each table is copied. [Data quality checks](/concepts/data-quality-checks/) has the JSON result shapes, the anomaly rules, and the freshness edge cases.
 
 ```toml
 [pipeline.bronze.checks]
@@ -657,11 +594,11 @@ threshold = 0
 
 ## 13. Audit Trail
 
-Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store) (a redb database on disk). You query that store for the audit trail. Every `rocky apply` stamps eight extra governance fields onto its `RunRecord`. `rocky history --audit` shows them.
+Rocky keeps run history and quality metrics in its embedded [state store](/reference/glossary/#state-store). Every `rocky apply` stamps eight governance fields onto its `RunRecord`. `rocky history --audit` shows them.
 
 ### `rocky history --audit` and the 8 audit fields
 
-Plain `rocky history` stays compact, so its bytes remain stable for schema v5 consumers. Pass `--audit` to expand every governance field, in text or in JSON:
+Plain `rocky history` stays compact. Pass `--audit` to expand every governance field, in text or JSON:
 
 ```bash
 rocky history --audit
@@ -681,15 +618,9 @@ Each `RunRecord` carries:
 | `hostname` | The host that executed the run. |
 | `rocky_version` | The CLI version that produced the record. |
 
-### Schema version v5 → v6 (forward-deserialize)
+### Rows from older stores
 
-The audit trail took the redb schema from v5 to v6. Rocky migrates by deserializing forward, and never rewrites a stored blob, so an existing store opens cleanly. It fills three defaults on a v5 row:
-
-- `hostname = "unknown"`
-- `rocky_version = "<pre-audit>"`
-- `session_source = Cli`
-
-An old run therefore still renders under `rocky history --audit`. It shows those placeholder strings for the three fields that did not exist when it ran.
+A run recorded before the audit fields shows `hostname = "unknown"`, `rocky_version = "<pre-audit>"` and `session_source = Cli` under `rocky history --audit`. Rocky never rewrites a stored row.
 
 ### Read history and metrics
 
@@ -711,16 +642,11 @@ Alert severity levels:
 
 ### JSON output
 
-Every history and metrics command also emits JSON:
-
-```bash
-rocky history -o json
-rocky metrics fct_daily_revenue --trend -o json
-```
+Every history and metrics command also takes `-o json`.
 
 ## 14. Where Each Block Lives
 
-Governance lives in three places. Pipeline-level blocks sit under each pipeline's target, so two pipelines can carry different policies. Project-level blocks sit at the top of `rocky.toml`. Model-level blocks sit in the sidecar.
+Pipeline blocks sit under each pipeline, so two pipelines can carry different policies. Project blocks sit at the top of `rocky.toml`. Model blocks sit in the sidecar.
 
 | Level | Block | Section |
 |---|---|---|
@@ -740,7 +666,7 @@ auto_create_schemas = true
 
 ## 15. CI Gate Example
 
-Wire `rocky compliance --fail-on exception` into a CI step and it blocks a merge that leaves a classified column unmasked. For a quieter local run, drop `--fail-on` and add `--exceptions-only`. The output then skips the per-column table when nothing is wrong.
+Wire `rocky compliance --fail-on exception` into CI to block a merge that leaves a classified column unmasked. For a quieter local run, drop `--fail-on` and add `--exceptions-only`.
 
 ### GitHub Actions
 
@@ -767,4 +693,4 @@ jobs:
         run: rocky compliance --env prod --fail-on exception
 ```
 
-The gate exits `0` when every classified column has a resolved strategy, or appears in `allow_unmasked`. It exits `1`, and fails the job, as soon as one exception appears.
+The gate exits `0` when every classified column has a strategy or appears in `allow_unmasked`. It exits `1` on the first exception.

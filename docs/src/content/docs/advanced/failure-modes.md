@@ -205,7 +205,7 @@ transient_max_retries = 2   # default; at most three attempts per model. 0 opts 
 
 A run-loop circuit breaker backs this up. After several consecutive transient model failures (default 3), Rocky retries no further model for the rest of that run. A systemically unhealthy warehouse then fails fast instead of spending the retry budget across the whole DAG.
 
-Set `transient_max_retries = 0`, or `[resilience] enabled = false`, to restore the earlier single-attempt behaviour. That suits CI, where a fast failure beats a slow one.
+Set `transient_max_retries = 0`, or `[resilience] enabled = false`, for single attempts. That suits CI, where a fast failure beats a slow one.
 
 There is a consequence for orchestrators. By the time a `failure_kind: "transient"` entry reaches your `errors[*]`, the engine has already retried it inside the run. Retrying immediately from outside duplicates work. Prefer a delayed re-run, or `--resume-latest`.
 
@@ -221,62 +221,31 @@ There is a consequence for orchestrators. By the time a `failure_kind: "transien
 
 ## Failure containment across the model graph
 
-By default a transformation run **contains failures** (`[resilience] contain_failures = true`). A model that fails while it runs is withheld with its downstream closure. Unrelated branches still build, and the run reports `PartialFailure`. Set `contain_failures = false` to **fail fast** instead: a failing model then stops the run and no later layer starts. Models already running beside it still finish, because `--parallel` is 4 by default. Only DuckDB runs one model at a time.
-
-A compile error is the exception. A selected model with an `Error`-severity
-diagnostic records `failure_kind: "compile-error"`. Rocky withholds that
-model's declared DAG descendants and lists them in `contained[*]`. Healthy
-branches can still build. Targets of failed or withheld models stay unchanged.
-If `--model` selects only a withheld descendant, the run records `compile-error` and
-`tables_failed`, so it cannot report `Success`.
-
-A project that cannot compile at all is not an exception. Nothing builds, and the run reports one error keyed `<compile>`. These are the causes:
-
-- SQL that does not parse.
-- A `.rocky` file Rocky cannot lower.
-- Broken or missing frontmatter.
-- A duplicate model name.
-- A `depends_on` entry that names a model that does not exist.
-
-```
-model has compile error    ->  model fails; declared descendants are withheld
-project does not compile   ->  nothing builds
-model fails while running  ->  it and its downstream are withheld; the rest builds
-                               (contain_failures = false: no later layer starts)
-```
-
-The default compile-error boundary follows declared DAG edges. An undeclared
-read can still use a retained table. Add `depends_on` when that relationship
-must be withheld. `rocky run --dag` runs each model as a separate sub-run.
-
-This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default: one table that fails does not stop the others. A second switch still can. `error_rate_abort_pct` defaults to 50, so once 4 or more tables finish, a failure rate at or above half aborts the rest.
-
-Containment is on by default. To restore fail-fast, set it to `false`:
+By default a transformation run **contains failures** (`[resilience] contain_failures = true`). A model that fails while it runs is withheld with its downstream closure. Unrelated branches still build, and the run reports `PartialFailure`. Set `contain_failures = false` to **fail fast**: a failing model then stops the run and no later layer starts. Models already running beside it still finish, because `--parallel` is 4 by default. Only DuckDB runs one model at a time.
 
 ```toml
 [resilience]
 contain_failures = false   # default: true
 ```
 
-With containment on (the default), Rocky also withholds the failed model and its whole
-downstream closure after a runtime failure. Unrelated subtrees still
-materialize. The run reports `PartialFailure`. It lists the withheld models on
-`RunOutput.contained[*]`, each naming what blocked it plus an unblock hint, and
-the causes on `RunOutput.errors[*]`. For a partitioned (`time_interval`) model,
-a failed partition withholds the downstream while the healthy partitions land.
+```
+model has compile error    ->  model fails; declared descendants are withheld
+project does not compile   ->  nothing builds (one error keyed <compile>)
+model fails while running  ->  it and its downstream are withheld; the rest builds
+                               (contain_failures = false: no later layer starts)
+```
 
-**Guarantee scope.** Containment is *guaranteed* for two kinds of dependency. The first is a dependency listed in the model's `depends_on`. The second is a physical read Rocky can resolve statically: `schema.table` or `catalog.schema.table`, quoted or unquoted.
+**Compile errors.** A selected model with an `Error`-severity diagnostic records `failure_kind: "compile-error"`. Rocky withholds that model's declared DAG descendants and lists them in `contained[*]`. Healthy branches still build. Targets of failed or withheld models stay unchanged. If `--model` selects only a withheld descendant, the run records `compile-error` and `tables_failed`, so it cannot report `Success`. This containment is always on. It follows declared DAG edges, so add `depends_on` when an undeclared read must be withheld. `rocky run --dag` runs each model as a separate sub-run.
 
-Rocky folds both kinds into the withholding closure and into the execution order. So a downstream model is never built on the stale or missing output of a failure. Under `--parallel`, a reader is scheduled strictly after every producer it reads.
+A project that cannot compile at all builds nothing. Causes: SQL that does not parse, a `.rocky` file Rocky cannot lower, broken or missing frontmatter, a duplicate model name, or a `depends_on` entry that names a missing model.
 
-Some reads Rocky **cannot enumerate**: a model built on a CTE, a sub-query, or a set operation. Those get best-effort handling, identical to a normal fail-fast run.
+**Runtime failures.** Rocky lists the withheld models on `RunOutput.contained[*]`, each naming what blocked it plus an unblock hint, and the causes on `RunOutput.errors[*]`. For a partitioned (`time_interval`) model, a failed partition withholds the downstream while the healthy partitions land.
 
-Such a model is still withheld when a *known* upstream of it failed. But its reads do not resolve into an ordering edge. So under `--parallel`, a same-layer reader of a failing producer can materialize on stale data, exactly as it would in a fail-fast run.
+This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default. Another switch can still abort: `error_rate_abort_pct` defaults to 50, so once 4 or more tables finish, a failure rate at or above half aborts the rest.
 
-This is a documented boundary, not a regression. Containment never materializes anything a fail-fast run would not. **List the dependency in the model's `depends_on` when you need a hard containment guarantee.**
+**Guarantee scope.** Containment is guaranteed for a dependency in the model's `depends_on`, and for a physical read Rocky can resolve statically (`schema.table` or `catalog.schema.table`, quoted or not). Rocky folds both into the withholding closure and the execution order. Under `--parallel`, a reader runs strictly after every producer it reads.
 
-Containment is on by default for runtime failures. Set `contain_failures = false` to restore fail-fast. Compile-error containment
-for declared DAG descendants is always on.
+Rocky cannot enumerate some reads: a model built on a CTE, a sub-query, or a set operation. Such a model is still withheld when a known upstream failed. But its reads do not become an ordering edge, so under `--parallel` a same-layer reader of a failing producer can materialize on stale data, as in a fail-fast run. Containment never builds anything a fail-fast run would not. **List the dependency in `depends_on` when you need a hard guarantee.**
 
 ---
 

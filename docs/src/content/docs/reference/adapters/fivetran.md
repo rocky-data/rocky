@@ -68,13 +68,7 @@ read connector state (GET)
 
 How Rocky decides how a sync ended: Fivetran gives no sync id. Rocky notes each connector's `succeeded_at` and `failed_at` when it first sees the sync running. When the connector stops syncing, a `succeeded_at` that moved is a success and a `failed_at` that moved is a failure. If both moved, the later one wins. If neither moved after three more polls, the outcome is `unknown`, which counts as a failure. Both values come from Fivetran, so no clock on your machine takes part.
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `wait` | `false` | Turn the wait on. The other keys do nothing without it. |
-| `wait_timeout_secs` | `3600` | Longest wait for the whole phase. A sync still running at the limit counts as a failure (`timeout`). `rocky validate` requires at most half of `[state.idempotency] in_flight_ttl_hours`, so another run cannot reap this run's idempotency claim while it waits. |
-| `poll_interval_secs` | `30` | Seconds between polls. At least 10. |
-| `on_sync_failure` | `"fail"` | `fail` stops the run before any warehouse write. `warn` logs the failure and runs on the data Fivetran already landed, except after a sync that Rocky started and cannot call finished: see [Start a sync](#start-a-sync). |
-| `trigger` | `false` | Start a sync first. Needs `wait = true` and `allow_sync_trigger = true` on the adapter. See [Start a sync](#start-a-sync). |
+Keys (`wait`, `wait_timeout_secs`, `poll_interval_secs`, `on_sync_failure`, `trigger`) and their defaults: [`[pipeline.NAME.source.discovery.sync]`](/reference/configuration/#pipelinenamesourcediscoverysync). With `on_sync_failure = "warn"`, a sync that Rocky started and cannot call finished still stops the run: see [Start a sync](#start-a-sync).
 
 The wait runs before the run takes its state session, so a long wait holds no state lock. Because no state store is open yet:
 

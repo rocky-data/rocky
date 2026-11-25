@@ -129,7 +129,7 @@ It does **not** prove the sweep succeeded, that the project compiled, that the s
 
 ## The browser UI
 
-`serve.ui.enabled` defaults to `true`. `rocky serve --ui` and `--allowed-host` shipped in `engine-v1.74.0`. The chart's default image is its `appVersion` (`1.76.0` today), so it serves the page at `/ui/`. Set it to `false` for the API alone. With `scheduling.mode=resident` the UI also needs `existingSecret.webhookSecretKey`: the page is handed a read-only token, and the scheduler's webhook route must not be reachable with it.
+`serve.ui.enabled` defaults to `true`. The chart's default image is its `appVersion`, so it serves the page at `/ui/`. Set it to `false` for the API alone. With `scheduling.mode=resident` the UI also needs `existingSecret.webhookSecretKey`: the page is handed a read-only token, and the scheduler's webhook route must not be reachable with it.
 
 With the UI on, the Ingress host is passed as `--allowed-host` and a request carrying any other `Host` is refused `421`. Note that a foreign host usually never reaches Rocky at all: it matches no Ingress rule, so the controller's own default backend answers `404` first.
 

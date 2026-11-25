@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-These commands read what already happened and maintain what Rocky keeps. They cover run history, quality metrics and cost; storage compaction, profiling and archival; the state store and the scheduler; and the governance rollups.
+These commands read past runs (history, metrics, cost), maintain storage (compaction, archival), manage the state store and the scheduler, and report governance rollups.
 
 ---
 
@@ -68,20 +68,14 @@ rocky history
 }
 ```
 
-A run made with `rocky run --branch <name>` also carries `rocky_branch`, the literal `<name>`. Rocky leaves the field out of any other run. It is not an audit field, so it appears with or without `--audit`. `rocky preview diff` and `rocky preview cost` find a branch's run by it. It differs from `git_branch`, the git branch you had checked out, which appears only with `--audit`.
+A run made with `rocky run --branch <name>` carries `rocky_branch`, with or without `--audit`. `rocky preview diff` and `rocky preview cost` find a branch's run by it. It differs from `git_branch`, the checked-out git branch, which appears only with `--audit`.
 
-A run can start without leaving a record. It may still be running, it may have crashed, or its record write may have failed. When the ledger holds evidence of such a run, the document adds `unrecorded_runs`. A replication run leaves a `checkpoint` header. Every other kind of run leaves a `run_started` marker. These runs are not counted in `count`. When the list is present, `runs` is not the complete history. Rocky leaves the field out when it is empty, and when the MCP `history` tool filters by trigger.
+A run can start without leaving a record: it may still be running, have crashed, or failed its record write. When the ledger holds evidence of such a run, the document adds `unrecorded_runs` (a `checkpoint` header for a replication run, a `run_started` marker for any other run). These runs are not counted in `count`, so `runs` is then not the complete history. Rocky omits the field when it is empty, and when the MCP `history` tool filters by trigger.
 
 ```json
 "unrecorded_runs": [
-  {
-    "run_id": "run_20260401_120000",
-    "started_at": "2026-04-01T12:00:00Z",
-    "pipeline": "orders",
-    "evidence": "checkpoint",
-    "total_tables": 12,
-    "superseded": false
-  }
+  { "run_id": "run_20260401_120000", "started_at": "2026-04-01T12:00:00Z", "pipeline": "orders",
+    "evidence": "checkpoint", "total_tables": 12, "superseded": false }
 ]
 ```
 
@@ -97,47 +91,7 @@ Show history for a specific model since a date. The `--model` variant returns a 
 rocky history --model fct_revenue --since 2026-03-01
 ```
 
-```json
-{
-  "version": "1.6.0",
-  "command": "history",
-  "model": "fct_revenue",
-  "count": 2,
-  "executions": [
-    {
-      "started_at": "2026-04-01T14:30:22Z",
-      "duration_ms": 2300,
-      "rows_affected": 8900,
-      "status": "success",
-      "sql_hash": "a3f2b1c4..."
-    },
-    {
-      "started_at": "2026-03-31T14:30:05Z",
-      "duration_ms": 8900,
-      "rows_affected": 150000,
-      "status": "success",
-      "sql_hash": "b4e3c2d5..."
-    }
-  ]
-}
-```
-
-`sql_hash` is stable across runs where the compiled SQL is identical; useful for detecting model body changes across runs.
-
-Show history with table output:
-
-```bash
-rocky -o table history --since 2026-04-01
-```
-
-```
-RUN ID       STARTED                  STATUS     MODELS   TRIGGER
-------------------------------------------------------------------
-run_2026040  2026-04-01 14:30:22      Success    14       Manual
-run_2026040  2026-04-01 08:00:15      Failure    13       Manual
-```
-
-The `RUN ID` column is truncated to 11 characters and the timestamp is rendered without the `T`/`Z` separators.
+The `--model` variant returns `model`, `count` and a flat `executions` list (`started_at`, `duration_ms`, `rows_affected`, `status`, `sql_hash`). `sql_hash` is stable across runs with identical compiled SQL, so it detects model body changes.
 
 ### Audit trail
 
@@ -154,36 +108,7 @@ The `RUN ID` column is truncated to 11 characters and the timestamp is rendered 
 | `hostname` | Hostname where the run executed. `"unknown"` on rows written before the audit trail existed. |
 | `rocky_version` | The engine version at run time. `"<pre-audit>"` on rows written before the audit trail existed. |
 
-```bash
-rocky history --audit
-```
-
-```json
-{
-  "version": "1.16.0",
-  "command": "history",
-  "count": 1,
-  "runs": [
-    {
-      "run_id": "run_20260423_143022",
-      "started_at": "2026-04-23T14:30:22Z",
-      "duration_ms": 45200,
-      "status": "Success",
-      "trigger": "Manual",
-      "models_executed": 14,
-      "models": [ /* per-model records */ ],
-      "triggering_identity": "alice@acme.io",
-      "session_source": "dagster",
-      "git_commit": "a3f2b1c4...",
-      "git_branch": "main",
-      "idempotency_key": "nightly-2026-04-23",
-      "target_catalog": "acme_warehouse",
-      "hostname": "runner-12",
-      "rocky_version": "1.16.0"
-    }
-  ]
-}
-```
+`--audit` adds these fields to each run object in the JSON, after `models`.
 
 Text output appends a `Governance audit trail (--audit):` section after the default run summary with short-form columns (`git_commit` truncated to 8 chars, `hostname` to 11) plus a per-run detail line carrying `rocky_version` and `idempotency_key`.
 
@@ -247,48 +172,11 @@ rocky metrics fct_revenue
 }
 ```
 
-`--trend` keeps the same snapshot shape but returns multiple entries (one per recent run):
+`--trend` returns one snapshot per recent run in the same shape. `--alerts` adds a non-empty `alerts` array (omitted otherwise), for example `{ "type": "anomaly", "severity": "warning", "run_id": "...", "column": "net_revenue", "message": "null rate rose from 0.0% to 2.3% vs. 7-run baseline" }`. `--column <name>` sets the top-level `column` field and fills `column_trend` with `{ run_id, timestamp, null_rate }` points.
 
 ```bash
 rocky metrics fct_revenue --trend
-```
-
-```json
-{
-  "version": "1.6.0",
-  "command": "metrics",
-  "model": "fct_revenue",
-  "count": 3,
-  "snapshots": [
-    { "run_id": "run_20260401_143022", "timestamp": "2026-04-01T14:30:22Z", "row_count": 148203, "null_rates": { /* … */ } },
-    { "run_id": "run_20260331_143005", "timestamp": "2026-03-31T14:30:05Z", "row_count": 145890, "null_rates": { /* … */ } },
-    { "run_id": "run_20260330_143010", "timestamp": "2026-03-30T14:30:10Z", "row_count": 143200, "null_rates": { /* … */ } }
-  ]
-}
-```
-
-`--alerts` adds a non-empty `alerts` array (omitted otherwise). `--column <name>` sets the top-level `column` field and populates `column_trend` with per-run null-rate points:
-
-```bash
 rocky metrics fct_revenue --column net_revenue --alerts
-```
-
-```json
-{
-  "version": "1.6.0",
-  "command": "metrics",
-  "model": "fct_revenue",
-  "column": "net_revenue",
-  "count": 3,
-  "snapshots": [ /* … */ ],
-  "column_trend": [
-    { "run_id": "run_20260401_143022", "timestamp": "2026-04-01T14:30:22Z", "null_rate": 0.023 },
-    { "run_id": "run_20260331_143005", "timestamp": "2026-03-31T14:30:05Z", "null_rate": 0.0 }
-  ],
-  "alerts": [
-    { "type": "anomaly", "severity": "warning", "run_id": "run_20260401_143022", "column": "net_revenue", "message": "null rate rose from 0.0% to 2.3% vs. 7-run baseline" }
-  ]
-}
 ```
 
 ### Related Commands
@@ -336,38 +224,15 @@ rocky optimize
       "compute_cost_per_run": 2.6666666666666673e-6,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 1
-    },
-    {
-      "model_name": "user_metrics",
-      "current_strategy": "table",
-      "recommended_strategy": "table",
-      "estimated_monthly_savings": 0.0,
-      "reasoning": "insufficient history: 1 runs (need 5)",
-      "compute_cost_per_run": 8.000000000000001e-6,
-      "storage_cost_per_month": 0.0023,
-      "downstream_references": 0
     }
   ],
-  "total_models_analyzed": 2
+  "total_models_analyzed": 1
 }
 ```
 
 `rocky optimize` recommends `table` or `view`. A model needs at least `min_history_runs` recorded runs, which is 5 unless `[cost]` says otherwise. With fewer, it keeps its current strategy. Prices come from the [`[cost]`](/reference/configuration/#cost) block in `rocky.toml`. Rocky falls back to its built-in rates when the project has no `rocky.toml` or no `[cost]` block. A `rocky.toml` that exists but fails to load stops the command with an error.
 
-`current_strategy` is `"unknown"` when Rocky cannot find the model in the compiled project, for example a model seen only in run history:
-
-```json
-{
-  "model_name": "events",
-  "current_strategy": "unknown",
-  "recommended_strategy": "unknown",
-  "estimated_monthly_savings": 0.0,
-  "reasoning": "current strategy is unknown (model not found in the compiled project); no recommendation",
-  "compute_cost_per_run": 0.000010666666666666669,
-  "storage_cost_per_month": 0.0023,
-  "downstream_references": 0
-}
-```
+`current_strategy` is `"unknown"` when Rocky cannot find the model in the compiled project (for example a model seen only in run history). It gets no recommendation.
 
 Analyze a single model:
 
@@ -418,7 +283,7 @@ Exactly one scope is required for plan generation: a fully-qualified `<model>`, 
 
 ### Examples
 
-`rocky compact` generates SQL and persists it as a plan under `.rocky/plans/<plan-id>.json`; it does not execute against the warehouse. The plan id is printed in text output and returned as `plan_id` in JSON. Pipe the SQL to your warehouse yourself once you're happy with it, or execute the persisted plan with `rocky compact apply <plan-id>`.
+`rocky compact` generates SQL and persists it as a plan under `.rocky/plans/<plan-id>.json`. It never executes against the warehouse. The plan id is printed in text output and returned as `plan_id` in JSON. Run the SQL yourself, or execute the plan with `rocky compact apply <plan-id>`.
 
 Compact a table (dry run):
 
@@ -428,14 +293,13 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --dry-run
 
 ```json
 {
-  "version": "1.6.0",
   "command": "compact",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "dry_run": true,
   "target_size_mb": 256,
   "statements": [
-    { "purpose": "compact small files",      "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE true\n  -- target file size: 256MB" },
-    { "purpose": "remove stale data files",  "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
+    { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE true\n  -- target file size: 256MB" },
+    { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
   ]
 }
 ```
@@ -446,69 +310,26 @@ With a target file size:
 rocky compact acme_warehouse.staging__us_west__shopify.orders --target-size 256MB
 ```
 
-The generated `OPTIMIZE` carries the target file size as a trailing `-- target file size: <N>MB` comment; `target_size_mb` echoes the parsed value (e.g. `256` for `256MB`). When `--target-size` is omitted it defaults to `256`.
+`--target-size` (default `256MB`) is a trailing `-- target file size: <N>MB` comment on the `OPTIMIZE`. `target_size_mb` echoes the parsed value.
 
 #### Catalog-scoped compaction
 
-`--catalog <name>` resolves every Rocky-managed table in the named catalog and emits a single envelope keyed by FQN. The flat `statements` list still carries every SQL statement across all tables in iteration order; consumers that just want to execute the plan don't need to walk `tables`.
+`--catalog <name>` resolves every Rocky-managed table in the catalog (lowercased) and emits one envelope. The flat `statements` list holds every statement. Extra fields `catalog`, `scope: "catalog"`, `tables` (statements keyed by FQN) and `totals` (`table_count`, `statement_count`) appear only in this form.
 
 ```bash
 rocky compact --catalog acme_warehouse --target-size 256MB --dry-run
 ```
 
-```json
-{
-  "version": "1.20.0",
-  "command": "compact",
-  "catalog": "acme_warehouse",
-  "scope": "catalog",
-  "dry_run": true,
-  "target_size_mb": 256,
-  "statements": [
-    { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE true\n  -- target file size: 256MB" },
-    { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" },
-    { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events WHERE true\n  -- target file size: 256MB" },
-    { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
-  ],
-  "tables": {
-    "acme_warehouse.staging__us_west__shopify.events": {
-      "statements": [
-        { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events WHERE true\n  -- target file size: 256MB" },
-        { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
-      ]
-    },
-    "acme_warehouse.staging__us_west__shopify.orders": {
-      "statements": [
-        { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE true\n  -- target file size: 256MB" },
-        { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
-      ]
-    }
-  },
-  "totals": { "table_count": 2, "statement_count": 4 }
-}
-```
-
-The single-model envelope is byte-stable: `catalog`, `scope`, `tables`, and `totals` are all `skip_serializing_if = "Option::is_none"`. The catalog identifier is normalized to lowercase to match the managed-table resolver.
-
 #### Layer 0 dedup measurement (experimental)
 
-`--measure-dedup` runs a project-wide analysis that hashes each row on its semantic columns and reports the fraction of duplicate content across Rocky-managed tables. It is a research tool for Rocky's Layer 0 storage work; the output is a measurement, not a plan, and no SQL is issued against the target tables.
+`--measure-dedup` hashes each row on its semantic columns and reports the fraction of duplicate content across Rocky-managed tables. It is a measurement, not a plan, and issues no SQL against the target tables. It emits a distinct `compact-dedup` JSON shape with per-table contributions and a project summary. Use `--output json` in CI to track the ratio.
 
 ```bash
-# Cheap partition-level estimate across all Rocky-managed tables
-rocky compact --measure-dedup
-
-# Add a byte-level calibration pass on a sampled subset
-rocky compact --measure-dedup --calibrate-bytes
-
-# Include every warehouse table, not just Rocky-managed ones
-rocky compact --measure-dedup --all-tables
-
-# Customize which metadata columns are excluded from the dedup hash
+rocky compact --measure-dedup                   # partition-level estimate
+rocky compact --measure-dedup --calibrate-bytes # add a byte-level pass on a sample
+rocky compact --measure-dedup --all-tables      # every warehouse table
 rocky compact --measure-dedup --exclude-columns "_loaded_at,_loaded_by,_synced_at"
 ```
-
-The command emits a distinct `compact-dedup` JSON shape with per-table contributions and a project-wide summary. Use `--output json` in CI to track the ratio over time.
 
 ### Related Commands
 
@@ -553,13 +374,6 @@ rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
       "estimated_cardinality": "low (< 100)",
       "recommended_encoding": "dictionary",
       "reasoning": "Low-cardinality string — dictionary encoding dramatically shrinks storage and speeds up filtering."
-    },
-    {
-      "column": "customer_notes",
-      "data_type": "STRING",
-      "estimated_cardinality": "high",
-      "recommended_encoding": "lz4",
-      "reasoning": "High-cardinality free-text — LZ4 gives the best compression without hurting scan latency."
     }
   ]
 }
@@ -577,7 +391,7 @@ rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
 
 ## `rocky archive`
 
-Archive old data partitions by moving them to cold storage or deleting them based on an age threshold. Supports dry-run mode for previewing which partitions would be affected.
+Archive old partitions by deleting rows older than an age threshold. Supports dry-run mode.
 
 ```bash
 rocky archive [flags]                    # generate + persist an archive plan
@@ -596,19 +410,16 @@ rocky archive apply <plan-id> [flags]    # execute a previously-generated plan
 
 ### Examples
 
-Like `compact`, `archive` generates SQL and persists it as a plan under `.rocky/plans/<plan-id>.json`; it does not execute against the warehouse. It builds a Delta-flavoured `DELETE FROM <target> WHERE _fivetran_synced < DATEADD(DAY, -<N>, CURRENT_TIMESTAMP())` plus a trailing `VACUUM`. Pipe the SQL to your warehouse yourself, or execute the persisted plan with `rocky archive apply <plan-id>`. The generator is gated to Delta-on-Databricks targets and errors on other dialects.
-
-Preview archival for data older than 90 days:
+Like `compact`, `archive` persists a plan under `.rocky/plans/<plan-id>.json` and never executes against the warehouse. It builds a Delta `DELETE FROM <target> WHERE _fivetran_synced < DATEADD(DAY, -<N>, CURRENT_TIMESTAMP())` plus a trailing `VACUUM`. Run the SQL yourself, or execute the plan with `rocky archive apply <plan-id>`. The generator errors on dialects other than Delta on Databricks.
 
 ```bash
 rocky archive --older-than 90d --dry-run
+rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.events
+rocky archive --older-than 90d --catalog acme_warehouse --dry-run
 ```
-
-Without `--model` or `--catalog`, the target resolves to a `*` wildcard placeholder — pass `--model <fqn>` (below) or `--catalog <name>` to emit concrete per-table SQL:
 
 ```json
 {
-  "version": "1.6.0",
   "command": "archive",
   "older_than": "90d",
   "older_than_days": 90,
@@ -620,56 +431,7 @@ Without `--model` or `--catalog`, the target resolves to a `*` wildcard placehol
 }
 ```
 
-Archive a specific model's old data. The persisted plan is executed later with `rocky archive apply <plan-id>`:
-
-```bash
-rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.events
-```
-
-Same output shape: `model` is set when `--model` filters the run, and `<target>` in the `DELETE`/`VACUUM` becomes the fully-qualified table. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
-
-#### Catalog-scoped archival
-
-`--catalog <name>` mirrors `rocky compact --catalog`: it resolves every Rocky-managed table in the catalog from the pipeline config and aggregates per-table DELETE + VACUUM SQL into a single envelope keyed by FQN. The flat `statements` list still carries every statement across every table.
-
-```bash
-rocky archive --older-than 90d --catalog acme_warehouse --dry-run
-```
-
-```json
-{
-  "version": "1.20.0",
-  "command": "archive",
-  "catalog": "acme_warehouse",
-  "scope": "catalog",
-  "older_than": "90d",
-  "older_than_days": 90,
-  "dry_run": true,
-  "statements": [
-    { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
-    { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 0 HOURS" },
-    { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
-    { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 0 HOURS" }
-  ],
-  "tables": {
-    "acme_warehouse.staging__us_west__shopify.events": {
-      "statements": [
-        { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
-        { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 0 HOURS" }
-      ]
-    },
-    "acme_warehouse.staging__us_west__shopify.orders": {
-      "statements": [
-        { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
-        { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 0 HOURS" }
-      ]
-    }
-  },
-  "totals": { "table_count": 2, "statement_count": 4 }
-}
-```
-
-The single-model envelope is byte-stable: `catalog`, `scope`, `tables`, and `totals` are absent on the existing `rocky archive` and `rocky archive --model` paths.
+Without `--model` or `--catalog`, the target is a `*` placeholder. With `--model`, `model` is set and `*` becomes the fully-qualified table. `older_than_days` is the parsed duration (`6m` is `180`). `--catalog <name>` mirrors `rocky compact --catalog`: the envelope adds `catalog`, `scope: "catalog"`, `tables` keyed by FQN, and `totals`.
 
 ### Related Commands
 
@@ -681,7 +443,7 @@ The single-model envelope is byte-stable: `catalog`, `scope`, `tables`, and `tot
 
 ## `rocky replay`
 
-Inspect, audit, or re-execute a recorded run from the state store. The default view surfaces the per-model SQL hashes, row counts, bytes, and timings captured by `RunRecord` at execution time: the concrete artefact behind the reproducibility claim. `--check` runs a read-only replayability audit, and `--execute` re-runs the recorded recipes and re-derives each output hash — locally on DuckDB, or against the live warehouse with `--warehouse`.
+Inspect, audit or re-execute a recorded run. The default view shows the per-model SQL hashes, row counts, bytes and timings that `RunRecord` captured. `--check` runs a read-only replayability audit. `--execute` re-runs the recorded recipes and re-derives each output hash, on local DuckDB or (`--warehouse`) the live warehouse.
 
 ```bash
 rocky replay <target> [flags]
@@ -735,17 +497,6 @@ rocky replay latest
       "rows_affected": 150000,
       "bytes_scanned": 41943040,
       "bytes_written": 20971520
-    },
-    {
-      "model_name": "fct_revenue",
-      "status": "success",
-      "started_at": "2026-04-20T14:30:24Z",
-      "finished_at": "2026-04-20T14:31:07Z",
-      "duration_ms": 43000,
-      "sql_hash": "hash_b4e3c2d5",
-      "rows_affected": 8900,
-      "bytes_scanned": 20971520,
-      "bytes_written": 4194304
     }
   ]
 }
@@ -757,11 +508,11 @@ Filter to a single model within a specific run:
 rocky replay run_20260420_143022 --model fct_revenue
 ```
 
-`sql_hash` is stable across runs where the compiled SQL is identical, so diffing two replays is a fast way to detect whether a re-run would execute the same statements.
+`sql_hash` is stable across runs with identical compiled SQL, so diffing two replays shows whether a re-run would execute the same statements.
 
 ### Re-execution
 
-`--execute` reconstructs each model's recipe from its recorded provenance — the canonical `ModelIr` embedded at run time, never the current working tree — and re-runs it, re-deriving the output artifact's blake3. With `--verify`, that digest is compared against the recorded hash:
+`--execute` rebuilds each model's recipe from its recorded provenance (the `ModelIr` embedded at run time, never the working tree), re-runs it, and re-derives the output's blake3. With `--verify`, Rocky compares that digest with the recorded hash:
 
 ```bash
 rocky replay latest --execute --verify
@@ -781,15 +532,13 @@ rocky replay latest --execute --verify
 }
 ```
 
-Each per-model `verdict` is a classification, not a tool failure — `bit_exact`, `diverged`, `executed` (without `--verify`), or `non_replayable` — so the command exits `0` and you read the verdict. A model that reads a mutable source is classified `non_replayable` rather than silently re-run against current data; a model whose recipe contains a non-deterministic construct (`now()`, `random()`) is flagged and a `diverged` there is expected.
+Each per-model `verdict` is a classification, not a failure: `bit_exact`, `diverged`, `executed` (without `--verify`) or `non_replayable`. The command exits `0`. A model that reads a mutable source is `non_replayable`, not re-run against current data. A model with a non-deterministic construct (`now()`, `random()`) is flagged, and `diverged` is expected there.
 
-By default re-execution runs on an ephemeral in-memory DuckDB engine. `--warehouse` re-runs against the live warehouse in `rocky.toml` instead, for content-addressed models whose artifacts live in the lakehouse:
+By default re-execution runs on an ephemeral in-memory DuckDB engine. `--warehouse` re-runs against the live warehouse for content-addressed models. It hashes with the target table's own physical column mapping from its Delta log, so `bit_exact` means the warehouse reproduced the recorded bytes.
 
 ```bash
 rocky replay latest --execute --verify --warehouse
 ```
-
-The warehouse path re-derives each output's blake3 using the target table's own physical column mapping, read from its Delta log. A `bit_exact` verdict therefore means the warehouse reproduced exactly the bytes the content-addressed writer recorded.
 
 Re-execution never touches production. Rocky materializes each replayed model into a fresh schema and redirects every in-run upstream reference into it:
 
@@ -807,11 +556,11 @@ Re-execution never touches production. Rocky materializes each replayed model in
    the whole replay schema is dropped after the run, unless --keep
 ```
 
-Three rules make that isolation hold:
+Three rules keep production safe:
 
-- Rocky materializes every replayed model into a fresh `hcv2_replay_<run>` schema, never into the production location of any recorded target. That schema is dropped after the run unless you pass `--keep`.
-- Rocky writes no object-store objects. It hashes the recomputed artifact in memory and never touches an existing content-addressed file.
-- A model whose upstream the run did not itself produce is classified `non_replayable`, as is a model that reads a mutable source. Rocky reports the classification rather than falling back to production data.
+- Every replayed model goes into a fresh `hcv2_replay_<run>` schema, dropped after the run unless `--keep`.
+- Rocky writes no object-store objects. It hashes the recomputed artifact in memory.
+- A model whose upstream the run did not produce, or that reads a mutable source, is `non_replayable`. Rocky never falls back to production data.
 
 ### Related Commands
 
@@ -823,7 +572,7 @@ Three rules make that isolation hold:
 
 ## `rocky trace`
 
-Render a completed run as a Gantt-style timeline. Sibling to `rocky replay`: it reads the same `RunRecord`, but lays out models by start offset and assigns them to concurrency lanes so overlapping models show up on separate rows.
+Render a completed run as a Gantt-style timeline. It reads the same `RunRecord` as `rocky replay` and assigns models to concurrency lanes by start offset, so overlapping models get separate rows.
 
 ```bash
 rocky trace <target> [flags]
@@ -871,34 +620,12 @@ rocky trace latest
       "rows_affected": 150000,
       "bytes_scanned": 41943040,
       "bytes_written": 20971520
-    },
-    {
-      "model_name": "stg_customers",
-      "status": "success",
-      "start_offset_ms": 100,
-      "duration_ms": 900,
-      "sql_hash": "hash_x9y8z7w6",
-      "lane": 1,
-      "rows_affected": 8000,
-      "bytes_scanned": 2097152,
-      "bytes_written": 1048576
-    },
-    {
-      "model_name": "fct_revenue",
-      "status": "success",
-      "start_offset_ms": 2000,
-      "duration_ms": 43000,
-      "sql_hash": "hash_b4e3c2d5",
-      "lane": 0,
-      "rows_affected": 8900,
-      "bytes_scanned": 20971520,
-      "bytes_written": 4194304
     }
   ]
 }
 ```
 
-Lane assignment is greedy first-fit over sorted start offsets, so `lane_count` is the observed maximum concurrency. The table-mode output prints a bar chart:
+Lane assignment is greedy first-fit over sorted start offsets, so `lane_count` is the observed maximum concurrency. `-o table` prints a bar chart:
 
 ```
 $ rocky -o table trace latest

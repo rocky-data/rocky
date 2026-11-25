@@ -21,43 +21,7 @@ just install-hooks
 
 ## Project Structure
 
-```
-integrations/dagster/            # path inside the rocky-data/rocky monorepo
-├── src/dagster_rocky/
-│   ├── __init__.py          # Public API exports
-│   ├── py.typed             # PEP 561 type marker
-│   ├── types.py             # Shim: re-exports rocky_sdk.types (models + parse_rocky_output)
-│   ├── types_generated.py   # Shim: re-exports rocky_sdk.types_generated
-│   ├── resource.py          # RockyResource — ConfigurableResource wrapping Rocky CLI
-│   ├── translator.py        # RockyDagsterTranslator — customizable Rocky→Dagster mapping
-│   ├── component.py         # RockyComponent — state-backed Dagster component
-│   ├── assets.py            # load_rocky_assets() — functional asset discovery
-│   ├── checks.py            # emit_materializations(), emit_check_results()
-│   ├── automation.py        # Dagster automation rules from Rocky config
-│   ├── branch_deploy.py     # Branch deployment support
-│   ├── column_lineage.py    # Column-level lineage mapping
-│   ├── contracts.py         # Data contract enforcement
-│   ├── dag_assets.py        # DAG-mode asset builder (rocky dag)
-│   ├── derived_models.py    # Silver-layer derived model assets
-│   ├── freshness.py         # FreshnessPolicy projection
-│   ├── health.py            # Health check integration
-│   ├── observability.py     # Observability event helpers
-│   ├── partitions.py        # Time-partitioned asset support
-│   ├── scaffold.py          # Project scaffolding utilities
-│   ├── schedules.py         # Schedule definitions
-│   └── sensor.py            # rocky_source_sensor (source sync events)
-├── tests/
-│   ├── conftest.py              # Pytest fixtures (loads from scenarios.py)
-│   ├── scenarios.py             # Hand-crafted test data as Python dicts
-│   ├── fixtures/                # Static fixtures (Pipes wire captures)
-│   ├── fixtures_generated/      # Live-binary fixtures from `just regen-fixtures`
-│   └── test_*.py                # One or more test modules per source module
-├── scripts/
-│   └── dev_setup.py         # Development environment setup
-├── .git-hooks/              # Pre-commit, commit-msg, pre-push hooks
-├── pyproject.toml           # Project config, deps, ruff, pytest
-└── uv.lock                  # Locked dependency versions
-```
+One module per feature in `src/dagster_rocky/` (`resource.py`, `component.py`, `translator.py`, `checks.py`, `sensor.py`, and others). `types.py` and `types_generated.py` are shims over `rocky_sdk`. Tests sit in `tests/`, one `test_*.py` per module. `tests/scenarios.py` holds hand-written data and `tests/fixtures_generated/` holds live-binary captures. The full tree is in [`AGENTS.md`](AGENTS.md#project-structure).
 
 ## Architecture
 
@@ -105,37 +69,16 @@ Key design decisions:
 
 ### Helpers (`checks.py`, `assets.py`)
 
-- `emit_materializations()` / `emit_check_results()` — convert Rocky run results to Dagster events (useful when building custom assets outside `RockyComponent`)
-- `check_metadata()` — build a Dagster metadata mapping for a single `CheckResult`
-- `load_rocky_assets()` — simple functional API that calls `rocky discover` and returns `AssetSpec` list
-- `cost_metadata_from_optimize()` — extracts per-model cost recommendations from optimize results (compute cost, storage cost, recommended strategy, savings, downstream references, reasoning)
+`emit_materializations()`, `emit_check_results()`, `check_metadata()`, `load_rocky_assets()` and `cost_metadata_from_optimize()` serve custom assets outside `RockyComponent`. See the [README](README.md#public-api).
 
 ## Common Commands
 
 ```bash
-# Run all tests
-uv run pytest -v
-
-# Run a specific test file
-uv run pytest tests/test_types.py -v
-
-# Run a specific test
-uv run pytest tests/test_types.py::test_parse_discover -v
-
-# Lint
-uv run ruff check src/ tests/
-
-# Auto-fix lint issues
-uv run ruff check --fix src/ tests/
-
-# Format
-uv run ruff format src/ tests/
-
-# Check formatting (CI mode)
-uv run ruff format --check src/ tests/
-
-# Build distribution
-uv build
+uv run pytest -v                                   # all tests
+uv run pytest tests/test_types.py::test_parse_discover -v   # one test
+uv run ruff check src/ tests/                      # lint (--fix to auto-fix)
+uv run ruff format --check src/ tests/             # format check (CI mode)
+uv build                                           # build distribution
 ```
 
 ## Testing
@@ -150,41 +93,12 @@ The monorepo root `.git-hooks/` holds the hooks that run. Install them from the 
 
 The `integrations/dagster/.git-hooks/` directory predates the monorepo. Git does not run it.
 
-## Code Style
+## Code Style and CI
 
-Enforced by [Ruff](https://docs.astral.sh/ruff/) with these rules:
+[Ruff](https://docs.astral.sh/ruff/) enforces style: line length 100, target Python 3.11, rules `E`, `F`, `I`, `N`, `UP`, `B`, `SIM`. Use `from __future__ import annotations` in every module, type hints on public functions, and Pydantic `BaseModel` for Rocky data types.
 
-- **Line length**: 100 characters
-- **Target**: Python 3.11
-- **Rules**: `E` (pycodestyle), `F` (pyflakes), `I` (isort), `N` (pep8-naming), `UP` (pyupgrade), `B` (flake8-bugbear), `SIM` (flake8-simplify)
-
-Additional conventions:
-- Use `from __future__ import annotations` in all modules
-- Type hints on all public functions
-- Pydantic `BaseModel` for all data structures (no dataclasses or TypedDicts for Rocky types)
-
-## CI
-
-GitHub Actions runs on push to `main` and on pull requests:
-
-1. `uv sync --dev` — install dependencies
-2. `uv run python -m pytest -v` — run tests
-3. `uv run python -m ruff check src/ tests/` — lint
-4. `uv run python -m ruff format --check src/ tests/` — format check
-
-All three must pass for merge.
-
-## Git Conventions
-
-- **Conventional commits**: `feat:`, `fix:`, `docs:`, `style:`, `refactor:`, `perf:`, `test:`, `build:`, `ci:`, `chore:`, `revert:`
-- Optional scope: `feat(component): add compile diagnostics`
-- Breaking changes: `feat!: rename RockyResource.execute to run`
+CI runs on push to `main` and on pull requests: `uv sync --dev`, `uv run python -m pytest -v`, `uv run python -m ruff check src/ tests/`, and `uv run python -m ruff format --check src/ tests/`. All must pass. Commits follow the conventional-commit rules in the [monorepo `AGENTS.md`](../../AGENTS.md#git-conventions).
 
 ## Versioning
 
 `dagster-rocky` versions on its own, with `dagster-v*` tags. Its version does not track the engine version. The published wheel resolves `rocky-sdk` from PyPI through the `rocky-sdk>=` floor in `pyproject.toml`. Release `rocky-sdk` before any `dagster-rocky` release that raises that floor.
-
-## Related Projects
-
-- **[Rocky](https://github.com/rocky-data/rocky)** — the Rust SQL transformation engine (the CLI this library wraps)
-- **[Rocky VS Code extension](https://github.com/rocky-data/rocky/tree/main/editors/vscode)** — VS Code extension with LSP, syntax highlighting, and AI features

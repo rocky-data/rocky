@@ -339,40 +339,7 @@ Pipe this to Graphviz to generate an SVG: `rocky lineage revenue_summary --forma
 
 ## 6. Try AI Features
 
-If you have an Anthropic API key, you can generate models from natural language:
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-### Generate a new model
-
-```bash
-rocky ai "monthly revenue per customer from raw_orders, only completed orders"
-```
-
-Rocky sends your intent to Claude, receives generated code, and compiles it
-against the available project context. Compilation can find supported static
-problems. It does not prove warehouse behavior or business correctness.
-Review the SQL and run relevant checks before you use the generated model.
-
-### Add intent to existing models
-
-```bash
-rocky ai-explain --all --save
-```
-
-This reads each model's SQL, generates a plain-English description, and saves it to the model's TOML config as an `intent` field. `ai-sync` later reads that intent to update models when upstream schemas change.
-
-### Generate tests from intent
-
-```bash
-rocky ai-test --all --save
-```
-
-Generates test assertions based on each model's SQL logic and intent description, and saves them to the `tests/` directory.
-
-See the [AI Features guide](/guides/ai-features/) for a complete walkthrough.
+With an `ANTHROPIC_API_KEY` set, `rocky ai "<intent>"` generates and compiles a model, `rocky ai-explain --all --save` writes an `intent` field per model, and `rocky ai-test --all --save` generates tests. Compilation does not prove warehouse behavior or business correctness, so review the output. See the [AI Features guide](/guides/ai-features/).
 
 ## 7. Run CI Locally
 
@@ -398,25 +365,14 @@ job.
 
 ## 8. Explore the POC Catalog
 
-Beyond this walkthrough, the playground ships {pocCounts.total} self-contained POCs across {pocCounts.categoryCount} categories. Each one demonstrates a single Rocky capability end to end. Browse them, grouped by category with a link to every one, in the [Examples & POC catalog](/getting-started/examples/). Or run one directly:
+The playground ships {pocCounts.total} self-contained POCs across {pocCounts.categoryCount} categories. Browse them in the [Examples & POC catalog](/getting-started/examples/), or run one:
 
 ```bash
 cd examples/playground
 ./pocs/02-performance/01-incremental-watermark/run.sh
 ```
 
-Most run on local DuckDB with no credentials. The exceptions: AI (`ANTHROPIC_API_KEY`), Governance (a Databricks workspace), and the warehouse-specific adapter POCs.
-
-## 9. Benchmarks
-
-The playground ships a benchmark suite. The `bench-rocky` target measures Rocky's compile time and peak memory:
-
-```bash
-cd examples/playground/benchmarks
-make bench-rocky
-```
-
-See [Benchmarks](/getting-started/benchmarks/) for the methodology and the numbers.
+Most run on local DuckDB with no credentials. The exceptions: AI (`ANTHROPIC_API_KEY`), Governance (a Databricks workspace), and the warehouse-specific adapter POCs. For compile-time and memory numbers, run `make bench-rocky` in `examples/playground/benchmarks`. See [Benchmarks](/getting-started/benchmarks/).
 
 ## Next Steps
 
@@ -425,5 +381,4 @@ See [Benchmarks](/getting-started/benchmarks/) for the methodology and the numbe
 - [IDE Setup](/guides/ide-setup/) — install the VS Code extension for hover types, go-to-definition, and inline lineage
 - [CI/CD Integration](/guides/ci-cd/) — add Rocky to your GitHub Actions or GitLab CI pipeline
 - [Migrating from dbt](/guides/migrate-from-dbt/) — import an existing dbt project
-- [AI Features](/guides/ai-features/) — generate models, sync schema changes, and create tests with AI
 - [Data Governance](/guides/governance/) — configure contracts, permissions, and quality checks

@@ -81,8 +81,7 @@ dim_products.toml         merge            →  rocky_models_unpartitioned
                                               (no partition definition)
 ```
 
-Four models produce three multi-assets. Each takes its name from its partition
-shape, so the three coexist without a name collision.
+Four models produce three multi-assets, each named from its partition shape.
 
 ## Materialization
 
@@ -154,9 +153,7 @@ for group in groups:
 
 ## Customizing the translator
 
-Override the `RockyDagsterTranslator.get_model_*` methods to control asset key
-derivation, group naming, tags, and metadata. The defaults are reasonable, but
-most teams want to namespace asset keys differently:
+Override the `RockyDagsterTranslator.get_model_*` methods (see [Customize with a translator](/dagster/assets/#customize-with-a-translator)) to change asset keys, groups, tags, and metadata:
 
 ```python
 from dagster_rocky import RockyDagsterTranslator

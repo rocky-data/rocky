@@ -7,13 +7,6 @@ sidebar:
 
 You do not need Dagster, Airflow, or any other orchestration platform to run Rocky on a schedule. A plain timer decides when to start. The engine does the rest.
 
-You get:
-
-- `rocky run` driven from cron, a systemd timer, GitHub Actions, or a warehouse-native scheduler;
-- exit codes that let your alerting tell a partial success from a hard failure;
-- failure notifications and health checks with no control plane;
-- optional native scheduling with `rocky tick` (experimental).
-
 | You want | Use | Section |
 |---|---|---|
 | A timer on a Linux host | cron or a systemd timer | [cron](#cron), [systemd](#systemd-timer-and-service) |
@@ -22,7 +15,7 @@ You get:
 | Pre-flight and history | `rocky doctor`, `rocky history` | [Health checks](#health-checks) |
 | Schedules declared in `rocky.toml` | `rocky tick` | [Native scheduling](#native-scheduling-with-rocky-tick-experimental) |
 
-If you already run Dagster or Airflow, keep them. The [`dagster-rocky`](/dagster/resource/) integration is fully supported.
+If you already run Dagster or Airflow, keep them. See [`dagster-rocky`](/dagster/resource/).
 
 ## What one `rocky run` already does
 
@@ -63,7 +56,7 @@ n=$(rocky ci --output json | jq '[.diagnostics[] | select(.severity == "Warning"
 
 **`rocky tick` and the webhook spool.** A tick that cannot read `.rocky/pending-demands` exits `1`, even when everything it did run succeeded. The scan fails only when something *is* at that path and cannot be read — a dangling symlink, a permission fault. A spool directory that does not exist yet reads as "no pending demand" and exits `0`, so this never fires on a project that has not used webhooks.
 
-It is worth a page rather than a ticket. Nothing about it clears on its own, and while it stands, every webhook-triggered pipeline is silently not firing. That is also why it outranks exit `2`: a failing run is already visible in the tick's report and in run history, and letting it win would hide the spool fault for as long as the run kept failing.
+This outranks exit `2`: a failing run is already visible in the tick's report and in run history, and letting it win would hide the spool fault.
 
 ### What to alert on
 
@@ -96,7 +89,7 @@ esac
 exit "$code"
 ```
 
-Replace `notify` with your `curl` to Slack, your `mail` command, or whatever you already use. `--output json` writes the full per-model result to the log, so the on-call sees which models failed without re-running anything.
+Replace `notify` with your own Slack or mail command. `--output json` writes the full per-model result to the log.
 
 ## cron
 
@@ -162,8 +155,6 @@ WantedBy=timers.target
 
 Enable it with `systemctl enable --now rocky-analytics.timer`. The `ExecStartPre` guard turns a broken deploy into a clean "service failed to start", instead of a half-run against a bad config. To let the platform do the routing instead, drop the wrapper, set `ExecStart=/usr/local/bin/rocky run --output json`, and read `$EXIT_STATUS` in the `rocky-analytics-failed@` handler unit.
 
-> These systemd and timer units are illustrative templates. Adapt the paths, the user, and `OnCalendar` to your host. The exit-code behavior they rely on is verified against the CLI. See the note at the end of this page.
-
 ## GitHub Actions on a schedule
 
 If your warehouse is reachable from GitHub's runners, a scheduled workflow needs no infrastructure of your own. Key off the exit code, so a partial success stays visible but distinct from a hard failure.
@@ -226,9 +217,7 @@ rocky run --output json
 
 The task's exit code propagates to the Workflow run. The platform's own retry and alerting policies then apply on top of Rocky's in-run retries. If your scheduler distinguishes exit codes, wire exit `2` to a warning and the rest to a failure, exactly as above. If it only sees success or failure, decide whether a partial success should mark the task failed.
 
-Snowflake Tasks, Airflow's `BashOperator`, and cloud cron services (Cloud Scheduler, or EventBridge Scheduler hitting a small runner) all follow the same shape: install, optional pre-flight, `rocky run`.
-
-> The Databricks and warehouse-native snippets are illustrative. They use the same `rocky run` and `rocky doctor` invocations verified below. The surrounding task configuration depends on your platform.
+Snowflake Tasks, Airflow's `BashOperator` and cloud cron services follow the same shape: install, optional pre-flight, `rocky run`.
 
 ## Failure notification without a platform
 
@@ -323,7 +312,7 @@ Everything above drives `rocky run` from a timer, and the timer decides *which* 
 
 There is still no daemon. The tick comes from the same cron or systemd timer you already have. You point that timer at `rocky tick` on a short interval, instead of at one specific `rocky run`. A one-minute timer turns the declarations below into SLO, cron, and dependency scheduling, with nothing resident.
 
-This is **experimental** while the reconciler soaks. External orchestrators stay fully supported. If you run Dagster or Airflow today, keep them.
+This is **experimental** while the reconciler soaks.
 
 Scheduling works on `replication`, `transformation`, `quality`, and `snapshot` pipelines. `load` pipelines cannot take part yet. A load re-ingests every discovered file on each run rather than incrementally, so scheduling one would duplicate data, and it records no run the scheduler can observe. `rocky validate` rejects a scheduled load, and rejects an `after` that references a load. Native load scheduling is a planned follow-up.
 
@@ -342,8 +331,6 @@ Scheduling works on `replication`, `transformation`, `quality`, and `snapshot` p
 | At-most-once | Rocky attempts the work one time and never retries it. The work can be lost, never duplicated. |
 | `failure_backoff` | The state a pipeline enters after a scheduled run fails. Later ticks skip it until its `resume_at`. |
 | Incident bundle | One JSON file under `.rocky/incidents/` holding the facts of one failed scheduled run. |
-
-Terms used across the rest of the docs are in the [glossary](/reference/glossary/).
 
 ### The demand lifecycle
 
@@ -415,7 +402,7 @@ after = ["raw"]             # run once raw has a newer success than staging's la
 * * * * *  analytics  cd /srv/analytics && flock -n /var/lock/rocky-tick.lock rocky tick --output json >> /var/log/rocky/tick.log 2>&1
 ```
 
-Or a systemd timer. It follows the units in the earlier systemd section: a `oneshot` service with `SuccessExitStatus=2`, because the wrapper routes exit `2`.
+Or a systemd timer, as in the earlier systemd section (`oneshot` service, `SuccessExitStatus=2`):
 
 ```ini
 # /etc/systemd/system/rocky-tick.timer
@@ -632,15 +619,9 @@ Two recovery paths write bundles as well: the stuck-claim resolver and the orpha
 
 Rocky keeps the newest 50 bundles. The sweep deletes only files the writer itself named, and it refuses to operate through a symlinked `incidents` directory.
 
-The point of the format is that whoever picks up the page, a human or an agent, starts from citations instead of re-deriving what happened. `rocky brief` surfaces the count and the newest bundle's path in its Scheduler section, so the digest a failure hook posts already points at the file to open.
-
 ## Where to go next
 
 - [Observability](/guides/observability/) — export traces and metrics over OpenTelemetry, so a scheduled estate is visible in Grafana, Tempo, or any OTLP backend, with no UI to host.
 - [Hooks](/concepts/hooks/) — the full lifecycle-event surface behind the notification recipes above.
 - [Failure modes](/advanced/failure-modes/) — how to read every failure Rocky can report, including partial success.
 - [CI/CD integration](/guides/ci-cd/) — `rocky ci` for pull-request checks, the complement to the scheduled runs here.
-
----
-
-**On verification.** The commands on this page were exercised against the playground pipeline with the current engine build. A clean `rocky run` returns `0`. A run where one model fails while the others materialize returns `2`, and so does a run that copied every table and then failed an error-severity check. `rocky doctor` returns `3` on a Critical check. `rocky validate`, `rocky hooks list`, and `rocky brief --output md` were run against the hook configuration shown above. Exit codes `1`, `4`, and `130` follow the CLI's documented convention. The systemd, GitHub Actions, and Databricks configurations are illustrative templates around those verified commands. Adapt them to your host and platform.

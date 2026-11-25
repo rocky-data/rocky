@@ -1,23 +1,6 @@
 # Rocky Explained: a short tour
 
-A plain-English tour of Rocky. Each section is short and links to the full page on [rocky-data.dev](https://rocky-data.dev).
-
-| # | Section |
-|---|---|
-| 1 | [What Rocky is](#1-what-rocky-is) |
-| 2 | [The core loop](#2-the-core-loop) |
-| 3 | [Checking your project](#3-checking-your-project) |
-| 4 | [State and incremental loads](#4-state-and-incremental-loads) |
-| 5 | [Branches, previews and replay](#5-branches-previews-and-replay) |
-| 6 | [The browser UI](#6-the-browser-ui) |
-| 7 | [The VS Code extension](#7-the-vs-code-extension) |
-| 8 | [Governance and policy](#8-governance-and-policy) |
-| 9 | [Agents and MCP](#9-agents-and-mcp) |
-| 10 | [Data products and `rocky fulfill`](#10-data-products-and-rocky-fulfill) |
-| 11 | [Adapters](#11-adapters) |
-| 12 | [Safety limits in one table](#12-safety-limits-in-one-table) |
-| 13 | [Quick reference](#13-quick-reference) |
-| 14 | [Not covered here](#14-not-covered-here) |
+A plain-English tour of Rocky. Each section links to the full page on [rocky-data.dev](https://rocky-data.dev).
 
 ---
 
@@ -46,7 +29,7 @@ There is no Jinja and no string substitution. Raw SQL is the main input. An opti
 
 A clean compile does not prove that every warehouse query is valid. It does not prove the result values are correct. A separate run can still fail at the warehouse.
 
-Rocky's terms are in the [glossary](https://rocky-data.dev/reference/glossary/). The full introduction is [here](https://rocky-data.dev/getting-started/introduction/).
+Terms: [glossary](https://rocky-data.dev/reference/glossary/). Full introduction: [Introduction](https://rocky-data.dev/getting-started/introduction/).
 
 ---
 
@@ -81,7 +64,7 @@ Every Rocky workflow follows three steps.
 
 The exit code is `0` for success, `2` for partial success, `1` for failure and `130` for Ctrl-C.
 
-Not every step runs for every pipeline type. Drift detection, watermarks and hooks belong to the replication path.
+Drift detection, watermarks and hooks belong to the replication path only.
 
 Full page: [execution flow](https://rocky-data.dev/concepts/execution-flow/).
 
@@ -216,14 +199,7 @@ The extension prefers the standalone `rocky-lsp` binary. It falls back to `rocky
   you hover "amount"  ──▶ typed column, lineage and consumers
 ```
 
-The server gives you:
-
-- Inline diagnostics for the codes the compiler emits.
-- Hover types, go to definition, find references and rename.
-- Completion, signature help, inlay hints and code actions.
-- Formatting for `.rocky` files.
-
-The extension adds its own commands, such as "Open Compiled SQL", "Preview Model Rows", "Show Model Lineage" and "Run Pipeline".
+The server gives you inline diagnostics, hover types, go to definition, find references, rename, completion, signature help, inlay hints, code actions and formatting for `.rocky` files. The extension adds commands such as "Open Compiled SQL", "Preview Model Rows", "Show Model Lineage" and "Run Pipeline".
 
 Full page: [IDE setup](https://rocky-data.dev/guides/ide-setup/).
 
@@ -401,15 +377,4 @@ Next: [Introduction](https://rocky-data.dev/getting-started/introduction/), [Qui
 
 ## 14. Not covered here
 
-This tour leaves out the topics below. Each links to the full page.
-
-| Topic | Page |
-|---|---|
-| The Rocky DSL (`.rocky` files) | [Rocky DSL](https://rocky-data.dev/concepts/rocky-dsl/) |
-| Dagster integration | [Dagster introduction](https://rocky-data.dev/dagster/introduction/) |
-| The Python SDK | [Python SDK introduction](https://rocky-data.dev/python-sdk/introduction/) |
-| Hooks and webhooks | [Hooks](https://rocky-data.dev/concepts/hooks/) |
-| The scheduler `rocky tick` and webhook ingress (experimental) | [Running without an orchestrator](https://rocky-data.dev/guides/running-without-an-orchestrator/) |
-| Snapshots and history tables (SCD Type 2) | [Silver layer](https://rocky-data.dev/concepts/silver-layer/) |
-| The container image | [Run the image](https://rocky-data.dev/guides/run-the-image/) |
-| Crates and the intermediate representation (IR) | [Architecture](https://rocky-data.dev/concepts/architecture/) |
+Full pages: [Rocky DSL](https://rocky-data.dev/concepts/rocky-dsl/), [Dagster](https://rocky-data.dev/dagster/introduction/), [Python SDK](https://rocky-data.dev/python-sdk/introduction/), [hooks](https://rocky-data.dev/concepts/hooks/), [`rocky tick` and webhook ingress](https://rocky-data.dev/guides/running-without-an-orchestrator/) (experimental), [snapshots (SCD Type 2)](https://rocky-data.dev/concepts/silver-layer/), [the container image](https://rocky-data.dev/guides/run-the-image/) and [architecture](https://rocky-data.dev/concepts/architecture/).

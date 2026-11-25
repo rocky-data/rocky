@@ -7,8 +7,7 @@ sidebar:
 
 `RockyComponent` caches the output of `rocky discover` in a state file. Dagster
 reloads a code location often, and every reload would otherwise call each source
-API again. The cache removes those calls. A code location is the Python process
-where Dagster loads your definitions.
+API again. The cache removes those calls.
 
 ## How the state file replaces the API call
 
@@ -123,26 +122,11 @@ own source, so tenants stay isolated from each other.
 
 ## Refreshing state
 
-Trigger a state refresh to pick up the latest discovery results. The
-`dg defs state refresh` workflow calls `write_state_to_path(state_path)` for
-you. A scheduled job that resolves the state path from the `defs_state` config
-does the same. A refresh runs on its own, separate from the code location reload
-cycle.
+`dg defs state refresh` calls `write_state_to_path(state_path)` for you. A scheduled job that resolves the state path from the `defs_state` config does the same. A refresh runs apart from the code location reload cycle.
 
-## State storage
+State lives on the local filesystem by default. Dagster's `defs_state` mechanism points it at another backend. Assets appear in the UI as soon as the code location loads, and stay visible when a source API is down.
 
-By default the component stores its state on the local filesystem. Dagster's
-`defs_state` mechanism lets you point it at another storage backend.
-
-## What the cached state gives you
-
-- **No API calls on reload** -- Assets appear in the Dagster UI as soon as the code location loads.
-- **Resilience** -- Assets stay visible when a source API is temporarily unavailable.
-- **Large source counts** -- Discovery cost does not land on code location startup, however many sources and tables you have.
-
-With `execution_mode: pipes`, each materialization also keeps a
-[plan](/reference/glossary/#plan) file. See [Plan artifact per
-materialization](/dagster/observability/#plan-artifact-per-materialization).
+With `execution_mode: pipes`, each materialization also keeps a [plan](/reference/glossary/#plan) file. See [Plan artifact per materialization](/dagster/observability/#plan-artifact-per-materialization).
 
 ## DAG mode
 

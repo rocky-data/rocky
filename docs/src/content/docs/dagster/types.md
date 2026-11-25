@@ -5,35 +5,22 @@ sidebar:
   order: 10
 ---
 
-Most `RockyResource` methods return a Pydantic v2 model, not a dictionary. The model validates the JSON while it parses it, and your editor completes the field names. This page is the field-by-field reference for the models you read most often.
-
-You do not need to construct these models yourself. The `rocky` binary prints JSON on stdout, and the resource parses that JSON into the matching model before it returns.
+Most `RockyResource` methods return a Pydantic v2 model, not a dictionary. The resource parses the JSON that the `rocky` binary prints into the matching model before it returns.
 
 ## Where these types come from
 
-These types come from two places. Most models on this page are hand-written Pydantic classes in `rocky_sdk.types`, which is the SDK's public API. Others, such as `TestOutput` and `CiOutput`, are generated from the engine's JSON schemas and re-exported from that same module.
+The models are hand-written classes in `rocky_sdk.types`, plus classes generated from the engine's JSON schemas (`TestOutput`, `CiOutput` and others). `dagster_rocky.types` re-exports both.
 
 ```
-  Rust output struct           one per rocky CLI command, in the engine
-        │
-        │  exported to
-        ▼
-  JSON schema                  the wire contract for --output json
-        │
-        │  just codegen
-        ▼
-  rocky_sdk.types_generated    the generated Pydantic v2 models
-        │
-        │  re-exported by
-        ▼
-  rocky_sdk.types              alongside the hand-written models
-        │
-        │  re-exported by
-        ▼
-  dagster_rocky.types          what your Dagster code imports
+  Rust output struct ──► JSON schema ──just codegen──► rocky_sdk.types_generated
+                                                              │
+                          rocky_sdk.types (+ hand-written) ◄──┘
+                                   │
+                                   ▼
+                          dagster_rocky.types   (import from here)
 ```
 
-The `codegen-drift` CI job re-runs `just codegen` and fails the build when the committed bindings drift from the engine's schemas.
+The `codegen-drift` CI job fails the build when the committed bindings drift from the engine's schemas.
 
 ## How you read one
 
@@ -52,11 +39,7 @@ print(result.drift.tables_drifted)         # int
 Nested fields are typed too. `RunResult.drift` is a `DriftInfo`, the summary of schema [drift](/reference/glossary/#drift) that Rocky found in your sources. Its `actions_taken` field is a list of `DriftAction`. Follow the type names down the tables below to see what each level holds.
 
 :::tip[Source of truth]
-The generated [`rocky_sdk.types_generated`](https://github.com/rocky-data/rocky/tree/main/sdk/python/src/rocky_sdk/types_generated) module is the canonical, complete definition. `dagster_rocky.types` (and the `dagster_rocky.types_generated` shim) re-export it with Python-flavored names for backward compatibility.
-
-This page documents the types you consume most: discover, run, compile, test, ci, doctor, plus `parse_rocky_output`. The field tables below are curated. They list the fields consumers branch on most, and some models carry extra wire fields that are not shown. Read the generated module for the exhaustive shape.
-
-For any type not on this page, read the generated module or the [JSON Output reference](/reference/json-output/).
+The generated [`rocky_sdk.types_generated`](https://github.com/rocky-data/rocky/tree/main/sdk/python/src/rocky_sdk/types_generated) module is the complete definition. This page lists the top-level results and the fields consumers branch on. It does not list every field. For a nested type not shown here, read the generated module or the [JSON Output reference](/reference/json-output/).
 :::
 
 ## Discover types
@@ -79,27 +62,7 @@ Top-level result from `rocky discover`.
 | `new_sources` | `list[str]` | Source schemas seen for the first time vs the prior discover snapshot |
 | `schemas_cached` | `int \| None` | Count of source schemas served from the discovery cache (`None` on older binaries) |
 
-### `SourceInfo`
-
-A discovered source (e.g., a Fivetran connector).
-
-| Field | Type | Description |
-|---|---|---|
-| `id` | `str` | Source identifier |
-| `components` | `dict[str, str \| list[str]]` | Parsed schema components (tenant, regions, connector, etc.) |
-| `source_type` | `str` | Source type (e.g., `"fivetran"`) |
-| `last_sync_at` | `datetime \| None` | Timestamp of last sync |
-| `tables` | `list[TableInfo]` | Tables in this source |
-| `metadata` | `dict` | Adapter-namespaced metadata, such as `fivetran.service` |
-
-### `TableInfo`
-
-A single table within a source.
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | `str` | Table name |
-| `row_count` | `int \| None` | Row count, if available |
+Nested: `SourceInfo` (`id`, `components`, `source_type`, `last_sync_at`, `tables`, `metadata`) and `TableInfo` (`name`, `row_count`).
 
 ---
 
@@ -134,103 +97,27 @@ Top-level result from `rocky run`.
 | `anomaly_evaluated` | `list[AnomalyEvaluation]` | Whether the detector evaluated each table |
 | `partition_summaries` | `list[PartitionSummary]` | Per-model `time_interval` partition stats |
 
-### `MaterializationInfo`
+### Nested run types
 
-Details about a single table materialization.
+| Type | Fields and notes |
+|---|---|
+| `MaterializationInfo` | `asset_key`, `rows_copied`, `duration_ms`, `metadata` (`MaterializationMetadata`), `partition` (`PartitionInfo`, set only for `time_interval` models) |
+| `MaterializationMetadata` | `strategy`, `watermark`, `target_table_full_name`, `sql_hash` (set for `time_interval`), `column_count` and `compile_time_ms` (derived models only) |
+| `PartitionInfo` | `key`, `start` (inclusive), `end` (exclusive), `batched_with` |
+| `PartitionSummary` | `model`, `partitions_planned`, `partitions_succeeded`, `partitions_failed`, `partitions_skipped` |
+| `TableError` | `asset_key`, `error` |
+| `ExcludedTable` | `asset_key`, `source_schema`, `table_name`, `reason` (always `"missing_from_source"`) |
+| `ExecutionSummary` | `concurrency`, `tables_processed`, `tables_failed` |
+| `MetricsSnapshot` | Counts (`tables_processed`, `tables_failed`, `statements_executed`, `retries_attempted`, `retries_succeeded`, `anomalies_detected`), `error_rate_pct`, and `table_duration_*_ms` and `query_duration_*_ms` for `p50`, `p95` and `max` |
+| `PermissionInfo` | `grants_added`, `grants_revoked` (always `0`: Rocky does not revoke grants), `catalogs_created`, `schemas_created` |
+| `DriftInfo` | `tables_checked`, `tables_drifted`, `actions_taken` (`list[DriftAction]`) |
+| `DriftAction` | `table`, `action` (for example `"drop_and_refresh"`), `reason` |
+| `AnomalyResult` | `table`, `current_count`, `baseline_avg`, `deviation_pct`, `reason` |
+| `AnomalyEvaluation` | `table`, `evaluated`, `not_evaluated_reason` (set exactly when `evaluated` is `False`) |
+| `ContractResult` | `passed`, `violations` (`list[ContractViolation]`: `rule`, `column`, `message`) |
+| `TableCheckResult` | `asset_key`, `checks` (`list[CheckResult]`) |
 
-| Field | Type | Description |
-|---|---|---|
-| `asset_key` | `list[str]` | Asset key path |
-| `rows_copied` | `int \| None` | Number of rows copied |
-| `duration_ms` | `int` | Time taken in milliseconds |
-| `metadata` | `MaterializationMetadata` | Additional metadata |
-| `partition` | `PartitionInfo \| None` | Partition window (populated only for `time_interval` models) |
-
-### `MaterializationMetadata`
-
-Metadata attached to a materialization.
-
-| Field | Type | Description |
-|---|---|---|
-| `strategy` | `str` | Materialization strategy (e.g., `"incremental"`, `"full_refresh"`) |
-| `watermark` | `datetime \| None` | New high watermark value |
-| `target_table_full_name` | `str \| None` | Fully-qualified `catalog.schema.table` identifier |
-| `sql_hash` | `str \| None` | 16-char fingerprint of executed SQL (populated for `time_interval`) |
-| `column_count` | `int \| None` | Number of columns in the typed schema (derived models only) |
-| `compile_time_ms` | `int \| None` | Compile time in milliseconds (derived models only) |
-
-### `PartitionInfo`
-
-Partition window information for a single `time_interval` materialization.
-
-| Field | Type | Description |
-|---|---|---|
-| `key` | `str` | Canonical partition key (e.g. `"2026-04-07"` for daily) |
-| `start` | `datetime` | Inclusive start of the `[start, end)` window |
-| `end` | `datetime` | Exclusive end of the window |
-| `batched_with` | `list[str]` | Additional partition keys merged into the batch (if `batch_size > 1`) |
-
-### `PartitionSummary`
-
-Per-model summary of `time_interval` partition execution.
-
-| Field | Type | Description |
-|---|---|---|
-| `model` | `str` | Model name |
-| `partitions_planned` | `int` | Partitions planned for this run |
-| `partitions_succeeded` | `int` | Partitions that succeeded |
-| `partitions_failed` | `int` | Partitions that failed |
-| `partitions_skipped` | `int` | Partitions already `Computed` and skipped |
-
-### `TableError`
-
-Per-table execution error.
-
-| Field | Type | Description |
-|---|---|---|
-| `asset_key` | `list[str]` | Asset key path |
-| `error` | `str` | Human-readable error message |
-
-### `ExcludedTable`
-
-A table the discovery adapter reported but which is missing from the source warehouse.
-
-| Field | Type | Description |
-|---|---|---|
-| `asset_key` | `list[str]` | Asset key path |
-| `source_schema` | `str` | Schema the table was reported under |
-| `table_name` | `str` | Raw table name |
-| `reason` | `str` | Free-form reason (currently always `"missing_from_source"`) |
-
-### `ExecutionSummary`
-
-Summary of execution parallelism and throughput.
-
-| Field | Type | Description |
-|---|---|---|
-| `concurrency` | `int` | Configured concurrency |
-| `tables_processed` | `int` | Total tables processed |
-| `tables_failed` | `int` | Total tables that failed |
-
-### `MetricsSnapshot`
-
-Engine execution metrics from `rocky-observe`.
-
-| Field | Type | Description |
-|---|---|---|
-| `tables_processed` | `int` | Total tables processed |
-| `tables_failed` | `int` | Total tables failed |
-| `error_rate_pct` | `float` | Failure percentage |
-| `statements_executed` | `int` | Total SQL statements executed |
-| `retries_attempted` | `int` | Retry attempts |
-| `retries_succeeded` | `int` | Successful retries |
-| `anomalies_detected` | `int` | Anomalies detected |
-| `table_duration_p50_ms` | `int` | Table duration 50th percentile |
-| `table_duration_p95_ms` | `int` | Table duration 95th percentile |
-| `table_duration_max_ms` | `int` | Table duration max |
-| `query_duration_p50_ms` | `int` | Query duration 50th percentile |
-| `query_duration_p95_ms` | `int` | Query duration 95th percentile |
-| `query_duration_max_ms` | `int` | Query duration max |
+`RunResult.anomalies` alone cannot tell "the detector ran and found nothing" from "the detector never ran": both are an empty list. Read `anomaly_evaluated` to tell them apart. An engine too old to send the field parses as an empty list.
 
 ### `CheckResult`
 
@@ -254,92 +141,6 @@ A single check result.
 | `query` | `str \| None` | SQL query (for custom checks) |
 | `result_value` | `int \| None` | Query result (for custom checks) |
 
-### `TableCheckResult`
-
-Check results grouped by table.
-
-| Field | Type | Description |
-|---|---|---|
-| `asset_key` | `list[str]` | Asset key path |
-| `checks` | `list[CheckResult]` | Check results for this table |
-
-### `PermissionInfo`
-
-Summary of the grants Rocky applied.
-
-| Field | Type | Description |
-|---|---|---|
-| `grants_added` | `int` | Number of grants added |
-| `grants_revoked` | `int` | Always `0`. Rocky does not revoke grants. |
-| `catalogs_created` | `int` | Number of catalogs created |
-| `schemas_created` | `int` | Number of schemas created |
-
-### `DriftInfo`
-
-Summary of schema drift detection.
-
-| Field | Type | Description |
-|---|---|---|
-| `tables_checked` | `int` | Number of tables checked |
-| `tables_drifted` | `int` | Number of tables with drift |
-| `actions_taken` | `list[DriftAction]` | Actions taken to resolve drift |
-
-### `DriftAction`
-
-An action taken in response to schema drift.
-
-| Field | Type | Description |
-|---|---|---|
-| `table` | `str` | Fully qualified table name |
-| `action` | `str` | Action taken (e.g., `"drop_and_refresh"`) |
-| `reason` | `str` | Why the action was taken |
-
-### `AnomalyResult`
-
-Result of anomaly detection for a table.
-
-| Field | Type | Description |
-|---|---|---|
-| `table` | `str` | Fully qualified table name |
-| `current_count` | `int` | Current row count |
-| `baseline_avg` | `float` | Baseline average row count |
-| `deviation_pct` | `float` | Percentage deviation from baseline |
-| `reason` | `str` | Explanation of the anomaly determination |
-
-### `AnomalyEvaluation`
-
-Whether the row-count anomaly detector evaluated one table. One entry per
-table the run considered.
-
-| Field | Type | Description |
-|---|---|---|
-| `table` | `str` | Fully qualified table name, the same key `AnomalyResult.table` uses |
-| `evaluated` | `bool` | True when the detector compared this table's count against its history |
-| `not_evaluated_reason` | `str \| None` | Why it did not. Set exactly when `evaluated` is `False` |
-
-`RunResult.anomalies` alone cannot tell "the detector ran and found
-nothing" from "the detector never ran": both are an empty list. An engine
-too old to send the field parses as an empty list.
-
-### `ContractResult`
-
-Result of contract validation.
-
-| Field | Type | Description |
-|---|---|---|
-| `passed` | `bool` | Whether all contracts passed |
-| `violations` | `list[ContractViolation]` | List of contract violations |
-
-### `ContractViolation`
-
-A single contract violation.
-
-| Field | Type | Description |
-|---|---|---|
-| `rule` | `str` | Contract rule that was violated |
-| `column` | `str` | Column involved in the violation |
-| `message` | `str` | Human-readable violation message |
-
 ---
 
 ## Compile types
@@ -360,31 +161,7 @@ Top-level result from `rocky compile`.
 | `has_errors` | `bool` | Whether any diagnostics are errors |
 | `models_detail` | `list[ModelDetail]` | Per-model detail (strategy, target, freshness, tags) |
 
-### `Diagnostic`
-
-A compiler diagnostic (error, warning, or info).
-
-| Field | Type | Description |
-|---|---|---|
-| `severity` | `Severity` | One of `"Error"`, `"Warning"`, `"Info"` |
-| `code` | `str` | Diagnostic code |
-| `message` | `str` | Human-readable message |
-| `model` | `str` | Model name |
-| `span` | `SourceSpan \| None` | Location in source file |
-| `suggestion` | `str \| None` | Suggested fix |
-
-### `ModelDetail`
-
-Per-model summary from compilation.
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | `str` | Model name |
-| `strategy` | `dict` | Strategy configuration (tagged union) |
-| `target` | `dict[str, str]` | Target catalog/schema/table |
-| `freshness` | `ModelFreshnessConfig \| None` | Per-model freshness config |
-| `depends_on` | `list[str]` | Upstream models |
-| `tags` | `dict[str, str] \| None` | Model governance tags (own + group-inherited), projected onto Dagster asset tags |
+Nested: `Diagnostic` (`severity` of `"Error"`, `"Warning"` or `"Info"`, `code`, `message`, `model`, `span`, `suggestion`). `ModelDetail` has `name`, `strategy` (tagged union), `target`, `freshness`, `depends_on`, and `tags` (own plus group-inherited governance tags, projected onto Dagster asset tags).
 
 ---
 
@@ -394,7 +171,7 @@ Per-model summary from compilation.
 
 `TestResult` and `CiResult` are import-compatible aliases for the generated `TestOutput` and `CiOutput`. `parse_rocky_output` dispatches the `"test"` command to `TestOutput` and the `"ci"` command to `CiOutput`. Both share the same `TestFailure` shape for the `failures` list.
 
-Some nested sub-types are not re-exported at the top level: `ModelTestResult`, `DeclarativeTestSummary`, `UnitTestSummary`, and their per-item types. Import those from `rocky_sdk.types_generated.test_schema` when you need to type-annotate a field.
+Some nested sub-types are not re-exported at the top level (`ModelTestResult`, `DeclarativeTestSummary`, `UnitTestSummary` and their per-item types). Import those from `rocky_sdk.types_generated.test_schema` when you need to type-annotate a field.
 
 ### `TestOutput`
 
@@ -412,48 +189,7 @@ Top-level result from `rocky test`. Also exported as `TestResult`.
 | `declarative` | `DeclarativeTestSummary \| None` | Results from declarative `[[tests]]` in model sidecars. Present only when `--declarative` is used |
 | `unit_tests` | `UnitTestSummary \| None` | Results from fixture-driven `[[test]]` unit tests. Present only when at least one model declares a `[[test]]` block |
 
-### `TestFailure`
-
-A single failed test. The `failures` field carries these as objects, not positional tuples.
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | `str` | Test name |
-| `error` | `str` | Failure message |
-
-### `ModelTestResult`
-
-One per-model outcome from the model-execution test.
-
-| Field | Type | Description |
-|---|---|---|
-| `model` | `str` | Model name |
-| `status` | `str` | `"pass"` or `"fail"` |
-| `error` | `str \| None` | Failure message, set only when `status` is `"fail"` |
-
-### `DeclarativeTestSummary`
-
-Summary of declarative test execution from `[[tests]]` in model sidecars.
-
-| Field | Type | Description |
-|---|---|---|
-| `total` | `int` | Total declarative assertions run |
-| `passed` | `int` | Assertions that passed |
-| `failed` | `int` | Assertions that failed |
-| `warned` | `int` | Assertions that failed at `warning` severity |
-| `errored` | `int` | Assertions that raised an execution error |
-| `results` | `list[DeclarativeTestResult]` | Per-assertion detail |
-
-### `UnitTestSummary`
-
-Summary of fixture-driven unit-test execution from `[[test]]` blocks in model sidecars.
-
-| Field | Type | Description |
-|---|---|---|
-| `total` | `int` | Total unit tests run |
-| `passed` | `int` | Unit tests that passed |
-| `failed` | `int` | Unit tests that failed |
-| `results` | `list[UnitTestResult]` | Per-test detail, including row-level mismatches |
+Nested: `TestFailure` (`name`, `error`; an object, not a positional tuple), `ModelTestResult` (`model`, `status` of `"pass"` or `"fail"`, `error`), `DeclarativeTestSummary` (`total`, `passed`, `failed`, `warned`, `errored`, `results`) and `UnitTestSummary` (`total`, `passed`, `failed`, `results` with row-level mismatches).
 
 ### `CiOutput`
 
@@ -489,17 +225,7 @@ Health check results from `rocky doctor`.
 | `checks` | `list[HealthCheck]` | Individual health checks |
 | `suggestions` | `list[str]` | Improvement suggestions |
 
-### `HealthCheck`
-
-A single health check result.
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | `str` | Check name |
-| `status` | `HealthStatus` | One of `"healthy"`, `"warning"`, `"critical"` |
-| `message` | `str` | Check result message |
-| `duration_ms` | `int` | Check duration |
-| `details` | `list[tuple[str, str]]` | Optional per-check `(key, value)` context populated when `rocky doctor` is invoked with `--verbose` (config path, state file size, adapter type + credential signal, pipeline kind, state backend). Empty list when the engine omits the field. |
+Nested: `HealthCheck` has `name`, `status` (`"healthy"`, `"warning"` or `"critical"`), `message`, `duration_ms`, and `details`, a list of `(key, value)` pairs filled when `rocky doctor` runs with `--verbose` (empty when the engine omits it).
 
 ---
 

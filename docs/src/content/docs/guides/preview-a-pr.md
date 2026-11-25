@@ -1,6 +1,6 @@
 ---
 title: Preview a PR Before Merging
-description: Use rocky preview to run only the models a PR changed, diff them against base, and see the cost difference. Locally today, in CI as a follow-up.
+description: Use rocky preview to run only the models a PR changed, diff them against base, and see the cost difference. Locally, or on every PR with the GitHub Action.
 sidebar:
   order: 6
 ---
@@ -159,53 +159,16 @@ The Markdown rendering shows a "Budget projection" section only when breaches ex
 
 ## What the prune set means
 
-The prune set is the set of models that re-execute against the branch. Each model in the working DAG lands in exactly one of two sets:
+The prune set is the models that re-execute against the branch: every changed model plus everything downstream of it via `depends_on`. The copy set is every other model in the working DAG. `preview create` copies those from the base schema. You run the prune set with `rocky run --branch <name>`.
 
-```
-   models changed in the PR diff
-              │
-              ▼
-   the working DAG splits into two sets
-        │                    │
-        ▼                    ▼
-   PRUNE SET            COPY SET
-   changed models +     every other model
-   everything           in the DAG
-   downstream of them
-        │                    │
-        │ you run            │ preview create
-        │ rocky run          │ copies each from
-        │ --branch <name>    │ the base schema
-        ▼                    ▼
-   rebuilt on the       copied into the
-   branch schema        branch schema
-```
+- `reason: "changed"`: the model file changed in the diff. Rocky leaves `changed_columns` empty and omits it from JSON.
+- `reason: "downstream_of_changed"`: the model did not change, but it sits downstream of one that did.
 
-The JSON carries a third field, `skipped_set`. It is reserved, and always empty on the wire today: nothing runs those models, and nothing copies them.
-
-Two reasons put a model in the prune set:
-
-- `reason: "changed"`: the model file itself changed in the diff. Rocky leaves `changed_columns` empty and omits it from JSON.
-- `reason: "downstream_of_changed"`: the model did not change, but it sits transitively downstream of a changed model via `depends_on`.
-
-If the prune set is empty, your PR changes no model output, a whitespace-only edit for example. There is nothing to run on the branch. `preview diff` and `preview cost` then report no branch run, which is expected.
+`skipped_set` is reserved and always empty on the wire. If the prune set is empty, your PR changes no model output (a whitespace-only edit, for example). `preview diff` and `preview cost` then report no branch run, which is expected. See [How Preview Works](/concepts/preview-internals/).
 
 ## What `coverage_warning: true` means
 
-The default `--algorithm sampled` does not read row content yet. It computes a row-count delta off the two `RunRecord`s. So every model comes back flagged, with `coverage: "not_yet_sampled"` and `coverage_warning: true`:
-
-```jsonc
-"algorithm": {
-  "kind": "sampled",
-  "sampled": { /* ... */ },
-  "sampling_window": {
-    "ordered_by": "",
-    "limit": 0,
-    "coverage": "not_yet_sampled",
-    "coverage_warning": true
-  }
-}
-```
+The default `--algorithm sampled` reads no row content. It computes a row-count delta from the two `RunRecord`s, so every model carries `coverage: "not_yet_sampled"` and `coverage_warning: true` in `sampling_window`. See [How Preview Works](/concepts/preview-internals/).
 
 The aggregate `summary.any_coverage_warning` fires on either of two conditions: a sampled diff with `coverage_warning: true`, or a bisection diff with `bisection_stats.depth_capped: true`. The second means the recursion hit the depth cap on a pathologically skewed PK distribution before it reached leaf size. Either way, the per-model findings might be incomplete.
 

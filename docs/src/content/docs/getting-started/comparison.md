@@ -32,13 +32,7 @@ adoption. It ships native Python models and an open-source CI/CD bot. Its
 virtual environments are more proven than Rocky's schema-prefix branches. Rocky
 keeps SQL as the default surface; SQLMesh leans Python-first.
 
-**Warehouse-native pipelines (Databricks LakeFlow, Snowflake Dynamic Tables).**
-These are coupled to one warehouse and come free with the platform. Rocky stays
-warehouse-neutral and ships a compiler. If portability and tooling matter to
-you, Rocky is the better fit. If they do not, the warehouse-native option may be
-enough. Adopting Rocky is not a one-way door either: `rocky emit-sql` reduces
-your transformation models to plain runnable SQL in dependency order, so leaving
-is one command rather than a rewrite. See [No lock-in](/guides/no-lock-in/).
+**Warehouse-native pipelines (Databricks LakeFlow, Snowflake Dynamic Tables).** These are coupled to one warehouse and come free with the platform. Rocky stays warehouse-neutral and ships a compiler. Leaving Rocky is one command: `rocky emit-sql` renders plain runnable SQL. See [No lock-in](/guides/no-lock-in/).
 
 **Observability tools (Datafold, Monte Carlo, Anomalo).** These are not
 competitors. Rocky prevents what they detect. They stay useful for the failure
@@ -174,29 +168,11 @@ can compare before you commit. SQLMesh ships none of these four.
 | Unit tests / fixture-driven tests | **Yes** | Yes |
 | Reusable named / generic tests | **Yes** | Yes (audits) |
 
-**Rocky:** two kinds of test ship, and neither is bolted on.
-[Unit tests](/concepts/data-quality-checks/#unit-tests-test) put mock input rows under a `[[test]]` block,
-assert on the output rows, and run locally on DuckDB with plain `rocky test`.
-[Reusable named tests](/concepts/data-quality-checks/#reusable-named-tests) let
-you define an assertion once in `models/test_definitions.toml` and apply it by
-name with `[[use_test]]`. References resolve when the project loads, so a typo
-fails the load instead of silently dropping a check. Named tests run against
-the warehouse with `rocky test --declarative`. See the
-[`[[test]]`](/reference/model-format/#test) and
-[`[[use_test]]`](/reference/model-format/#use_test) blocks in the model format.
+**Rocky:** [unit tests](/concepts/data-quality-checks/#unit-tests-test) (`[[test]]`) run locally on DuckDB with `rocky test`. [Reusable named tests](/concepts/data-quality-checks/#reusable-named-tests) (`[[use_test]]`) run against the warehouse with `rocky test --declarative`. See [`[[test]]`](/reference/model-format/#test) and [`[[use_test]]`](/reference/model-format/#use_test).
 
 ## Modeling utilities
 
-Rocky generates surrogate keys; SQLMesh does not. A
-[`[[surrogate_key]]`](/reference/model-format/#surrogate_key) block injects a
-deterministic hash column at materialization, written in dialect-correct SQL for
-each warehouse, so you never hand-write the hash.
-
-On a given warehouse the value is identical to what
-`dbt_utils.generate_surrogate_key` produces over the same columns, because NULL
-inputs coalesce to the same sentinel. A Rocky key therefore joins against the
-matching key in an upstream dbt model, and it survives a migration in either
-direction.
+Rocky generates surrogate keys; SQLMesh does not. A [`[[surrogate_key]]`](/reference/model-format/#surrogate_key) block injects a dialect-correct hash column at materialization. On a given warehouse the value equals `dbt_utils.generate_surrogate_key` over the same columns, so a Rocky key joins against a dbt key.
 
 ## Governance
 
@@ -207,21 +183,9 @@ SQLMesh ships none of these five.
 
 ## Provenance & Agent Governance
 
-Rocky records what produced every table and controls what an agent may change.
-Each run writes a content-addressed record: the artifacts are keyed by the hash
-of their bytes. From that record, Rocky replays a deterministic model
-bit-for-bit. It restores an evicted artifact only when the rebuilt bytes match
-the recorded hash. A third party can verify a manifest offline, with no engine
-installed. The policy plane grades an agent's proposed change as allow, require
-review, or deny; `rocky policy test` runs pinned scenarios in CI so a loosened
-rule fails the build. `rocky audit`, `rocky brief`, and the review queue are the
-custody trail. SQLMesh ships none of these seven.
+Rocky records what produced every table and controls what an agent may change. Each run writes a content-addressed record. From it, Rocky replays a deterministic model bit-for-bit and restores an evicted artifact only when the rebuilt bytes match the recorded hash. A third party can verify a manifest offline. The policy plane grades a proposed change as allow, require review, or deny, and `rocky policy test` runs pinned scenarios in CI. `rocky audit`, `rocky brief` and the review queue are the custody trail. SQLMesh ships none of these seven.
 
-One honest boundary. The warehouse platforms govern the adjacent layer:
-Databricks Unity AI Gateway and Snowflake Agent Identity control which systems
-an agent may *access* at run time. Rocky governs what an agent may *change* in
-the transformation program. Those are different questions, and the two layers
-compose rather than compete.
+The warehouse platforms govern the adjacent layer: Databricks Unity AI Gateway and Snowflake Agent Identity control which systems an agent may *access*. Rocky governs what an agent may *change* in the transformation program. The two layers compose.
 
 ## AI Features
 
@@ -260,7 +224,7 @@ Rocky compiles 10,000 models in about one second and holds peak memory near
 150 MB. See [benchmarks](/getting-started/benchmarks/) for the full numbers, the
 methodology, and the commands to reproduce them.
 
-## Where Each Tool Excels
+## Where each tool excels
 
 | Tool | Best for |
 |---|---|

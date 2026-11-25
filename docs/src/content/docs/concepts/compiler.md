@@ -5,23 +5,15 @@ sidebar:
   order: 7
 ---
 
-Rocky ships a real compiler, in the `rocky-compiler` crate. It analyses SQL
-models before a later run sends generated SQL to the warehouse. It reports type
-mismatches, missing columns, contract violations, and lineage findings when the
-needed information is available.
+Rocky ships a compiler in the `rocky-compiler` crate. It analyses SQL models before any generated SQL reaches the warehouse. It reports type mismatches, missing columns, contract violations and lineage findings when it has the information.
 
 ## What a clean compile means
 
-A clean compile means the enabled checks found no error in the information they
-could resolve. It does not establish general warehouse SQL validity, source data
-values, or business correctness. Run the relevant data checks and inspect a
-plan before execution.
+A clean compile means the enabled checks found no error in the information they could resolve. It does not prove warehouse SQL validity, source data values or business correctness. Run the data checks and inspect a plan before execution.
 
 ## Compile pipeline
 
-The compiler runs a fixed sequence of stages. The first five do the core work:
-load, resolve, build the graph, type-check, validate contracts. Three lint passes
-run after that. Then Rocky merges every diagnostic into one result.
+The compiler runs a fixed sequence of stages: load, resolve, build the graph, type-check, validate contracts, three lint passes, then one merged diagnostic result.
 
 ```
  ┌──────────────────────────────────────┐
@@ -72,10 +64,7 @@ Rocky loads the model files from the models directory. A model is a `.sql` file
 holding the transformation, plus a `.toml` sidecar holding its configuration:
 name, target, strategy, intent.
 
-A `.rocky` DSL file takes one extra step first. `lower_to_sql()` in the
-`rocky-lang` crate lowers the DSL to a SQL string. From there the model follows
-exactly the same path as a hand-written `.sql` file. Raw SQL and the DSL are two
-front ends onto one pipeline.
+A `.rocky` DSL file first goes through `lower_to_sql()` in `rocky-lang`, which lowers it to a SQL string. From there it follows the same path as a `.sql` file. Raw SQL and the DSL are two front ends onto one pipeline.
 
 ### 2. Resolve dependencies
 
@@ -113,11 +102,7 @@ diagnostics until you remove it.
 
 ### 3. Build semantic graph
 
-Rocky walks the models in topological order. For each one it pulls column-level
-lineage out of the SQL AST. It resolves table aliases to real model or source
-names. It expands `SELECT *` against the upstream schemas.
-
-The result is a `SemanticGraph`. The [Semantic graph](#semantic-graph) section below covers it.
+Rocky walks the models in topological order. For each model it pulls column-level lineage out of the SQL AST, resolves table aliases to model or source names, and expands `SELECT *` against the upstream schemas. The result is a `SemanticGraph` ([below](#semantic-graph)).
 
 ### 4. Type check
 
@@ -304,21 +289,11 @@ checked yet.
 
 ### 5. Validate contracts
 
-Rocky loads the `.contract.toml` files and checks resolvable facts against
-the inferred schemas. It reads a `<model>.contract.toml` next to a model file,
-then the project `contracts/` directory beside the models directory. A
-`--contracts <DIR>` flag replaces the project directory. A file in the
-directory wins over a file next to the model.
+Rocky checks the `.contract.toml` files against the inferred schemas. It reads `<model>.contract.toml` next to a model, then the project `contracts/` directory beside the models directory. `--contracts <DIR>` replaces the project directory. A file in the directory wins. The format and codes are in [Checks and Tests](/concepts/data-quality-checks/#data-contracts).
 
-One `contracts/` directory serves every pipeline. A compile skips a file
-for a model it does not include. If that file does not parse, the compile
-logs a warning and goes on. A file that does not parse for a model in the
-compile is an error.
+One `contracts/` directory serves every pipeline. A compile skips a file for a model it does not include. If that skipped file does not parse, the compile logs a warning and goes on. A file that does not parse for a model in the compile is an error.
 
-A `rocky plan` fingerprints the contract file of each model it covers, from
-either place. If that file changes or is deleted before `rocky apply`, the
-apply refuses with `plan_models_changed`. The
-[Checks and Tests](/concepts/data-quality-checks/) page has the contract format.
+`rocky plan` fingerprints the contract file of each model it covers. If that file changes or is deleted before `rocky apply`, the apply refuses with `plan_models_changed`.
 
 ### 6. Lint passes and merge
 
@@ -578,25 +553,16 @@ a CTE, or a subquery in `FROM`. These stay silent:
 
 Each subquery and CTE is checked as its own query.
 
-### Numeric promotion
+### Numeric promotion and assignability
 
-When two numeric types meet in one expression (arithmetic, `COALESCE`, `CASE`,
-`UNION`), the compiler works out a common supertype:
+When two numeric types meet (arithmetic, `COALESCE`, `CASE`, `UNION`), the compiler picks a common supertype:
 
-- `Int32` widens to `Int64`
-- `Float32` widens to `Float64`
-- An integer widens to `Float64` when mixed with a float
-- An integer widens to `Decimal` when mixed with a decimal, with the precision adjusted
-- Two decimals take the larger precision and the larger scale
-- `Timestamp` and `TimestampNtz` resolve to `Timestamp`
+- `Int32` widens to `Int64`. `Float32` widens to `Float64`.
+- An integer mixed with a float widens to `Float64`. Mixed with a decimal, it widens to `Decimal`.
+- Two decimals take the larger precision and the larger scale.
+- `Timestamp` and `TimestampNtz` resolve to `Timestamp`.
 
-Types that cannot mix, such as `String` and `Int64`, produce an error diagnostic.
-
-### Assignability
-
-The `is_assignable` function decides whether a value of one type can be written
-into a column of another. It allows a widening conversion, such as `Int32` into
-`Int64`. It rejects a narrowing conversion, such as `Int64` into `Int32`.
+Types that cannot mix, such as `String` and `Int64`, produce an error. `is_assignable` allows a widening write (`Int32` into `Int64`) and rejects a narrowing one.
 
 ## Semantic graph
 
@@ -686,35 +652,35 @@ span, and sometimes a suggested fix.
 | `E046` | An `incremental` model's watermark filter has no safe place: no `@incremental_filter` and the watermark is not a provable passthrough column; or the watermark is not an output column or not a plain name; or `@incremental_filter` appears under another strategy |
 | `E047` | A model reads a `private` model outside its ownership group, or a producer model that is not `public` (see [Model governance](/concepts/model-governance/)) |
 | `E048` | A model-version problem: undeclared latest version, missing version file, or a reference to an undeclared version |
-| `E049` | A `type = "snapshot"` model has an invalid config: no `unique_key` or `strategy`, `timestamp` without `updated_at`, `check` without `check_cols`, a key or change column that is an expression, an `updated_at` or `check_cols` entry the model's explicit SELECT does not output, a key computed with `random()`/`uuid()`/`now()`, or an output column named like a snapshot metadata column |
+| `E049` | A `type = "snapshot"` model has an invalid config: no `unique_key` or `strategy`, `timestamp` without `updated_at`, `check` without `check_cols`, an expression as key or change column, an `updated_at` or `check_cols` entry the explicit SELECT does not output, a key computed with `random()`/`uuid()`/`now()`, or an output column named like a snapshot metadata column |
 | `E050` | A freshness declaration cannot be evaluated: no threshold, a bad duration, `error_after` shorter than `warn_after`, a bad `loaded_at_field` or `filter`, or a model `time_column` absent from a complete output |
 | `E051` | A [user-defined function](/concepts/user-defined-functions/) or a call to one is invalid: bad definition, Python language, wrong argument count, a certainly incompatible argument type, or a warehouse that cannot create functions (Trino, ClickHouse, SQL Server, Spark) |
 | `E052` | A model's `[redshift]` table options cannot render (an invalid or contradictory `dist_key` / `sort_key`), or sit on a strategy that builds no table. See [Redshift](/reference/adapters/redshift/#table-distribution-and-sort-keys) |
-| `E053` | ClickHouse cannot run the model as configured: its `[clickhouse]` table options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and a warehouse the model runs on is ClickHouse, which has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
+| `E053` | ClickHouse cannot run the model: its `[clickhouse]` options cannot render or sit on a strategy that builds no table, or it is a `merge` model (or `incremental` with `unique_key`) and ClickHouse has no `MERGE`. See [ClickHouse](/reference/adapters/clickhouse/#strategies) |
 | `E054` | SQL Server cannot run the model's SQL: its CTEs cannot be lifted to the start of the statement, even after Rocky renames colliding nested CTEs. Emitted when a warehouse the model runs on is SQL Server. See [SQL Server](/reference/adapters/sqlserver/) |
-| `E055` | `rocky package` refused to vendor a dbt package: a bad spec, `dbt` not on `PATH`, an adapter with no dbt profile mapping, a failed `dbt deps` or `dbt compile`, a compile that came out wrong without `--build-empty` (all-NULL columns or a placeholder `*`), a package model name or `[target]` table the project already uses (ignoring case), a package model that reads a seed or a model that was not vendored, vendored SQL that does not parse, Jinja or a credential-like name in a var, a dbt step past `--dbt-timeout`, or a `remove` that would delete edited files without `--force`. See [Vendor dbt Packages](/guides/dbt-packages/) |
-| `E056` | A bare read (`FROM orders`, no schema) is ambiguous: several models write a table called `orders`, none is also named `orders`, and the reader's `depends_on` does not pick one. Rocky binds a bare read by the table a model writes, not by its name, and does not guess between candidates. Qualify the read with its schema or list the intended model in `depends_on` |
+| `E055` | `rocky package` refused to vendor a dbt package: a bad spec, a missing `dbt`, a failed `dbt deps` or `dbt compile`, a name or `[target]` clash, unvendored seed or model reads, SQL that does not parse, a dbt step past `--dbt-timeout`, or a `remove` that would delete edited files without `--force`. See [Vendor dbt Packages](/guides/dbt-packages/) |
+| `E056` | A bare read (`FROM orders`) is ambiguous: several models write a table called `orders`, none is also named `orders`, and `depends_on` does not pick one. Qualify the read with its schema, or list the intended model in `depends_on` |
 | `E057` | A call names a function the target warehouse does not have and `functions/` does not declare (DuckDB; the other warehouses with a list get `W057`). See [Unknown functions](#unknown-functions) |
 | `E058` | The models form a dependency cycle, so they have no execution order. One diagnostic for each model on the cycle. See [Dependency cycles](#dependency-cycles-e058) |
 | `E059` | A contract declares a type for a column whose type Rocky could not infer, and strict contracts are on (`--strict-contracts` or `[contracts] strict = true`). The `I003` note, as an error |
 | `E060` | A downstream-consumer file in `consumers/` is invalid: it does not parse, two consumers share a name, or `depends_on` names something that is not a model. See [Downstream consumers](/concepts/downstream-consumers/) |
-| `E061` | The model's output repeats a column name (`SELECT a.id, b.id`) and its strategy writes into the existing table: `incremental`, `delete_insert`, `time_interval` (or `microbatch`) or `merge`. The write cannot tell the columns apart; on DuckDB every run after the first fails. Alias the column (`b.id AS b_id`). Rocky checks aliased names and bare or qualified columns of the outermost `SELECT`. Names match as the target warehouse compares them (DuckDB, Databricks, BigQuery and Trino ignore case even for quoted names). Rocky does not check what a star (`*`, `b.*`) expands to |
+| `E061` | The output repeats a column name (`SELECT a.id, b.id`) and the strategy writes into the existing table (`incremental`, `delete_insert`, `time_interval`, `microbatch`, `merge`). The write cannot tell the columns apart. On DuckDB every run after the first fails. Alias the column (`b.id AS b_id`). Rocky checks aliased names and bare or qualified columns of the outermost `SELECT`, matched as the target warehouse compares them (DuckDB, Databricks, BigQuery and Trino ignore case even for quoted names). It does not check what a star expands to |
 | `E062` | A model with a contract repeats an output name the contract constrains (`[[columns]]`, `required` or `protected`). The contract checks one column of that name; the warehouse writes the other under another name. Alias the repeat. Names match as for `E061` |
 | `E063` | `[rules] no_extra_columns = true` and the model outputs a column the contract does not name in `[[columns]]`, `required` or `protected`, or Rocky cannot prove the column list (a `SELECT *`, an unaliased expression). Declare the column, drop it, or list the columns explicitly |
-| `E064` | A one-part read (`FROM stg_ordrs`) names no model, no `WITH` name and no known source table, and is one or two edits from a model name (one edit for names under 5 characters). The message names the model. If it is a real warehouse table, qualify it with its schema (`main.stg_ordrs`) |
+| `E064` | A one-part read (`FROM stg_ordrs`) names no model, `WITH` name or known source table, and is one or two edits from a model name (one edit under 5 characters). If it is a real warehouse table, qualify it (`main.stg_ordrs`) |
 | `E065` | A `WHERE` clause contains an aggregate (`WHERE SUM(amount) > 1`). Move the condition to `HAVING` |
 | `E066` | A `WHERE` clause contains a window function, a call with `OVER`. Filter on it with `QUALIFY`, or in a subquery |
 | `E067` | A `GROUP BY` position names no output column (`GROUP BY 3` over two columns, or `GROUP BY 0`) |
 | `E071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns, in a place tests show DuckDB checks. Checked whatever the warehouse. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `W001` | Unused model (no downstream consumers) |
-| `W002` | The model's output repeats a column name and its strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`); the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
+| `W002` | The output repeats a column name and the strategy rebuilds or defines the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`). The warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream whose schema is unknown |
 | `W004` | Classification tag with no matching `[mask]` strategy |
 | `W005` | Temporal column present but no `freshness` declaration in scope |
 | `W006` | `merge` strategy declares a `unique_key` column the model does not output |
 | `W010`, `W011` | A contract column is not in the model output, or a contract exists for a model not in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |
 | `W013` | `rocky.toml` is present but could not be read, so every project-level check is silent (`rocky lsp` and `rocky serve` only; one-shot commands refuse instead) |
-| `W014` | `rocky serve` could not load the transformation pipelines' models (a model name shared across pipelines, a malformed sidecar, a dangling models directory), so `/api/v1/models` shows only `models/` and `/api/v1/dag` answers the load error until it is fixed. If `models/` has no model either, the server reports `engine_not_ready` with the load error instead. Also raised once per transformation pipeline whose models directory does not exist, unless the pipeline sets `allow_empty_models = true`: the other pipelines' models are still served, and that pipeline adds none. The file watcher does not watch a directory that did not exist at start, so after you create it, the warning clears at the next recompile (an edit to `rocky.toml` or to a watched model file, or `POST /api/v1/compile`) or restart |
+| `W014` | `rocky serve` could not load the transformation pipelines' models (a shared model name, a malformed sidecar, a dangling models directory). `/api/v1/models` then shows only `models/`, and `/api/v1/dag` answers the load error. With no model in `models/` either, the server reports `engine_not_ready`. Also raised once per transformation pipeline whose models directory is missing, unless the pipeline sets `allow_empty_models = true`. The file watcher ignores a directory that did not exist at start: the warning clears at the next recompile (an edit to `rocky.toml` or a watched model, or `POST /api/v1/compile`) or at restart |
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `W041` | A direct reference names a column absent from an external source schema that may be out of date (seed or old cache entry) |
@@ -724,14 +690,14 @@ span, and sometimes a suggested fix.
 | `W045` | A two-part read names a table absent from a known schema whose table list came from a seed or the schema cache (escalate with `--strict-sources`) |
 | `W046` | An `incremental` model sets `lookback` without `unique_key`, so the re-read window is appended again on each run |
 | `W048` | A model reads a model version whose `deprecation_date` has passed or is less than 30 days away |
-| `W049` | A `type = "snapshot"` model is valid but risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a `SELECT *` model's compile-time schema (which may be stale) |
+| `W049` | A valid `type = "snapshot"` model is risky: a `unique_key` the SELECT does not output (it may be a `[[surrogate_key]]` column), `check` over more than 20 columns, an `updated_at` that is not a timestamp or date, or a key or change column missing from a stale `SELECT *` schema |
 | `W050` | A freshness `loaded_at_field` / `time_column` is not a date or time type, or a source `loaded_at_field` is missing from the known source schema |
 | `W051` | A user-defined function call could not be fully verified: an unknown argument type, or an argument the warehouse must convert implicitly |
 | `W052` | A `[redshift]` `dist_key` or `sort_key` column is not in the model's output |
 | `W053` | A `[clickhouse]` `order_by` or `partition_by` column is not in the model's output |
-| `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), a package model it could not vendor, an incremental model that fell back to full refresh, or dbt tests it did not map |
+| `W055` | `rocky package` vendored a package with something to review: an edited file the new version changed (written beside it as `.incoming`), an unvendored model, an incremental model that fell back to full refresh, or unmapped dbt tests |
 | `W056` | An `incremental` model sets no `lookback`, so a late row whose timestamp equals the target's `MAX` watermark is never loaded. `unique_key` alone does not fix this: it merges only the rows the filter reads |
-| `W057` | A call names a function that is not in Rocky's function list for the target warehouse (every warehouse with a list except DuckDB, which gets `E057`). The list was built from the vendor's reference, or holds only the built-in functions of one engine version, so the call may still be valid: an extension, a connector or a UDF may define it. Escalate with `--deny-warnings W057` |
+| `W057` | A call names a function missing from Rocky's list for the target warehouse (every warehouse with a list except DuckDB). The call may still be valid: an extension, connector or UDF may define it. Escalate with `--deny-warnings W057`. See [Unknown functions](#unknown-functions) |
 | `W058` | `rocky validate` only: a freshness block uses a deprecated spelling (`threshold_seconds`, `max_lag_seconds`, `expected_lag_seconds`, `max_lag`, or `severity`). It still works; the message names the `warn_after` / `error_after` replacement. |
 | `W071` | The warning form of `E071`, for a set-operation mismatch in a place the warehouse may skip, such as a CTE body or a named `WINDOW` nothing uses. See [Set operations with different column counts](#set-operations-with-different-column-counts-e071-w071) |
 | `I001` | Model dependency inferred from SQL |
@@ -759,15 +725,7 @@ Each diagnostic carries:
 
 ## Reference tracking
 
-The type checker builds a `ReferenceMap` as it runs. That map records three
-things:
-
-- Where each model is referenced in `FROM` and `JOIN` clauses across the project
-- Where each column is referenced
-- Where each model is defined
-
-This is what powers Find References and Rename Symbol when Rocky runs as an LSP
-server.
+The type checker builds a `ReferenceMap` of where each model is defined and referenced (in `FROM` and `JOIN`), and where each column is referenced. It powers Find References and Rename Symbol in the LSP server.
 
 ## Using the compiler
 
@@ -791,16 +749,10 @@ let config = CompilerConfig {
     contracts_dir: Some("contracts/".into()),
     ..Default::default()
 };
-
 let result = compile(&config)?;
-
 if result.has_errors {
-    for d in &result.diagnostics {
-        eprintln!("{d}");
-    }
+    for d in &result.diagnostics { eprintln!("{d}"); }
 }
 ```
 
-`CompileResult` gives you the resolved project, semantic graph, inferred
-schemas, and diagnostics. Types can remain `Unknown`. The test runner, CI
-pipeline, and AI sync all build on it.
+`CompileResult` holds the resolved project, semantic graph, inferred schemas and diagnostics. The test runner, CI pipeline and AI sync build on it.

@@ -5,11 +5,11 @@ sidebar:
   order: 15
 ---
 
-`rocky preview` is the workflow you reach for when reviewing a PR that touches transformation models. It runs only the models the PR changed. Everything else is copied from the base ref into a per-PR branch.
+`rocky preview` reviews a PR that touches transformation models. It runs only the models the PR changed and copies everything else from the base ref into a per-PR branch. It answers: *what does this PR change in the warehouse, and what does it cost?* It does so on a small fraction of a full run's bytes. Task steps: [Preview a PR](/guides/preview-a-pr/).
 
-It answers a reviewer's question before merge: *what does this PR change in the warehouse, and what does it cost?* It does that on a small fraction of a full run's bytes. It produces three artifacts you can attach to the PR: a comparison of the `rows_affected` the two runs recorded, a row-content diff when you ask for `--algorithm bisection`, and a cost delta against base. The column-level delta is an open follow-up, so the structural arrays come back empty.
+It produces three artifacts: a comparison of the `rows_affected` the two runs recorded, a row-content diff with `--algorithm bisection`, and a cost delta against base. The column-level delta is an open follow-up, so the structural arrays come back empty.
 
-The sampling described below is the design, not what the default path runs. The default path samples no rows. It compares the `rows_affected` the two runs recorded, and it reports `limit: 0` and `coverage: "not_yet_sampled"`. `rocky preview diff` has no `--sample-size` flag, because nothing read it.
+The default diff samples no rows. It compares recorded `rows_affected` and reports `limit: 0` and `coverage: "not_yet_sampled"`. `rocky preview diff` has no `--sample-size` flag, because nothing read it.
 
 ## The prune-and-copy substrate
 
@@ -87,37 +87,15 @@ Other warehouses (DuckDB, Postgres, Trino, ClickHouse, SQL Server) ignore the ca
 
 A run recorded before Rocky added `rocky_branch` has none, so it never matches as a branch run. Run `rocky run --branch <name>` again to record one. `rocky history --output json` shows `rocky_branch` on every run that has one.
 
-## Comparison to Fivetran's Smart Run
-
-The closest published commercial analogue is Fivetran's [Smart Run for dbt Core](https://www.fivetran.com/blog/how-we-execute-dbt-runs-faster-and-cheaper). Both rest on the same insight. Re-running unchanged upstream is wasted work, so copy it and run only the changed subtree.
-
-| Property | Fivetran Smart Run (per article) | Rocky `preview` |
-|---|---|---|
-| Change detection | "Manifest-independent" — mechanism not specified in the article | Git diff identifies changed model files; sidecar `depends_on` links identify downstream models |
-| Pruning granularity | Model-level (per the article's red / I-node / R-node example) | Model-level; a changed model pulls in all downstream models linked by `depends_on` |
-| Copy substrate | `COPY` ("the COPY command is free" per article) | Per-adapter dispatch: Databricks `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY`, Snowflake `CREATE TABLE … CLONE`, DuckDB CTAS |
-| Cost delta | Not surfaced in the article | First-class output ([`PreviewCostOutput`](#output-shapes)) |
-| Data diff | Not surfaced in the article | First-class output ([`PreviewDiffOutput`](#output-shapes)) |
-| PR comment | Not described in the article | Pre-rendered Markdown in every output |
-
-The article does not document Smart Run's internal mechanism beyond a conceptual diagram and the "manifest-independent" claim. The rows above hedge accordingly.
-
 ## Two diff algorithms
 
 `rocky preview diff` produces a row-level diff per model the branch run executed. It uses one of two algorithms, and a `kind` discriminator on each per-model entry says which one ran.
 
 ### `--algorithm sampled` (default)
 
-**What runs today.** The default reads no rows. It subtracts the `rows_affected` the two runs recorded. When a run recorded no count for a model, that model's row delta is `null`, and `summary.models_unknown` counts it. The `sampling_window` block reports `limit: 0` and `coverage: "not_yet_sampled"`.
+The default reads no rows. It subtracts the `rows_affected` the two runs recorded. When a run recorded no count for a model, that row delta is `null`, and `summary.models_unknown` counts it. The `sampling_window` block reports `limit: 0` and `coverage: "not_yet_sampled"`.
 
-**The design.** The intended algorithm reads a window of rows from both sides:
-
-```
-ORDER BY <primary_key>     -- or first column if no PK declared
-LIMIT <sample_size>        -- design default 1000; no flag sets it today
-```
-
-This is fast, deterministic, and bounded. It has one known blind spot: a row that changed outside the sampling window reads as no change. The diff layer flags that risk explicitly. Each per-model `Sampled` variant carries a `sampling_window` block. With the design in place, it reads:
+The design reads a window of rows from both sides (`ORDER BY <primary_key>` or the first column, `LIMIT <sample_size>`, design default 1000, no flag today). A row that changed outside the window reads as no change. So each per-model `Sampled` entry carries a `sampling_window` block:
 
 ```jsonc
 {
@@ -132,7 +110,7 @@ This is fast, deterministic, and bounded. It has one known blind spot: a row tha
 }
 ```
 
-`coverage_warning: true` means a meaningful number of rows sit outside the sampling window. A clean sample does not mean "no change".
+`coverage_warning: true` means a meaningful number of rows sit outside the window. A clean sample does not mean "no change".
 
 ### `--algorithm bisection`
 
