@@ -1,29 +1,14 @@
 # Agent conformance eval suite
 
-A versioned, one-command **scorecard** for the Rocky MCP interface: does a
-frontier agent, given only Rocky's typed MCP tools, ground itself in the data
-and author a model that compiles first-try and stops at the human-review gate?
-Agents work through the MCP surface, so the suite tests it like an API.
+A versioned, one-command **scorecard** for the Rocky MCP interface: does a frontier agent, given only Rocky's typed MCP tools, ground itself in the data and author a model that compiles first-try and stops at the human-review gate? The suite tests the MCP surface like an API.
 
-The suite drives a **scripted agent session** against a fresh `rocky mcp` server
-on a pinned DuckDB fixture, then scores the session with **deterministic
-assertions** that are pure functions of the captured transcript and the
-fixture's on-disk state. No LLM judge.
+It drives a **scripted agent session** against a fresh `rocky mcp` server on a pinned DuckDB fixture. It then scores the session with **deterministic assertions** that are pure functions of the captured transcript and the fixture's on-disk state. There is no LLM judge.
 
-## Is it creds-free?
+## Does it need credentials?
 
-Partly, and the distinction matters:
-
-- **No warehouse credentials.** The fixture is a local DuckDB file; nothing
-  reaches a cloud warehouse.
-- **The live agent loop needs a model API key.** A scripted agent that drives
-  `rocky mcp` is, by definition, a model call. The runner reads the key from
-  **`ANTHROPIC_API_KEY`**. When it (or the `claude`/`rocky`/`duckdb` CLIs) is
-  absent, the suite **skips cleanly** — it writes a skip scorecard and exits `0`
-  so a contributor or fork without a key is never blocked.
-- **The plumbing is checkable creds-free.** `--selftest` validates the parser,
-  the grounding/propose scoring, and the scorecard rendering against a recorded
-  transcript, with no key and no model call.
+- **No warehouse credentials.** The fixture is a local DuckDB file.
+- **The live agent loop needs a model API key**, read from `ANTHROPIC_API_KEY`. When the key (or the `claude`/`rocky`/`duckdb` CLIs) is absent, the suite **skips cleanly**: it writes a skip scorecard and exits `0`.
+- **The plumbing is checkable without a key.** `--selftest` validates the parser, the grounding/propose scoring and the scorecard rendering against a recorded transcript.
 
 ## Run it
 
@@ -39,9 +24,8 @@ uv run python run_evals.py --scenario completed_revenue --model claude-opus-4-1 
 # Creds-free plumbing check (pull-request CI runs this):
 uv run python run_evals.py --selftest
 
-# Structured-error contract check (needs only the `rocky` binary — no key, no
-# warehouse, no model): drives `rocky mcp` with bad input and asserts the
-# {code, message, remediation_hint} error envelope + hint quality.
+# Structured-error contract check (needs only the `rocky` binary): drives
+# `rocky mcp` with bad input and asserts the {code, message, remediation_hint} envelope.
 uv run python run_evals.py --error-contract
 ```
 
@@ -51,11 +35,7 @@ and printed to stdout; per-attempt transcripts land in `results/transcripts/`.
 
 ## What it measures
 
-Scenario classes over pinned fixtures. The base fixture (`fixtures/orders_trap/`)
-is a `seeds.orders` table whose `status` is uppercase `'COMPLETE'` and whose
-amount is in integer **cents**; both traps are invisible to the schema. The
-policy scenario adds `fixtures/orders_trap_governed/` — the same dataset plus a
-`[policy]` block that denies an agent authoring any `*_pii` model:
+Scenario classes over pinned fixtures. The base fixture (`fixtures/orders_trap/`) is a `seeds.orders` table whose `status` is uppercase `'COMPLETE'` and whose amount is in integer **cents**. The schema shows neither trap. The policy scenario adds `fixtures/orders_trap_governed/`: the same data plus a `[policy]` block that denies an agent authoring any `*_pii` model.
 
 | Class | Question | Signal |
 |---|---|---|
@@ -66,62 +46,35 @@ policy scenario adds `fixtures/orders_trap_governed/` — the same dataset plus 
 
 ### The deterministic checks
 
-Every check re-derives its verdict from artifacts the harness controls — never
-from the agent's own claim of success:
+Every check re-derives its verdict from artifacts the harness controls, never from the agent's claim of success:
 
-- `grounded_before_propose` — from the transcript's ordered tool calls.
-- `compiles_clean` — the harness runs `rocky compile` on the produced models.
-- `authored_model_present` — a `.sql` file was written to `models/`.
-- `plan_created` — a `propose` call returned a `plan_id`.
-- `authored_via_draft_tool` *(draft scenarios)* — a `draft_model` call authored
-  the model; the agent's raw file writers are denied, so this is the only path.
-- `contract_present` *(contract scenario)* — a `<model>.contract.toml` was
-  written (via `draft_contract`); `compiles_clean` proves it validates.
-- `check_present` *(check scenario)* — a declarative `[[tests]]` check was merged
-  into the model's sidecar (via `draft_check`).
-- `denied_draft_absent` *(policy scenario)* — the draft into the policy-denied
-  scope left no file on disk (the deny rolled the write back).
-- `no_direct_mutation` — the fixture warehouse has no materialized target tables.
-- `reconciles` *(bonus, non-gating)* — the harness materializes the model from
-  **Rocky's emitted SQL** on a throwaway copy of the warehouse and checks the
-  number (e.g. completed revenue = `$1000.00`, completed count = `5`).
+- `grounded_before_propose`: from the transcript's ordered tool calls.
+- `compiles_clean`: the harness runs `rocky compile` on the produced models.
+- `authored_model_present`: a `.sql` file was written to `models/`.
+- `plan_created`: a `propose` call returned a `plan_id`.
+- `authored_via_draft_tool` *(draft scenarios)*: a `draft_model` call authored the model. The agent's raw file writers are denied, so this is the only path.
+- `contract_present` *(contract scenario)*: a `<model>.contract.toml` was written via `draft_contract`. `compiles_clean` proves it validates.
+- `check_present` *(check scenario)*: a declarative `[[tests]]` check was merged into the model's sidecar via `draft_check`.
+- `denied_draft_absent` *(policy scenario)*: the draft into the denied scope left no file (the deny rolled the write back).
+- `no_direct_mutation`: the fixture warehouse has no materialized target tables.
+- `reconciles` *(bonus, non-gating)*: the harness materializes the model from **Rocky's emitted SQL** on a throwaway warehouse copy and checks the number (completed revenue = `$1000.00`, completed count = `5`).
 
-A scenario **passes** when all of its *required* checks pass; the reconcile bonus
-is recorded but never gates the pass.
+A scenario **passes** when all its *required* checks pass. The reconcile bonus never gates.
 
 ### The structured-error contract (`--error-contract`)
 
-A separate, **creds-free** check (needs only the `rocky` binary — no model key,
-no `claude`, no warehouse) asserts the MCP surface's *failure* paths, not just
-its success paths. It drives a real `rocky mcp` server over stdio with
-deliberately bad input and checks, with deterministic assertions, that every
-failing tool call returns a tool-result error (`isError: true`) carrying a
-`{code, message, remediation_hint, policy_rule?}` envelope in
-`structuredContent` — the machine-UX analog of Rocky's diagnostic codes — with a
-stable `code` and an *actionable* `remediation_hint` (e.g. an unknown dialect's
-hint must name the accepted set; a `model_not_found` hint must point at a
-discovery tool). It also pins the complementary shape: a genuine **compile
-error** is *not* an envelope — it is a successful call reporting
-`has_errors: true` with diagnostics that each carry a code and message. Several
-cases cover the `draft_*` write path: a draft into a policy-denied scope returns
-a `policy_denied` envelope **and leaves no file on disk** (for both `draft_model`
-and `draft_contract` — the write-side pin, asserted after the call before the
-temp project is cleaned up), and a `draft_contract`/`draft_check` call made with
-no `spec` returns an `invalid_argument` envelope whose hint routes to the
-matching `ai_contract`/`ai_test` generator (the deprecation redirect).
+This check needs only the `rocky` binary: no model key, no `claude`, no warehouse. It asserts the MCP surface's *failure* paths. It drives a real `rocky mcp` server over stdio with bad input and checks that every failing tool call returns an error result (`isError: true`) with a `{code, message, remediation_hint, policy_rule?}` envelope in `structuredContent`. The `code` is stable and the `remediation_hint` is actionable: an unknown dialect's hint names the accepted set, and a `model_not_found` hint points at a discovery tool.
 
-Unlike the live authoring scenarios (whose pass/fail is model-outcome variance),
-this contract is deterministic, so a failure is a real regression and **gates**
-the run. CI runs it on the no-secret path alongside `--selftest`.
+A genuine **compile error** is *not* an envelope. It is a successful call reporting `has_errors: true`, with diagnostics that each carry a code and message. Cases for the `draft_*` write path:
+
+- A draft into a policy-denied scope returns a `policy_denied` envelope **and leaves no file on disk**. This holds for `draft_model` and `draft_contract`, asserted before the temp project is cleaned up.
+- A `draft_contract` or `draft_check` call with no `spec` returns an `invalid_argument` envelope. Its hint routes to the `ai_contract` / `ai_test` generator.
+
+This contract is deterministic, so a failure is a real regression and **gates** the run. CI runs it with `--selftest`, with no secrets.
 
 ### Why the agent gets no shell
 
-The driver denies `Bash` (and `WebSearch`/`WebFetch`). This is deliberate:
-grounding must go **through the MCP tools** to be a real measurement (with a
-shell, an agent can route around them with raw `duckdb` — which tells us nothing
-about the tool surface). It also makes "no direct mutation" **structural**: the
-only warehouse-mutation path is `rocky apply` via a shell, and there is no MCP
-apply tool — so the safety property is *prevented*, not merely *observed*.
+The driver denies `Bash`, `WebSearch` and `WebFetch`. Grounding must go **through the MCP tools** to be a real measurement: with a shell, an agent can route around them with raw `duckdb`. It also makes "no direct mutation" **structural**: the only mutation path is `rocky apply` through a shell, and no MCP tool applies. The property is prevented, not observed.
 
 ## Contract quality (`--contract-quality`)
 
@@ -152,11 +105,7 @@ fixtures/contract_quality ──copy──▶ temp project
        drafted contract ──score──▶ results/contract_quality{,_live}.{json,md}
 ```
 
-The fixture is a DuckDB transformation pipeline over three raw tables with
-real `NOT NULL` constraints, plus columns that are nullable but hold no NULL
-today. The answer key (`fixtures/contract_quality/answer_key.toml`) holds 80
-items: 4 models, 5 columns each, and 4 attributes per column (`type`,
-`nullable`, `required`, `protected`).
+The fixture is a DuckDB transformation pipeline over three raw tables with real `NOT NULL` constraints, plus columns that are nullable but hold no NULL today. The answer key (`fixtures/contract_quality/answer_key.toml`) holds 80 items: 4 models, 5 columns each, 4 attributes per column (`type`, `nullable`, `required`, `protected`).
 
 Each item gets one outcome:
 
@@ -168,29 +117,14 @@ Each item gets one outcome:
 | `overclaim` | the draft promises more than the key: a wrong type, `nullable = false` on a nullable column, a non-key column in `required` / `protected` |
 | `underclaim` | the draft promises less: `nullable = true` on a NOT NULL column, a key column left out of `required` / `protected` |
 
-Every item of a returned draft passed the compiler, so an overclaim or an
-underclaim is a wrong item the compiler accepted. The pass line is in the
-answer key's `[pass_line]`: at least 64 of 80 matched, at most 4 overclaims,
-no unverified type, and no key-column omission. A drafted column the key does
-not list counts as one more overclaim.
+Every item of a returned draft passed the compiler, so an overclaim or underclaim is a wrong item the compiler accepted. The pass line is in the key's `[pass_line]`: at least 64 of 80 matched, at most 4 overclaims, no unverified type, and no key-column omission. A drafted column the key does not list counts as one more overclaim.
 
 Underclaims split in two:
 
-- A nullable underclaim is safe: the contract promises less than the data
-  gives. It is reported but does not gate.
-- A key column left out of `required` / `protected` is a **key-column
-  omission**. It is not safe: the contract no longer stops that column being
-  dropped. It counts against the pass line. Without this check, a draft with right types and
-  nullability but empty key lists would score 66/80 with 0 overclaims and pass.
+- A nullable underclaim is safe: the contract promises less than the data gives. It is reported but does not gate.
+- A key column left out of `required` / `protected` is a **key-column omission**. It is not safe, because the contract no longer stops that column being dropped. It counts against the pass line. Without this check, a draft with right types and nullability but empty key lists would score 66/80 with 0 overclaims and pass.
 
-The pass line sets the PASS or FAIL verdict. It never sets the exit code. A
-replay exits 1 only when an outcome moves from its golden file, so
-`--contract-quality-update-expected` accepts whatever the replay produced.
-Read the scorecard before you refresh a golden: a live set that turns from
-PASS to FAIL is a finding, not drift to accept.
-
-(Splitting "wrong" by direction was an advisor ruling of 2026-11-11. The
-key-omission gate is a Fable ruling of 2026-11-13. Both need a maintainer to confirm.)
+The pass line sets the PASS or FAIL verdict, never the exit code. A replay exits 1 only when an outcome moves from its golden file, so `--contract-quality-update-expected` accepts whatever the replay produced. Read the scorecard before you refresh a golden: a live set that turns from PASS to FAIL is a finding, not drift to accept.
 
 There are two recording sets. CI replays both.
 
@@ -221,67 +155,36 @@ The three modes:
 
 ### Live rerun runbook
 
-The live rerun is the only real measure of draft quality. Results go on [#2577](https://github.com/rocky-data/rocky/issues/2577).
-
-**One command**, from the repo root on a fresh clone of `main`:
+The live rerun is the only real measure of draft quality. Post results on [#2577](https://github.com/rocky-data/rocky/issues/2577). From the repo root on a fresh clone of `main`:
 
 ```bash
 cd engine && cargo build -p rocky && cd evals && ANTHROPIC_API_KEY=<your key> python3 run_evals.py --contract-quality --contract-quality-mode live
 ```
 
-**What it needs:**
+**Needs:**
 
-- A Rust toolchain (stable), to build `rocky`. The build compiles the bundled DuckDB from C++, so a C++ compiler is needed too, and the first build takes several minutes. To use a `rocky` binary you already have, set `ROCKY_BIN=/path/to/rocky` and skip `cargo build`.
-- Python 3.11 or newer. The harness uses only the standard library, so there is nothing to install; `uv run python` works too.
-- The `ANTHROPIC_API_KEY` environment variable. Nothing else: no Docker, no warehouse, no other credential.
-- Network access to `api.anthropic.com`.
+- A stable Rust toolchain and a C++ compiler (the bundled DuckDB builds from C++; the first build takes minutes). To use an existing binary, set `ROCKY_BIN=/path/to/rocky` and skip `cargo build`.
+- Python 3.11 or newer. The harness uses only the standard library; `uv run python` also works.
+- `ANTHROPIC_API_KEY` and network access to `api.anthropic.com`. No Docker, warehouse or other credential.
 
-**What it reads and writes:**
+**Reads and writes:**
 
-- It reads `fixtures/contract_quality/` (the project, its seed data and `answer_key.toml`).
-- It builds a DuckDB warehouse in a temporary directory and deletes it afterwards.
-- It sends four drafting requests, one per model, each retried at most twice. The prompt carries the model's schema and aggregate statistics, not raw rows.
-- It **overwrites** `fixtures/contract_quality/recordings_live/<model>.json` with the real responses. The hand-written `recordings/` stay as they are.
-- It writes the scorecard to `results/contract_quality_live.md` and `results/contract_quality_live.json`. `results/` is git-ignored.
+- It reads `fixtures/contract_quality/`, builds a DuckDB warehouse in a temp directory, and deletes it afterwards.
+- It sends four drafting requests, one per model, each retried at most twice. The prompt carries the schema and aggregate statistics, not raw rows.
+- It **overwrites** `fixtures/contract_quality/recordings_live/<model>.json`. The hand-written `recordings/` stay as they are.
+- It writes `results/contract_quality_live.md` and `.json`. `results/` is git-ignored.
 
-**Reading the result.** The last block printed (also in `results/contract_quality_live.md`) starts with a line like this:
+**Reading the result.** The last printed block starts with a line like:
 
 ```
 **PASS** — 78/80 matched (need >= 64), 0 overclaim(s) accepted (max 4), 0 unverified type(s) (max 0), 0 key-column omission(s) (max 0).
 ```
 
-- `PASS` means all four conditions hold: at least 64 of 80 items matched, at most 4 overclaims, no unverified type, and no key-column omission. An overclaim is a wrong item the compiler accepted that promises more than the data gives. A key-column omission is a key column left out of `required` / `protected`.
-- Nullable underclaims are listed but do not gate.
-- `FAIL` is a finding, not a broken run. The exit code is 0 either way; a non-zero exit means the harness itself could not run.
-- The table under the summary gives the outcomes per model, and the list after it names every item that did not match.
+`PASS` means all four conditions hold. `FAIL` is a finding, not a broken run. The exit code is 0 either way, and a non-zero exit means the harness could not run. The table gives outcomes per model, and the list names every item that did not match.
 
-**Posting the result.** Comment on #2577 with:
+**Posting.** Comment on #2577 with the summary line, the per-model table, the list of items that did not match, and the commit SHA. Do not paste the key, request bodies or raw responses. Add no tool or agent attribution footer. To make CI pin the real responses, open a PR with the new `recordings_live/` files, the scorecard in the PR body, and a refreshed `expected_replay_live.json`: run `python3 run_evals.py --contract-quality`, then `python3 run_evals.py --contract-quality-update-expected --contract-quality-set live`. The PR body gets no agent attribution either.
 
-- the summary line;
-- the per-model table;
-- the list of items that did not match;
-- the commit SHA you ran.
-
-Do not paste the key, request bodies or raw responses. Write the comment in your own name, with no tool or agent attribution footer. To make CI pin the real responses, open a PR with:
-
-- the new `recordings_live/` files;
-- the scorecard, in the PR body (`results/` is git-ignored);
-- a refreshed `expected_replay_live.json`: run `python3 run_evals.py --contract-quality`, then `python3 run_evals.py --contract-quality-update-expected --contract-quality-set live`.
-
-The PR body gets no agent attribution either.
-
-**Can it run in a cloud agent session instead?** Yes, but only if the key owner chooses to. The session's network proxy can hold the key and add it to requests for `api.anthropic.com`:
-
-1. In the session, the agent asks for a credential for that host, sent in the `x-api-key` header.
-2. The key owner types the key into the secure form. The agent never sees it.
-3. The agent runs the command above with a dummy `ANTHROPIC_API_KEY`, which the proxy replaces.
-
-Two costs:
-
-- The key is saved on the cloud environment. The proxy then adds it to every session in that environment, other agents' sessions included, and to other people's sessions when the environment is shared.
-- It needs the owner present for the form.
-
-So only the key owner can start it. On a shared environment, a local run is simpler and keeps the key on one machine. Either way, the agent never handles the key.
+**Cloud agent session.** It works only if the key owner chooses it. The agent asks for a credential for `api.anthropic.com` (header `x-api-key`), the owner types the key into the secure form, and the agent runs the command with a dummy `ANTHROPIC_API_KEY` that the proxy replaces. The key is then saved on the environment and used by every session in it, other people's sessions included on a shared environment. On a shared environment, a local run is simpler.
 
 ## Determinism, flake, and reading a score
 

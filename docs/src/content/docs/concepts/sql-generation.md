@@ -127,8 +127,8 @@ Rocky wraps the SQL you wrote in a statement chosen by the model's materializati
 - **Incremental**: `INSERT INTO ... <user_sql>`
 - **Merge**: `MERGE INTO ... USING (<user_sql>) ...`
 - **Materialized View**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS <user_sql>` (Databricks, Snowflake, BigQuery; PostgreSQL and Redshift drop and re-create the view)
-- **Dynamic Table**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '<lag>' AS <user_sql>` (Snowflake)
-- **Time Interval**: Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` substitution
+- **Dynamic Table**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '<lag>' WAREHOUSE = <warehouse> AS <user_sql>` (Snowflake)
+- **Time Interval**: Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` substitution (see below)
 
 ## Surrogate Key Columns
 
@@ -149,66 +149,19 @@ FROM (
 ) AS __rocky_keyed
 ```
 
-The hash expression follows dbt-utils' `generate_surrogate_key`. Rocky casts each input to text, replaces a NULL with the `_dbt_utils_surrogate_key_null_` sentinel, joins the values with a `-` separator, and MD5-hashes the result. Most warehouses concatenate with `||` and differ only in the text type they cast to:
+The hash expression follows dbt-utils' `generate_surrogate_key`, so a key Rocky computes joins against the same key in an upstream dbt model. Rocky casts each input to text, replaces a NULL with the `_dbt_utils_surrogate_key_null_` sentinel, joins the values with `-`, and MD5-hashes the result. Warehouses differ in the text type and the join:
 
-- **DuckDB / Snowflake** cast to `VARCHAR`:
+| Warehouse | Text type | Join | Hash |
+|---|---|---|---|
+| DuckDB, Snowflake | `VARCHAR` | `\|\|` | `md5(...)` |
+| Databricks | `STRING` (Spark SQL rejects an unsized `VARCHAR`) | `\|\|` | `md5(...)` |
+| BigQuery | `STRING` | `concat(...)` | `to_hex(md5(...))` (its `MD5()` returns `BYTES`) |
 
-  ```sql
-  md5(cast(coalesce(cast(a as VARCHAR), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))
-  ```
-
-- **Databricks** casts to `STRING` (Spark SQL rejects an unsized `VARCHAR`):
-
-  ```sql
-  md5(cast(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_') as STRING))
-  ```
-
-- **BigQuery** wraps the hash in `to_hex(...)` (its `MD5()` returns `BYTES`) and concatenates with `concat(...)` instead of `||`, casting to `STRING`:
-
-  ```sql
-  to_hex(md5(cast(concat(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_'), '-', coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_')) as STRING)))
-  ```
-
-The hash digest is the same one dbt-utils' `generate_surrogate_key` produces for the same columns, so a key Rocky computes joins against the same key in an upstream dbt model.
-
-## Materialized View
-
-Databricks, Snowflake and BigQuery:
-
-```sql
-CREATE OR REPLACE MATERIALIZED VIEW <catalog>.<schema>.<table> AS
-<user_sql>
-```
-
-## Dynamic Table (Snowflake)
-
-```sql
-CREATE OR REPLACE DYNAMIC TABLE <catalog>.<schema>.<table>
-TARGET_LAG = '<lag>'
-WAREHOUSE = <warehouse>
-AS <user_sql>
-```
+Two columns `a` and `b` on Databricks give `md5(cast(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_') as STRING))`.
 
 ## Time-Interval Partition Processing
 
-Each warehouse gets its own statement shape for partition-keyed materialization. See [Time interval materialization](/concepts/time-interval/) for the strategy itself.
-
-**Databricks (Delta, atomic):**
-
-```sql
-INSERT INTO <target>
-REPLACE WHERE <time_column> >= '<start>' AND <time_column> < '<end>'
-<user_sql with @start_date/@end_date substituted>
-```
-
-**Snowflake (multi-statement transaction):**
-
-```sql
-BEGIN;
-DELETE FROM <target> WHERE <time_column> >= '<start>' AND <time_column> < '<end>';
-INSERT INTO <target> <user_sql>;
-COMMIT;
-```
+Each warehouse gets its own partition statement: Databricks `INSERT INTO ... REPLACE WHERE`, Snowflake and DuckDB a `BEGIN; DELETE; INSERT; COMMIT;` transaction, BigQuery one transaction script. See [Time interval materialization](/concepts/time-interval/#per-warehouse-sql).
 
 ## Drift Detection
 

@@ -1242,3 +1242,25 @@ rocky retention-status [--model NAME] [--drift]
 }
 ```
 
+
+### Example
+
+```bash
+rocky retention-status --output json
+```
+
+```json
+{
+  "command": "retention-status",
+  "models": [
+    { "model": "fct_revenue",   "configured_days": 90, "in_sync": true },
+    { "model": "dim_customers",                        "in_sync": true }
+  ]
+}
+```
+
+### Related Commands
+
+- [`rocky compliance`](#rocky-compliance) -- sibling governance rollup for classification + masking
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- applies retention policies inline during the post-DAG governance pass
+- [Model sidecar `retention`](/reference/model-format/) -- configure `retention = "<N>[dy]"`
