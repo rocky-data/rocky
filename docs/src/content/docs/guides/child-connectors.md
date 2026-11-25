@@ -283,7 +283,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 
 ## Reference connector
 
-The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete child connector for Postgres. Its manifest sets `support_tier = "reference"`: the Rocky project maintains it and tests it in CI. Copy it as a starting point, or follow [Write a connector](/guides/write-a-connector/) to build your own from a scaffold. It is one Python 3.8 file with no packages. It runs its SQL through the `duckdb` CLI and the DuckDB `postgres` extension.
+The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete child connector for Postgres. Its manifest sets `support_tier = "reference"`: the Rocky project maintains it and tests it in CI. Copy it as a starting point, and change or remove `support_tier` in your copy. Or follow [Write a connector](/guides/write-a-connector/) to build your own from a scaffold. It is one Python 3.8 file with no packages. It runs its SQL through the `duckdb` CLI and the DuckDB `postgres` extension.
 
 The connector reads one table and keeps a timestamp cursor in its state.
 

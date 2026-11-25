@@ -16,7 +16,7 @@ You need `rocky`, `python3` (3.8 or newer) and the `duckdb` CLI on `PATH`. The s
 
 ## Step 1: Scaffold the connector
 
-Run `rocky connector init` in the directory that holds `rocky.toml`. The name uses letters, digits and underscores.
+Make a project directory and run `rocky connector init` there. Step 2 adds `rocky.toml` to the same directory. The name uses letters, digits and underscores.
 
 ```bash
 rocky connector init orders
@@ -28,6 +28,7 @@ Rocky writes `connectors/orders/` and prints the next steps. The directory holds
 - `main.py`: your program. This is the file you edit.
 - `rocky_connector.py`: a helper. Do not edit it.
 - `connector-test.toml`: the runs that `rocky connector test` makes.
+- `.gitignore`: ignores the `__pycache__/` directory that Python writes.
 
 The scaffold loads as written. Its example source is a fixed list of 5 rows.
 
@@ -79,7 +80,7 @@ rocky connector test orders
 run 1: ok, 3 rows in 1 file(s)
 run 2: ok, 2 rows in 1 file(s)
 run 3: ok, 0 rows in 0 file(s)
-Connector `orders` passed all 3 run(s) in connectors/orders/connector-test.toml
+Connector `orders` passed all 3 run(s) in /path/to/project/connectors/orders/connector-test.toml
 ```
 
 Each run gets the state that the run before it returned. The command checks four things:
@@ -101,20 +102,20 @@ Export the variables you declared under `secrets`. Then run the connector.
 rocky load --connector orders
 ```
 
-Rocky starts the program with a cleared environment, checks the files, and appends the rows to the target table. It then saves the cursor. Run the command a second time. The second run loads only the rows that are new, and the output shows `commit_seq_after` one higher.
+Rocky starts the program with a cleared environment, checks the files, and appends the rows to the target table. It then saves the cursor. The table output ends with a line such as `commit 0 -> 1`. Run the command a second time. It loads no new row, and the line reads `commit 1 -> 2`. With `--output json`, the same numbers are the fields `commit_seq_before` and `commit_seq_after`.
 
 Delivery is at least once. A crash between the load and the state save loads a batch twice. Deduplicate downstream on a key.
 
 ## Read a finished connector
 
-The Postgres connector is the reference connector. The Rocky project maintains it and tests it in CI. Its manifest sets `support_tier = "reference"`. Read it to see a cursor, a replay mode and a secret in real code.
+The Postgres connector is the reference connector. The Rocky project maintains it and tests it in CI. Its manifest sets `support_tier = "reference"`. If you copy it, change or remove that line: the tier is the Rocky project's statement about its own connector, not yours. Read it to see a cursor, a replay mode and a secret in real code.
 
 - The program, manifest, spec and recorded input are in [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector).
 - It keeps a timestamp cursor and holds back the rows at the source maximum, so rows that tie are never split across two runs.
 - Its `replay_fixture` option reads a SQL file instead of Postgres. `rocky connector test pg_events` uses it with no Docker.
 - It was written before `rocky connector init`, so it does not use the `rocky_connector.py` helper. It follows the same protocol.
 
-Two checks keep it working. The pull request CI runs `rocky connector test pg_events` when connector code or this connector changes. The weekly CI runs `run.sh` against a Postgres container. A failure of either turns the job red. The [Child connectors](/guides/child-connectors/#reference-connector) guide lists the limits of its design.
+Two checks cover it. The pull request CI runs `rocky connector test pg_events` when connector code or this connector changes. The weekly CI runs `run.sh` against a Postgres container. The pull request job is not a required check, so a red result does not block a merge by itself. The [Child connectors](/guides/child-connectors/#reference-connector) guide lists the limits of its design.
 
 ## Related
 
