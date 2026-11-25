@@ -403,7 +403,9 @@ fn withhold_unproven_non_null(
 fn retry_context(rejected: &str, errors: &str) -> String {
     format!(
         "{errors}\n\nThe rejected contract was:\n\n{rejected}\n\nKeep every claim the errors do \
-         not name. Fix only what they name, following the rules."
+         not name. Fix only what they name, following the rules. A contract file has no test \
+         field: if an error suggests adding a `[[tests]]` block or a `not_null` test, do not \
+         write one here; that belongs in the model's sidecar."
     )
 }
 
@@ -610,6 +612,7 @@ mod tests {
         let ctx = retry_context("[[columns]]\nname = \"id\"", "E011: type mismatch");
         assert!(ctx.starts_with("E011: type mismatch"));
         assert!(ctx.contains("The rejected contract was:\n\n[[columns]]\nname = \"id\""));
+        assert!(ctx.contains("A contract file has no test field"));
     }
 
     #[test]

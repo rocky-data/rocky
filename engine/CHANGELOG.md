@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The `E012` help now says that `[run] tests_on_run` defaults to `enforce`, and that a contract generated from a product spec is changed in the spec, not in the contract file. The `rocky ai-contract` retry prompt now tells the model not to add a `[[tests]]` block to a contract (#2734).
+
 ## [1.94.0] — 2026-11-23
 
 ### Upgrade notes
