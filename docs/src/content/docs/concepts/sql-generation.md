@@ -58,7 +58,7 @@ Rocky rebuilds the whole table when it finds drift it cannot fix in place, and w
 CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>
 ```
 
-A full refresh never drops the target before the new table exists. If the `SELECT` fails, the old table stays. Trino has no `CREATE OR REPLACE` on every connector, so there Rocky builds the new table under a stage name and swaps it in by rename:
+A full refresh never drops the target before the new table exists, so a failed `SELECT` leaves the old table. Trino has no `CREATE OR REPLACE` on every connector, so Rocky builds the new table under a stage name and swaps it in by rename:
 
 ```sql
 CREATE TABLE <target>__rocky_stage AS SELECT * FROM <source>
@@ -67,7 +67,7 @@ ALTER TABLE <target>__rocky_stage RENAME TO <target>
 DROP TABLE IF EXISTS <target>__rocky_old
 ```
 
-If the third statement fails, Rocky renames the old table back. If a run stops between the two renames, the next run restores `<target>` from `<target>__rocky_old` before it does anything else. Rocky never drops a `__rocky_stage` or `__rocky_old` table it did not create in the same run: it stops and names the table instead. A target whose name ends in `__rocky_stage` or `__rocky_old` is refused on Trino. Readers can get "table not found" for the short moment between the two renames. The design is in [ADR-REPLACE](https://github.com/rocky-data/rocky/blob/main/docs/adr/ADR-REPLACE.md).
+If the third statement fails, Rocky renames the old table back. If a run stops between the renames, the next run restores `<target>` from `<target>__rocky_old` first. Rocky never drops a `__rocky_stage` or `__rocky_old` table it did not create in the same run: it stops and names the table. A target ending in `__rocky_stage` or `__rocky_old` is refused on Trino. Readers can get "table not found" between the two renames. Design: [ADR-REPLACE](https://github.com/rocky-data/rocky/blob/main/docs/adr/ADR-REPLACE.md).
 
 ## Merge (Upsert)
 
@@ -119,15 +119,13 @@ FROM (
 ) AS __rocky_keyed
 ```
 
-The hash expression follows dbt-utils' `generate_surrogate_key`, so a key Rocky computes joins against the same key in an upstream dbt model. Rocky casts each input to text, replaces a NULL with the `_dbt_utils_surrogate_key_null_` sentinel, joins the values with `-`, and MD5-hashes the result. Warehouses differ in the text type and the join:
+The hash follows dbt-utils' `generate_surrogate_key`, so a key Rocky computes joins against the same key in an upstream dbt model: cast each input to text, replace a NULL with the `_dbt_utils_surrogate_key_null_` sentinel, join with `-`, MD5-hash. Warehouses differ in text type and join:
 
 | Warehouse | Text type | Join | Hash |
 |---|---|---|---|
 | DuckDB, Snowflake | `VARCHAR` | `\|\|` | `md5(...)` |
 | Databricks | `STRING` (Spark SQL rejects an unsized `VARCHAR`) | `\|\|` | `md5(...)` |
 | BigQuery | `STRING` | `concat(...)` | `to_hex(md5(...))` (its `MD5()` returns `BYTES`) |
-
-Two columns `a` and `b` on Databricks give `md5(cast(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_') as STRING))`.
 
 ## Time-Interval Partition Processing
 
@@ -148,28 +146,11 @@ GRANT <PERMISSION> ON SCHEMA <catalog>.<schema> TO `<principal>`
 
 ## Data Quality Checks
 
-**Row count** (batched):
+See [Data Quality Checks](/concepts/data-quality-checks/) for the checks. Row count is batched (`UNION ALL`, up to 200 tables per batch). Freshness returns the count beside the maximum so a NULL maximum can be told apart: zero rows is an empty table with nothing to measure, and one or more rows with no value is a check Rocky could not evaluate. Null rate samples with `TABLESAMPLE (N PERCENT)`.
 
 ```sql
-SELECT '<catalog>', '<schema>', '<table>', COUNT(*)
-FROM <catalog>.<schema>.<table>
-UNION ALL
-SELECT '<catalog>', '<schema>', '<table>', COUNT(*)
-FROM <catalog>.<schema>.<table>
--- ... up to 200 tables per batch
-```
-
-**Freshness**:
-
-```sql
+SELECT '<catalog>', '<schema>', '<table>', COUNT(*) FROM <catalog>.<schema>.<table>   -- UNION ALL per table
 SELECT COUNT(*), MAX(<timestamp_column>) FROM <catalog>.<schema>.<table>
-```
-
-The count rides beside the maximum so that a NULL maximum can be told apart: zero rows is an empty table with nothing to measure, one or more rows with no value in the column is a check Rocky could not evaluate.
-
-**Null rate** (sampled):
-
-```sql
 SELECT ... FROM <catalog>.<schema>.<table> TABLESAMPLE (N PERCENT)
 ```
 

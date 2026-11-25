@@ -9,12 +9,7 @@ enforces. For a shorter tour with worked examples, read the
 
 ## Scope
 
-The DSL is one of two ways to write a Rocky transformation model. The other is
-plain SQL in a `.sql` file. Both compile the same way and produce the same
-kind of model. Neither replaces the other, and one project can hold both.
-
-The DSL has no warehouse-specific syntax of its own. Rocky picks the SQL
-dialect later, when it generates the statement it sends to the warehouse.
+The DSL is one of two ways to write a transformation model. The other is plain SQL in a `.sql` file. Both compile the same way, can share a project, and neither replaces the other. The DSL has no warehouse-specific syntax: Rocky picks the dialect when it generates the statement.
 
 ## How a `.rocky` file becomes warehouse SQL
 
@@ -43,23 +38,7 @@ A file with no `let` bindings and no pipeline steps is a parse error.
 
 ### The sidecar `.toml` file
 
-A `.rocky` file may sit beside a `.toml` file of the same name. The sidecar
-carries the model's name, its materialization strategy, its target table, and
-its declared tests.
-
-```toml
-name = "filtered_orders"
-
-[strategy]
-type = "full_refresh"
-
-[target]
-catalog = "warehouse"
-schema = "silver"
-table = "filtered_orders"
-```
-
-The sidecar and every key in it are optional. A `_defaults.toml` in the same directory supplies directory-wide `[target]` and `[strategy]` values. Declare a dependency with `depends_on`. Precedence: sidecar key, then the model's config group, then `_defaults.toml`.
+A `.rocky` file may sit beside a `.toml` file of the same name that carries the model's name, strategy, target and tests (see [Model Format](/reference/model-format/)). The sidecar and every key in it are optional. A `_defaults.toml` in the same directory supplies directory-wide `[target]` and `[strategy]` values. Declare a dependency with `depends_on`. Precedence: sidecar key, then the model's config group, then `_defaults.toml`.
 
 What Rocky fills in depends on whether the sidecar exists at all:
 
@@ -221,8 +200,7 @@ projection.
 
 ## `let` bindings
 
-A `let` binding names a sub-pipeline. Rocky lowers each one to a common table
-expression (CTE). Bindings come before the main pipeline.
+A `let` binding names a sub-pipeline and lowers to a common table expression (CTE). Bindings come before the main pipeline.
 
 ```rocky
 let active = from users
@@ -232,19 +210,7 @@ from active
 select { id, name }
 ```
 
-This lowers to:
-
-```sql
-WITH active AS (SELECT *
-FROM users
-WHERE is_active = TRUE)
-SELECT id, name
-FROM active
-```
-
-A binding ends at the next `let`, at the end of the file, or at a `from` step
-when the binding already has one. Several bindings become a comma-separated
-`WITH` list.
+lowers to `WITH active AS (SELECT * FROM users WHERE is_active = TRUE) SELECT id, name FROM active`. A binding ends at the next `let`, at the end of the file, or at a `from` step when the binding already has one. Several bindings become a comma-separated `WITH` list.
 
 ## Expressions
 
@@ -265,12 +231,7 @@ null                  -- null
 @2025-01-01T10:30:00Z -- date literal with a time part
 ```
 
-A string literal ends at its own quote character. It has no escape sequences,
-so write a double-quoted string to include an apostrophe. Rocky escapes the
-apostrophe for you: `"it's"` lowers to `'it''s'`.
-Backslashes in `.rocky` string literals are refused at compile time with `E040`,
-pointing to the literal. For a value that needs a backslash, use a `.sql` model
-and the target warehouse's own escaping.
+A string literal ends at its own quote character and has no escape sequences. Use double quotes to include an apostrophe: `"it's"` lowers to `'it''s'`. A backslash is refused at compile time with `E040`, pointing to the literal. Use a `.sql` model and the warehouse's own escaping for it.
 
 ### Date literals
 
@@ -322,13 +283,7 @@ max(price)
 coalesce(email, "unknown")
 ```
 
-Rocky uppercases the function name and lowers each argument in place. It does
-not check the name or the argument count, and it does not rewrite the call for
-a particular warehouse. `coalesce(email, "unknown")` lowers to `COALESCE(email,
-'unknown')`.
-
-The argument list passes through unchanged, so `count()` lowers to `COUNT()`.
-Check that your warehouse accepts that form. `count(1)` lowers to `COUNT(1)`.
+Rocky uppercases the function name and lowers each argument in place. It does not check the name or the argument count, and does not rewrite the call per warehouse: `coalesce(email, "unknown")` lowers to `COALESCE(email, 'unknown')`. The argument list passes through unchanged, so `count()` lowers to `COUNT()`: check that your warehouse accepts it, or write `count(1)`.
 
 ### Window functions
 
@@ -349,60 +304,21 @@ derive {
 A `-` prefix on a window sort column means descending. This differs from the
 `sort` pipeline step, which uses the `asc` and `desc` keywords.
 
-A frame starts with `rows` or `range`, then two bounds joined by `..`. Each
-bound is `unbounded`, `current`, or a number.
-
-| Bound | As a start | As an end |
-|---|---|---|
-| `unbounded` | `UNBOUNDED PRECEDING` | `UNBOUNDED FOLLOWING` |
-| `current` | `CURRENT ROW` | `CURRENT ROW` |
-| `3` | `3 PRECEDING` | `3 FOLLOWING` |
-
-So `rows unbounded..current` lowers to `ROWS BETWEEN UNBOUNDED PRECEDING AND
-CURRENT ROW`.
+A frame starts with `rows` or `range`, then two bounds joined by `..`. Each bound is `unbounded`, `current` or a number. As a start, `unbounded` is `UNBOUNDED PRECEDING`, `3` is `3 PRECEDING`. As an end, `unbounded` is `UNBOUNDED FOLLOWING`, `3` is `3 FOLLOWING`. `current` is `CURRENT ROW` in both. So `rows unbounded..current` lowers to `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 
 ### `match` expressions
 
-A `match` expression lowers to `CASE WHEN`.
+`match` lowers to `CASE WHEN`: `tier: match amount { > 10000 => "enterprise", _ => "smb" }` becomes `CASE WHEN amount > 10000 THEN 'enterprise' ELSE 'smb' END AS tier`. A pattern is one of:
 
-```rocky
-from orders
-derive {
-    tier: match amount {
-        > 10000 => "enterprise",
-        > 1000  => "mid-market",
-        _       => "smb"
-    }
-}
-```
+- `_`: the default arm, which lowers to `ELSE`. It is optional: without it an unmatched row yields `NULL`.
+- A comparison operator followed by a value, such as `> 1000`.
+- A bare value, shorthand for `== value`.
 
-This lowers to:
-
-```sql
-SELECT *, CASE WHEN amount > 10000 THEN 'enterprise' WHEN amount > 1000 THEN 'mid-market' ELSE 'smb' END AS tier
-FROM orders
-```
-
-A pattern is one of these:
-
-- `_` — the default arm, which lowers to `ELSE`
-- A comparison operator followed by a value, such as `> 1000`
-- A bare value, which is shorthand for `== value`
-
-The `_` arm is optional. Without it the `CASE` has no `ELSE`, so an unmatched
-row yields `NULL`.
-
-`!=` in a match arm lowers to `IS DISTINCT FROM`, the same as it does
-everywhere else.
+`!=` in a match arm lowers to `IS DISTINCT FROM`, as everywhere else.
 
 ## Comments
 
 A line comment starts with `--` and runs to the end of the line.
-
-```rocky
--- This is a comment
-from orders  -- inline comment
-```
 
 ## Reserved words
 

@@ -84,9 +84,9 @@ Code: `ModelFreshnessConfig` (`engine/crates/rocky-core/src/models.rs`), `Pipeli
 
 **Rocky-guaranteed: enforced at apply, as a floor.** A plan an agent proposes is marked AI-authored. `rocky apply` refuses to execute it unless an approval marker is present that parses and names that exact plan. `rocky review <plan-id> --approve` writes the marker. Apply enforces the marker check, not the approver's identity:
 
-- **It is a floor.** The check runs on every AI-authored apply, whatever your `[policy]` says. A policy `allow` cannot waive it. A policy rule can only add restrictions.
-- **It is parse-and-match, not file-exists.** A truncated, malformed or mispasted marker is refused with its own error.
-- **It is not cryptographic.** The marker records who approved (best-effort git identity) and when, and `rocky review <plan-id> --status` reports it. It carries no signature: it proves an approval was recorded on this machine, not who wrote the bytes. Signed approvals are planned, not shipped.
+- **A floor.** The check runs on every AI-authored apply, whatever `[policy]` says. A policy `allow` cannot waive it. A policy rule can only add restrictions.
+- **Parse-and-match, not file-exists.** A truncated, malformed or mispasted marker is refused with its own error.
+- **Not cryptographic.** The marker records who approved (best-effort git identity) and when (`rocky review <plan-id> --status` reports it). It has no signature: it proves an approval was recorded on this machine, not who wrote the bytes. Signed approvals are planned.
 
 Engine v1.70.1 and earlier check only that a marker file exists, and skip even that when a `[policy]` rule resolves to `allow`. Use v1.71.0 or later.
 
@@ -101,7 +101,7 @@ three gates".
 
 **Rocky recording: attempted for ordinary rules, durable for the two gating kinds.** The mutating seams are `rocky apply`, promote, an agent's `rocky run`, and the `draft_*` and `propose` tools. They run the same evaluator into the same sink: a `policy_decisions` table in the embedded redb state store. For ordinary rules a failed write warns and continues. Some refusals never reach the table, because the gate can return a verdict before any rule runs. Decisions tied to an autonomy budget or to `verify_after` are durable: when they cannot persist, the apply fails closed. Treat the ledger as a best-effort record, not proof that a decision happened.
 
-`rocky audit` lists the decisions. `rocky audit --for <table|run|plan>` assembles the custody chain for one subject: who proposed, what policy decided, what the plan changed, which runs materialized it, and what verification found. A link with no recorded signal renders as `unavailable`. Rocky never fabricates a value.
+`rocky audit` lists the decisions. `rocky audit --for <table|run|plan>` assembles the custody chain for one subject: who proposed, what policy decided, what the plan changed, which runs materialized it, and what verification found. A link with no recorded signal renders as `unavailable`. Rocky never fabricates a value. The ledger is evidence, not enforcement, and is only as safe as your state store.
 
 Ledger tables: `engine/crates/rocky-core/src/state.rs`. Command:
 `engine/crates/rocky-cli/src/commands/audit.rs`. Reading the ledger without
@@ -109,9 +109,7 @@ Rocky: [Verify a Run Without Rocky](/guides/verify-a-run/).
 
 ## Byte-identical replay
 
-**One write path only.** On the content-addressed write path (S3-backed Delta/UniForm), Rocky names each output Parquet file after the BLAKE3 hash of its own bytes and records the hash in the ledger. An engine test pins that the writer is byte-stable across runs. There, `rocky replay --execute --verify` re-derives a past run and compares hashes.
-
-A general run against DuckDB, Databricks, Snowflake or BigQuery records less: recipe identity for successful materializations, and SQL hashes and row counts only when the execution path supplies them (a replication copy supplies neither). It emits no hash-named artifacts, so there is no byte-level replay proof. Treat a byte-identical claim as unverified on an adapter until you have run the verification there.
+**One write path only.** On the content-addressed write path (S3-backed Delta/UniForm), Rocky names each output Parquet file after the BLAKE3 hash of its own bytes, records the hash in the ledger, and pins byte-stability with an engine test. There, `rocky replay --execute --verify` re-derives a past run and compares hashes. A general run on DuckDB, Databricks, Snowflake or BigQuery records recipe identity, plus SQL hashes and row counts only when the execution path supplies them (a replication copy supplies neither). It emits no hash-named artifacts, so there is no byte-level replay proof. Treat a byte-identical claim as unverified on an adapter until you have run the verification there.
 
 Scope and walkthrough: [Verify a Run Without Rocky](/guides/verify-a-run/).
 Byte-stability test: `build_parquet_is_byte_stable_across_runs`,

@@ -105,8 +105,3 @@ Every load-bearing claim, in one table. The partial rows are where teams get sur
 | Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. |
 | Declarative governance | Partial | Full on Databricks (Unity Catalog); tags + `GRANT` on Snowflake; label tagging only on BigQuery (grants no-op); no-op on DuckDB. Snowflake reconciles `ALTER … SET TAG`, `GRANT` role grants and retention policy, not workspace binding or masking. |
 | Cross-team / cross-project contract enforcement | Shipped | Producer `rocky publish-ir` → consumer `[imports.<name>]` vendored snapshot → `E030`–`E034` enforced at the consumer's `rocky compile`. |
-
-## Where Rocky sits
-
-- **Databricks LakeFlow** is coupled to the warehouse and free with the platform. Rocky differs on portability across warehouses and on a real compiler with tooling. If neither matters to you, the native option may be enough.
-- **Polaris, Iceberg and Delta** are a catalog and open table formats. Rocky is none of those. It targets them: it writes content-addressed Delta and UniForm that Iceberg-compatible readers consume.

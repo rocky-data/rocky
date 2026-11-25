@@ -50,52 +50,24 @@ Auth, strategies and limits for each warehouse: [Adapters](/reference/configurat
 
 ## Monorepo
 
-```
-rocky-data/
-├── engine/                  # Rust CLI + engine (this section)
-├── sdk/python/              # rocky-sdk: typed Python client over the rocky CLI
-├── integrations/dagster/    # dagster-rocky (thin adapter over rocky-sdk)
-├── editors/vscode/          # VS Code extension (LSP client)
-├── examples/playground/     # POC catalog + benchmarks
-└── docs/                    # Documentation site (Astro + Starlight)
-```
-
-The playground catalog currently ships {pocCounts.total} POCs across {pocCounts.categoryCount} categories. See the [playground guide](/guides/playground/).
+`engine/` (Rust CLI and engine, this section), `sdk/python/` (`rocky-sdk`, a typed Python client over the CLI), `integrations/dagster/` (`dagster-rocky`, a thin adapter over `rocky-sdk`), `editors/vscode/` (LSP client), `examples/playground/` (POC catalog and benchmarks) and `docs/` (Astro + Starlight). The playground catalog ships {pocCounts.total} POCs across {pocCounts.categoryCount} categories: see the [playground guide](/guides/playground/).
 
 ## Crate overview
 
-The 32 crates under `engine/crates/`, the two binary crates, and the browser UI:
+The crates are the adapters above plus the crates below, the two binary crates (`rocky/`, the CLI, and `rocky-lsp/`, the `rocky lsp` language server) and `ui/` (the React browser UI that `rocky serve --ui` embeds).
 
-```
-engine/
-├── crates/
-│   ├── rocky-ir/            # Typed IR (ModelIr, MaterializationStrategy)
-│   ├── rocky-core/          # Generic SQL transformation engine
-│   ├── rocky-secret-registry/  # Prints resolved ${VAR} values as ${NAME}
-│   ├── rocky-core-compiletest/  # Compile-fail (trybuild) guards for rocky-core
-│   ├── rocky-cli-compiletest/   # Compile-fail guard: rocky-cli's plan writers stay crate-private
-│   ├── rocky-catalog-core/  # Catalog client abstraction (Iceberg REST, Unity Catalog, Polaris, Nessie)
-│   ├── rocky-sql/           # SQL parsing + typed AST
-│   ├── rocky-lang/          # Rocky DSL parser (.rocky files)
-│   ├── rocky-compiler/      # Type checking + semantic analysis
-│   ├── rocky-adapter-sdk/   # Adapter SDK + conformance tests
-│   ├── rocky-databricks/ rocky-snowflake/ rocky-bigquery/ rocky-trino/
-│   ├── rocky-postgres/ rocky-sqlserver/ rocky-clickhouse/ rocky-spark/
-│   ├── rocky-fivetran/ rocky-airbyte/ rocky-iceberg/ rocky-duckdb/
-│   ├── rocky-engine/        # Local execution engine (DuckDB-backed)
-│   ├── rocky-server/        # HTTP server support (auth, jobs, UI guard) + LSP server
-│   ├── rocky-cache/         # Three-tier caching
-│   ├── rocky-ai/            # AI intent layer
-│   ├── rocky-fulfill/       # Fulfillment loop behind `rocky fulfill` (experimental)
-│   ├── rocky-mcp/           # MCP server backing `rocky mcp`
-│   ├── rocky-verify/        # Standalone offline verifier for rocky-manifest attestations
-│   ├── rocky-observe/       # Observability
-│   ├── rocky-wasm/          # WebAssembly exports for browser/edge
-│   └── rocky-cli/           # CLI framework, `/api/v1` routes, Dagster Pipes
-├── rocky/                   # Binary crate (the `rocky` CLI)
-├── rocky-lsp/               # Binary crate (the `rocky lsp` language server)
-└── ui/                      # Browser UI (React), embedded by `rocky serve --ui`
-```
+| Crate | Job |
+|---|---|
+| `rocky-ir`, `rocky-core`, `rocky-sql`, `rocky-lang`, `rocky-compiler` | Typed IR, generic engine, SQL parsing, DSL parser, type checking (detailed below) |
+| `rocky-adapter-sdk` | Adapter SDK and conformance tests |
+| `rocky-catalog-core` | Catalog client abstraction (Iceberg REST, Unity Catalog, Polaris, Nessie) |
+| `rocky-secret-registry` | Prints resolved `${VAR}` values as `${NAME}` |
+| `rocky-core-compiletest`, `rocky-cli-compiletest` | Compile-fail (trybuild) guards: for `rocky-core`, and that `rocky-cli`'s plan writers stay crate-private |
+| `rocky-engine`, `rocky-server`, `rocky-cache`, `rocky-ai`, `rocky-observe`, `rocky-cli` | Described below |
+| `rocky-fulfill` | Fulfillment loop behind `rocky fulfill` (experimental) |
+| `rocky-mcp` | MCP server backing `rocky mcp` |
+| `rocky-verify` | Standalone offline verifier for rocky-manifest attestations |
+| `rocky-wasm` | WebAssembly exports for browser and edge |
 
 ### rocky-ir
 

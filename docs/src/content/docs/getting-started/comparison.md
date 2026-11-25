@@ -5,38 +5,19 @@ sidebar:
   order: 4.5
 ---
 
-This page lists what Rocky does next to what SQLMesh, Coalesce, and Dataform do.
-Features verified against official documentation and source code as of July
-2026. Read the tables to find one feature. Read the notes under a table for the
-detail a Yes/No cell cannot carry.
+This page lists what Rocky does next to what SQLMesh, Coalesce and Dataform do, verified against official documentation and source code as of July 2026. Notes under a table carry detail a Yes/No cell cannot.
 
 ## How Rocky relates to the tools around it
 
-**SQLMesh.** SQLMesh is the tool Rocky most resembles. It also analyzes SQL
-statically, using SQLGlot, with no templating layer. SQLMesh pioneered several
-primitives Rocky shares: virtual data environments, plan/apply with
-breaking-change classification, and column-level lineage. Rocky does not claim
-those as differentiators.
+**SQLMesh** is the tool Rocky most resembles. It also analyzes SQL statically, using SQLGlot, with no templating layer. It pioneered primitives Rocky shares: virtual data environments, plan/apply with breaking-change classification and column-level lineage. Rocky does not claim those as differentiators.
 
-Rocky differs on the enforcement plane. It ships declarative governance in the
-open-source build (roles, masking, and classification, deepest on Databricks).
-It ships `[budget]` blocks that fail the build on overspend. Neither is in
-SQLMesh OSS. Rocky also detects source-schema drift, the case a code-diff plan
-cannot see. A column type changes in the warehouse, under a model that is
-already materialized. And `P001` flags warehouse-specific SQL at PR time, where
-SQLMesh instead transpiles between dialects with SQLGlot. That is a different
-bet, not a worse one.
+Rocky differs on the enforcement plane. It ships declarative governance in the open-source build (roles, masking and classification, deepest on Databricks) and `[budget]` blocks that fail the build on overspend. Neither is in SQLMesh OSS. Rocky also detects source-schema drift, which a code-diff plan cannot see: a column type changes in the warehouse under an already materialized model. `P001` flags warehouse-specific SQL at PR time, where SQLMesh transpiles between dialects with SQLGlot. That is a different bet, not a worse one.
 
-Be clear about where SQLMesh leads. It has more years, more funding, and more
-adoption. It ships native Python models and an open-source CI/CD bot. Its
-virtual environments are more proven than Rocky's schema-prefix branches. Rocky
-keeps SQL as the default surface; SQLMesh leans Python-first.
+SQLMesh leads on years, funding and adoption. It ships native Python models and an open-source CI/CD bot, and its virtual environments are more proven than Rocky's schema-prefix branches. Rocky keeps SQL as the default surface; SQLMesh leans Python-first.
 
 **Warehouse-native pipelines (Databricks LakeFlow, Snowflake Dynamic Tables).** These are coupled to one warehouse and come free with the platform. Rocky stays warehouse-neutral and ships a compiler. Leaving Rocky is one command: `rocky emit-sql` renders plain runnable SQL. See [No lock-in](/guides/no-lock-in/).
 
-**Observability tools (Datafold, Monte Carlo, Anomalo).** These are not
-competitors. Rocky prevents what they detect. They stay useful for the failure
-modes Rocky does not model. Integrate them, do not replace them.
+**Observability tools (Datafold, Monte Carlo, Anomalo)** are not competitors. Rocky prevents what they detect, and they stay useful for the failure modes Rocky does not model. Integrate them.
 
 ## Architecture
 
@@ -65,9 +46,7 @@ modes Rocky does not model. Integrate them, do not replace them.
 
 ## Materialization Strategies
 
-A materialization strategy decides how Rocky writes a model's rows: replace the
-table, append to it, merge into it, or something else. See
-[glossary](/reference/glossary/).
+A materialization strategy decides how Rocky writes a model's rows. See the [glossary](/reference/glossary/).
 
 | Strategy | Rocky | SQLMesh | Coalesce | Dataform |
 |---|:---:|:---:|:---:|:---:|
@@ -82,10 +61,7 @@ table, append to it, merge into it, or something else. See
 | Microbatch | Yes | No | No | No |
 | Delete+Insert | Yes | No | No | No |
 
-**Rocky-unique:** Time Interval materialization runs one execution per
-partition. `--lookback` re-reads recent partitions for late-arriving data,
-`--missing` finds gaps, and `--parallel N` processes partitions concurrently.
-Dynamic Tables (Snowflake) refresh on a declared lag.
+**Rocky-unique:** Time Interval runs one execution per partition. `--lookback` re-reads recent partitions for late data, `--missing` finds gaps, and `--parallel N` processes partitions concurrently. Dynamic Tables (Snowflake) refresh on a declared lag.
 
 ## Type Checking & Compilation
 
@@ -100,19 +76,9 @@ Dynamic Tables (Snowflake) refresh on a declared lag.
 | SELECT * expansion | **Yes** | Yes |
 | Parallel type checking | **Yes** | No |
 
-**Rocky:** a contract (a declared promise about a model's columns and their
-types) holds inside a project and across teams. `rocky publish-ir` writes a
-snapshot of one project's compiled types to a JSON file. A consuming project
-vendors that file and points at it from an `[imports.<name>]` block. The
-consumer's own `rocky compile` then fails when the producer breaks a column the
-consumer reads: `E030` for a dropped column, `E031` for a narrowed type, `E032`
-for a nullability change. `rocky imports update` is how a consumer accepts a
-reviewed change.
+**Rocky:** a contract (a declared promise about a model's columns and types) holds inside a project and across teams. `rocky publish-ir` writes a snapshot of one project's compiled types to a JSON file. A consuming project vendors it through an `[imports.<name>]` block, and its own `rocky compile` fails when the producer breaks a column the consumer reads: `E030` dropped column, `E031` narrowed type, `E032` nullability change. `rocky imports update` accepts a reviewed change.
 
 ## Column-Level Lineage
-
-Lineage traces where each output column came from, through every transformation
-between the source and the model.
 
 | Feature | Rocky | SQLMesh |
 |---|:---:|:---:|
@@ -123,11 +89,7 @@ between the source and the model.
 
 ## Schema Drift Detection
 
-Drift is a change to a source table that nobody declared: a new column, a
-dropped column, or a type that widened. Rocky detects drift automatically at
-run time, widens types where widening is safe, and grades its response to the
-severity of the change. Shadow mode runs the new shape beside the old one so you
-can compare before you commit. SQLMesh ships none of these four.
+Drift is an undeclared change to a source table: a new column, a dropped column or a widened type. Rocky detects it at run time, widens types where that is safe, and grades its response to the severity. Shadow mode runs the new shape beside the old one for comparison. SQLMesh ships none of these four.
 
 ## IDE / Language Server
 
@@ -176,10 +138,7 @@ Rocky generates surrogate keys; SQLMesh does not. A [`[[surrogate_key]]`](/refer
 
 ## Governance
 
-Rocky manages the warehouse objects around your models, which SQLMesh leaves to
-you. It creates and lifecycles catalogs, declares roles and issues
-the `GRANT` statements for them, isolates workspaces, and supports multi-tenant layouts.
-SQLMesh ships none of these five.
+Rocky manages the warehouse objects around your models, which SQLMesh leaves to you: it creates and lifecycles catalogs, declares roles and issues their `GRANT` statements, isolates workspaces and supports multi-tenant layouts. SQLMesh ships none of these five.
 
 ## Provenance & Agent Governance
 
@@ -197,32 +156,9 @@ The warehouse platforms govern the adjacent layer: Databricks Unity AI Gateway a
 | Test generation | **Yes** | No | No |
 | Agent authoring surface | **MCP (31 tools)** | No | No |
 
-## CLI Commands
-
-| Command | Rocky | SQLMesh |
-|---|:---:|:---:|
-| Init / compile / run / test | Yes | Yes |
-| Source discovery | **Yes** | No |
-| Schema drift check | **Yes** | No |
-| Cost analysis | **Yes** | No |
-| AI generation | **Yes** | No |
-| dbt migration | **Yes** | Yes |
-| Migration validation | **Yes** | No |
-| Shadow comparison | **Yes** | No |
-| Quality metrics + trends | **Yes** | No |
-| Storage profiling | **Yes** | No |
-| Partition archival | **Yes** | No |
-| Table compaction | **Yes** | No |
-| Benchmarks | **Yes** | No |
-| HTTP API / LSP | **Yes** | Yes |
-| Hook management | **Yes** | No |
-| **Total** | **70+** | ~20 |
-
 ## Performance
 
-Rocky compiles 10,000 models in about one second and holds peak memory near
-150 MB. See [benchmarks](/getting-started/benchmarks/) for the full numbers, the
-methodology, and the commands to reproduce them.
+Rocky compiles 10,000 models in about one second and holds peak memory near 150 MB. See [benchmarks](/getting-started/benchmarks/).
 
 ## Where each tool excels
 
