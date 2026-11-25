@@ -7,7 +7,7 @@ sidebar:
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-The [playground](/guides/playground/) runs on local DuckDB and needs no credentials. To run against a real warehouse, you swap one block: the `[adapter]` definition. Your tables stay in your warehouse. Rocky connects over the warehouse API and sends it SQL.
+The [playground](/guides/playground/) runs on local DuckDB with no credentials. To run against a real warehouse, swap the `[adapter]` block. Your tables stay in the warehouse. Rocky connects over its API and sends SQL.
 
 ## Name an adapter, then point a pipeline at it
 
@@ -22,7 +22,7 @@ type = "databricks"   # or "snowflake", "bigquery"
 adapter = "prod"
 ```
 
-Connection fields use `${VAR}` substitution, so no secret lands in the file. Export the variables in your shell or in CI. You can then commit `rocky.toml` safely.
+Connection fields use `${VAR}` substitution, so no secret lands in the file. Export the variables in your shell or CI.
 
 ## Configure the adapter
 
@@ -212,7 +212,7 @@ Databricks is GA (live-tested). PostgreSQL is tested live against PostgreSQL 16.
 
 ## Run against it
 
-Configure the adapter, export the environment variables, then run these four commands in order. Each one costs more than the one before it, so a failure stops you early:
+Export the environment variables, then run these in order. Each costs more than the last, so a failure stops you early:
 
 ```bash
 rocky validate          # config + adapter wiring; no network calls
@@ -221,9 +221,7 @@ plan_id=$(rocky plan --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 
-`rocky doctor` tells you which adapter Rocky can reach before you spend any warehouse time. `rocky plan` compiles the models and writes a plan; `rocky apply` executes that plan against the warehouse.
-
-For a replication pipeline, scope the run with `--filter`. For example, `rocky plan --filter tenant=acme` plans one tenant.
+`rocky plan` compiles the models and writes a plan. `rocky apply` executes it. For a replication pipeline, scope the run with `--filter`, for example `rocky plan --filter tenant=acme`.
 
 Each adapter has its own reference page for fields, authentication, and examples: [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [PostgreSQL](/reference/adapters/postgres/), [Redshift](/reference/adapters/redshift/), [ClickHouse](/reference/adapters/clickhouse/), [SQL Server](/reference/adapters/sqlserver/), [Spark](/reference/adapters/spark/), [Fivetran](/reference/adapters/fivetran/). The fields every adapter type shares are in [Configuration](/reference/configuration/#adaptername). Databricks auth detail is in [Authentication](/reference/authentication/).
 

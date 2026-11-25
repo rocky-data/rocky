@@ -5,13 +5,13 @@ sidebar:
   order: 3
 ---
 
-These commands use an AI model to draft, reconcile, explain and test Rocky models, and to draft contracts. The generating commands need an AI provider: Rocky reads `ANTHROPIC_API_KEY` from the environment. `rocky mcp` serves the same abilities, and more, to an agent. None of them materializes anything on its own: a person still runs `rocky apply`.
+These commands use an AI model to draft, reconcile, explain and test models, and to draft contracts. They read `ANTHROPIC_API_KEY` from the environment. `rocky mcp` serves the same abilities to an agent. None of them materializes anything: a person runs `rocky apply`.
 
 ---
 
 ## `rocky ai`
 
-Generate a model from a natural language description and write **both the body file and a matching `.toml` sidecar** to the models directory. The emitted sidecar carries the materialization strategy and target coordinates, so Rocky's model loader picks the generated model up on the next `rocky apply` without manual editing.
+Generate a model from a natural language description. Rocky writes the body file and a matching `.toml` sidecar (strategy and target) to the models directory, so the next `rocky apply` loads it with no manual edit.
 
 ```bash
 rocky ai <intent> [flags]
@@ -30,13 +30,9 @@ rocky ai <intent> [flags]
 | `--format <FORMAT>` | `string` | `rocky` | Output format: `rocky` (`.rocky` body + `.toml` sidecar) or `sql` (`.sql` body + `.toml` sidecar). |
 | `--models <PATH>` | `string` | `models` | Models directory. Used both to ground the prompt in real schemas and as the destination directory for the emitted body + sidecar. |
 | `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh` or `merge`. Two values fail before any LLM call: `incremental`, because on a transformation model it re-inserts every row on each run (`E037`), and `ephemeral`, because a new model has no consumer to inline it into. |
-| `--unique-key <COLUMNS>` | `string` | | Upsert key for `--materialization=merge`. Maps to `[strategy].unique_key` (an array) in the sidecar. Accepts a comma-separated list (`--unique-key id,created_at`) or repeated flags. Required when materialization is `merge`; the emitted sidecar is incomplete without it. |
+| `--unique-key <COLUMNS>` | `string` | | Upsert key for `--materialization=merge`. Maps to `[strategy].unique_key` (an array) in the sidecar. Accepts a comma-separated list (`--unique-key id,created_at`) or repeated flags. Required with `merge`: without it the sidecar is incomplete and `rocky run` rejects it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table` and `content_addressed` are not offered. |
 | `--target <FQN>` | `string` | `generated.ai.<name>` | Target table coordinates as `catalog.schema.table`. Written into the sidecar `[target]` block. |
 | `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
-
-:::note[Merge requires `--unique-key`]
-Pass `--unique-key <columns>` alongside `--materialization merge` to write the upsert key into the sidecar's `[strategy].unique_key`. Omitting it emits an incomplete sidecar that `rocky run` rejects until you fill in `unique_key` by hand. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization`: they need richer flag plumbing or live in the IR-only surface.
-:::
 
 ### Examples
 
@@ -53,7 +49,7 @@ rocky ai "monthly revenue by customer, joining orders and refunds"
   "intent": "monthly revenue by customer, joining orders and refunds",
   "format": "rocky",
   "name": "fct_monthly_revenue_by_customer",
-  "source": "from stg_orders\njoin stg_refunds on order_id {\n    keep stg_refunds.refund_amount\n}\nderive {\n    revenue_month: date_trunc('month', order_date),\n    net_revenue: total_amount - coalesce(refund_amount, 0)\n}\ngroup customer_id, revenue_month {\n    customer_id,\n    revenue_month,\n    net_revenue: sum(net_revenue)\n}",
+  "source": "from stg_orders\njoin stg_refunds ...",
   "attempts": 1,
   "body_path": "models/fct_monthly_revenue_by_customer.rocky",
   "sidecar_path": "models/fct_monthly_revenue_by_customer.toml"
@@ -83,15 +79,7 @@ schema = "marts"
 table = "fct_orders_daily"
 ```
 
-`--materialization incremental` fails before any LLM call, with:
-
-> --materialization incremental is not supported: on a transformation model it re-inserts every row on each run (E037). Use `merge` with --unique-key, or `full_refresh`
-
-`--materialization ephemeral` fails the same way, with:
-
-> --materialization ephemeral is not offered: an ephemeral model builds nothing on its own — it is inlined into the models that read it, and a newly generated model has none yet. Use `view`, or `full_refresh`
-
-`--watermark` no longer exists. Passing it is an argument error.
+`--materialization incremental` and `--materialization ephemeral` fail before any LLM call, with the reasons in the flag table. `--watermark` does not exist: passing it is an argument error.
 
 Generate raw SQL instead (still emits both `.sql` body and `.toml` sidecar):
 
@@ -99,22 +87,7 @@ Generate raw SQL instead (still emits both `.sql` body and `.toml` sidecar):
 rocky ai "top 10 customers by lifetime value" --format sql
 ```
 
-The `source` field then contains standard SQL using bare model references (resolved by the compiler against project models):
-
-```sql
-SELECT
-  customer_id,
-  SUM(total_amount) AS lifetime_value,
-  COUNT(DISTINCT order_id) AS total_orders,
-  MIN(order_date) AS first_order,
-  MAX(order_date) AS last_order
-FROM stg_orders
-GROUP BY customer_id
-ORDER BY lifetime_value DESC
-LIMIT 10
-```
-
-Rocky generates plain SQL: no Jinja, no templating. `stg_orders` is resolved by the compiler to the project model of that name.
+With `--format sql`, `source` holds plain SQL (no Jinja, no templating) with bare model references that the compiler resolves against project models.
 
 ### Related Commands
 
@@ -126,7 +99,7 @@ Rocky generates plain SQL: no Jinja, no templating. `stg_orders` is resolved by 
 
 ## `rocky ai-sync`
 
-Detect schema changes in upstream sources and propose intent-guided model updates. Compares the current state of source schemas against what models expect and suggests SQL modifications that preserve each model's declared intent.
+Detect schema changes in upstream sources and propose model updates that keep each model's declared intent.
 
 ```bash
 rocky ai-sync [flags]
@@ -164,21 +137,9 @@ rocky ai-sync
 }
 ```
 
-Each proposal carries a unified `diff` (ready to show in a review UI) plus the full `proposed_source` (ready to write if you apply). The sync command is dry-run by default.
+Each proposal carries a unified `diff` and the full `proposed_source`. The command is a dry run by default.
 
-Sync a specific model and apply changes:
-
-```bash
-rocky ai-sync --model fct_revenue --apply
-```
-
-Same output shape. `--apply` writes `proposed_source` to disk after the proposal passes the compile-verify loop.
-
-Only check models that have intent metadata:
-
-```bash
-rocky ai-sync --with-intent --models src/models
-```
+`--model fct_revenue --apply` syncs one model and writes `proposed_source` to disk after the proposal passes the compile-verify loop. `--with-intent --models src/models` checks only models that have intent metadata.
 
 ### Related Commands
 
@@ -190,7 +151,7 @@ rocky ai-sync --with-intent --models src/models
 
 ## `rocky ai-explain`
 
-Generate natural language intent descriptions from existing model SQL. Analyzes the SQL logic and produces human-readable descriptions of what each model does, which can be saved to the model's TOML sidecar for use by `ai-sync`.
+Generate plain-language intent descriptions from model SQL. Save them to the model's TOML sidecar for `ai-sync`.
 
 ```bash
 rocky ai-explain [model] [flags]
@@ -232,29 +193,7 @@ rocky ai-explain fct_revenue
 }
 ```
 
-Explain all models without intent and save to TOML:
-
-```bash
-rocky ai-explain --all --save
-```
-
-```json
-{
-  "version": "1.30.0",
-  "command": "ai-explain",
-  "explanations": [
-    { "model": "fct_revenue",   "intent": "Calculates monthly net revenue per customer by joining orders with refunds.", "saved": true },
-    { "model": "dim_customers", "intent": "Customer dimension combining profile data with computed lifetime metrics.",  "saved": true },
-    { "model": "fct_orders",    "intent": "Order fact table enriched with customer and product dimensions.",             "saved": true }
-  ]
-}
-```
-
-Explain models from a custom directory:
-
-```bash
-rocky ai-explain fct_revenue --models src/transformations
-```
+`rocky ai-explain --all --save` explains every model without intent and sets `saved: true` on each entry. `--models <PATH>` selects another directory.
 
 ### Related Commands
 
@@ -308,15 +247,6 @@ rocky ai-test fct_revenue
           "description": "Net revenue should never be negative after refunds",
           "sql": "SELECT COUNT(*) FROM fct_revenue WHERE net_revenue < 0"
         },
-        {
-          "name": "customer_id_not_null",
-          "description": "Every revenue row must have a customer",
-          "sql": "SELECT COUNT(*) FROM fct_revenue WHERE customer_id IS NULL"
-        },
-        {
-          "name": "no_duplicate_customer_months",
-          "description": "Each customer should have at most one row per month",
-          "sql": "SELECT COUNT(*) FROM (SELECT customer_id, revenue_month, COUNT(*) AS cnt FROM fct_revenue GROUP BY 1, 2 HAVING cnt > 1)"
         }
       ]
     }
@@ -326,31 +256,7 @@ rocky ai-test fct_revenue
 
 Each test is an assertion query: it passes when the query returns 0 rows. Rocky's test SQL references models by bare name (no Jinja), matching how the compiler resolves refs.
 
-Generate and save tests for all models (`saved: true` per model, full test bodies elided here):
-
-```bash
-rocky ai-test --all --save
-```
-
-```json
-{
-  "version": "1.30.0",
-  "command": "ai-test",
-  "results": [
-    { "model": "fct_revenue",   "saved": true, "tests": [ /* 3 assertions */ ] },
-    { "model": "dim_customers", "saved": true, "tests": [ /* 2 assertions */ ] },
-    { "model": "fct_orders",    "saved": true, "tests": [ /* 4 assertions */ ] }
-  ]
-}
-```
-
-With `--save`, each assertion is written out as a `.sql` file under `tests/` (one file per model) so `rocky test` picks them up.
-
-Generate tests from a custom models directory:
-
-```bash
-rocky ai-test fct_revenue --models src/transformations --save
-```
+With `--all --save`, each model's assertions are written as one `.sql` file under `tests/`, and `rocky test` picks them up. `--models <PATH>` selects another directory.
 
 ### Related Commands
 
@@ -417,12 +323,11 @@ The server is **stateless**: every tool call resolves the project from the confi
 
 ### Local and bring-your-own-key
 
-`rocky mcp` runs entirely **locally against your own infrastructure**. There is no Rocky-hosted service:
+`rocky mcp` runs locally. There is no Rocky-hosted service.
 
-- Warehouse-touching tools hit **your own warehouse** with the credentials in your `rocky.toml`.
-- The draft generators call the Anthropic API using **your own `ANTHROPIC_API_KEY`** from the server environment. Without the key set, those tools return a null/empty draft and a `message` explaining why.
-
-What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema to **your own** Anthropic key, and for `ai_contract` only aggregate column counts (row / null / distinct), **never raw cell values**.
+- Warehouse-touching tools use the credentials in your `rocky.toml`.
+- The draft generators call the Anthropic API with your own `ANTHROPIC_API_KEY` from the server environment. Without it, those tools return an empty draft and a `message` that says why.
+- The generators send your model's SQL and schema to your key. `ai_contract` sends only aggregate column counts (row, null, distinct), never raw cell values.
 
 ### Safety model: the server does not materialize
 
@@ -531,22 +436,10 @@ The server also exposes MCP prompts that orchestrate the tools above into a guid
 
 ### Examples
 
-Start the server against the default config:
-
 ```bash
-rocky mcp
-```
-
-Start it against a specific project config:
-
-```bash
-rocky mcp --config pipelines/prod.toml
-```
-
-Register it with an MCP client (Claude Code example):
-
-```bash
-claude mcp add rocky -- rocky mcp --config rocky.toml
+rocky mcp                                          # default config
+rocky mcp --config pipelines/prod.toml             # a specific project
+claude mcp add rocky -- rocky mcp --config rocky.toml   # register with Claude Code
 ```
 
 ### Related Commands

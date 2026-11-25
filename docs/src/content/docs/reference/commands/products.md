@@ -105,15 +105,15 @@ The marker lives in the replicated state table `product_volume_breaches` (state 
 
 With a remote state backend, the marker reaches other machines the way the rest of the run's state does:
 
-- A run that opens, widens, narrows or clears a marker must upload its state, whatever `on_upload_failure` says. If that upload fails, the run fails with `refusing to exit 0`, so a marker never lives only in a local file a pod can lose. A run that stops on an error after the change still uploads, best effort, and an interrupted run that opened a marker exits non-zero, not 130, when that upload fails. A run that changes no marker keeps the configured `on_upload_failure`.
-- When the state download fails, an ungoverned run continues on its local file, as for every other state table. Its upload is then skipped. If that run opens a marker, the run fails and says the marker was not replicated: rerun once the backend is reachable. A governed run (`rocky apply`) with a `[policy]` block refuses the run instead.
-- The same run cannot see a marker another machine opened. So every output whose product declares an `error` range is held, as if a marker covered the whole output. A run of a downstream model alone withholds it. A build of the output passes only if it rebuilt the whole table in range (a first run, `--full-refresh`, or a drift rebuild). An incremental, merge or `time_interval` load in range stays held, because it says nothing about the rows a remote marker covers. The same holds when the local store was recreated for a newer schema (`on_schema_mismatch = "recreate"`). A `warning` range is not held, so a range lowered from `error` to `warning` while a remote marker is open is not held either.
+- A run that opens, widens, narrows or clears a marker must upload its state, whatever `on_upload_failure` says. If the upload fails, the run fails with `refusing to exit 0`, so a marker never lives only in a local file. A run that stops on an error after the change still uploads, best effort. An interrupted run that opened a marker exits non-zero, not 130, when that upload fails. A run that changes no marker keeps the configured `on_upload_failure`.
+- When the state download fails, an ungoverned run continues on its local file and skips its upload. If that run opens a marker, it fails and says the marker was not replicated: rerun once the backend is reachable. A governed run (`rocky apply`) with a `[policy]` block refuses instead.
+- A run cannot see a marker another machine opened, so every output whose product declares an `error` range is held, as if a marker covered the whole output. A downstream model run alone is withheld. A build of the output passes only if it rebuilt the whole table in range (a first run, `--full-refresh` or a drift rebuild). An in-range incremental, merge or `time_interval` load stays held. The same holds when the local store was recreated for a newer schema (`on_schema_mismatch = "recreate"`). A `warning` range is never held.
 - Without conditional writes (`concurrency_control = "off"`, or Valkey), a concurrent run's upload can still overwrite an uploaded marker. Use `concurrency_control = "cas"` where runs overlap.
 - `rocky product clear-breach` uploads with a conditional write on S3, GCS and the tiered backend, so a run that started before the clear cannot put the marker back: its own upload fails with a conflict. Valkey, and any backend with `concurrency_control = "off"`, has no conditional write. There, clear a breach while no run is in flight. `clear-breach` warns about this.
 
-A marker is enforced only while the product still declares a range for that output model. If the range is removed or the output model renamed, the marker holds nothing, but `rocky product status` still lists it; delete it with `clear-breach`. A marker that covers the whole output stays when the model changes to `time_interval`, and only `clear-breach` removes it. A severity lowered to `warning` keeps an open marker until a rebuild or `clear-breach`. A backfill (`rocky apply` of a backfill plan) neither judges, clears nor enforces markers.
+A marker is enforced only while the product still declares a range for that output model. If the range is removed or the model renamed, the marker holds nothing but `rocky product status` still lists it: delete it with `clear-breach`. A whole-output marker stays when the model becomes `time_interval`. A severity lowered to `warning` keeps an open marker until a rebuild or `clear-breach`. A backfill (`rocky apply` of a backfill plan) neither judges, clears nor enforces markers.
 
-A `warning` breach opens no marker, and neither does a count that was not evaluated. A marker that is already open still holds the model when a later run is `not_evaluated`. A shadow or branch run neither reads nor writes markers. A run that does not build a held output model, such as `rocky run --model <downstream>`, withholds every model downstream of it, with the same message. Those models do not build over the breached rows. A cancel after the write does not skip the count, so a breach that a cancelled run wrote still opens its marker.
+A `warning` breach opens no marker, and neither does a count that was not evaluated. A marker that is already open still holds the model when a later run is `not_evaluated`. A shadow or branch run neither reads nor writes markers. A run that does not build a held output model, such as `rocky run --model <downstream>`, withholds every model downstream of it. A cancel after the write does not skip the count, so a cancelled run's breach still opens its marker.
 
 ### `rocky product clear-breach`
 
@@ -216,20 +216,21 @@ Lowering runs in two phases because the drafting tool rewrites the model sidecar
 
 The command picks the phase itself: Phase A on a fresh product, Phase B once `models/<model>.toml` exists. Re-running is safe — the merge is idempotent.
 
-Every generation commits through staged same-directory writes, journaled, with the lowering manifest renamed **last** as the commit marker. The next run recovers from the journal. If the marker landed, the new generation stands and the staging files are cleaned up. If it did not, the previous generation is restored exactly. The journal is treated as untrusted input during recovery — forged, traversing, symlinked, or foreign entries are refused before anything mutates.
+Every generation commits through staged, journaled writes in the same directory. The lowering manifest is renamed last, as the commit marker. The next run recovers from the journal, which it treats as untrusted: forged, traversing, symlinked or foreign entries are refused before anything changes.
 
-Recovery reads the marker first. If it cannot read it at all — a permission fault, a link swapped in — it changes nothing and fails with `commit-io`, because rolling back there would restore backups over a commit that may have succeeded.
+Recovery reads the marker first:
 
-If the marker says the generation **committed**, recovery finishes the job: it deletes each `.ff-staged` and `.ff-prev` sibling and keeps the new files. It does not inspect them, so an orphan `.ff-prev` is removed rather than questioned.
+| Marker | Recovery |
+|---|---|
+| Unreadable (a permission fault, a swapped link) | Changes nothing and fails with `commit-io`, because a rollback could restore backups over a commit that succeeded. |
+| Committed | Deletes each `.ff-staged` and `.ff-prev` sibling and keeps the new files, without inspecting them. |
+| Not committed | Restores the previous generation. |
 
-If the marker says it did **not** commit, recovery restores the previous generation, and refuses instead of guessing in two cases. Each keeps the journal, so the next run asks the same question:
+A restore refuses, and keeps the journal, in two cases. A `.ff-prev` backup the journal does not record fails with `commit-unexpected-backup`, naming the file to inspect. A new file that recovery cannot read is left alone, with `commit-io`.
 
-- A `.ff-prev` backup exists that the journal does not record. Rocky will not restore a backup it did not create, and fails with `commit-unexpected-backup` naming the file to inspect.
-- A new file is in place that recovery cannot read to identify. It is left alone, with `commit-io`.
+A restore reads every recorded backup first, writes the bytes to a new synced file and renames that over the final. It never renames the backup itself. On Unix a backup that is a symlink or has a second hard link is refused with `commit-io`, and nothing is restored. A crash during a restore leaves the backup and journal, so the next run repeats it.
 
-A restore reads every recorded `.ff-prev` backup before it changes anything. It writes the bytes it read to a new file, syncs it, and renames that file over the final. It never renames the backup itself into place. On Unix a backup that is a symlink or has a second hard link is refused with `commit-io`, and nothing is restored. A crash during a restore leaves the backup and the journal, so the next run repeats it.
-
-On Unix, `product compile` also refuses a directory it writes into that is itself a symlink, for example `models -> models_real`, with `commit-io` ("taking directory custody for the commit failed"). This holds even when the link points inside the project. Replace the link with the real directory.
+On Unix, `product compile` also refuses to write into a directory that is itself a symlink (such as `models -> models_real`), even when the link points inside the project. It fails with `commit-io` ("taking directory custody for the commit failed"). Replace the link with the real directory.
 
 If an approval exists, compile re-verifies the snapshot's bytes against the approval digest before doing anything. A mismatch is tamper, and nothing proceeds.
 

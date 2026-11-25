@@ -10,30 +10,15 @@ server. It exposes 31 typed tools that an MCP-capable agent can call to author a
 evolve Rocky models against your real warehouse. Claude Desktop, an IDE assistant,
 or your own client all connect the same way.
 
-This page is the tool-by-tool reference. For the loop an agent runs and the gates
-that check its work, read
-[Operating Rocky with Agents](/concepts/operating-rocky-with-agents/) first.
-
-For the CLI-level `rocky ai` / `ai-sync` / `ai-explain` / `ai-test` commands (a
-separate, non-MCP surface), see [AI Commands](/reference/commands/ai/).
+This page is the tool-by-tool reference. For the loop an agent runs and the gates that check it, read [Operating Rocky with Agents](/concepts/operating-rocky-with-agents/). The `rocky ai` / `ai-sync` / `ai-explain` / `ai-test` CLI commands are a separate surface: see [AI Commands](/reference/commands/ai/).
 
 ## Local, and bring-your-own-key
 
-There is no Rocky-hosted agent and no Rocky-hosted inference. `rocky mcp` is a
-server you run yourself. The boundaries are worth stating plainly:
+There is no Rocky-hosted agent and no Rocky-hosted inference. `rocky mcp` runs on your machine.
 
-- **Your warehouse.** The grounding tools read the same warehouse your
-  `rocky.toml` points at (DuckDB, Snowflake, BigQuery, Databricks, Trino). Rocky
-  is not a proxy in front of it. The server connects directly with your
-  configured credentials.
-- **Your key.** The tools that call a language model need `ANTHROPIC_API_KEY` in
-  the *server's own environment*. Rocky ships no key, bills no inference, and
-  routes no prompt through a Rocky service. Without the key, those tools return
-  empty drafts rather than failing, so the read-only tools keep working.
-- **No vendor egress of your data.** The server runs next to your warehouse. The
-  only place row-derived information leaves your environment is the language-model
-  call you opted into by setting your own key. Even there the payload is
-  constrained (see [What leaves your environment](#what-leaves-your-environment)).
+- **Your warehouse.** The grounding tools connect directly to the warehouse your `rocky.toml` points at (DuckDB, Snowflake, BigQuery, Databricks, Trino) with your credentials. Rocky is not a proxy.
+- **Your key.** Tools that call a language model need `ANTHROPIC_API_KEY` in the *server's own environment*. Rocky ships no key, bills no inference and routes no prompt through a Rocky service. Without the key those tools return empty drafts, and the read-only tools keep working.
+- **No vendor egress.** Row-derived information leaves your environment only in the language-model call you opted into, and that payload is constrained ([below](#what-leaves-your-environment)).
 
 The agent is whatever client you connect. The model is whatever your key points at.
 
@@ -76,9 +61,7 @@ them `catalog`, `history`, `metrics`, `audit_query`, and `review_queue`.
 
 ### Verify and ground (read-only, no LLM)
 
-These reach your project and your warehouse to give an agent the facts it needs
-before it writes anything. None of them change the project or the warehouse, and
-none of them call a language model.
+These give an agent the facts it needs before it writes. None changes the project or the warehouse, and none calls a language model. They let an agent check the data, not just the schema (see [AI authoring workflow](/concepts/ai-intent/)).
 
 | Tool | What it returns |
 |---|---|
@@ -90,10 +73,6 @@ none of them call a language model.
 | `breaking_change` | Classifies a model's change against a base ref as breaking / non-breaking, with findings. |
 | `dependents` | The downstream models that depend on a given model. |
 
-These are how an agent follows the
-[AI authoring workflow](/concepts/ai-intent/) honestly: it checks the data, not
-just the schema. They are the reason an agent can write a correct `WHERE` filter
-or `CAST` against a column it has actually looked at.
 
 ### Preview governance and drift (read-only)
 
@@ -102,8 +81,7 @@ or `CAST` against a column it has actually looked at.
 | `governance_preview` | What masking / classification / grants *would* be applied — without applying them. |
 | `drift_preview` | The schema drift Rocky *would* reconcile on the next run — without reconciling. |
 
-Both are strictly read-only. They show the governed and drift-reconciled shape of
-a change before any plan is proposed, let alone applied.
+Both are read-only. They show the governed and drift-reconciled shape of a change before any plan is proposed.
 
 ### Generators (draft-only, your key)
 
@@ -120,9 +98,7 @@ generator (`ai_contract` ↔ `ai-contract`, `ai_test` ↔ `ai-test`, `explain_mo
 | `explain_model` | A natural-language intent description for a model's SQL. |
 | `suggest_freshness_block` | A `[freshness]` block for a model with temporal columns. |
 
-The output is a proposal to review and write, not an applied change. Hand it to
-the matching write tool below, or write it yourself. With no key set, each
-returns an empty result rather than failing.
+The output is a proposal. Hand it to the matching write tool, or write it yourself. With no key set, each returns an empty result.
 
 ### Write path (draft tools)
 
@@ -138,11 +114,7 @@ rules. A `draft_*` tool never applies a change to the warehouse.
 | `draft_check` | one or more declarative `[[tests]]` blocks merged into the model's sidecar. It infers the target SQL dialect when every pipeline uses the same one; otherwise pass `pipeline` to select one. After the target is applied, call `test` with `declarative = true` to execute the checks. Pass `pipeline` there when the project has multiple pipelines, as with `rocky test --declarative --pipeline`. |
 | `draft_metadata` | a structured freshness / classification patch, parse-merged into the model's sidecar as TOML. `freshness` replaces the `[freshness]` table; `classifications` merges per-column tags into `[classification]`. Comments in the sidecar are dropped on re-serialize; an unparseable sidecar is never overwritten. The policy check runs against the sidecar **as patched**, so a patch that adds the first `pii` tag is judged by that tag. |
 
-The split from the generators is deliberate. The `ai_*` generators *propose*
-content with a language model. The `draft_*` tools *write* content, yours or a
-generator's, through the compiler and your policy rules. A `draft_*` call made
-without its content argument returns a structured error naming the matching
-`ai_*` generator, so the two are never confused.
+A `draft_*` call made without its content argument returns a structured error naming the matching `ai_*` generator.
 
 ### Prompts: pre-written multi-step recipes
 
@@ -200,60 +172,27 @@ tools on the allowlist and end at a hand-off to the trusted runner — never at
 
 ## The gates on the write path
 
-The write path has three gates. No single call passes all three. A `draft_*`
-call passes two: the compiler type-checks what it wrote, then Rocky evaluates
-your `[policy]` rules before the call returns. The third gate is the approval
-marker, and it sits at apply time. `propose` records an AI-authored plan and returns a
-`plan_id`; it executes nothing:
+A `draft_*` call passes two gates: the compiler type-checks what it wrote, then Rocky evaluates your `[policy]` rules before the call returns. The third gate, the approval marker, sits at apply time. `propose` records an AI-authored plan and returns a `plan_id`. It executes nothing.
 
 ```bash
 rocky review <plan_id> --approve    # writes the approval marker
 rocky apply  <plan_id>              # refused until that marker names it
 ```
 
-A bare `rocky apply <plan_id>` on an unapproved AI-authored plan is rejected by
-the engine, not by convention.
-[The three gates](/concepts/operating-rocky-with-agents/#the-three-gates)
-describes all three, including what a `deny` verdict rolls back. The
-[`[policy]` reference](/reference/configuration/#policy) shows how the rules
-are written.
+The engine rejects a bare `rocky apply <plan_id>` on an unapproved AI-authored plan. See [The three gates](/concepts/operating-rocky-with-agents/#the-three-gates).
 
 ## Structured errors
 
-When a tool rejects a request it has parsed, the failure comes back as a stable
-envelope: `{ code, message, remediation_hint, policy_rule? }`. When `propose`
-returns `policy_review_required`, the envelope also carries the recorded plan's
-typed reference — `plan_id`, plus `product_id` / `spec_digest` when the propose
-was product-bound — so a runner reads the handoff from fields, not prose. An
-agent branches
-on the `code` and acts on the `remediation_hint` without scraping text. See
-[Structured errors](/concepts/operating-rocky-with-agents/#structured-errors)
-for the field-by-field contract and a worked example.
+A rejected request comes back as `{ code, message, remediation_hint, policy_rule? }`, with `plan_id`, `product_id` and `spec_digest` on `policy_review_required`. See [Structured errors](/concepts/operating-rocky-with-agents/#structured-errors) for the contract.
 
-One boundary sits below the envelope. A request can fail to parse before the tool
-even runs, because a field is missing or mistyped. That still comes back as a
-tool-result error, never as a transport-level failure. Its content is a plain
-message rather than the envelope. The input schema each tool publishes in
-`tools/list` is what keeps a well-behaved client from sending one.
+One boundary sits below the envelope. A request that fails to parse before the tool runs (a missing or mistyped field) comes back as a tool-result error with a plain message, never as a transport failure. The input schema each tool publishes in `tools/list` keeps a well-behaved client from sending one.
 
 ## What leaves your environment
 
-The grounding and generator tools are deliberately constrained in what they send
-out:
+- **`ai_contract` sends aggregate statistics only**: counts and aggregate column statistics (null rates, distinct counts, ranges), never raw cell values.
+- **`governance_preview`, `drift_preview` and the verify-and-ground tools never call a language model.** `sample_rows` and `profile_column` read your warehouse to inform the *agent*. Whether that reaches a model depends on the client you connect and the prompts you run, under your key.
 
-- **`ai_contract` sends aggregate statistics only.** It profiles the target table
-  and hands the model **counts and aggregate column statistics**, never raw cell
-  values. The contract is drafted from the *shape* of the data (null rates,
-  distinct counts, ranges), not its contents.
-- **`governance_preview` and `drift_preview` are read-only** and never call a
-  language model at all.
-- **The verify and ground tools never call a language model** either.
-  `sample_rows` and `profile_column` read your warehouse to inform the *agent*.
-  Whether any of that reaches a model is governed by the client you connect and
-  the prompts you run, under your key.
-
-The one intended egress is the language-model call you enabled by setting your
-own `ANTHROPIC_API_KEY`.
+The one intended egress is the language-model call you enabled with your own `ANTHROPIC_API_KEY`.
 
 ## Where this sits
 

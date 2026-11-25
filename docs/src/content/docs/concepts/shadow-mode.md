@@ -71,37 +71,17 @@ The two modes answer this differently, and everything below follows from it.
       The next run on that branch replaces them. That is the point.
 ```
 
-An unnamed shadow run is disposable. It creates its objects and drops them when
-it finishes. The run output reports the comparison before cleanup. Nothing
-accumulates, and a second run of the same command starts clean.
+An unnamed shadow run is disposable. It creates its objects and drops them after a completed comparison, whether the verdict is `pass`, `warn`, `fail` or `no_baseline`. A failed verdict makes the run exit non-zero, and the run output keeps the comparison result. A second run starts clean.
 
-Pass `--keep-shadow` when you need a separate `rocky compare`. This keeps the
-objects after the run. The next one-off shadow run still refuses those occupied
-names. Remove the kept objects before you run it again.
+Pass `--keep-shadow` to keep the objects, for a separate `rocky compare` or to inspect a failed comparison. The next one-off shadow run refuses those occupied names, so remove them first.
 
-Rocky drops its shadow objects after a completed comparison, whether the verdict
-is `pass`, `warn`, `fail`, or `no_baseline`. A failed verdict makes the run exit
-non-zero. The run output keeps the comparison result. Use `--keep-shadow` if
-you need to inspect the objects after a failed comparison.
+A model write error or a comparison query error can leave the target's state uncertain. Rocky may keep those objects. The next shadow run refuses the occupied name and prints the `DROP` that clears it.
 
-A model write error or a comparison query error can leave the target's state
-uncertain. Rocky may keep those objects. The next shadow run refuses an occupied
-name and prints the `DROP` that clears it.
+Rocky will not delete an object it did not create. Before writing, it checks every derived shadow target in the warehouse. If one exists, the run is refused and names the object, the model and the `DROP` statement.
 
-Because it drops what it made, it must be sure it made them. So before writing,
-it checks every derived shadow target in the warehouse. If one already exists,
-the run is refused and names the object, the model, and the `DROP` statement
-that would clear it. Rocky will not delete an object it did not create.
+A named branch is a persistent workspace. Its objects survive the run, and the next run on that branch replaces them. Rocky does **not** check them for prior occupancy and tracks no per-object ownership there. Give a branch a namespace nothing else writes to.
 
-A named branch is a persistent workspace. Its objects survive the run so you can
-query them, and the next run on that branch replaces them. Rocky does **not**
-check them for prior occupancy. A branch namespace is yours wholesale, and
-Rocky tracks no per-object ownership there. Give a branch a namespace nothing
-else writes to.
-
-Cleanup is best effort. A drop that fails is reported as a run warning rather
-than failing the run: the comparison already happened, and the answer you came
-for should not be withheld because a leftover table could not be removed.
+Cleanup is best effort. A failed drop is a run warning, not a failure, because the comparison already happened.
 
 ## Models a shadow run refuses
 
@@ -130,10 +110,7 @@ shadow target. This holds whether or not the model declares the dependency in
 `depends_on`. Rocky matches on the upstream's configured
 `catalog.schema.table`, so it redirects a physical read too.
 
-Sometimes a reference could resolve to more than one selected upstream. Two
-models may have targets that share a table name in different catalogs, read as a
-bare or partially qualified name. Rocky refuses the run rather than guess which
-one to read.
+A reference could resolve to more than one selected upstream, for example two targets that share a table name in different catalogs, read by a bare or partial name. Rocky refuses the run rather than guess.
 
 ### Identifier case
 
@@ -148,67 +125,26 @@ Matching follows the warehouse's own rule for identifier case, per component.
 On BigQuery and Snowflake, a model reading `raw.Orders` is **not** redirected to
 the shadow of a model whose target is `raw.orders`. It never read that table.
 
-Where a reference matches a routed upstream **only if case is ignored**, Rocky
-refuses the run rather than guess. Redirecting it could read a table the model
-never named. Leaving it alone would read production while the model writes its
-shadow. Spell the reference exactly as the upstream's configured target — on
-Snowflake, see the note below, where spelling it the same is not enough.
+Where a reference matches a routed upstream **only if case is ignored**, Rocky refuses the run. Redirecting it could read a table the model never named. Leaving it alone would read production while the model writes its shadow. Spell the reference exactly as the upstream's configured target.
 
-Deciding whether two *targets* collide is the opposite question. Rocky answers
-it conservatively on every warehouse. Two selected models whose targets differ
-only by identifier case are always treated as one object, and Rocky refuses the
-run. Case sensitivity is connection state Rocky cannot observe: a Snowflake
-account may set `QUOTED_IDENTIFIERS_IGNORE_CASE`, and a BigQuery dataset may be
-created `is_case_insensitive`. Assuming the two targets are distinct could let
-both models write the same shadow table with no error. Rename one target so the
-two differ by more than case.
+Two *targets* that differ only by identifier case are always treated as one object, and Rocky refuses the run, on every warehouse. Case sensitivity is connection state Rocky cannot observe (Snowflake `QUOTED_IDENTIFIERS_IGNORE_CASE`, BigQuery `is_case_insensitive`), and assuming the targets differ could let both models write one shadow table. Rename one target so they differ by more than case.
 
 :::caution[Snowflake: quoting is a second identity axis]
-Snowflake reads an *unquoted* identifier as upper case, and Rocky writes every
-Snowflake target double-quoted. A target configured as `main.orders` is the
-object `"main"."orders"`. A model's `FROM main.orders` names `MAIN.ORDERS`.
-Those are two different tables with the same text.
+Snowflake reads an *unquoted* identifier as upper case, and Rocky writes every Snowflake target double-quoted. A target `main.orders` is the object `"main"."orders"`. A model's `FROM main.orders` names `MAIN.ORDERS`. Those are two tables.
 
-Rocky resolves the reference the way Snowflake resolves it before matching. So
-an upper-case target read by an unquoted reference routes normally — that is the
-idiomatic Snowflake project. It also routes when the reference is written in a
-different case, such as `FROM main.orders` against `MAIN.ORDERS`; that spelling
-used to be refused. A lower-case or mixed-case target read by an unquoted
-reference is refused instead of redirected.
+Rocky resolves the reference the way Snowflake does before matching. An upper-case target read by an unquoted reference routes normally, in any spelling case. A lower-case or mixed-case target read by an unquoted reference is refused. Fix it either way:
 
-Two ways to fix a refusal, either one:
+- quote every component so the reference spells the target exactly: `FROM "main"."orders"`
+- or leave every component unquoted and spell the configured target in upper case: `MAIN.ORDERS`
 
-- quote every component of the reference so it spells the target exactly —
-  `FROM "main"."orders"`;
-- or leave every component unquoted and spell the configured target in upper
-  case — `MAIN.ORDERS` — so the reference resolves onto it.
+A half-quoted reference such as `"main".orders` needs both. A reserved word (`ORDER`, `SELECT`, …) has only the first remedy.
 
-A half-quoted reference such as `"main".orders` needs both: the quoted part must
-match the target's spelling, and the unquoted part must be upper case in the
-target. A name that is a reserved word (`ORDER`, `SELECT`, …) has only the first
-remedy — it cannot be read unquoted at all.
-
-On an account with Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`,
-a lower-case target read unquoted could not be read on a plain run either. The
-refusal replaces a silent wrong read on a shape that was already broken. Two
-settings can make the two spellings one object:
-`QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` on the account, and
-`CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE` on a catalog-linked database. Rocky
-can observe the first on a connection, but that answer describes one request and
-does not govern the next, so it asks for an unambiguous spelling instead.
+With the default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`, a lower-case target read unquoted could not be read on a plain run either, so the refusal replaces a silent wrong read. `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` on the account, or `CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE` on a catalog-linked database, can make the two spellings one object. Rocky sees the first only per request, so it asks for an unambiguous spelling.
 :::
 
 ### CTE names on Snowflake
 
-The same rule decides whether a CTE hides a bare table name. Rocky folds an
-unquoted CTE alias and an unquoted reference to upper case before comparing them,
-and leaves a quoted one as written. That is how Snowflake reads them under its
-default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`.
-
-With `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`, a double-quoted identifier folds to
-upper case too. Some pairs are then hidden under one setting and free under the
-other. Rocky cannot observe the setting for the statement it is deciding, so it
-refuses those pairs instead of guessing:
+A CTE can hide a bare table name. Rocky folds an unquoted CTE alias and an unquoted reference to upper case before comparing them, and leaves a quoted one as written, as Snowflake does under the default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`. With `TRUE`, a quoted identifier folds to upper case too. Rocky cannot observe the setting for the statement it decides, so it refuses the pairs that differ between settings:
 
 | CTE alias | Reference | `FALSE` (default) | `TRUE` | Rocky |
 |---|---|---|---|---|
@@ -218,12 +154,7 @@ refuses those pairs instead of guessing:
 | `orders` | `"orders"` | free | hidden | refuses |
 | `"Orders"` | `"orders"` | free | hidden | refuses |
 
-The refusal applies only when the reference would otherwise name an upstream
-that the command redirects. That covers a deferred model on `--defer`, a routed
-upstream on a shadow or branch run, an upstream on `branch promote`, and a
-recorded upstream on `rocky replay --execute`. To fix it, spell the CTE alias
-and the reference alike: both unquoted, or both quoted with the same case. Or
-rename the CTE.
+The refusal applies only when the reference would otherwise name an upstream that the command redirects: a deferred model on `--defer`, a routed upstream on a shadow or branch run, an upstream on `branch promote`, or a recorded upstream on `rocky replay --execute`. Spell the CTE alias and the reference alike (both unquoted, or both quoted with the same case), or rename the CTE.
 
 ## Shadow target rewriting
 
@@ -247,12 +178,7 @@ Schema override keeps the table name clean and groups all shadow tables together
 
 ### The two modes on a replication pipeline
 
-Replication supports both modes, and they isolate differently. Under
-`--shadow-suffix` the copy writes `<table><suffix>` **in the pipeline's own
-target schema**, and reads the unsuffixed production source. Under
-`--shadow-schema` the whole target schema moves and the table names stay as they
-are. Prefer the schema override when you want the shadow objects kept away from
-production tables rather than sitting beside them.
+Under `--shadow-suffix` the copy writes `<table><suffix>` **in the pipeline's own target schema** and reads the unsuffixed production source. Under `--shadow-schema` the whole target schema moves and table names stay. Prefer the schema override to keep shadow objects away from production tables.
 
 ## Comparison engine
 

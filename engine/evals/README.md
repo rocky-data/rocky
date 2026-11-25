@@ -188,44 +188,18 @@ cd engine && cargo build -p rocky && cd evals && ANTHROPIC_API_KEY=<your key> py
 
 ## Determinism, flake, and reading a score
 
-Scenario scoring is deterministic **per attempt** — re-scoring a captured
-transcript yields the same verdict. What varies across runs is the *model's
-behavior*, not the harness. The suite keeps the two apart:
+Scoring is deterministic **per attempt**: re-scoring a captured transcript gives the same verdict. What varies across runs is the *model's behavior*, not the harness.
 
-- **Harness flake must be zero.** The CI job's success criterion is "a valid
-  scorecard was produced," exactly like `engine-bench` — never "all scenarios
-  passed." A scenario fail is recorded data, not a red build.
-- **Model-outcome variance is the tracked axis.** `--max-attempts N` retries a
-  scenario and records whether it passed only on retry (`flaky`) plus the
-  `flake_rate`. Compare scores **within the same model id and harness version** —
-  every scorecard stamps both, because a moved score can be a frontier-model
-  change, a harness change, or a real regression, and only those stamps tell them
-  apart.
+- **Harness flake must be zero.** The CI success criterion is "a valid scorecard was produced", like `engine-bench`, never "all scenarios passed". A scenario fail is recorded data, not a red build.
+- **Model-outcome variance is the tracked axis.** `--max-attempts N` retries a scenario and records whether it passed only on retry (`flaky`) and the `flake_rate`. Compare scores **within the same model id and harness version**. Every scorecard stamps both, because a moved score can be a model change, a harness change or a real regression.
 
-The system prompt names Rocky's authoring loop but never the traps; grounding is
-therefore *partly instructed* (the MCP server also ships the workflow as its
-`instructions`). This is intentional — the suite measures whether the tools +
-their shipped guidance induce grounding, not spontaneous discipline.
+The system prompt names Rocky's authoring loop but never the traps, so grounding is *partly instructed* (the MCP server also ships the workflow as its `instructions`). The suite measures whether the tools and their shipped guidance induce grounding, not spontaneous discipline.
 
 ## Cadence
 
-Pull-request CI (`engine-evals.yml`) runs only `--selftest` and
-`--error-contract`; it never receives a model key. The live suite runs from an
-exact trusted `main` revision in `engine-evals-live.yml`, behind the
-`credentialed-ci` environment, after relevant eval/MCP changes land. A manual
-dispatch is also accepted only for `refs/heads/main`. See
-`.github/SECURITY_ENVIRONMENTS.md` for the required secret scope and deployment
-restriction.
+Pull-request CI (`engine-evals.yml`) runs only `--selftest` and `--error-contract` and never receives a model key. The live suite runs from an exact trusted `main` revision in `engine-evals-live.yml`, behind the `credentialed-ci` environment, after relevant eval or MCP changes land. A manual dispatch is accepted only for `refs/heads/main`. See `.github/SECURITY_ENVIRONMENTS.md` for the secret scope and deployment restriction.
 
-Run the live suite before any `rocky-mcp`-touching release. The live `results/`
-a run writes is gitignored. `engine-evals-live.yml` uploads each run's
-scorecard as a workflow artifact; it does not commit it. A run worth keeping is
-copied into `scorecards/<date>-<model>.{md,json}` by hand.
-
-Scorecards are not published per release. `scorecards/` holds one scorecard so
-far: `2026-07-08-claude-sonnet-4-5`, run against `rocky 1.57.0` with harness
-`0.4.0`. Treat it as a single past data point, not as the score of the current
-engine.
+Run the live suite before any `rocky-mcp`-touching release. `results/` is gitignored. `engine-evals-live.yml` uploads each scorecard as a workflow artifact and does not commit it. Copy a run worth keeping into `scorecards/<date>-<model>.{md,json}` by hand. `scorecards/` holds one scorecard so far: `2026-07-08-claude-sonnet-4-5`, run against `rocky 1.57.0` with harness `0.4.0`. It is a single past data point, not the score of the current engine.
 
 ## Layout
 
@@ -253,11 +227,4 @@ engine/evals/
 
 ## Extending it
 
-Add a `Scenario` to `harness/scenarios.py` (id, fixture, intent, required checks,
-optional reconcile) and, if it needs new data, a fixture directory under
-`fixtures/`. Bump `HARNESS_VERSION` whenever scenarios, prompts, driver flags, or
-scoring change — scores are only comparable within a harness version.
-
-The driver is behind a small protocol; an Anthropic-SDK API loop can replace the
-Claude Code CLI if the CLI dependency ever becomes awkward in CI, without
-touching scenarios or scoring.
+Add a `Scenario` to `harness/scenarios.py` (id, fixture, intent, required checks, optional reconcile) and, for new data, a directory under `fixtures/`. Bump `HARNESS_VERSION` whenever scenarios, prompts, driver flags or scoring change: scores compare only within a harness version. The driver sits behind a small protocol, so an Anthropic-SDK loop can replace the Claude Code CLI without touching scenarios or scoring.

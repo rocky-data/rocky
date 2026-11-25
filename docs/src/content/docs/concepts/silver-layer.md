@@ -119,9 +119,8 @@ WHERE o.order_date >= '2024-01-01'
 
 ## Example: merge model
 
-**models/dim_customers.toml**
-
 ```toml
+# models/dim_customers.toml
 name = "dim_customers"
 depends_on = ["stg_customers"]
 
@@ -135,35 +134,7 @@ schema = "analytics"
 table = "dim_customers"
 ```
 
-**models/dim_customers.sql**
-
-```sql
-SELECT
-    customer_id,
-    customer_name,
-    email,
-    signup_date,
-    current_timestamp() AS updated_at
-FROM acme_warehouse.staging__us_west__shopify.customers
-```
-
-This generates a `MERGE` statement:
-
-```sql
-MERGE INTO acme_warehouse.analytics.dim_customers AS target
-USING (
-    SELECT
-        customer_id,
-        customer_name,
-        email,
-        signup_date,
-        current_timestamp() AS updated_at
-    FROM acme_warehouse.staging__us_west__shopify.customers
-) AS source
-ON target.customer_id = source.customer_id
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
-```
+Rocky wraps the model's `SELECT` in `MERGE INTO ... USING (...) AS source ON target.customer_id = source.customer_id`. See [SQL Generation](/concepts/sql-generation/#merge-upsert).
 
 ## Materialization strategies
 
@@ -188,28 +159,15 @@ format reference show each one in full.
 
 ### full_refresh (default)
 
-Rocky rebuilds the whole table on every run:
-
-```sql
-CREATE OR REPLACE TABLE target AS SELECT ...
-```
+Rocky rebuilds the whole table on every run with `CREATE OR REPLACE TABLE target AS SELECT ...`.
 
 ### incremental
 
-A silver model loads only rows newer than its target's watermark. Declare the watermark column with `timestamp_column`, and put `@incremental_filter` where the filter belongs in the SQL. Rocky resolves the placeholder to `TRUE` on the first run and on `rocky run --full-refresh`. On every later run it becomes a comparison with `MAX(<watermark>)` read from the target. A model with no watermark is refused with `E037`. See [Incremental](/reference/model-format/#incremental) in the model format reference.
-
-In the [bronze layer](/concepts/bronze-layer/), `incremental` copies source tables and filters each copy on a watermark in the state store.
+A silver model loads only rows newer than its target's watermark. Declare the watermark column with `timestamp_column`, and put `@incremental_filter` where the filter belongs in the SQL. Rocky resolves the placeholder to `TRUE` on the first run and on `rocky run --full-refresh`. On every later run it becomes a comparison with `MAX(<watermark>)` read from the target. A model with no watermark is refused with `E037`. See [Incremental](/reference/model-format/#incremental). In the [bronze layer](/concepts/bronze-layer/), `incremental` copies source tables and filters on a watermark in the state store.
 
 ### merge
 
-Rocky upserts by unique key:
-
-```sql
-MERGE INTO target USING (...) AS source
-ON target.key = source.key
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *
-```
+Rocky upserts by unique key. See [SQL Generation](/concepts/sql-generation/#merge-upsert).
 
 ## Validation
 

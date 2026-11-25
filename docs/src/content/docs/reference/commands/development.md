@@ -5,13 +5,13 @@ sidebar:
   order: 4
 ---
 
-These commands support local development. Build a sample project, import a dbt project or package, or scaffold an adapter. Run the HTTP server with its browser UI, or the language server. Check the project's health, and list what it holds.
+These commands support local development: sample projects, dbt import, adapter scaffolding, the HTTP server and browser UI, the language server, health checks and project listings.
 
 ---
 
 ## `rocky playground`
 
-Create a self-contained sample project that runs on DuckDB in process. It needs no warehouse credentials and no external service. Use it to learn Rocky, to try model logic, and to prototype.
+Create a sample project that runs on in-process DuckDB. It needs no credentials and no external service.
 
 ```bash
 rocky playground [path]
@@ -27,7 +27,7 @@ rocky playground [path]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--template <TEMPLATE>` | `string` | `quickstart` | Sample project template. `quickstart` is the only one. The removed `ecommerce` and `showcase` templates fail with a message that lists the remaining templates. |
+| `--template <TEMPLATE>` | `string` | `quickstart` | Sample project template. `quickstart` is the only one. |
 
 ### Examples
 
@@ -52,25 +52,7 @@ rocky playground
     rocky preview rows --model customer_orders  # peek at materialized rows
 ```
 
-Create a playground with a custom name:
-
-```bash
-rocky playground my-experiment
-```
-
-```
-  Rocky Playground
-
-  Created sample project at ./my-experiment/
-  Template: Quickstart (3 models)
-  Using DuckDB (local, no warehouse needed)
-
-  Try:
-    cd my-experiment
-    rocky compile
-    rocky test
-    rocky run
-```
+Pass a path, for example `rocky playground my-experiment`, to name the directory.
 
 ### Related Commands
 
@@ -187,7 +169,6 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 
 ```json
 {
-  "version": "1.30.0",
   "command": "import-dbt",
   "import_method": "regex",
   "project_name": "demo_project",
@@ -197,38 +178,18 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
   "imported_models": ["orders"],
   "warning_details": [],
   "failed_details": [],
-  "emission": {
-    "out_dir": "rocky-out",
-    "rocky_toml_path": "rocky-out/rocky.toml",
-    "migration_notes_path": "rocky-out/MIGRATION-NOTES.md",
-    "models_translated_count": 1,
-    "models_skipped_count": 0,
-    "seeds_copied_count": 0,
-    "adapter_type": "duckdb",
-    "original_dbt_adapter_type": "duckdb",
-    "required_env_vars": []
-  }
+  "emission": { "out_dir": "rocky-out", "rocky_toml_path": "rocky-out/rocky.toml",
+    "migration_notes_path": "rocky-out/MIGRATION-NOTES.md", "models_translated_count": 1,
+    "adapter_type": "duckdb", "required_env_vars": [] }
 }
 ```
 
 `import_method` is `"manifest"` when a compiled `target/manifest.json` was found (pre-resolved Jinja), or `"regex"` when Rocky parsed the raw `.sql` files directly. The `emission` block is populated whenever `--output-dir` writes succeeded. Model-level import failures use the command's partial-import contract and do not make the process exit non-zero, so automation must check `failed` and `failed_details` before consuming the emitted repository.
 
-Import into a custom directory and override the target adapter (e.g. migrating a Postgres dbt project to Rocky-on-Snowflake):
+Import into another directory with another adapter, replace a previous emit, then verify it compiles:
 
 ```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --target-adapter snowflake
-```
-
-Re-run after fixing the dbt source, replacing the previous emit:
-
-```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite
-```
-
-End-to-end migration in one shot (emit, then compile to verify the result is loadable):
-
-```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite \
+rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --target-adapter snowflake --overwrite \
     && rocky compile --models ./acme-rocky/models/
 ```
 
@@ -298,11 +259,7 @@ The lockfile records the build mode: `compile-only`, `build-empty` or `compiled`
     "target_schema": "main",
     "vars_hash": "blake3:af13…",
     "mode": "build-empty",
-    "includes": [],
     "models": ["int_stripe__account_daily", "..."],
-    "models_added": ["int_stripe__account_daily", "..."],
-    "models_removed": [],
-    "sources": [{ "name": "stripe.charge", "catalog": "dev", "schema": "stripe", "table": "charge" }],
     "tests_mapped": 15,
     "tests_dropped": [],
     "incremental_fallbacks": [],
@@ -346,15 +303,13 @@ read-only token
   └─ POST /api/v1/compile    → 403 forbidden_read_only_token
 ```
 
-The check reads the HTTP method, not a list of paths, so a route added later with a mutating method is refused the moment it exists. Two limits are worth knowing: the check classifies the METHOD, not the handler, so a `GET` that mutates would pass; and it only covers routes registered inside the authenticated router, not one added after that layer. Two things it does not touch: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
+The check reads the HTTP method, not a list of paths, so a later route with a mutating method is refused at once. It classifies the method, not the handler, so a `GET` that mutates would pass. It covers only routes inside the authenticated router. It does not touch two paths: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
 
-The webhook exemption has three more clauses, and they are stated here rather than left to be assembled from three sections.
+The webhook exemption has three more clauses:
 
-**On a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET`, the route accepts an unsigned `POST`** and queues work for the scheduler. No token is involved, so a read-only token does not stop it. This is the dev-convenience path.
-
-**On a non-loopback bind with no secret, the route is refused outright** — `404 webhook_disabled`, not accepted-unsigned. So the unsigned path cannot be reached from the network by binding wider; widening the bind closes it rather than exposing it.
-
-**`rocky serve --ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`.** A browser can reach the webhook route, so the combination that would let page script queue unsigned work is rejected at startup rather than served.
+- On a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET`, the route accepts an unsigned `POST` and queues work for the scheduler. No token is involved, so a read-only token does not stop it. This is the dev-convenience path.
+- On a non-loopback bind with no secret, the route is refused: `404 webhook_disabled`. Widening the bind closes the unsigned path.
+- `rocky serve --ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`, because a browser can reach the webhook route.
 
 ```text
 --scheduler, no ROCKY_WEBHOOK_SECRET:
@@ -434,102 +389,53 @@ The [browser UI guide](/guides/browser-ui/) shows what each screen displays.
 
 ### Ask the server what it is doing
 
-`GET /api/v1/settings` reports the posture of the running server. Read it when you want to check what a server is actually enforcing, rather than what its start command looked like.
+`GET /api/v1/settings` reports what a running server enforces, not what its start command looked like.
 
 ```bash
-curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" \
-  http://127.0.0.1:8080/api/v1/settings
+curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/v1/settings
 ```
 
-It reports the bind host, the CORS allowlist, the `Host` values the host check accepts, whether the scheduler and the UI are on, the token's scope, and the state backend.
+It reports the bind host, the CORS allowlist, the `Host` values the host check accepts, whether the scheduler and the UI are on, the token's scope and the state backend. It holds no secret: the token appears as its name and scope, and the webhook secret as `webhook_secret`:
 
-No secret is in the response. The token appears as its name and scope. The webhook secret appears only as whether it can sign a webhook:
+| `webhook_secret` | Meaning |
+|---|---|
+| `present` | Webhook requests must carry a signature. |
+| `absent` | Loopback accepts unsigned requests. Non-loopback answers `404`. |
+| `set_but_unusable` | Blank or not valid UTF-8. `--scheduler` refuses to start. |
 
-```text
-  webhook_secret       what it means
-  ------------------   --------------------------------------------------
-  present              webhook requests must carry a signature
-  absent               loopback accepts UNSIGNED; non-loopback answers 404
-  set_but_unusable     blank or not valid UTF-8 -- --scheduler will REFUSE
-                       to start
-```
+The field is reported even when the scheduler is off, so you see what happens when you turn it on.
 
-That field is reported even when the scheduler is off. It tells you what will happen when you turn the scheduler on, which is the point.
+`state_backend` and `concurrency_control` come from `rocky.toml`. Rocky reads them once, on the first request to this route, and they stay fixed for the life of the process. A plain `rocky serve` reads no file before it binds the listener. The read runs one at a time under a 5 second deadline:
 
-Two fields have a different freshness from the rest. `state_backend` and `concurrency_control` come from `rocky.toml`, and are read once on the **first request to this route**, then fixed for the life of the process. They are not read at startup on purpose. On a plain `rocky serve`, nothing on the path to binding the listener reads a file, and reading `rocky.toml` eagerly would put one there — letting a `rocky.toml` on a stalled mount stop the server binding at all. (`--scheduler` without an explicit `--poll-interval` already reads the config before binding; that is unchanged.) When `concurrency_control` is unset, the field reports the backend default (`cas` on `s3`, `gcs`, `tiered`; `off` on `local`, `valkey`). It is the requested mode: the writers' startup probe does not run here, so a store that falls back to `off` shows up in `rocky doctor` instead.
+| Status | Meaning |
+|---|---|
+| `503 engine_busy` | Another settings read is in flight. Retry. |
+| `504 settings_config_timeout` | The read blew its deadline, usually a file that will not return. Retrying will not help. |
 
-That read runs one at a time under a 5 second deadline, so a stuck file cannot starve the server either:
+Both fields are `null` when there was no readable config. `config_status` says why: `loaded`, `absent` (no `rocky.toml`, not a failure) or `unreadable` (present but would not parse; the scheduler skips every tick until it does). A config edited after the first request is not reflected here, but the scheduler re-reads the file every tick.
 
-```text
-  503 engine_busy               another settings read is in flight -- retry
-  504 settings_config_timeout   the read blew its deadline; usually a file
-                                that will not return, so retrying will not help
-```
-
-Every other field on the route is unaffected by either.
-
-So a config edited after that first request is not reflected here, while the scheduler — which re-reads the file every tick — acts on the new one. They are `null` when there was no readable config, and `config_status` says which:
-
-```text
-  loaded       read and parsed
-  absent       no rocky.toml -- an ordinary fact, not a failure
-  unreadable   present but would not parse; the scheduler will skip every
-               tick until it does
-```
-
-`allowed_hosts` and `allowed_origins` both report what is **enforced**, not what was typed. `--allowed-host` only becomes a check on a loopback or `--ui` bind, so that list is empty on a non-loopback bind without `--ui`. `--allowed-origin` values that are not valid header values are dropped when the CORS layer is built, and an origin that could not be installed grants nothing, so they are absent here too.
+`allowed_hosts` and `allowed_origins` report what is enforced, not what was typed. `--allowed-host` is a check only on a loopback or `--ui` bind, so the list is empty on a non-loopback bind without `--ui`. An `--allowed-origin` value that is not a valid header value is dropped when the CORS layer is built, and grants nothing.
 
 ### Examples
 
-Start the server with defaults (loopback, token via env var):
+Start on loopback with a token from the environment, then call an endpoint:
 
 ```bash
 export ROCKY_SERVE_TOKEN=$(openssl rand -hex 32)
 rocky serve
-```
-
-```
-Compiled 14 models in 42ms
-Listening on http://127.0.0.1:8080
-Endpoints:
-  GET /api/v1/models              - List all compiled models
-  GET /api/v1/models/:name        - Get model details
-  GET /api/v1/models/:name/lineage - Column-level lineage
-  GET /api/v1/dag                 - Full dependency graph
-```
-
-Call an authenticated endpoint:
-
-```bash
 curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/v1/models
 ```
 
-Start with file watching on a custom port:
+Watch files on a custom port, with contracts:
 
 ```bash
-rocky serve --port 3000 --watch --token "$ROCKY_SERVE_TOKEN"
+rocky serve --models src/models --contracts src/contracts --port 3000 --watch --token "$ROCKY_SERVE_TOKEN"
 ```
 
-```
-Compiled 14 models in 42ms
-Watching models/ for changes...
-Listening on http://127.0.0.1:3000
-```
-
-Expose to the LAN with explicit token + origin allowlist:
+Expose to the LAN with a token and an origin allowlist:
 
 ```bash
-rocky serve \
-  --host 0.0.0.0 \
-  --token "$ROCKY_SERVE_TOKEN" \
-  --allowed-origin https://dashboard.internal \
-  --port 9090
-```
-
-Start with contracts:
-
-```bash
-rocky serve --models src/models --contracts src/contracts --port 9090 --watch
+rocky serve --host 0.0.0.0 --token "$ROCKY_SERVE_TOKEN" --allowed-origin https://dashboard.internal --port 9090
 ```
 
 ### Related Commands
@@ -583,23 +489,7 @@ rocky init-adapter <name>
 |----------|------|---------|-------------|
 | `name` | `string` | **(required)** | Adapter name, for example `redshift`. The crate is `rocky-<name>`. |
 
-```bash
-rocky init-adapter redshift
-```
-
-```
-Created adapter scaffold at crates/rocky-redshift/
-
-  crates/rocky-redshift/
-  ├── Cargo.toml
-  ├── src/
-  │   ├── lib.rs
-  │   ├── dialect.rs     ← SqlDialect trait (TODO: implement methods)
-  │   ├── adapter.rs     ← WarehouseAdapter trait (TODO: implement)
-  │   └── types.rs       ← TypeMapper trait
-  └── tests/
-      └── integration.rs ← Live tests (#[ignore])
-```
+Example: `rocky init-adapter redshift` creates `crates/rocky-redshift/` with `Cargo.toml`, `src/{lib,dialect,adapter,types}.rs` and `tests/integration.rs` (live tests, `#[ignore]`).
 
 The command then prints the next steps: add the crate to the workspace, choose `literal_escape` in `dialect.rs` (the crate does not compile until you do), implement the traits, and register the adapter in `registry.rs`.
 
@@ -626,10 +516,6 @@ rocky connector init <name> [--dir <path>] [--lang python]
 
 ```bash
 rocky connector init orders
-```
-
-```
-Created connector `orders` in connectors/orders
 ```
 
 The directory holds five files:
@@ -713,15 +599,6 @@ rocky hooks test <event>
 
 `hooks test` builds a synthetic context for the event, prints it, and runs every hook configured for that event.
 
-```bash
-$ rocky hooks test on_pipeline_start
-Firing test event: on_pipeline_start
-Context JSON:
-{ ... }
-
-All hooks passed.
-```
-
 See [Hooks](/concepts/hooks/) for the events and the config.
 
 ---
@@ -745,15 +622,10 @@ rocky validate-migration --dbt-project <PATH> [flags]
 ### Examples
 
 ```bash
-$ rocky validate-migration --dbt-project ~/dbt-project
-Migration Validation Report
-===========================
-
-Models:  12 imported, 0 failed
-
-Results:
-  12 models validated successfully
+rocky validate-migration --dbt-project ~/dbt-project
 ```
+
+The report lists models imported and failed, and conversion results.
 
 ### Related Commands
 
@@ -805,13 +677,6 @@ rocky test-adapter --command <PATH> [--adapter-config <JSON>]
 | `--adapter <NAME>` | `string` | | Adapter name. Built-in names are `databricks`, `snowflake`, `duckdb`, `postgres`, `redshift`, `clickhouse`, `sqlserver` and `spark`. Any other name resolves to a `rocky-<name>` executable on your `PATH`. |
 | `--command <PATH>` | `string` | | Path to a process adapter binary. |
 | `--adapter-config <JSON>` | `string` | | Adapter config as a JSON string. |
-
-```bash
-$ rocky test-adapter --adapter duckdb
-Adapter Conformance: duckdb (SDK 1.x)
-==================================================
-...
-```
 
 Most specs report `skipped` today. The suite declares 26 specs. Three of them (`format_table_ref`, `watermark_where` and `row_hash`) run real dialect calls, and only against a process adapter. On a built-in adapter, those three are skipped too. A skipped spec never counts as a pass. A run that verified nothing prints a warning. It still exits `0`, because the exit status keys on failures only.
 
@@ -901,28 +766,7 @@ rocky list consumers <model>   # what depends on a model
 
 Bare `rocky list` lists models, so `rocky list --select +fct_orders` works like `dbt ls`. Its JSON is the same as `rocky list models`. Rocky finds models in the models directory and its direct subdirectories, which covers the common `models/{layer}/` layout.
 
-```
-$ rocky -o table list pipelines
-NAME                      TYPE             TARGET               SOURCE               DEPENDS ON
-playground                replication      default              default              -
-```
-
-```json
-{
-  "version": "1.80.0",
-  "command": "list_pipelines",
-  "pipelines": [
-    {
-      "name": "playground",
-      "pipeline_type": "replication",
-      "target_adapter": "default",
-      "source_adapter": "default",
-      "depends_on": [],
-      "concurrency": "16"
-    }
-  ]
-}
-```
+`rocky -o table list pipelines` prints `NAME`, `TYPE`, `TARGET`, `SOURCE` and `DEPENDS ON` columns. The JSON has `command: "list_pipelines"` and a `pipelines` array of `name`, `pipeline_type`, `target_adapter`, `source_adapter`, `depends_on` and `concurrency`.
 
 ### Related Commands
 

@@ -61,61 +61,30 @@ A stored intent lets Rocky do three things:
 
 ## Commands
 
+Flags and options: [AI Commands](/reference/commands/ai/).
+
 ### rocky ai "intent"
 
-Writes a new model from a description:
+Writes a new model, in Rocky DSL by default or SQL with `--format sql`, and its `.toml` sidecar into `--models` (default `models`). The output carries the generated source, the suggested name, the format and the compile attempt count.
 
 ```bash
-# Generate in Rocky DSL (default)
 rocky ai "Top 10 customers by lifetime revenue"
-
-# Generate in SQL
-rocky ai "Top 10 customers by lifetime revenue" --format sql
-
-# Output as JSON for programmatic consumption
-rocky ai "Top 10 customers by lifetime revenue" --output json
 ```
-
-Rocky writes the model file and its `.toml` sidecar into `--models` (default
-`models`). An existing file at that path fails the command unless you pass
-`--overwrite`. `--materialization` accepts `full_refresh` (default) or `merge`.
-A `merge` model needs `--unique-key`.
-
-The output carries the generated source, the suggested model name, the format,
-and how many compile attempts it took.
 
 ### rocky ai-explain
 
-Reads models you already have and writes an intent description for each. Run
-this first when adopting intent on an existing project.
+Reads existing models and writes an intent description for each. Run it first when adopting intent on an existing project. `--save` writes the intent into the model's TOML sidecar, where `rocky ai-sync` uses it.
 
 ```bash
-# Explain a specific model
-rocky ai-explain --models models/ orders_summary
-
-# Explain all models that don't have intent yet
-rocky ai-explain --models models/ --all
-
-# Save the generated intent to each model's TOML config
 rocky ai-explain --models models/ --all --save
 ```
 
-`--save` writes the intent string into the model's TOML sidecar. Once saved,
-`rocky ai-sync` can use it.
-
 ### rocky ai-sync
 
-Proposes updates to models that carry intent:
+Proposes updates to models that carry intent. It prints a diff. `--apply` writes it, and `--model <name>` limits it to one model.
 
 ```bash
-# Show proposed changes
-rocky ai-sync --models models/
-
-# Apply the proposed changes
 rocky ai-sync --models models/ --apply
-
-# Sync a specific model
-rocky ai-sync --models models/ --model orders_summary
 ```
 
 The sync runs in five steps:
@@ -133,37 +102,19 @@ baseline advances only when `--apply` writes its proposal.
 
 ### rocky ai-test
 
-Writes test assertions from a model's intent and schema:
+Writes SQL assertions from a model's intent, column schema (types and nullability) and target table. Each assertion is a query that returns 0 rows when it holds. [Checks and Tests](/concepts/data-quality-checks/) has the test format.
 
 ```bash
-# Generate tests for a specific model
-rocky ai-test --models models/ orders_summary
-
-# Generate tests for all models
-rocky ai-test --models models/ --all
-
-# Save generated tests to the tests/ directory
-rocky ai-test --models models/ --all --save
+rocky ai-test --models models/ --all --save   # save to tests/
 ```
-
-The LLM reads the intent, the column schema with types and nullability, and the
-target table. It produces SQL assertions. Each assertion is a query that returns
-0 rows when the assertion holds. The [Checks and Tests](/concepts/data-quality-checks/)
-page has the test format.
 
 ### rocky ai-contract
 
-Drafts a `.contract.toml` for a model from its observed data. It works on
-DuckDB only.
+Drafts a `.contract.toml` from the observed data. It works on DuckDB only. Rocky profiles the target table per column and compile-verifies the draft. By default only the schema and aggregate counts leave the machine. `--with-data` also sends min/max values and samples of low-cardinality columns.
 
 ```bash
-rocky ai-contract orders_summary          # print the draft
 rocky ai-contract orders_summary --save   # write <model>.contract.toml
 ```
-
-Rocky profiles the target table per column and compile-verifies the draft.
-By default only the schema and aggregate counts leave the machine.
-`--with-data` also sends min/max values and samples of low-cardinality columns.
 
 ## The compile-verify safety net
 

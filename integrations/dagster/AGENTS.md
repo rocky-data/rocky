@@ -1,34 +1,16 @@
 # dagster-rocky
 
-Dagster integration for the Rocky SQL engine. A thin Dagster
-adapter over [`rocky-sdk`](../../sdk/python/AGENTS.md)'s `RockyClient` that maps
-Rocky's discovery/execution output into Dagster assets, checks, and
-materializations. `dagster-rocky` depends on `rocky-sdk` (in-repo: a
-`[tool.uv.sources]` path dependency; published: a `rocky-sdk>=…` floor).
+Dagster integration for the Rocky SQL engine: a thin adapter over [`rocky-sdk`](../../sdk/python/AGENTS.md)'s `RockyClient` that maps Rocky's discovery and execution output into Dagster assets, checks and materializations. It depends on `rocky-sdk` (in-repo: a `[tool.uv.sources]` path dependency; published: a `rocky-sdk>=…` floor).
 
 ## Architecture
 
 Four layers, each independently usable:
 
-1. **Types** (`types.py`) — a backward-compat shim. The Pydantic models and
-   `parse_rocky_output()` now live in `rocky_sdk.types`; `dagster_rocky.types`
-   re-exports the full surface so existing `from dagster_rocky import RunResult`
-   / `parse_rocky_output` imports keep working. `dagster_rocky.types_generated`
-   is likewise a shim over `rocky_sdk.types_generated`. For a new
-   command, follow the `rocky-new-cli-command` skill.
-2. **Resource** (`resource.py`) — `RockyResource`, a `ConfigurableResource` that
-   builds a `rocky_sdk.RockyClient` from its config (`_get_client()`) and
-   delegates each command method to it inside a `_translating()` boundary that
-   converts the SDK's `RockyError` hierarchy into `dagster.Failure` (same descriptions and metadata as before). The client is
-   built with `mirror_stderr=True` and the `dagster_rocky` logger, so Dagster's compute-log
-   capture keeps the engine stderr. Dagster-only concerns stay here: per-call
-   resolvers, `timeout_seconds`, the strict-doctor startup gate, the governance pre-flight (raises
-   `dg.Failure` directly), live `context.log` streaming, and Pipes. Three
-   execution modes for `rocky run`, all sharing the `_build_run_args` argv builder
-   (which delegates to the client) so flags stay in sync:
-   - **`run(filter, ...)`** — buffered `subprocess.run`. No Dagster context. Returns `RunResult`. For scripts, tests, notebooks.
-   - **`run_streaming(context, filter, ...)`** — `subprocess.Popen` with a daemon thread that forwards stderr to `context.log.info`. Returns `RunResult`. Keeps the last 20 stderr lines in `dg.Failure.stderr_tail` on hard failure. Works with any rocky binary. **`RockyComponent` uses this by default** via `_run_filters`.
-   - **`run_pipes(context, filter, ...)`** — Dagster Pipes via `dg.PipesSubprocessClient`. The engine detects `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` and emits `report_asset_materialization` / `report_asset_check` / `log` messages. Returns a `PipesClientCompletedInvocation`; chain `.get_results()`. Optional `pipes_client` kwarg (env, cwd, message_reader).
+1. **Types** (`types.py`): a backward-compat shim. The Pydantic models and `parse_rocky_output()` live in `rocky_sdk.types`; `dagster_rocky.types` and `dagster_rocky.types_generated` re-export them so existing imports keep working. For a new command, follow the `rocky-new-cli-command` skill.
+2. **Resource** (`resource.py`): `RockyResource`, a `ConfigurableResource` that builds a `rocky_sdk.RockyClient` (`_get_client()`) and delegates each command to it inside a `_translating()` boundary that converts the SDK's `RockyError` hierarchy into `dagster.Failure`. The client uses `mirror_stderr=True` and the `dagster_rocky` logger, so Dagster's compute-log capture keeps engine stderr. Dagster-only concerns stay here: per-call resolvers, `timeout_seconds`, the strict-doctor startup gate, the governance pre-flight (raises `dg.Failure` directly), live `context.log` streaming and Pipes. `rocky run` has three modes, all sharing the `_build_run_args` argv builder so flags stay in sync:
+   - **`run(filter, ...)`**: buffered `subprocess.run`, no Dagster context, returns `RunResult`. For scripts, tests, notebooks.
+   - **`run_streaming(context, filter, ...)`**: `subprocess.Popen` with a daemon thread forwarding stderr to `context.log.info`. Returns `RunResult`. Keeps the last 20 stderr lines in `dg.Failure.stderr_tail` on hard failure. **`RockyComponent` uses this by default** via `_run_filters`.
+   - **`run_pipes(context, filter, ...)`**: Dagster Pipes via `dg.PipesSubprocessClient`. The engine detects `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` and emits `report_asset_materialization` / `report_asset_check` / `log` messages. Returns a `PipesClientCompletedInvocation`; chain `.get_results()`. Optional `pipes_client` kwarg (env, cwd, message_reader).
 3. **Translator** (`translator.py`) — `RockyDagsterTranslator` maps Rocky metadata → Dagster asset keys, groups, tags, metadata. Subclass to customize.
 4. **Component** (`component.py`) — `RockyComponent` state-backed Dagster component. Caches `rocky discover` + `rocky compile` output. Subset-aware. Helpers: `_load_state`, `_build_group_contexts`, `_select_filters`, `_run_filters`, `_emit_results`, `_emit_placeholder_checks`.
 
@@ -118,8 +100,7 @@ All tests run without the Rocky binary or credentials. They use hand-crafted dic
 
 ## Git Conventions
 
-- Follow "Git conventions" in the root `../../AGENTS.md`. Scope: `feat(dagster)`.
-- Git hooks in `.git-hooks/`: pre-commit (ruff), commit-msg (conventional commit validation), pre-push (pytest)
+Follow "Git conventions" in the root `../../AGENTS.md`. Scope: `feat(dagster)`. Hooks in `.git-hooks/`: pre-commit (ruff), commit-msg (conventional commit validation), pre-push (pytest).
 
 ## Key Design Decisions
 
@@ -130,8 +111,3 @@ All tests run without the Rocky binary or credentials. They use hand-crafted dic
 - **Group checks**: `cross_source_overlap` runs once per `(source_type, table)` sibling group. The engine reports it on the sibling it copied first. This is not knowable at spec-build time. Its specs carry `GROUP_CHECK_METADATA_KEY`. `_emit_placeholder_checks` yields **nothing** for the other siblings, only one INFO line naming the carrier. A passing placeholder would be a green verdict for a check that never ran. A failing one would warn on every run. Dagster records the unevaluated check as `PLANNED`; `AssetCheckExecutionRecord.resolve_status` maps it to `SKIPPED` on a finished, non-failed run (#1669).
 - **HTTP fallback**: compile/lineage/metrics support `server_url` for live Rocky server mode.
 - **Backward compatible state**: reads the legacy raw DiscoverResult and the current `{discover, compile}` format.
-
-## Related Projects
-
-- [rocky](https://github.com/rocky-data/rocky) — Core CLI + engine (Rust)
-- [Rocky VS Code extension](https://github.com/rocky-data/rocky/tree/main/editors/vscode) — TypeScript

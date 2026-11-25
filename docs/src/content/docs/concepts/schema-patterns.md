@@ -78,39 +78,13 @@ source  →  matches the last segment
 
 ## Parsing examples
 
-Given the pattern `prefix = "src__"`, `separator = "__"`, `components = ["tenant", "regions...", "source"]`:
+With `prefix = "src__"`, `separator = "__"` and `components = ["tenant", "regions...", "source"]`:
 
-### Single region
-
-```
-src__acme__us_west__shopify
-     │     │        │
-     │     │        └── source = "shopify"
-     │     └── regions = ["us_west"]
-     └── tenant = "acme"
-```
-
-### Multiple regions
-
-```
-src__acme__us_west__us_central__shopify
-     │     │        │           │
-     │     │        │           └── source = "shopify"
-     │     └────────┘
-     │     regions = ["us_west", "us_central"]
-     └── tenant = "acme"
-```
-
-### Deep region hierarchy
-
-```
-src__globex__emea__france__paris__zendesk
-     │       │     │       │      │
-     │       │     │       │      └── source = "zendesk"
-     │       └─────┴───────┘
-     │       regions = ["emea", "france", "paris"]
-     └── tenant = "globex"
-```
+| Schema name | `tenant` | `regions` | `source` |
+|---|---|---|---|
+| `src__acme__us_west__shopify` | `acme` | `["us_west"]` | `shopify` |
+| `src__acme__us_west__us_central__shopify` | `acme` | `["us_west", "us_central"]` | `shopify` |
+| `src__globex__emea__france__paris__zendesk` | `globex` | `["emea", "france", "paris"]` | `zendesk` |
 
 ## Template resolution
 
@@ -143,14 +117,7 @@ staging__{regions}__{source}
 
 ### Full resolution example
 
-Source: `src__acme__us_west__shopify`
-
-| Template | Result |
-|---|---|
-| `{tenant}_warehouse` | `acme_warehouse` |
-| `staging__{regions}__{source}` | `staging__us_west__shopify` |
-
-Target table: `acme_warehouse.staging__us_west__shopify.<table_name>`
+Source `src__acme__us_west__shopify` gives `{tenant}_warehouse` = `acme_warehouse` and `staging__{regions}__{source}` = `staging__us_west__shopify`. The target table is `acme_warehouse.staging__us_west__shopify.<table_name>`.
 
 ### Pinning the join separator at the use site
 
@@ -190,28 +157,7 @@ This is how Rocky handles a schema name that does not fit the pattern:
 
 ## Custom patterns
 
-Schema patterns are not limited to `tenant`, `regions`, and `source`. Define whatever components match your naming convention:
-
-```toml
-[pipeline.bronze.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["environment", "department", "system"]
-```
-
-This would parse `raw__prod__finance__sap` into:
-- `environment = "prod"`
-- `department = "finance"`
-- `system = "sap"`
-
-And you could use templates like:
-
-```toml
-[pipeline.bronze.target]
-adapter = "prod"
-catalog_template = "{environment}_analytics"
-schema_template = "{department}__{system}"
-```
+Components are not limited to `tenant`, `regions` and `source`. With `prefix = "raw__"` and `components = ["environment", "department", "system"]`, `raw__prod__finance__sap` parses to `environment = "prod"`, `department = "finance"`, `system = "sap"`. Templates such as `catalog_template = "{environment}_analytics"` and `schema_template = "{department}__{system}"` then apply.
 
 ## Config groups vs schema patterns
 

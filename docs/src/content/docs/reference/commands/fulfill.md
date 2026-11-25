@@ -53,52 +53,22 @@ The loop trusts nothing it did not verify itself:
 
 ### When the applied output is wrong
 
-The checks your spec declares about its output — the grain, the `checks` list,
-the non-null columns — need a table to run against. They cannot run before the
-apply, so the loop reports them deferred at verify and runs them at observation,
-where the table finally exists.
+The checks your spec declares about its output (the grain, the `checks` list, the non-null columns) need a table to run against. They cannot run before the apply, so the loop reports them deferred at verify and runs them at observation.
 
-A check that FAILS there is different from every other failure the loop handles:
-the wrong data is already live. The loop does not roll it back. It does this
-instead:
+A check that fails there is different from every other failure: the wrong data is already live. The loop does not roll it back. It does this:
 
-1. Records `observed_failing` — never a healthy-looking `observing` — and prints
-   which check failed and what it measured.
-2. On your next run, reads the checks AGAIN. A reading that has gone green
-   releases the product; nothing trusts the stored verdict.
-3. If it is still failing, spends one repair round: the drafting agent gets the
-   failing check and its actual values, and rewrites the model.
-4. Proposes the repaired model as a NEW plan. You review and approve it exactly
-   like the first one. The earlier approval buys it nothing — a bare apply of the
-   repaired plan refuses, and the plan carries a new id, so the marker you wrote
-   for the failing plan cannot be reused.
+1. It records `observed_failing`, never a healthy-looking `observing`, and prints which check failed and what it measured.
+2. On your next run, it reads the checks again. A reading that has gone green releases the product. Nothing trusts the stored verdict.
+3. If a check still fails, it spends one repair round: the drafting agent gets the failing check and its actual values, and rewrites the model.
+4. It proposes the repaired model as a new plan with a new id. You review and approve it like the first. The earlier marker cannot be reused, and a bare apply of the repaired plan refuses.
 
-Repair rounds are bounded. Repeated failures land `blocked`, naming the check
-that would not go green, so a product can never cycle you forever on a defect the
-agent cannot fix.
+Repair rounds are bounded. Repeated failures land `blocked`, naming the check that would not go green.
 
-Two things report rather than route. **Staleness** is usually a scheduling fact,
-not a model defect — rewriting SQL cannot fix a job that did not run.
-**Warning-severity checks** are ones you declared as not disqualifying. Both are
-printed and journaled; neither starts a repair.
+Two things report and do not route: staleness (usually a scheduling fact, which rewriting SQL cannot fix) and warning-severity checks (declared as not disqualifying). Both are printed and journaled, and neither starts a repair. A check the loop cannot evaluate (its SQL will not run, or a column is missing) did not pass: the loop holds at `applied` and says so.
 
-A check the loop cannot EVALUATE is not a check that passed. If a check errors —
-its SQL will not run, the column is missing — the loop holds at `applied` and
-says so, rather than claiming health or rewriting a model on a guess.
+Before it runs the checks, the loop compares them with the set it verified for this plan. The comparison uses what the model loader produces, so an edited `[[use_test]]` entry in `models/test_definitions.toml` is covered. It also covers the table the checks run against, and the warehouse is fixed at that moment, so a later edit to `rocky.toml` cannot move the query. A set that does not match is not run: the loop holds and tells you to restore what changed.
 
-Before it runs any of them, the loop compares the checks on disk with the set it
-verified for this plan. It compares what the model loader produces, so a
-`[[use_test]]` entry edited in `models/test_definitions.toml` is covered even
-though no manifest lists that file. The comparison also covers the table the
-checks run against, and the warehouse is fixed at the same moment, so a later
-edit to `rocky.toml` cannot move the query. A set that does not match is not run:
-the loop holds and tells you to put back what changed.
-
-Be exact about what that buys you. It catches a change made AFTER the plan was
-verified. A check that was already on disk at that point is part of the verified
-set, so this comparison does not question it — including one an agent wrote
-there. Verification pins the check set; it does not judge it. To know what will
-run, read the model's sidecar.
+This catches a change made after the plan was verified. A check already on disk at that point is part of the verified set, including one an agent wrote. Verification pins the check set. It does not judge it. Read the model's sidecar to know what will run.
 
 Two invocations never fight: every state write is a compare-and-swap, and a loop that finds a live owner prints its pid and exits. A crashed owner is taken over automatically — a dead pid is detected by its start time, so a recycled pid never counts as alive.
 

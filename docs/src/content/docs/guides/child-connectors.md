@@ -7,10 +7,10 @@ sidebar:
 
 A child connector is a program you write. `rocky load --connector <name>` runs it once. The program fetches data from a source and writes Parquet files. Rocky checks the files, loads them into one table, and saves the connector's state for the next run.
 
-This page says "child connector" so that it does not clash with a Fivetran connector. They are different things. A Fivetran connector moves data into the warehouse by itself. A child connector is a program that Rocky starts and waits for.
+A Fivetran connector moves data into the warehouse by itself. A child connector is a program that Rocky starts and waits for.
 
 :::caution[A child connector is not a sandbox]
-Rocky hides its own environment from the program. It does not isolate the program. The program runs as the same user as Rocky. It can open any file that user can read. It can call any host. Run only programs you trust.
+Rocky hides its own environment from the program. It does not isolate it. The program runs as the same user as Rocky, can open any file that user can read, and can call any host. Run only programs you trust.
 :::
 
 ## What a run does
@@ -28,11 +28,9 @@ Rocky hides its own environment from the program. It does not isolate the progra
   commit_seq N+1    the table     (ALTERs)    table      files
 ```
 
-The steps, in order:
-
 1. Rocky reads the saved state of the connector. A new connector has none.
 2. Rocky claims the key `connector:<name>:<commit_seq>`. If another run holds the key, this run skips and exits 0.
-3. Rocky starts the program with a cleared environment and resource limits. If the program fails, Rocky starts it again, up to `retries` times.
+3. Rocky starts the program with a cleared environment and resource limits. If it fails, Rocky retries up to `retries` times.
 4. Rocky checks the files the program wrote.
 5. Rocky loads every file into one staging table, handles schema drift, and appends the rows to the target table with one `INSERT` that names every column.
 6. Rocky drops the staging table and saves the connector's new state.
@@ -45,13 +43,11 @@ The steps, in order:
 rocky connector init orders
 ```
 
-It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. The connector needs `python3` and the `duckdb` CLI on `PATH`, and the scaffold runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
+It creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` with code that reads your source, and set `license` in the manifest. It needs `python3` and the `duckdb` CLI on `PATH`, and runs on Linux and macOS. See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
 
 ## Test a connector
 
 `rocky connector test <name>` runs the connector once per `[[run]]` in `connector-test.toml`, beside the manifest. Each run sets options that point the connector at recorded input, and says how many rows it must write. Each run gets the state the run before it returned. Rocky checks the rows, the state (when the run declares `state = "advanced"` or `"unchanged"`) and that every Parquet file has the same column names and types. It loads nothing, saves no state and passes no secrets. It does not block the network, so it cannot prove a run used its recorded input. See [`rocky connector test`](/reference/commands/development/#rocky-connector-test).
-
-The spec lives in its own file because test fixtures do not belong in the manifest a connector ships.
 
 ## Configure a connector
 
@@ -107,12 +103,12 @@ wall_time_secs = 1800
 - `egress_hosts` is required. Write `[]` for a program that calls no host.
 - `license` is optional. It is an SPDX identifier or expression, such as `MIT` or `Apache-2.0 OR MIT`. It must not be blank. Rocky does not check the name against the SPDX list. `rocky load` reports it, and reports `unknown` when it is not set. `rocky validate` warns (**V068**) when it is not set.
 - `support_tier` is optional. It says who supports the connector: `reference` (maintained by the Rocky project and tested in its CI) or `community` (not tested in CI by the Rocky project; Rocky supports the protocol, the state and the load, and a bug in the program the connector runs goes to that program's authors). `rocky load` reports it, and reports `unknown` when it is not set.
-- Both keys are the author's own statement. Rocky does not verify them. A shim that runs another tool, such as the dlt, Airbyte and Meltano shims, declares the license of the shim's code. The tool it runs has its own license.
-- Rocky 1.93.0 and older refuse a manifest that sets `license` or `support_tier`, because they refuse unknown keys. Leave both out if the manifest must load on those versions.
+- Both keys are the author's own statement. Rocky does not verify them. A shim that runs another tool declares the license of the shim's code, not the tool's.
+- Rocky 1.93.0 and older refuse a manifest that sets `license` or `support_tier`. Leave both out if the manifest must load on those versions.
 
-A manifest with an unknown key is refused. A manifest with no `egress_hosts` is refused.
+A manifest with an unknown key, or with no `egress_hosts`, is refused.
 
-`rocky validate` reads each manifest offline and reports **V067** for each connector. It is `ok` when the manifest reads and is valid, and the program in `command` exists. It is an error when the manifest is missing or invalid, or when the first entry of `command` is a path that does not exist. Validate does not check that the program can run, nor any later argument such as a script path. A bare program name is looked up on `PATH` at run time, so validate does not check it. The `[connector.<name>]` fields themselves, such as `output_uri` and `limits`, are checked when the config loads. Secrets are read only at load time. A project with connectors and no `[pipeline]` is valid: V020 ("No pipelines defined") does not warn.
+`rocky validate` reads each manifest offline and reports **V067** for each connector. It is `ok` when the manifest is valid and the program in `command` exists. It is an error when the manifest is missing or invalid, or the first entry of `command` is a path that does not exist. Validate does not check that the program can run, any later argument, or a bare program name (looked up on `PATH` at run time). The `[connector.<name>]` fields, such as `output_uri` and `limits`, are checked when the config loads. A project with connectors and no `[pipeline]` is valid: V020 ("No pipelines defined") does not warn.
 
 ## The request and the result
 
@@ -131,7 +127,7 @@ Rocky writes one JSON document to the stdin of the program.
 
 `options_path` is the absolute path of `options.json`. See [Options](#options).
 
-Ignore request fields you do not know. Rocky can add fields without a new `protocol_version`, as it did with `options_path`.
+Ignore request fields you do not know. Rocky can add fields without a new `protocol_version`.
 
 `state` is `null` on the first run. If the saved state has an older `schema_version` than the manifest, Rocky hands it over unchanged. The program must upgrade it. If the saved state has a newer version than the manifest, Rocky refuses to start the program.
 
@@ -147,7 +143,7 @@ The program writes its Parquet files into `output_dir`. When it is done, it writ
 }
 ```
 
-Rocky checks the following. Any failure fails the attempt, and Rocky may start a new one.
+Rocky checks the following. A failure fails the attempt, and Rocky may retry.
 
 - The result file parses, and `protocol_version` is 0.
 - `state.schema_version` equals `state_schema_version` in the manifest.
@@ -179,9 +175,9 @@ Before each attempt, Rocky writes the table as one line of JSON to `options.json
 {"account":"acct_main","filters":{"status":["succeeded","refunded"]},"page_size":100,"since":"2026-01-01T00:00:00Z"}
 ```
 
-Rocky does not keep the key order of the TOML. Keys are sorted. Read the file by key, not by position.
+Keys are sorted, not in TOML order. Read by key.
 
-- The file always exists. With no `options` table it holds `{}`. A program can read it with no check first.
+- The file always exists. With no `options` table it holds `{}`.
 - Strings, integers, floats, booleans, arrays and tables keep their JSON types.
 - A datetime becomes a string. An offset datetime is RFC 3339, such as `2026-01-01T00:00:00Z`. A local datetime, date or time is written as TOML spells it, such as `2026-01-01T00:00:00`, `2026-01-01` or `07:30:00`.
 - A float that is `nan` or `inf` has no JSON form. The config is refused.
@@ -191,7 +187,7 @@ Rocky does not keep the key order of the TOML. Keys are sorted. Read the file by
 :::caution[Options are not secrets]
 Rocky writes `options.json` to disk in clear. A failed run keeps its scratch directory, and `keep_scratch = true` keeps a successful run's one, so the file stays there too. Put a credential under `secrets`, and read it from the environment of the program.
 
-Rocky refuses an option key or value that holds a value it substituted from the environment with `${VAR}`. The error names the option and shows `${VAR}`, never the value. This check has two gaps. A value shorter than 8 bytes is not detected. The literal default in `${VAR:-default}` is not detected either, because it is already in `rocky.toml` in clear.
+Rocky refuses an option key or value that holds a value substituted from the environment with `${VAR}`. The error names the option and shows `${VAR}`, never the value. Two gaps: a value shorter than 8 bytes is not detected, and the literal default in `${VAR:-default}` is not detected because it is already in `rocky.toml` in clear.
 :::
 
 ## What the program sees
@@ -203,11 +199,9 @@ Rocky clears the environment of the program. The program gets only:
 - `ROCKY_RUN_ID`.
 - `HOME` and `TMPDIR`, both set to the scratch directory.
 
-Nothing else is passed. This means that `DATABRICKS_TOKEN`, `AWS_*` and similar variables of Rocky do not reach the program. The operating system or the language runtime can add variables of its own after the program starts, such as `__CF_USER_TEXT_ENCODING` on macOS.
+Nothing else is passed, so `DATABRICKS_TOKEN`, `AWS_*` and similar variables do not reach the program. The operating system or language runtime can add its own after start, such as `__CF_USER_TEXT_ENCODING` on macOS. This is "not handed over", not a sandbox: the program can still read `~/.aws/credentials` by its absolute path.
 
-This is "not handed over". It is not a sandbox. The program can still read `~/.aws/credentials` by its absolute path if the user can read it.
-
-The output of the program never reaches the stdout of Rocky. Rocky writes each line of stdout and stderr to its log, one line at a time. A value of a declared secret is replaced by `${NAME}` in those log lines. This keeps `--output json` valid.
+The program's output never reaches the stdout of Rocky, which keeps `--output json` valid. Rocky writes each stdout and stderr line to its log, and replaces a declared secret's value with `${NAME}`.
 
 ## Limits
 
@@ -222,7 +216,7 @@ Each key is optional. Both the manifest and `[connector.<name>.limits]` can set 
 
 When Rocky stops a program, it sends `SIGTERM` to the whole process group, waits 5 seconds, and then sends `SIGKILL`.
 
-Each attempt gets a new scratch directory, named with the run id and the attempt number, readable by its owner only. Rocky removes the scratch directory of a failed attempt. After the state commit of a successful run, Rocky removes that run's scratch directory too, unless `keep_scratch = true`. It removes only that one directory, never anything else under `output_uri`. A run that fails after the child succeeded keeps its scratch directory, so you can see what was or may have been loaded. That directory is the program's `HOME` and can hold its caches and credential files, so remove it when you are done.
+Each attempt gets a new scratch directory, named with the run id and attempt number, readable by its owner only. Rocky removes it after a failed attempt, and after the state commit of a successful run unless `keep_scratch = true`. It removes only that directory, never anything else under `output_uri`. A run that fails after the child succeeded keeps its scratch directory, so you can see what may have been loaded. That directory is the program's `HOME` and can hold caches and credential files. Remove it when you are done.
 
 ## Schema drift
 
@@ -232,7 +226,7 @@ Rocky compares the staging table with the target table.
 - A safe type widening is applied with `ALTER COLUMN ... TYPE`.
 - A type change that is not a safe widening fails the run. The load only appends, so Rocky never rebuilds the target.
 
-The final `INSERT` names every column, so files whose columns are in a different order than the target still land in the right columns. All files of one batch must have the same columns. If a later file differs from the first one, the run fails and drops the staging table.
+The final `INSERT` names every column, so column order does not matter. All files of one batch must have the same columns. If a later file differs from the first, the run fails and drops the staging table.
 
 ## What Rocky guarantees
 
@@ -259,11 +253,10 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 ## Known gaps in this release
 
 - Secret values shorter than 8 bytes are not replaced by `${NAME}` in the log. Use long secrets.
-- A run that fails after the child succeeded keeps its scratch directory. Rocky never removes those. Remove them from `output_uri` by hand.
-- A run that crashes leaves its staging table, `<table>__rocky_stg_<run id>`, in the warehouse. On the local state file and on an object-store state backend (`s3`, `gcs`), the next run of that connector takes over the crashed run's claim once it expires. That run drops the one staging table whose name the claim gives. It drops no other table, because another connector can write the same target. If the claim cannot be read, or the drop fails, the table stays and the run goes on with a warning. A prior run that is still alive after its claim expired loses its staging table and fails without loading its batch, so nothing loads twice. Its error says the batch may or may not be in the table; it is not.
-- On the `valkey` and `tiered` state backends this cleanup almost never happens. The Valkey server deletes the crashed run's expired claim, so the next run finds no claim to take over and does not learn the crashed run's ID. Drop those staging tables by hand. Also drop by hand a staging table whose drop failed at the end of a run, and one whose claim was removed before a later run took it over.
-- Only `file://` output is supported.
-- A Ctrl-C or `SIGTERM` while the program runs stops the program group and fails the run. Rocky frees the claim. A signal that arrives while Rocky stages the batch makes Rocky stop before the promote. Rocky drops the staging table and frees the claim. Only a signal that arrives after Rocky sent the promote lets the state commit finish.
+- Rocky never removes the scratch directory of a run that failed after the child succeeded. Remove it from `output_uri` by hand.
+- A run that crashes leaves its staging table, `<table>__rocky_stg_<run id>`, in the warehouse. On the local state file and on an object-store state backend (`s3`, `gcs`), the next run of that connector takes over the crashed run's claim once it expires. That run drops the one staging table whose name the claim gives. It drops no other table, because another connector can write the same target. If the claim cannot be read, or the drop fails, the table stays and the run goes on with a warning. A prior run that is still alive after its claim expired loses its staging table and fails without loading its batch, so nothing loads twice.
+- On the `valkey` and `tiered` state backends this cleanup almost never happens, because the Valkey server deletes the expired claim. Drop those staging tables by hand. Also drop by hand a staging table whose drop failed at the end of a run, and one whose claim was removed before a later run took it over.
+- A Ctrl-C or `SIGTERM` while the program runs stops the program group, fails the run and frees the claim. A signal while Rocky stages the batch stops it before the promote: Rocky drops the staging table and frees the claim. Only a signal after the promote lets the state commit finish.
 
 ## JSON output
 
@@ -283,9 +276,7 @@ Rocky does not block other hosts in v0. The `egress_hosts` list is the connector
 
 ## Reference connector
 
-The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete child connector for Postgres. Copy it as a starting point. It is one Python 3.8 file with no packages. It runs its SQL through the `duckdb` CLI and the DuckDB `postgres` extension.
-
-The connector reads one table and keeps a timestamp cursor in its state.
+The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete child connector for Postgres: one Python 3.8 file with no packages. It runs its SQL through the `duckdb` CLI and the DuckDB `postgres` extension. It reads one table and keeps a timestamp cursor in its state.
 
 ```json
 { "schema_version": 1, "value": { "cursor": "2026-10-01T00:19:00.000000Z" } }
@@ -298,9 +289,7 @@ Each run works like this:
 3. The new cursor is the largest value it extracted. Rows at M wait until a newer row exists, so rows that tie at M always land together. On a quiet source the newest rows wait until newer data arrives.
 4. If no row qualifies, the program writes no file. Rocky loads nothing and still saves the state.
 
-The source table and the cursor column are in `[connector.pg_events.options]`. The program reads them from `options.json`.
-
-The connection settings are the `PG*` variables, declared under `secrets` in `rocky.toml`. The program attaches with an empty connection string, so libpq reads them from its environment. They never appear in SQL or in the output.
+The source table and cursor column are in `[connector.pg_events.options]`. The connection settings are the `PG*` variables, declared under `secrets`. The program attaches with an empty connection string, so libpq reads them from its environment. They never appear in SQL or output.
 
 The limits of this design:
 
@@ -312,13 +301,13 @@ The limits of this design:
 
 **Replay mode.** With `replay_fixture` set in the options (a SQL file, relative to `main.py`), the connector builds a local DuckDB catalog named `pg` from that file instead of attaching Postgres. It runs the same two queries, skips the `postgres` extension and reads no `PG*` variable. A missing fixture fails the run; it never falls back to Postgres. The log says the run is a replay. `rocky connector test pg_events` uses it: its `connector-test.toml` replays the three loads below (19, 5 and 0 rows) with no Docker.
 
-The POC runs three loads against a Postgres container and checks the row counts, which rows were held back, and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file. The weekly CI runs it as a gate: a failure turns the weekly job red.
+The POC runs three loads against a Postgres container and checks the row counts, the held-back rows and the commit sequence. It also checks that the password appears in no output, log, scratch directory or state file. The weekly CI runs it as a gate.
 
 The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the same connector inside a full project, with a data product, a deadline, volume ranges, a monthly cost and a budget.
 
 ## Connector shims
 
-Three POCs show how to run a third-party extraction tool as a child connector. Each one is a short program that adapts the tool's output and state to the protocol. Rocky ships no extractors and no catalog. You bring the tool and its configuration.
+Three POCs run a third-party extraction tool as a child connector. Each shim is a short program that adapts the tool's output and state to the protocol. Rocky ships no extractors and no catalog.
 
 | Tool | POC | What the shim runs |
 |---|---|---|
@@ -330,8 +319,8 @@ All three follow the same rules.
 
 - **One stream per connector.** The options name the one stream (table) to load. If the tool emits several, the shim loads that one. If the name does not exist, the run fails and lists the streams that do.
 - **The tool's state lives in Rocky state.** The shim restores the tool's own incremental state from the request, and returns the new state in the result. Rocky's commit fence then governs it. Never keep the tool's state anywhere Rocky does not commit it, such as Meltano's own state backend or an Airbyte database. A crash before the state commit would then skip a batch, and the at-least-once guarantee would break.
-- **Delivery is at least once.** A crash between the promote and the state commit loads a batch twice. Deduplicate downstream on a key.
-- **No catalog.** Rocky does not discover or list sources. The options name the module, the image or the tap.
+- **Delivery is at least once.** Deduplicate downstream on a key.
+- **No catalog.** The options name the module, the image or the tap.
 - **Credentials go under `secrets`.** Each tool reads its credentials from the environment. Declare the variable names under `secrets`. Never put a credential under `options`.
 - **The tool, not Rocky, calls the network.** The manifest `egress_hosts` lists the hosts the tool calls. Rocky does not enforce the list.
 

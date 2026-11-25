@@ -95,7 +95,7 @@ rocky apply <plan-id>
 
 The plan is review-gated even for a person. At apply time, Rocky rebuilds the artifact from the recipe its tombstone references. It checks that the recomputed blake3 hash equals the tombstoned hash before any write becomes visible. Then it writes the bytes at the tombstoned path, never over mismatched bytes, and reinstates the ledger row.
 
-Restore rebuilds only a recipe that is content-addressed, not partitioned, and reads no recorded upstream. See [What restore can and cannot undo](#what-restore-can-and-cannot-undo) for every case that refuses.
+See [What restore can and cannot undo](#what-restore-can-and-cannot-undo) for every case that refuses.
 
 ---
 

@@ -9,7 +9,7 @@
 
 Editor support for [Rocky](https://github.com/rocky-data/rocky), the typed graph between your code and your warehouse.
 
-The extension is a language client. It starts `rocky lsp` and asks it the language questions. So the diagnostics, the hover types, and the lineage all come from the same compiler that builds your tables.
+The extension is a language client. It starts `rocky lsp`, so diagnostics, hover types and lineage come from the same compiler that builds your tables. Rocky reads plain SQL and the `.rocky` DSL, and the server attaches to both. For a browser view, run `rocky serve --ui` ([guide](https://rocky-data.dev/guides/browser-ui/)).
 
 ```
   .rocky files          ┌───────────────┐                    ┌──────────────┐
@@ -24,19 +24,13 @@ The extension is a language client. It starts `rocky lsp` and asks it the langua
                         └───────────────┘
 ```
 
-Rocky reads plain SQL as well as the `.rocky` DSL. The language server attaches to both.
-
-Rocky also has a browser UI. Run `rocky serve --ui` to browse the project and review plans in a browser. See the [browser UI guide](https://rocky-data.dev/guides/browser-ui/).
-
 ## In action
 
 **See the SQL behind the DSL.** Open a model and run `Rocky: Open Compiled SQL`. The compiled SQL appears beside it and refreshes every time you save. Here `!=` becomes a null-safe `IS DISTINCT FROM`, and the post-aggregate filter becomes `HAVING`.
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-compiledSql.gif" alt="A Rocky DSL model on the left and its compiled SQL on the right" width="820" /></p>
 
-**Inspect a model.** The Inspector opens in the bottom panel with six tabs: Overview, Columns, Lineage, Tests, Preview, and Profile. Overview is a trust dashboard. It carries cards for estimated cost, blast radius, contract, freshness, governance (classified and unmasked columns), last run, materialization, column count, and last materialized time.
-
-In the recording below, a PII-classified model flags a column left unmasked. Columns then traces each column to its upstream source. The Lineage canvas draws the model's neighbourhood with a cost overlay.
+**Inspect a model.** The Inspector opens in the bottom panel with six tabs: Overview, Columns, Lineage, Tests, Preview, and Profile. Overview is a trust dashboard with cards for estimated cost, blast radius, contract, freshness, governance (classified and unmasked columns), last run, materialization, column count, and last materialized time. Below, a PII-classified model flags an unmasked column, Columns traces each column upstream, and the Lineage canvas draws the neighbourhood with a cost overlay.
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector touring a PII-classified model: an Overview trust dashboard with a red Governance card, Columns, the lineage canvas with a cost overlay, Tests, and per-column Profile" width="820" /></p>
 
@@ -54,15 +48,17 @@ In the recording below, a PII-classified model flags a column left unmasked. Col
 
 **Lineage**: `Rocky: Show Model Lineage` opens the Inspector on its Lineage tab, framed on the model you are editing.
 
-**AI generate**: `Rocky: Generate Model from Intent` turns a description in plain English into a model. Rocky compiles each attempt. It makes at most three attempts in total. It writes the model and its sidecar into `models/` only when the model type-checks. The command opens the result in a new tab, including the path of each file it wrote.
+**AI generate**: `Rocky: Generate Model from Intent` turns a plain-English description into a model. Rocky compiles each attempt, up to three in total. It writes the model and its sidecar into `models/` only when the model type-checks, and opens the result in a new tab with the path of each file.
 
-**Agent mode**: the extension registers `rocky mcp` as a Model Context Protocol server for each workspace folder that has a `rocky.toml` at its root. Agent mode then drives Rocky through the engine's 31 tools. Most of them only read: compile, lineage, schema, row samples, and run history. Six of them write.
+**Agent mode**: the extension registers `rocky mcp` as a Model Context Protocol server for each workspace folder with a `rocky.toml` at its root. Agent mode drives Rocky through the engine's 31 tools. Most only read (compile, lineage, schema, row samples, run history). Six write:
 
-`draft_model`, `draft_contract`, and `draft_check` write files under `models/`, and `draft_metadata` patches a model's sidecar metadata. `propose` records a plan for a human to review, and applies nothing itself. `pause_schedule` pauses a pipeline's schedule, and refuses to act unless the agent passes `confirm: true`.
+- `draft_model`, `draft_contract` and `draft_check` write files under `models/`. `draft_metadata` patches a model's sidecar metadata.
+- `propose` records a plan for a human to review and applies nothing.
+- `pause_schedule` pauses a pipeline's schedule and refuses unless the agent passes `confirm: true`.
 
-`review_queue` lists the plans waiting on you. The agent **cannot** sign one off: signing off writes the approval marker that unblocks `rocky apply`, and the engine serves that action only to a server started as `rocky mcp --profile approver`. The extension starts `rocky mcp` without that flag, so the call is refused and nothing is written.
+`review_queue` lists the plans waiting on you. The agent **cannot** sign one off: signing off writes the approval marker that unblocks `rocky apply`, and the engine serves it only to a server started as `rocky mcp --profile approver`. The extension starts `rocky mcp` without that flag, so the call is refused and nothing is written.
 
-**Plan review**: you approve a plan yourself. Run `Rocky: Review Plan (Breaking Changes + Apply)` and pick a plan from `.rocky/plans/`. When that directory has no plans, the command asks for a plan id. The panel shows the breaking-change report with two buttons. **Approve** runs `rocky review <plan-id> --approve`. **Apply** runs `rocky apply <plan-id>`, and stays disabled until the plan is approved.
+**Plan review**: you approve a plan yourself. Run `Rocky: Review Plan (Breaking Changes + Apply)` and pick a plan from `.rocky/plans/` (with none, the command asks for a plan id). The panel shows the breaking-change report. **Approve** runs `rocky review <plan-id> --approve`. **Apply** runs `rocky apply <plan-id>` and stays disabled until the plan is approved.
 
 A `@rocky` chat participant handles four single-shot requests: `/generate`, `/explain`, `/sync`, and `/test`.
 
@@ -77,11 +73,7 @@ A `@rocky` chat participant handles four single-shot requests: `/generate`, `/ex
 
 From the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky):
 
-1. Open the Extensions view (`Ctrl+Shift+X` / `Cmd+Shift+X`).
-2. Search for **Rocky**.
-3. Install and reload.
-
-The extension starts `rocky lsp` on activation. It attaches the server to every `.rocky` file, and to every `.sql` file under a `models/` directory.
+Open the Extensions view (`Ctrl+Shift+X` / `Cmd+Shift+X`), search for **Rocky**, install and reload. The extension starts `rocky lsp` on activation and attaches it to every `.rocky` file and every `.sql` file under a `models/` directory.
 
 ## Settings
 
