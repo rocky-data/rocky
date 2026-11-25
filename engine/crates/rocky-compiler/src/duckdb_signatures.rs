@@ -31,7 +31,7 @@ use std::sync::LazyLock;
 
 /// The DuckDB version the data was generated from. A different bundled
 /// version fails `the_signature_file_matches_the_bundled_duckdb`.
-pub const DUCKDB_VERSION: &str = "v2.0.0";
+pub const DUCKDB_VERSION: &str = "v2.0.1";
 
 #[derive(Debug, Default)]
 struct Signatures {
