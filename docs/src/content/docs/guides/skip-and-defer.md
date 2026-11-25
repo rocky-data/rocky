@@ -122,7 +122,11 @@ lag_tolerance_seconds = 0        # default: any MAX(ts) movement forces a rebuil
 ```
 
 - `skip_rowcount_fallback` (default `false`) allows a `COUNT(*)`-only stability signal when an upstream has no timestamp to probe. Only `incremental` and `microbatch` models that set a timestamp column have one, so a model with any other strategy that reads a raw source can never skip without this switch. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE`, or a matched insert plus delete. So it stays behind this switch.
-- `lag_tolerance_seconds` (default `0`) treats an upstream `MAX(ts)` that moved by at most this many seconds as unchanged. It is the late-arriving-but-irrelevant micro-update analog of a freshness SLA threshold. A `MAX(ts)` that went backwards forces a rebuild whatever this value is.
+- `lag_tolerance_seconds` (default `0`) is the largest forward move of a raw source's `MAX(ts)` watermark, compared with the value stored on the prior build, that still counts as unchanged. It is a gap between two watermark readings, in seconds. At `0`, only an identical reading counts as unchanged. A `MAX(ts)` that went backwards forces a rebuild whatever this value is.
+
+  Example: with `lag_tolerance_seconds = 300`, the prior build saw `MAX(ts)` at `10:00:00`. A new reading of `10:03:00` is a 180-second move, so the model can skip. A reading of `10:06:00` is a 360-second move, so the model rebuilds.
+
+  This is not a wait-before-rebuild window like the `lag_tolerance` setting in other tools. Rocky never delays a build. It only decides, at run time, whether a small watermark move is ignored.
 
 The full `[run]` reference is in the [configuration reference](/reference/configuration/#run).
 
