@@ -106,7 +106,7 @@ type = "not_null"
 column = "customer_id"
 ```
 
-With `rocky run --tests enforce`, or `[run] tests_on_run = "enforce"`, a NULL fails the model, and its downstream models do not build. The default is `off`, so set one of them. The test runs after the write, so the rows stay in the model's table. `rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence is that failure. A later run that rebuilds the model without tests replaces that evidence, and promote then only warns. See [Tests during a run](/reference/commands/core-pipeline/#tests-during-a-run) and [Declarative tests](#declarative-tests-tests).
+With `rocky run --tests enforce`, or `[run] tests_on_run = "enforce"`, a NULL fails the model, and its downstream models do not build. `[run] tests_on_run` defaults to `enforce`, so a run enforces tests unless you set `report` or `off`. The test runs after the write, so the rows stay in the model's table. `rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence is that failure. A later run that rebuilds the model without tests replaces that evidence, and promote then only warns. See [Tests during a run](/reference/commands/core-pipeline/#tests-during-a-run) and [Declarative tests](#declarative-tests-tests).
 
 Two cases differ:
 

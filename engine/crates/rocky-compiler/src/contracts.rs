@@ -400,7 +400,7 @@ pub fn validate_contract_with(
                              says GENERATED), make the change in the spec, not in the contract file, \
                              because the next lowering overwrites the contract. `[run] tests_on_run` \
                              defaults to \"enforce\"; \"report\" and \"off\" turn that down. With \
-                             `rocky run --tests enforce`, the default, a NULL fails the model and its downstream models do not build; the \
+                             `rocky run --tests enforce`, or with the default setting, a NULL fails the model and its downstream models do not build; the \
                              rows it wrote stay in the table. `rocky plan promote` refuses a branch when the \
                              model's newest `rocky run --branch` evidence is that failure. A `WHERE {0} IS NOT NULL` filter does not clear `E012`: \
                              Rocky does not read the WHERE clause when it infers nullability. Use the \
