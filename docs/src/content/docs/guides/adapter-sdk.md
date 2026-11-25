@@ -11,35 +11,11 @@ The `rocky-adapter-sdk` crate mirrors the `rocky-core` traits for adapters built
 
 This guide takes you to a compiling skeleton with passing tests: [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton). It is shaped after ClickHouse but fits any SQL warehouse not shipped in-tree (Trino and ClickHouse already ship: see [`rocky-trino`](/concepts/architecture/#rocky-trino) and the [ClickHouse adapter](/reference/adapters/clickhouse/)).
 
-Your crate supplies the two boxes marked "yours":
-
-```
-   rocky plan / apply
-          │
-          ▼
-   ┌──────────────────────────────┐
-   │ Rocky planner                │  reads AdapterCapabilities
-   │                              │  to decide what it may emit
-   └──────────────┬───────────────┘
-                  │ target table ref + SELECT text
-                  ▼
-   ┌──────────────────────────────┐
-   │ SqlDialect            yours  │  composes every SQL string
-   └──────────────┬───────────────┘
-                  │ SQL text
-                  ▼
-   ┌──────────────────────────────┐
-   │ WarehouseAdapter      yours  │  execute_statement
-   │                              │  execute_query
-   └──────────────┬───────────────┘
-                  │ driver call or HTTP request
-                  ▼
-            your warehouse
-```
+Your crate supplies two parts. The planner reads `AdapterCapabilities` to decide what it may emit, then hands a target table ref and `SELECT` text to your `SqlDialect`, which composes every SQL string Rocky sends. Your `WarehouseAdapter` (`execute_statement`, `execute_query`) sends that SQL to the warehouse by driver call or HTTP request.
 
 ## When to reach for the SDK
 
-Use the SDK when the warehouse is not in-tree (DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, Redshift, Trino, ClickHouse, SQL Server, Spark), when you need a forked variant of an in-tree adapter (such as Databricks Serverless on `rocky-databricks`), or when you embed Rocky in a tool that owns its warehouse client. For an in-tree warehouse, use `[adapter]` in `rocky.toml`. For another language, use the [process adapter protocol](#process-adapter-protocol).
+Use the SDK for a warehouse that is not in-tree (DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, Redshift, Trino, ClickHouse, SQL Server, Spark), a forked variant of an in-tree adapter, or a tool that owns its warehouse client. For an in-tree warehouse use `[adapter]` in `rocky.toml`. For another language use the [process adapter protocol](#process-adapter-protocol).
 
 ## The trait surface
 
@@ -73,7 +49,7 @@ A flag in `AdapterCapabilities` gates each opt-in trait: set it and implement th
 rocky init-adapter bigquery
 ```
 
-This creates `crates/rocky-bigquery/` with a `Cargo.toml`, `src/{lib,dialect,adapter,types}.rs` stubs, and an `#[ignore]`d live-connection test in `tests/integration.rs`. Add the crate to the workspace first, or Cargo refuses it.
+This creates `crates/rocky-bigquery/` with a `Cargo.toml`, `src/{lib,dialect,adapter,types}.rs` stubs and an `#[ignore]`d live test in `tests/integration.rs`. Add the crate to the workspace first.
 
 **The scaffolded crate does not compile until you answer one question.** `SqlDialect::literal_escape` says how your warehouse reads a single-quoted string.
 
@@ -130,10 +106,10 @@ fn format_table_ref(&self, _catalog: &str, schema: &str, table: &str) -> Adapter
 
 Four methods deserve extra thought:
 
-- **`merge_into`**: return `AdapterError::not_supported("merge_into")` when your warehouse has no `MERGE`.
-- **`insert_overwrite_partition`**: returns `Vec<String>`, because some warehouses need a multi-statement transaction, such as Snowflake's `BEGIN; DELETE; INSERT; COMMIT`. The runtime executes the statements in order and rolls back on a partial failure.
-- **`row_hash_expr`**: Rocky uses this for change detection. ClickHouse uses `sipHash128(tuple(...))`. For hashes that compare across warehouses, see `rocky-bigquery` and `rocky-snowflake`.
-- **`watermark_where`**: Rocky passes the watermark in as a literal `DateTime<Utc>` from its state store. Your dialect only formats it as a native timestamp literal in `col > <literal>`. `None` (first run, or after `delete_watermark`) means format the `1970-01-01` sentinel. Validate `timestamp_col` before you splice it in.
+- **`merge_into`**: return `AdapterError::not_supported("merge_into")` when the warehouse has no `MERGE`.
+- **`insert_overwrite_partition`**: returns `Vec<String>`, because some warehouses need a transaction (Snowflake's `BEGIN; DELETE; INSERT; COMMIT`). The runtime runs the statements in order and rolls back on a partial failure.
+- **`row_hash_expr`**: change detection. ClickHouse uses `sipHash128(tuple(...))`. For cross-warehouse hashes see `rocky-bigquery` and `rocky-snowflake`.
+- **`watermark_where`**: Rocky passes the watermark as a `DateTime<Utc>` literal. Format it as a native timestamp in `col > <literal>`. `None` (first run, or after `delete_watermark`) means the `1970-01-01` sentinel. Validate `timestamp_col` before splicing it in.
 
 ## Auth and connection management
 
@@ -147,7 +123,7 @@ Two rules for every adapter:
 1. **Read credentials at config-parse time.** Rocky substitutes `${VAR}` while parsing `rocky.toml`. Take the resolved string from `SkeletonConfig`. Do not re-read the environment in the constructor, or tests collide.
 2. **Pool HTTP clients in the adapter struct.** Build `reqwest::Client` once in `SkeletonAdapter::new` and clone the handle.
 
-For retry and rate limiting, see `rocky-adapter-sdk/src/throttle.rs` (the AIMD helper) and the `is_transient` / `is_rate_limit` loop in `rocky-databricks/src/connector.rs`.
+For retry and rate limiting, see `rocky-adapter-sdk/src/throttle.rs` (AIMD) and the `is_transient` / `is_rate_limit` loop in `rocky-databricks/src/connector.rs`.
 
 ## Testing your adapter
 
@@ -155,15 +131,9 @@ Neither layer needs a live warehouse. Unit tests with a mock backend assert on t
 
 ### The conformance harness
 
-`rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult` saying which tests apply, from your declared capabilities, and which were skipped. The SDK ships 26 test specifications: 18 always run, and 8 are capability-gated (skipped when the manifest declares the capability `false`).
+`rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult` saying which tests apply, from your declared capabilities, and which were skipped. The SDK ships 26 test specifications across Connection, DDL, DML, Query, Types, Dialect, Governance, Batch Checks and Discovery. 18 always run, and 8 are capability-gated (skipped when the manifest declares the capability `false`).
 
-| Category | Tests | Category | Tests |
-|---|---|---|---|
-| Connection | 1 | Dialect | 3 |
-| DDL | 4 | Governance | 2 |
-| DML | 2 | Batch Checks | 2 |
-| Query | 4 | Discovery | 1 |
-| Types | 7 | | |
+
 
 `rocky test-adapter --adapter <name>` resolves only the builtins (`databricks`, `snowflake`, `duckdb`) or a `rocky-<name>` process-adapter binary on your `PATH`. To test your own adapter, expose it as a process adapter or pass `--command`:
 
@@ -206,4 +176,4 @@ The adapter registry is static at compile time, with no dynamic plugin system. T
 
 **`AdapterError` is type-erased on purpose.** Use `AdapterError::msg(...)` for an ad-hoc error, `AdapterError::new(my_err)` to wrap an `std::error::Error`, and `AdapterError::not_supported("method_name")` for a missing capability. Do not use `thiserror` inside the trait impl.
 
-See also the [skeleton POC source](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and the in-tree adapters in `engine/crates/rocky-{databricks,snowflake,bigquery,duckdb,fivetran}/`. File an issue on [github.com/rocky-data/rocky](https://github.com/rocky-data/rocky/issues) if a trait method is missing something.
+See the in-tree adapters in `engine/crates/rocky-{databricks,snowflake,bigquery,duckdb,fivetran}/`. File an [issue](https://github.com/rocky-data/rocky/issues) if a trait method is missing something.

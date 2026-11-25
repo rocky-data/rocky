@@ -35,7 +35,7 @@ Every recipe below keys off the process exit code:
 | Code | Meaning | Emitted by |
 |------|---------|------------|
 | `0` | Success | every command |
-| `1` | Hard failure: config error, unreadable state, or an error raised *after* some models materialized (a budget breach). For `rocky tick`, also an unreadable webhook spool | most commands |
+| `1` | Hard failure: config error, unreadable state, or an error raised *after* some models materialized (a budget breach). For `rocky tick`, also a `.rocky/pending-demands` webhook spool that exists but cannot be read (a missing spool exits `0`); this outranks exit `2` | most commands |
 | `2` | **Partial success**: some models failed, or an error-severity check failed after the data was copied. Also `rocky fulfill` blocked and needing a human, and `rocky product verify` failed | `rocky run`, `rocky tick`, `rocky fulfill`, `rocky product verify` |
 | `3` | A Critical health check. Also `rocky fulfill` parked at `applying_unknown` | `rocky doctor`, `rocky fulfill` |
 | `4` | `rocky fulfill` applied a plan whose output fails a check the product declared | `rocky fulfill` |

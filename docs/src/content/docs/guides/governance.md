@@ -243,19 +243,7 @@ The model's own `[tags]` merge over the group's, key by key. `dagster-rocky` pro
 
 Rocky runs quality checks inside a replication run, as soon as each table is copied. Keys are in [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks). [Data quality checks](/concepts/data-quality-checks/) has the result shapes, anomaly rules and freshness edge cases.
 
-```toml
-[pipeline.bronze.checks]
-enabled = true
-row_count = true
-column_match = true
-freshness = { error_after = "24h" }
-null_rate = { columns = ["email", "phone"], threshold = 0.05, sample_percent = 10 }
-
-[[pipeline.bronze.checks.custom]]
-name = "no_future_dates"
-sql = "SELECT COUNT(*) FROM {target} WHERE order_date > CURRENT_DATE()"
-threshold = 0
-```
+Example: `[pipeline.bronze.checks]` with `enabled = true`, `row_count = true`, `column_match = true`, `freshness = { error_after = "24h" }` and `null_rate = { columns = ["email", "phone"], threshold = 0.05, sample_percent = 10 }`, plus a `[[pipeline.bronze.checks.custom]]` entry with `name`, `sql` (using the `{target}` placeholder) and `threshold`.
 
 ## 13. Audit Trail
 
@@ -289,7 +277,7 @@ Say which region each pipeline and the AI endpoint is in, and stop a plan or an 
 
 **Pipelines (`V061`).** A replication or snapshot pipeline reads its `source` and writes its `target`. When both set `region` and the labels differ, Rocky refuses the pipeline, whether or not `enforce` is on. `rocky validate` reports it offline, and every command that loads the config (`plan`, `run`, `apply`, `discover`) refuses the project. The reverse direction needs its own `allow` entry. Rocky checks only a pipeline's own source and target. It does not check the SQL inputs of a transformation's models, the `tables` of a quality pipeline, the `source_dir` of a load pipeline, a `source.discovery` block, or a pipeline-level `depends_on` (it orders pipelines but does not say one reads the other's tables). A transformation in `"us"` that reads a table another pipeline wrote in `"eu"` is not refused.
 
-**Required labels (`V060`).** With `enforce = true`, `region` is required on `source` and `target` of replication and snapshot pipelines, on `target` of transformation, quality and load pipelines, and on `[ai]` (even when the project never runs `rocky ai`). An empty string counts as missing. The `regions...` component of a `schema_pattern` is unrelated: it names part of a source schema.
+**Required labels (`V060`).** With `enforce = true`, `region` is required on `source` and `target` of replication and snapshot pipelines, on `target` of transformation, quality and load pipelines, and on `[ai]` (even when the project never runs `rocky ai`). An empty string counts as missing.
 
 **AI requests (`V062`).** Rocky compares `[ai] region` with the region of the data an AI request carries. Same region: the request goes. Different regions: refused unless `allow` has an entry from the data's region to the `[ai]` region, whether or not `enforce` is on. No label on the data or on `[ai]`, with `enforce` off: the request goes. Rocky checks when it builds the AI client, before it profiles the warehouse or sends anything, and `rocky ai-sync` checks before it writes its upstream schema baseline. One command builds one client for all its data, so one refused item stops the whole command: `rocky ai-explain --all` over an `"eu"` and a `"us"` model with `[ai] region = "us"` sends nothing. Name one model (`rocky ai-explain <model>`, `rocky ai-test <model>`, `rocky ai-sync --model <model>`) to run the models that may go.
 

@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Swap `"run_history"` for `"output_artifacts"` or `"branches"` to dump those tables. The reader reads the file format directly and never links against Rocky.
+Swap `"run_history"` for `"output_artifacts"` or `"branches"` to dump those tables. The reader never links against Rocky.
 
 ## Verify one run, step by step
 
@@ -264,7 +264,7 @@ Four checks, none needing the `rocky` binary.
 
 ## What this verifies, and what it does not
 
-Verified with the tools above, with no `rocky` binary:
+Verified with no `rocky` binary:
 
 - That a run happened, when, who triggered it, and what code ran (`sql_hash`, `git_commit`).
 - The output table's live schema and row count, and on the content-addressed path the output bytes' hash.

@@ -135,7 +135,7 @@ The entry records what already happened, not a plan. Rocky records it after the 
 
 **Definition.** A warehouse call failed at execution time, after compile, contracts and drift passed: network, auth, quota, statement timeout, deadlock. Anything that starts inside the [adapter](/reference/glossary/#adapter).
 
-**Detection signal.** A non-zero `rocky apply` exit plus one `RunOutput.errors[*]` entry per failed table, with a typed [`failure_kind`](/advanced/per-table-error-containment/#failure_kind-taxonomy). The other tables keep going. See [Per-table error containment](/advanced/per-table-error-containment/). Typical causes: Databricks `401` (expired PAT, misconfigured OAuth M2M), Snowflake auth rejection or a suspended warehouse, BigQuery quota or scope mismatch, DuckDB lock contention or out-of-memory, Fivetran / Airbyte `403` (missing API scope) or a connector mid-sync.
+**Detection signal.** A non-zero `rocky apply` exit plus one `RunOutput.errors[*]` entry per failed table, with a typed [`failure_kind`](/advanced/per-table-error-containment/#failure_kind-taxonomy). The other tables keep going. See [Per-table error containment](/advanced/per-table-error-containment/). Typical causes: Databricks `401 Unauthorized` (expired PAT, misconfigured OAuth M2M), Snowflake auth rejection or a suspended warehouse, BigQuery quota or scope mismatch, DuckDB lock contention or out-of-memory, Fivetran / Airbyte `403 Forbidden` (missing API scope) or a connector mid-sync.
 
 ### Classified retry
 

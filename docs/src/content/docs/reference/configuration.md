@@ -115,18 +115,7 @@ A worked example covering all three layers lives in `examples/playground/pocs/00
 
 Rocky prints the placeholder, not the value. A value of 8 bytes or more is rewritten to `${NAME}` wherever it appears, even inside a longer string. With `BUCKET=analytics_prod`, the hook command `upload.sh s3://analytics_prod/out` prints as `upload.sh s3://${BUCKET}/out`. A value shorter than 8 bytes prints as itself, and so does the literal in `${VAR:-default}`. A value that a TOML basic string unescapes (`A`, `\t`) is matched in its unescaped form too.
 
-| Surface | What prints `${NAME}` |
-|---|---|
-| `rocky serve` responses | Every value of 8 bytes or more. |
-| `rocky policy show`, `rocky policy check`, `rocky brief` | Policy `scope`, `verify_after`, `autonomy_budget.window`; a model's `tags`, `classifications` and `layer`; a degraded rule's `window`. |
-| `rocky compile`, `rocky dag` | `models_detail` (`strategy`, `freshness`, `tags`, `depends_on`, `name`), diagnostics text; a node's `strategy`, `freshness` and `partition_shape`. |
-| `rocky list models` / `adapters` / `sources`, `rocky catalog` | `depends_on`; an adapter's `host`; a source's `catalog`, `schema_prefix` and `components`; an asset's `intent` and column descriptions. |
-| `rocky validate`, `rocky doctor` | A pipeline's `strategy`, `catalog_template` and `schema_template`; every message, detail and suggestion. |
-| `rocky hooks list`, `rocky hooks test` | A hook's `command`, and the abort reason. |
-| `GET /api/v1/schedule`, `rocky audit`, policy-decision ledger | `timezone`, `cron`, `after`, config error; a decision's `model` and `reason`; a verification's `checks` and `reason`; a `verify_after` check name and outcome. |
-| `rocky plan` (replication) plan files | `config_snapshot` holds `${NAME}`. A keyed digest of each config section sits beside it, so `rocky apply` refuses when an environment value changed. The key is `.rocky/plan-digest.key`; without it, apply refuses. |
-| Config errors and model-file errors | Every quoted value of 8 bytes or more, including TOML parse errors in a sidecar, `_defaults.toml` or frontmatter. |
-| Adapter connection fields | DuckDB `path`, `extension_directory`; Databricks `host`, `http_path`, `client_id`; Snowflake `account`, `warehouse`, `username`, `private_key_path`, `role`, `database`; BigQuery `project_id`, `location`; Fivetran `destination_id`. Only the adapter connect path reads the value. |
+Surfaces that print `${NAME}`: `rocky serve` responses (every value of 8 bytes or more); `rocky policy show` / `check` and `rocky brief` (policy `scope`, `verify_after`, `autonomy_budget.window`, a model's `tags`, `classifications` and `layer`); `rocky compile` and `rocky dag` (`models_detail` fields `strategy`, `freshness`, `tags`, `depends_on`, `name`, diagnostics text, a node's `strategy`, `freshness`, `partition_shape`); `rocky list models` / `adapters` / `sources` and `rocky catalog` (`depends_on`, an adapter's `host`, a source's `catalog`, `schema_prefix`, `components`, an asset's `intent` and column descriptions); `rocky validate` and `rocky doctor` (a pipeline's `strategy`, `catalog_template`, `schema_template`, every message, detail and suggestion); `rocky hooks list` / `test` (a hook's `command` and the abort reason); `GET /api/v1/schedule`, `rocky audit` and the policy-decision ledger (`timezone`, `cron`, `after`, a decision's `model` and `reason`, a verification's `checks`, `reason` and outcome); config and model-file errors (every quoted value of 8 bytes or more, TOML parse errors included); and the adapter connection fields (DuckDB `path`, `extension_directory`; Databricks `host`, `http_path`, `client_id`; Snowflake `account`, `warehouse`, `username`, `private_key_path`, `role`, `database`; BigQuery `project_id`, `location`; Fivetran `destination_id`), which only the adapter connect path reads. In a replication `rocky plan` file, `config_snapshot` holds `${NAME}`, and a keyed digest of each config section sits beside it, so `rocky apply` refuses when an environment value changed. The key is `.rocky/plan-digest.key`; without it, apply refuses.
 
 These outputs show a resolved value:
 
@@ -415,7 +404,7 @@ Declarative assertions. Each block declares a `type` and its parameters. Every a
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `table` | string | (required) | Unqualified target table the assertion runs against. Implied in a model sidecar; required in a pipeline-level block. |
-| `name` | string | | Result identifier; synthesized from `{kind}:{column}` when unset. Set it to tell apart several assertions on one table, kind and column. Refused at config load: the reserved names `quarantine:compile`, `quarantine:execute`, `row_count`, `column_match`, `row_count_anomaly`, and `freshness` when the pipeline declares `[checks.freshness]`. Names are compared after every non-alphanumeric character maps to `_` (as Dagster keys a check), so `quarantine.execute` is refused too. The same rule covers a `[[checks.custom]]` name and any two check names that sanitize alike. `rocky run` and `rocky plan` re-check once discovery has resolved the real table set, which catches a `cross_source_overlap` collision. |
+| `name` | string | | Result identifier; synthesized from `{kind}:{column}` when unset. Set it to tell apart several assertions on one table, kind and column. Refused at config load: the reserved names `quarantine:compile`, `quarantine:execute`, `row_count`, `column_match`, `row_count_anomaly`, and `freshness` when the pipeline declares `[checks.freshness]`. Names compare after every non-alphanumeric character maps to `_` (as Dagster keys a check), so `quarantine.execute` is refused too, as is any pair of check names (custom, `null_rate` column, assertion) that sanitize alike. `rocky run` and `rocky plan` re-check once discovery has resolved the real table set, which catches a `cross_source_overlap` collision. |
 | `type` | string | (required) | One of: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. |
 | `column` | string | | Required for the row-level column kinds (`not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`). |
 | `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
@@ -745,13 +734,12 @@ on_breach = "warn"           # the only value
 
 Each limit must be a finite number, 0 or more. A limit left unset is not checked. Rocky rejects an unknown field here.
 
-- **What is tested.** The figure the product is **charged** in `rocky cost --month <YYYY-MM> --by product`: `kept` plus `allocated_upstream`. A table this product builds that another product reads is charged to the reader. `built` is not tested. The month is cut in the project's `[schedule].timezone`.
-- **When.** At the end of every production `rocky run`, after the run record is written, for **every** product that has a budget. Shadow and branch runs check nothing. An interrupted run and a backfill do not check either, but their builds count: if one moves a product over, its event names that run and the next run fires no hook.
-- **Verdict.** `in_budget`, `breached` or `not_evaluated`. `breached` when any limit is over (more than the limit, not equal). Otherwise `not_evaluated` when any limit cannot be checked (`max_usd` has no price, or the month has no model time or no stored size), or when run history does not cover the whole month. Rocky never reports `in_budget` by default.
-- **Breach events.** Rocky records an event each time a product goes from not over to over, by re-checking after each production run of the month in finish order. Each names the run (`run_id`), the limit and the figure, and is never withdrawn. Stored data accrues between runs, so `rocky cost --month` can show `breached` with no event yet. The next production run records it and fires the hook.
-- **The hook.** `on_budget_breach` fires once per exceeded limit, only at the run that made the change. A `max_storage_gb_month` over on both bases fires twice. Its metadata has `scope = "product_month"`, `product` and `month` beside `limit_type`, `limit` and `actual`. See [Hooks](/concepts/hooks/).
-- **Large months.** The end-of-run check splits at most 8 earlier runs. Past that with no verdict, a breach counts as the product's first. `rocky cost --month` and `rocky product status` list breach events only below a work cap (750 runs of 21 executions), and say so in `breach_events_skipped` above it.
-- **Where to read it.** `product_budgets` in `rocky run --output json` (replication, transformation and model-only runs; a quality or snapshot run fires the hook but has none). `budget` and `breach_events` per product in `rocky cost --month <YYYY-MM> --by product`. `cost_month` in `rocky product status`.
+- **What is tested.** The figure the product is **charged** in `rocky cost --month <YYYY-MM> --by product` (`kept` plus `allocated_upstream`; a table another product reads is charged to the reader). The month is cut in `[schedule].timezone`.
+- **When.** At the end of every production `rocky run`, for **every** product with a budget. Shadow and branch runs check nothing. An interrupted run and a backfill do not check, but their builds count.
+- **Verdict.** `breached` when any limit is over (more than the limit, not equal). Otherwise `not_evaluated` when any limit cannot be checked (`max_usd` has no price, or no model time or stored size) or run history does not cover the month. Otherwise `in_budget`. Rocky never reports `in_budget` by default.
+- **Breach events.** Each time a product goes from not over to over, re-checked after each production run of the month in finish order. An event names the run (`run_id`), the limit and the figure, and is never withdrawn. Stored data accrues between runs, so `rocky cost --month` can show `breached` with no event yet.
+- **The hook.** `on_budget_breach` fires once per exceeded limit, only at the run that made the change (`max_storage_gb_month` over on both bases fires twice). Metadata: `scope = "product_month"`, `product`, `month`, `limit_type`, `limit`, `actual`. See [Hooks](/concepts/hooks/).
+- **Where to read it.** `product_budgets` in `rocky run --output json` (a quality or snapshot run fires the hook but has none); `budget` and `breach_events` per product in `rocky cost --month <YYYY-MM> --by product` (events are skipped above 750 runs of 21 executions, reported in `breach_events_skipped`); `cost_month` in `rocky product status`.
 
 `rocky validate` warns with **V065** when `NAME` matches no file in `products/`, and with **V066** when `[product_budget]` is set and `[state.retention] max_age_days` is below 62.
 
@@ -1123,21 +1111,7 @@ Configure the agent driver for the experimental `rocky fulfill` loop. The determ
 
 Declare a child connector: a program that `rocky load --connector` runs once and whose Parquet output it loads into one table. Rocky refuses an unknown key here. The [child connectors guide](/guides/child-connectors/) explains the manifest, the limits and the guarantees.
 
-```toml
-[connector.stripe_charges]
-manifest   = "connectors/stripe/connector.toml"
-output_uri = "file://./.rocky/landing/stripe"
-secrets    = ["STRIPE_API_KEY"]
-target     = { catalog = "raw", schema = "stripe", table = "charges" }
-retries    = 1
-
-[connector.stripe_charges.limits]
-wall_time_secs = 3600
-
-[connector.stripe_charges.options]
-account = "acct_main"
-page_size = 100
-```
+Example: `[connector.stripe_charges]` with `manifest = "connectors/stripe/connector.toml"`, `output_uri = "file://./.rocky/landing/stripe"`, `secrets = ["STRIPE_API_KEY"]`, `target = { catalog = "raw", schema = "stripe", table = "charges" }`, `retries = 1`, a `[connector.stripe_charges.limits]` table (`wall_time_secs = 3600`) and a `[connector.stripe_charges.options]` table (`account = "acct_main"`, `page_size = 100`).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -1150,70 +1124,6 @@ page_size = 100
 | `limits` | see guide | `wall_time_secs` (3600), `cpu_time_secs`, `memory_bytes`, `output_bytes` (5 GiB). The smaller of this and the manifest wins. |
 | `keep_scratch` | `false` | Keep the scratch directory of a successful run. By default Rocky removes it after the state commit. |
 | `options` | `{}` | Settings for the program, as any TOML table. Rocky writes it as JSON to `options.json` in the scratch directory. At most 64 KiB as JSON. Not for secrets: the file is on disk in clear. See [Options](/guides/child-connectors/#options). |
-
----
-
-## Full Example
-
-A Fivetran → Databricks replication pipeline with governance. The [minimal config](#config-at-a-glance) at the top of this page is the credential-free DuckDB version.
-
-```toml
-[adapter.fivetran]
-type = "fivetran"
-kind = "discovery"
-destination_id = "${FIVETRAN_DESTINATION_ID}"
-api_key = "${FIVETRAN_API_KEY}"
-api_secret = "${FIVETRAN_API_SECRET}"
-
-[adapter.prod]
-type = "databricks"
-host = "${DATABRICKS_HOST}"
-http_path = "${DATABRICKS_HTTP_PATH}"
-token = "${DATABRICKS_TOKEN}"
-
-[pipeline.bronze]
-type = "replication"
-strategy = "incremental"
-timestamp_column = "_fivetran_synced"
-
-[pipeline.bronze.source]
-adapter = "prod"
-
-[pipeline.bronze.source.discovery]
-adapter = "fivetran"
-
-[pipeline.bronze.source.schema_pattern]
-prefix = "src__"
-separator = "__"
-components = ["source"]
-
-[pipeline.bronze.target]
-adapter = "prod"
-catalog_template = "warehouse"
-schema_template = "stage__{source}"
-
-[pipeline.bronze.target.governance]
-auto_create_catalogs = true
-auto_create_schemas = true
-
-[pipeline.bronze.target.governance.tags]
-managed_by = "rocky"
-
-[[pipeline.bronze.target.governance.grants]]
-principal = "group:data_engineers"
-permissions = ["USE CATALOG", "MANAGE"]
-
-[pipeline.bronze.checks]
-enabled = true
-row_count = true
-freshness = { error_after = "24h" }
-
-[pipeline.bronze.execution]
-concurrency = 8
-
-[state]
-backend = "${ROCKY_STATE_BACKEND:-local}"
-```
 
 ---
 
@@ -1239,22 +1149,12 @@ Name the table after the event's config key, always in the `on_<event>` form. Ro
 
 | Config key | Trigger |
 |-------|---------|
-| `on_pipeline_start` | Pipeline execution begins |
-| `on_discover_complete` | Source discovery finishes |
-| `on_compile_complete` | Compilation finishes |
-| `on_pipeline_complete` | Pipeline execution succeeds |
-| `on_pipeline_error` | Pipeline execution fails |
-| `on_before_materialize` | Before a table is materialized |
-| `on_after_materialize` | After a table is materialized |
-| `on_materialize_error` | Table materialization fails |
-| `on_before_model_run` | Before a compiled model runs |
-| `on_after_model_run` | After a compiled model runs |
-| `on_model_error` | Compiled model execution fails |
-| `on_before_checks` | Before a table's quality checks run |
-| `on_check_result` | A quality check completes |
-| `on_after_checks` | After a table's quality checks run |
-| `on_drift_detected` | Schema drift detected |
-| `on_anomaly_detected` | Row count anomaly detected |
+| `on_pipeline_start` / `on_pipeline_complete` / `on_pipeline_error` | Pipeline execution begins / succeeds / fails |
+| `on_discover_complete` / `on_compile_complete` | Source discovery / compilation finishes |
+| `on_before_materialize` / `on_after_materialize` / `on_materialize_error` | Before / after a table is materialized, or materialization fails |
+| `on_before_model_run` / `on_after_model_run` / `on_model_error` | Before / after a compiled model runs, or its execution fails |
+| `on_before_checks` / `on_check_result` / `on_after_checks` | Before a table's quality checks, a check completes, after the checks |
+| `on_drift_detected` / `on_anomaly_detected` | Schema drift / row count anomaly detected |
 | `on_state_synced` | State store sync completes |
 | `on_budget_breach` | A run-level budget limit is breached |
 

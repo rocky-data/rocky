@@ -41,18 +41,9 @@ A newer engine migrates an older store forward on first open. An older engine re
 
 The version moves when an older engine would misread a newer record. A read-only command (`rocky state`, `rocky history`, `rocky serve`) reads a table that a store stamped below the version lacks as empty. During a rolling upgrade, an older process keeps its own `v<N>/` remote key and does not see rows that newer processes record under the newer key.
 
-| Version | Change |
-|---|---|
-| v31 | A checkpoint can list the targets whose post-copy checks still owe a run. An engine at v30 or older ignores that list and would skip those checks. |
-| v32 | Adds `environments` and `publish_history`. |
-| v33 | Marks a `rocky review --approve` row in the policy-decision ledger as an approval. No table changes. A v32 engine would read that row as a policy `allow`. |
-| v34 | Adds `connector_state`: the saved state and committed batch count of each [child connector](/guides/child-connectors/). Replicates with the shared state. |
-| v35 | Adds `ai_usage`: one row for each AI call that returned a response. `rocky cost --month <YYYY-MM> --by product` reads it. |
-| v36 | Adds `product_volume_breaches`: one marker for each product output model whose `error` volume range was breached and not yet rebuilt. Replicates with the shared state. |
+The current version is v36. Recent additions: v31 lets a checkpoint list the targets whose post-copy checks still owe a run (an engine at v30 or older ignores the list and would skip those checks); v32 adds `environments` and `publish_history`; v33 marks a `rocky review --approve` row in the policy-decision ledger as an approval (a v32 engine would read it as a policy `allow`); v34 adds `connector_state` (the saved state and committed batch count of each [child connector](/guides/child-connectors/), replicated); v35 adds `ai_usage` (one row per AI call that returned a response, read by `rocky cost --month <YYYY-MM> --by product`); v36 adds `product_volume_breaches` (one marker per product output model whose `error` volume range was breached and not yet rebuilt, replicated).
 
-`ai_usage` is local-only, so a call counts in the store of the machine that made it. It holds two reserved rows: `ai_usage_since` (when recording started) and `ai_usage_dropped` (spooled lines that could not be read). A month that began before the stamp reports its AI part as `partial`. `rocky ai` spools its calls until `rocky run` upgrades an older store. The LSP and MCP servers never write the store: they append to `<state file>.ai-usage.jsonl`, and the next process that holds the writer moves the lines in.
-
-While a `product_volume_breaches` marker is open, `rocky run` fails that model. `rocky product clear-breach` deletes a marker, and `rocky product status` lists them. See [product volume ranges](/reference/commands/products/).
+`ai_usage` is local-only: a call counts in the store of the machine that made it, and a month that began before its `ai_usage_since` stamp reports its AI part as `partial`. The LSP and MCP servers never write the store: they append to `<state file>.ai-usage.jsonl`, and the next process that holds the writer moves the lines in. While a `product_volume_breaches` marker is open, `rocky run` fails that model. `rocky product clear-breach` deletes a marker and `rocky product status` lists them ([product volume ranges](/reference/commands/products/)).
 
 ### Environments and Delta table publish (engine API only, preview)
 
@@ -89,10 +80,8 @@ From v32, the engine API can record **environments**: named sets of pointers (`s
 | `unknown` | The commit write returned an error that does not say whether the commit was stored (for example a timeout). |
 | `not_attempted` | An earlier table failed or ended `unknown`. |
 
-- Another publish to the environment is refused with `PublishInProgress`, state-only publishes included.
-- The head moves only for `moved`, `already_current` and `sync_failed`. Publish again to reconcile. If the process dies mid-publish, the environment stays `publishing`: a publish that names that head and asks to take over moves every table again, so take over only when the first publisher is dead.
-- Only `content_addressed` outputs of unpartitioned tables can be published. The publish refuses, with no commit, a version whose files are gone, a version written before the protocol, schema, partitioning or `delta.columnMapping.mode` changed, and a version whose `add` carries a deletion vector.
-- It refuses when another environment's head, or its unfinished publish plan, points the same table at a different version. `allow_shared_tables` overrides that, and Rocky does not update the other head.
+- Another publish to the environment is refused with `PublishInProgress`, state-only publishes included. A failure stops the publish, and the head moves only for `moved`, `already_current` and `sync_failed`: publish again to reconcile. A process that dies mid-publish leaves the environment `publishing`: take over only when the first publisher is dead.
+- Only `content_addressed` outputs of unpartitioned tables can be published. The publish refuses, with no commit, a version whose files are gone, a version written before the protocol, schema, partitioning or `delta.columnMapping.mode` changed, a version whose `add` carries a deletion vector, and a table that another environment points at a different version (`allow_shared_tables` overrides, and Rocky does not update the other head).
 
 ## Per-namespace state files
 
@@ -295,17 +284,7 @@ Replication publishes recovery intent before it copies, on supported atomic adap
                "Filter": { "Prefix": "rocky/state/" }, "Expiration": { "Days": 31 } } ] }
 ```
 
-```bash
-aws s3api put-bucket-lifecycle-configuration --bucket "$ROCKY_STATE_BUCKET" \
-  --lifecycle-configuration file://rocky-lifecycle.json
-```
-
-GCS lifecycle JSON, applied with `gcloud storage buckets update "gs://$ROCKY_STATE_BUCKET" --lifecycle-file=rocky-lifecycle.json`:
-
-```json
-{ "lifecycle": { "rule": [ { "action": { "type": "Delete" },
-    "condition": { "age": 31, "matchesPrefix": ["rocky/state/"] } } ] } }
-```
+Apply it with `aws s3api put-bucket-lifecycle-configuration --bucket "$ROCKY_STATE_BUCKET" --lifecycle-configuration file://rocky-lifecycle.json`. On GCS use a lifecycle rule with `action.type = "Delete"` and `condition` `age = 31`, `matchesPrefix = ["rocky/state/"]`, applied with `gcloud storage buckets update "gs://$ROCKY_STATE_BUCKET" --lifecycle-file=rocky-lifecycle.json`.
 
 The rule covers every object under the prefix, state snapshots included. To keep snapshots longer than stamps, use separate prefixes via `s3_prefix` and two rules. A bucket rule does not replace `retention_days`: the local copy on each pod still needs Rocky's sweep. On `tiered`, Valkey's own TTL evicts the hot copy long before the cold copy expires.
 

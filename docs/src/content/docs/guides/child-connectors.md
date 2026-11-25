@@ -13,19 +13,6 @@ Rocky hides its own environment from the program. It does not isolate it. The pr
 
 ## What a run does
 
-```
-  rocky load --connector stripe_charges
-        │
-        ▼
-  read saved state ──► claim the batch key ──► run the program
-   (commit_seq N)       connector:NAME:N        (own process group)
-                                                      │
-                                      files + _rocky_result.json
-                                                      ▼
-  save state, ◄── append to ◄── fix drift ◄── stage ◄── check the
-  commit_seq N+1    the table     (ALTERs)    table      files
-```
-
 1. Rocky reads the saved state. A new connector has none.
 2. Rocky claims the key `connector:<name>:<commit_seq>`. If another run holds it, this run skips and exits 0.
 3. Rocky starts the program with a cleared environment and resource limits. On failure it retries up to `retries` times.
@@ -34,7 +21,7 @@ Rocky hides its own environment from the program. It does not isolate it. The pr
 
 ## Start from a scaffold
 
-`rocky connector init orders` creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` and set `license` in the manifest. It needs `python3` and the `duckdb` CLI on `PATH` (Linux and macOS). See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
+`rocky connector init orders` creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` and set `license` in the manifest. It needs `python3` and the `duckdb` CLI on `PATH` (Linux, macOS). See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
 
 ## Test a connector
 
@@ -87,7 +74,7 @@ wall_time_secs = 1800
 
 A manifest with an unknown key, or with no `egress_hosts`, is refused.
 
-`rocky validate` reads each manifest offline and reports **V067** per connector. It is `ok` when the manifest is valid and the program in `command` exists. It is an error when the manifest is missing or invalid, or the first `command` entry is a path that does not exist. It does not check that the program can run, later arguments, or a bare program name (looked up on `PATH` at run time). The config loader checks `output_uri` and `limits`. A project with connectors and no `[pipeline]` is valid: V020 does not warn.
+`rocky validate` reads each manifest offline and reports **V067** per connector: `ok` when the manifest is valid and the first `command` entry exists, an error when the manifest is missing or invalid or that path does not exist. It does not check later arguments or a bare program name (looked up on `PATH` at run time). A project with connectors and no `[pipeline]` is valid: V020 does not warn.
 
 ## The request and the result
 
@@ -120,7 +107,7 @@ The program writes Parquet files into `output_dir`, then `_rocky_result.json` in
 }
 ```
 
-A failed check fails the attempt, and Rocky may retry. Rocky checks that:
+A failed check fails the attempt (Rocky may retry). Rocky checks that:
 
 - The result file parses and `protocol_version` is 0.
 - `state.schema_version` equals the manifest's `state_schema_version`, and the serialized state is at most 1 MiB.
@@ -144,7 +131,7 @@ since     = 2026-01-01T00:00:00Z
 status = ["succeeded", "refunded"]
 ```
 
-Before each attempt, Rocky writes the table as one line of JSON to `options.json` in the scratch directory (absolute path in `options_path`, also in the program's working directory).
+Before each attempt, Rocky writes the table as one JSON line to `options.json` in the scratch directory (path in `options_path`).
 
 ```json
 {"account":"acct_main","filters":{"status":["succeeded","refunded"]},"page_size":100,"since":"2026-01-01T00:00:00Z"}
@@ -152,11 +139,8 @@ Before each attempt, Rocky writes the table as one line of JSON to `options.json
 
 Keys are sorted, not in TOML order. Read by key.
 
-- The file always exists. With no `options` table it holds `{}`.
-- Strings, integers, floats, booleans, arrays and tables keep their JSON types.
-- A datetime becomes a string: RFC 3339 for an offset datetime (`2026-01-01T00:00:00Z`), as TOML spells it for a local datetime, date or time.
-- A `nan` or `inf` float has no JSON form. The config is refused.
-- The JSON is at most 64 KiB (65536 bytes). A larger table is refused at config load and by `rocky validate`, naming the connector and the size.
+- The file always exists (`{}` with no `options` table). Types keep their JSON forms. A datetime becomes a string: RFC 3339 for an offset datetime, as TOML spells it otherwise. A `nan` or `inf` float is refused.
+- The JSON is at most 64 KiB (65536 bytes). A larger table is refused at config load and by `rocky validate`.
 - On Unix the file is mode `0600` in a `0700` scratch directory. On Windows it gets the directory's default permissions. It counts toward `output_bytes`.
 
 :::caution[Options are not secrets]
@@ -167,7 +151,7 @@ Rocky refuses an option holding a value substituted from the environment with `$
 
 ## What the program sees
 
-Rocky clears the environment of the program. The program gets only:
+The program gets a cleared environment with only:
 
 - `PATH` and `LANG`, copied from Rocky. `LANG` is set only if Rocky has it.
 - Each name in `secrets`, with its value.
@@ -207,12 +191,7 @@ The final `INSERT` names every column, so column order does not matter. All file
 
 Delivery is at least once. It is not exactly once.
 
-```
-  promote ──────────────► commit state
-     ▲                         ▲
-     │  a crash here           │  a crash here
-     │  loads nothing          │  loads the batch twice
-```
+Delivery is at least once, not exactly once. A crash between the promote and the state commit loads the batch twice. A crash before the promote loads nothing.
 
 - A failure before the promote changes no rows and no saved state. Rocky frees the claim and the next run restarts the batch. Schema drift `ALTER` statements that already ran are not rolled back. A promote that finds the claim expired is such a failure.
 - If the promote statement was sent and failed, rows may be in the table. Rocky leaves the claim in flight, as for a failed state commit.
@@ -226,8 +205,8 @@ Rocky does not block other hosts. `egress_hosts` is the author's statement of in
 
 ## Known gaps in this release
 
-- Secret values shorter than 8 bytes are not replaced by `${NAME}` in the log. Use long secrets.
-- Rocky never removes the scratch directory of a run that failed after the child succeeded. Remove it by hand.
+- Secret values shorter than 8 bytes are not masked as `${NAME}` in the log. Use long secrets.
+- Rocky never removes the scratch directory of a run that failed after the child succeeded.
 - A crashed run leaves its staging table, `<table>__rocky_stg_<run id>`. On the local state file and on `s3` or `gcs` state backends, the next run takes over the expired claim and drops only the one staging table the claim names (another connector can write the same target). If the claim cannot be read or the drop fails, the table stays and the run warns. A prior run still alive after its claim expired loses its staging table and fails without loading, so nothing loads twice.
 - On the `valkey` and `tiered` backends this cleanup almost never happens, because Valkey deletes the expired claim. Drop those staging tables by hand, and any whose drop failed or whose claim was removed before takeover.
 - Ctrl-C or `SIGTERM` while the program runs stops the program group, fails the run and frees the claim. A signal during staging stops the run before the promote: Rocky drops the staging table and frees the claim. Only a signal after the promote lets the state commit finish.
@@ -250,13 +229,13 @@ The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-dat
 
 Each run reads the maximum cursor value M (UTC) and extracts rows with a value above the saved cursor and below M (the first run has no lower bound; NULL values are skipped). The new cursor is the largest value extracted. Rows at M wait until a newer row exists, so ties at M always land together, and the newest rows of a quiet source wait. With no qualifying row the program writes no file, and Rocky loads nothing and still saves the state.
 
-The source table and cursor column are in `[connector.pg_events.options]`. The `PG*` connection variables are declared under `secrets`. The program attaches with an empty connection string, so libpq reads them from its environment and they never appear in SQL or output.
+The source table and cursor column are in `[connector.pg_events.options]`. The `PG*` variables are declared under `secrets`, and libpq reads them from the environment, so they never appear in SQL or output.
 
 Limits of this design: the target only appends, so use it for insert-only tables. An updated row lands again as a duplicate if its cursor value moves forward, and is otherwise never seen. Deletes are never seen. A row that commits late with a cursor value below the saved cursor is never loaded. Delivery is at least once. Each run scans the whole source table.
 
 **Replay mode.** With `replay_fixture` set in the options (a SQL file, relative to `main.py`), the connector builds a local DuckDB catalog `pg` from that file instead of attaching Postgres. It runs the same two queries and reads no `PG*` variable. A missing fixture fails the run and never falls back to Postgres. `rocky connector test pg_events` replays three loads (19, 5 and 0 rows) with no Docker.
 
-The POC runs three loads against a Postgres container and checks row counts, held-back rows and the commit sequence, and that the password appears in no output, log, scratch directory or state file. Weekly CI runs it as a gate. The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the same connector in a full project.
+The POC runs three loads against a Postgres container, checks row counts, held-back rows and the commit sequence, and checks the password appears nowhere in output, logs, scratch or state. Weekly CI gates on it. The [open-stack acceptance journey](/guides/open-stack-acceptance/) runs the connector in a full project.
 
 ## Connector shims
 
@@ -268,14 +247,7 @@ Three POCs run a third-party extraction tool as a child connector. Each shim ada
 | Airbyte | [`07-adapters/11-airbyte-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/11-airbyte-connector-shim) | A source image with `docker run` (`spec`, `discover`, `read`), or with no Docker a declarative manifest through `airbyte-cdk`'s `source-declarative-manifest`. The protocol and `airbyte-cdk` are MIT. Each image and manifest has its own license, often Elastic License 2.0, which is not open source: check its `metadata.yaml`. |
 | Meltano | [`07-adapters/12-meltano-connector-shim`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/12-meltano-connector-shim) | A Singer tap with `meltano invoke`. Its `connector-test.toml` points `meltano_bin` at a replay stand-in, so `rocky connector test orders_tap` needs no PyPI package. |
 
-All three follow the same rules.
-
-- **One stream per connector.** The options name the stream (table). If the name does not exist, the run fails and lists the streams that do.
-- **The tool's state lives in Rocky state.** The shim restores the tool's incremental state from the request and returns the new state in the result, so Rocky's commit fence governs it. Never keep it where Rocky does not commit it (Meltano's own state backend, an Airbyte database): a crash before the commit would skip a batch and break at-least-once.
-- **Delivery is at least once.** Deduplicate downstream on a key.
-- **No catalog.** The options name the module, image or tap.
-- **Credentials go under `secrets`**, never under `options`.
-- **The tool calls the network.** The manifest `egress_hosts` lists its hosts. Rocky does not enforce it.
+All three follow the same rules. The options name one stream (table) and the module, image or tap (there is no catalog); a missing stream fails the run and lists the real ones. The tool's incremental state lives in Rocky state: the shim restores it from the request and returns the new state in the result, so Rocky's commit fence governs it. Never keep it elsewhere (Meltano's state backend, an Airbyte database): a crash before the commit would skip a batch and break at-least-once. Deduplicate downstream on a key. Credentials go under `secrets`, never `options`. The tool calls the network, and `egress_hosts` lists its hosts without enforcement.
 
 The Airbyte shim's no-Docker mode has rules of its own:
 
@@ -283,7 +255,7 @@ The Airbyte shim's no-Docker mode has rules of its own:
 - **No custom code runs.** The shim never passes `--components-path`. It needs `airbyte-cdk` 7.48.0 or newer, which refuses custom classes in a manifest it did not ship, and it refuses to run when `AIRBYTE_ENABLE_UNSAFE_CODE` or any `PYTHON*` variable is set. A manifest that needs custom Python components does not work here.
 - **Rows can load again at the cursor.** `airbyte-cdk` reads from the saved cursor, not after it. With an inclusive API lower bound the cursor row loads again, and a `lookback_window` reloads the whole window. The target only appends, so deduplicate downstream on a key.
 
-The POCs run offline once the tool is installed (the Airbyte one uses its own Apache-2.0 manifest against a local stub). Each skips with exit 0 when its tool is missing. Set `REQUIRE_DLT=1`, `REQUIRE_DOCKER=1` or `REQUIRE_MELTANO=1` to make that a failure.
+The POCs run offline once the tool is installed. Each skips with exit 0 when its tool is missing: set `REQUIRE_DLT=1`, `REQUIRE_DOCKER=1` or `REQUIRE_MELTANO=1` to make that a failure.
 
 ## Related
 
