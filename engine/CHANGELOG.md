@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **compiler:** the DuckDB function list now includes four names from DuckDB 2.0.1: `add_grammar_extension`, `map_type_id_to_pg_oid`, `remove_grammar_extension` and `duckdb_live_query_metrics`. A call to any of them now passes the compiler check where it used to be refused.
+
 ## [1.94.0] — 2026-11-23
 
 ### Upgrade notes
