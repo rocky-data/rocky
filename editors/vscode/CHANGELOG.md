@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The lineage canvas follows `@xyflow/react` 13. Its re-fit when you switch to the Lineage tab keeps its margin: the padding is now `"8%"`, because v13 reads a bare number as pixels.
+
 ## [1.54.0] — 2026-11-10
 
 ### Changed
