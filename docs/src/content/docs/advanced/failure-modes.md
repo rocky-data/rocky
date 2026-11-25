@@ -49,7 +49,7 @@ Entries on `contained[*]` are not failures. They name models Rocky withheld afte
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
 
-The compiler also emits `E010`-`E014`, `E029`-`E061`, `E062`, `E063`, `E064`, `E065`-`E067` and `E071`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all. `E010`-`E014`, `E062` and `E063` have their own section because the fix is contract-shaped.
+The compiler also emits `E010`-`E014`, `E029`-`E061`, `E062`, `E063`, `E064`, `E065`-`E068` and `E071`. [Diagnostic codes](/concepts/compiler/#diagnostic-codes) lists them all. `E010`-`E014`, `E062` and `E063` have their own section because the fix is contract-shaped.
 
 **Recovery playbook.**
 

@@ -99,7 +99,7 @@ type = "not_null"
 column = "customer_id"
 ```
 
-With `[run] tests_on_run = "enforce"` (the default) or `rocky run --tests enforce`, a NULL fails the model, and its downstream models do not build. The test runs after the write, so the rows stay in the model's table. `rocky plan promote` can refuse a branch on that evidence: see [The failing-tests gate](/reference/commands/core-pipeline/#the-failing-tests-gate) and [Tests during a run](/reference/commands/core-pipeline/#tests-during-a-run).
+With `rocky run --tests enforce`, or `[run] tests_on_run = "enforce"`, a NULL fails the model, and its downstream models do not build. `[run] tests_on_run` defaults to `enforce`, so a run enforces tests unless you set `report` or `off`. The test runs after the write, so the rows stay in the model's table. `rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence is that failure. A later run that rebuilds the model without tests replaces that evidence, and promote then only warns. See [Tests during a run](/reference/commands/core-pipeline/#tests-during-a-run) and [Declarative tests](#declarative-tests-tests).
 
 Two cases differ. A data-product model gets its contract from the product spec: edit the spec, not the generated contract (a spec column with `nullable = false` already lowers to a `not_null` test). A `content_addressed` model writes no warehouse table, so its `[[tests]]` do not run.
 

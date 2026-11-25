@@ -21,7 +21,7 @@ Rocky hides its own environment from the program. It does not isolate it. The pr
 
 ## Start from a scaffold
 
-`rocky connector init orders` creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` and set `license` in the manifest. It needs `python3` and the `duckdb` CLI on `PATH` (Linux, macOS). See [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
+`rocky connector init orders` creates `connectors/orders/` with a manifest, a `main.py` program and the `rocky_connector.py` helper, then prints the `[connector.orders]` block for `rocky.toml`. Replace `fetch()` in `main.py` and set `license` in the manifest. It needs `python3` and the `duckdb` CLI on `PATH` (Linux, macOS). See [Write a connector](/guides/write-a-connector/) and [`rocky connector init`](/reference/commands/development/#rocky-connector-init).
 
 ## Test a connector
 
@@ -225,7 +225,7 @@ The `connector` object holds:
 
 ## Reference connector
 
-The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete Postgres child connector: one Python 3.8 file with no packages. It runs SQL through the `duckdb` CLI and the DuckDB `postgres` extension, reads one table and keeps a timestamp cursor in its state.
+The POC [`07-adapters/08-postgres-child-connector`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/08-postgres-child-connector) is a complete Postgres child connector. Its manifest sets `support_tier = "reference"`: the Rocky project maintains it and tests it in CI. Copy it as a starting point, and change or remove `support_tier` in your copy. Or follow [Write a connector](/guides/write-a-connector/) to build your own from a scaffold. It is one Python 3.8 file with no packages. It runs SQL through the `duckdb` CLI and the DuckDB `postgres` extension, reads one table and keeps a timestamp cursor in its state.
 
 Each run reads the maximum cursor value M (UTC) and extracts rows with a value above the saved cursor and below M (the first run has no lower bound; NULL values are skipped). The new cursor is the largest value extracted. Rows at M wait until a newer row exists, so ties at M always land together, and the newest rows of a quiet source wait. With no qualifying row the program writes no file, and Rocky loads nothing and still saves the state.
 
@@ -259,6 +259,7 @@ The POCs run offline once the tool is installed. Each skips with exit 0 when its
 
 ## Related
 
+- [Write a connector](/guides/write-a-connector/) for a step-by-step walk-through
 - [`rocky load`](/reference/cli/#rocky-load) for loading files from a directory
 - [`[connector.NAME]`](/reference/configuration/#connectorname) for the config keys
 - [State management](/concepts/state-management/) for the state backends
