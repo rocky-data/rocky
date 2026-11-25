@@ -32,7 +32,7 @@ Full page: [Introduction](https://rocky-data.dev/getting-started/introduction/).
 | `rocky apply <plan_id>` | Runs a saved plan. |
 | `rocky run` | Plans and applies in one step. |
 
-The exit code of `rocky run` is `0` for success, `2` for partial success, `1` for failure and `130` for Ctrl-C. Drift detection, watermarks and hooks belong to the replication path only.
+The exit code of `rocky run` is `0` for success, `2` for partial success, `1` for failure and `130` for Ctrl-C. Drift detection and watermarks belong to the replication path. Pipeline hooks fire on every pipeline type.
 
 Full page: [execution flow](https://rocky-data.dev/concepts/execution-flow/).
 

@@ -36,7 +36,7 @@ There is no Rocky-hosted agent and no Rocky-hosted inference.
 | `lineage` | Model- or column-level lineage. |
 | `test` | Run local model and fixture tests. With `declarative = true`, run sidecar `[[tests]]` against the warehouse after apply. |
 | `list` | List `models`, `pipelines`, `adapters` or `sources`. |
-| `inspect_schema` | Typed columns of every model and source. Works at cold start. |
+| `inspect_schema` | Typed columns of every model and source. Adds warehouse tables on a best-effort basis. Works at cold start. |
 | `catalog` | The project-wide asset catalog in one call. |
 | `breaking_change` | Classify breaking changes between the working tree and a base ref. |
 | `dependents` | The downstream models of a model. |
@@ -82,7 +82,7 @@ Sidecar merges drop comments on re-serialize. An unparseable sidecar is never ov
 | `scorecard` | Acceptance, denial and review rates per principal, rule or scope (`rocky audit --scorecard`). Read-only. |
 | `schedule_status` | Stored scheduler state per pipeline and queued webhook demands. Read-only. |
 | `pause_schedule` | Pause a pipeline's schedule. Needs `confirm: true`. Resume is human-only. |
-| `review_queue` | List the pending-review queue. On `--profile approver` only, it can also write an approval marker. |
+| `review_queue` | List the pending-review queue. On `--profile approver` only, it can also write an approval marker, and only for a plan that is already in the pending queue. |
 
 ### Prompts
 
@@ -103,7 +103,7 @@ The profile is fixed when the server starts. An agent cannot change it mid-sessi
 | Profile | Serves | Approve action |
 |---|---|---|
 | `default` | All 31 tools | `review_queue` lists the queue. Approve is refused with `approve_not_enabled`. |
-| `approver` | The same 31 tools | Allowed: `approve_plan_id` + `confirm: true` writes the approval marker. Use it only for a server you intend to sign off plans. |
+| `approver` | The same 31 tools | Allowed: `approve_plan_id` + `confirm: true` writes the approval marker, and only for a plan that is pending in the current review queue. Use it only for a server you intend to sign off plans. |
 | `worker` | A fixed allowlist for an untrusted drafting worker | No `review_queue`. |
 
 The `worker` allowlist:

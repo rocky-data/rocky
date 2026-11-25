@@ -78,7 +78,7 @@ build ok ──▶ count ────▶ in range ──────────
                                                       a `volume_warnings` line says why)
 ```
 
-At `error` severity the table is already written and Rocky cannot undo it. The model is marked failed after the fact, downstream models are withheld, the run status is `partial_failure`, and the build gets no `due_at`. A time-interval output is judged one partition at a time: a partition that breaches at `error` fails the model and is marked failed in the run record, the others stay successes, and no partition gets a `due_at`.
+At `error` severity the table is already written and Rocky cannot undo it. The model is marked failed after the fact, downstream models are withheld, the run status is `partial_failure`, and the build gets no `due_at`. A time-interval output is judged one partition at a time: a partition that breaches at `error` fails the model and is marked failed in the run record, the others stay successes, and no partition gets a `due_at`. Partitions written before another partition failed to run are judged too.
 
 An `error` breach also:
 
@@ -159,7 +159,7 @@ run start ──▶ for each range whose product output is in the selection:
 
 At `error` severity, an out-of-range count refuses the output model, and so does a count Rocky could not take (a missing table, a refused name, a query error, an unreadable result). The output table keeps its rows. The model records one failed execution, with the count's time as its duration. The `on_model_error` hook fires. `on_before_model_run` and `on_after_model_run` do not. Downstream models are withheld, the run status is `partial_failure`, and the model gets no `due_at`. Only the output model is protected: the upstream models in the chain still build.
 
-The result is `source_volumes` on the run output: one row per range, with `product`, `model` (the output model), `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records the same rows in its history. An output refused at `error` is never skipped as unchanged: the refusal always reaches it, and the run fails.
+The result is `source_volumes` on the run output: one row per range, with `product`, `model` (the output model), `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records the same rows in its history. A row stays even when the skip gate later skips the output model. An output refused at `error` is never skipped as unchanged: the refusal always reaches it, and the run fails.
 
 ---
 

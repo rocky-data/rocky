@@ -240,7 +240,7 @@ rocky ai-test fct_revenue
 
 Each test is an assertion query that passes when it returns 0 rows. It references models by bare name.
 
-With `--all --save`, each assertion is written as a `.sql` file under `tests/`. `rocky test` and `rocky ci` do not read that directory: see [AI Features](/guides/ai-features/#run-the-generated-tests).
+With `--save`, each assertion is written as a `.sql` file under `tests/`. `rocky test` and `rocky ci` do not read that directory: see [AI Features](/guides/ai-features/#run-the-generated-tests).
 
 ### Related Commands
 
