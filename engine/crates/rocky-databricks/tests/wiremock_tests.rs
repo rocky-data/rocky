@@ -2914,7 +2914,10 @@ async fn test_client_deadline_cancels_and_does_not_resubmit() {
     match &err {
         ConnectorError::Abandoned { id, cancel, cause } => {
             assert_eq!(id, "stmt-slow");
-            assert_eq!(cancel, "cancel requested");
+            assert_eq!(
+                *cancel,
+                rocky_core::statement_cancel::AbandonCancel::Requested
+            );
             assert!(matches!(**cause, ConnectorError::Timeout { .. }), "{cause}");
         }
         other => panic!("expected Abandoned, got {other}"),
@@ -3008,5 +3011,35 @@ async fn test_single_attempt_timeout_cancels_the_statement() {
     assert!(
         matches!(err, ConnectorError::Abandoned { ref id, .. } if id == "stmt-read"),
         "{err}"
+    );
+}
+
+/// #2768: a rate-limited poll (429) does not count as a failed poll, even
+/// with no retries configured: the statement may still be running, and the
+/// deadline bounds the wait. It is polled again, never cancelled.
+#[tokio::test]
+async fn test_rate_limited_polls_do_not_abandon_the_statement() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "stmt-busy", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-busy"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .up_to_n_times(3)
+        .with_priority(1)
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-busy"))
+        .respond_with(statement_state("stmt-busy", "SUCCEEDED"))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_secs(30), 0);
+    assert_eq!(
+        connector.execute_statement("SELECT 1").await.unwrap(),
+        "stmt-busy"
     );
 }

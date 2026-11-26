@@ -14089,7 +14089,8 @@ adapter = "db"
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let kill_after = std::time::Duration::from_millis(300);
         let run = tokio::spawn(run_job_child(cmd, rx, kill_after));
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Let the shell install its trap before the first terminate lands.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let (message, answer) = cancel_message(GroupSignal::Terminate);
         tx.send(message).unwrap();

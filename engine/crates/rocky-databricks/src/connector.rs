@@ -8,7 +8,9 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
 use rocky_core::retry::compute_backoff;
-use rocky_core::statement_cancel::{ABANDON_CANCEL_BUDGET, InFlightStatements, StatementHandle};
+use rocky_core::statement_cancel::{
+    ABANDON_CANCEL_BUDGET, AbandonCancel, InFlightStatements, StatementHandle,
+};
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
 };
@@ -42,7 +44,9 @@ pub enum ConnectorError {
     #[error("stopped waiting on statement {id} ({cancel}): {cause}")]
     Abandoned {
         id: String,
-        cancel: String,
+        cancel: AbandonCancel,
+        /// Not `#[source]`: the message already ends with it, and a source
+        /// would print it twice in an `{:#}` chain.
         cause: Box<ConnectorError>,
     },
 
@@ -759,7 +763,8 @@ impl DatabricksConnector {
         let response = tokio::time::timeout_at(deadline, self.submit(sql, result_format))
             .await
             // No id yet, so nothing to cancel. The server may have accepted
-            // the statement, so this is never resubmitted either.
+            // the statement, so this deadline is not retried. A transport
+            // timeout of the same POST (`Http`) still is: see `is_transient`.
             .map_err(|_| ConnectorError::Timeout {
                 id: "<not yet assigned>".to_string(),
                 seconds: wait.timeout.as_secs(),
@@ -840,6 +845,7 @@ impl DatabricksConnector {
         };
         let mut step = 0;
         let mut failed_polls: u32 = 0;
+        let mut rate_limited: u32 = 0;
 
         loop {
             let now = tokio::time::Instant::now();
@@ -857,9 +863,28 @@ impl DatabricksConnector {
             match polled {
                 Ok(response) => {
                     failed_polls = 0;
+                    rate_limited = 0;
                     if is_terminal(&response.status.state) {
                         return Ok(response);
                     }
+                }
+                // A rate-limited poll: the statement may well still be running
+                // (Snowflake answers an unfinished statement with 202 or 429).
+                // It does not count as a failed poll; the deadline bounds it.
+                Err(err @ ConnectorError::ApiError { status: 429, .. }) => {
+                    rate_limited = rate_limited.saturating_add(1);
+                    let backoff_ms = compute_backoff(&self.config.retry, rate_limited - 1);
+                    debug!(
+                        statement_id = id,
+                        backoff_ms,
+                        error = %err,
+                        "poll rate-limited, polling the same statement again"
+                    );
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(backoff_ms))
+                            .min(deadline),
+                    )
+                    .await;
                 }
                 Err(err) if failed_polls < wait.repolls && is_transient(&err) => {
                     failed_polls += 1;
@@ -908,15 +933,14 @@ impl DatabricksConnector {
     /// Ask Databricks to cancel a statement this client stops waiting on.
     /// Best effort and bounded by [`ABANDON_CANCEL_BUDGET`]: returns what
     /// happened, for the error, and never fails.
-    async fn cancel_abandoned(&self, id: &str) -> String {
+    async fn cancel_abandoned(&self, id: &str) -> AbandonCancel {
         let outcome =
             match tokio::time::timeout(ABANDON_CANCEL_BUDGET, self.cancel_statement(id)).await {
-                Ok(Ok(())) => "cancel requested".to_string(),
-                Ok(Err(e)) => format!("cancel failed: {e}"),
-                Err(_) => format!(
-                    "no answer to the cancel within {}s",
-                    ABANDON_CANCEL_BUDGET.as_secs()
+                Ok(Ok(())) => AbandonCancel::Requested,
+                Ok(Err(e)) => AbandonCancel::Failed(
+                    rocky_core::secret_registry::render_placeholders(&e.to_string()),
                 ),
+                Err(_) => AbandonCancel::NoAnswer,
             };
         warn!(
             statement_id = id,
@@ -1758,7 +1782,7 @@ mod tests {
             },
             ConnectorError::Abandoned {
                 id: "s4".to_string(),
-                cancel: "cancel requested".to_string(),
+                cancel: AbandonCancel::Requested,
                 cause: Box::new(ConnectorError::ApiError {
                     status: 503,
                     body: "unavailable".to_string(),

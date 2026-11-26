@@ -71,6 +71,37 @@ pub enum CancelOutcome {
     Unsupported,
 }
 
+/// What came of the cancel a client sent for a statement it stopped waiting
+/// on. Carried on the connector's error, so the caller can tell a requested
+/// cancel from one that may have left the statement running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbandonCancel {
+    /// The warehouse accepted the cancel request. As with
+    /// [`CancelOutcome::Requested`], that does not prove the statement
+    /// stopped.
+    Requested,
+    /// The cancel request failed, with the rendered error. The statement may
+    /// still run.
+    Failed(String),
+    /// No answer within [`ABANDON_CANCEL_BUDGET`]. The statement may still
+    /// run.
+    NoAnswer,
+}
+
+impl fmt::Display for AbandonCancel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requested => f.write_str("cancel requested"),
+            Self::Failed(error) => write!(f, "cancel failed: {error}"),
+            Self::NoAnswer => write!(
+                f,
+                "no answer to the cancel within {}s",
+                ABANDON_CANCEL_BUDGET.as_secs()
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Registry {
     next_key: u64,

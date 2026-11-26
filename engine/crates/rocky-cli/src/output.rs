@@ -901,10 +901,12 @@ impl From<&rocky_databricks::connector::ConnectorError> for FailureKind {
                 }
             }
             E::StatementFailed { .. } => FailureKind::QueryRejected,
-            E::Timeout { .. } => FailureKind::Transient,
+            // The submit did not answer by the deadline: the statement may
+            // have been accepted, with no id to cancel. Not `Transient`: a
+            // retry could run it twice (#2768).
+            E::Timeout { .. } => FailureKind::Unknown,
             // The client stopped waiting while the statement may still run
-            // (a cancel was sent first). Not `Transient`: a retry could run
-            // the statement twice (#2768).
+            // (a cancel was sent first). Not `Transient`, for the same reason.
             E::Abandoned { .. } => FailureKind::Unknown,
             E::Canceled { .. } => FailureKind::Unknown,
             E::UnexpectedState { .. } => FailureKind::Unknown,
@@ -954,9 +956,8 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
                 }
             }
             E::StatementFailed { .. } => FailureKind::QueryRejected,
-            E::Timeout { .. } => FailureKind::Transient,
             // See the databricks branch above.
-            E::Abandoned { .. } => FailureKind::Unknown,
+            E::Timeout { .. } | E::Abandoned { .. } => FailureKind::Unknown,
             E::ApiError { status, .. } => match status {
                 401 | 403 => FailureKind::AuthFailed,
                 404 => FailureKind::NotFound,
@@ -15662,13 +15663,15 @@ mod failure_kind_tests {
         assert_eq!(FailureKind::from(&e), FailureKind::QueryRejected);
     }
 
+    /// #2768: a statement that timed out may still run (or have been
+    /// accepted), so it is never reported as `Transient`.
     #[test]
-    fn databricks_timeout_maps_to_transient() {
+    fn databricks_timeout_maps_to_unknown() {
         let e = DbE::Timeout {
             id: "stmt-1".into(),
             seconds: 30,
         };
-        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
     }
 
     /// #2768: a statement the client stopped waiting on may still run, so it
@@ -15688,7 +15691,7 @@ mod failure_kind_tests {
         ] {
             let e = DbE::Abandoned {
                 id: "stmt-1".into(),
-                cancel: "cancel requested".into(),
+                cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
                 cause: Box::new(cause),
             };
             assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
@@ -15787,13 +15790,14 @@ mod failure_kind_tests {
         assert_eq!(FailureKind::from(&e), FailureKind::QueryRejected);
     }
 
+    /// #2768: see `databricks_timeout_maps_to_unknown`.
     #[test]
-    fn snowflake_timeout_maps_to_transient() {
+    fn snowflake_timeout_maps_to_unknown() {
         let e = SnE::Timeout {
             handle: "h-1".into(),
             seconds: 60,
         };
-        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
     }
 
     /// #2768: see `databricks_abandoned_maps_to_unknown`.
@@ -15801,7 +15805,7 @@ mod failure_kind_tests {
     fn snowflake_abandoned_maps_to_unknown() {
         let e = SnE::Abandoned {
             handle: "h-1".into(),
-            cancel: "cancel requested".into(),
+            cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
             cause: Box::new(SnE::Timeout {
                 handle: "h-1".into(),
                 seconds: 60,
@@ -15880,9 +15884,9 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_walks_chain_for_snowflake_connector_error() {
-        let err = anyhow::Error::new(SnE::Timeout {
-            handle: "h".into(),
-            seconds: 30,
+        let err = anyhow::Error::new(SnE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         })
         .context("running materialization");
         assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);
@@ -15973,9 +15977,9 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_with_cooldown_returns_none_for_non_breaker_failure() {
-        let conn_err = DbE::Timeout {
-            id: "s".into(),
-            seconds: 60,
+        let conn_err = DbE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         };
         let err = anyhow::Error::new(conn_err);
         assert_eq!(
@@ -16024,9 +16028,9 @@ mod failure_kind_tests {
     /// the classifier must keep unwrapping it too.
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_snowflake_connector() {
-        let conn_err = SnE::Timeout {
-            handle: "h".into(),
-            seconds: 30,
+        let conn_err = SnE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         };
         let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err).context("execute_statement failed");
@@ -16095,10 +16099,10 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn run_path_bare_wrap_preserves_snowflake_timeout() {
-        let result: rocky_adapter_sdk::AdapterResult<()> = Err(sn_adapter_err(SnE::Timeout {
-            handle: "h-1".into(),
-            seconds: 60,
+    fn run_path_bare_wrap_preserves_snowflake_transient() {
+        let result: rocky_adapter_sdk::AdapterResult<()> = Err(sn_adapter_err(SnE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         }));
         let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
         assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);
