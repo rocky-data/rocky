@@ -1376,8 +1376,8 @@ fn resolve_rerun_writes(
                     // A run substitutes `@var()` into each model's SQL before
                     // it finds the functions the model calls, so a call written
                     // as `@var(f, name)(x)` is hidden from the raw text. Apply
-                    // the run's own substitution, with no `--var` (the inline
-                    // defaults). A variable it cannot resolve means the scan
+                    // the substitution of a run with no `--var` (the inline
+                    // defaults), which is what the scheduler starts. A variable it cannot resolve means the scan
                     // cannot see the SQL a run executes, so fail closed.
                     let diagnostics = rocky_compiler::compile::substitute_run_vars_into_models(
                         &mut models,
@@ -1389,7 +1389,7 @@ fn resolve_rerun_writes(
                     }) {
                         return ResolvedWrites::Unresolved {
                             reason: format!(
-                                "model '{}' uses an @var() that has no inline default, so Rocky cannot read the SQL a run executes",
+                                "model '{}' leaves an `@var(` in its SQL that the run does not substitute (a required var with no default, or one inside a comment); V069 cannot see what it hides",
                                 model.config.name
                             ),
                         };
@@ -6677,6 +6677,27 @@ cron = "0 * * * *"
         let message = v069_message_for(&dir);
         assert!(
             message.starts_with("pipeline.silver: not_rerun_safe (") && message.contains("@var()"),
+            "{message}"
+        );
+    }
+
+    /// A run skips `@var(` inside a SQL comment, so the text stays in the SQL.
+    /// The leftover check must class that model not safe, with a reason that
+    /// is true for a comment too.
+    #[test]
+    fn a_var_left_in_a_sql_comment_is_not_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        let model = dir.path().join("models").join("orders.sql");
+        std::fs::write(
+            &model,
+            "-- @var(f, cents_to_dollars)(id)\nSELECT id FROM raw.orders",
+        )
+        .unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (")
+                && message.contains("leaves an `@var(` in its SQL")
+                && message.contains("or one inside a comment"),
             "{message}"
         );
     }
