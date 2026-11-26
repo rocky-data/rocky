@@ -1,38 +1,42 @@
 //! Whether a pipeline is safe to run a second time.
 //!
-//! A pipeline is *rerun-safe* when a second run of the same work cannot
-//! corrupt the target, **even while a first run may still be writing to the
-//! warehouse**. A sequential re-run after the first run stopped is the easy
-//! case; two overlapping runs are the bar. The scheduler will retry, re-run
-//! and fail over only pipelines this module classifies as
-//! [`RerunSafety::Safe`].
+//! A pipeline is *rerun-safe* when a second run, sequential or overlapping
+//! the first, leaves the target exactly as one run would. The scheduler will
+//! retry, re-run and fail over only pipelines this module classifies as
+//! [`RerunSafety::Safe`]. A false `Safe` writes data twice, so the
+//! classifier fails closed: anything it cannot prove is
+//! [`RerunSafety::NotSafe`] with a reason.
 //!
-//! The answer depends on the pipeline type, each materialization strategy it
-//! writes with, the target warehouse and, for upserts, whether a unique key
-//! exists. Anything this module cannot prove safe is
-//! [`RerunSafety::NotSafe`] with a reason: the classifier fails closed.
+//! A write is `Safe` only when both of these hold:
 //!
-//! A verdict is `Safe` only on one of three grounds, each proven from Rocky's
-//! own code:
+//! 1. The SQL Rocky generates makes a second run a no-op by construction. The
+//!    proof must not rest on the user's data (non-null keys, a model that
+//!    filters on the right column) or on how the warehouse resolves
+//!    concurrent writers.
+//! 2. The write is **one statement that replaces the whole object**, or it
+//!    writes nothing.
 //!
-//! - The steady-state write is **one statement that replaces the whole
-//!   object** from the model's query (`CREATE OR REPLACE ...`). Two
-//!   overlapping runs each leave a complete object.
-//! - The target is a **single-writer DuckDB file**. Every scheduled run is a
-//!   separate `rocky` process (`SubprocessSpawner`), and DuckDB lets only one
-//!   process open a file to write, so the runs cannot overlap.
-//! - The writer itself handles contention (`content_addressed`: a
-//!   conditional PUT on the Delta log entry, then a re-read on conflict).
+//! So the safe set is small: a `full_refresh` that is one
+//! `CREATE OR REPLACE TABLE ... AS`, a `view`, a `materialized_view` or a
+//! `dynamic_table` that is one `CREATE OR REPLACE`, a `content_addressed`
+//! model (one replace commit to the Delta log), an `ephemeral` model (it
+//! writes nothing), and a quality pipeline that only reads. Every upsert,
+//! append, partition replace and snapshot is `NotSafe` on every adapter,
+//! and the reason says what would make it provable.
 //!
-//! Warehouse concurrency semantics that Rocky has not proven, such as how
-//! Delta Lake resolves two overlapping `MERGE`s, are not a ground.
+//! A whole-object replace is a no-op on a second run only if it does not
+//! read what it writes. A model that reads its own target, directly, through
+//! an ephemeral model or through another model of the same pipeline, builds
+//! on the previous run, so it is `NotSafe` too ([`classify_pipeline`] checks
+//! this from [`ResolvedModel::reads`]).
 //!
 //! The classification judges the steady-state statements a run executes. It
-//! does not audit the first-run bootstrap or the drift rebuild paths.
+//! does not audit the first-run bootstrap or the drift rebuild paths. It
+//! does not classify `[hook.*]` shell commands or webhooks.
 
 use serde::{Deserialize, Serialize};
 
-use rocky_ir::MaterializationStrategy;
+use rocky_ir::{MaterializationStrategy, ModelIr, TargetRef};
 
 use crate::config::{AdapterConfig, ChecksConfig, PipelineConfig, QuarantineMode};
 use crate::cost::WarehouseType;
@@ -41,7 +45,8 @@ use crate::cost::WarehouseType;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
 pub enum RerunSafety {
-    /// A second run is safe, even while a first run is still writing.
+    /// A second run, sequential or overlapping, leaves the target as one
+    /// run would.
     #[serde(rename = "rerun_safe")]
     Safe,
     /// A second run may duplicate, lose or corrupt data. `reason` says why.
@@ -94,15 +99,16 @@ pub enum WriterPipeline {
 /// The target warehouse, as far as rerun safety is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetWarehouse {
-    /// DuckDB on a plain local file path, or in memory, with no attached
-    /// catalog. Only one process can open a DuckDB file for writing, so a
-    /// second run cannot overlap the first one: it fails to open the
-    /// database. A memory database is private to its process.
-    DuckDbSingleWriter,
+    /// DuckDB with no attached catalog, on a plain local file path, in
+    /// memory, or with no `path`. A full refresh there is one
+    /// `CREATE OR REPLACE TABLE ... AS`.
+    DuckDbPlain,
     /// Any other DuckDB target: an attached catalog (Iceberg, DuckLake), or a
     /// `path` with a `scheme:` prefix (`md:`, `ducklake:`, ...) that DuckDB
-    /// may route to a store other processes can write.
-    DuckDbShared,
+    /// routes to another store. A full refresh into an attached Iceberg
+    /// catalog is several statements (`sql_gen::in_place_overwrite_statements`),
+    /// and Rocky does not resolve which catalog each model writes here.
+    DuckDbAttached,
     /// Databricks (Delta Lake).
     Databricks,
     /// Snowflake.
@@ -137,14 +143,14 @@ impl TargetWarehouse {
             WarehouseType::DuckDb => {
                 // The registry opens a set `path` verbatim with
                 // `Connection::open` and no `path` in memory.
-                let single_path = adapter
+                let plain_path = adapter
                     .path
                     .as_ref()
-                    .is_none_or(|path| duckdb_path_is_single_writer(path.expose()));
-                if single_path && adapter.attach.is_empty() {
-                    Self::DuckDbSingleWriter
+                    .is_none_or(|path| duckdb_path_is_plain(path.expose()));
+                if plain_path && adapter.attach.is_empty() {
+                    Self::DuckDbPlain
                 } else {
-                    Self::DuckDbShared
+                    Self::DuckDbAttached
                 }
             }
             WarehouseType::Databricks => Self::Databricks,
@@ -155,7 +161,7 @@ impl TargetWarehouse {
 
     fn label(&self) -> &str {
         match self {
-            Self::DuckDbSingleWriter | Self::DuckDbShared => "DuckDB",
+            Self::DuckDbPlain | Self::DuckDbAttached => "DuckDB",
             Self::Databricks => "Databricks",
             Self::Snowflake => "Snowflake",
             Self::BigQuery => "BigQuery",
@@ -164,16 +170,15 @@ impl TargetWarehouse {
     }
 }
 
-/// Whether a DuckDB `path` names a single-writer database. An allowlist: only
+/// Whether a DuckDB `path` names a plain database: one whose only catalog is
+/// its own, so a full refresh is one `CREATE OR REPLACE`. An allowlist: only
 /// `:memory:` and a plain filesystem path count. DuckDB reads a `scheme:`
 /// prefix (`md:`, `motherduck:`, `ducklake:`, an extension's own prefix) as a
-/// route to another store, which other processes may write. So any `:` makes
-/// the path shared, except a Windows drive letter (`C:\`, `C:/`) at the
-/// start. An empty path is shared too: it is not a file Rocky can name.
-///
-/// `:memory:` is single-writer because each scheduled run is its own `rocky`
-/// process, and a memory database lives and dies inside that process.
-fn duckdb_path_is_single_writer(path: &str) -> bool {
+/// route to another store, whose writes Rocky has not verified. So any `:`
+/// makes the path not plain, except a Windows drive letter (`C:\`, `C:/`) at
+/// the start. An empty path is not plain either: it is not a file Rocky can
+/// name.
+fn duckdb_path_is_plain(path: &str) -> bool {
     if path == ":memory:" {
         return true;
     }
@@ -189,6 +194,35 @@ fn duckdb_path_is_single_writer(path: &str) -> bool {
     !rest.contains(':')
 }
 
+/// One model of a transformation pipeline, with what its SQL reads.
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    /// The model name.
+    pub name: String,
+    /// The materialization the run uses.
+    pub strategy: MaterializationStrategy,
+    /// The table the model writes.
+    pub target: TargetRef,
+    /// The tables the model's SQL reads, lower-cased, CTE names dropped
+    /// (`rocky_sql::lineage::referenced_tables`). `Err` when the SQL could
+    /// not be parsed.
+    pub reads: Result<Vec<String>, String>,
+}
+
+impl ResolvedModel {
+    /// Resolve a model from its IR, reading its SQL with
+    /// `rocky_sql::lineage::referenced_tables`.
+    #[must_use]
+    pub fn from_ir(ir: &ModelIr) -> Self {
+        Self {
+            name: ir.name.to_string(),
+            strategy: ir.materialization.clone(),
+            target: ir.target.clone(),
+            reads: rocky_sql::lineage::referenced_tables(&ir.sql),
+        }
+    }
+}
+
 /// What a pipeline writes, resolved by the caller from files and settings
 /// this crate does not read.
 #[derive(Debug, Clone)]
@@ -197,8 +231,8 @@ pub enum ResolvedWrites {
     /// pipeline default and each `table_overrides` strategy). An `Err` is a
     /// strategy the run refuses or does not recognize.
     Strategies(Vec<Result<MaterializationStrategy, String>>),
-    /// A transformation pipeline: each model it builds, by name.
-    Models(Vec<(String, MaterializationStrategy)>),
+    /// A transformation pipeline: each model it builds.
+    Models(Vec<ResolvedModel>),
     /// The writes could not be resolved, for example because the models
     /// directory is missing or a model fails to load.
     Unresolved {
@@ -211,6 +245,9 @@ pub enum ResolvedWrites {
 
 const CUSTOM_CHECK_REASON: &str =
     "a [[checks.custom]] check runs its SQL as written, so Rocky cannot prove it only reads";
+
+/// What every non-replace reason ends with.
+const NOT_PROVABLE: &str = "not provable from the generated SQL alone";
 
 /// Classify a pipeline. A pipeline is safe only when every materialization
 /// it writes is safe; a transformation pipeline that builds no models, and
@@ -246,10 +283,10 @@ pub fn classify_pipeline(
             }
         },
         PipelineConfig::Quality(quality) => classify_quality(&quality.checks),
-        PipelineConfig::Snapshot(_) => RerunSafety::not_safe(
+        PipelineConfig::Snapshot(_) => RerunSafety::not_safe(format!(
             "a snapshot pipeline closes old versions and inserts new ones in separate \
-             statements with no transaction, so two runs can record a change twice",
-        ),
+             statements, so a second run can record a change twice; {NOT_PROVABLE}"
+        )),
         PipelineConfig::Load(_) => RerunSafety::not_safe(
             "a load pipeline re-ingests every file on each run, so a second run \
              duplicates the rows",
@@ -277,21 +314,95 @@ fn classify_strategies(
     RerunSafety::Safe
 }
 
-fn classify_models(
-    models: &[(String, MaterializationStrategy)],
-    target: &TargetWarehouse,
-) -> RerunSafety {
+fn classify_models(models: &[ResolvedModel], target: &TargetWarehouse) -> RerunSafety {
     if models.is_empty() {
         return RerunSafety::not_safe("the pipeline builds no models");
     }
-    for (name, strategy) in models {
+    for model in models {
         if let RerunSafety::NotSafe { reason } =
-            classify_strategy(strategy, WriterPipeline::Transformation, target)
+            classify_strategy(&model.strategy, WriterPipeline::Transformation, target)
         {
-            return RerunSafety::not_safe(format!("model '{name}': {reason}"));
+            return RerunSafety::not_safe(format!("model '{}': {reason}", model.name));
         }
     }
+    for model in models {
+        if let Err(e) = &model.reads {
+            return RerunSafety::not_safe(format!(
+                "model '{}': its SQL could not be parsed, so Rocky cannot check that it does \
+                 not read its own output ({e})",
+                model.name
+            ));
+        }
+    }
+    if let Some(model) = first_model_reading_its_own_output(models) {
+        return RerunSafety::not_safe(format!(
+            "model '{}' reads its own output, directly or through other models of the \
+             pipeline, so each run builds on the last one",
+            model.name
+        ));
+    }
     RerunSafety::Safe
+}
+
+/// The first non-ephemeral model that can reach its own target through the
+/// reads of the pipeline's models. A read reaches a model when it names the
+/// model's target table (see [`read_names_model`]) or, for an ephemeral
+/// model, its name. An ephemeral model is inlined into its consumers, so
+/// what it reads, they read.
+fn first_model_reading_its_own_output(models: &[ResolvedModel]) -> Option<&ResolvedModel> {
+    let edges: Vec<Vec<usize>> = models
+        .iter()
+        .map(|reader| {
+            let reads = reader.reads.as_deref().unwrap_or_default();
+            (0..models.len())
+                .filter(|&j| reads.iter().any(|read| read_names_model(read, &models[j])))
+                .collect()
+        })
+        .collect();
+    models.iter().enumerate().find_map(|(start, model)| {
+        if matches!(model.strategy, MaterializationStrategy::Ephemeral) {
+            return None;
+        }
+        let mut seen = vec![false; models.len()];
+        let mut stack = edges[start].clone();
+        while let Some(next) = stack.pop() {
+            if next == start {
+                return Some(model);
+            }
+            if !std::mem::replace(&mut seen[next], true) {
+                stack.extend(edges[next].iter().copied());
+            }
+        }
+        None
+    })
+}
+
+/// Whether `read` (a dotted, lower-cased name from the model's SQL) may name
+/// `model`'s output. The match errs toward yes: a bare name matches the
+/// target table in any schema, every qualifier the read spells must match
+/// the target's (compared case-insensitively, quotes dropped), and a read
+/// with more than three parts matches on its last three.
+fn read_names_model(read: &str, model: &ResolvedModel) -> bool {
+    let fold = |part: &str| {
+        part.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
+            .to_ascii_lowercase()
+    };
+    if matches!(model.strategy, MaterializationStrategy::Ephemeral)
+        && fold(read) == fold(&model.name)
+    {
+        return true;
+    }
+    let parts: Vec<String> = read.split('.').map(fold).collect();
+    let Some((table, qualifiers)) = parts.split_last() else {
+        return false;
+    };
+    let target = [&model.target.schema, &model.target.catalog];
+    *table == fold(&model.target.table)
+        && qualifiers
+            .iter()
+            .rev()
+            .zip(target)
+            .all(|(part, expected)| *part == fold(expected))
 }
 
 /// A quality pipeline reads the warehouse and writes nothing there, unless
@@ -304,8 +415,7 @@ fn classify_quality(checks: &ChecksConfig) -> RerunSafety {
                 RerunSafety::not_safe("quarantine mode \"tag\" rewrites the checked table in place")
             }
             QuarantineMode::Split | QuarantineMode::Drop => RerunSafety::not_safe(
-                "quarantine writes its tables in several statements, and overlapping runs \
-                 are not verified",
+                "quarantine writes its tables in several statements, not one replace",
             ),
         };
     }
@@ -315,7 +425,9 @@ fn classify_quality(checks: &ChecksConfig) -> RerunSafety {
     RerunSafety::Safe
 }
 
-/// Classify one materialization written by `pipeline` to `target`.
+/// Classify one materialization written by `pipeline` to `target`, from the
+/// strategy alone. [`classify_pipeline`] also checks that a transformation
+/// model does not read its own output.
 #[must_use]
 pub fn classify_strategy(
     strategy: &MaterializationStrategy,
@@ -337,27 +449,28 @@ pub fn classify_strategy(
             | MaterializationStrategy::DeleteInsert { .. }
             | MaterializationStrategy::Microbatch { .. }
             | MaterializationStrategy::ContentAddressed { .. }
-            | MaterializationStrategy::Snapshot(_) => RerunSafety::not_safe(format!(
-                "rerun safety is not verified on adapter type '{adapter_type}'"
-            )),
+            | MaterializationStrategy::Snapshot(_) => unverified(adapter_type),
         };
     }
     let warehouse = target.label();
     match strategy {
         // One `CREATE OR REPLACE TABLE ... AS` (`SqlDialect::create_table_as`
-        // on DuckDB, Databricks, Snowflake and BigQuery; the lakehouse
-        // `format` DDL is one statement too). On an attached Iceberg catalog
-        // a full refresh is a multi-statement in-place overwrite
-        // (`sql_gen::in_place_overwrite_statements`), so shared DuckDB fails
-        // closed.
+        // on DuckDB, Databricks, Snowflake and BigQuery, for a transformation
+        // model and for a replication table; the lakehouse `format` DDL is
+        // one statement too). On an attached Iceberg catalog a full refresh
+        // is a multi-statement in-place overwrite
+        // (`sql_gen::in_place_overwrite_statements`).
         MaterializationStrategy::FullRefresh => match target {
-            TargetWarehouse::DuckDbSingleWriter
+            TargetWarehouse::DuckDbPlain
             | TargetWarehouse::Databricks
             | TargetWarehouse::Snowflake
             | TargetWarehouse::BigQuery => RerunSafety::Safe,
-            TargetWarehouse::DuckDbShared | TargetWarehouse::Unverified { .. } => {
-                not_proven("a full refresh", warehouse)
-            }
+            TargetWarehouse::DuckDbAttached => RerunSafety::not_safe(
+                "a full refresh on a DuckDB target with an attached catalog or a `scheme:` \
+                 path can be several statements (an attached Iceberg catalog is overwritten \
+                 in place), not one replace",
+            ),
+            TargetWarehouse::Unverified { adapter_type } => unverified(adapter_type),
         },
         // One `CREATE OR REPLACE VIEW` (`SqlDialect::view_ddl`).
         MaterializationStrategy::View => RerunSafety::Safe,
@@ -369,121 +482,102 @@ pub fn classify_strategy(
             TargetWarehouse::Databricks
             | TargetWarehouse::Snowflake
             | TargetWarehouse::BigQuery => RerunSafety::Safe,
-            TargetWarehouse::DuckDbSingleWriter
-            | TargetWarehouse::DuckDbShared
+            TargetWarehouse::DuckDbPlain
+            | TargetWarehouse::DuckDbAttached
             | TargetWarehouse::Unverified { .. } => unsupported("a materialized view", warehouse),
         },
         // One `CREATE OR REPLACE DYNAMIC TABLE` (Snowflake `dynamic_table_ddl`).
         MaterializationStrategy::DynamicTable { .. } => match target {
             TargetWarehouse::Snowflake => RerunSafety::Safe,
-            TargetWarehouse::DuckDbSingleWriter
-            | TargetWarehouse::DuckDbShared
+            TargetWarehouse::DuckDbPlain
+            | TargetWarehouse::DuckDbAttached
             | TargetWarehouse::Databricks
             | TargetWarehouse::BigQuery
             | TargetWarehouse::Unverified { .. } => unsupported("a dynamic table", warehouse),
         },
-        MaterializationStrategy::Incremental {
-            unique_key,
-            lookback,
-            ..
-        } => match pipeline {
-            WriterPipeline::Replication => RerunSafety::not_safe(
-                "replication incremental reads its watermark from the Rocky state store, \
-                 so a second run before the first records it copies the same rows again",
-            ),
-            // With no key the run is a plain INSERT of the rows past
-            // `MAX(watermark) - lookback`, so every run appends the lookback
-            // window again (W046), even a sequential one on a DuckDB file.
-            WriterPipeline::Transformation
-                if unique_key.is_empty() && lookback.is_some_and(|l| l.amount > 0) =>
-            {
-                RerunSafety::not_safe(
-                    "incremental append with a lookback and no unique_key: every run appends \
-                     the rows of the lookback window again",
-                )
-            }
-            // Even on a DuckDB file a keyless append is not proven: with the
-            // `@incremental_filter` placeholder or a `filter_column`, a
-            // mis-specified model re-appends rows on every sequential run.
+        MaterializationStrategy::Incremental { unique_key, .. } => match pipeline {
+            WriterPipeline::Replication => RerunSafety::not_safe(format!(
+                "replication incremental appends the rows past the watermark in the Rocky \
+                 state store, so a second run before the first records it copies the same \
+                 rows again; {NOT_PROVABLE}"
+            )),
+            // A plain INSERT of the rows the model's filter lets through
+            // (`MAX(watermark) - lookback`, `@incremental_filter` or a
+            // `filter_column`). Whether a row comes through twice depends on
+            // the model and the data.
             WriterPipeline::Transformation if unique_key.is_empty() => {
                 RerunSafety::not_safe(format!(
-                    "incremental append with no unique_key: a second run can append the same \
-                     rows again on {warehouse}"
+                    "incremental with no unique_key appends every row its filter lets \
+                     through, so a row the filter passes twice, such as one in the lookback \
+                     window, is appended twice; {NOT_PROVABLE}"
                 ))
             }
-            WriterPipeline::Transformation => classify_upsert(target, warehouse),
+            // A MERGE on the key, with the same NULL-key hole as `merge`.
+            WriterPipeline::Transformation => RerunSafety::not_safe(format!(
+                "incremental with a unique_key is a MERGE: a row with a NULL key matches no \
+                 target row, so every run inserts it again; {NOT_PROVABLE}"
+            )),
         },
+        // `MERGE ... ON t.k = s.k`: a NULL key never matches, so it is
+        // inserted again on every run. Nothing rejects a nullable key.
         MaterializationStrategy::Merge { unique_key, .. } => {
             if unique_key.is_empty() {
                 RerunSafety::not_safe("merge with no unique_key")
             } else {
-                classify_upsert(target, warehouse)
+                RerunSafety::not_safe(format!(
+                    "merge: a row with a NULL unique_key matches no target row, so every run \
+                     inserts it again; {NOT_PROVABLE}"
+                ))
             }
         }
-        // `INSERT ... REPLACE WHERE` on Databricks
-        // (`DatabricksSqlDialect::insert_overwrite_partition`). Whether Delta
-        // fails one of two overlapping replaces of the same window, also an
-        // empty one, is not proven. The test that would prove it is a live
-        // two-session test: two runs replace the same window at once, and the
-        // table must hold the window once.
-        MaterializationStrategy::TimeInterval { .. } => match target {
-            TargetWarehouse::DuckDbSingleWriter => RerunSafety::Safe,
-            TargetWarehouse::DuckDbShared
-            | TargetWarehouse::Databricks
-            | TargetWarehouse::Snowflake
-            | TargetWarehouse::BigQuery
-            | TargetWarehouse::Unverified { .. } => not_proven("partition replacement", warehouse),
-        },
-        MaterializationStrategy::DeleteInsert { .. } => match target {
-            TargetWarehouse::DuckDbSingleWriter => RerunSafety::Safe,
-            TargetWarehouse::Databricks
+        // Delete the window on `time_column`, then insert the model's rows.
+        // A row the model returns outside the window is not deleted by the
+        // next run, and nothing checks that the model filters on
+        // `time_column`.
+        MaterializationStrategy::TimeInterval { .. } => RerunSafety::not_safe(format!(
+            "time_interval deletes the window on time_column and inserts the model's rows, \
+             so a row the model returns outside the window is inserted again on every run; \
+             {NOT_PROVABLE}"
+        )),
+        MaterializationStrategy::DeleteInsert { .. } => RerunSafety::not_safe(format!(
+            "delete_insert deletes the partitions it rewrites and inserts the rows in \
+             separate statements on {warehouse}, not one replace of the table; {NOT_PROVABLE}"
+        )),
+        // Unreachable from a loaded model: the loader lowers a declared
+        // `microbatch` to `time_interval` (`models::normalize_transformation_strategy`).
+        // This arm covers hand-built IR only.
+        MaterializationStrategy::Microbatch { .. } => RerunSafety::not_safe(format!(
+            "microbatch runs as time_interval, which deletes a window and inserts the \
+             model's rows, so a row outside the window is inserted again on every run; \
+             {NOT_PROVABLE}"
+        )),
+        // The uniform writer replaces the whole table in one Delta commit, a
+        // conditional PUT of the log entry. On a conflict it re-reads the
+        // live set and recomputes; an unchanged output writes no commit
+        // (`rocky_iceberg::uniform_writer`). The run then syncs the table
+        // with `MSCK REPAIR TABLE ... SYNC METADATA`, which only Databricks
+        // runs.
+        MaterializationStrategy::ContentAddressed { .. } => match target {
+            TargetWarehouse::Databricks => RerunSafety::Safe,
+            TargetWarehouse::DuckDbPlain
+            | TargetWarehouse::DuckDbAttached
             | TargetWarehouse::Snowflake
             | TargetWarehouse::BigQuery
             | TargetWarehouse::Unverified { .. } => RerunSafety::not_safe(format!(
-                "delete_insert runs the DELETE and the INSERT as separate statements on \
-                 {warehouse}, so two runs can both insert the rows"
+                "content_addressed syncs its table with MSCK REPAIR TABLE, which {warehouse} \
+                 does not run"
             )),
-            TargetWarehouse::DuckDbShared => not_proven("delete_insert", warehouse),
         },
-        // Unreachable from a loaded model: the loader lowers a declared
-        // `microbatch` to `time_interval` (`models::normalize_transformation_strategy`),
-        // so a microbatch model gets the time_interval class. This arm covers
-        // hand-built IR only, and fails closed.
-        MaterializationStrategy::Microbatch { .. } => RerunSafety::not_safe(
-            "microbatch has no run path of its own; a loaded model runs as time_interval",
-        ),
-        // The uniform writer replaces the whole table in one Delta commit,
-        // guarded by a conditional PUT; on a conflict it re-reads the live
-        // set and recomputes (`rocky_iceberg::uniform_writer`).
-        MaterializationStrategy::ContentAddressed { .. } => RerunSafety::Safe,
-        MaterializationStrategy::Snapshot(_) => RerunSafety::not_safe(
+        MaterializationStrategy::Snapshot(_) => RerunSafety::not_safe(format!(
             "a snapshot model closes old versions and inserts new ones in separate \
-             statements with no transaction, so two runs can record a change twice",
-        ),
+             statements, so a second run can record a change twice; {NOT_PROVABLE}"
+        )),
     }
 }
 
-/// A `MERGE` on a unique key. A second MERGE of the same rows after the first
-/// is a no-op, so on a single-writer DuckDB file, where the runs cannot
-/// overlap, it is safe. Everywhere else two overlapping MERGEs that both
-/// insert the same new key can both succeed: on Databricks, row-level
-/// concurrency (DBR 14.3+, deletion vectors) need not report a conflict. The
-/// test that would prove Databricks safe is a live two-session test: two runs
-/// MERGE the same new key at once, and the table must hold the key once.
-fn classify_upsert(target: &TargetWarehouse, warehouse: &str) -> RerunSafety {
-    match target {
-        TargetWarehouse::DuckDbSingleWriter => RerunSafety::Safe,
-        TargetWarehouse::DuckDbShared
-        | TargetWarehouse::Databricks
-        | TargetWarehouse::Snowflake
-        | TargetWarehouse::BigQuery
-        | TargetWarehouse::Unverified { .. } => not_proven("a MERGE", warehouse),
-    }
-}
-
-fn not_proven(what: &str, warehouse: &str) -> RerunSafety {
+fn unverified(adapter_type: &str) -> RerunSafety {
     RerunSafety::not_safe(format!(
-        "{what} on {warehouse} is not proven under concurrent writers"
+        "rerun safety is not verified on adapter type '{adapter_type}'"
     ))
 }
 
@@ -534,8 +628,8 @@ mod tests {
     /// The warehouses each table row lists, in column order.
     fn warehouses() -> [TargetWarehouse; 6] {
         [
-            TargetWarehouse::DuckDbSingleWriter,
-            TargetWarehouse::DuckDbShared,
+            TargetWarehouse::DuckDbPlain,
+            TargetWarehouse::DuckDbAttached,
             TargetWarehouse::Databricks,
             TargetWarehouse::Snowflake,
             TargetWarehouse::BigQuery,
@@ -569,6 +663,14 @@ mod tests {
         MaterializationStrategy::Merge {
             unique_key,
             update_columns: ColumnSelection::All,
+        }
+    }
+
+    fn interval() -> MaterializationStrategy {
+        MaterializationStrategy::TimeInterval {
+            time_column: "day".to_string(),
+            granularity: TimeGrain::Day,
+            window: None,
         }
     }
 
@@ -607,15 +709,12 @@ mod tests {
     const N: bool = false;
 
     /// Expected class per row, in [`warehouses`] column order:
-    /// DuckDB single writer, DuckDB shared, Databricks, Snowflake, BigQuery,
-    /// unverified adapter.
+    /// plain DuckDB, attached DuckDB, Databricks, Snowflake, BigQuery,
+    /// unverified adapter. Only whole-object replaces and writes of nothing
+    /// are safe; every upsert, append and partition replace is not, on every
+    /// adapter.
     fn table() -> Vec<(MaterializationStrategy, WriterPipeline, [bool; 6])> {
         use WriterPipeline::{Replication as R, Transformation as T};
-        let interval = MaterializationStrategy::TimeInterval {
-            time_column: "day".to_string(),
-            granularity: TimeGrain::Day,
-            window: None,
-        };
         let delete_insert = MaterializationStrategy::DeleteInsert {
             partition_by: vec![Arc::from("day")],
         };
@@ -650,36 +749,36 @@ mod tests {
                     [N, N, S, S, S, N],
                 ),
                 (dynamic.clone(), pipeline, [N, N, N, S, N, N]),
-                (merge(key()), pipeline, [S, N, N, N, N, N]),
+                (merge(key()), pipeline, [N, N, N, N, N, N]),
                 (merge(Vec::new()), pipeline, [N, N, N, N, N, N]),
-                (interval.clone(), pipeline, [S, N, N, N, N, N]),
-                (delete_insert.clone(), pipeline, [S, N, N, N, N, N]),
+                (interval(), pipeline, [N, N, N, N, N, N]),
+                (delete_insert.clone(), pipeline, [N, N, N, N, N, N]),
                 (microbatch.clone(), pipeline, [N, N, N, N, N, N]),
-                (content.clone(), pipeline, [S, S, S, S, S, N]),
+                (content.clone(), pipeline, [N, N, S, N, N, N]),
                 (snapshot(), pipeline, [N, N, N, N, N, N]),
             ]);
         }
-        rows.extend([
-            (incremental(Vec::new()), R, [N, N, N, N, N, N]),
-            (incremental(key()), R, [N, N, N, N, N, N]),
-            (incremental(Vec::new()), T, [N, N, N, N, N, N]),
-            (
-                incremental_lookback(Vec::new(), Some("0 days")),
-                T,
-                [N, N, N, N, N, N],
-            ),
-            (
-                incremental_lookback(Vec::new(), Some("3 days")),
-                T,
-                [N, N, N, N, N, N],
-            ),
-            (incremental(key()), T, [S, N, N, N, N, N]),
-            (
-                incremental_lookback(key(), Some("3 days")),
-                T,
-                [S, N, N, N, N, N],
-            ),
-        ]);
+        for pipeline in [R, T] {
+            rows.extend([
+                (incremental(Vec::new()), pipeline, [N, N, N, N, N, N]),
+                (incremental(key()), pipeline, [N, N, N, N, N, N]),
+                (
+                    incremental_lookback(Vec::new(), Some("0 days")),
+                    pipeline,
+                    [N, N, N, N, N, N],
+                ),
+                (
+                    incremental_lookback(Vec::new(), Some("3 days")),
+                    pipeline,
+                    [N, N, N, N, N, N],
+                ),
+                (
+                    incremental_lookback(key(), Some("3 days")),
+                    pipeline,
+                    [N, N, N, N, N, N],
+                ),
+            ]);
+        }
         rows
     }
 
@@ -769,40 +868,67 @@ mod tests {
         }
     }
 
+    /// Every upsert, append and partition replace says why it is not safe
+    /// and that the generated SQL alone does not prove it, on every adapter
+    /// Rocky verifies, a plain DuckDB file included.
     #[test]
-    fn databricks_upserts_and_partition_replacement_are_not_proven() {
-        let interval = MaterializationStrategy::TimeInterval {
-            time_column: "day".to_string(),
-            granularity: TimeGrain::Day,
-            window: None,
-        };
-        for strategy in [merge(key()), incremental(key()), interval] {
-            let class = classify_strategy(
-                &strategy,
+    fn non_replace_writes_name_the_hole_on_every_adapter() {
+        let cases = [
+            (
+                merge(key()),
                 WriterPipeline::Transformation,
-                &TargetWarehouse::Databricks,
-            );
-            let RerunSafety::NotSafe { reason } = class else {
-                panic!("{}: Databricks is not proven", witness(&strategy));
-            };
-            assert!(
-                reason.contains("not proven under concurrent writers"),
-                "{reason}"
-            );
+                "NULL unique_key",
+            ),
+            (merge(key()), WriterPipeline::Replication, "NULL unique_key"),
+            (
+                incremental(key()),
+                WriterPipeline::Transformation,
+                "NULL key",
+            ),
+            (
+                incremental_lookback(key(), Some("1 hour")),
+                WriterPipeline::Transformation,
+                "NULL key",
+            ),
+            (
+                incremental_lookback(Vec::new(), Some("1 hour")),
+                WriterPipeline::Transformation,
+                "lookback",
+            ),
+            (
+                incremental(Vec::new()),
+                WriterPipeline::Replication,
+                "watermark",
+            ),
+            (
+                interval(),
+                WriterPipeline::Transformation,
+                "outside the window",
+            ),
+            (
+                MaterializationStrategy::DeleteInsert {
+                    partition_by: vec![Arc::from("day")],
+                },
+                WriterPipeline::Transformation,
+                "separate statements",
+            ),
+        ];
+        let verified = warehouses()
+            .into_iter()
+            .filter(|w| !matches!(w, TargetWarehouse::Unverified { .. }));
+        for target in verified {
+            for (strategy, pipeline, hole) in &cases {
+                let class = classify_strategy(strategy, *pipeline, &target);
+                let RerunSafety::NotSafe { reason } = class else {
+                    panic!("{} / {pipeline:?} / {target:?} is safe", witness(strategy));
+                };
+                assert!(
+                    reason.contains(hole) && reason.ends_with(NOT_PROVABLE),
+                    "{} / {target:?}: {reason}",
+                    witness(strategy)
+                );
+            }
         }
-    }
-
-    #[test]
-    fn a_keyless_lookback_is_not_safe_even_on_a_duckdb_file() {
-        let class = classify_strategy(
-            &incremental_lookback(Vec::new(), Some("1 hour")),
-            WriterPipeline::Transformation,
-            &TargetWarehouse::DuckDbSingleWriter,
-        );
-        let RerunSafety::NotSafe { reason } = class else {
-            panic!("a keyless lookback re-appends its window");
-        };
-        assert!(reason.contains("lookback"), "{reason}");
     }
 
     fn pipeline(toml: &str) -> PipelineConfig {
@@ -813,30 +939,140 @@ mod tests {
         pipeline("type = \"transformation\"\n[target]\nadapter = \"wh\"\n")
     }
 
+    /// A model writing `c.s.<table>` and reading `reads`.
+    fn model(
+        name: &str,
+        table: &str,
+        strategy: MaterializationStrategy,
+        reads: &[&str],
+    ) -> ResolvedModel {
+        ResolvedModel {
+            name: name.to_string(),
+            strategy,
+            target: TargetRef {
+                catalog: "c".to_string(),
+                schema: "s".to_string(),
+                table: table.to_string(),
+            },
+            reads: Ok(reads.iter().map(|r| (*r).to_string()).collect()),
+        }
+    }
+
+    fn models(models: Vec<ResolvedModel>) -> ResolvedWrites {
+        ResolvedWrites::Models(models)
+    }
+
     #[test]
     fn a_transformation_pipeline_is_safe_only_when_every_model_is() {
-        let models = ResolvedWrites::Models(vec![
-            ("a".to_string(), MaterializationStrategy::FullRefresh),
-            ("b".to_string(), incremental(key())),
+        let full = MaterializationStrategy::FullRefresh;
+        let writes = models(vec![
+            model("a", "a", full.clone(), &["raw.a"]),
+            model("b", "b", MaterializationStrategy::View, &["a"]),
         ]);
-        let duckdb = classify_pipeline(
-            &transformation(),
-            &TargetWarehouse::DuckDbSingleWriter,
-            &models,
-        );
-        assert_eq!(duckdb, RerunSafety::Safe);
+        let class = classify_pipeline(&transformation(), &TargetWarehouse::Databricks, &writes);
+        assert_eq!(class, RerunSafety::Safe);
 
-        let databricks =
-            classify_pipeline(&transformation(), &TargetWarehouse::Databricks, &models);
-        let RerunSafety::NotSafe { reason } = databricks else {
-            panic!("an upsert model on Databricks is not safe");
+        let writes = models(vec![
+            model("a", "a", full, &["raw.a"]),
+            model("b", "b", merge(key()), &["a"]),
+        ]);
+        let class = classify_pipeline(&transformation(), &TargetWarehouse::DuckDbPlain, &writes);
+        let RerunSafety::NotSafe { reason } = class else {
+            panic!("a merge model is not safe");
         };
-        assert!(reason.starts_with("model 'b': "), "{reason}");
+        assert!(reason.starts_with("model 'b': merge"), "{reason}");
+    }
+
+    #[test]
+    fn a_model_that_reads_its_own_output_is_not_safe() {
+        let full = MaterializationStrategy::FullRefresh;
+        let target = TargetWarehouse::DuckDbPlain;
+        let not_safe = |writes: &ResolvedWrites, name: &str| {
+            let class = classify_pipeline(&transformation(), &target, writes);
+            let RerunSafety::NotSafe { reason } = class else {
+                panic!("{writes:?} reads its own output");
+            };
+            assert!(
+                reason.starts_with(&format!("model '{name}' reads its own output")),
+                "{reason}"
+            );
+        };
+        // Directly: bare, schema-qualified, fully qualified, quoted.
+        for read in ["orders", "s.orders", "c.s.orders", "\"c\".\"S\".\"Orders\""] {
+            not_safe(
+                &models(vec![model("o", "orders", full.clone(), &[read])]),
+                "o",
+            );
+        }
+        // Through an ephemeral model, which its consumer inlines.
+        not_safe(
+            &models(vec![
+                model("e", "e", MaterializationStrategy::Ephemeral, &["orders"]),
+                model("o", "orders", full.clone(), &["e"]),
+            ]),
+            "o",
+        );
+        // Through another model: a qualified read derives no DAG edge, so
+        // two models can each read the other's output.
+        not_safe(
+            &models(vec![
+                model("a", "a", full.clone(), &["c.s.b"]),
+                model("b", "b", MaterializationStrategy::View, &["c.s.a"]),
+            ]),
+            "a",
+        );
+        // A same-named table in another schema is not the target.
+        for read in ["raw.orders", "other.s.orders"] {
+            let writes = models(vec![model("o", "orders", full.clone(), &[read])]);
+            assert_eq!(
+                classify_pipeline(&transformation(), &target, &writes),
+                RerunSafety::Safe,
+                "{read}"
+            );
+        }
+        // SQL the parser cannot read is not safe either.
+        let mut unparsed = model("o", "orders", full, &[]);
+        unparsed.reads = Err("unexpected token".to_string());
+        let class = classify_pipeline(&transformation(), &target, &models(vec![unparsed]));
+        let RerunSafety::NotSafe { reason } = class else {
+            panic!("unparsed SQL is not safe");
+        };
+        assert!(reason.contains("could not be parsed"), "{reason}");
+    }
+
+    #[test]
+    fn a_resolved_model_reads_its_sql_with_the_lineage_parser() {
+        let ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "c".to_string(),
+                schema: "s".to_string(),
+                table: "orders".to_string(),
+            },
+            MaterializationStrategy::FullRefresh,
+            Vec::new(),
+            "SELECT id FROM raw.orders WHERE id NOT IN (SELECT id FROM c.s.orders)".to_string(),
+            rocky_ir::GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        let resolved = ResolvedModel::from_ir(&ir);
+        let reads = resolved.reads.clone().expect("the SQL parses");
+        assert!(reads.contains(&"c.s.orders".to_string()), "{reads:?}");
+        let class = classify_pipeline(
+            &transformation(),
+            &TargetWarehouse::Databricks,
+            &models(vec![resolved]),
+        );
+        assert!(!class.is_safe(), "{class:?}");
     }
 
     #[test]
     fn unknown_writes_are_not_safe() {
-        let target = TargetWarehouse::DuckDbSingleWriter;
+        let target = TargetWarehouse::DuckDbPlain;
         for writes in [
             ResolvedWrites::Models(Vec::new()),
             ResolvedWrites::Unresolved {
@@ -956,24 +1192,24 @@ mod tests {
     fn the_target_warehouse_comes_from_the_adapter_block() {
         assert_eq!(
             TargetWarehouse::from_adapter(Some(&adapter("type = \"duckdb\"\npath = \"x.db\"\n"))),
-            TargetWarehouse::DuckDbSingleWriter
+            TargetWarehouse::DuckDbPlain
         );
         assert_eq!(
             TargetWarehouse::from_adapter(Some(&adapter("type = \"duckdb\"\n"))),
-            TargetWarehouse::DuckDbSingleWriter
+            TargetWarehouse::DuckDbPlain
         );
         assert_eq!(
             TargetWarehouse::from_adapter(Some(&adapter(
                 "type = \"duckdb\"\npath = \"md:prod\"\n"
             ))),
-            TargetWarehouse::DuckDbShared
+            TargetWarehouse::DuckDbAttached
         );
         assert_eq!(
             TargetWarehouse::from_adapter(Some(&adapter(
                 "type = \"duckdb\"\npath = \"x.db\"\n[[attach]]\nalias = \"dl\"\ntype = \"ducklake\"\n\
                  metadata_path = \"m.ducklake\"\ndata_path = \"d/\"\n"
             ))),
-            TargetWarehouse::DuckDbShared
+            TargetWarehouse::DuckDbAttached
         );
         assert_eq!(
             TargetWarehouse::from_adapter(Some(&adapter("type = \"databricks\"\n"))),
@@ -985,7 +1221,7 @@ mod tests {
                 "type = \"duckdb\"\npath = \"{path}\"\n"
             ))))
         };
-        for single in [
+        for plain in [
             "x.db",
             "./data/warehouse.duckdb",
             "/var/lib/rocky/wh.duckdb",
@@ -993,13 +1229,9 @@ mod tests {
             "C:\\data\\wh.duckdb",
             "d:/data/wh.duckdb",
         ] {
-            assert_eq!(
-                duckdb_path(single),
-                TargetWarehouse::DuckDbSingleWriter,
-                "{single}"
-            );
+            assert_eq!(duckdb_path(plain), TargetWarehouse::DuckDbPlain, "{plain}");
         }
-        for shared in [
+        for attached in [
             "md:prod",
             "motherduck:prod",
             "ducklake:meta.ducklake",
@@ -1013,9 +1245,9 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                duckdb_path(shared),
-                TargetWarehouse::DuckDbShared,
-                "{shared:?}"
+                duckdb_path(attached),
+                TargetWarehouse::DuckDbAttached,
+                "{attached:?}"
             );
         }
         assert_eq!(

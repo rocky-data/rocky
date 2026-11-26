@@ -564,37 +564,47 @@ It lists what the ingress accepted and no tick has consumed, with the `token` yo
 
 ### Which pipelines are safe to run twice
 
-`rocky validate` gives each scheduled pipeline a rerun-safety class. The scheduler will use the class before it retries, re-runs or fails over a run. A pipeline is `rerun_safe` when a second run cannot corrupt the target, even while the first run is still writing. Otherwise it is `not_rerun_safe`, and the message says why.
+`rocky validate` gives each scheduled pipeline a rerun-safety class. The scheduler will use the class before it retries, re-runs or fails over a run. A pipeline is `rerun_safe` when a second run leaves the target exactly as one run would. That holds for a second run after the first, and for one that overlaps it. Otherwise the class is `not_rerun_safe`, and the message says why.
 
 ```
   ok  pipeline.silver: rerun_safe
-  ok  pipeline.raw: not_rerun_safe (replication incremental reads its watermark from the Rocky state store, ...)
+  ok  pipeline.raw: not_rerun_safe (replication incremental appends the rows past the watermark ...)
 ```
 
 The message has code `V069` and severity `ok`, so it never fails validation. A pipeline with no `[schedule]` block gets no class.
 
-The class depends on four things: the pipeline type, each materialization strategy, the target warehouse, and whether an upsert has a `unique_key`. A pipeline is `rerun_safe` only when every model or table it writes is. When Rocky cannot prove a case, the class is `not_rerun_safe`.
+A write is `rerun_safe` only when both of these are true:
+
+1. The SQL Rocky generates makes a second run a no-op. The proof does not rely on your data, such as keys that are never NULL or a model that filters on the right column. It does not rely on how the warehouse handles two writers at once.
+2. The write is one statement that replaces the whole table or view, or it writes nothing.
+
+A pipeline is `rerun_safe` only when every model or table it writes is. When Rocky cannot prove a case, the class is `not_rerun_safe`.
 
 | Writes | Class |
 |---|---|
-| `view`, `content_addressed` | `rerun_safe` on DuckDB, Databricks, Snowflake and BigQuery |
-| `full_refresh` | `rerun_safe` on a DuckDB file, Databricks, Snowflake and BigQuery |
+| `full_refresh` | `rerun_safe` on a plain DuckDB target, Databricks, Snowflake and BigQuery. Each is one `CREATE OR REPLACE TABLE ... AS`. |
+| `view` | `rerun_safe` on DuckDB, Databricks, Snowflake and BigQuery. It is one `CREATE OR REPLACE VIEW`. |
+| `materialized_view` | `rerun_safe` on Databricks, Snowflake and BigQuery. It is one `CREATE OR REPLACE MATERIALIZED VIEW`. |
+| `dynamic_table` | `rerun_safe` on Snowflake. It is one `CREATE OR REPLACE DYNAMIC TABLE`. |
+| `content_addressed` | `rerun_safe` on Databricks. It replaces the table in one Delta log commit. Other adapters do not run the `MSCK REPAIR TABLE` that follows the commit. |
 | `ephemeral` | `rerun_safe` on every adapter. It writes nothing. |
-| `materialized_view` | `rerun_safe` on Databricks, Snowflake and BigQuery |
-| `dynamic_table` | `rerun_safe` on Snowflake |
-| `merge` or `incremental` with a `unique_key`, `time_interval`, `delete_insert` | `rerun_safe` on a DuckDB file only |
-| `merge` with no `unique_key` | never |
-| `incremental` with no `unique_key` (transformation), with or without a `lookback` | never, on any adapter. With a `lookback` above 0 each run appends the window again. Without one, a model that does not filter on the watermark exactly can still append rows again on a sequential run. |
-| `microbatch` | the same as `time_interval`. Rocky runs a microbatch model as `time_interval`. |
-| `incremental` (replication), `snapshot`, `load` | never |
+| `merge` | never. A row with a NULL `unique_key` matches no row in the target, so every run inserts it again. |
+| `incremental` with a `unique_key` (transformation) | never. It runs as a `MERGE`, with the same NULL-key problem. |
+| `incremental` with no `unique_key` (transformation) | never. It appends every row its filter lets through. A row the filter lets through twice is appended twice, for example a row in the `lookback` window. |
+| `time_interval`, `microbatch` | never. A run deletes the window on `time_column` and inserts the model's rows. A row the model returns outside the window is inserted again on every run. Rocky runs a `microbatch` model as `time_interval`. |
+| `delete_insert` | never. It deletes and inserts in separate statements. It does not replace the whole table. |
+| `incremental` (replication) | never. A second run before the first records its watermark copies the same rows again. |
+| `snapshot`, `load` | never |
 | a `replication` pipeline with a `[[checks.custom]]` check | never. A replication run sends the check SQL to the warehouse as written. |
 | a `quality` pipeline | `rerun_safe` on every adapter. It only reads the warehouse. Not when `[checks.quarantine]` is on, or when the pipeline has a `[[checks.custom]]` check. |
 
-On Databricks, `merge`, `incremental` with a `unique_key` and `time_interval` are `not_rerun_safe` for now. Rocky has not proven what two overlapping writes do there. The message says "not proven under concurrent writers".
+For every `never` row, the message ends with "not provable from the generated SQL alone". Only a change to the generated SQL can make that write `rerun_safe`.
 
-"A DuckDB file" means a DuckDB adapter with no `[[adapter.NAME.attach]]`. Its `path` is a plain file path, `:memory:`, or not set. A `path` with a `:` in it, such as `md:prod` or `ducklake:meta.ducklake`, is not a DuckDB file. The exceptions are `:memory:` and a Windows drive letter such as `C:\`. Each scheduled run is a separate process, and only one process can open a DuckDB file to write. So two runs cannot overlap. That holds only while DuckDB enforces its file lock, as it does on a local disk. A network mount may not enforce it. A `path` with no `:` that points at a SQLite file is also treated as a DuckDB file.
+A model that reads its own target is `not_rerun_safe`, even as a `full_refresh`. Each run builds on the table the last run left. This includes a read through an `ephemeral` model, or through another model of the same pipeline that reads this model's target. Rocky finds the reads with its SQL parser. If the parser cannot read the model's SQL, the model is `not_rerun_safe`.
 
-The class judges the statements of a normal run. It does not cover the first-run bootstrap or the rebuild after schema drift.
+"A plain DuckDB target" is a DuckDB adapter with no `[[adapter.NAME.attach]]`. Its `path` is a plain file path, `:memory:`, or not set. A `path` with a `:` in it, such as `md:prod` or `ducklake:meta.ducklake`, is not plain. The exceptions are `:memory:` and a Windows drive letter such as `C:\`. On a target that is not plain, a `full_refresh` is `not_rerun_safe`: into an attached Iceberg catalog it is several statements.
+
+The class judges the statements of a normal run. It does not cover the first-run bootstrap or the rebuild after schema drift. It does not classify `[hook.*]` shell commands or webhooks. A hook that writes to the warehouse can make a `rerun_safe` pipeline unsafe to run twice.
 
 Other adapter types are `not_rerun_safe` for every write, except `ephemeral` and a `quality` pipeline as shown above.
 

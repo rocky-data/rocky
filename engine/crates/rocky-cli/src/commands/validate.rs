@@ -1346,7 +1346,7 @@ fn resolve_rerun_writes(
     use rocky_core::config::{
         PipelineConfig, RECOGNIZED_REPLICATION_STRATEGIES, ResolvedTableOverride,
     };
-    use rocky_core::rerun_safety::ResolvedWrites;
+    use rocky_core::rerun_safety::{ResolvedModel, ResolvedWrites};
 
     match pc {
         PipelineConfig::Replication(pipeline) => {
@@ -1405,10 +1405,7 @@ fn resolve_rerun_writes(
                 Ok(models) => ResolvedWrites::Models(
                     models
                         .iter()
-                        .map(|model| {
-                            let ir = model.to_model_ir();
-                            (ir.name.to_string(), ir.materialization)
-                        })
+                        .map(|model| ResolvedModel::from_ir(&model.to_model_ir()))
                         .collect(),
                 ),
                 Err(e) => ResolvedWrites::Unresolved {
@@ -6298,8 +6295,27 @@ auto_create_catalogs = false
 
     /// A transformation project on `adapter_type` with one scheduled pipeline
     /// whose single model uses `strategy` (a sidecar `[strategy]` body, or
-    /// empty for the full-refresh default).
+    /// empty for the full-refresh default) and the default SQL.
     fn scheduled_transformation(adapter_type: &str, strategy: &str) -> tempfile::TempDir {
+        // A time_interval or microbatch model must bound its rows with
+        // `@start_date` / `@end_date` (E024); other models read a source
+        // column straight through, so the incremental watermark filter has a
+        // column to land on (E046).
+        let sql = if strategy.contains("time_interval") || strategy.contains("microbatch") {
+            "SELECT id, ts FROM raw.orders WHERE ts >= @start_date AND ts < @end_date"
+        } else {
+            "SELECT id, ts FROM raw.orders"
+        };
+        scheduled_transformation_sql(adapter_type, strategy, sql)
+    }
+
+    /// [`scheduled_transformation`] with the model's SQL given. The model
+    /// writes `c.s.orders`.
+    fn scheduled_transformation_sql(
+        adapter_type: &str,
+        strategy: &str,
+        sql: &str,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("rocky.toml"),
@@ -6321,18 +6337,9 @@ auto_create_catalogs = false
             ),
         )
         .unwrap();
-        // A time_interval or microbatch model must bound its rows with
-        // `@start_date` / `@end_date` (E024); other models read a source
-        // column straight through, so the incremental watermark filter has a
-        // column to land on (E046).
-        let sql = if strategy.contains("time_interval") || strategy.contains("microbatch") {
-            "SELECT id, ts FROM raw.orders WHERE ts >= @start_date AND ts < @end_date"
-        } else {
-            "SELECT id, ts FROM raw.orders"
-        };
         std::fs::write(models.join("orders.sql"), sql).unwrap();
-        // Every positive `rerun_safe` assertion must sit on a model that
-        // compiles, so the fixture fails here if it would not run.
+        // Every V069 assertion must sit on a model that compiles, so the
+        // fixture fails here if it would not compile.
         let compiled = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
             models_dir: models,
             ..Default::default()
@@ -6398,7 +6405,10 @@ auto_create_catalogs = false
     }
 
     fn v069_message(adapter_type: &str, strategy: &str) -> String {
-        let dir = scheduled_transformation(adapter_type, strategy);
+        v069_message_for(&scheduled_transformation(adapter_type, strategy))
+    }
+
+    fn v069_message_for(dir: &tempfile::TempDir) -> String {
         let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
         let hits = v069(&out);
         assert_eq!(hits.len(), 1, "{:?}", out.messages);
@@ -6406,75 +6416,143 @@ auto_create_catalogs = false
     }
 
     /// The loader lowers a declared `microbatch` to `time_interval`, so the
-    /// class V069 prints for it is the time_interval class, on every adapter.
+    /// class V069 prints for it is the time_interval class. Neither is safe,
+    /// on a DuckDB file either: a row the model returns outside the window
+    /// is inserted again on every run.
     #[test]
-    fn a_loaded_microbatch_model_gets_the_time_interval_class() {
+    fn time_interval_and_microbatch_models_are_not_rerun_safe() {
         let microbatch = "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n";
         let interval =
             "[strategy]\ntype = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"hour\"\n";
         for adapter_type in ["duckdb", "databricks"] {
+            let message = v069_message(adapter_type, interval);
             assert_eq!(
                 v069_message(adapter_type, microbatch),
-                v069_message(adapter_type, interval),
+                message,
                 "{adapter_type}"
             );
+            assert!(
+                message
+                    .starts_with("pipeline.silver: not_rerun_safe (model 'orders': time_interval")
+                    && message.contains("outside the window"),
+                "{adapter_type}: {message}"
+            );
         }
-        assert_eq!(
-            v069_message("duckdb", microbatch),
-            "pipeline.silver: rerun_safe"
-        );
-        let databricks = v069_message("databricks", microbatch);
-        assert!(
-            databricks.contains("not_rerun_safe")
-                && databricks.contains("not proven under concurrent writers"),
-            "{databricks}"
-        );
     }
 
-    /// A keyless incremental model is never rerun-safe, on any adapter: with a
-    /// lookback it re-appends its window on every run, and with the
-    /// `@incremental_filter` placeholder or a `filter_column` a mis-specified
-    /// model re-appends rows even on a sequential run.
+    /// A merge on a DuckDB file is not safe: the join `t.k = s.k` never
+    /// matches a NULL key, so a NULL-key row is inserted again on every run.
     #[test]
-    fn a_loaded_keyless_lookback_model_is_not_rerun_safe_on_duckdb() {
-        let lookback = |amount: &str| {
-            format!(
-                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\
-                 lookback = \"{amount}\"\n"
-            )
-        };
-        let message = v069_message("duckdb", &lookback("3 days"));
+    fn a_merge_model_on_a_duckdb_file_is_not_rerun_safe() {
+        let message = v069_message(
+            "duckdb",
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n",
+        );
         assert!(
-            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': ")
-                && message.contains("lookback"),
+            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': merge")
+                && message.contains("NULL unique_key"),
             "{message}"
         );
-        let zero = v069_message("duckdb", &lookback("0 days"));
-        assert!(
-            zero.starts_with("pipeline.silver: not_rerun_safe (model 'orders': ")
-                && zero.contains("no unique_key"),
-            "{zero}"
-        );
     }
 
+    /// An incremental model is never rerun-safe on a DuckDB file, with or
+    /// without a unique_key or a lookback.
     #[test]
-    fn a_loaded_incremental_model_is_safe_only_with_a_key() {
-        let keyless = v069_message(
+    fn a_loaded_incremental_model_is_never_rerun_safe_on_duckdb() {
+        let base = "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n";
+        for (extra, hole) in [
+            ("", "no unique_key"),
+            ("lookback = \"0 days\"\n", "no unique_key"),
+            ("lookback = \"3 days\"\n", "lookback"),
+            ("unique_key = [\"id\"]\n", "NULL key"),
+            ("unique_key = [\"id\"]\nlookback = \"3 days\"\n", "NULL key"),
+        ] {
+            let message = v069_message("duckdb", &format!("{base}{extra}"));
+            assert!(
+                message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': incremental")
+                    && message.contains(hole),
+                "{extra:?}: {message}"
+            );
+        }
+    }
+
+    /// A full refresh that reads its own target builds on the previous run,
+    /// so it is not safe. The same model reading another schema's table of
+    /// that name is.
+    #[test]
+    fn a_full_refresh_model_that_reads_its_own_target_is_not_rerun_safe() {
+        let own = scheduled_transformation_sql(
             "duckdb",
-            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n",
+            "",
+            "SELECT id, ts FROM raw.orders UNION ALL SELECT id, ts FROM c.s.orders",
         );
+        let message = v069_message_for(&own);
         assert!(
-            keyless.starts_with("pipeline.silver: not_rerun_safe (model 'orders': ")
-                && keyless.contains("no unique_key"),
-            "{keyless}"
-        );
-        assert_eq!(
-            v069_message(
-                "duckdb",
-                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\
-                 unique_key = [\"id\"]\n",
+            message.starts_with(
+                "pipeline.silver: not_rerun_safe (model 'orders' reads its own output"
             ),
-            "pipeline.silver: rerun_safe"
+            "{message}"
+        );
+        let other = scheduled_transformation_sql("duckdb", "", "SELECT id, ts FROM raw.orders");
+        assert_eq!(v069_message_for(&other), "pipeline.silver: rerun_safe");
+    }
+
+    /// A scheduled full-refresh replication pipeline on DuckDB, with
+    /// `checks` appended to the pipeline.
+    fn scheduled_full_refresh_replication(checks: &str) -> String {
+        format!(
+            r#"
+[adapter.wh]
+type = "duckdb"
+path = "x.db"
+
+[pipeline.raw]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.raw.source]
+adapter = "wh"
+
+[pipeline.raw.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.raw.target]
+adapter = "wh"
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+
+[pipeline.raw.schedule]
+cron = "0 * * * *"
+
+{checks}
+"#
+        )
+    }
+
+    /// The custom-check guard, through the real `rocky validate` call site.
+    /// Without the check the same pipeline is safe, so the check is what
+    /// makes it not safe.
+    #[test]
+    fn a_replication_pipeline_with_a_custom_check_is_not_rerun_safe_in_validate() {
+        let plain = validate_toml(&scheduled_full_refresh_replication(""));
+        let hits = v069(&plain);
+        assert_eq!(hits.len(), 1, "{:?}", plain.messages);
+        assert_eq!(hits[0].message, "pipeline.raw: rerun_safe");
+
+        let checked = validate_toml(&scheduled_full_refresh_replication(
+            "[[pipeline.raw.checks.custom]]\nname = \"c\"\nsql = \"DELETE FROM t\"\n",
+        ));
+        let hits = v069(&checked);
+        assert_eq!(hits.len(), 1, "{:?}", checked.messages);
+        assert!(
+            hits[0]
+                .message
+                .starts_with("pipeline.raw: not_rerun_safe (")
+                && hits[0].message.contains("checks.custom"),
+            "{}",
+            hits[0].message
         );
     }
 
