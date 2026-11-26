@@ -39,7 +39,12 @@
 //! bounded: past [`SIGNAL_SETTLE_GRACE`] the listener exits 130 without the
 //! settle (crash parity, the pre-#1606 behaviour). The replication fan-out is
 //! the one exception; see [`RunCancel::hold_unbounded`]. A second signal of
-//! either kind exits 130 at once.
+//! either kind exits 130 without waiting for the settle.
+//!
+//! Both of those exits stop waiting on statements the warehouse still runs.
+//! Before it exits, the listener asks each adapter to cancel them
+//! ([`crate::statement_cancel`]), for at most
+//! [`CANCEL_ON_EXIT_BUDGET`](crate::statement_cancel::CANCEL_ON_EXIT_BUDGET).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -229,7 +234,12 @@ pub(crate) fn for_run() -> RunCancel {
     }
     let unbounded = Arc::new(AtomicUsize::new(0));
     let token = CancellationToken::new();
-    let listener = spawn_signal_listener(token.clone(), Arc::clone(&unbounded));
+    let listener = spawn_signal_listener(
+        token.clone(),
+        Arc::clone(&unbounded),
+        StopSignals::os(),
+        crate::statement_cancel::exit_process,
+    );
     RunCancel {
         token,
         unbounded,
@@ -239,37 +249,17 @@ pub(crate) fn for_run() -> RunCancel {
 
 /// Spawn the signal listener for a token this run owns.
 ///
-/// The streams are registered here, before the spawn, so a signal that lands
-/// before the task is first polled is latched rather than lost.
+/// The streams behind `signals` are registered before this call, so a signal
+/// that lands before the task is first polled is latched rather than lost.
 fn spawn_signal_listener(
     token: CancellationToken,
     unbounded: Arc<AtomicUsize>,
+    mut signals: StopSignals,
+    exit: crate::statement_cancel::ExitProcess,
 ) -> tokio::task::JoinHandle<()> {
-    #[cfg(unix)]
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-    #[cfg(unix)]
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-    #[cfg(windows)]
-    let mut stops = WindowsStopEvents::register(true);
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            tokio::select! {
-                Some(()) = recv_or_pending(sigint.as_mut()) => {}
-                Some(()) = recv_or_pending(sigterm.as_mut()) => {}
-                else => return,
-            }
-        }
-        #[cfg(windows)]
-        {
-            if stops.recv().await.is_none() {
-                return;
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+        if signals.recv().await.is_none() {
+            return;
         }
         eprintln!(
             "\n[rocky] shutdown signal received — finishing in-flight statements; press Ctrl-C \
@@ -279,23 +269,8 @@ fn spawn_signal_listener(
         // The first signal was consumed above, so only a later one resolves
         // this, of either kind.
         let second = async {
-            #[cfg(unix)]
-            {
-                tokio::select! {
-                    Some(()) = recv_or_pending(sigint.as_mut()) => {}
-                    Some(()) = recv_or_pending(sigterm.as_mut()) => {}
-                    else => std::future::pending::<()>().await,
-                }
-            }
-            #[cfg(windows)]
-            {
-                if stops.recv().await.is_none() {
-                    std::future::pending::<()>().await;
-                }
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
+            if signals.recv().await.is_none() {
+                std::future::pending::<()>().await;
             }
         };
         tokio::select! {
@@ -310,8 +285,87 @@ fn spawn_signal_listener(
                 );
             }
         }
-        std::process::exit(130);
+        // The run's futures are still alive here, so their statements are
+        // still listed. The first signal never reaches this: it drains.
+        crate::statement_cancel::cancel_before_exit("[rocky]").await;
+        exit(130);
     })
+}
+
+/// Where stop signals come from, injected like the exit function so a test
+/// can raise one without a real OS signal (which every listener in the
+/// process would see).
+pub(crate) struct StopSignals(StopSource);
+
+enum StopSource {
+    Os(OsStops),
+    #[cfg(test)]
+    Injected(tokio::sync::mpsc::UnboundedReceiver<()>),
+}
+
+impl StopSignals {
+    /// The process's real stop signals, registered now: SIGINT and SIGTERM on
+    /// Unix, the console events on Windows, Ctrl-C elsewhere.
+    pub(crate) fn os() -> Self {
+        Self(StopSource::Os(OsStops::register()))
+    }
+
+    /// Signals a test sends through the returned sender.
+    #[cfg(test)]
+    pub(crate) fn injected() -> (tokio::sync::mpsc::UnboundedSender<()>, Self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, Self(StopSource::Injected(rx)))
+    }
+
+    /// The next stop signal. `None` when no source is left to deliver one.
+    pub(crate) async fn recv(&mut self) -> Option<()> {
+        match &mut self.0 {
+            StopSource::Os(os) => os.recv().await,
+            #[cfg(test)]
+            StopSource::Injected(rx) => rx.recv().await,
+        }
+    }
+}
+
+struct OsStops {
+    #[cfg(unix)]
+    sigint: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    sigterm: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    stops: WindowsStopEvents,
+}
+
+impl OsStops {
+    fn register() -> Self {
+        Self {
+            #[cfg(unix)]
+            sigint: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok(),
+            #[cfg(unix)]
+            sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok(),
+            #[cfg(windows)]
+            stops: WindowsStopEvents::register(true),
+        }
+    }
+
+    async fn recv(&mut self) -> Option<()> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                Some(()) = recv_or_pending(self.sigint.as_mut()) => Some(()),
+                Some(()) = recv_or_pending(self.sigterm.as_mut()) => Some(()),
+                else => None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.stops.recv().await
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            tokio::signal::ctrl_c().await.ok()
+        }
+    }
 }
 
 /// The Windows console events that stop a run (#2440): Ctrl-C, Ctrl-Break,
@@ -495,5 +549,61 @@ mod tests {
         );
         tokio::time::sleep(GRACE * 2).await;
         assert!(deadline.is_finished(), "the grace then ends the wait");
+    }
+
+    static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    fn record_exit(code: i32) {
+        EXIT_CODE.store(code, Ordering::SeqCst);
+    }
+
+    /// The forced exit of `rocky run` (second signal): the listener cancels
+    /// what the tracked adapters still run, then exits 130. The test drives
+    /// the real listener with injected signals; only the signal source and
+    /// the process exit are replaced, so the cancel call and the exit both
+    /// have to be in the listener for this to pass.
+    #[tokio::test]
+    async fn a_second_signal_cancels_the_tracked_statements_then_exits_130() {
+        use crate::testing::{CancelAnswer, CancellableWarehouseAdapter, FORCED_EXIT_TESTS};
+        use rocky_core::statement_cancel::StatementHandle;
+        use rocky_core::traits::WarehouseAdapter;
+
+        let _serial = FORCED_EXIT_TESTS.lock().await;
+        let concrete = Arc::new(CancellableWarehouseAdapter::new(CancelAnswer::Accept));
+        let _guard = concrete
+            .in_flight
+            .register(StatementHandle::new("run-cancel-1"));
+        let adapter: Arc<dyn WarehouseAdapter> = concrete.clone();
+        crate::statement_cancel::track("run-cancel-test", &adapter);
+
+        let token = CancellationToken::new();
+        let (signal, signals) = StopSignals::injected();
+        let listener = spawn_signal_listener(
+            token.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            signals,
+            record_exit,
+        );
+        signal.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), token.cancelled())
+            .await
+            .expect("the first signal cancels the token");
+        assert_eq!(
+            EXIT_CODE.load(Ordering::SeqCst),
+            -1,
+            "the first signal drains"
+        );
+        assert!(concrete.cancelled.lock().unwrap().is_empty());
+
+        signal.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), listener)
+            .await
+            .expect("the second signal ends the listener")
+            .unwrap();
+        assert_eq!(EXIT_CODE.load(Ordering::SeqCst), 130);
+        assert_eq!(
+            *concrete.cancelled.lock().unwrap(),
+            [StatementHandle::new("run-cancel-1")]
+        );
     }
 }

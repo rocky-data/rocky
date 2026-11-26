@@ -5,13 +5,11 @@ sidebar:
   order: 8
 ---
 
-The ClickHouse adapter is **Beta**. It talks to the server's HTTP interface. It is tested live against ClickHouse 26.10, and it needs ClickHouse 23.6 or later. Rocky logs a warning when you register it.
+The ClickHouse adapter is **Beta**. It talks to the server's HTTP interface, needs ClickHouse 23.6 or later, and is tested live against 26.10. Rocky logs a warning when you register it.
 
-ClickHouse has no transactions and no `MERGE` statement. Rocky runs the strategies it can run safely and refuses the rest at compile time. The table in [Strategies](#strategies) shows which is which.
+ClickHouse has no transactions and no `MERGE`. Rocky runs the strategies it can run safely and refuses the rest at compile time (see [Strategies](#strategies)).
 
 ## Fields
-
-The adapter reads the shared `[adapter]` fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -21,7 +19,7 @@ The adapter reads the shared `[adapter]` fields:
 | `password` | string | No | Password. |
 | `timeout_secs` | integer | No | Per-statement timeout, also sent to the server as `max_execution_time`. Default `300`. |
 
-Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses a key it does not know, so a typo fails loudly:
+Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses an unknown key. `rocky validate` runs the same parse the adapter runs, so a bad field or key shows up there first.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -40,17 +38,13 @@ password = "${CLICKHOUSE_PASSWORD}"
 secure = true
 ```
 
-`rocky validate` runs the same parse the adapter runs, so a bad field or an unknown `extra` key shows up there first.
-
 ## Authentication and TLS
 
-Rocky sends the user and password in the `X-ClickHouse-User` and `X-ClickHouse-Key` headers. It never puts them in the URL, which proxies and server logs record.
-
-With `secure = true`, Rocky connects over HTTPS and checks the certificate chain and the host name. It trusts the operating system's certificate store plus `ca_cert`. There is no mode that skips the check.
+Rocky sends the user and password in the `X-ClickHouse-User` and `X-ClickHouse-Key` headers, never in the URL. With `secure = true`, Rocky connects over HTTPS and checks the certificate chain and host name against the operating system's store plus `ca_cert`. No mode skips the check.
 
 ## Names: databases, not catalogs
 
-ClickHouse names a table `database.table`. A Rocky **schema** is a ClickHouse **database**, and there is no catalog level. Set the model's `catalog` to the empty string:
+ClickHouse names a table `database.table`. A Rocky **schema** is a ClickHouse **database**, with no catalog level. Set the model's `catalog` to the empty string:
 
 ```toml
 # models/_defaults.toml
@@ -59,13 +53,11 @@ catalog = ""         # ClickHouse has no catalog level
 schema = "marts"     # the ClickHouse database
 ```
 
-A non-empty `catalog` is refused. Rocky does not ignore it, because two models that differ only by catalog would then write the same table. With `auto_create_schemas = true`, Rocky runs `CREATE DATABASE IF NOT EXISTS`.
-
-ClickHouse names are case-sensitive: `orders` and `Orders` are two tables. Rocky writes every name without quotes. A name must start with a letter or `_`.
+A non-empty `catalog` is refused, because two models that differ only by catalog would write the same table. With `auto_create_schemas = true`, Rocky runs `CREATE DATABASE IF NOT EXISTS`. Names are case-sensitive (`orders` and `Orders` are two tables), are written without quotes, and must start with a letter or `_`.
 
 ## Strategies
 
-This table lists every strategy and how Rocky runs it on ClickHouse:
+Every strategy on ClickHouse:
 
 | Strategy | On ClickHouse |
 |----------|---------------|
@@ -79,17 +71,11 @@ This table lists every strategy and how Rocky runs it on ClickHouse:
 | `materialized_view` | Refused. A ClickHouse materialized view is an insert trigger over new rows. It is not a refreshed query result. |
 | User-defined functions | Refused, `E051`. |
 
-Rocky reports `E053` at compile time when a pipeline that loads the model targets ClickHouse. Another adapter in `rocky.toml` that no pipeline targets does not change this. A model that no pipeline loads is judged against every pipeline's target.
+Rocky reports `E053` when a pipeline that loads the model targets ClickHouse. An adapter that no pipeline targets does not change this. A model that no pipeline loads is judged against every pipeline's target.
 
 ### Why Rocky refuses `merge`
 
-ClickHouse cannot update a row by key in one statement. A `ReplacingMergeTree` table removes duplicate keys only during background merges. Until a merge runs, a reader sees both the old and the new row. Rocky does not emulate `merge` with it, because the result would be wrong for a while after every run.
-
-Use one of these instead:
-
-- `delete_insert` with `partition_by = ["<key>"]` to replace rows by key.
-- `incremental` without `unique_key` to append.
-- `full_refresh` to rebuild.
+ClickHouse cannot update a row by key in one statement. A `ReplacingMergeTree` removes duplicate keys only during background merges, so a reader sees both rows until one runs. Rocky does not emulate `merge` with it. Use `delete_insert` with `partition_by = ["<key>"]` to replace rows by key, `incremental` without `unique_key` to append, or `full_refresh` to rebuild.
 
 ### What "not atomic" means
 
@@ -107,9 +93,7 @@ time_interval, one window:
 
 `delete_insert` runs its `DELETE` with the model's `SELECT` as a subquery, so a broken `SELECT` also fails before the delete.
 
-Each window gets its own staging table, named `<table>__rocky_stage_<hash>`, because `rocky run` writes several windows at once. If a run stops before the last step, the staging table stays until that window runs again.
-
-A failure after the `DELETE` leaves the window, or the keys, empty. Run the model again to repair it. Readers can see the window empty for the moment between the `DELETE` and the `INSERT`.
+Each window gets its own staging table, `<table>__rocky_stage_<hash>`, because `rocky run` writes several windows at once. A run that stops before the last step leaves the staging table until that window runs again. A failure after the `DELETE` leaves the window, or the keys, empty: run the model again. Readers can see the window empty between the `DELETE` and the `INSERT`.
 
 ### Time windows on a `Date` column
 
@@ -162,7 +146,7 @@ Another adapter refuses a model that sets `[clickhouse]`, at SQL generation. It 
 
 ## Session settings
 
-Rocky sends these settings with every statement. They make ClickHouse behave the way the rest of Rocky expects:
+Rocky sends these settings with every statement:
 
 | Setting | Why |
 |---------|-----|
@@ -172,11 +156,11 @@ Rocky sends these settings with every statement. They make ClickHouse behave the
 | `wait_end_of_query = 1` | An error arrives as an HTTP error, never after a partial result. |
 | `mutations_sync = 2` | A mutation returns after it is applied. |
 
-`join_use_nulls = 1` changes results for SQL that relied on ClickHouse's default of filling unmatched columns with default values. Wrap such a column in `coalesce(col, 0)` to keep the old result.
+`join_use_nulls = 1` changes results for SQL that relied on ClickHouse filling unmatched columns with defaults. Wrap such a column in `coalesce(col, 0)` to keep the old result.
 
 ## Types
 
-Rocky reads column types from `system.columns`. It peels `Nullable(…)` into the column's nullability and drops `LowCardinality(…)`, which is a storage encoding. It reports each type with a name that is valid ClickHouse DDL and that Rocky's type checker reads:
+Rocky reads column types from `system.columns`. It peels `Nullable(...)` into nullability and drops `LowCardinality(...)`, a storage encoding. Each type is reported with a valid ClickHouse DDL name:
 
 | ClickHouse | Reported as | Rocky type |
 |------------|-------------|------------|
@@ -191,15 +175,11 @@ Rocky reads column types from `system.columns`. It peels `Nullable(…)` into th
 
 Other types keep their ClickHouse name and are unknown to the type checker: unsigned and 128/256-bit integers, `FixedString`, `Date32`, `UUID`, `Enum`, `Array`, `Map`, `Tuple` and `JSON`. An unknown type is never an error. A contract on such a column reports "not checked".
 
-A column added by drift (or by `on_schema_change = "append_new_columns"`) is added as `Nullable(T)`, so rows that predate it read `NULL`, not `''` or `0`. Types ClickHouse cannot wrap in `Nullable` (`Array`, `Map`, `Tuple`, `Variant`, …) are added as they are.
+A column added by drift (or `on_schema_change = "append_new_columns"`) is added as `Nullable(T)`, so older rows read `NULL`. Types ClickHouse cannot wrap in `Nullable` (`Array`, `Map`, `Tuple`, `Variant`, ...) are added as they are.
 
 `MAX` over no rows returns the type's default in ClickHouse (`1970-01-01 00:00:00` for a `DateTime`). Freshness checks and watermark reads use `maxOrNull`, so an empty table reads as empty, not as fresh in 1970.
 
 When a source column's type changes, Rocky rebuilds the target table. It does not run `ALTER TABLE … MODIFY COLUMN`, because the reported type has no `Nullable` wrapper and the change could drop a column's nullability.
-
-## Compile-time checks
-
-`rocky compile` has no ClickHouse-specific operand rules for `E042` / `E043`. On a ClickHouse project it uses the conservative default: an operand is refused only when every warehouse Rocky knows refuses it.
 
 ## Not supported yet
 
@@ -207,6 +187,7 @@ When a source column's type changes, Rocky rebuilds the target table. It does no
 - Engine parameters, such as `ReplacingMergeTree(version)`, and `PRIMARY KEY`, `SAMPLE BY`, `TTL` or `SETTINGS` clauses.
 - Governance (grants, tags), checksum-bisection `rocky compare`, and ClickHouse as a discovery source.
 - The native TCP protocol. Rocky uses HTTP only.
+- ClickHouse-specific `E042` / `E043` operand rules. Rocky uses the conservative default: an operand is refused only when every warehouse Rocky knows refuses it.
 
 ## See also
 

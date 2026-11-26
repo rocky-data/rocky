@@ -5,9 +5,7 @@ sidebar:
   order: 9
 ---
 
-The Spark adapter is **Beta**. It talks to a Spark Connect server over gRPC, so Rocky needs no JVM. It is tested live against Spark 4.0.1 with Delta Lake 4.0.0. Rocky logs a warning when you register it.
-
-Use it for an open-source Spark cluster. For Databricks, use the [Databricks adapter](/reference/adapters/databricks/): it adds Unity Catalog governance and Databricks-only SQL.
+The Spark adapter is **Beta**. It talks to a Spark Connect server over gRPC, so Rocky needs no JVM. It is tested live against Spark 4.0.1 with Delta Lake 4.0.0. Rocky logs a warning when you register it. For Databricks, use the [Databricks adapter](/reference/adapters/databricks/) (Unity Catalog governance, Databricks-only SQL).
 
 ## Requirements
 
@@ -28,8 +26,6 @@ docker run -d --rm -p 15002:15002 -e SPARK_NO_DAEMONIZE=1 apache/spark:4.0.1 \
 
 ## Fields
 
-The adapter reads the shared `[adapter]` fields:
-
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `host` | string | Yes | `host`, `host:port` or `sc://host[:port]`. The default port is `15002`. Connection-string parameters (`sc://host/;token=…`) are refused: use the fields below. |
@@ -37,7 +33,7 @@ The adapter reads the shared `[adapter]` fields:
 | `username` | string | No | The Spark Connect user id, shown in the Spark UI. Default `rocky`. |
 | `timeout_secs` | integer | No | Per-statement timeout. Default `300`. When it expires, Rocky stops waiting but does not cancel the statement: the server may still be running it. Rocky does not retry it. |
 
-Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses a key it does not know, so a typo fails loudly:
+Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses an unknown key. `rocky validate` runs the same parse the adapter runs, so a bad field or key shows up there first.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -55,15 +51,13 @@ token = "${SPARK_CONNECT_TOKEN}"
 table_format = "delta"
 ```
 
-`rocky validate` runs the same parse the adapter runs, so a bad field or an unknown `extra` key shows up there first.
-
 ## Names and table format
 
 Spark names a table `catalog.schema.table`. The session catalog is `spark_catalog`; another catalog is whatever the server configures as `spark.sql.catalog.<name>`. Rocky cannot create a catalog, so leave `auto_create_catalogs` off. `auto_create_schemas = true` runs `CREATE SCHEMA IF NOT EXISTS catalog.schema`.
 
 Before its first statement, Rocky runs `SET spark.sql.sources.default = delta` (or `iceberg`) in its session. So every `CREATE TABLE` Rocky renders makes a table of that format. That includes models, snapshots, seeds and branch copies. A full refresh also says `USING delta` (or `USING iceberg`) itself.
 
-Rocky sends back the server's session id on every call. If the server replaced the session (it expired, or the server restarted), Spark 4.0 refuses the call. So a statement never runs in a fresh session that lacks the format setting.
+Rocky sends the server's session id on every call. If the server replaced the session (it expired, or restarted), Spark 4.0 refuses the call, so a statement never runs in a fresh session that lacks the format setting.
 
 Identifiers are quoted with backticks. String literals use Spark's default backslash escapes: Rocky writes `\'` and `\\`.
 
@@ -90,7 +84,7 @@ Schema drift never alters a column type in place on Spark. A type change rebuild
 
 ## Testing
 
-`cargo test -p rocky-spark --features spark-conformance -- --ignored` runs the live harness in `engine/crates/rocky-spark/tests/conformance.rs` against the server above. It proves the string-literal round trip, every strategy's SQL (snapshots with `invalidate` and `new_record` hard deletes included), `DESCRIBE TABLE`, the view/table probe, Arrow fetch and the checksum query.
+`cargo test -p rocky-spark --features spark-conformance -- --ignored` runs the live harness in `engine/crates/rocky-spark/tests/conformance.rs` against the server above.
 
 ## See also
 

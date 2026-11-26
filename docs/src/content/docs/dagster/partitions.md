@@ -32,18 +32,9 @@ definitions and once on every run:
                              "2026-04-08T13" ──► rocky run --partition <key>
 ```
 
-`RockyComponent` can do both steps for you, but not by default. Both
-`surface_derived_models` and `dag_mode` default to `False`. Turn either
-one on. The component then groups assets by partitioning shape, and
-threads each Dagster partition key into a fused
-`rocky run --partition <key>`.
+`RockyComponent` does both steps when you set `surface_derived_models` or `dag_mode` (both default to `False`). It groups assets by partitioning shape and threads each Dagster partition key into `rocky run --partition <key>`. `dag_mode` reads partition shape from `rocky dag` output, not from `rocky compile`.
 
-The diagram above traces the compile-driven path. `dag_mode` takes a
-different route to the same builders. It reads each node's partition
-shape from `rocky dag` output, not from `rocky compile`.
-
-Reach for the standalone helpers below when you build partitioned assets
-by hand.
+Use the standalone helpers below when you build partitioned assets by hand.
 
 ## Strategy mapping
 
@@ -145,41 +136,4 @@ args = partition_range_args("2026-04-01", "2026-04-08")
 # ["--from", "2026-04-01", "--to", "2026-04-08"]
 ```
 
-Both return `[]` when their inputs are `None`. A caller can therefore
-splat them into the CLI argument list without checking first.
-
-## End-to-end example
-
-```python
-import dagster as dg
-from dagster_rocky import (
-    RockyResource,
-    partitions_def_for_model_detail,
-    dagster_to_rocky_partition_key,
-)
-
-rocky = RockyResource(config_path="rocky.toml", models_dir="models")
-compile_result = rocky.compile()
-
-# Find the time_interval model
-fct_daily_orders = next(
-    m for m in compile_result.models_detail if m.name == "fct_daily_orders"
-)
-pdef = partitions_def_for_model_detail(fct_daily_orders)
-assert pdef is not None  # it's a DailyPartitionsDefinition
-
-@dg.asset(
-    key=dg.AssetKey(["fct_daily_orders"]),
-    partitions_def=pdef,
-)
-def fct_daily_orders_asset(
-    context: dg.AssetExecutionContext,
-    rocky: RockyResource,
-):
-    rocky_key = dagster_to_rocky_partition_key("day", context.partition_key)
-    result = rocky.run(
-        filter="layer=marts",
-        partition=rocky_key,   # threads through to `rocky run --partition <key>`
-    )
-    return result.tables_copied
-```
+Both return `[]` when their inputs are `None`, so you can splat them into the argument list.

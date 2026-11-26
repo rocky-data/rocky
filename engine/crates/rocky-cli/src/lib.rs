@@ -14,6 +14,7 @@ pub(crate) mod scope;
 pub mod secret_filter;
 pub mod selection;
 pub(crate) mod source_schemas;
+pub(crate) mod statement_cancel;
 pub mod ui;
 
 /// Test-only warehouse doubles. Compiled only under `cfg(test)`, so a released

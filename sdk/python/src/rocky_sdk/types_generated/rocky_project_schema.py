@@ -4407,7 +4407,7 @@ class TransformationPipelineConfig(BaseModel):
         validate_default=True,
     )
     """
-    Data quality checks run after model execution.
+    Data quality checks. A transformation run does not execute them, and `rocky validate` warns (V034) about each one that is set.
     """
     depends_on: list[str] | None = []
     """

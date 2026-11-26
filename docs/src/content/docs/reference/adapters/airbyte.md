@@ -5,7 +5,7 @@ sidebar:
   order: 11
 ---
 
-The Airbyte source adapter calls the Airbyte API (`{host}/v1/...`) to list connections and their streams. It reads **metadata**. Rocky never moves data through this adapter. By default it never starts a sync either. Rocky may start a sync only when two opt-ins are set: `allow_sync_trigger = true` on the adapter (the owner of the token) and `trigger = true` on the pipeline. See [Start a sync](#start-a-sync).
+The Airbyte source adapter calls the Airbyte API (`{host}/v1/...`) to list connections and their streams. It reads **metadata**. Rocky never moves data through it, and never starts a sync unless two opt-ins are set: `allow_sync_trigger = true` on the adapter (the owner of the token) and `trigger = true` on the pipeline. See [Start a sync](#start-a-sync).
 
 ## Fields
 
@@ -51,7 +51,7 @@ A `reset` or `clear` job never sets `succeeded_at` or `failed_at`. It is not the
 
 A `deprecated` connection is deleted in Airbyte. Rocky leaves it out: discovery never returns it, so the run never reads it.
 
-Why `lastUpdatedAt`: Airbyte sets it when a job changes state. For a job that ended, that is the time it ended. `startTime` is not an end. A job that ended with no `lastUpdatedAt` gives no end time, so it never counts as the end of Rocky's sync, and the wait fails closed. A `lastUpdatedAt` that is not RFC 3339 fails the read: Rocky never guesses a time.
+`lastUpdatedAt` is the end time: Airbyte sets it when a job changes state, and `startTime` is not an end. A job that ended with no `lastUpdatedAt` gives no end time, so the wait fails closed. A `lastUpdatedAt` that is not RFC 3339 fails the read: Rocky never guesses a time.
 
 Only the newest 25 jobs are read. A connection whose last success is older than that has no `succeeded_at`. That is safe: a sync that ends during the wait still sets a new one.
 
@@ -61,10 +61,6 @@ With both opt-ins set, `rocky run` starts a sync on each selected connection bef
 
 ```toml
 [adapter.airbyte]
-type = "airbyte"
-kind = "discovery"
-host = "https://api.airbyte.com"
-token = "${AIRBYTE_TOKEN}"
 allow_sync_trigger = true            # the token owner's opt-in
 
 [pipeline.bronze.source.discovery.sync]

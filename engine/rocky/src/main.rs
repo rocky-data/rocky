@@ -1342,6 +1342,15 @@ enum Command {
         #[arg(long, value_enum, value_name = "MODE")]
         tests: Option<TestsModeArg>,
 
+        /// Batch each built model's default-config `unique` tests into one
+        /// query, and its `not_null` tests into another, when it has at
+        /// least two of that type. A test with `severity = "warning"`, a
+        /// `filter` or a `composite` test still runs alone. If a batch query fails, its tests
+        /// rerun one by one. The per-test results are the same; only the
+        /// number of queries changes. Off by default.
+        #[arg(long)]
+        batch_tests: bool,
+
         /// Disable content-addressed reuse for this invocation, even when
         /// `[reuse]` is enabled in config.
         ///
@@ -2124,6 +2133,14 @@ enum Command {
         /// pipeline's declarative tests.
         #[arg(long)]
         pipeline: Option<String>,
+        /// With `--declarative`: batch each model's default-config `unique`
+        /// tests into one query, and its `not_null` tests into another, when
+        /// it has at least two of that type. A test with
+        /// `severity = "warning"`, a `filter` or a `composite` test still runs alone. If a batch query
+        /// fails, its tests rerun one by one. The per-test results are the
+        /// same; only the number of queries changes. Off by default.
+        #[arg(long, requires = "declarative")]
+        batch_tests: bool,
         /// Per-run variable substituted into model SQL (repeatable). Resolves
         /// `@var(name)` markers to the supplied value so a required-`@var`
         /// model type-checks under `rocky test`, mirroring `rocky compile
@@ -2131,6 +2148,12 @@ enum Command {
         /// and no inline default is a compile error.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+        /// Refuse each fixture `[[test]]` whose model's target warehouse is
+        /// not DuckDB alone (another warehouse, several, or none resolved),
+        /// instead of running it on DuckDB. A refused test fails the run.
+        /// Without it, such a test runs on DuckDB and its result says so.
+        #[arg(long, conflicts_with = "declarative")]
+        strict_dialect: bool,
     },
 
     /// Run CI pipeline: compile + test without warehouse credentials
@@ -4751,6 +4774,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             skip_unchanged,
             force_rebuild,
             tests,
+            batch_tests,
             no_reuse,
             no_prune,
             no_sync_trigger,
@@ -5015,6 +5039,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 no_sync_trigger,
                 no_source_sync: false,
                 tests_on_run: tests.map(Into::into),
+                batch_tests,
             };
             // Who is running (RV4-P1): stamped on the drift auto-apply
             // custody rows. Resolved here, once, for all three run shapes.
@@ -5719,7 +5744,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             selection,
             declarative,
             pipeline,
+            batch_tests,
             var,
+            strict_dialect,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -5737,6 +5764,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     model_scope(models.as_deref()),
                     pipeline.as_deref(),
                     model.as_deref(),
+                    rocky_cli::commands::TestBatching::from_flag(batch_tests),
                     json,
                 )
                 .await
@@ -5754,6 +5782,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     json,
                     &run_vars,
                     selection.as_ref().map(|s| (s, &state_ctx)),
+                    strict_dialect,
                 )
             }
         }

@@ -202,6 +202,11 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
             for msg in schedule_messages(name, pc, &cfg) {
                 out.push(msg);
             }
+
+            // V069: whether the scheduler may run this pipeline a second time.
+            if let Some(msg) = rerun_safety_message(name, pc, &cfg, config_path) {
+                out.push(msg);
+            }
         }
 
         // Validate pipeline dependency graph (depends_on)
@@ -1293,6 +1298,129 @@ fn inert_config_messages(
     }
 
     msgs
+}
+
+/// **V069** — the rerun-safety class of a scheduled pipeline: `rerun_safe`, or
+/// `not_rerun_safe` with the reason. Informational (`ok`): it never fails
+/// validation. Pipelines without a `[schedule]` block get no message.
+fn rerun_safety_message(
+    name: &str,
+    pc: &rocky_core::config::PipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+) -> Option<ValidateMessage> {
+    use rocky_core::hooks::HookRegistry;
+    use rocky_core::rerun_safety::{RerunSafety, TargetWarehouse, classify_pipeline, with_hooks};
+
+    pc.schedule()?;
+    let target = TargetWarehouse::from_adapter(cfg.adapters.get(pc.target_adapter()));
+    let writes = resolve_rerun_writes(pc, cfg, config_path);
+    let class = with_hooks(
+        classify_pipeline(pc, &target, &writes),
+        HookRegistry::from_config(&cfg.hooks).total_hook_count(),
+    );
+    let message = match &class {
+        RerunSafety::Safe => format!("pipeline.{name}: {}", class.class_name()),
+        RerunSafety::NotSafe { reason } => {
+            format!("pipeline.{name}: {} ({reason})", class.class_name())
+        }
+    };
+    Some(ValidateMessage {
+        severity: "ok".into(),
+        code: "V069".into(),
+        message,
+        file: None,
+        field: Some(format!("pipeline.{name}.schedule")),
+    })
+}
+
+/// What a transformation pipeline builds, for [`rerun_safety_message`]: the
+/// models of this pipeline's own `models` glob, with the project functions
+/// each calls and whether it sets `[governance.tags]`. Every other pipeline
+/// type resolves nothing: the classifier needs no more than its config.
+///
+/// This loads the models a second time. `validate_inner` loads them once more
+/// after the pipeline loop, but it flattens and deduplicates every pipeline's
+/// selection into one list, so it cannot tell which models belong to which
+/// pipeline. Reusing it would need a per-pipeline load there first.
+fn resolve_rerun_writes(
+    pc: &rocky_core::config::PipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+) -> rocky_core::rerun_safety::ResolvedWrites {
+    use rocky_core::config::PipelineConfig;
+    use rocky_core::rerun_safety::{ResolvedModel, ResolvedWrites};
+
+    match pc {
+        PipelineConfig::Transformation(pipeline) => {
+            let dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path) {
+                Ok(crate::models_loader::ModelsDir::Present(dir)) => dir,
+                Ok(crate::models_loader::ModelsDir::Absent(_)) => {
+                    return ResolvedWrites::Unresolved {
+                        reason: "the models directory is missing".to_string(),
+                    };
+                }
+                Err(e) => {
+                    return ResolvedWrites::Unresolved {
+                        reason: format!("the models directory cannot be read: {e:#}"),
+                    };
+                }
+            };
+            let glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
+            match crate::models_loader::load_project_models_matching(
+                &dir,
+                &glob,
+                Some(&cfg.freshness),
+            ) {
+                Ok(mut models) => {
+                    // A run substitutes `@var()` into each model's SQL before
+                    // it finds the functions the model calls, so a call written
+                    // as `@var(f, name)(x)` is hidden from the raw text. Apply
+                    // the substitution of a run with no `--var` (the inline
+                    // defaults), which is what the scheduler starts. A variable it cannot resolve means the scan
+                    // cannot see the SQL a run executes, so fail closed.
+                    let diagnostics = rocky_compiler::compile::substitute_run_vars_into_models(
+                        &mut models,
+                        &rocky_core::run_vars::RunVars::new(),
+                    );
+                    if let Some(model) = models.iter().find(|m| {
+                        m.sql.contains("@var(")
+                            || diagnostics.iter().any(|d| d.model == m.config.name)
+                    }) {
+                        return ResolvedWrites::Unresolved {
+                            reason: format!(
+                                "model '{}' leaves an `@var(` in its SQL that the run does not substitute (a required var with no default, or one inside a comment); V069 cannot see what it hides",
+                                model.config.name
+                            ),
+                        };
+                    }
+                    let (functions, _) = rocky_compiler::udf::load_for_models_dir(&dir);
+                    ResolvedWrites::Models(
+                        models
+                            .iter()
+                            .map(|model| ResolvedModel {
+                                name: model.config.name.clone(),
+                                strategy: model.to_model_ir().materialization,
+                                calls_functions: rocky_compiler::udf::model_calls(
+                                    &model.sql, &functions,
+                                )
+                                .into_iter()
+                                .collect(),
+                                has_governance_tags: !model.config.governance.tags.is_empty(),
+                            })
+                            .collect(),
+                    )
+                }
+                Err(e) => ResolvedWrites::Unresolved {
+                    reason: format!("the models cannot be loaded: {e:#}"),
+                },
+            }
+        }
+        PipelineConfig::Replication(_)
+        | PipelineConfig::Quality(_)
+        | PipelineConfig::Snapshot(_)
+        | PipelineConfig::Load(_) => ResolvedWrites::NotNeeded,
+    }
 }
 
 /// Validation for a pipeline's optional `[schedule]` block (native demand
@@ -6167,5 +6295,433 @@ auto_create_catalogs = false
             "{:?}",
             out.messages
         );
+    }
+
+    /// A transformation project on `adapter_type` with one scheduled pipeline
+    /// whose single model uses `strategy` (a sidecar `[strategy]` body, or
+    /// empty for the full-refresh default) and the default SQL.
+    fn scheduled_transformation(adapter_type: &str, strategy: &str) -> tempfile::TempDir {
+        // A time_interval or microbatch model must bound its rows with
+        // `@start_date` / `@end_date` (E024); other models read a source
+        // column straight through, so the incremental watermark filter has a
+        // column to land on (E046).
+        let sql = if strategy.contains("time_interval") || strategy.contains("microbatch") {
+            "SELECT id, ts FROM raw.orders WHERE ts >= @start_date AND ts < @end_date"
+        } else {
+            "SELECT id, ts FROM raw.orders"
+        };
+        scheduled_transformation_sql(adapter_type, strategy, sql)
+    }
+
+    /// [`scheduled_transformation`] with the model's SQL given. The model
+    /// writes `c.s.orders`.
+    fn scheduled_transformation_sql(
+        adapter_type: &str,
+        strategy: &str,
+        sql: &str,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rocky.toml"),
+            format!(
+                "[adapter]\ntype = \"{adapter_type}\"\npath = \"wh.duckdb\"\n\n\
+                 [pipeline.silver]\ntype = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\n\
+                 [pipeline.silver.schedule]\ncron = \"0 * * * *\"\n"
+            ),
+        )
+        .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            format!(
+                "name = \"orders\"\n[target]\ncatalog = \"c\"\nschema = \"s\"\n\
+                 table = \"orders\"\n{strategy}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(models.join("orders.sql"), sql).unwrap();
+        // Every V069 assertion must sit on a model that compiles, so the
+        // fixture fails here if it would not compile.
+        let compiled = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: models,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !compiled.has_errors,
+            "the fixture model must compile: {:?}",
+            compiled.diagnostics
+        );
+        dir
+    }
+
+    fn v069(out: &ValidateOutput) -> Vec<&ValidateMessage> {
+        out.messages.iter().filter(|m| m.code == "V069").collect()
+    }
+
+    fn v069_message(adapter_type: &str, strategy: &str) -> String {
+        v069_message_for(&scheduled_transformation(adapter_type, strategy))
+    }
+
+    fn v069_message_for(dir: &tempfile::TempDir) -> String {
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert_eq!(hits[0].severity, "ok");
+        hits[0].message.clone()
+    }
+
+    const EPHEMERAL: &str = "[strategy]\ntype = \"ephemeral\"\n";
+
+    #[test]
+    fn an_ephemeral_only_pipeline_is_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert_eq!(hits[0].severity, "ok");
+        assert_eq!(hits[0].message, "pipeline.silver: rerun_safe");
+        assert_eq!(hits[0].field.as_deref(), Some("pipeline.silver.schedule"));
+    }
+
+    /// A full refresh is a write, so it is not safe on any adapter: it can
+    /// read another model of its pipeline and mix two runs' inputs.
+    #[test]
+    fn a_full_refresh_model_is_not_rerun_safe() {
+        for adapter_type in ["duckdb", "databricks"] {
+            let message = v069_message(adapter_type, "");
+            assert!(
+                message
+                    .starts_with("pipeline.silver: not_rerun_safe (model 'orders': full_refresh")
+                    && message.contains("lineage cannot prove no self-read"),
+                "{adapter_type}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delete_insert_model_on_databricks_is_not_rerun_safe() {
+        let message = v069_message(
+            "databricks",
+            "[strategy]\ntype = \"delete_insert\"\npartition_by = [\"id\"]\n",
+        );
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': delete_insert"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_scheduled_replication_pipeline_is_not_rerun_safe() {
+        let out = validate_toml(&trigger_toml(
+            "",
+            "",
+            "[pipeline.raw.schedule]\ncron = \"0 * * * *\"",
+        ));
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert!(
+            hits[0]
+                .message
+                .starts_with("pipeline.raw: not_rerun_safe (a replication pipeline writes"),
+            "{}",
+            hits[0].message
+        );
+    }
+
+    /// The loader lowers a declared `microbatch` to `time_interval`, so the
+    /// class V069 prints for it is the time_interval class.
+    #[test]
+    fn time_interval_and_microbatch_models_are_not_rerun_safe() {
+        let microbatch = "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n";
+        let interval =
+            "[strategy]\ntype = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"hour\"\n";
+        let message = v069_message("duckdb", interval);
+        assert_eq!(v069_message("duckdb", microbatch), message);
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': time_interval")
+                && message.contains("a row outside the window"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn merge_and_incremental_models_are_not_rerun_safe() {
+        let merge = v069_message(
+            "duckdb",
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n",
+        );
+        assert!(
+            merge.starts_with("pipeline.silver: not_rerun_safe (model 'orders': merge")
+                && merge.contains("a NULL key re-inserts on every run"),
+            "{merge}"
+        );
+        let base = "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n";
+        for extra in ["", "lookback = \"3 days\"\n", "unique_key = [\"id\"]\n"] {
+            let message = v069_message("duckdb", &format!("{base}{extra}"));
+            assert!(
+                message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': incremental")
+                    && message.contains("a lookback or a filter on another column"),
+                "{extra:?}: {message}"
+            );
+        }
+    }
+
+    /// A scheduled quality pipeline on DuckDB, with `checks` appended.
+    fn scheduled_quality(checks: &str) -> String {
+        format!(
+            r#"
+[adapter.wh]
+type = "duckdb"
+path = "x.db"
+
+[pipeline.q]
+type = "quality"
+
+[pipeline.q.target]
+adapter = "wh"
+
+[pipeline.q.schedule]
+cron = "0 * * * *"
+
+[pipeline.q.checks]
+enabled = true
+{checks}
+"#
+        )
+    }
+
+    fn v069_toml(toml: &str) -> String {
+        let out = validate_toml(toml);
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        hits[0].message.clone()
+    }
+
+    #[test]
+    fn a_quality_pipeline_is_safe_unless_it_quarantines_or_runs_custom_sql() {
+        assert_eq!(v069_toml(&scheduled_quality("")), "pipeline.q: rerun_safe");
+        let quarantine = v069_toml(&scheduled_quality(
+            "[pipeline.q.checks.quarantine]\nenabled = true\nmode = \"split\"\n",
+        ));
+        assert!(
+            quarantine.starts_with("pipeline.q: not_rerun_safe (quarantine"),
+            "{quarantine}"
+        );
+        let custom = v069_toml(&scheduled_quality(
+            "[[pipeline.q.checks.custom]]\nname = \"c\"\nsql = \"SELECT 1\"\n",
+        ));
+        assert!(
+            custom.starts_with("pipeline.q: not_rerun_safe (a [[checks.custom]] check"),
+            "{custom}"
+        );
+    }
+
+    /// A scheduled full-refresh replication pipeline on DuckDB, with
+    /// `checks` appended to the pipeline.
+    fn scheduled_full_refresh_replication(checks: &str) -> String {
+        format!(
+            r#"
+[adapter.wh]
+type = "duckdb"
+path = "x.db"
+
+[pipeline.raw]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.raw.source]
+adapter = "wh"
+
+[pipeline.raw.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.raw.target]
+adapter = "wh"
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+
+[pipeline.raw.schedule]
+cron = "0 * * * *"
+
+{checks}
+"#
+        )
+    }
+
+    /// The replication reason names the custom check SQL only when the
+    /// pipeline has one, through the real `rocky validate` call site.
+    #[test]
+    fn a_replication_pipeline_with_a_custom_check_names_it_in_validate() {
+        let plain = v069_toml(&scheduled_full_refresh_replication(""));
+        assert!(
+            plain.starts_with("pipeline.raw: not_rerun_safe (") && !plain.contains("checks.custom"),
+            "{plain}"
+        );
+        let checked = v069_toml(&scheduled_full_refresh_replication(
+            "[[pipeline.raw.checks.custom]]\nname = \"c\"\nsql = \"DELETE FROM t\"\n",
+        ));
+        assert!(
+            checked.starts_with("pipeline.raw: not_rerun_safe (")
+                && checked.contains("checks.custom"),
+            "{checked}"
+        );
+    }
+
+    /// A `[hook.*]` shell command can write anything, so it makes an
+    /// otherwise safe pipeline not safe. So does a webhook: a `generic`
+    /// one can POST to a warehouse SQL API.
+    #[test]
+    fn a_shell_hook_makes_a_safe_pipeline_not_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        let path = dir.path().join("rocky.toml");
+        let base = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(v069_message_for(&dir), "pipeline.silver: rerun_safe");
+
+        std::fs::write(
+            &path,
+            format!("{base}\n[hook.on_pipeline_complete]\ncommand = \"./notify.sh\"\n"),
+        )
+        .unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (a [hook.*] shell command"),
+            "{message}"
+        );
+
+        for webhook in [
+            "[hook.webhooks.on_pipeline_complete]\nurl = \"https://example.com/h\"\n",
+            "[hook.webhooks.on_pipeline_complete]\nurl = \"https://example.com/sql\"\npreset = \"generic\"\nbody_template = \"{}\"\n",
+        ] {
+            std::fs::write(&path, format!("{base}\n{webhook}")).unwrap();
+            let message = v069_message_for(&dir);
+            assert!(
+                message.starts_with(
+                    "pipeline.silver: not_rerun_safe (a [hook.*] shell command or webhook"
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    /// A run creates the project functions an ephemeral model calls, and
+    /// tags every model, so neither is a pipeline that writes nothing.
+    #[test]
+    fn an_ephemeral_model_with_a_function_or_tags_is_not_rerun_safe() {
+        let tagged = scheduled_transformation(
+            "duckdb",
+            &format!("{EPHEMERAL}\n[governance.tags]\ndomain = \"finance\"\n"),
+        );
+        let message = v069_message_for(&tagged);
+        assert!(
+            message.starts_with(
+                "pipeline.silver: not_rerun_safe (model 'orders' sets [governance.tags]"
+            ),
+            "{message}"
+        );
+
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        assert_eq!(v069_message_for(&dir), "pipeline.silver: rerun_safe");
+        std::fs::write(
+            dir.path().join("models").join("orders.sql"),
+            "SELECT id, cents_to_dollars(id) AS d FROM raw.orders",
+        )
+        .unwrap();
+        let functions = dir.path().join("functions");
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("cents_to_dollars.toml"),
+            "returns = \"DOUBLE\"\n[[arguments]]\nname = \"cents\"\ntype = \"BIGINT\"\n",
+        )
+        .unwrap();
+        std::fs::write(functions.join("cents_to_dollars.sql"), "cents / 100.0").unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.contains("calls the project function 'cents_to_dollars'"),
+            "{message}"
+        );
+    }
+
+    /// A run substitutes `@var()` before it finds the functions a model calls,
+    /// so a call written through an inline-default `@var` is still a call. A
+    /// variable with no default hides the SQL, so it fails closed.
+    #[test]
+    fn a_function_call_behind_a_var_is_not_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        let functions = dir.path().join("functions");
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("cents_to_dollars.toml"),
+            "returns = \"DOUBLE\"\n[[arguments]]\nname = \"cents\"\ntype = \"BIGINT\"\n",
+        )
+        .unwrap();
+        std::fs::write(functions.join("cents_to_dollars.sql"), "cents / 100.0").unwrap();
+        let model = dir.path().join("models").join("orders.sql");
+
+        std::fs::write(
+            &model,
+            "SELECT @var(f, cents_to_dollars)(id) AS d FROM raw.orders",
+        )
+        .unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.contains("calls the project function 'cents_to_dollars'"),
+            "{message}"
+        );
+
+        std::fs::write(&model, "SELECT @var(f)(id) AS d FROM raw.orders").unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (")
+                && message.contains("leaves an `@var(` in its SQL"),
+            "{message}"
+        );
+    }
+
+    /// A run skips `@var(` inside a SQL comment, so the text stays in the SQL.
+    /// The leftover check must class that model not safe, with a reason that
+    /// is true for a comment too.
+    #[test]
+    fn a_var_left_in_a_sql_comment_is_not_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        let model = dir.path().join("models").join("orders.sql");
+        std::fs::write(
+            &model,
+            "-- @var(f, cents_to_dollars)(id)\nSELECT id FROM raw.orders",
+        )
+        .unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (")
+                && message.contains("leaves an `@var(` in its SQL")
+                && message.contains("or one inside a comment"),
+            "{message}"
+        );
+    }
+
+    /// The V069 call site, like the classifier, must name every variant: a
+    /// catch-all arm would class a new pipeline type or write without a
+    /// compile error.
+    #[test]
+    fn the_rerun_safety_call_site_has_no_catch_all_arm() {
+        const SOURCE: &str = include_str!("validate.rs");
+        let start = SOURCE
+            .find("fn rerun_safety_message(")
+            .expect("the V069 builder is present");
+        let len = SOURCE[start..]
+            .find("/// Validation for a pipeline's optional `[schedule]` block")
+            .expect("the V069 builders end before the schedule validation");
+        let arms = rocky_core::rerun_safety::catch_all_match_arms(&SOURCE[start..start + len]);
+        assert!(arms.is_empty(), "a catch-all match arm crept in: {arms:#?}");
+    }
+
+    #[test]
+    fn an_unscheduled_pipeline_gets_no_rerun_safety_message() {
+        let out = validate_toml(&trigger_toml("", "", ""));
+        assert!(v069(&out).is_empty(), "{:?}", out.messages);
     }
 }

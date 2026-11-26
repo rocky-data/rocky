@@ -64,6 +64,7 @@ pub mod quarantine;
 pub mod recipe_identity;
 pub mod redacted;
 pub mod replace;
+pub mod rerun_safety;
 pub mod retention;
 pub mod retry;
 pub mod retry_budget;
@@ -86,6 +87,7 @@ pub mod source_sync;
 pub mod sql_gen;
 pub mod state;
 pub mod state_sync;
+pub mod statement_cancel;
 pub mod table_publish;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_harness;

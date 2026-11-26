@@ -15,6 +15,7 @@ use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use rocky_core::config::RetryConfig;
 use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::retry::compute_backoff;
+use rocky_core::statement_cancel::{InFlightStatements, StatementHandle};
 use rocky_core::traits::AdapterError;
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
@@ -179,6 +180,10 @@ pub struct SnowflakeConnector {
     /// Shared retry budget across the run (§P2.7). Unbounded by default —
     /// set via `config.retry.max_retries_per_run`.
     retry_budget: rocky_core::retry_budget::RetryBudget,
+    /// The statements this connector waits on now (clones share it). Each
+    /// statement is listed from the submit response until it reaches a
+    /// terminal state or the client stops waiting.
+    in_flight: InFlightStatements,
     /// Override for the base URL (used by tests to point at wiremock).
     #[cfg(any(test, feature = "test-support"))]
     base_url_override: Option<String>,
@@ -202,6 +207,7 @@ impl SnowflakeConnector {
                 .unwrap_or_else(|_| Client::new()),
             circuit_breaker,
             retry_budget,
+            in_flight: InFlightStatements::new(),
             #[cfg(any(test, feature = "test-support"))]
             base_url_override: None,
         }
@@ -213,6 +219,20 @@ impl SnowflakeConnector {
     pub fn with_retry_budget(mut self, budget: rocky_core::retry_budget::RetryBudget) -> Self {
         self.retry_budget = budget;
         self
+    }
+
+    /// Record in-flight statements in `in_flight` instead of a list of this
+    /// connector's own. Give every connector of one adapter the same list, so
+    /// the adapter can name a statement sent through any of them.
+    #[must_use]
+    pub fn with_in_flight(mut self, in_flight: InFlightStatements) -> Self {
+        self.in_flight = in_flight;
+        self
+    }
+
+    /// The statements this connector waits on now.
+    pub fn in_flight(&self) -> &InFlightStatements {
+        &self.in_flight
     }
 
     /// Compute warehouse name from the connector config.
@@ -509,6 +529,13 @@ impl SnowflakeConnector {
 
         // Poll until complete
         let handle = &response.statement_handle;
+        // Listed until this function returns, on every path, so a forced
+        // exit can cancel it. Before the submit returns there is no handle:
+        // a statement Snowflake still runs synchronously (up to 45 s) cannot
+        // be cancelled.
+        let _in_flight = self
+            .in_flight
+            .register(StatementHandle::new(handle.clone()));
         let poll_url = format!("{}/{}", self.base_url(), handle);
         let deadline = tokio::time::Instant::now() + self.config.timeout;
         let backoff_steps = [100, 200, 500, 1000, 2000];

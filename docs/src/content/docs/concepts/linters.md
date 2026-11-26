@@ -5,9 +5,7 @@ sidebar:
   order: 7.6
 ---
 
-Rocky ships two built-in lints. Each catches a way SQL breaks silently: SQL that only runs on one warehouse dialect, and a `SELECT *` whose schema a downstream model actually consumes.
-
-Both run as part of `rocky compile`. Both also appear as inline diagnostics in the VS Code extension, over the language server.
+Rocky ships two built-in lints. Each catches a silent break: SQL that only runs on one warehouse dialect, and a `SELECT *` whose schema a downstream model consumes. Both run in `rocky compile` and appear as inline diagnostics in the VS Code extension.
 
 | Code | Severity | What it catches | Enabled |
 |---|---|---|---|
@@ -18,17 +16,15 @@ Both run as part of `rocky compile`. Both also appear as inline diagnostics in t
 
 ## Semantic lints, not style lints
 
-A SQL style linter such as SQLFluff checks the text of a query: indentation, alias conventions, ambiguous references, unused columns. [`rocky lint`](/reference/commands/modeling/#rocky-lint) covers a small set of these rules, such as bare joins and unqualified columns. It is not a full SQLFluff replacement. Run a style linter alongside Rocky if you want more.
+A style linter such as SQLFluff checks the text of one query. [`rocky lint`](/reference/commands/modeling/#rocky-lint) covers a small set of those rules (bare joins, unqualified columns) and is not a SQLFluff replacement. P001 and P002 are **semantic**: they read the compiled model graph. P001 knows a construct will not run on your target warehouse. P002 knows a `SELECT *` will pass an upstream schema change to a named downstream consumer. A well-formatted query can fail both.
 
-Rocky's lints answer a different question. P001 and P002 are **semantic**. They read the compiled model graph, not one query in isolation, so they see breakage a style linter cannot. P001 knows a construct will not run on your target warehouse. P002 knows a `SELECT *` will pass an upstream schema change straight through to a named downstream consumer. A query can be perfectly formatted and still fail both.
-
-These compile-time lints are the first of three layers. The other two run at execution time: [data-quality checks](/concepts/data-quality-checks/) and [schema-drift detection](/concepts/schema-drift/) confirm that a model's real output still matches what it declared.
+These compile-time lints are the first of three layers. The other two run at execution time: [data-quality checks](/concepts/data-quality-checks/) and [schema-drift detection](/concepts/schema-drift/).
 
 ---
 
 ## P001 — dialect portability
 
-P001 rejects a SQL construct that does not exist on the warehouse dialect you chose. Detection reads the parsed SQL, not the text: a sqlparser visitor walks each model, checking constructs against the same catalog that backs Rocky's SQL transpiler.
+P001 rejects a SQL construct that does not exist on the dialect you chose. A sqlparser visitor walks each model and checks constructs against the catalog behind Rocky's SQL transpiler.
 
 ### Covered constructs
 
@@ -48,24 +44,18 @@ P001 rejects a SQL construct that does not exist on the warehouse dialect you ch
 | `SELECT * REPLACE (... AS col)` | DuckDB, Snowflake, BigQuery |
 | `FLATTEN` | Snowflake |
 
-The catalog is deliberately conservative. Anything not in it is assumed portable. Expect the odd non-portable construct to slip through. Do not expect portable SQL to be flagged.
+The catalog is conservative: anything not in it is assumed portable. Expect the odd non-portable construct to slip through, not portable SQL to be flagged.
 
 ### How to enable
 
-Either pass `--target-dialect <dbx|sf|bq|duckdb>` on the command line:
-
-```bash
-rocky compile --target-dialect bq
-```
-
-Or declare the target once in `rocky.toml`:
+Pass `--target-dialect <dbx|sf|bq|duckdb>` (`rocky compile --target-dialect bq`), or set it once in `rocky.toml`:
 
 ```toml
 [portability]
 target_dialect = "bigquery"
 ```
 
-When both are set, the CLI flag wins. See [`[portability]`](/reference/configuration/#portability) for the full configuration.
+The CLI flag wins when both are set. See [`[portability]`](/reference/configuration/#portability).
 
 ### Example diagnostic
 
@@ -80,45 +70,15 @@ When both are set, the CLI flag wins. See [`[portability]`](/reference/configura
 }
 ```
 
-Every P001 diagnostic names the construct, the supported dialects, and a one-line suggestion of the portable replacement.
-
 ---
 
 ## P002 — blast-radius `SELECT *`
 
 P002 warns when a model uses `SELECT *` **and** at least one downstream model names specific columns of its output. The blast radius is the set of downstream models a change would reach.
 
-A leaf model with `SELECT *` is **not** flagged. Nothing names its columns, so an upstream schema change cannot leak past it unseen.
+A leaf model with `SELECT *` is **not** flagged: nothing names its columns.
 
-### What it protects against
-
-```sql
--- models/stg_orders.sql
-SELECT * FROM raw__orders.orders
-```
-
-```sql
--- models/fct_revenue.sql
-SELECT order_id, total_amount  -- explicit column reference
-FROM stg_orders
-```
-
-Now drop `total_amount` from the source:
-
-```
-  raw__orders.orders        stg_orders          fct_revenue
-  ┌────────────────┐      ┌────────────┐      ┌───────────────┐
-  │ order_id       │─────►│ SELECT *   │─────►│ SELECT        │
-  │ total_amount ✗ │      │            │      │  order_id,    │
-  │ status         │      │ compiles   │      │  total_amount │
-  └────────────────┘      │ fine: it   │      │               │
-     column dropped       │ names no   │      │ BREAKS at run │
-                          │ columns    │      │ time          │
-                          └────────────┘      └───────────────┘
-
-  P002 fires on stg_orders and names fct_revenue as the consumer
-  that makes the radius concrete.
-```
+Example: `stg_orders` is `SELECT * FROM raw__orders.orders` and `fct_revenue` is `SELECT order_id, total_amount FROM stg_orders`. Drop `total_amount` from the source: `stg_orders` still compiles, and `fct_revenue` breaks at run time. P002 fires on `stg_orders` and names `fct_revenue` as the consumer.
 
 ### Example diagnostic
 
@@ -137,7 +97,7 @@ The diagnostic lists at most 3 columns per consumer, so a wide schema stays read
 
 ### Always on
 
-P002 runs on every `rocky compile` and `rocky ci` invocation. No flag, no config. It reads the semantic graph (`ModelSchema::has_star` plus `column_consumers`) rather than re-parsing the SQL, so it costs one pass over a graph that is already compiled.
+P002 runs on every `rocky compile` and `rocky ci`, with no flag or config. It reads the semantic graph (`ModelSchema::has_star` plus `column_consumers`), not the SQL.
 
 ---
 
@@ -157,7 +117,7 @@ Labels are case-insensitive and match `PortabilityIssue::construct`, for example
 
 ### Per-model `-- rocky-allow:` pragma
 
-For a one-off exemption, put a pragma anywhere a line comment is legal in the model's SQL. A pragma is a directive Rocky reads out of a SQL comment:
+For a one-off exemption, put a pragma (a directive Rocky reads from a SQL line comment) in the model's SQL:
 
 ```sql
 -- rocky-allow: NVL, QUALIFY
@@ -166,12 +126,7 @@ FROM t
 QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY ts DESC) = 1
 ```
 
-A pragma:
-
-- Accepts a comma-separated list of construct labels.
-- Is case-insensitive. `nvl`, `NVL`, and `Nvl` all work.
-- Applies only to the model whose SQL contains it. Rocky never hoists it to the project.
-- Is ignored when the label matches no known construct, so a new lint later does not force you to clean up stale pragmas.
+A pragma takes a comma-separated list of case-insensitive construct labels. It applies only to its own model, never the project. It is ignored when a label matches no known construct, so a new lint does not force you to clean up stale pragmas.
 
 Prefer the pragma over widening `[portability] allow`. The pragma sits next to the expression it exempts, which makes the decision reviewable in the diff.
 
@@ -183,13 +138,7 @@ You cannot yet silence a P002 warning per model. The shared `pragma` parser is i
 
 ## Reading diagnostics
 
-Both lints emit the same [diagnostic](/reference/glossary/) envelope as every other compiler check, so anything that reads `CompileOutput.diagnostics` handles them the same way:
-
-- The CLI's text output renders them with miette spans pointing at `models/<name>.sql`.
-- `rocky compile --output json` includes them in the `diagnostics` array.
-- The VS Code extension shows them as inline squiggles, over the language server.
-
-A P001 diagnostic is an error. It fails `rocky compile` and `rocky ci`. A P002 diagnostic is a warning. It appears in the output but does not fail the run.
+Both lints emit the same [diagnostic](/reference/glossary/) envelope as every compiler check: miette spans in text output, the `diagnostics` array in `rocky compile --output json`, and inline squiggles in VS Code. A P001 diagnostic is an error and fails `rocky compile` and `rocky ci`. A P002 diagnostic is a warning and does not fail the run.
 
 ## Related
 
