@@ -1565,4 +1565,67 @@ kind = "discovery"
             "Replace `<discovery-adapter-name>` with an adapter configured for discovery."
         ));
     }
+
+    /// A statement registered through the side connector (the one that
+    /// drives batch checks, and discovery for Databricks) must be listed by
+    /// the warehouse adapter and be reachable from a forced exit. Each
+    /// assertion fails if the matching `with_in_flight` or the `track` loop
+    /// is removed.
+    #[test]
+    fn statements_on_either_connector_reach_the_adapter_and_the_forced_exit_list() {
+        use rocky_core::statement_cancel::StatementHandle;
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let dbx = format!("dbx-{suffix}");
+        let snow = format!("snow-{suffix}");
+        let cfg: RockyConfig = toml::from_str(&format!(
+            r#"
+[adapter.{dbx}]
+type = "databricks"
+host = "example.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc123"
+token = "dapi-test"
+
+[adapter.{snow}]
+type = "snowflake"
+account = "xy12345"
+warehouse = "WH"
+username = "u"
+password = "p"
+"#
+        ))
+        .unwrap();
+        let registry = AdapterRegistry::from_config(&cfg).expect("registry builds offline");
+
+        let _dbx_guard = registry
+            .databricks_connector(&dbx)
+            .unwrap()
+            .in_flight()
+            .register(StatementHandle::new("dbx-1"));
+        let _snow_guard = registry
+            .snowflake_connectors
+            .get(&snow)
+            .expect("snowflake side connector")
+            .in_flight()
+            .register(StatementHandle::new("snow-1"));
+
+        assert_eq!(
+            registry
+                .warehouse_adapter(&dbx)
+                .unwrap()
+                .in_flight_statements(),
+            [StatementHandle::new("dbx-1")]
+        );
+        assert_eq!(
+            registry
+                .warehouse_adapter(&snow)
+                .unwrap()
+                .in_flight_statements(),
+            [StatementHandle::new("snow-1")]
+        );
+
+        let tracked = crate::statement_cancel::tracked_statements();
+        assert!(tracked.contains(&(dbx, StatementHandle::new("dbx-1"))));
+        assert!(tracked.contains(&(snow, StatementHandle::new("snow-1"))));
+    }
 }

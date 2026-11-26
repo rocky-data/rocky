@@ -4163,6 +4163,7 @@ dependencies = [
  "hostname",
  "include_dir",
  "indexmap",
+ "libc",
  "miette",
  "notify",
  "object_store",

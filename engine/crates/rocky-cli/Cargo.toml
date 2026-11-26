@@ -68,6 +68,8 @@ async-trait = { workspace = true }
 include_dir = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Raises SIGINT at the test process, to drive the forced-exit signal paths.
+libc = { workspace = true }
 async-trait = { workspace = true }
 # Turns on rocky-core's remote-state test rig (fault store, cross-pod
 # harness, provider-override seam) for THIS crate's test targets only — the

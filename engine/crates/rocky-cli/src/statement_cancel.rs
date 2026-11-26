@@ -1,10 +1,20 @@
 //! Cancel the warehouse statements a forced exit would leave running.
 //!
-//! `rocky run` drains in-flight statements on the first signal. It stops
-//! waiting on them only on a forced exit: a second signal, or the settle grace
-//! has passed (`run_cancel`), or the `--watch` loop drops a stalled iteration
+//! `rocky run` drains in-flight statements on the first signal. A forced exit
+//! stops waiting on them: a second signal, or the settle grace has passed
+//! (`run_cancel`), or the `--watch` loop drops a stalled iteration
 //! (`run_watch`). A warehouse keeps running a statement whose client went
-//! away, so on that path Rocky asks each adapter to cancel what it still runs.
+//! away, so on those paths Rocky asks each adapter to cancel what it still
+//! runs.
+//!
+//! Only those forced-exit paths cancel today. Three other ways of abandoning
+//! a statement do not yet: `join_set.abort_all()` in `run.rs` (a fan-out
+//! abort drops the futures that wait on their statements), a client timeout,
+//! and a poll error that returns early from the Databricks and Snowflake
+//! connectors. Each of them leaves the statement running on the warehouse.
+//! Cancelling on them is follow-up work. Only the Databricks and Snowflake
+//! adapters list statements; every other adapter lists none, so nothing is
+//! cancelled and nothing is printed for it.
 //!
 //! ```text
 //!   AdapterRegistry::from_config ──▶ track(name, adapter)     (weak reference)
@@ -61,6 +71,22 @@ pub(crate) fn track(name: &str, adapter: &Arc<dyn WarehouseAdapter>) {
     TRACKED.track(name, adapter);
 }
 
+/// Every statement the tracked adapters list now, with the adapter's name.
+/// What a forced exit would try to cancel.
+#[cfg(test)]
+pub(crate) fn tracked_statements() -> Vec<(String, StatementHandle)> {
+    TRACKED
+        .live()
+        .into_iter()
+        .flat_map(|(name, adapter)| {
+            adapter
+                .in_flight_statements()
+                .into_iter()
+                .map(move |handle| (name.clone(), handle))
+        })
+        .collect()
+}
+
 /// What became of one cancel request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CancelResult {
@@ -81,6 +107,15 @@ pub(crate) struct StatementCancel {
     pub(crate) adapter: String,
     pub(crate) handle: StatementHandle,
     pub(crate) result: CancelResult,
+}
+
+/// How the process ends on a forced exit. A plain `fn`, so a test can pass
+/// one that records the call instead of ending the test process.
+pub(crate) type ExitProcess = fn(i32);
+
+/// End the process with `code`.
+pub(crate) fn exit_process(code: i32) {
+    std::process::exit(code)
 }
 
 /// Cancel every statement a tracked adapter still waits on, print one line
@@ -165,68 +200,10 @@ fn report(prefix: &str, cancel: &StatementCancel) {
 mod tests {
     use super::*;
 
-    use async_trait::async_trait;
-    use rocky_core::statement_cancel::InFlightStatements;
-    use rocky_core::traits::{AdapterError, AdapterResult, QueryResult, SqlDialect};
-    use rocky_ir::{ColumnInfo, TableRef};
-
-    use crate::testing::RecordingWarehouseAdapter;
-
-    #[derive(Clone, Copy)]
-    enum Answer {
-        Accept,
-        Fail,
-        Hang,
-    }
-
-    /// Lists what its [`InFlightStatements`] holds and records each cancel.
-    struct Cancellable {
-        inner: RecordingWarehouseAdapter,
-        in_flight: InFlightStatements,
-        answer: Answer,
-        cancelled: Mutex<Vec<StatementHandle>>,
-    }
-
-    impl Cancellable {
-        fn new(answer: Answer) -> Self {
-            Self {
-                inner: RecordingWarehouseAdapter::new(&format!(
-                    "statement-cancel-{}",
-                    uuid::Uuid::new_v4()
-                )),
-                in_flight: InFlightStatements::new(),
-                answer,
-                cancelled: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl WarehouseAdapter for Cancellable {
-        fn dialect(&self) -> &dyn SqlDialect {
-            self.inner.dialect()
-        }
-        async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
-            self.inner.execute_statement(sql).await
-        }
-        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
-            self.inner.execute_query(sql).await
-        }
-        async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
-            self.inner.describe_table(table).await
-        }
-        fn in_flight_statements(&self) -> Vec<StatementHandle> {
-            self.in_flight.snapshot()
-        }
-        async fn cancel_statement(&self, handle: &StatementHandle) -> AdapterResult<CancelOutcome> {
-            self.cancelled.lock().unwrap().push(handle.clone());
-            match self.answer {
-                Answer::Accept => Ok(CancelOutcome::Requested),
-                Answer::Fail => Err(AdapterError::msg("cancel refused")),
-                Answer::Hang => std::future::pending().await,
-            }
-        }
-    }
+    use crate::testing::{
+        CancelAnswer as Answer, CancellableWarehouseAdapter as Cancellable,
+        RecordingWarehouseAdapter,
+    };
 
     fn handles(names: &[&str]) -> Vec<StatementHandle> {
         names.iter().map(|n| StatementHandle::new(*n)).collect()

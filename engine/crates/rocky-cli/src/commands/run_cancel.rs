@@ -234,7 +234,11 @@ pub(crate) fn for_run() -> RunCancel {
     }
     let unbounded = Arc::new(AtomicUsize::new(0));
     let token = CancellationToken::new();
-    let listener = spawn_signal_listener(token.clone(), Arc::clone(&unbounded));
+    let listener = spawn_signal_listener(
+        token.clone(),
+        Arc::clone(&unbounded),
+        crate::statement_cancel::exit_process,
+    );
     RunCancel {
         token,
         unbounded,
@@ -249,6 +253,7 @@ pub(crate) fn for_run() -> RunCancel {
 fn spawn_signal_listener(
     token: CancellationToken,
     unbounded: Arc<AtomicUsize>,
+    exit: crate::statement_cancel::ExitProcess,
 ) -> tokio::task::JoinHandle<()> {
     #[cfg(unix)]
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
@@ -318,7 +323,7 @@ fn spawn_signal_listener(
         // The run's futures are still alive here, so their statements are
         // still listed. The first signal never reaches this: it drains.
         crate::statement_cancel::cancel_before_exit("[rocky]").await;
-        std::process::exit(130);
+        exit(130);
     })
 }
 
@@ -503,5 +508,59 @@ mod tests {
         );
         tokio::time::sleep(GRACE * 2).await;
         assert!(deadline.is_finished(), "the grace then ends the wait");
+    }
+
+    static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    fn record_exit(code: i32) {
+        EXIT_CODE.store(code, Ordering::SeqCst);
+    }
+
+    /// The forced exit of `rocky run` (second signal): the listener cancels
+    /// what the tracked adapters still run, then exits 130. The test drives
+    /// the real listener with real signals; only the process exit is
+    /// replaced, so the cancel call and the exit both have to be in the
+    /// listener for this to pass.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_signal_cancels_the_tracked_statements_then_exits_130() {
+        use crate::testing::{
+            CancelAnswer, CancellableWarehouseAdapter, SIGNAL_TESTS, raise_sigint,
+        };
+        use rocky_core::statement_cancel::StatementHandle;
+        use rocky_core::traits::WarehouseAdapter;
+
+        let _serial = SIGNAL_TESTS.lock().await;
+        let concrete = Arc::new(CancellableWarehouseAdapter::new(CancelAnswer::Accept));
+        let _guard = concrete
+            .in_flight
+            .register(StatementHandle::new("run-cancel-1"));
+        let adapter: Arc<dyn WarehouseAdapter> = concrete.clone();
+        crate::statement_cancel::track("run-cancel-test", &adapter);
+
+        let token = CancellationToken::new();
+        let listener =
+            spawn_signal_listener(token.clone(), Arc::new(AtomicUsize::new(0)), record_exit);
+        raise_sigint();
+        tokio::time::timeout(Duration::from_secs(5), token.cancelled())
+            .await
+            .expect("the first signal cancels the token");
+        assert_eq!(
+            EXIT_CODE.load(Ordering::SeqCst),
+            -1,
+            "the first signal drains"
+        );
+        assert!(concrete.cancelled.lock().unwrap().is_empty());
+
+        raise_sigint();
+        tokio::time::timeout(Duration::from_secs(5), listener)
+            .await
+            .expect("the second signal ends the listener")
+            .unwrap();
+        assert_eq!(EXIT_CODE.load(Ordering::SeqCst), 130);
+        assert_eq!(
+            *concrete.cancelled.lock().unwrap(),
+            [StatementHandle::new("run-cancel-1")]
+        );
     }
 }
