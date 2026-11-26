@@ -659,10 +659,32 @@ rocky test [flags]
 | `--declarative` | `bool` | `false` | Run the `[[tests]]` of model sidecars against the warehouse instead of DuckDB. |
 | `--pipeline <NAME>` | `string` | | With `--declarative`: run the tests of the models in `--models` against this pipeline's warehouse. Without it and without `--models`, every transformation pipeline runs its own models' tests against its own warehouse. |
 | `--batch-tests` | `bool` | `false` | With `--declarative` only. A model's default-config `unique` tests share one query, and its `not_null` tests share another, when it has two or more of that type. A test with `severity = "warning"` or a `filter` runs alone. A failing shared query costs one extra query. A shared query that fails reruns its tests one by one. The results are the same; only their `sql` changes. |
+| `--strict-dialect` | `bool` | `false` | Refuse each fixture `[[test]]` whose model does not target DuckDB alone, instead of running it on DuckDB. A refused test fails the run. Not with `--declarative`. |
 
 `rocky test` runs `data/seed.sql` first, when the project has one, and types its compile from the tables the seed made. The models then run on those tables. So a contract type mismatch (`E011`) or a column the seed lacks (`W041`) is reported before any model runs.
 
 With a `rocky.toml`, the compile also runs the per-model-target checks of [`rocky ci`](#rocky-ci) (`E042`/`E043`, `E057`, `E044`, `E049`, `E051`, `E053` and `E054`). An error from them fails `rocky test` before any model runs.
+
+### Unit tests on a warehouse that is not DuckDB
+
+Fixture `[[test]]` blocks always run on DuckDB. SQL that both DuckDB and your warehouse accept can still give a different result on the warehouse, so a local pass does not prove the model there.
+
+Rocky reads each model's target warehouse from `rocky.toml`: the adapter of each pipeline that loads the model, as `rocky compile` resolves it. A model whose only target is DuckDB gets no notice, and its output is unchanged. Every other unit test is marked:
+
+| Target | JSON `dialect.status` | Default | `--strict-dialect` |
+|---|---|---|---|
+| DuckDB only | (no `dialect` key) | runs | runs |
+| One other warehouse, such as Snowflake | `non_duckdb_target` | runs, marked | refused |
+| More than one warehouse | `multiple_targets` | runs, marked | refused |
+| None resolved (no `rocky.toml`, or no warehouse adapter) | `unresolved_target` | runs, marked | refused |
+
+Rocky never takes an unresolved target as DuckDB. In table output each marked test is listed with its target, after one `warning:` line:
+
+```text
+  Unit tests: 1 passed, 0 failed
+  warning: 1 unit test(s) ran on DuckDB, not on their target warehouse (target: Snowflake); SQL both accept can behave differently there. --strict-dialect refuses them
+  ✓ flagged::keeps_high [ran on DuckDB, target Snowflake]
+```
 
 ### Examples
 

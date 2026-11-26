@@ -28183,9 +28183,81 @@
         ],
         "type": "object"
       },
+      "UnitTestDialect": {
+        "description": "How the dialect a unit test ran on relates to the model's target warehouse.\n\n`rocky test` runs every unit test on an in-memory DuckDB. SQL that both DuckDB and the target accept can still behave differently on the target, so a pass here does not prove the model on its warehouse.",
+        "properties": {
+          "ran_on_duckdb": {
+            "description": "`true` once the model's SQL was sent to DuckDB, even if DuckDB rejected it. `false` when the test failed before that: a refusal by `--strict-dialect`, a compile failure, a dependency cycle, or a fixture, function or database setup failure.",
+            "type": "boolean"
+          },
+          "refused": {
+            "description": "`true` when `--strict-dialect` refused the test instead of running it.",
+            "type": "boolean"
+          },
+          "status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UnitTestDialectStatus"
+              }
+            ],
+            "description": "Why the test carries this notice."
+          },
+          "targets": {
+            "description": "The model's target warehouses, by dialect name (`Snowflake`) or, for an adapter with no dialect table, by adapter type (`clickhouse`). Empty when no target is known.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ran_on_duckdb",
+          "refused",
+          "status",
+          "targets"
+        ],
+        "type": "object"
+      },
+      "UnitTestDialectStatus": {
+        "description": "Why a unit test carries a [`UnitTestDialect`] notice.",
+        "oneOf": [
+          {
+            "description": "The model has one target warehouse, and it is not DuckDB.",
+            "enum": [
+              "non_duckdb_target"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "No target warehouse is configured for the model (no `rocky.toml`, or no warehouse adapter). Rocky does not assume DuckDB.",
+            "enum": [
+              "unresolved_target"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The model can run on more than one warehouse.",
+            "enum": [
+              "multiple_targets"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "UnitTestResult": {
         "description": "Result of running a single unit test.",
         "properties": {
+          "dialect": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UnitTestDialect"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set when the model's target warehouse is not known to be DuckDB. Absent for a model whose only target is DuckDB: its test ran on its own dialect and needs no notice."
+          },
           "error": {
             "default": null,
             "description": "Error message if failed.",
