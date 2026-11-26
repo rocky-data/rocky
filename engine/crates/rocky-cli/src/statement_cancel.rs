@@ -7,14 +7,12 @@
 //! away, so on those paths Rocky asks each adapter to cancel what it still
 //! runs.
 //!
-//! Only those forced-exit paths cancel today. Three other ways of abandoning
-//! a statement do not yet: `join_set.abort_all()` in `run.rs` (a fan-out
-//! abort drops the futures that wait on their statements), a client timeout,
-//! and a poll error that returns early from the Databricks and Snowflake
-//! connectors. Each of them leaves the statement running on the warehouse.
-//! Cancelling on them is follow-up work. Only the Databricks and Snowflake
-//! adapters list statements; every other adapter lists none, so nothing is
-//! cancelled and nothing is printed for it.
+//! A fan-out abort inside a run (`fail_fast`, the error-rate abort) also stops
+//! waiting on statements: [`abort_fan_out`] cancels the ones the run's own
+//! adapter lists, then aborts the tasks. A client deadline and a poll error
+//! are handled inside the Databricks and Snowflake connectors, which cancel
+//! before they return. Only those two adapters list statements; every other
+//! adapter lists none, so nothing is cancelled and nothing is printed for it.
 //!
 //! ```text
 //!   AdapterRegistry::from_config ──▶ track(name, adapter)     (weak reference)
@@ -34,7 +32,7 @@
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use rocky_core::statement_cancel::{CancelOutcome, StatementHandle};
+use rocky_core::statement_cancel::{ABANDON_CANCEL_BUDGET, CancelOutcome, StatementHandle};
 use rocky_core::traits::WarehouseAdapter;
 
 /// How long one cancel request may take on a forced exit. The requests run at
@@ -135,28 +133,92 @@ async fn cancel_all(
     adapters: &[(String, Arc<dyn WarehouseAdapter>)],
     budget: Duration,
 ) -> Vec<StatementCancel> {
-    let requests = adapters.iter().flat_map(|(name, adapter)| {
-        adapter
-            .in_flight_statements()
-            .into_iter()
-            .map(move |handle| async move {
-                let result =
-                    match tokio::time::timeout(budget, adapter.cancel_statement(&handle)).await {
-                        Ok(Ok(CancelOutcome::Requested)) => CancelResult::Requested,
-                        Ok(Ok(CancelOutcome::Unsupported)) => CancelResult::Unsupported,
-                        Ok(Err(e)) => CancelResult::Failed(
-                            rocky_core::secret_registry::render_placeholders(&e.to_string()),
-                        ),
-                        Err(_) => CancelResult::TimedOut,
-                    };
-                StatementCancel {
-                    adapter: name.clone(),
-                    handle,
-                    result,
-                }
-            })
+    let requests = adapters.iter().map(|(name, adapter)| {
+        cancel_handles(
+            name,
+            adapter.as_ref(),
+            adapter.in_flight_statements(),
+            budget,
+        )
+    });
+    futures::future::join_all(requests)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Send one cancel request per handle through `adapter`, all at once, each
+/// bounded by `budget`.
+async fn cancel_handles(
+    name: &str,
+    adapter: &dyn WarehouseAdapter,
+    handles: Vec<StatementHandle>,
+    budget: Duration,
+) -> Vec<StatementCancel> {
+    let requests = handles.into_iter().map(|handle| async move {
+        let result = match tokio::time::timeout(budget, adapter.cancel_statement(&handle)).await {
+            Ok(Ok(CancelOutcome::Requested)) => CancelResult::Requested,
+            Ok(Ok(CancelOutcome::Unsupported)) => CancelResult::Unsupported,
+            Ok(Err(e)) => CancelResult::Failed(rocky_core::secret_registry::render_placeholders(
+                &e.to_string(),
+            )),
+            Err(_) => CancelResult::TimedOut,
+        };
+        StatementCancel {
+            adapter: name.to_string(),
+            handle,
+            result,
+        }
     });
     futures::future::join_all(requests).await
+}
+
+/// Stop a fan-out early: abort every task in `join_set`, and cancel the
+/// statements they were waiting on through `adapter`, the run's own
+/// warehouse adapter.
+///
+/// ```text
+///   snapshot adapter.in_flight_statements() ──▶ abort_all() ──▶ cancel each
+/// ```
+///
+/// The snapshot comes first, while the tasks still hold their statements
+/// (an aborted task drops its guard, which unlists the handle). The abort
+/// comes before the cancels, so no task submits a new statement while they
+/// are sent. Only this run's adapter is swept, never the process-wide list:
+/// a sibling `--dag` sub-run's statements are not this run's to cancel.
+/// Each request is bounded by [`ABANDON_CANCEL_BUDGET`]; the run goes on
+/// either way, so the outcome is logged, not printed.
+pub(crate) async fn abort_fan_out<T: 'static>(
+    join_set: &mut tokio::task::JoinSet<T>,
+    adapter_name: &str,
+    adapter: &dyn WarehouseAdapter,
+) -> Vec<StatementCancel> {
+    let handles = adapter.in_flight_statements();
+    join_set.abort_all();
+    let results = cancel_handles(adapter_name, adapter, handles, ABANDON_CANCEL_BUDGET).await;
+    for cancel in &results {
+        let StatementCancel {
+            adapter,
+            handle,
+            result,
+        } = cancel;
+        match result {
+            CancelResult::Requested => {
+                tracing::warn!(adapter = %adapter, statement = %handle, "fan-out abort: cancel requested");
+            }
+            CancelResult::Unsupported => {
+                tracing::warn!(adapter = %adapter, statement = %handle, "fan-out abort: adapter cannot cancel; statement may still run");
+            }
+            CancelResult::Failed(error) => {
+                tracing::warn!(adapter = %adapter, statement = %handle, error = %error, "fan-out abort: cancel failed; statement may still run");
+            }
+            CancelResult::TimedOut => {
+                tracing::warn!(adapter = %adapter, statement = %handle, "fan-out abort: cancel got no answer in time; statement may still run");
+            }
+        }
+    }
+    results
 }
 
 /// One stderr line and one `tracing` event per statement. Stderr because the
@@ -288,6 +350,72 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// #2768: a fan-out abort cancels the statement an aborted task was
+    /// waiting on, and the task is aborted.
+    #[tokio::test]
+    async fn a_fan_out_abort_cancels_what_its_tasks_wait_on_and_aborts_them() {
+        let adapter = Arc::new(Cancellable::new(Answer::Accept));
+        let mut join_set = tokio::task::JoinSet::new();
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        {
+            let in_flight = adapter.in_flight.clone();
+            join_set.spawn(async move {
+                let _guard = in_flight.register(StatementHandle::new("copy-1"));
+                let _ = registered_tx.send(());
+                std::future::pending::<()>().await;
+            });
+        }
+        registered_rx.await.unwrap();
+
+        let results = abort_fan_out(&mut join_set, "wh", adapter.as_ref()).await;
+
+        assert_eq!(*adapter.cancelled.lock().unwrap(), handles(&["copy-1"]));
+        assert_eq!(
+            results,
+            vec![StatementCancel {
+                adapter: "wh".into(),
+                handle: StatementHandle::new("copy-1"),
+                result: CancelResult::Requested,
+            }]
+        );
+        let joined = join_set.join_next().await.expect("the task").unwrap_err();
+        assert!(joined.is_cancelled(), "the task must be aborted");
+        assert!(adapter.in_flight.snapshot().is_empty());
+    }
+
+    /// Every early stop of the replication fan-out in `run.rs` goes through
+    /// [`abort_fan_out`]. A bare `abort_all` there would drop the copies and
+    /// leave their statements running. A new site must use the helper too
+    /// (and bump the count).
+    #[test]
+    fn every_fan_out_abort_in_run_rs_cancels_its_statements() {
+        let run = include_str!("commands/run.rs");
+        let bare = concat!("join_set", ".abort_all()");
+        assert!(
+            !run.contains(bare),
+            "run.rs aborts a fan-out without cancelling its statements"
+        );
+        assert_eq!(
+            run.matches("statement_cancel::abort_fan_out(").count(),
+            4,
+            "the four fan-out stops: fail_fast and error rate (inline drain), \
+             fail_fast on a copy error and on a panic, error rate (final drain)"
+        );
+    }
+
+    /// A fan-out abort with nothing in flight sends nothing.
+    #[tokio::test]
+    async fn a_fan_out_abort_with_nothing_in_flight_sends_nothing() {
+        let adapter = Cancellable::new(Answer::Accept);
+        let mut join_set = tokio::task::JoinSet::<()>::new();
+        assert!(
+            abort_fan_out(&mut join_set, "wh", &adapter)
+                .await
+                .is_empty()
+        );
+        assert!(adapter.cancelled.lock().unwrap().is_empty());
     }
 
     #[test]

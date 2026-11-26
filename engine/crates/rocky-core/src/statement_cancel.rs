@@ -2,11 +2,13 @@
 //!
 //! A warehouse keeps running a statement after the client stops waiting for
 //! it. When `rocky run` exits without the settle (a second signal, or the
-//! settle grace has passed), the statements it still waits on would run on.
-//! An adapter that can cancel records each statement while it waits on it,
-//! in an [`InFlightStatements`]. The forced-exit path reads that list through
-//! [`WarehouseAdapter::in_flight_statements`] and asks the adapter to cancel
-//! each one through [`WarehouseAdapter::cancel_statement`].
+//! settle grace has passed) or aborts its fan-out, the statements it still
+//! waits on would run on. An adapter that can cancel records each statement
+//! while it waits on it, in an [`InFlightStatements`]. Those paths read that
+//! list through [`WarehouseAdapter::in_flight_statements`] and ask the
+//! adapter to cancel each one through [`WarehouseAdapter::cancel_statement`].
+//! A connector that gives up on a statement itself (its deadline, a poll
+//! error) cancels it before it returns.
 //!
 //! ```text
 //!   submit ──▶ warehouse returns an id ──▶ register(id) ──▶ poll ... ──▶ done

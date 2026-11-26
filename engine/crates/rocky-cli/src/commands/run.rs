@@ -7074,6 +7074,10 @@ pub(crate) async fn run_with_direct_gate(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let shared_batch_check = batch_check_adapter.clone();
     let shared_warehouse = warehouse_adapter.clone();
+    // Every early stop of the fan-out below goes through
+    // `statement_cancel::abort_fan_out`, never a bare `abort_all`: a bare
+    // abort drops the copies' futures and leaves their statements running on
+    // the warehouse (#2768).
     // `Arc<StateStore>` (not `Arc<Mutex<…>>`): every StateStore method takes
     // `&self` and redb serialises writers internally, so a shared reference is
     // sound. Concurrent state I/O runs on the blocking pool via `spawn_blocking`
@@ -7268,7 +7272,12 @@ pub(crate) async fn run_with_direct_gate(
                             "error rate exceeded threshold, aborting remaining tables"
                         ),
                     }
-                    join_set.abort_all();
+                    crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                     drain_abort = Some(cause);
                     break;
                 }
@@ -7529,7 +7538,12 @@ pub(crate) async fn run_with_direct_gate(
                     cooldown_seconds,
                 });
                 if fail_fast {
-                    join_set.abort_all();
+                    crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -7564,7 +7578,12 @@ pub(crate) async fn run_with_direct_gate(
                     cooldown_seconds: None,
                 });
                 if fail_fast {
-                    join_set.abort_all();
+                    crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -7579,7 +7598,12 @@ pub(crate) async fn run_with_direct_gate(
                     threshold = error_rate_abort_pct,
                     "error rate exceeded threshold, aborting remaining tables"
                 );
-                join_set.abort_all();
+                crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                 break;
             }
         }

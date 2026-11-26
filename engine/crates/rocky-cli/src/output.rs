@@ -902,6 +902,10 @@ impl From<&rocky_databricks::connector::ConnectorError> for FailureKind {
             }
             E::StatementFailed { .. } => FailureKind::QueryRejected,
             E::Timeout { .. } => FailureKind::Transient,
+            // The client stopped waiting while the statement may still run
+            // (a cancel was sent first). Not `Transient`: a retry could run
+            // the statement twice (#2768).
+            E::Abandoned { .. } => FailureKind::Unknown,
             E::Canceled { .. } => FailureKind::Unknown,
             E::UnexpectedState { .. } => FailureKind::Unknown,
             E::ApiError { status, .. } => match status {
@@ -951,6 +955,8 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
             }
             E::StatementFailed { .. } => FailureKind::QueryRejected,
             E::Timeout { .. } => FailureKind::Transient,
+            // See the databricks branch above.
+            E::Abandoned { .. } => FailureKind::Unknown,
             E::ApiError { status, .. } => match status {
                 401 | 403 => FailureKind::AuthFailed,
                 404 => FailureKind::NotFound,
@@ -15665,6 +15671,30 @@ mod failure_kind_tests {
         assert_eq!(FailureKind::from(&e), FailureKind::Transient);
     }
 
+    /// #2768: a statement the client stopped waiting on may still run, so it
+    /// is never reported as `Transient` (an orchestrator would retry it),
+    /// even when the poll error behind it was a 503 or a timeout.
+    #[test]
+    fn databricks_abandoned_maps_to_unknown() {
+        for cause in [
+            DbE::Timeout {
+                id: "stmt-1".into(),
+                seconds: 30,
+            },
+            DbE::ApiError {
+                status: 503,
+                body: "unavailable".into(),
+            },
+        ] {
+            let e = DbE::Abandoned {
+                id: "stmt-1".into(),
+                cancel: "cancel requested".into(),
+                cause: Box::new(cause),
+            };
+            assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
+        }
+    }
+
     #[test]
     fn databricks_canceled_maps_to_unknown() {
         let e = DbE::Canceled {
@@ -15764,6 +15794,20 @@ mod failure_kind_tests {
             seconds: 60,
         };
         assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+    }
+
+    /// #2768: see `databricks_abandoned_maps_to_unknown`.
+    #[test]
+    fn snowflake_abandoned_maps_to_unknown() {
+        let e = SnE::Abandoned {
+            handle: "h-1".into(),
+            cancel: "cancel requested".into(),
+            cause: Box::new(SnE::Timeout {
+                handle: "h-1".into(),
+                seconds: 60,
+            }),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
     }
 
     #[test]
