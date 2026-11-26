@@ -81,7 +81,7 @@ Without an abort, the run finishes and exits non-zero, and the JSON stays well-f
 | `connection-failed` | TCP / TLS / DNS / connection-establishment failure -- the request never reached the warehouse. | Yes, with backoff. |
 | `auth-failed` | Credentials rejected or token expired -- 401, 403, or an auth-chain rejection. | No. Fix credentials before retrying. |
 | `query-rejected` | Warehouse parsed and rejected the SQL -- syntax error, missing column, missing permission, semantic analysis failure. | No. The SQL needs fixing. |
-| `transient` | Retry-worthy failure -- 5xx, network glitch, statement aborted by a transient warehouse condition, a transport timeout. | Yes. |
+| `transient` | Retry-worthy failure -- 5xx, network glitch, statement aborted by a transient warehouse condition, a transport timeout, a statement timeout on BigQuery, Trino or PostgreSQL. | Yes. |
 | `quota-exceeded` | Rate limit hit or a configured cap reached -- 429, retry-budget exhaustion, account-level quota. | Yes, with extended backoff and an alert. |
 | `not-found` | Requested catalog / schema / table not present -- 404 from the warehouse, often an upstream rename. | No. Re-discovery or human triage needed. |
 | `compile-error` | The selected model has an `Error`-severity compile diagnostic, or Rocky withheld it after an upstream compile error. Rocky makes no warehouse call for it. Its declared descendants are withheld and listed in `contained[]`. Healthy branches can still run. Targets of failed or withheld models stay unchanged. The diagnostic or block reason is in `error`. | No. Fix the model SQL or its upstream; re-running without a change will not help. |

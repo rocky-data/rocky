@@ -86,6 +86,20 @@ fn classify_table_error(err: &anyhow::Error) -> CopyErrorClass {
     }
 }
 
+/// Settle `table_errors` after the `table_retries` arm: drop the first error
+/// of each table in `retried` (its retry either succeeded or is in
+/// `still_failed`), then add `still_failed`. A table the arm did not retry
+/// keeps its first error: one `auto_retry_indices` left out (its statement may
+/// still run, #2768), or one a cancel stopped before its turn (#1606).
+fn settle_table_retries(
+    table_errors: &mut Vec<TableError>,
+    retried: &[usize],
+    still_failed: Vec<TableError>,
+) {
+    table_errors.retain(|e| e.task_index.is_none_or(|idx| !retried.contains(&idx)));
+    table_errors.extend(still_failed);
+}
+
 /// The task indices the `table_retries` arm runs again: every failed copy that
 /// has a task, except one whose statement may still run on the warehouse. A
 /// resubmit of that copy could apply it twice (#2768).
@@ -8000,8 +8014,7 @@ pub(crate) async fn run_with_direct_gate(
                     }
                 }
             }
-            table_errors.retain(|e| e.task_index.is_none_or(|idx| !retried.contains(&idx)));
-            table_errors.extend(still_failed);
+            settle_table_retries(&mut table_errors, &retried, still_failed);
         }
     }
 
@@ -37959,6 +37972,48 @@ backend = "local"
         for skipped in &errors[..4] {
             assert_eq!(skipped.failure_kind, FailureKind::Unknown);
         }
+    }
+
+    /// #2768: after the retry arm, a table it skipped because its statement
+    /// may still run keeps its first error, so the run still reports it as
+    /// failed. A retried table's first error is replaced by its retry's.
+    #[test]
+    fn a_skipped_table_keeps_its_first_error_after_the_retry_arm() {
+        let failed = |idx: usize, may_still_run: bool| {
+            let mut entry = copy_table_error(&format!("t{idx}"));
+            entry.task_index = Some(idx);
+            entry.may_still_run = may_still_run;
+            entry
+        };
+        let mut errors = vec![
+            failed(0, true),
+            failed(1, false),
+            copy_table_error("<freeze>"),
+        ];
+        let retried = super::auto_retry_indices(&errors);
+        assert_eq!(retried, vec![1]);
+        let mut retry_error = failed(1, false);
+        retry_error.error = "retry of t1 failed".to_string();
+
+        super::settle_table_retries(&mut errors, &retried, vec![retry_error]);
+
+        let left: Vec<(Vec<String>, String)> = errors
+            .iter()
+            .map(|e| (e.asset_key.clone(), e.error.clone()))
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                (vec!["t0".to_string()], "copy of t0 failed".to_string()),
+                (
+                    vec!["<freeze>".to_string()],
+                    "copy of <freeze> failed".to_string()
+                ),
+                (vec!["t1".to_string()], "retry of t1 failed".to_string()),
+            ],
+            "the skipped table keeps its error, the entry with no task stays, \
+             the retried table carries its retry's error"
+        );
     }
 
     /// #2768: the auto-retry arm takes its task list from
