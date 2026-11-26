@@ -673,6 +673,13 @@ describe("Cancel on a running job", () => {
     expect(await screen.findByText("Forced stop sent.", { exact: false })).toBeInTheDocument();
     expect(screen.getByText("the engine kills it", { exact: false })).toBeInTheDocument();
     expect(screen.queryByText("Asked the job to stop, as Ctrl-C does.", { exact: false })).toBeNull();
+    expect(screen.getByText("Press again to kill it now.", { exact: false })).toBeInTheDocument();
+
+    // After the kill was sent, the hint no longer offers a kill.
+    fireEvent.click(screen.getByRole("button", { name: FORCE_STOP_LABEL }));
+    jobs.answer("kill");
+    expect(await screen.findByText("Kill sent.", { exact: false })).toBeInTheDocument();
+    expect(screen.queryByText("Press again to kill it now.", { exact: false })).toBeNull();
 
     jobs.settle();
     expect(

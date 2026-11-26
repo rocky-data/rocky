@@ -685,6 +685,9 @@ pub struct PartialFailure {
     /// Whether the same run ALSO failed its check gate. Changes the advice,
     /// never the exit code — both shapes are exit 2.
     pub check_gate_failed: bool,
+    /// Whether a failed table's statement may still run on the warehouse (a
+    /// connector `Timeout` or `Abandoned`). Changes the resume advice only.
+    pub statement_may_still_run: bool,
     /// Whether this run's record is persisted (#1836). Read by
     /// [`session_disposition`]; never changes the exit code, which stays 2
     /// either way — the run failed the same amount, and downgrading it to the
@@ -702,6 +705,15 @@ impl std::fmt::Display for PartialFailure {
                  check gate (run_id: {}); `--resume {}` re-copies only the failed table(s) and \
                  re-runs none of the checks that gated this run, so a resume cannot clear the \
                  gate — fix the data and re-run the pipeline",
+                self.count, self.run_id, self.run_id
+            );
+        }
+        if self.statement_may_still_run {
+            return write!(
+                f,
+                "{} table(s) failed during parallel execution (run_id: {}); at least one \
+                 statement may still be running on the warehouse, so confirm it has stopped \
+                 before you use --resume {}",
                 self.count, self.run_id, self.run_id
             );
         }
@@ -987,6 +999,7 @@ pub(crate) fn run_status_exit_result(
             // (#1720). `false` on the transformation / model-only paths, which
             // never stamp the gate — those messages are unchanged.
             check_gate_failed: output.check_gate_failed,
+            statement_may_still_run: false,
             custody,
         }
         .into()),
@@ -7992,10 +8005,10 @@ pub(crate) async fn run_with_direct_gate(
                     }
                     Err(e) => {
                         let CopyErrorClass {
-                    failure_kind,
-                    cooldown_seconds,
-                    may_still_run,
-                } = classify_table_error(&e);
+                            failure_kind,
+                            cooldown_seconds,
+                            may_still_run,
+                        } = classify_table_error(&e);
                         let msg = format!("{e:#}");
                         warn!(
                             table = task.target_table_name.as_str(),
@@ -8996,6 +9009,7 @@ pub(crate) async fn run_with_direct_gate(
         // "use --resume to retry" alone is wrong there: a resume re-copies the
         // failed table and re-runs none of the checks that gated the run.
         let gated = output.check_gate_failed;
+        let may_still_run = table_errors.iter().any(|e| e.may_still_run);
         if matches!(
             output.derive_run_status(),
             rocky_core::state::RunStatus::PartialFailure
@@ -9004,6 +9018,7 @@ pub(crate) async fn run_with_direct_gate(
                 count,
                 run_id: run_id.clone(),
                 check_gate_failed: gated,
+                statement_may_still_run: may_still_run,
                 custody: record_custody,
             }
             .into());
@@ -9013,6 +9028,13 @@ pub(crate) async fn run_with_direct_gate(
                 "{count} table(s) failed during parallel execution and this run also failed \
                  its check gate (run_id: {run_id}); a resume re-runs none of the checks that \
                  gated this run — fix the data and re-run the pipeline"
+            );
+        }
+        if may_still_run {
+            anyhow::bail!(
+                "{count} table(s) failed during parallel execution (run_id: {run_id}); at least one \
+                 statement may still be running on the warehouse, so confirm it has stopped before \
+                 you use --resume {run_id}"
             );
         }
         anyhow::bail!(
@@ -36754,6 +36776,7 @@ backend = "local"
                 count: 1,
                 run_id: "r".to_string(),
                 check_gate_failed: false,
+                statement_may_still_run: false,
                 custody,
             })
         };
@@ -37638,6 +37661,7 @@ backend = "local"
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: false,
+            statement_may_still_run: false,
             custody: super::RecordCustody::Persisted,
         }
         .to_string();
@@ -37647,10 +37671,26 @@ backend = "local"
             "an ungated copy failure keeps its exact message"
         );
 
+        let running = super::PartialFailure {
+            count: 1,
+            run_id: "run-1".to_string(),
+            check_gate_failed: false,
+            statement_may_still_run: true,
+            custody: super::RecordCustody::Persisted,
+        }
+        .to_string();
+        assert!(
+            running.contains("may still be running")
+                && running.contains("confirm it has stopped before you use --resume run-1")
+                && !running.contains("to retry"),
+            "a statement that may still run must not be told to resume: {running}"
+        );
+
         let gated = super::PartialFailure {
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: true,
+            statement_may_still_run: false,
             custody: super::RecordCustody::Persisted,
         }
         .to_string();

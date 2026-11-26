@@ -486,13 +486,19 @@ function CancelControl({ cancel }: { cancel: JobCancel }) {
   if (access.kind !== "operator") return null;
   const view = cancel.view;
   const label = cancel.stopping ? FORCE_STOP_LABEL : "Cancel";
-  const busy = view.kind === "sending" || (view.kind === "sent" && view.signal === "kill");
+  const killed = view.kind === "sent" && view.signal === "kill";
+  const busy = view.kind === "sending" || killed;
   return (
     <div className="space-y-0.5">
       <WriteButton label={label} busy={busy} busyLabel="stopping…" onClick={cancel.request} />
       {cancel.stopping && !cancel.forced && !busy && (
         <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
           Asked the job to stop, as Ctrl-C does. A run finishes the copies in flight first.
+        </p>
+      )}
+      {killed && (
+        <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+          Kill sent. The job should end now. The warehouse may still be running its statements.
         </p>
       )}
       {cancel.forced && !busy && (
