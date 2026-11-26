@@ -62,12 +62,39 @@ struct MissingTimestampColumn {
     columns: String,
 }
 
-fn classify_table_error(err: &anyhow::Error) -> (FailureKind, Option<u64>) {
-    if err.is::<MissingTimestampColumn>() {
+/// How a failed replication copy is reported, and whether the auto-retry arm
+/// may run it again.
+struct CopyErrorClass {
+    failure_kind: FailureKind,
+    cooldown_seconds: Option<u64>,
+    /// The copy's statement may still run on the warehouse (a connector
+    /// `Timeout` or `Abandoned`). The `table_retries` arm must not resubmit
+    /// it: the copy could run twice (#2768).
+    may_still_run: bool,
+}
+
+fn classify_table_error(err: &anyhow::Error) -> CopyErrorClass {
+    let (failure_kind, cooldown_seconds) = if err.is::<MissingTimestampColumn>() {
         (FailureKind::CompileError, None)
     } else {
         classify_anyhow_error_with_cooldown(err)
+    };
+    CopyErrorClass {
+        failure_kind,
+        cooldown_seconds,
+        may_still_run: crate::output::statement_may_still_run(err),
     }
+}
+
+/// The task indices the `table_retries` arm runs again: every failed copy that
+/// has a task, except one whose statement may still run on the warehouse. A
+/// resubmit of that copy could apply it twice (#2768).
+fn auto_retry_indices(table_errors: &[TableError]) -> Vec<usize> {
+    table_errors
+        .iter()
+        .filter(|e| !e.may_still_run)
+        .filter_map(|e| e.task_index)
+        .collect()
 }
 
 fn source_has_timestamp_column(source_cols: &[ColumnInfo], timestamp_column: &str) -> bool {
@@ -453,6 +480,10 @@ struct TableError {
     /// `circuit_breaker_recovery_timeout_secs`). Mirrors the
     /// source-side hint on `FailedSource.cooldown_seconds`.
     cooldown_seconds: Option<u64>,
+    /// The failed statement may still run on the warehouse, so the
+    /// `table_retries` arm skips this entry (see [`auto_retry_indices`]).
+    /// `false` for every entry no copy produced.
+    may_still_run: bool,
 }
 
 /// Sentinel error signalling that `rocky run` was cancelled by a shutdown
@@ -7192,6 +7223,7 @@ pub(crate) async fn run_with_direct_gate(
             copy: None,
             failure_kind: crate::output::FailureKind::Unknown,
             cooldown_seconds: None,
+            may_still_run: false,
         });
     }
 
@@ -7448,7 +7480,11 @@ pub(crate) async fn run_with_direct_gate(
                 // variant is preserved on `TableError.failure_kind` and
                 // the optional engine-supplied cooldown hint
                 // (warehouse-side breaker trip) is captured.
-                let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+                let CopyErrorClass {
+                    failure_kind,
+                    cooldown_seconds,
+                    may_still_run,
+                } = classify_table_error(&e);
                 // The copy's own time and attempt, for its run record (#2470).
                 let copy = tables_to_process.get(idx).map(|task| CopyFailure {
                     table: task.target_table_name.clone(),
@@ -7536,6 +7572,7 @@ pub(crate) async fn run_with_direct_gate(
                     copy,
                     failure_kind,
                     cooldown_seconds,
+                    may_still_run,
                 });
                 if fail_fast {
                     crate::statement_cancel::abort_fan_out(
@@ -7576,6 +7613,7 @@ pub(crate) async fn run_with_direct_gate(
                     copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
+                    may_still_run: false,
                 });
                 if fail_fast {
                     crate::statement_cancel::abort_fan_out(
@@ -7819,7 +7857,9 @@ pub(crate) async fn run_with_direct_gate(
     // Auto-retry failed tables
     let table_retries = pipeline.execution.table_retries;
     if table_retries > 0 && !table_errors.is_empty() {
-        let retryable: Vec<usize> = table_errors.iter().filter_map(|e| e.task_index).collect();
+        // A copy whose statement may still run keeps its first error and is
+        // not resubmitted (#2768).
+        let retryable = auto_retry_indices(&table_errors);
 
         if !retryable.is_empty() {
             info!(
@@ -7829,15 +7869,16 @@ pub(crate) async fn run_with_direct_gate(
             let mut still_failed = Vec::new();
             // A cancel stops the retries (#1606): a table not yet retried
             // keeps its first-attempt error, and the run settles as
-            // interrupted at its terminal exit.
-            let mut not_retried: Vec<usize> = Vec::new();
-            let mut pending = retryable.into_iter();
-            for idx in pending.by_ref() {
+            // interrupted at its terminal exit. So does a table
+            // `auto_retry_indices` left out. Only a retried table's first
+            // error is replaced.
+            let mut retried: Vec<usize> = Vec::new();
+            for idx in retryable {
                 if cancel.is_cancelled() {
                     output.interrupted = true;
-                    not_retried.push(idx);
                     break;
                 }
+                retried.push(idx);
                 let task = &tables_to_process[idx];
                 let retry_start = Instant::now();
                 match retry_table_after_recovery(
@@ -7924,7 +7965,11 @@ pub(crate) async fn run_with_direct_gate(
                         info!(table = task.target_table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
-                        let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+                        let CopyErrorClass {
+                    failure_kind,
+                    cooldown_seconds,
+                    may_still_run,
+                } = classify_table_error(&e);
                         let msg = format!("{e:#}");
                         warn!(
                             table = task.target_table_name.as_str(),
@@ -7946,12 +7991,12 @@ pub(crate) async fn run_with_direct_gate(
                             }),
                             failure_kind,
                             cooldown_seconds,
+                            may_still_run,
                         });
                     }
                 }
             }
-            not_retried.extend(pending);
-            table_errors.retain(|e| e.task_index.is_none_or(|idx| not_retried.contains(&idx)));
+            table_errors.retain(|e| e.task_index.is_none_or(|idx| !retried.contains(&idx)));
             table_errors.extend(still_failed);
         }
     }
@@ -8335,6 +8380,7 @@ pub(crate) async fn run_with_direct_gate(
                         copy: None,
                         failure_kind,
                         cooldown_seconds,
+                        may_still_run: false,
                     });
                     None
                 }
@@ -8362,6 +8408,7 @@ pub(crate) async fn run_with_direct_gate(
                     copy: None,
                     failure_kind: crate::output::FailureKind::Unknown,
                     cooldown_seconds: None,
+                    may_still_run: false,
                 });
             }
 
@@ -21687,7 +21734,11 @@ async fn process_completed_result(
             // Classify before stringification so the typed connector
             // variant is preserved on `TableError.failure_kind` (plus
             // the optional warehouse-breaker cooldown hint).
-            let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+            let CopyErrorClass {
+                failure_kind,
+                cooldown_seconds,
+                may_still_run,
+            } = classify_table_error(&e);
             // The copy's own time and attempt, for its run record (#2470).
             let copy = tables_to_process.get(idx).map(|task| CopyFailure {
                 table: task.target_table_name.clone(),
@@ -21786,6 +21837,7 @@ async fn process_completed_result(
                 copy,
                 failure_kind,
                 cooldown_seconds,
+                may_still_run,
             });
             failed = true;
         }
@@ -21818,6 +21870,7 @@ async fn process_completed_result(
                 copy: None,
                 failure_kind: FailureKind::Unknown,
                 cooldown_seconds: None,
+                may_still_run: false,
             });
             failed = true;
         }
@@ -36756,6 +36809,7 @@ backend = "local"
             copy: None,
             failure_kind: crate::output::FailureKind::QueryRejected,
             cooldown_seconds: None,
+            may_still_run: false,
         }
     }
 
@@ -37814,6 +37868,113 @@ backend = "local"
             "an entry with no copy record adds nothing"
         );
         assert!(CopyFailure::prior_attempts(&errors, 9).is_empty());
+    }
+
+    /// #2768: `table_retries` defaults to 1, and the auto-retry arm used to
+    /// re-run every failed copy. A copy whose statement may still run (a
+    /// connector `Timeout` or `Abandoned`) must keep its first error and not
+    /// be resubmitted: the copy could apply twice. An ordinary failure is
+    /// still retried.
+    ///
+    /// Each error has the production shape: the connector error wrapped in
+    /// `rocky_core`'s `AdapterError`, then in `anyhow` with context, and
+    /// classified by the same `classify_table_error` the copy arms call.
+    #[test]
+    fn auto_retry_skips_a_copy_whose_statement_may_still_run() {
+        use rocky_core::statement_cancel::AbandonCancel;
+        use rocky_core::traits::AdapterError;
+        use rocky_databricks::connector::ConnectorError as DbE;
+        use rocky_snowflake::connector::ConnectorError as SnE;
+
+        fn wrapped(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+            anyhow::Error::from(AdapterError::new(e)).context("copying the table")
+        }
+        let entry = |idx: usize, err: anyhow::Error| {
+            let class = classify_table_error(&err);
+            let mut entry = copy_table_error("t");
+            entry.task_index = Some(idx);
+            entry.failure_kind = class.failure_kind;
+            entry.cooldown_seconds = class.cooldown_seconds;
+            entry.may_still_run = class.may_still_run;
+            entry
+        };
+        let errors = vec![
+            entry(
+                0,
+                wrapped(DbE::Abandoned {
+                    id: "s0".into(),
+                    cancel: AbandonCancel::Requested,
+                    cause: Box::new(DbE::Timeout {
+                        id: "s0".into(),
+                        seconds: 60,
+                    }),
+                }),
+            ),
+            entry(
+                1,
+                wrapped(DbE::Timeout {
+                    id: "s1".into(),
+                    seconds: 60,
+                }),
+            ),
+            entry(
+                2,
+                wrapped(SnE::Abandoned {
+                    handle: "h2".into(),
+                    cancel: AbandonCancel::NoAnswer,
+                    cause: Box::new(SnE::ApiError {
+                        status: 503,
+                        body: "unavailable".into(),
+                    }),
+                }),
+            ),
+            entry(
+                3,
+                wrapped(SnE::Timeout {
+                    handle: "h3".into(),
+                    seconds: 60,
+                }),
+            ),
+            // Ordinary failures: a transient 503 and an unclassified error.
+            entry(
+                4,
+                wrapped(DbE::ApiError {
+                    status: 503,
+                    body: "unavailable".into(),
+                }),
+            ),
+            entry(5, anyhow::anyhow!("the warehouse said no")),
+        ];
+
+        assert_eq!(
+            super::auto_retry_indices(&errors),
+            vec![4, 5],
+            "only the ordinary failures are retried"
+        );
+        assert_eq!(errors[4].failure_kind, FailureKind::Transient);
+        for skipped in &errors[..4] {
+            assert_eq!(skipped.failure_kind, FailureKind::Unknown);
+        }
+    }
+
+    /// #2768: the auto-retry arm takes its task list from
+    /// [`super::auto_retry_indices`], the one place that drops a copy whose
+    /// statement may still run. An inline `filter_map` over `task_index` at
+    /// the arm would bypass that filter.
+    #[test]
+    fn the_auto_retry_arm_selects_through_auto_retry_indices() {
+        let compact = production_source();
+        assert_eq!(
+            compact
+                .matches("letretryable=auto_retry_indices(&table_errors);")
+                .count(),
+            1
+        );
+        assert_eq!(
+            compact.matches(".filter_map(|e|e.task_index)").count(),
+            1,
+            "only `auto_retry_indices` may list failed tasks for the retry"
+        );
     }
 
     /// #2470: a failed replication copy reaches the run record under its
@@ -54196,6 +54357,7 @@ timestamp_column = "ts"
                     copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
+                    may_still_run: false,
                 })
                 .collect();
             let mut total_completed = prior_completed;

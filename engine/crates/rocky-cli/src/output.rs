@@ -1220,6 +1220,37 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
     (FailureKind::Unknown, None)
 }
 
+/// One chain link's answer to [`statement_may_still_run`]: `Some` when the
+/// link is a Databricks or Snowflake `ConnectorError`, `None` otherwise.
+fn cause_may_still_run(cause: &(dyn std::error::Error + 'static)) -> Option<bool> {
+    if let Some(e) = cause.downcast_ref::<rocky_databricks::connector::ConnectorError>() {
+        return Some(e.may_still_run());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
+        return Some(e.may_still_run());
+    }
+    None
+}
+
+/// Whether `err` carries a connector error that says its statement may still
+/// run on the warehouse (a Databricks or Snowflake `Timeout` or `Abandoned`).
+/// A caller must not resubmit that work: it could run twice (#2768).
+///
+/// Walks the chain the way [`classify_anyhow_error`] does, through both
+/// `AdapterError` wrappers. The first connector error found decides.
+/// `false` when the chain holds no Databricks or Snowflake connector error.
+pub fn statement_may_still_run(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(answer) = cause_may_still_run(cause) {
+            return answer;
+        }
+        if let Some(answer) = probe_wrapped_adapter_cause(cause, cause_may_still_run) {
+            return answer;
+        }
+    }
+    false
+}
+
 /// [`classify_anyhow_error_with_cooldown`] for a bare
 /// [`rocky_core::traits::AdapterError`], as `WarehouseAdapter` methods return.
 ///

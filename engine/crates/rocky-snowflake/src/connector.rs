@@ -80,6 +80,17 @@ pub enum ConnectorError {
     RetryBudgetExhausted { limit: u32 },
 }
 
+impl ConnectorError {
+    /// Whether the statement this error names may still run on the
+    /// warehouse: a [`Self::Timeout`] (the submit did not answer, so it may
+    /// have been accepted) or an [`Self::Abandoned`] (the client stopped
+    /// waiting). No layer may resubmit such a statement: it could run twice.
+    #[must_use]
+    pub fn may_still_run(&self) -> bool {
+        matches!(self, Self::Timeout { .. } | Self::Abandoned { .. })
+    }
+}
+
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
 /// the plaintext of every field and wrapped error (#1919).
 impl std::fmt::Debug for ConnectorError {
