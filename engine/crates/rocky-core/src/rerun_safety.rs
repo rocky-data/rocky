@@ -287,10 +287,10 @@ pub fn classify_pipeline(
             "a snapshot pipeline closes old versions and inserts new ones in separate \
              statements, so a second run can record a change twice; {NOT_PROVABLE}"
         )),
-        PipelineConfig::Load(_) => RerunSafety::not_safe(
+        PipelineConfig::Load(_) => RerunSafety::not_safe(format!(
             "a load pipeline re-ingests every file on each run, so a second run \
-             duplicates the rows",
-        ),
+             duplicates the rows; {NOT_PROVABLE}"
+        )),
     }
 }
 
@@ -378,10 +378,12 @@ fn first_model_reading_its_own_output(models: &[ResolvedModel]) -> Option<&Resol
 }
 
 /// Whether `read` (a dotted, lower-cased name from the model's SQL) may name
-/// `model`'s output. The match errs toward yes: a bare name matches the
-/// target table in any schema, every qualifier the read spells must match
-/// the target's (compared case-insensitively, quotes dropped), and a read
-/// with more than three parts matches on its last three.
+/// `model`'s output. The match errs toward yes. Parts compare
+/// case-insensitively with quotes dropped, and an empty target part matches
+/// any part. A bare name matches the target table in any schema. One
+/// qualifier matches when it is the target's schema or its catalog
+/// (`schema.table` or `catalog.table`). Two or more qualifiers match when
+/// the last two are the target's catalog and schema.
 fn read_names_model(read: &str, model: &ResolvedModel) -> bool {
     let fold = |part: &str| {
         part.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
@@ -396,13 +398,20 @@ fn read_names_model(read: &str, model: &ResolvedModel) -> bool {
     let Some((table, qualifiers)) = parts.split_last() else {
         return false;
     };
-    let target = [&model.target.schema, &model.target.catalog];
-    *table == fold(&model.target.table)
-        && qualifiers
-            .iter()
-            .rev()
-            .zip(target)
-            .all(|(part, expected)| *part == fold(expected))
+    if *table != fold(&model.target.table) {
+        return false;
+    }
+    let schema = fold(&model.target.schema);
+    let catalog = fold(&model.target.catalog);
+    let is = |part: &String, expected: &str| expected.is_empty() || part == expected;
+    let mut rev = qualifiers.iter().rev();
+    let Some(last) = rev.next() else {
+        return true;
+    };
+    let Some(before) = rev.next() else {
+        return is(last, &schema) || is(last, &catalog);
+    };
+    is(last, &schema) && is(before, &catalog)
 }
 
 /// A quality pipeline reads the warehouse and writes nothing there, unless
@@ -522,7 +531,10 @@ pub fn classify_strategy(
         // inserted again on every run. Nothing rejects a nullable key.
         MaterializationStrategy::Merge { unique_key, .. } => {
             if unique_key.is_empty() {
-                RerunSafety::not_safe("merge with no unique_key")
+                RerunSafety::not_safe(format!(
+                    "merge with no unique_key matches no target row, so every run inserts \
+                     its rows again; {NOT_PROVABLE}"
+                ))
             } else {
                 RerunSafety::not_safe(format!(
                     "merge: a row with a NULL unique_key matches no target row, so every run \
@@ -555,8 +567,8 @@ pub fn classify_strategy(
         // conditional PUT of the log entry. On a conflict it re-reads the
         // live set and recomputes; an unchanged output writes no commit
         // (`rocky_iceberg::uniform_writer`). The run then syncs the table
-        // with `MSCK REPAIR TABLE ... SYNC METADATA`, which only Databricks
-        // runs.
+        // with `MSCK REPAIR TABLE ... SYNC METADATA` on every run, a
+        // Databricks statement; other adapters are not verified.
         MaterializationStrategy::ContentAddressed { .. } => match target {
             TargetWarehouse::Databricks => RerunSafety::Safe,
             TargetWarehouse::DuckDbPlain
@@ -564,8 +576,8 @@ pub fn classify_strategy(
             | TargetWarehouse::Snowflake
             | TargetWarehouse::BigQuery
             | TargetWarehouse::Unverified { .. } => RerunSafety::not_safe(format!(
-                "content_addressed syncs its table with MSCK REPAIR TABLE, which {warehouse} \
-                 does not run"
+                "content_addressed is verified on Databricks only: the run syncs its table \
+                 with MSCK REPAIR TABLE, not verified on {warehouse}"
             )),
         },
         MaterializationStrategy::Snapshot(_) => RerunSafety::not_safe(format!(
@@ -881,6 +893,11 @@ mod tests {
             ),
             (merge(key()), WriterPipeline::Replication, "NULL unique_key"),
             (
+                merge(Vec::new()),
+                WriterPipeline::Transformation,
+                "no unique_key",
+            ),
+            (
                 incremental(key()),
                 WriterPipeline::Transformation,
                 "NULL key",
@@ -997,13 +1014,24 @@ mod tests {
                 "{reason}"
             );
         };
-        // Directly: bare, schema-qualified, fully qualified, quoted.
-        for read in ["orders", "s.orders", "c.s.orders", "\"c\".\"S\".\"Orders\""] {
+        // Directly: bare, schema- or catalog-qualified, fully qualified, quoted.
+        for read in [
+            "orders",
+            "s.orders",
+            "c.orders",
+            "c.s.orders",
+            "x.c.s.orders",
+            "\"c\".\"S\".\"Orders\"",
+        ] {
             not_safe(
                 &models(vec![model("o", "orders", full.clone(), &[read])]),
                 "o",
             );
         }
+        // A target part that is not set matches any qualifier.
+        let mut no_schema = model("o", "orders", full.clone(), &["c.anything.orders"]);
+        no_schema.target.schema = String::new();
+        not_safe(&models(vec![no_schema]), "o");
         // Through an ephemeral model, which its consumer inlines.
         not_safe(
             &models(vec![
@@ -1022,7 +1050,7 @@ mod tests {
             "a",
         );
         // A same-named table in another schema is not the target.
-        for read in ["raw.orders", "other.s.orders"] {
+        for read in ["raw.orders", "other.s.orders", "c.raw.orders"] {
             let writes = models(vec![model("o", "orders", full.clone(), &[read])]);
             assert_eq!(
                 classify_pipeline(&transformation(), &target, &writes),
@@ -1179,7 +1207,10 @@ mod tests {
         for pc in [snapshot, load] {
             for target in warehouses() {
                 let class = classify_pipeline(&pc, &target, &ResolvedWrites::NotNeeded);
-                assert!(!class.is_safe(), "{}: {class:?}", pc.pipeline_type_str());
+                let RerunSafety::NotSafe { reason } = class else {
+                    panic!("{} is not safe", pc.pipeline_type_str());
+                };
+                assert!(reason.ends_with(NOT_PROVABLE), "{reason}");
             }
         }
     }

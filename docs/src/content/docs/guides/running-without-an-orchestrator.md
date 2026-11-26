@@ -586,7 +586,7 @@ A pipeline is `rerun_safe` only when every model or table it writes is. When Roc
 | `view` | `rerun_safe` on DuckDB, Databricks, Snowflake and BigQuery. It is one `CREATE OR REPLACE VIEW`. |
 | `materialized_view` | `rerun_safe` on Databricks, Snowflake and BigQuery. It is one `CREATE OR REPLACE MATERIALIZED VIEW`. |
 | `dynamic_table` | `rerun_safe` on Snowflake. It is one `CREATE OR REPLACE DYNAMIC TABLE`. |
-| `content_addressed` | `rerun_safe` on Databricks. It replaces the table in one Delta log commit. Other adapters do not run the `MSCK REPAIR TABLE` that follows the commit. |
+| `content_addressed` | `rerun_safe` on Databricks. It replaces the table in one Delta log commit. The `MSCK REPAIR TABLE` that follows the commit is verified on Databricks only. |
 | `ephemeral` | `rerun_safe` on every adapter. It writes nothing. |
 | `merge` | never. A row with a NULL `unique_key` matches no row in the target, so every run inserts it again. |
 | `incremental` with a `unique_key` (transformation) | never. It runs as a `MERGE`, with the same NULL-key problem. |
@@ -598,9 +598,9 @@ A pipeline is `rerun_safe` only when every model or table it writes is. When Roc
 | a `replication` pipeline with a `[[checks.custom]]` check | never. A replication run sends the check SQL to the warehouse as written. |
 | a `quality` pipeline | `rerun_safe` on every adapter. It only reads the warehouse. Not when `[checks.quarantine]` is on, or when the pipeline has a `[[checks.custom]]` check. |
 
-For every `never` row, the message ends with "not provable from the generated SQL alone". Only a change to the generated SQL can make that write `rerun_safe`.
+For every `never` strategy row and for `snapshot` and `load`, the message ends with "not provable from the generated SQL alone". Only a change to the generated SQL can make that write `rerun_safe`.
 
-A model that reads its own target is `not_rerun_safe`, even as a `full_refresh`. Each run builds on the table the last run left. This includes a read through an `ephemeral` model, or through another model of the same pipeline that reads this model's target. Rocky finds the reads with its SQL parser. If the parser cannot read the model's SQL, the model is `not_rerun_safe`.
+A model that reads its own target is `not_rerun_safe`, even as a `full_refresh`. Each run builds on the table the last run left. This includes a read through an `ephemeral` model, or through another model of the same pipeline that reads this model's target. Rocky finds the reads with its SQL parser. If the parser cannot read the model's SQL, the model is `not_rerun_safe`. SQL that only DuckDB accepts can fail that parser. The check is best-effort: it does not see a read through a view or table outside the pipeline, or through a table function.
 
 "A plain DuckDB target" is a DuckDB adapter with no `[[adapter.NAME.attach]]`. Its `path` is a plain file path, `:memory:`, or not set. A `path` with a `:` in it, such as `md:prod` or `ducklake:meta.ducklake`, is not plain. The exceptions are `:memory:` and a Windows drive letter such as `C:\`. On a target that is not plain, a `full_refresh` is `not_rerun_safe`: into an attached Iceberg catalog it is several statements.
 
