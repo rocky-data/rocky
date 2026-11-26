@@ -550,9 +550,9 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Ask the warehouse to cancel one statement that
     /// [`Self::in_flight_statements`] listed.
     ///
-    /// `rocky run` calls this only on a forced exit, the path that stops
-    /// waiting on statements that still run. The caller bounds the call with
-    /// its own timeout.
+    /// `rocky run` calls this on the paths that stop waiting on statements
+    /// that still run: a forced exit and a fan-out abort. The caller bounds
+    /// the call with its own timeout.
     ///
     /// Default: [`CancelOutcome::Unsupported`](crate::statement_cancel::CancelOutcome::Unsupported),
     /// with nothing sent. Every adapter in this workspace overrides it, so
