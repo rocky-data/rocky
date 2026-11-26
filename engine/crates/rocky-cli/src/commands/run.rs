@@ -38025,6 +38025,81 @@ backend = "local"
         }
     }
 
+    /// #2768, part B: the same skip for BigQuery and Trino. A copy whose job
+    /// or query may still run (`Timeout`, `Abandoned`, or a BigQuery
+    /// `NoJobReference`) keeps its first error; an ordinary transient
+    /// failure of either adapter is still retried.
+    #[test]
+    fn auto_retry_skips_a_bigquery_or_trino_copy_whose_statement_may_still_run() {
+        use rocky_bigquery::connector::BigQueryError as BqE;
+        use rocky_core::statement_cancel::AbandonCancel;
+        use rocky_core::traits::AdapterError;
+        use rocky_trino::connector::TrinoError as TrE;
+
+        fn wrapped(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+            anyhow::Error::from(AdapterError::new(e)).context("copying the table")
+        }
+        let entry = |idx: usize, err: anyhow::Error| {
+            let class = classify_table_error(&err);
+            let mut entry = copy_table_error("t");
+            entry.task_index = Some(idx);
+            entry.failure_kind = class.failure_kind;
+            entry.cooldown_seconds = class.cooldown_seconds;
+            entry.may_still_run = class.may_still_run;
+            entry
+        };
+        let bq_503 = || BqE::ApiError {
+            status: "503 Service Unavailable".into(),
+            message: "unavailable".into(),
+        };
+        let trino_503 = || TrE::HttpStatus {
+            status: 503,
+            message: "unavailable".into(),
+        };
+        let errors = vec![
+            entry(
+                0,
+                wrapped(BqE::Abandoned {
+                    job_id: "j0".into(),
+                    cancel: AbandonCancel::Requested,
+                    cause: Box::new(BqE::Timeout { timeout_secs: 60 }),
+                }),
+            ),
+            entry(1, wrapped(BqE::Timeout { timeout_secs: 60 })),
+            entry(2, wrapped(BqE::NoJobReference)),
+            entry(
+                3,
+                wrapped(TrE::Abandoned {
+                    id: "q3".into(),
+                    cancel: AbandonCancel::NoAnswer,
+                    cause: Box::new(trino_503()),
+                }),
+            ),
+            entry(
+                4,
+                wrapped(TrE::Timeout {
+                    timeout_secs: 60,
+                    last_state: "RUNNING".into(),
+                }),
+            ),
+            // Ordinary transient failures of each adapter.
+            entry(5, wrapped(bq_503())),
+            entry(6, wrapped(trino_503())),
+        ];
+
+        assert_eq!(
+            super::auto_retry_indices(&errors),
+            vec![5, 6],
+            "only the ordinary failures are retried"
+        );
+        for retried in &errors[5..] {
+            assert_eq!(retried.failure_kind, FailureKind::Transient);
+        }
+        for skipped in &errors[..5] {
+            assert_eq!(skipped.failure_kind, FailureKind::Unknown);
+        }
+    }
+
     /// #2768: after the retry arm, a table it skipped because its statement
     /// may still run keeps its first error, so the run still reports it as
     /// failed. A retried table's first error is replaced by its retry's.

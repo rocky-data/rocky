@@ -999,7 +999,8 @@ impl From<&rocky_trino::connector::TrinoError> for FailureKind {
                 | "SERVER_SHUTTING_DOWN" => Self::Transient,
                 _ => Self::QueryRejected,
             },
-            E::Timeout { .. } => Self::Transient,
+            // See the databricks branch: the query may still run (#2768).
+            E::Timeout { .. } | E::Abandoned { .. } => Self::Unknown,
             E::MalformedResponse(_)
             | E::UntrustedNextUri { .. }
             | E::ArrowEncodingUnavailable
@@ -1054,7 +1055,8 @@ impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
             },
             E::TableNotFound { .. } => Self::NotFound,
             E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
-            E::Timeout { .. } => Self::Transient,
+            // See the databricks branch: the job may still run (#2768).
+            E::Timeout { .. } | E::Abandoned { .. } | E::NoJobReference => Self::Unknown,
             E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,
             E::StorageRead(_) => Self::Unknown,
         }
@@ -1221,7 +1223,8 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
 }
 
 /// One chain link's answer to [`statement_may_still_run`]: `Some` when the
-/// link is a Databricks or Snowflake `ConnectorError`, `None` otherwise.
+/// link is a Databricks, Snowflake, BigQuery or Trino connector error, `None`
+/// otherwise.
 fn cause_may_still_run(cause: &(dyn std::error::Error + 'static)) -> Option<bool> {
     if let Some(e) = cause.downcast_ref::<rocky_databricks::connector::ConnectorError>() {
         return Some(e.may_still_run());
@@ -1229,16 +1232,23 @@ fn cause_may_still_run(cause: &(dyn std::error::Error + 'static)) -> Option<bool
     if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
         return Some(e.may_still_run());
     }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        return Some(e.may_still_run());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some(e.may_still_run());
+    }
     None
 }
 
 /// Whether `err` carries a connector error that says its statement may still
-/// run on the warehouse (a Databricks or Snowflake `Timeout` or `Abandoned`).
+/// run on the warehouse (a Databricks, Snowflake, BigQuery or Trino `Timeout`
+/// or `Abandoned`, or a BigQuery `NoJobReference`).
 /// A caller must not resubmit that work: it could run twice (#2768).
 ///
 /// Walks the chain the way [`classify_anyhow_error`] does, through both
 /// `AdapterError` wrappers. The first connector error found decides.
-/// `false` when the chain holds no Databricks or Snowflake connector error.
+/// `false` when the chain holds no connector error of those four adapters.
 pub fn statement_may_still_run(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
         if let Some(answer) = cause_may_still_run(cause) {
@@ -15564,12 +15574,24 @@ mod failure_kind_tests {
                 },
                 FailureKind::QueryRejected,
             ),
+            // #2768: a query that may still run is never `Transient`.
             (
                 TrE::Timeout {
                     timeout_secs: 30,
                     last_state: "RUNNING".into(),
                 },
-                FailureKind::Transient,
+                FailureKind::Unknown,
+            ),
+            (
+                TrE::Abandoned {
+                    id: "q1".into(),
+                    cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
+                    cause: Box::new(TrE::HttpStatus {
+                        status: 503,
+                        message: String::new(),
+                    }),
+                },
+                FailureKind::Unknown,
             ),
             (
                 TrE::MalformedResponse("missing rows".into()),
@@ -15627,7 +15649,17 @@ mod failure_kind_tests {
                 },
                 FailureKind::QueryRejected,
             ),
-            (BqE::Timeout { timeout_secs: 30 }, FailureKind::Transient),
+            // #2768: a job that may still run is never `Transient`.
+            (BqE::Timeout { timeout_secs: 30 }, FailureKind::Unknown),
+            (
+                BqE::Abandoned {
+                    job_id: "j1".into(),
+                    cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
+                    cause: Box::new(api("503 Service Unavailable")),
+                },
+                FailureKind::Unknown,
+            ),
+            (BqE::NoJobReference, FailureKind::Unknown),
             (
                 BqE::RetryBudgetExhausted { limit: 3 },
                 FailureKind::QuotaExceeded,
