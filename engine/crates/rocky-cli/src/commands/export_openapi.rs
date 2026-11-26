@@ -1454,6 +1454,143 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/compliance",
+            operation_id: "getCompliance",
+            tag: "governor",
+            summary: "Classification versus masking",
+            description: "The classification-versus-masking rollup for the project: every \
+                 classified column, whether each environment masks it, and the exceptions. \
+                 The same bytes as `rocky compliance --output json`. Reads `rocky.toml` and \
+                 the models directory only: no state store, no warehouse.",
+            path_params: &[],
+            query_params: &[
+                QueryParam {
+                    name: "env",
+                    description: "Evaluate this environment only. Default: every environment.",
+                    allowed: &[],
+                },
+                QueryParam {
+                    name: "exceptions_only",
+                    description: "List only the exceptions. Default: false.",
+                    allowed: &["true", "false"],
+                },
+            ],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The compliance rollup.",
+                    body: Body::Component("ComplianceOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` or the models directory could not \
+                         be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/optimize",
+            operation_id: "getOptimize",
+            tag: "estate",
+            summary: "Materialization recommendations",
+            description: "Per-model materialization recommendations from production run \
+                 history, the models on disk and the `[cost]` pricing. The same bytes as \
+                 `rocky optimize --output json`. With no run history the recommendation list \
+                 is empty and says why. Reads only.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The recommendations.",
+                    body: Body::Component("OptimizeOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/runs/{id}/replay-check",
+            operation_id: "getRunReplayCheck",
+            tag: "history",
+            summary: "Replayability audit of one run",
+            description: "Whether each model of a recorded run could be re-executed from its \
+                 recording alone: provenance present, embedded IR parses, inputs resolvable, \
+                 plus a static non-determinism flag. The same bytes as `rocky replay <id> \
+                 --check --output json`. `id` may be `latest`. Nothing is executed or \
+                 written.",
+            path_params: &["id"],
+            query_params: &[QueryParam {
+                name: "model",
+                description: "Check this model of the run only.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The replayability verdicts.",
+                    body: Body::Component("ReplayCheckOutput"),
+                },
+                Resp {
+                    status: "404",
+                    description: "No run has this id (or `latest` and no run is recorded), \
+                         or the run did not execute `model`.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/recipes/{hash}/history",
+            operation_id: "getRecipeHistory",
+            tag: "history",
+            summary: "Every execution of one recipe",
+            description: "Every recorded execution of one exact program (a recipe hash) \
+                 across the 500 newest runs, newest run first. The same bytes as `rocky \
+                 history --recipe <hash> --output json`. An unknown hash is `200` with no \
+                 executions. Reads only.",
+            path_params: &["hash"],
+            query_params: &[QueryParam {
+                name: "since",
+                description: "Only runs that started at or after this: RFC 3339 or \
+                     `YYYY-MM-DD`.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The executions of the recipe.",
+                    body: Body::Component("RecipeHistoryOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/brief",
             operation_id: "getBrief",
             tag: "governor",
@@ -2045,6 +2182,10 @@ mod tests {
             "AuditScorecardOutput",
             "AuditForOutput",
             "AuditOutput",
+            "ComplianceOutput",
+            "OptimizeOutput",
+            "ReplayCheckOutput",
+            "RecipeHistoryOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -2117,6 +2258,10 @@ mod tests {
             ("/api/v1/audit/scorecard", "AuditScorecardOutput"),
             ("/api/v1/custody/{subject}", "AuditForOutput"),
             ("/api/v1/audit", "AuditOutput"),
+            ("/api/v1/compliance", "ComplianceOutput"),
+            ("/api/v1/optimize", "OptimizeOutput"),
+            ("/api/v1/runs/{id}/replay-check", "ReplayCheckOutput"),
+            ("/api/v1/recipes/{hash}/history", "RecipeHistoryOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

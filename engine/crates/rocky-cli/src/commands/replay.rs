@@ -70,11 +70,30 @@ fn resolve(store: &StateStore, target: &str) -> Result<RunRecord> {
         return runs
             .into_iter()
             .next()
-            .context("no runs recorded yet — nothing to replay");
+            .ok_or_else(|| ReplayLookupError::NoRuns.into());
     }
-    store
-        .get_run(target)?
-        .with_context(|| format!("no run with id '{target}' in the state store"))
+    store.get_run(target)?.ok_or_else(|| {
+        ReplayLookupError::RunNotFound {
+            target: target.to_string(),
+        }
+        .into()
+    })
+}
+
+/// A replay target that names nothing the state store holds. A typed error
+/// so the HTTP route can answer `404` for it instead of a `500`; the CLI
+/// renders the same message as before.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayLookupError {
+    /// `latest` was asked for and no run is recorded.
+    #[error("no runs recorded yet — nothing to replay")]
+    NoRuns,
+    /// No run carries this id.
+    #[error("no run with id '{target}' in the state store")]
+    RunNotFound { target: String },
+    /// The run exists but did not execute the filtered model.
+    #[error("run '{run_id}' did not execute model '{model}'")]
+    ModelNotInRun { run_id: String, model: String },
 }
 
 /// Execute `rocky replay`.
@@ -360,8 +379,29 @@ pub fn compute_replay_check(
 ) -> Result<ReplayCheckOutput> {
     let store = StateStore::open_read_only_or_empty(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    replay_check_from_store(&store, target, model_filter)
+}
 
-    let record = resolve(&store, target)?;
+/// [`compute_replay_check`] with a redb cache budget for the request-local
+/// open. The HTTP route opens, reads once and drops, so it passes a small
+/// budget (see `HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399).
+pub fn compute_replay_check_with_cache(
+    state_path: &Path,
+    target: &str,
+    model_filter: Option<&str>,
+    cache_bytes: usize,
+) -> Result<ReplayCheckOutput> {
+    let store = StateStore::open_read_only_or_empty_with_cache(state_path, cache_bytes)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    replay_check_from_store(&store, target, model_filter)
+}
+
+fn replay_check_from_store(
+    store: &StateStore,
+    target: &str,
+    model_filter: Option<&str>,
+) -> Result<ReplayCheckOutput> {
+    let record = resolve(store, target)?;
 
     let models: Vec<ReplayCheckModelOutput> = record
         .models_executed
@@ -370,13 +410,17 @@ pub fn compute_replay_check(
             Some(name) => m.model_name == name,
             None => true,
         })
-        .map(|m| classify_model(&store, &record.run_id, &m.model_name))
+        .map(|m| classify_model(store, &record.run_id, &m.model_name))
         .collect();
 
     if let Some(name) = model_filter
         && models.is_empty()
     {
-        anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
+        return Err(ReplayLookupError::ModelNotInRun {
+            run_id: record.run_id.clone(),
+            model: name.to_string(),
+        }
+        .into());
     }
 
     let replayable_count = models.iter().filter(|m| m.verdict == "replayable").count();

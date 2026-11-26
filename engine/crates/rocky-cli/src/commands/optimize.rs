@@ -25,7 +25,29 @@ pub fn optimize_output(
     model_filter: Option<&str>,
 ) -> Result<OptimizeOutput> {
     let store = StateStore::open_read_only_or_empty(state_path)?;
+    optimize_output_from_store(&store, config_path, models_dir, model_filter)
+}
 
+/// [`optimize_output`] with a redb cache budget for the request-local open.
+/// The HTTP route opens, reads once and drops, so it passes a small budget
+/// (see `HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399).
+pub fn optimize_output_with_cache(
+    state_path: &Path,
+    config_path: &Path,
+    models_dir: Option<&Path>,
+    model_filter: Option<&str>,
+    cache_bytes: usize,
+) -> Result<OptimizeOutput> {
+    let store = StateStore::open_read_only_or_empty_with_cache(state_path, cache_bytes)?;
+    optimize_output_from_store(&store, config_path, models_dir, model_filter)
+}
+
+fn optimize_output_from_store(
+    store: &StateStore,
+    config_path: &Path,
+    models_dir: Option<&Path>,
+    model_filter: Option<&str>,
+) -> Result<OptimizeOutput> {
     // `[cost]` pricing: read it from the loaded project config when one
     // exists, and fall back to `CostConfig::default()` only when the
     // project has no `rocky.toml` to read (#2056). `CostConfig::default()`
@@ -56,8 +78,7 @@ pub fn optimize_output(
     // they are most of the history right after an upgrade, and dropping them
     // would leave nothing to recommend from. `run_scope` in the output says
     // how many of each were read.
-    let (runs, run_scope) =
-        ProductionRunScope::read(&store, 100, UnrecordedScope::Count, |_| true)?;
+    let (runs, run_scope) = ProductionRunScope::read(store, 100, UnrecordedScope::Count, |_| true)?;
 
     if runs.is_empty() {
         let mut out = OptimizeOutput::empty("no production run history available");

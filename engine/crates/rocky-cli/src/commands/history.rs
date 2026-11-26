@@ -126,7 +126,7 @@ fn truncate_cell(s: &str, max: usize) -> String {
 
 /// Parse a `--since` filter string (RFC 3339 or `YYYY-MM-DD`) into a UTC
 /// timestamp. Shared by the run-level and model-level cores.
-fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+pub(crate) fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> {
     since
         .map(|s| {
             s.parse::<DateTime<Utc>>()
@@ -355,6 +355,26 @@ pub fn recipe_history_output(
     since: Option<&str>,
 ) -> Result<RecipeHistoryOutput> {
     let store = StateStore::open_read_only_or_empty(state_path)?;
+    recipe_history_from_store(&store, recipe_hash, since)
+}
+
+/// [`recipe_history_output`] with the request-local cache budget
+/// ([`HISTORY_REQUEST_CACHE_BYTES`], #1399), for the HTTP route.
+pub fn recipe_history_output_request_scoped(
+    state_path: &Path,
+    recipe_hash: &str,
+    since: Option<&str>,
+) -> Result<RecipeHistoryOutput> {
+    let store =
+        StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?;
+    recipe_history_from_store(&store, recipe_hash, since)
+}
+
+fn recipe_history_from_store(
+    store: &StateStore,
+    recipe_hash: &str,
+    since: Option<&str>,
+) -> Result<RecipeHistoryOutput> {
     let since_ts = parse_since(since)?;
 
     let runs = store.list_runs(RECIPE_SCAN_RUN_LIMIT)?;
