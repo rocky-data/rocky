@@ -75,6 +75,19 @@ Exit `1` is generic. It often means nothing materialized, but it can also fire *
 
 Exit `130` means an interrupt cut the run short, usually a deploy or a machine restart. Treat it as informational unless it repeats.
 
+**What an interrupt does to running statements.** The first signal stops new work. Rocky then waits for the statements already running, so their watermarks get written. A forced exit does not wait: a second signal, or a run that does not settle within 5 seconds. A watched run (`--watch`) that does not stop in its grace exits the same way. On a forced exit, Rocky asks the warehouse to cancel each statement it still waits on. It waits at most 3 seconds for those requests. It prints one line per statement on stderr.
+
+| Adapter | Cancels on a forced exit |
+|---------|--------------------------|
+| Databricks | Yes, once the statement has an id: after the first 30 seconds |
+| Snowflake | Yes, once the statement has a handle: after the first 45 seconds |
+| BigQuery, Trino | No. A later release adds it |
+| PostgreSQL, Redshift | No. The server statement timeout that Rocky sets from `timeout_secs` still stops it |
+| SQL Server, ClickHouse, Spark | No. The statement runs on |
+| DuckDB | Not needed. It runs inside the `rocky` process and ends with it |
+
+A Databricks or Snowflake statement younger than that limit has no id yet, so Rocky cannot cancel it. Other adapters do not cancel: they list no statements, so Rocky prints nothing for them. Only a forced exit cancels. A fan-out abort inside the run, a client timeout and a poll error do not cancel yet. Rocky stops waiting on such a statement, and the warehouse runs it on. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
+
 A small wrapper makes the routing explicit, and it is reusable across every scheduler:
 
 ```bash
@@ -602,7 +615,7 @@ The class judges the statements of a normal run. Other adapter types get the sam
 
 Run exactly one reconciler per project, meaning per state file. One `rocky tick` timer, or one `rocky serve --scheduler`. Not both, and not several.
 
-All of a reconciler's mutual exclusion is local to one machine. The `.rocky/tick.lock` flock and the state store's own writer lock both live on that host's filesystem, and neither can see a second host. Scheduler state (the cursor and claim tables) is deliberately local-only as well: a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it, and a download never overwrites it. Two hosts ticking the same project each keep an independent cursor, and both fire the same occurrence. Remote state is last-writer-wins today, with no cross-host compare-and-swap, so there is no fence to lean on across machines.
+All of a reconciler's mutual exclusion is local to one machine. The `.rocky/tick.lock` flock and the state store's own writer lock both live on that host's filesystem, and neither can see a second host. Scheduler state (the cursor and claim tables) is deliberately local-only as well: a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it, and a download never overwrites it. Two hosts ticking the same project each keep an independent cursor, and both fire the same occurrence. Remote state does not help here. On S3, GCS and tiered, the state upload uses compare-and-swap by default ([`concurrency_control`](/reference/configuration/#concurrent-writers)), so a writer that lost a race fails instead of erasing the winner. On Valkey the upload is last-writer-wins. Either way the scheduler tables are never uploaded, so no remote backend fences scheduling across machines.
 
 If you need timers on several hosts, give each host its own project and state file. Or keep a single timer, and let the other hosts invoke `rocky run` directly.
 
