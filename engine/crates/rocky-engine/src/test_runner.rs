@@ -2180,6 +2180,38 @@ mod tests {
         assert!(!dialect.ran_on_duckdb && !dialect.refused, "{dialect:?}");
     }
 
+    /// A model whose SQL DuckDB rejects did reach DuckDB: `ran_on_duckdb` is
+    /// `true` once the SQL is sent, whatever DuckDB answers.
+    #[test]
+    fn a_model_duckdb_rejects_is_marked_ran_on_duckdb() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        std::fs::write(
+            models.join("flagged.sql"),
+            "SELECT id, CAST('not a number' AS INTEGER) AS amount, true AS is_high FROM orders",
+        )
+        .unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &snowflake_target(),
+            false,
+        )
+        .unwrap();
+        let result = &run.results[0];
+        assert!(!result.passed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("model execution failed"),
+            "{result:?}"
+        );
+        let dialect = result.dialect.as_ref().expect("marked");
+        assert!(dialect.ran_on_duckdb && !dialect.refused, "{dialect:?}");
+    }
+
     /// No resolved target is never taken as DuckDB: the default mode runs and
     /// marks the test, strict mode refuses it.
     #[test]

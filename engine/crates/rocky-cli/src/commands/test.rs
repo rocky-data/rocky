@@ -106,7 +106,13 @@ fn dialect_warning(results: &[rocky_core::unit_test::UnitTestResult]) -> Option<
              DuckDB, not on their target warehouse (target: {named})"
         ));
     }
-    None
+    // Every marked test failed before its model's SQL reached DuckDB (a
+    // compile failure, a cycle, a fixture). They would still run on DuckDB.
+    Some(format!(
+        "warning: {} unit test(s) did not run; they would run on DuckDB, not on their \
+         target warehouse (target: {named}). --strict-dialect refuses them",
+        marked.len()
+    ))
 }
 
 /// Side-effect-free core of `rocky test` (DuckDB-based local tests): run the
@@ -1541,6 +1547,32 @@ mod tests {
         );
         let (tmp, models) = unit_test_project(DUCKDB_TOML);
         assert_eq!(super::dialect_warning(&unit_results(&tmp, &models)), None);
+    }
+
+    /// A marked test that never ran (a compile failure or an E058 cycle, not
+    /// a refusal) still gets the warning line.
+    #[test]
+    fn the_warning_prints_for_a_marked_test_that_did_not_run() {
+        use rocky_core::unit_test::{UnitTestDialect, UnitTestDialectStatus, UnitTestResult};
+        let not_run = UnitTestResult {
+            model: "flagged".to_string(),
+            test: "keeps_high".to_string(),
+            passed: false,
+            error: Some("model 'flagged' did not compile".to_string()),
+            mismatches: Vec::new(),
+            dialect: Some(UnitTestDialect {
+                status: UnitTestDialectStatus::NonDuckdbTarget,
+                targets: vec!["Snowflake".to_string()],
+                ran_on_duckdb: false,
+                refused: false,
+            }),
+        };
+        let warning = super::dialect_warning(&[not_run]).expect("warns");
+        assert!(
+            warning.starts_with("warning: 1 unit test(s) did not run"),
+            "{warning}"
+        );
+        assert!(warning.contains("Snowflake"), "{warning}");
     }
 
     /// A project with three pipelines — `transform` (models/**), `reporting`

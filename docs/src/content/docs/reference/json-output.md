@@ -402,7 +402,7 @@ When a model declares a fixture-driven `[[test]]` block, `rocky test --output js
 | `unit_tests.results[].dialect` | object, absent | Present only when the model does not target DuckDB alone. The test ran (or would run) on DuckDB. See [unit tests on a warehouse that is not DuckDB](/reference/commands/modeling/#unit-tests-on-a-warehouse-that-is-not-duckdb). |
 | `unit_tests.results[].dialect.status` | string | `non_duckdb_target`, `multiple_targets` or `unresolved_target`. |
 | `unit_tests.results[].dialect.targets` | array of strings | The model's target warehouses, such as `["Snowflake"]`. Empty when unresolved. |
-| `unit_tests.results[].dialect.ran_on_duckdb` | boolean | Whether the test ran on DuckDB. |
+| `unit_tests.results[].dialect.ran_on_duckdb` | boolean | `true` once the model's SQL was sent to DuckDB, even if DuckDB rejected it. `false` when the test failed before that. |
 | `unit_tests.results[].dialect.refused` | boolean | Whether `--strict-dialect` refused the test. A refused test has `passed: false`. |
 
 ### `test` and `ci` failures

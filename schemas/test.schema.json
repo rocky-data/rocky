@@ -278,7 +278,7 @@
       "description": "How the dialect a unit test ran on relates to the model's target warehouse.\n\n`rocky test` runs every unit test on an in-memory DuckDB. SQL that both DuckDB and the target accept can still behave differently on the target, so a pass here does not prove the model on its warehouse.",
       "properties": {
         "ran_on_duckdb": {
-          "description": "`true` when the test ran on DuckDB. `false` when it was not run: `--strict-dialect` refused it, or the model could not run at all.",
+          "description": "`true` once the model's SQL was sent to DuckDB, even if DuckDB rejected it. `false` when the test failed before that: a refusal by `--strict-dialect`, a compile failure, a dependency cycle, or a fixture, function or database setup failure.",
           "type": "boolean"
         },
         "refused": {

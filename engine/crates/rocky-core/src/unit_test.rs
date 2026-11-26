@@ -103,8 +103,10 @@ pub struct UnitTestDialect {
     /// an adapter with no dialect table, by adapter type (`clickhouse`).
     /// Empty when no target is known.
     pub targets: Vec<String>,
-    /// `true` when the test ran on DuckDB. `false` when it was not run:
-    /// `--strict-dialect` refused it, or the model could not run at all.
+    /// `true` once the model's SQL was sent to DuckDB, even if DuckDB
+    /// rejected it. `false` when the test failed before that: a refusal by
+    /// `--strict-dialect`, a compile failure, a dependency cycle, or a
+    /// fixture, function or database setup failure.
     pub ran_on_duckdb: bool,
     /// `true` when `--strict-dialect` refused the test instead of running it.
     pub refused: bool,
