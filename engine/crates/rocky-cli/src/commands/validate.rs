@@ -1309,12 +1309,16 @@ fn rerun_safety_message(
     cfg: &rocky_core::config::RockyConfig,
     config_path: &Path,
 ) -> Option<ValidateMessage> {
-    use rocky_core::rerun_safety::{RerunSafety, TargetWarehouse, classify_pipeline};
+    use rocky_core::hooks::HookRegistry;
+    use rocky_core::rerun_safety::{RerunSafety, TargetWarehouse, classify_pipeline, with_hooks};
 
     pc.schedule()?;
     let target = TargetWarehouse::from_adapter(cfg.adapters.get(pc.target_adapter()));
     let writes = resolve_rerun_writes(pc, cfg, config_path);
-    let class = classify_pipeline(pc, &target, &writes);
+    let class = with_hooks(
+        classify_pipeline(pc, &target, &writes),
+        HookRegistry::from_config(&cfg.hooks).shell_hook_count(),
+    );
     let message = match &class {
         RerunSafety::Safe => format!("pipeline.{name}: {}", class.class_name()),
         RerunSafety::NotSafe { reason } => {
@@ -1330,9 +1334,10 @@ fn rerun_safety_message(
     })
 }
 
-/// What a pipeline writes, for [`rerun_safety_message`]. Replication strategies
-/// go through the same builder `rocky run` uses; transformation models are
-/// loaded from this pipeline's own `models` glob.
+/// What a transformation pipeline builds, for [`rerun_safety_message`]: the
+/// models of this pipeline's own `models` glob, with the project functions
+/// each calls and whether it sets `[governance.tags]`. Every other pipeline
+/// type resolves nothing: the classifier needs no more than its config.
 ///
 /// This loads the models a second time. `validate_inner` loads them once more
 /// after the pipeline loop, but it flattens and deduplicates every pipeline's
@@ -1343,45 +1348,10 @@ fn resolve_rerun_writes(
     cfg: &rocky_core::config::RockyConfig,
     config_path: &Path,
 ) -> rocky_core::rerun_safety::ResolvedWrites {
-    use rocky_core::config::{
-        PipelineConfig, RECOGNIZED_REPLICATION_STRATEGIES, ResolvedTableOverride,
-    };
+    use rocky_core::config::PipelineConfig;
     use rocky_core::rerun_safety::{ResolvedModel, ResolvedWrites};
 
     match pc {
-        PipelineConfig::Replication(pipeline) => {
-            let mut overrides = vec![ResolvedTableOverride::default()];
-            for rule in &pipeline.table_overrides {
-                if rule.strategy.is_none() || rule.enabled == Some(false) {
-                    continue;
-                }
-                overrides.push(ResolvedTableOverride {
-                    strategy: rule.strategy.clone(),
-                    merge_keys: rule.merge_keys.clone(),
-                    merge_keys_fallback: rule.merge_keys_fallback.clone(),
-                    timestamp_column: rule.timestamp_column.clone(),
-                    enabled: None,
-                });
-            }
-            let strategies = overrides
-                .iter()
-                .map(|resolved| {
-                    let strategy = resolved
-                        .strategy
-                        .as_deref()
-                        .unwrap_or(pipeline.strategy.as_str());
-                    if !RECOGNIZED_REPLICATION_STRATEGIES.contains(&strategy) {
-                        return Err(format!(
-                            "strategy \"{}\" is not recognized",
-                            rocky_core::secret_registry::render_placeholders(strategy)
-                        ));
-                    }
-                    super::run::build_replication_strategy_with_override(pipeline, resolved)
-                        .map_err(|e| format!("{e:#}"))
-                })
-                .collect();
-            ResolvedWrites::Strategies(strategies)
-        }
         PipelineConfig::Transformation(pipeline) => {
             let dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path) {
                 Ok(crate::models_loader::ModelsDir::Present(dir)) => dir,
@@ -1402,20 +1372,33 @@ fn resolve_rerun_writes(
                 &glob,
                 Some(&cfg.freshness),
             ) {
-                Ok(models) => ResolvedWrites::Models(
-                    models
-                        .iter()
-                        .map(|model| ResolvedModel::from_ir(&model.to_model_ir()))
-                        .collect(),
-                ),
+                Ok(models) => {
+                    let (functions, _) = rocky_compiler::udf::load_for_models_dir(&dir);
+                    ResolvedWrites::Models(
+                        models
+                            .iter()
+                            .map(|model| ResolvedModel {
+                                name: model.config.name.clone(),
+                                strategy: model.to_model_ir().materialization,
+                                calls_functions: rocky_compiler::udf::model_calls(
+                                    &model.sql, &functions,
+                                )
+                                .into_iter()
+                                .collect(),
+                                has_governance_tags: !model.config.governance.tags.is_empty(),
+                            })
+                            .collect(),
+                    )
+                }
                 Err(e) => ResolvedWrites::Unresolved {
                     reason: format!("the models cannot be loaded: {e:#}"),
                 },
             }
         }
-        PipelineConfig::Quality(_) | PipelineConfig::Snapshot(_) | PipelineConfig::Load(_) => {
-            ResolvedWrites::NotNeeded
-        }
+        PipelineConfig::Replication(_)
+        | PipelineConfig::Quality(_)
+        | PipelineConfig::Snapshot(_)
+        | PipelineConfig::Load(_) => ResolvedWrites::NotNeeded,
     }
 }
 
@@ -6357,9 +6340,23 @@ auto_create_catalogs = false
         out.messages.iter().filter(|m| m.code == "V069").collect()
     }
 
+    fn v069_message(adapter_type: &str, strategy: &str) -> String {
+        v069_message_for(&scheduled_transformation(adapter_type, strategy))
+    }
+
+    fn v069_message_for(dir: &tempfile::TempDir) -> String {
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert_eq!(hits[0].severity, "ok");
+        hits[0].message.clone()
+    }
+
+    const EPHEMERAL: &str = "[strategy]\ntype = \"ephemeral\"\n";
+
     #[test]
-    fn a_scheduled_pipeline_reports_its_rerun_safety_class() {
-        let dir = scheduled_transformation("duckdb", "");
+    fn an_ephemeral_only_pipeline_is_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
         let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
         let hits = v069(&out);
         assert_eq!(hits.len(), 1, "{:?}", out.messages);
@@ -6368,26 +6365,35 @@ auto_create_catalogs = false
         assert_eq!(hits[0].field.as_deref(), Some("pipeline.silver.schedule"));
     }
 
+    /// A full refresh is a write, so it is not safe on any adapter: it can
+    /// read another model of its pipeline and mix two runs' inputs.
+    #[test]
+    fn a_full_refresh_model_is_not_rerun_safe() {
+        for adapter_type in ["duckdb", "databricks"] {
+            let message = v069_message(adapter_type, "");
+            assert!(
+                message
+                    .starts_with("pipeline.silver: not_rerun_safe (model 'orders': full_refresh")
+                    && message.contains("lineage cannot prove no self-read"),
+                "{adapter_type}: {message}"
+            );
+        }
+    }
+
     #[test]
     fn a_delete_insert_model_on_databricks_is_not_rerun_safe() {
-        let dir = scheduled_transformation(
+        let message = v069_message(
             "databricks",
             "[strategy]\ntype = \"delete_insert\"\npartition_by = [\"id\"]\n",
         );
-        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
-        let hits = v069(&out);
-        assert_eq!(hits.len(), 1, "{:?}", out.messages);
         assert!(
-            hits[0]
-                .message
-                .starts_with("pipeline.silver: not_rerun_safe (model 'orders': delete_insert"),
-            "{}",
-            hits[0].message
+            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': delete_insert"),
+            "{message}"
         );
     }
 
     #[test]
-    fn a_scheduled_replication_incremental_pipeline_is_not_rerun_safe() {
+    fn a_scheduled_replication_pipeline_is_not_rerun_safe() {
         let out = validate_toml(&trigger_toml(
             "",
             "",
@@ -6398,103 +6404,98 @@ auto_create_catalogs = false
         assert!(
             hits[0]
                 .message
-                .starts_with("pipeline.raw: not_rerun_safe (replication incremental"),
+                .starts_with("pipeline.raw: not_rerun_safe (a replication pipeline writes"),
             "{}",
             hits[0].message
         );
     }
 
-    fn v069_message(adapter_type: &str, strategy: &str) -> String {
-        v069_message_for(&scheduled_transformation(adapter_type, strategy))
-    }
-
-    fn v069_message_for(dir: &tempfile::TempDir) -> String {
-        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
-        let hits = v069(&out);
-        assert_eq!(hits.len(), 1, "{:?}", out.messages);
-        hits[0].message.clone()
-    }
-
     /// The loader lowers a declared `microbatch` to `time_interval`, so the
-    /// class V069 prints for it is the time_interval class. Neither is safe,
-    /// on a DuckDB file either: a row the model returns outside the window
-    /// is inserted again on every run.
+    /// class V069 prints for it is the time_interval class.
     #[test]
     fn time_interval_and_microbatch_models_are_not_rerun_safe() {
         let microbatch = "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n";
         let interval =
             "[strategy]\ntype = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"hour\"\n";
-        for adapter_type in ["duckdb", "databricks"] {
-            let message = v069_message(adapter_type, interval);
-            assert_eq!(
-                v069_message(adapter_type, microbatch),
-                message,
-                "{adapter_type}"
-            );
-            assert!(
-                message
-                    .starts_with("pipeline.silver: not_rerun_safe (model 'orders': time_interval")
-                    && message.contains("outside the window"),
-                "{adapter_type}: {message}"
-            );
-        }
-    }
-
-    /// A merge on a DuckDB file is not safe: the join `t.k = s.k` never
-    /// matches a NULL key, so a NULL-key row is inserted again on every run.
-    #[test]
-    fn a_merge_model_on_a_duckdb_file_is_not_rerun_safe() {
-        let message = v069_message(
-            "duckdb",
-            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n",
-        );
+        let message = v069_message("duckdb", interval);
+        assert_eq!(v069_message("duckdb", microbatch), message);
         assert!(
-            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': merge")
-                && message.contains("NULL unique_key"),
+            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': time_interval")
+                && message.contains("a row outside the window"),
             "{message}"
         );
     }
 
-    /// An incremental model is never rerun-safe on a DuckDB file, with or
-    /// without a unique_key or a lookback.
     #[test]
-    fn a_loaded_incremental_model_is_never_rerun_safe_on_duckdb() {
+    fn merge_and_incremental_models_are_not_rerun_safe() {
+        let merge = v069_message(
+            "duckdb",
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\n",
+        );
+        assert!(
+            merge.starts_with("pipeline.silver: not_rerun_safe (model 'orders': merge")
+                && merge.contains("a NULL key re-inserts on every run"),
+            "{merge}"
+        );
         let base = "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n";
-        for (extra, hole) in [
-            ("", "no unique_key"),
-            ("lookback = \"0 days\"\n", "no unique_key"),
-            ("lookback = \"3 days\"\n", "lookback"),
-            ("unique_key = [\"id\"]\n", "NULL key"),
-            ("unique_key = [\"id\"]\nlookback = \"3 days\"\n", "NULL key"),
-        ] {
+        for extra in ["", "lookback = \"3 days\"\n", "unique_key = [\"id\"]\n"] {
             let message = v069_message("duckdb", &format!("{base}{extra}"));
             assert!(
                 message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': incremental")
-                    && message.contains(hole),
+                    && message.contains("a lookback or a filter on another column"),
                 "{extra:?}: {message}"
             );
         }
     }
 
-    /// A full refresh that reads its own target builds on the previous run,
-    /// so it is not safe. The same model reading another schema's table of
-    /// that name is.
+    /// A scheduled quality pipeline on DuckDB, with `checks` appended.
+    fn scheduled_quality(checks: &str) -> String {
+        format!(
+            r#"
+[adapter.wh]
+type = "duckdb"
+path = "x.db"
+
+[pipeline.q]
+type = "quality"
+
+[pipeline.q.target]
+adapter = "wh"
+
+[pipeline.q.schedule]
+cron = "0 * * * *"
+
+[pipeline.q.checks]
+enabled = true
+{checks}
+"#
+        )
+    }
+
+    fn v069_toml(toml: &str) -> String {
+        let out = validate_toml(toml);
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        hits[0].message.clone()
+    }
+
     #[test]
-    fn a_full_refresh_model_that_reads_its_own_target_is_not_rerun_safe() {
-        let own = scheduled_transformation_sql(
-            "duckdb",
-            "",
-            "SELECT id, ts FROM raw.orders UNION ALL SELECT id, ts FROM c.s.orders",
-        );
-        let message = v069_message_for(&own);
+    fn a_quality_pipeline_is_safe_unless_it_quarantines_or_runs_custom_sql() {
+        assert_eq!(v069_toml(&scheduled_quality("")), "pipeline.q: rerun_safe");
+        let quarantine = v069_toml(&scheduled_quality(
+            "[pipeline.q.checks.quarantine]\nenabled = true\nmode = \"split\"\n",
+        ));
         assert!(
-            message.starts_with(
-                "pipeline.silver: not_rerun_safe (model 'orders' reads its own output"
-            ),
-            "{message}"
+            quarantine.starts_with("pipeline.q: not_rerun_safe (quarantine"),
+            "{quarantine}"
         );
-        let other = scheduled_transformation_sql("duckdb", "", "SELECT id, ts FROM raw.orders");
-        assert_eq!(v069_message_for(&other), "pipeline.silver: rerun_safe");
+        let custom = v069_toml(&scheduled_quality(
+            "[[pipeline.q.checks.custom]]\nname = \"c\"\nsql = \"SELECT 1\"\n",
+        ));
+        assert!(
+            custom.starts_with("pipeline.q: not_rerun_safe (a [[checks.custom]] check"),
+            "{custom}"
+        );
     }
 
     /// A scheduled full-refresh replication pipeline on DuckDB, with
@@ -6531,28 +6532,91 @@ cron = "0 * * * *"
         )
     }
 
-    /// The custom-check guard, through the real `rocky validate` call site.
-    /// Without the check the same pipeline is safe, so the check is what
-    /// makes it not safe.
+    /// The replication reason names the custom check SQL only when the
+    /// pipeline has one, through the real `rocky validate` call site.
     #[test]
-    fn a_replication_pipeline_with_a_custom_check_is_not_rerun_safe_in_validate() {
-        let plain = validate_toml(&scheduled_full_refresh_replication(""));
-        let hits = v069(&plain);
-        assert_eq!(hits.len(), 1, "{:?}", plain.messages);
-        assert_eq!(hits[0].message, "pipeline.raw: rerun_safe");
-
-        let checked = validate_toml(&scheduled_full_refresh_replication(
+    fn a_replication_pipeline_with_a_custom_check_names_it_in_validate() {
+        let plain = v069_toml(&scheduled_full_refresh_replication(""));
+        assert!(
+            plain.starts_with("pipeline.raw: not_rerun_safe (") && !plain.contains("checks.custom"),
+            "{plain}"
+        );
+        let checked = v069_toml(&scheduled_full_refresh_replication(
             "[[pipeline.raw.checks.custom]]\nname = \"c\"\nsql = \"DELETE FROM t\"\n",
         ));
-        let hits = v069(&checked);
-        assert_eq!(hits.len(), 1, "{:?}", checked.messages);
         assert!(
-            hits[0]
-                .message
-                .starts_with("pipeline.raw: not_rerun_safe (")
-                && hits[0].message.contains("checks.custom"),
-            "{}",
-            hits[0].message
+            checked.starts_with("pipeline.raw: not_rerun_safe (")
+                && checked.contains("checks.custom"),
+            "{checked}"
+        );
+    }
+
+    /// A `[hook.*]` shell command can write anything, so it makes an
+    /// otherwise safe pipeline not safe. A webhook runs no warehouse
+    /// statement, so it does not.
+    #[test]
+    fn a_shell_hook_makes_a_safe_pipeline_not_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        let path = dir.path().join("rocky.toml");
+        let base = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(v069_message_for(&dir), "pipeline.silver: rerun_safe");
+
+        std::fs::write(
+            &path,
+            format!("{base}\n[hook.on_pipeline_complete]\ncommand = \"./notify.sh\"\n"),
+        )
+        .unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (a [hook.*] shell command"),
+            "{message}"
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "{base}\n[hook.webhooks.on_pipeline_complete]\nurl = \"https://example.com/h\"\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(v069_message_for(&dir), "pipeline.silver: rerun_safe");
+    }
+
+    /// A run creates the project functions an ephemeral model calls, and
+    /// tags every model, so neither is a pipeline that writes nothing.
+    #[test]
+    fn an_ephemeral_model_with_a_function_or_tags_is_not_rerun_safe() {
+        let tagged = scheduled_transformation(
+            "duckdb",
+            &format!("{EPHEMERAL}\n[governance.tags]\ndomain = \"finance\"\n"),
+        );
+        let message = v069_message_for(&tagged);
+        assert!(
+            message.starts_with(
+                "pipeline.silver: not_rerun_safe (model 'orders' sets [governance.tags]"
+            ),
+            "{message}"
+        );
+
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        assert_eq!(v069_message_for(&dir), "pipeline.silver: rerun_safe");
+        std::fs::write(
+            dir.path().join("models").join("orders.sql"),
+            "SELECT id, cents_to_dollars(id) AS d FROM raw.orders",
+        )
+        .unwrap();
+        let functions = dir.path().join("functions");
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("cents_to_dollars.toml"),
+            "returns = \"DOUBLE\"\n[[arguments]]\nname = \"cents\"\ntype = \"BIGINT\"\n",
+        )
+        .unwrap();
+        std::fs::write(functions.join("cents_to_dollars.sql"), "cents / 100.0").unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.contains("calls the project function 'cents_to_dollars'"),
+            "{message}"
         );
     }
 

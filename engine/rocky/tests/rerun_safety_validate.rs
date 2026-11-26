@@ -13,8 +13,8 @@ fn rocky(dir: &Path, args: &[&str]) -> Output {
         .expect("spawn rocky")
 }
 
-/// Two scheduled transformation pipelines on DuckDB: `safe` builds a
-/// full-refresh model, `unsafe_` a snapshot model. `manual` has no schedule.
+/// Two scheduled transformation pipelines on DuckDB: `safe` builds an
+/// ephemeral model (it writes nothing), `unsafe_` a snapshot model. `manual` has no schedule.
 fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let toml = r#"[adapter]
@@ -57,7 +57,7 @@ models = "safe/**"
         )
         .expect("write sql");
     };
-    model("safe", "orders", "");
+    model("safe", "orders", "[strategy]\ntype = \"ephemeral\"\n");
     model(
         "history",
         "orders_history",
@@ -79,7 +79,7 @@ fn validate_prints_each_scheduled_pipelines_rerun_safety_class() {
     );
     assert!(
         stdout.contains(
-            "  ok  pipeline.unsafe_: not_rerun_safe (model 'orders_history': a snapshot model"
+            "  ok  pipeline.unsafe_: not_rerun_safe (model 'orders_history': snapshot: it closes"
         ),
         "{stdout}"
     );
