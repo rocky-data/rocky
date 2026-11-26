@@ -19,7 +19,7 @@ The evaluator reads `(principal, capability, model attributes)` and returns one 
 |---|---|
 | `allow` | Runs. |
 | `deny` | Refuses before any write, and exits 1. |
-| `require_review` | Refuses before any write, and exits 1. A one-step run has no plan to review. Use a reviewed plan (`rocky plan`, `rocky review`, `rocky apply <plan-id>`). When the verdict comes from `default_agent_effect`, not from a `run` rule, you can also build on a branch and promote it. A retry whose `--idempotency-key` already completed still reports `skipped_idempotent` and exits 0: a skip writes nothing. |
+| `require_review` | Refuses before any write, and exits 1. A one-step run has no plan to review. Use a reviewed plan (`rocky plan`, `rocky review`, `rocky apply <plan-id>`). When the verdict comes from `default_agent_effect`, not from a `run` rule, you can also build on a branch and promote it. A retry whose `--idempotency-key` already completed still reports `skipped_idempotent` and exits 0: a skip writes no table. |
 
 A `rocky run --branch <name>` writes branch schemas, not production. `default_agent_effect` does not apply to it: only an explicit `run` rule governs it, so an agent can still build a branch and propose it with `rocky plan promote` under `default_agent_effect = "deny"`.
 
