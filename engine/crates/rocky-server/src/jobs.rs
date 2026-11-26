@@ -98,11 +98,20 @@ impl Drop for PermitGuard {
 /// message's reply channel whether a signal was delivered, so the route never
 /// claims a stop that did not happen.
 ///
-/// The first delivered request for a job is a
+/// The first two delivered requests for a job are each a
 /// [`Terminate`](rocky_core::process::GroupSignal::Terminate); any later one
 /// is a [`Kill`](rocky_core::process::GroupSignal::Kill). The first asks
-/// `rocky run` to stop cleanly; the second is the "stop now" for a child that
-/// does not.
+/// `rocky run` to stop cleanly. The second is its forced exit: it cancels the
+/// warehouse statements it still waits on, then exits. A kill would skip that
+/// and leave them running. The job's task kills the child itself if it has
+/// not exited a bounded wait after the second terminate; a third request
+/// kills at once.
+///
+/// ```text
+///   request 1 ──▶ SIGTERM  (drain)
+///   request 2 ──▶ SIGTERM  (forced exit: cancel statements) ──▶ wait ──▶ SIGKILL
+///   request 3 ──▶ SIGKILL
+/// ```
 ///
 /// A job is registered from submission until its terminal record is
 /// written ([`CancelGuard`] drops then). Its task closes the channel as soon
@@ -178,15 +187,15 @@ impl JobCancels {
         )
     }
 
-    /// Ask the job's task to signal its child: a terminate until one has been
-    /// delivered, a kill after that. Call [`delivered`](Self::delivered) when
+    /// Ask the job's task to signal its child: a terminate until two have
+    /// been delivered, a kill after that. Call [`delivered`](Self::delivered) when
     /// the task answers `true`.
     pub fn request(&self, job_id: &str) -> CancelRequest {
         let slots = self.slots.lock().expect("job cancels mutex poisoned");
         let Some(slot) = slots.get(job_id) else {
             return CancelRequest::NotRegistered;
         };
-        let signal = if slot.delivered == 0 {
+        let signal = if slot.delivered < 2 {
             rocky_core::process::GroupSignal::Terminate
         } else {
             rocky_core::process::GroupSignal::Kill
@@ -198,8 +207,8 @@ impl JobCancels {
         CancelRequest::Sent(signal, answer)
     }
 
-    /// Record that the job's task delivered a signal, so the next request
-    /// escalates to a kill.
+    /// Record that the job's task delivered a signal. After two, the next
+    /// request escalates to a kill.
     pub fn delivered(&self, job_id: &str) {
         if let Some(slot) = self
             .slots
@@ -801,8 +810,10 @@ mod tests {
         }
     }
 
-    /// Requests terminate until one is delivered, then kill. A request the
-    /// task did not deliver does not escalate. A job whose receiver is gone
+    /// Requests terminate until two are delivered, then kill: the second
+    /// terminate is the child's forced exit, which cancels its warehouse
+    /// statements before it exits (#2768). A request the task did not
+    /// deliver does not escalate. A job whose receiver is gone
     /// is settling; a job whose guard dropped is unknown.
     #[test]
     fn cancel_requests_escalate_only_after_a_delivery() {
@@ -816,6 +827,12 @@ mod tests {
             sent_signal(&cancels.request("j")),
             GroupSignal::Terminate,
             "nothing was delivered yet, so no escalation"
+        );
+        cancels.delivered("j");
+        assert_eq!(
+            sent_signal(&cancels.request("j")),
+            GroupSignal::Terminate,
+            "the second delivery is a terminate too, so the child's cancel hook runs"
         );
         cancels.delivered("j");
         assert_eq!(sent_signal(&cancels.request("j")), GroupSignal::Kill);
@@ -843,6 +860,8 @@ mod tests {
         assert_eq!(a.try_recv().unwrap().0, GroupSignal::Terminate);
         assert!(a.try_recv().is_err(), "one terminate, not two");
         assert!(b.try_recv().is_err(), "b was already signalled");
+        assert_eq!(sent_signal(&cancels.request("a")), GroupSignal::Terminate);
+        cancels.delivered("a");
         assert_eq!(sent_signal(&cancels.request("a")), GroupSignal::Kill);
     }
 }

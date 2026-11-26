@@ -4348,7 +4348,7 @@ async fn execute_job_subprocess(
         &request,
     );
 
-    let output = match run_job_child(cmd, cancel).await {
+    let output = match run_job_child(cmd, cancel, FORCED_EXIT_KILL_AFTER).await {
         Ok(output) => output,
         Err(e) => {
             return (
@@ -4435,12 +4435,19 @@ struct JobChildOutput {
 /// Elsewhere there is no process group and no terminate signal: a cancel kills the
 /// child alone (`Child::start_kill`).
 ///
+/// A second delivered terminate is the child's forced exit: `rocky run`
+/// cancels the warehouse statements it still waits on, then exits. If the
+/// child is still running `kill_after` later, this sends the kill itself.
+/// That keeps a child that ignores the terminate (or never reaches its
+/// settle step) from running on, without skipping the cancel hook.
+///
 /// stdin is closed and stdout and stderr are read to the end in parallel with
 /// the wait, as `Command::output` did, so a child that writes more than a pipe
 /// buffer never blocks.
 async fn run_job_child(
     mut cmd: tokio::process::Command,
     mut cancel: tokio::sync::mpsc::UnboundedReceiver<CancelMessage>,
+    kill_after: std::time::Duration,
 ) -> std::io::Result<JobChildOutput> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -4471,6 +4478,9 @@ async fn run_job_child(
 
     let mut signalled = None;
     let mut cancel_open = true;
+    let mut terminates_delivered = 0u32;
+    // Armed by the second delivered terminate: when the child must be gone.
+    let mut kill_at: Option<tokio::time::Instant> = None;
     let status = loop {
         tokio::select! {
             status = child.wait() => break status,
@@ -4478,17 +4488,35 @@ async fn run_job_child(
                 Some((signal, reply)) => {
                     let delivered = signal_job_child(&mut child, signal);
                     if delivered {
-                        signalled = Some(match (signalled, signal) {
-                            (Some(GroupSignal::Kill), _) | (_, GroupSignal::Kill) => GroupSignal::Kill,
-                            (Some(GroupSignal::Terminate) | None, GroupSignal::Terminate) => {
-                                GroupSignal::Terminate
+                        signalled = Some(strongest(signalled, signal));
+                        match signal {
+                            GroupSignal::Terminate => {
+                                terminates_delivered += 1;
+                                if terminates_delivered >= 2 && kill_at.is_none() {
+                                    kill_at = Some(tokio::time::Instant::now() + kill_after);
+                                }
                             }
-                        });
+                            GroupSignal::Kill => kill_at = None,
+                        }
                     }
                     let _ = reply.send(delivered);
                 }
                 None => cancel_open = false,
             },
+            () = async {
+                if let Some(at) = kill_at {
+                    tokio::time::sleep_until(at).await;
+                }
+            }, if kill_at.is_some() => {
+                kill_at = None;
+                tracing::warn!(
+                    kill_after_secs = kill_after.as_secs(),
+                    "a job child did not exit after its forced-exit terminate; killing it"
+                );
+                if signal_job_child(&mut child, GroupSignal::Kill) {
+                    signalled = Some(GroupSignal::Kill);
+                }
+            }
         }
     };
     // The child has exited, so nothing is left to signal. Close the channel
@@ -4505,6 +4533,14 @@ async fn run_job_child(
         stderr: stderr.await.unwrap_or_default(),
         signalled,
     })
+}
+
+/// The stronger of the signal already delivered and the new one.
+fn strongest(signalled: Option<GroupSignal>, signal: GroupSignal) -> GroupSignal {
+    match (signalled, signal) {
+        (Some(GroupSignal::Kill), _) | (_, GroupSignal::Kill) => GroupSignal::Kill,
+        (Some(GroupSignal::Terminate) | None, GroupSignal::Terminate) => GroupSignal::Terminate,
+    }
 }
 
 /// Deliver `signal` to a job child that has not been reaped. `false` when
@@ -4541,6 +4577,12 @@ fn signal_job_child(child: &mut tokio::process::Child, signal: GroupSignal) -> b
 /// loop, so this bounds only a wedged runtime.
 const CANCEL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a job child may run after its second terminate (its forced
+/// exit) before its task kills it. Longer than the child's own cancel step
+/// (`CANCEL_ON_EXIT_BUDGET`, 3 s), so the warehouse statements it still waits
+/// on get their cancel requests first.
+const FORCED_EXIT_KILL_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// How long `rocky serve` waits at shutdown for its jobs' tasks to deliver
 /// the terminate signal before the process exits.
 const SHUTDOWN_TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -4548,8 +4590,11 @@ const SHUTDOWN_TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// `POST /api/v1/jobs/{id}/cancel` — stop a job this server process started.
 ///
 /// The first request sends the child's process group `SIGTERM`, which
-/// `rocky run` handles like Ctrl-C; once that has been delivered, a later
-/// request sends `SIGKILL`. Returns `202 {job_id, signal}` only after the
+/// `rocky run` handles like Ctrl-C. The second sends `SIGTERM` again, which
+/// `rocky run` takes as a forced exit: it cancels the warehouse statements it
+/// still waits on, then exits. If the child has not exited
+/// [`FORCED_EXIT_KILL_AFTER`] later, its task sends `SIGKILL`. A third
+/// request sends `SIGKILL` at once. Returns `202 {job_id, signal}` only after the
 /// job's task reports the signal delivered; a child that exited first is a
 /// `409 job_not_running`. The job's final state, read at
 /// `GET /api/v1/jobs/{id}`, says what happened: `cancelled` when the child
@@ -13967,11 +14012,13 @@ adapter = "db"
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (message, answer) = cancel_message(GroupSignal::Terminate);
         tx.send(message).unwrap();
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(10), run_job_child(cmd, rx))
-                .await
-                .expect("the cancelled child must exit long before `sleep 30` would")
-                .expect("spawn sleep");
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_job_child(cmd, rx, FORCED_EXIT_KILL_AFTER),
+        )
+        .await
+        .expect("the cancelled child must exit long before `sleep 30` would")
+        .expect("spawn sleep");
         assert!(answer.await.unwrap(), "the task reports the delivery");
         assert!(!output.status.success());
         assert_eq!(output.signalled, Some(GroupSignal::Terminate));
@@ -13991,7 +14038,7 @@ adapter = "db"
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg("trap '' INT; sleep 30 & wait");
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let run = tokio::spawn(run_job_child(cmd, rx));
+        let run = tokio::spawn(run_job_child(cmd, rx, FORCED_EXIT_KILL_AFTER));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let (message, answer) = cancel_message(GroupSignal::Terminate);
         tx.send(message).unwrap();
@@ -14015,7 +14062,7 @@ adapter = "db"
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 30 & wait");
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let run = tokio::spawn(run_job_child(cmd, rx));
+        let run = tokio::spawn(run_job_child(cmd, rx, FORCED_EXIT_KILL_AFTER));
         // Let the shell start its background sleep before the kill lands.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let (message, answer) = cancel_message(GroupSignal::Kill);
@@ -14026,6 +14073,41 @@ adapter = "db"
             .unwrap()
             .expect("spawn sh");
         assert!(answer.await.unwrap());
+        assert!(!output.status.success());
+        assert_eq!(output.signalled, Some(GroupSignal::Kill));
+    }
+
+    /// #2768: the second terminate is the child's forced exit, so the task
+    /// does not kill at once. It kills a child still running `kill_after`
+    /// later. One terminate alone never arms the kill.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_still_running_after_its_second_terminate_is_killed_after_the_wait() {
+        let mut cmd = tokio::process::Command::new("sh");
+        // TERM ignored by the shell and, inherited, by the sleep.
+        cmd.arg("-c").arg("trap '' TERM; sleep 30");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let kill_after = std::time::Duration::from_millis(300);
+        let run = tokio::spawn(run_job_child(cmd, rx, kill_after));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let (message, answer) = cancel_message(GroupSignal::Terminate);
+        tx.send(message).unwrap();
+        assert!(answer.await.unwrap());
+        tokio::time::sleep(kill_after * 3).await;
+        assert!(
+            !run.is_finished(),
+            "one terminate must not arm the kill: the child is still draining"
+        );
+
+        let (message, answer) = cancel_message(GroupSignal::Terminate);
+        tx.send(message).unwrap();
+        assert!(answer.await.unwrap());
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the task must kill the child after the wait")
+            .unwrap()
+            .expect("spawn sh");
         assert!(!output.status.success());
         assert_eq!(output.signalled, Some(GroupSignal::Kill));
     }
@@ -14041,7 +14123,7 @@ adapter = "db"
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 3 & exit 0");
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let run = tokio::spawn(run_job_child(cmd, rx));
+        let run = tokio::spawn(run_job_child(cmd, rx, FORCED_EXIT_KILL_AFTER));
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
             !run.is_finished(),
@@ -14059,8 +14141,8 @@ adapter = "db"
 
     /// The route answers `202` only for a delivered signal. A request the
     /// task could not deliver (the child exited first) is
-    /// `409 job_not_running` and does not escalate the next one; after a
-    /// delivered terminate, the next request is a kill.
+    /// `409 job_not_running` and does not escalate the next one; after two
+    /// delivered terminates, the next request is a kill.
     #[tokio::test]
     async fn cancel_answers_202_only_for_a_delivered_signal() {
         let state = test_state();
@@ -14093,7 +14175,7 @@ adapter = "db"
         let body: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(body.code, "job_not_running");
 
-        for expected in ["terminate", "kill"] {
+        for expected in ["terminate", "terminate", "kill"] {
             let resp = cancel().await.unwrap();
             assert_eq!(resp.status(), 202);
             let body: serde_json::Value = resp.json().await.unwrap();
@@ -14103,6 +14185,7 @@ adapter = "db"
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
+                GroupSignal::Terminate,
                 GroupSignal::Terminate,
                 GroupSignal::Terminate,
                 GroupSignal::Kill
