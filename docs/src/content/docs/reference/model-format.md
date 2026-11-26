@@ -341,6 +341,8 @@ rows = [
 
 A test may declare several `[[test.given]]` blocks to mock more than one upstream, and a model may declare several `[[test]]` blocks.
 
+`rocky test` runs every `[[test]]` on DuckDB. For a model whose target warehouse is not DuckDB alone, each result says so, and `rocky test --strict-dialect` refuses the test. See [unit tests on a warehouse that is not DuckDB](/reference/commands/modeling/#unit-tests-on-a-warehouse-that-is-not-duckdb).
+
 ### `[columns.<name>]`
 
 Document what an output column means. Each `[columns.<name>]` table describes one column:
