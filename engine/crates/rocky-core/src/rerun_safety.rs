@@ -890,13 +890,13 @@ mod tests {
 
     #[test]
     fn a_replication_pipeline_with_a_custom_check_is_not_safe() {
-        let with_custom = pipeline(&format!(
+        let with_custom = pipeline(
             "type = \"replication\"\n\
              [source]\nadapter = \"src\"\n\
              [source.schema_pattern]\nprefix = \"src__\"\nseparator = \"__\"\ncomponents = [\"source\"]\n\
              [target]\nadapter = \"wh\"\ncatalog_template = \"c\"\nschema_template = \"s\"\n\
-             [[checks.custom]]\nname = \"c\"\nsql = \"DELETE FROM t\"\n"
-        ));
+             [[checks.custom]]\nname = \"c\"\nsql = \"DELETE FROM t\"\n",
+        );
         let safe = ResolvedWrites::Strategies(vec![Ok(MaterializationStrategy::FullRefresh)]);
         let class = classify_pipeline(&with_custom, &TargetWarehouse::Databricks, &safe);
         let RerunSafety::NotSafe { reason } = class else {
