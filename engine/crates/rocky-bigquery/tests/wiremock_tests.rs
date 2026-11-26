@@ -826,8 +826,8 @@ async fn poll_loop_completes_after_deferred_job() {
 }
 
 /// Deferred job (`jobComplete=false`) with **no** `jobReference` is
-/// unpollable — the connector returns an `ApiError` ("missing
-/// jobReference") rather than hanging or panicking.
+/// unpollable — the connector returns `NoJobReference` rather than hanging
+/// or panicking. The job may still run, so it is never resubmitted.
 #[tokio::test]
 async fn deferred_job_without_reference_errors_cleanly() {
     let server = MockServer::start().await;
@@ -841,21 +841,14 @@ async fn deferred_job_without_reference_errors_cleanly() {
         .mount(&server)
         .await;
 
-    let adapter = test_adapter(&server);
+    let adapter = retrying_adapter(&server, 3);
     let err = adapter
         .execute_query("SELECT 1")
         .await
         .expect_err("no jobReference to poll → error");
-    match as_bq_error(&err) {
-        BigQueryError::ApiError { status, message } => {
-            assert_eq!(status, "missing jobReference");
-            assert!(
-                message.contains("cannot poll"),
-                "message should explain the unpollable response, got: {message}"
-            );
-        }
-        other => panic!("expected ApiError(missing jobReference), got: {other:?}"),
-    }
+    let bq = as_bq_error(&err);
+    assert!(matches!(bq, BigQueryError::NoJobReference), "{bq:?}");
+    assert!(bq.may_still_run());
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,8 +1052,11 @@ async fn never_completing_job_times_out() {
         .await
         .expect_err("a never-completing job must time out, not hang");
     match as_bq_error(&err) {
-        BigQueryError::Timeout { timeout_secs } => assert_eq!(*timeout_secs, 1),
-        other => panic!("expected Timeout, got: {other:?}"),
+        BigQueryError::Abandoned { cause, .. } => assert!(
+            matches!(**cause, BigQueryError::Timeout { timeout_secs: 1 }),
+            "{cause:?}"
+        ),
+        other => panic!("expected Abandoned(Timeout), got: {other:?}"),
     }
 }
 
@@ -1911,9 +1907,13 @@ async fn load_job_poll_times_out_when_never_done() {
         .await
         .expect_err("a never-DONE load job must time out");
 
+    let BigQueryError::Abandoned { job_id, cause, .. } = &err else {
+        panic!("expected Abandoned, got: {err:?}");
+    };
+    assert_eq!(job_id, "load-stuck");
     assert!(
-        matches!(err, BigQueryError::Timeout { timeout_secs: 1 }),
-        "expected Timeout, got: {err:?}"
+        matches!(**cause, BigQueryError::Timeout { timeout_secs: 1 }),
+        "{cause:?}"
     );
 }
 
@@ -2103,4 +2103,289 @@ async fn describe_table_bare_numeric_satisfies_a_default_precision_contract() {
 
     let result = validate_contract_typed(&contract("price", "NUMERIC(38,9)"), &landed, gate);
     assert!(result.passed, "{result:?}");
+}
+
+// ---------------------------------------------------------------------------
+// (g) #2768: cancel on every path that stops waiting on a job
+// ---------------------------------------------------------------------------
+
+fn running_job(job_id: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "jobComplete": false,
+        "jobReference": {"projectId": "test-project", "jobId": job_id, "location": "EU"}
+    }))
+}
+
+fn finished_job(job_id: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "jobComplete": true,
+        "jobReference": {"projectId": "test-project", "jobId": job_id},
+        "schema": {"fields": [{"name": "n", "type": "INTEGER"}]},
+        "rows": [{"f": [{"v": "1"}]}],
+        "totalRows": "1"
+    }))
+}
+
+/// Mount the submit of `job_id` (exactly `submits` times; it answers with a
+/// running job) and its `jobs.cancel` (exactly `cancels` times).
+async fn mount_submit_and_cancel(server: &MockServer, job_id: &str, submits: u64, cancels: u64) {
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(running_job(job_id))
+        .expect(submits)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{JOBS_PATH}/{job_id}/cancel")))
+        .and(query_param("location", "EU"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "job": {"jobReference": {"projectId": "test-project", "jobId": job_id}}
+        })))
+        .expect(cancels)
+        .mount(server)
+        .await;
+}
+
+fn queries_path(job_id: &str) -> String {
+    format!("{QUERIES_PATH}/{job_id}")
+}
+
+/// #2768: the submit asks BigQuery to wait at most 1 s, so a slow job comes
+/// back with its id at once. It is listed in flight while the first poll is
+/// still open, and unlisted once it ends.
+#[tokio::test]
+async fn the_job_is_listed_before_the_first_poll_ends() {
+    use rocky_core::statement_cancel::StatementHandle;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .and(body_partial_json(json!({"timeoutMs": 1000})))
+        .respond_with(running_job("job-young"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-young")))
+        .respond_with(finished_job("job-young").set_delay(std::time::Duration::from_secs(1)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = std::sync::Arc::new(test_adapter(&server));
+    let running = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.execute_query("SELECT 1 AS n").await })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while adapter.in_flight_statements().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "never listed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        adapter.in_flight_statements(),
+        vec![StatementHandle::new("job-young")]
+    );
+    assert!(
+        !running.is_finished(),
+        "listed while the first poll is open"
+    );
+    running.await.unwrap().unwrap();
+    assert!(adapter.in_flight_statements().is_empty());
+}
+
+/// #2768: what a forced exit does. A running job is listed through the
+/// adapter, and cancelling the listed handle sends `jobs.cancel`.
+#[tokio::test]
+async fn a_forced_exit_cancels_a_listed_job() {
+    use rocky_core::statement_cancel::CancelOutcome;
+
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-forced", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-forced")))
+        .respond_with(finished_job("job-forced").set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+
+    let adapter = std::sync::Arc::new(test_adapter(&server));
+    let running = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move { adapter.execute_statement("INSERT INTO t SELECT 1").await })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while adapter.in_flight_statements().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "never listed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for handle in adapter.in_flight_statements() {
+        assert_eq!(
+            adapter.cancel_statement(&handle).await.unwrap(),
+            CancelOutcome::Requested
+        );
+    }
+    running.abort();
+    // `.expect(1)` on the cancel mock asserts the request on drop.
+}
+
+/// #2768: the client deadline cancels the job and does not resubmit it,
+/// even with retries left. The run loop does not retry it either.
+#[tokio::test]
+async fn the_client_deadline_cancels_and_does_not_resubmit() {
+    use rocky_core::failure_class::FailureClass;
+
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-slow", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-slow")))
+        .respond_with(running_job("job-slow"))
+        .mount(&server)
+        .await;
+
+    let adapter = retrying_adapter(&server, 3).with_timeout(1);
+    let err = adapter
+        .execute_statement("MERGE INTO t USING s ON TRUE WHEN MATCHED THEN DELETE")
+        .await
+        .unwrap_err();
+    match as_bq_error(&err) {
+        BigQueryError::Abandoned {
+            job_id,
+            cancel,
+            cause,
+        } => {
+            assert_eq!(job_id, "job-slow");
+            assert_eq!(
+                *cancel,
+                rocky_core::statement_cancel::AbandonCancel::Requested
+            );
+            assert!(
+                matches!(**cause, BigQueryError::Timeout { .. }),
+                "{cause:?}"
+            );
+        }
+        other => panic!("expected Abandoned, got: {other:?}"),
+    }
+    assert_eq!(adapter.classify_failure(&err), FailureClass::Permanent);
+    assert!(adapter.in_flight_statements().is_empty());
+}
+
+/// #2768: a transient poll error polls the same job again, and never
+/// submits a second copy.
+#[tokio::test]
+async fn a_transient_poll_error_polls_the_same_job_again() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-flaky", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-flaky")))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-flaky")))
+        .respond_with(finished_job("job-flaky"))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = retrying_adapter(&server, 3);
+    let result = adapter.execute_query("SELECT 1 AS n").await.unwrap();
+    assert_eq!(result.rows.len(), 1);
+}
+
+/// #2768: a poll error that polling again does not fix cancels the job.
+/// The submit is never repeated.
+#[tokio::test]
+async fn poll_errors_that_persist_cancel_and_do_not_resubmit() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-lost", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-lost")))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let adapter = retrying_adapter(&server, 2);
+    let err = adapter
+        .execute_statement("INSERT INTO t SELECT 1")
+        .await
+        .unwrap_err();
+    match as_bq_error(&err) {
+        BigQueryError::Abandoned { cause, .. } => assert!(
+            matches!(**cause, BigQueryError::ApiError { ref status, .. } if status.starts_with("503")),
+            "{cause:?}"
+        ),
+        other => panic!("expected Abandoned, got: {other:?}"),
+    }
+}
+
+/// #2768: a `400` on the poll is the job's own failure. It has ended, so no
+/// cancel is sent and the error stays BigQuery's answer.
+#[tokio::test]
+async fn a_rejected_job_on_the_poll_is_its_outcome_not_an_abandon() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-bad", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-bad")))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalidQuery"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = retrying_adapter(&server, 3);
+    let err = adapter.execute_statement("SELECT x").await.unwrap_err();
+    assert!(
+        matches!(as_bq_error(&err), BigQueryError::ApiError { status, .. } if status.starts_with("400")),
+        "{err}"
+    );
+}
+
+/// #2768: a load job is listed and cancelled the same way: its deadline
+/// sends `jobs.cancel`, and the insert is not repeated.
+#[tokio::test]
+async fn a_load_job_deadline_cancels_the_job() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-slow"},
+            "status": {"state": "RUNNING"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{JOBS_PATH}/load-slow")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-slow"},
+            "status": {"state": "RUNNING"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{JOBS_PATH}/load-slow/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server).with_timeout(1);
+    let err = adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BigQueryError::Abandoned {
+                cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
