@@ -12,7 +12,7 @@ Rocky checks a model at four points. Each point runs different checks and has a 
 | [Contract](#data-contracts) | `{model}.contract.toml` | `rocky compile` | Nothing | Compares the inferred schema. Reads no rows. |
 | [Model execution](#rocky-test) | None | `rocky test`, `rocky ci` | Nothing | Runs each model on in-memory DuckDB. |
 | [Unit test](#unit-tests-test) | `[[test]]` | `rocky test` | Nothing | Runs one model on DuckDB per test, with your fixtures. |
-| [Declarative test](#declarative-tests-tests) | `[[tests]]` | `rocky test --declarative` | `rocky.toml` and a reachable warehouse | One SQL query per assertion. |
+| [Declarative test](#declarative-tests-tests) | `[[tests]]` | `rocky test --declarative` | `rocky.toml` and a reachable warehouse | One SQL query per assertion. `--batch-tests` groups `unique` and `not_null` per model. |
 | [Pipeline-level check](#pipeline-level-checks) | `[pipeline.<name>.checks]` | `rocky run`, `rocky apply` | The warehouse | A few queries per table. See each check. |
 | [Assertion](#assertions-in-a-run) | `[[assertions]]` | `rocky run`, `rocky apply` | The warehouse | One SQL query per assertion. |
 | [Cross-source overlap](#cross-source-overlap) | `checks.cross_source_overlap` | `rocky run` | The warehouse | One `UNION ALL` query per sibling group. |
@@ -184,6 +184,8 @@ severity = "warning"
 ```
 
 Run them with `rocky test --declarative`. They execute on the configured warehouse adapter, not DuckDB, so they need a `rocky.toml` and a warehouse Rocky can reach. With no `--pipeline` and no `--models`, each transformation pipeline runs the tests of its own models, against the warehouse that pipeline targets. Rocky reports `pass`, `fail`, or `error`. A failed `error`-severity assertion (the default) exits non-zero. A `warning` reports without failing the run.
+
+Add `--batch-tests` to send fewer queries. A model's default-config `unique` tests then share one query, and its `not_null` tests share another, when it has two or more of that type. The results are the same as without the flag.
 
 ## rocky ci
 

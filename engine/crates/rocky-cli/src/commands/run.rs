@@ -1747,6 +1747,10 @@ pub struct SkipRunOptions {
     /// `[run] tests_on_run` for this invocation; `None` keeps the config
     /// value.
     pub tests_on_run: Option<rocky_core::config::TestsOnRun>,
+    /// `rocky run --batch-tests`: a built model's eligible `unique` and
+    /// `not_null` tests share one query per type (#2756). Results are the
+    /// same as unbatched; only the query count changes.
+    pub batch_tests: bool,
 }
 
 impl SkipRunOptions {
@@ -1802,6 +1806,8 @@ pub(crate) struct SkipGateConfig {
     /// decision already threaded to `execute_models`. It does not change what
     /// the skip gate decides.
     pub tests_on_run: rocky_core::config::TestsOnRun,
+    /// `--batch-tests`: how the `tests_on_run` evaluation groups its queries.
+    pub test_batching: super::declarative_test::TestBatching,
 }
 
 impl SkipGateConfig {
@@ -1820,6 +1826,7 @@ impl SkipGateConfig {
             shadow_or_branch,
             full_refresh: skip_opts.full_refresh,
             tests_on_run: skip_opts.tests_on_run.unwrap_or(run_config.tests_on_run),
+            test_batching: super::declarative_test::TestBatching::from_flag(skip_opts.batch_tests),
         }
     }
 
@@ -1844,6 +1851,7 @@ impl SkipGateConfig {
             shadow_or_branch: false,
             full_refresh: false,
             tests_on_run: rocky_core::config::TestsOnRun::Off,
+            test_batching: super::declarative_test::TestBatching::Off,
         }
     }
 }
@@ -15508,6 +15516,7 @@ async fn execute_models_phase(
                             None => {
                                 super::run_tests::evaluate_model_tests(
                                     skip_gate.tests_on_run,
+                                    skip_gate.test_batching,
                                     warehouse,
                                     matched[idx].2,
                                     output,
@@ -16268,6 +16277,7 @@ async fn execute_models_phase(
                     None => {
                         super::run_tests::evaluate_model_tests(
                             skip_gate.tests_on_run,
+                            skip_gate.test_batching,
                             warehouse,
                             model,
                             output,
@@ -16403,6 +16413,7 @@ async fn execute_models_phase(
                         None => {
                             super::run_tests::evaluate_model_tests(
                                 skip_gate.tests_on_run,
+                                skip_gate.test_batching,
                                 warehouse,
                                 model,
                                 output,
@@ -45423,6 +45434,7 @@ auto_create_schemas = true
             shadow_or_branch: false,
             full_refresh: false,
             tests_on_run: Default::default(),
+            test_batching: Default::default(),
         }
     }
 
@@ -46113,6 +46125,7 @@ auto_create_schemas = true
             shadow_or_branch: false,
             full_refresh: false,
             tests_on_run: Default::default(),
+            test_batching: Default::default(),
         };
         let out2 = run_with_gate(
             &models_dir,
@@ -46399,6 +46412,7 @@ auto_create_schemas = true
                     shadow_or_branch: false,
                     full_refresh: false,
                     tests_on_run: Default::default(),
+                    test_batching: Default::default(),
                 },
                 false,
                 false,
@@ -46477,6 +46491,7 @@ auto_create_schemas = true
                     shadow_or_branch: false,
                     full_refresh: false,
                     tests_on_run: Default::default(),
+                    test_batching: Default::default(),
                 },
                 false,
                 false,
@@ -46535,6 +46550,7 @@ auto_create_schemas = true
                     shadow_or_branch: false,
                     full_refresh: false,
                     tests_on_run: Default::default(),
+                    test_batching: Default::default(),
                 },
                 false,
                 false,
@@ -46665,6 +46681,7 @@ auto_create_schemas = true
                     shadow_or_branch: false,
                     full_refresh: false,
                     tests_on_run: Default::default(),
+                    test_batching: Default::default(),
                 },
                 false,
                 false,
@@ -46739,6 +46756,7 @@ auto_create_schemas = true
                         shadow_or_branch: false,
                         full_refresh: false,
                         tests_on_run: Default::default(),
+                        test_batching: Default::default(),
                     },
                     false,
                     false,
@@ -46809,6 +46827,7 @@ auto_create_schemas = true
                     shadow_or_branch: false,
                     full_refresh: false,
                     tests_on_run: Default::default(),
+                    test_batching: Default::default(),
                 },
                 false,
                 false,
@@ -46900,6 +46919,7 @@ auto_create_schemas = true
                 shadow_or_branch: false,
                 full_refresh: false,
                 tests_on_run: Default::default(),
+                test_batching: Default::default(),
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -47051,6 +47071,7 @@ auto_create_schemas = true
             shadow_or_branch: false,
             full_refresh: false,
             tests_on_run: Default::default(),
+            test_batching: Default::default(),
         };
         let res = super::execute_models(
             &models_dir,
@@ -47177,6 +47198,7 @@ auto_create_schemas = true
                 shadow_or_branch: false,
                 full_refresh: false,
                 tests_on_run: Default::default(),
+                test_batching: Default::default(),
             };
             let res = super::execute_models(
                 &models_dir,
@@ -47328,6 +47350,7 @@ auto_create_schemas = true
             shadow_or_branch: false,
             full_refresh: false,
             tests_on_run: Default::default(),
+            test_batching: Default::default(),
         };
         let res = super::execute_models(
             &models_dir,
@@ -47634,6 +47657,7 @@ auto_create_schemas = true
                 shadow_or_branch: false,
                 full_refresh: false,
                 tests_on_run: Default::default(),
+                test_batching: Default::default(),
             };
             // Both outcomes are asserted below: the exclusion lands in `output`
             // either way, and the Result says whether the dependent could run.
@@ -47801,6 +47825,7 @@ auto_create_schemas = true
             shadow_or_branch: false,
             full_refresh: false,
             tests_on_run: Default::default(),
+            test_batching: Default::default(),
         };
         let resilience = rocky_core::config::ResilienceConfig {
             contain_failures: true,

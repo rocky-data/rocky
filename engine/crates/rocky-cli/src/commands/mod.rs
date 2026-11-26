@@ -247,6 +247,7 @@ pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_sched
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
+pub use declarative_test::TestBatching;
 pub use defer_state::{DeferStateError, DeferStateSource};
 pub use plan_cost::CostEstimateMode;
 pub use rocky_sql::transpile::Dialect;

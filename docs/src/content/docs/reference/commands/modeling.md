@@ -658,6 +658,7 @@ rocky test [flags]
 | `--var <NAME=VALUE>` | `string` (repeatable) | | Bind a run variable, as in `rocky compile --var`. |
 | `--declarative` | `bool` | `false` | Run the `[[tests]]` of model sidecars against the warehouse instead of DuckDB. |
 | `--pipeline <NAME>` | `string` | | With `--declarative`: run the tests of the models in `--models` against this pipeline's warehouse. Without it and without `--models`, every transformation pipeline runs its own models' tests against its own warehouse. |
+| `--batch-tests` | `bool` | `false` | With `--declarative` only. A model's default-config `unique` tests share one query, and its `not_null` tests share another, when it has two or more of that type. A test with `severity = "warning"` or a `filter` runs alone. A failing shared query costs one extra query. A shared query that fails reruns its tests one by one. The results are the same; only their `sql` changes. |
 | `--strict-dialect` | `bool` | `false` | Refuse each fixture `[[test]]` whose model does not target DuckDB alone, instead of running it on DuckDB. A refused test fails the run. Not with `--declarative`. |
 
 `rocky test` runs `data/seed.sql` first, when the project has one, and types its compile from the tables the seed made. The models then run on those tables. So a contract type mismatch (`E011`) or a column the seed lacks (`W041`) is reported before any model runs.

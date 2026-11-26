@@ -1246,6 +1246,7 @@ mod tests {
                 shadow_or_branch: false,
                 full_refresh: false,
                 tests_on_run: Default::default(),
+                test_batching: Default::default(),
             };
             let models = [("vol", "SELECT id AS x FROM main.src\n", FULL_REFRESH)];
             let layer_run = || LayerRun {
@@ -1300,6 +1301,7 @@ mod tests {
                 shadow_or_branch: false,
                 full_refresh: false,
                 tests_on_run: Default::default(),
+                test_batching: Default::default(),
             };
             let models = [("vol", "SELECT id AS x FROM main.src\n", FULL_REFRESH)];
             for parallel in [1, 4] {
