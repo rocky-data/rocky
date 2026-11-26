@@ -15,7 +15,7 @@ use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use rocky_core::config::RetryConfig;
 use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::retry::compute_backoff;
-use rocky_core::statement_cancel::{InFlightStatements, StatementHandle};
+use rocky_core::statement_cancel::{ABANDON_CANCEL_BUDGET, InFlightStatements, StatementHandle};
 use rocky_core::traits::AdapterError;
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
@@ -41,6 +41,18 @@ pub enum ConnectorError {
 
     #[error("statement {handle} timed out after {seconds}s")]
     Timeout { handle: String, seconds: u64 },
+
+    /// The client stopped waiting on statement `handle` while it may still
+    /// run: its deadline passed, or a poll failed and re-polling did not
+    /// help. A cancel was sent first; `cancel` says what came of it. Never
+    /// retried, by the connector or the run loop: a resubmit could run the
+    /// statement twice.
+    #[error("stopped waiting on statement {handle} ({cancel}): {cause}")]
+    Abandoned {
+        handle: String,
+        cancel: String,
+        cause: Box<ConnectorError>,
+    },
 
     #[error("API error {status}: {body}")]
     ApiError { status: u16, body: String },
@@ -446,7 +458,15 @@ impl SnowflakeConnector {
     }
 
     /// Single attempt: submit SQL, poll until terminal.
+    ///
+    /// ```text
+    ///   submit (async) ──▶ handle ──▶ register ──▶ poll ... ──▶ ended ──▶ Ok / failure
+    ///                                               │
+    ///                          deadline, or a poll error that re-polling
+    ///                          did not fix ──▶ cancel (bounded) ──▶ Abandoned
+    /// ```
     async fn submit_and_wait_once(&self, sql: &str) -> Result<StatementResponse, ConnectorError> {
+        let deadline = tokio::time::Instant::now() + self.config.timeout;
         let token = self.auth.get_token().await?;
         let url = self.base_url();
 
@@ -506,51 +526,87 @@ impl SnowflakeConnector {
         let request = self
             .client
             .post(&url)
+            // Asynchronous: Snowflake answers at once with the handle (202,
+            // code `333334`) instead of running the statement for up to 45 s
+            // first. The statement can then be cancelled from its first
+            // moment.
+            .query(&[("async", "true")])
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(&body);
-        let resp = self.apply_auth_headers(request, &token).send().await?;
+            .header("Accept", "application/json");
+        let request = request.json(&body);
+        let response = tokio::time::timeout_at(deadline, async {
+            let resp = self.apply_auth_headers(request, &token).send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let body_text = resp.text().await.unwrap_or_default();
+                return Err(ConnectorError::ApiError {
+                    status,
+                    body: body_text,
+                });
+            }
+            Ok::<StatementResponse, ConnectorError>(resp.json().await?)
+        })
+        .await
+        // No handle yet, so nothing to cancel. Snowflake may have accepted
+        // the statement, so this is never resubmitted either.
+        .map_err(|_| ConnectorError::Timeout {
+            handle: "<not yet assigned>".to_string(),
+            seconds: self.config.timeout.as_secs(),
+        })??;
 
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ApiError {
-                status,
-                body: body_text,
-            });
-        }
-
-        let response: StatementResponse = resp.json().await?;
-
-        // Check if statement completed inline
+        // A statement that ended before the submit answered.
         if is_terminal_code(&response.code) {
             return check_terminal(response);
         }
 
-        // Poll until complete
-        let handle = &response.statement_handle;
+        let handle = response.statement_handle;
         // Listed until this function returns, on every path, so a forced
-        // exit can cancel it. Before the submit returns there is no handle:
-        // a statement Snowflake still runs synchronously (up to 45 s) cannot
-        // be cancelled.
+        // exit or a fan-out abort can cancel it.
         let _in_flight = self
             .in_flight
             .register(StatementHandle::new(handle.clone()));
+        match self.poll_until_terminal(&handle, deadline).await {
+            Ok(terminal) => terminal,
+            Err(cause) => {
+                let cancel = self.cancel_abandoned(&handle).await;
+                Err(ConnectorError::Abandoned {
+                    handle,
+                    cancel,
+                    cause: Box::new(cause),
+                })
+            }
+        }
+    }
+
+    /// Poll `handle` until the statement ends, and return how it ended (`Ok`
+    /// holds the terminal outcome, which may be a failure). An `Err` means the
+    /// client stops waiting while the statement may still run: the deadline
+    /// passed, or a poll failed and re-polling did not help.
+    ///
+    /// A transient poll error polls the same handle again, at most
+    /// `retry.max_retries` times in a row, never submits it again.
+    async fn poll_until_terminal(
+        &self,
+        handle: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Result<StatementResponse, ConnectorError>, ConnectorError> {
         let poll_url = format!("{}/{}", self.base_url(), handle);
-        let deadline = tokio::time::Instant::now() + self.config.timeout;
+        let timed_out = || ConnectorError::Timeout {
+            handle: handle.to_string(),
+            seconds: self.config.timeout.as_secs(),
+        };
         let backoff_steps = [100, 200, 500, 1000, 2000];
+        let retry = &self.config.retry;
         let mut step = 0;
+        let mut failed_polls: u32 = 0;
 
         loop {
-            if tokio::time::Instant::now() > deadline {
-                return Err(ConnectorError::Timeout {
-                    handle: handle.clone(),
-                    seconds: self.config.timeout.as_secs(),
-                });
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(timed_out());
             }
-
             let delay = Duration::from_millis(backoff_steps[step.min(backoff_steps.len() - 1)]);
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep_until((now + delay).min(deadline)).await;
             step += 1;
 
             debug!(
@@ -558,28 +614,88 @@ impl SnowflakeConnector {
                 step, "polling Snowflake statement"
             );
 
-            let token = self.auth.get_token().await?;
-            let poll_request = self
-                .client
-                .get(&poll_url)
-                .header("Accept", "application/json");
-            let poll_resp = self.apply_auth_headers(poll_request, &token).send().await?;
-
-            if !poll_resp.status().is_success() {
-                let status = poll_resp.status().as_u16();
-                let body_text = poll_resp.text().await.unwrap_or_default();
-                return Err(ConnectorError::ApiError {
-                    status,
-                    body: body_text,
-                });
-            }
-
-            let poll_response: StatementResponse = poll_resp.json().await?;
-
-            if is_terminal_code(&poll_response.code) {
-                return check_terminal(poll_response);
+            let polled = tokio::time::timeout_at(deadline, self.poll_once(&poll_url))
+                .await
+                .map_err(|_| timed_out())?;
+            match polled {
+                Ok(response) => {
+                    failed_polls = 0;
+                    if is_terminal_code(&response.code) {
+                        return Ok(check_terminal(response));
+                    }
+                }
+                // 422: the statement failed. It has ended, so this is its
+                // outcome, not a lost statement.
+                Err(err @ ConnectorError::ApiError { status: 422, .. }) => return Ok(Err(err)),
+                Err(err) if failed_polls < retry.max_retries && is_transient(&err) => {
+                    failed_polls += 1;
+                    // See the matching branch in `submit_and_wait_inner`.
+                    if matches!(&err, ConnectorError::ApiError { status: 401, .. }) {
+                        self.auth.invalidate_cache().await;
+                    }
+                    let backoff_ms = compute_backoff(retry, failed_polls - 1);
+                    warn!(
+                        statement_handle = handle,
+                        attempt = failed_polls,
+                        max_repolls = retry.max_retries,
+                        backoff_ms,
+                        error = %err,
+                        "poll failed, polling the same statement again"
+                    );
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(backoff_ms))
+                            .min(deadline),
+                    )
+                    .await;
+                }
+                Err(err) => return Err(err),
             }
         }
+    }
+
+    /// One status read of a submitted statement: 200 when it ended, 202
+    /// while it runs.
+    async fn poll_once(&self, poll_url: &str) -> Result<StatementResponse, ConnectorError> {
+        let token = self.auth.get_token().await?;
+        let poll_request = self
+            .client
+            .get(poll_url)
+            .header("Accept", "application/json");
+        let poll_resp = self.apply_auth_headers(poll_request, &token).send().await?;
+        if !poll_resp.status().is_success() {
+            let status = poll_resp.status().as_u16();
+            let body_text = poll_resp.text().await.unwrap_or_default();
+            return Err(ConnectorError::ApiError {
+                status,
+                body: body_text,
+            });
+        }
+        Ok(poll_resp.json().await?)
+    }
+
+    /// Ask Snowflake to cancel a statement this client stops waiting on.
+    /// Best effort and bounded by [`ABANDON_CANCEL_BUDGET`]: returns what
+    /// happened, for the error, and never fails.
+    async fn cancel_abandoned(&self, handle: &str) -> String {
+        let outcome = match tokio::time::timeout(
+            ABANDON_CANCEL_BUDGET,
+            self.cancel_statement(handle),
+        )
+        .await
+        {
+            Ok(Ok(())) => "cancel requested".to_string(),
+            Ok(Err(e)) => format!("cancel failed: {e}"),
+            Err(_) => format!(
+                "no answer to the cancel within {}s",
+                ABANDON_CANCEL_BUDGET.as_secs()
+            ),
+        };
+        warn!(
+            statement_handle = handle,
+            cancel = %outcome,
+            "stopped waiting on a statement that may still run"
+        );
+        outcome
     }
 
     /// Cancels a running statement.
@@ -848,7 +964,10 @@ pub(crate) fn is_transient(err: &ConnectorError) -> bool {
                 || warehouse_transient
                 || msg.contains("TIMEOUT")
         }
-        ConnectorError::Timeout { .. } => true,
+        // The statement may still run on the warehouse (or, for a submit that
+        // did not answer, may have been accepted). A resubmit could run it
+        // twice.
+        ConnectorError::Timeout { .. } | ConnectorError::Abandoned { .. } => false,
         ConnectorError::Auth(_)
         | ConnectorError::CircuitBreakerOpen { .. }
         | ConnectorError::RetryBudgetExhausted { .. } => false,
@@ -870,6 +989,7 @@ pub(crate) fn classify_error(err: &ConnectorError) -> ErrorClass {
         ConnectorError::Http(e) if e.is_connect() => ErrorClass::Transient,
         ConnectorError::Http(_) => ErrorClass::Transient,
         ConnectorError::Timeout { .. } => ErrorClass::Timeout,
+        ConnectorError::Abandoned { cause, .. } => classify_error(cause),
         ConnectorError::Auth(_) => ErrorClass::Auth,
         ConnectorError::CircuitBreakerOpen { .. } => ErrorClass::Transient,
         ConnectorError::RetryBudgetExhausted { .. } => ErrorClass::Permanent,
@@ -1356,13 +1476,15 @@ mod tests {
         assert!(is_transient(&err));
     }
 
+    /// A timed-out statement may still run on the warehouse, so it is never
+    /// resubmitted (#2768): a resubmit could run it twice.
     #[test]
-    fn test_transient_timeout() {
+    fn test_not_transient_timeout() {
         let err = ConnectorError::Timeout {
             handle: "h-1".into(),
             seconds: 120,
         };
-        assert!(is_transient(&err));
+        assert!(!is_transient(&err));
     }
 
     #[test]

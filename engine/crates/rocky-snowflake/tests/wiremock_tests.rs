@@ -12,7 +12,7 @@ use rocky_core::config::RetryConfig;
 use rocky_snowflake::auth::{Auth, AuthConfig};
 use rocky_snowflake::connector::{ConnectorConfig, ConnectorError, SnowflakeConnector};
 use rocky_snowflake::loader::SnowflakeLoaderAdapter;
-use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Creates an OAuth-authenticated connector pointing at the given wiremock server.
@@ -1853,4 +1853,240 @@ async fn test_in_flight_statement_is_listed_and_cancelled() {
         "a statement nobody waits on must leave the list"
     );
     // `.expect(1)` on the cancel mock asserts the request on drop.
+}
+
+/// A connector with `timeout` as its deadline and `max_retries` retries,
+/// with fast backoff and no circuit breaker.
+fn deadline_connector(
+    server: &MockServer,
+    timeout: Duration,
+    max_retries: u32,
+) -> SnowflakeConnector {
+    let auth = Auth::from_config(AuthConfig {
+        account: "test_account".into(),
+        username: None,
+        password: None,
+        oauth_token: Some("test-sf-token".into()),
+        private_key_path: None,
+        pat: None,
+    })
+    .unwrap();
+    let config = ConnectorConfig {
+        account: "test_account".into(),
+        warehouse: "COMPUTE_WH".into(),
+        database: Some("TEST_DB".into()),
+        schema: Some("PUBLIC".into()),
+        role: Some("SYSADMIN".into()),
+        timeout,
+        retry: RetryConfig {
+            max_retries,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 50,
+            backoff_multiplier: 1.0,
+            jitter: false,
+            circuit_breaker_threshold: 0,
+            ..Default::default()
+        },
+    };
+    SnowflakeConnector::new(config, auth).with_base_url(server.uri())
+}
+
+fn executing(handle: &str) -> ResponseTemplate {
+    ResponseTemplate::new(202).set_body_json(serde_json::json!({
+        "statementHandle": handle,
+        "code": "333334",
+        "message": "Asynchronous execution in progress.",
+        "statementStatusUrl": format!("/api/v2/statements/{handle}")
+    }))
+}
+
+/// Mount the asynchronous submit (exactly `submits` times) and the cancel
+/// (exactly `cancels` times) of statement `handle`.
+async fn mount_async_submit_and_cancel(
+    server: &MockServer,
+    handle: &str,
+    submits: u64,
+    cancels: u64,
+) {
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(query_param("async", "true"))
+        .respond_with(executing(handle))
+        .expect(submits)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/v2/statements/{handle}/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "000604",
+            "message": "Statement canceled.",
+            "statementHandle": handle
+        })))
+        .expect(cancels)
+        .mount(server)
+        .await;
+}
+
+/// #2768: the submit is asynchronous (`?async=true`), so the handle comes
+/// back at once and is listed in flight while the first poll is still open.
+#[tokio::test]
+async fn test_async_submit_lists_the_handle_before_the_first_poll_ends() {
+    use rocky_core::statement_cancel::StatementHandle;
+
+    let server = MockServer::start().await;
+    mount_async_submit_and_cancel(&server, "sf-young", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-young"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "statementHandle": "sf-young",
+                    "code": "090001",
+                    "message": "Statement executed successfully."
+                }))
+                .set_delay(Duration::from_secs(1)),
+        )
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let running = {
+        let connector = connector.clone();
+        tokio::spawn(async move { connector.execute_statement("SELECT 1").await })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while connector.in_flight().snapshot().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "never listed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        connector.in_flight().snapshot(),
+        vec![StatementHandle::new("sf-young")]
+    );
+    assert!(
+        !running.is_finished(),
+        "listed while the first poll is open"
+    );
+    assert_eq!(running.await.unwrap().unwrap(), "sf-young");
+    assert!(connector.in_flight().snapshot().is_empty());
+}
+
+/// #2768: the client deadline cancels the statement and does not resubmit
+/// it, even with retries left.
+#[tokio::test]
+async fn test_client_deadline_cancels_and_does_not_resubmit() {
+    let server = MockServer::start().await;
+    mount_async_submit_and_cancel(&server, "sf-slow", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-slow"))
+        .respond_with(executing("sf-slow"))
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_millis(700), 3);
+    let err = connector
+        .execute_statement("MERGE INTO t")
+        .await
+        .unwrap_err();
+    match &err {
+        ConnectorError::Abandoned {
+            handle,
+            cancel,
+            cause,
+        } => {
+            assert_eq!(handle, "sf-slow");
+            assert_eq!(cancel, "cancel requested");
+            assert!(matches!(**cause, ConnectorError::Timeout { .. }), "{cause}");
+        }
+        other => panic!("expected Abandoned, got {other}"),
+    }
+}
+
+/// #2768: a transient poll error polls the same statement again, and never
+/// submits a second copy.
+#[tokio::test]
+async fn test_transient_poll_error_polls_again_and_does_not_resubmit() {
+    let server = MockServer::start().await;
+    mount_async_submit_and_cancel(&server, "sf-flaky", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-flaky"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-flaky"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-flaky",
+            "code": "090001",
+            "message": "Statement executed successfully."
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_secs(30), 3);
+    assert_eq!(
+        connector.execute_statement("INSERT INTO t").await.unwrap(),
+        "sf-flaky"
+    );
+}
+
+/// #2768: a poll error that re-polling does not fix cancels the statement.
+/// The submit is never repeated, and the run loop does not retry it either.
+#[tokio::test]
+async fn test_poll_errors_that_persist_cancel_and_do_not_resubmit() {
+    use rocky_core::failure_class::FailureClass;
+    use rocky_core::traits::{AdapterError, WarehouseAdapter};
+
+    let server = MockServer::start().await;
+    mount_async_submit_and_cancel(&server, "sf-lost", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-lost"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_secs(30), 2);
+    let err = connector
+        .execute_statement("INSERT INTO t")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConnectorError::Abandoned { .. }), "{err}");
+    let adapter = rocky_snowflake::adapter::SnowflakeWarehouseAdapter::new(test_connector(&server));
+    assert_eq!(
+        adapter.classify_failure(&AdapterError::new(err)),
+        FailureClass::Permanent,
+        "a statement that may still run is never retried by the run loop"
+    );
+}
+
+/// #2768: a 422 on the poll is the statement's own failure. It has ended, so
+/// no cancel is sent and the error stays the warehouse's answer.
+#[tokio::test]
+async fn test_a_failed_statement_on_the_poll_is_its_outcome_not_a_lost_statement() {
+    let server = MockServer::start().await;
+    mount_async_submit_and_cancel(&server, "sf-bad", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-bad"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+            "statementHandle": "sf-bad",
+            "code": "000904",
+            "message": "SQL compilation error: invalid identifier 'X'",
+            "sqlState": "42000"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_secs(30), 3);
+    let err = connector.execute_statement("SELECT x").await.unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::ApiError { status: 422, .. }),
+        "{err}"
+    );
 }
