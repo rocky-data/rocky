@@ -176,6 +176,7 @@ export function CompactControls({
           disabledReason={blocked}
           onClick={() => {
             setPlannedFor(key);
+            setApplyingPlan(null);
             plan.start(scope === "table" ? { table: target } : { catalog: target });
           }}
         />

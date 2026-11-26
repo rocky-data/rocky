@@ -67,18 +67,26 @@ describe("JobTray", () => {
     render(<Shell store={new JobStore(5, 60_000)} client={jobs.client} />);
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     const card = await screen.findByRole("article", { name: "Apply change abc" });
-    await within(card).findByText(/^Running · \d+ s$/);
+    await within(card).findByRole("status");
+    expect(within(card).getByRole("status")).toHaveTextContent(/^Running$/);
+    expect(card).toHaveTextContent(/Running · \d+ s/);
     expect(screen.getByText("1 job running")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Switch page" }));
     expect(screen.queryByTestId("page-view")).toBeNull();
     jobs.finish("succeeded");
-    await within(card).findByText("Done · 3 s");
+    await waitFor(() => expect(card).toHaveTextContent("Done · 3 s"));
     expect(screen.queryByText(/job running/)).toBeNull();
 
+    // It ended while the page was away: the page shows how it ended.
     fireEvent.click(screen.getByRole("button", { name: "Switch page" }));
     expect(screen.getByTestId("page-view")).toHaveTextContent("done succeeded");
     expect(jobs.client.submit).toHaveBeenCalledTimes(1);
+
+    // Seen, then left: the next visit starts clean, not on an old result.
+    fireEvent.click(screen.getByRole("button", { name: "Switch page" }));
+    fireEvent.click(screen.getByRole("button", { name: "Switch page" }));
+    expect(screen.getByTestId("page-view")).toHaveTextContent("idle");
   });
 
   it("cancels from the card in operator mode, and says Stopping… once the stop is sent", async () => {
@@ -98,7 +106,9 @@ describe("JobTray", () => {
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     const card = await screen.findByRole("article", { name: "Apply change abc" });
     jobs.finish("failed", "Error: plan_models_changed\nCaused by: the models moved");
-    expect(await within(card).findByRole("alert")).toHaveTextContent("Error: plan_models_changed");
+    await waitFor(() => expect(within(card).getByRole("status")).toHaveTextContent("Error: plan_models_changed"));
+    // The page that started it alerts; the card does not say it twice.
+    expect(within(card).queryByRole("alert")).toBeNull();
     expect(within(card).getByText("Details")).toBeInTheDocument();
     const buttons = within(card)
       .getAllByRole("button")

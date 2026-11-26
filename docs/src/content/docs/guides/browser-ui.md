@@ -244,9 +244,12 @@ Every job the page starts also gets a card in the bottom-right corner. The card 
 | Failed | The first line of the failure, with the rest under **Details**. It stays until you close it. |
 | Cancelled | "Cancelled". It stays until you close it. |
 | Not started | The job that holds the project. A second write is refused at once, never queued. |
+| Cannot reach the engine | The page keeps trying. The job may still be running. |
 | Outcome unknown | The page could no longer read the job, which may have finished. Check Runs or the audit log first. |
 
-A card never starts a write again. A failed apply, approval or change freeze is started again from its own screen, behind that screen's confirm step. If you leave a screen while its job runs and come back, the screen shows that job again.
+A card never starts a write again. A failed apply, approval or change freeze is started again from its own screen, behind that screen's confirm step.
+
+If you leave a screen while its job runs and come back, the screen shows that job, and how it ended. After you have seen the end and left again, the screen starts clean. Reloading the page drops every card, but a running job keeps running.
 
 The engine reports no progress while a job runs, and keeps no log the page can read. So a card shows neither.
 

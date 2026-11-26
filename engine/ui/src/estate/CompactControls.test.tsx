@@ -152,6 +152,13 @@ describe("Optimize tables from the browser", () => {
     await screen.findByText("Optimize tables: done.", {}, { timeout: 3000 });
     // A compaction that ran does not offer the same apply again.
     expect(screen.queryByRole("button", { name: "Optimize tables" })).toBeNull();
+
+    // Planning the same tables again gives the same change id. It is a new
+    // plan, so it offers the apply again, and the old "done" is gone.
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
+    await waitFor(() => expect(submitted.filter((s) => s.kind === "compact")).toHaveLength(2));
+    expect(await screen.findByRole("button", { name: "Optimize tables" }, { timeout: 3000 })).toBeEnabled();
+    expect(screen.queryByText("Optimize tables: done.")).toBeNull();
   });
 
   it("shows the cleaned reason when the apply fails, such as a non-Databricks warehouse", async () => {

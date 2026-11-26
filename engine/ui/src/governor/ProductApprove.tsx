@@ -106,7 +106,9 @@ export function ProductApprove({
 }) {
   const approve = useJob("product_approve", jobs, onDone, { subject: name, label: `Approve data product ${name}` });
   // The digest the person confirmed, for the comparison with the result.
-  const [confirmed, setConfirmed] = useState<string | null>(null);
+  const [confirmed, setConfirmed] = useState<string | null>(
+    typeof approve.body?.expect_spec_digest === "string" ? approve.body.expect_spec_digest : null,
+  );
   const digest = approvableSpec(status);
   const summary = succeededSummary(approve.view);
   if (digest === null && approve.view.kind === "idle") return null;

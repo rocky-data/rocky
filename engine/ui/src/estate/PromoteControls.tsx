@@ -180,6 +180,7 @@ function PromotePanel({
           busy={planBusy}
           onClick={() => {
             setPlannedFor(branch);
+            setApplyingPlan(null);
             plan.start({ name: branch });
           }}
         />

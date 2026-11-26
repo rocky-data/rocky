@@ -137,7 +137,11 @@ function UnfreezeRow({
   const name = unreadable
     ? "unreadable marker (agent and human) on every model"
     : `${freeze.principal} on ${scopeWords(freeze.scope)}`;
-  const unfreeze = useJob("unfreeze", jobs, onChanged, { subject: name, label: `Lift change freeze: ${name}` });
+  const unfreeze = useJob("unfreeze", jobs, onChanged, {
+    // The row's own identity: two freezes can share a name.
+    subject: `${freeze.principal}|${freeze.scope}|${freeze.plan_id}`,
+    label: `Lift change freeze: ${name}`,
+  });
   return (
     <li className="space-y-1">
       <div className="flex flex-wrap items-center gap-2">

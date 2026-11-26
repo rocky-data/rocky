@@ -17,7 +17,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, us
 import type { JobKind, JobStatus } from "@rocky-types/job_status";
 import type { MetaTokenScope } from "@rocky-types/meta";
 import { ApiError } from "./api";
-import { JOB_POLL_MS, JobStore, defaultJobClient, idleRecord, jobKey } from "./jobs/store";
+import { JOB_POLL_MS, JobStore, defaultJobClient, idleRecord, jobKey, settled } from "./jobs/store";
 import type { CancelView, JobClient, JobView } from "./jobs/store";
 import { JobStoreContext } from "./jobs/context";
 import { READ_BUTTON } from "./components";
@@ -155,16 +155,38 @@ export function useJob(
   const key = jobKey(kind, slot.subject);
   const label = slot.label ?? kind;
   const [idle] = useState(() => idleRecord(key, kind, label));
-  const record = useSyncExternalStore(
-    store.subscribe,
-    () => store.get(key) ?? idle,
-  );
+  const record = useSyncExternalStore(store.subscribe, () => {
+    const found = store.get(key);
+    // An ended job every page has left is not this visit's state.
+    return found === undefined || found.forgotten ? idle : found;
+  });
+  useEffect(() => store.attach(key), [store, key]);
 
   const done = useRef(onDone);
   useEffect(() => {
     done.current = onDone;
   }, [onDone]);
-  useEffect(() => store.onDone(key, (job) => done.current?.(job)), [store, key]);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    const stop = store.onDone(key, (job) => done.current?.(job));
+    return () => {
+      stop();
+      // The subject changed while this key's job runs (another model was
+      // picked): still refresh once when it ends, if this page is shown.
+      const left = store.get(key);
+      if (left === undefined || settled(left)) return;
+      const once = store.onDone(key, (job) => {
+        once();
+        if (mounted.current) done.current?.(job);
+      });
+    };
+  }, [store, key]);
 
   const start = useCallback(
     (body: Record<string, unknown> = {}) => store.start(key, kind, label, client, body),

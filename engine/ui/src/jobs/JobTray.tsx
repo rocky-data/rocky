@@ -18,7 +18,7 @@ import { ApiError } from "../api";
 import { failureSummary, useWriteAccess } from "../operator";
 import { navigateTo, usePathname } from "../router";
 import { JobStoreContext } from "./context";
-import { JobStore, type JobRecord } from "./store";
+import { JobStore, UNREACHABLE_AFTER, type JobRecord } from "./store";
 
 /** The shell's job store, for the whole tab. Tests hand one in. */
 export function JobTrayProvider({ store, children }: { store?: JobStore; children: ReactNode }) {
@@ -109,7 +109,7 @@ function Cards({ store }: { store: JobStore }) {
   return (
     <section
       aria-label="Jobs"
-      className="pointer-events-none fixed right-4 bottom-4 z-50 flex w-[min(380px,calc(100vw-2rem))] flex-col gap-3"
+      className="pointer-events-none fixed right-4 bottom-4 z-50 flex max-h-[calc(100vh-2rem)] w-[min(380px,calc(100vw-2rem))] flex-col gap-3 overflow-y-auto"
     >
       {shown.map((record) => (
         <Card key={record.key} record={record} now={now} store={store} />
@@ -148,18 +148,23 @@ const CARD_BUTTON =
   "inline-flex h-8 items-center rounded-md border border-line bg-surface px-3 text-xs font-medium text-ink hover:bg-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 disabled:cursor-not-allowed disabled:text-muted";
 
 /** What a card says: its tone, its line under the label, and any detail. */
-function describe(record: JobRecord, now: number): { tone: CardTone; line: string; detail?: string } {
+function describe(
+  record: JobRecord,
+  now: number,
+): { tone: CardTone; line: string; time?: string; detail?: string } {
   const view = record.view;
   switch (view.kind) {
     case "idle":
     case "submitting":
       return { tone: "pending", line: "Sending…" };
     case "running":
+      if (record.failedReads >= UNREACHABLE_AFTER) {
+        return { tone: "warn", line: "Cannot reach the engine. Still trying." };
+      }
       return {
         tone: "running",
-        line: record.stopping
-          ? "Stopping…"
-          : `Running · ${shortDuration(now - record.submittedAt)}`,
+        line: record.stopping ? "Stopping…" : "Running",
+        time: record.stopping ? undefined : shortDuration(now - record.submittedAt),
       };
     case "refused": {
       const error = view.error;
@@ -182,7 +187,7 @@ function describe(record: JobRecord, now: number): { tone: CardTone; line: strin
       const took = ranFor(record);
       switch (view.job.state) {
         case "succeeded":
-          return { tone: "ok", line: took === null ? "Done" : `Done · ${took}` };
+          return { tone: "ok", line: "Done", time: took ?? undefined };
         case "cancelled":
           return { tone: "warn", line: "Cancelled" };
         default: {
@@ -206,10 +211,12 @@ function Card({
 }) {
   const access = useWriteAccess();
   const pathname = usePathname();
-  const { tone, line, detail } = describe(record, now);
+  const { tone, line, time, detail } = describe(record, now);
   const failed = tone === "fail";
   const running = record.view.kind === "running";
-  const sendingCancel = record.cancel.kind === "sending";
+  const cancel = record.cancel;
+  // Sending, or a forced stop already sent: nothing more a press can do.
+  const cancelSpent = cancel.kind === "sending" || (cancel.kind === "sent" && cancel.signal === "kill");
   const elsewhere = record.from !== "" && record.from !== pathname;
   return (
     <article
@@ -220,9 +227,21 @@ function Card({
         <Badge tone={tone} />
         <div className="min-w-0 flex-1 space-y-0.5">
           <p className="text-sm font-semibold text-ink">{record.label}</p>
-          <p role={failed ? "alert" : "status"} className="text-[13px] break-words text-muted">
-            {line}
+          {/* One live region per card, with the state only: the ticking time
+              sits outside it, so a screen reader is not told every second.
+              The page that started the job already alerts a failure. */}
+          <p className="text-[13px] break-words text-muted">
+            <span role="status">{line}</span>
+            {time !== undefined && <span> · {time}</span>}
           </p>
+          {cancel.kind === "refused" && (
+            <p className="text-xs text-fail-ink">
+              Cancel refused.{" "}
+              {cancel.error instanceof ApiError
+                ? `${cancel.error.envelope.code}: ${cancel.error.envelope.message}`
+                : cancel.error.message}
+            </p>
+          )}
         </div>
         {!inFlight(record) && (
           <button
@@ -249,10 +268,10 @@ function Card({
             <button
               type="button"
               className={CARD_BUTTON}
-              disabled={sendingCancel}
+              disabled={cancelSpent}
               onClick={() => store.cancel(record.key)}
             >
-              {sendingCancel ? "Stopping…" : record.stopping ? "Force stop" : "Cancel"}
+              {cancelSpent ? "Stopping…" : record.stopping ? "Force stop" : "Cancel"}
             </button>
           )}
           {failed && elsewhere && (

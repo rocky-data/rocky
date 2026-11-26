@@ -49,8 +49,11 @@ export const JOB_POLL_MS = 1_000;
 /** The longest wait between reads while the engine cannot be reached. */
 export const JOB_POLL_MAX_MS = 30_000;
 
-/** How long a succeeded job's card stays in the tray. */
+/** How long a succeeded job's card (or a not-started one) stays in the tray. */
 export const DONE_CARD_MS = 6_000;
+
+/** Failed reads in a row before a card says the engine cannot be reached. */
+export const UNREACHABLE_AFTER = 4;
 
 /** One job slot: a kind of job about one subject (a change, a product, a model). */
 export interface JobRecord {
@@ -72,6 +75,13 @@ export interface JobRecord {
   submittedAt: number;
   /** Closed in the tray (by hand, or a done card's timer). The page still reads it. */
   closed: boolean;
+  /**
+   * The job ended and every page that showed it has left. A page that opens
+   * now starts clean: an old result is not read as the current state.
+   */
+  forgotten: boolean;
+  /** Status reads that failed in a row because the engine could not be reached. */
+  failedReads: number;
 }
 
 /** The record a key has before any job was started for it. */
@@ -88,7 +98,15 @@ export function idleRecord(key: string, kind: JobKind, label: string): JobRecord
     body: null,
     submittedAt: 0,
     closed: true,
+    forgotten: false,
+    failedReads: 0,
   };
+}
+
+/** Whether a record's job has ended, one way or another. */
+export function settled(record: JobRecord): boolean {
+  const kind = record.view.kind;
+  return kind !== "submitting" && kind !== "running";
 }
 
 /** The slot a job of `kind` about `subject` lives in. */
@@ -121,12 +139,19 @@ function asError(error: unknown): ApiError | Error {
  * - A read that fails because the engine is unreachable is tried again,
  *   with a growing wait; one that cannot succeed (401, 403, 404) marks the
  *   job lost. A read failure is never shown as a failed job.
+ *
+ * How long a page sees a job: a page that is open when the job ends, or
+ * that opens before anyone saw the end, shows it. Once the job has ended
+ * and the last page showing it leaves, it is forgotten for pages: the next
+ * visit starts clean. The tray card keeps its own life (closed by hand, or
+ * by its timer).
  */
 export class JobStore {
   private records = new Map<string, JobRecord>();
   private listeners = new Set<() => void>();
   private doneListeners = new Map<string, Set<(job: JobStatus) => void>>();
   private closeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private mounts = new Map<string, number>();
   private disposed = false;
   private list: JobRecord[] = [];
 
@@ -148,6 +173,26 @@ export class JobStore {
 
   /** Every record, oldest first. The same array until something changes. */
   all = (): JobRecord[] => this.list;
+
+  /**
+   * A page shows `key`. Returns the detach: when the last page leaves and
+   * the job has ended, the job is forgotten for pages.
+   */
+  attach(key: string): () => void {
+    this.mounts.set(key, (this.mounts.get(key) ?? 0) + 1);
+    return () => {
+      const left = (this.mounts.get(key) ?? 1) - 1;
+      if (left > 0) {
+        this.mounts.set(key, left);
+        return;
+      }
+      this.mounts.delete(key);
+      const record = this.records.get(key);
+      if (record !== undefined && settled(record) && record.view.kind !== "idle" && !record.forgotten) {
+        this.put({ ...record, forgotten: true });
+      }
+    };
+  }
 
   /** Run `listener` once when the job in `key` ends. Returns the unsubscribe. */
   onDone(key: string, listener: (job: JobStatus) => void): () => void {
@@ -186,6 +231,14 @@ export class JobStore {
     this.put(change(record));
   }
 
+  /** Close the card after its time, unless the person closed it first. */
+  private closeLater(key: string): void {
+    this.closeTimers.set(
+      key,
+      setTimeout(() => this.close(key), this.doneCardMs),
+    );
+  }
+
   /** Hide a card from the tray. The page keeps reading the record. */
   close(key: string): void {
     const timer = this.closeTimers.get(key);
@@ -219,6 +272,8 @@ export class JobStore {
       body,
       submittedAt: Date.now(),
       closed: false,
+      forgotten: false,
+      failedReads: 0,
     });
     client
       .submit(kind, body)
@@ -234,6 +289,7 @@ export class JobStore {
         // it. Any other refusal is said beside the button that was pressed.
         const busy = refused instanceof ApiError && refused.envelope.code === "mutation_in_progress";
         this.update(key, (record) => ({ ...record, view: { kind: "refused", error: refused }, closed: !busy }));
+        if (busy) this.closeLater(key);
       });
   }
 
@@ -249,17 +305,15 @@ export class JobStore {
         .then((job) => {
           if (this.disposed) return;
           wait = this.pollMs;
+          if (this.records.get(key)?.failedReads !== 0) {
+            this.update(key, (record) => ({ ...record, failedReads: 0 }));
+          }
           if (job.state === "running" || job.state === "queued") {
             setTimeout(tick, wait);
             return;
           }
           this.update(key, (record) => ({ ...record, view: { kind: "done", job } }));
-          if (job.state === "succeeded") {
-            this.closeTimers.set(
-              key,
-              setTimeout(() => this.close(key), this.doneCardMs),
-            );
-          }
+          if (job.state === "succeeded") this.closeLater(key);
           for (const listener of [...(this.doneListeners.get(key) ?? [])]) listener(job);
         })
         .catch((error: unknown) => {
@@ -268,6 +322,7 @@ export class JobStore {
             this.update(key, (record) => ({ ...record, view: { kind: "lost", jobId, error: asError(error) } }));
             return;
           }
+          this.update(key, (record) => ({ ...record, failedReads: record.failedReads + 1 }));
           wait = Math.min(wait * 2, JOB_POLL_MAX_MS);
           setTimeout(tick, wait);
         });

@@ -146,6 +146,65 @@ describe("JobStore", () => {
     store.dispose();
   });
 
+  it("forgets an ended job once every page that showed it has left", async () => {
+    const client: JobClient = {
+      submit: vi.fn(async () => ({ job_id: "job_1" })),
+      status: vi.fn(async () => job("run", "succeeded")),
+      cancel: vi.fn(),
+    };
+    const store = new JobStore(2, 60_000);
+    const first = store.attach("run");
+    const second = store.attach("run");
+    store.start("run", "run", "Run", client);
+    await until(() => store.get("run")?.view.kind === "done");
+    first();
+    expect(store.get("run")?.forgotten).toBe(false);
+    second();
+    expect(store.get("run")?.forgotten).toBe(true);
+    // The card keeps its own life.
+    expect(store.get("run")?.closed).toBe(false);
+    store.start("run", "run", "Run", client);
+    expect(store.get("run")?.forgotten).toBe(false);
+    store.dispose();
+  });
+
+  it("keeps a job a page left while it ran, so the next visit shows how it ended", async () => {
+    let end = false;
+    const client: JobClient = {
+      submit: vi.fn(async () => ({ job_id: "job_1" })),
+      status: vi.fn(async () => job("run", end ? "succeeded" : "running")),
+      cancel: vi.fn(),
+    };
+    const store = new JobStore(2, 60_000);
+    const leave = store.attach("run");
+    store.start("run", "run", "Run", client);
+    await until(() => store.get("run")?.view.kind === "running");
+    leave();
+    end = true;
+    await until(() => store.get("run")?.view.kind === "done");
+    expect(store.get("run")?.forgotten).toBe(false);
+    store.dispose();
+  });
+
+  it("counts failed reads in a row, and starts again from zero after one that worked", async () => {
+    let reads = 0;
+    const client: JobClient = {
+      submit: vi.fn(async () => ({ job_id: "job_1" })),
+      status: vi.fn(async () => {
+        reads += 1;
+        if (reads <= 3) throw new TypeError("Failed to fetch");
+        return job("run", "running");
+      }),
+      cancel: vi.fn(),
+    };
+    const store = new JobStore(1, 60_000);
+    store.start("run", "run", "Run", client);
+    await until(() => store.get("run")?.failedReads === 3);
+    await until(() => store.get("run")?.failedReads === 0);
+    expect(store.get("run")?.view.kind).toBe("running");
+    store.dispose();
+  });
+
   it("closes a succeeded card after its time, and keeps a failed one", async () => {
     const client: JobClient = {
       submit: vi.fn(async (kind: JobKind) => ({ job_id: kind })),
