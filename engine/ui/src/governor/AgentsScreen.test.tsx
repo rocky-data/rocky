@@ -37,6 +37,11 @@ const AUDIT: AuditOutput = {
     entry({ plan_id: "plan-n1", principal_id: null, principal_id_source: null, timestamp: "2026-09-03T01:00:00Z" }),
     entry({ plan_id: "plan-h1", principal: "human", principal_id: "hugo", principal_id_source: "flag" }),
     entry({ plan_id: "plan-ap", kind: "approval", principal_id: "claude-dev" }),
+    entry({ plan_id: "freeze:global", kind: "freeze", principal_id: "claude-dev" }),
+    entry({ plan_id: "plan-v1", kind: "verify_after_custody", principal_id: "claude-dev" }),
+    entry({ plan_id: "plan-m1", model: "orders", timestamp: "2026-09-05T06:00:00Z" }),
+    entry({ plan_id: "plan-m1", model: "customers", timestamp: "2026-09-05T06:00:01Z" }),
+    entry({ plan_id: "autoapply:run-1", capability: "schema_change.additive", principal_id: "ci-bot", principal_id_source: "env" }),
   ],
 };
 
@@ -45,10 +50,14 @@ describe("AgentsScreen", () => {
     render(<AgentsScreen load={async () => AUDIT} now={NOW} />);
     await screen.findByRole("table", { name: "Agents" });
     const card = (label: string) => screen.getByText(label).parentElement as HTMLElement;
-    expect(within(card("Agents seen")).getByText("2")).toBeInTheDocument();
-    expect(within(card("Agent requests")).getByText("7")).toBeInTheDocument();
+    expect(within(card("Distinct names")).getByText("2")).toBeInTheDocument();
+    // 7 single-model requests plus plan-m1; autoapply, freeze and verify rows are out.
+    const requests = card("Agent requests");
+    expect(within(requests).getByText("8")).toBeInTheDocument();
+    expect(within(requests).getByText("9 gate decisions, one per model")).toBeInTheDocument();
     expect(within(card("Needed approval")).getByText("2")).toBeInTheDocument();
     expect(within(card("Rows with no name")).getByText("3")).toBeInTheDocument();
+    expect(screen.getByText(/leaves 1 such decision out/)).toBeInTheDocument();
   });
 
   it("lists one row per group, most requests first, with an unknown channel", async () => {
@@ -63,8 +72,9 @@ describe("AgentsScreen", () => {
     ]);
     const first = within(rows[0]).getAllByRole("cell");
     expect(first[1]).toHaveTextContent("MCP profile");
-    expect(first[3]).toHaveTextContent("3");
-    expect(first[4]).toHaveTextContent("1 allowed · 1 needed approval · 1 blocked");
+    // plan-m1 has two models: 4 requests, 5 decisions.
+    expect(first[3]).toHaveTextContent("4(5 decisions)");
+    expect(first[4]).toHaveTextContent("3 allowed · 1 needed approval · 1 blocked decisions");
     for (const row of rows) {
       const channel = within(row).getAllByRole("cell")[2].firstElementChild as HTMLElement;
       expect(channel).toHaveTextContent("-");
@@ -80,9 +90,14 @@ describe("AgentsScreen", () => {
     render(<AgentsScreen load={async () => AUDIT} now={NOW} />);
     const first = await screen.findByRole("region", { name: "Agent claude-dev" });
     expect(within(first).getByText(/named by MCP profile · not verified/)).toBeInTheDocument();
+    expect(within(first).getByText("rocky audit --actor claude-dev --since 7d")).toBeInTheDocument();
+    expect(within(first).getByRole("link", { name: "Audit log" })).toBeInTheDocument();
+    const merged = within(within(first).getByRole("list", { name: "Recent requests" })).getAllByRole("listitem");
+    expect(merged).toHaveLength(4);
+    expect(within(merged[0]).getByText("customers, orders")).toBeInTheDocument();
     const recent = within(first).getByRole("list", { name: "Recent requests" });
     expect(within(recent).getByText("Needs approval")).toBeInTheDocument();
-    expect(within(recent).getByText("Allowed")).toBeInTheDocument();
+    expect(within(recent).getAllByText("Allowed").length).toBeGreaterThan(0);
     expect(within(recent).getByText("Blocked")).toBeInTheDocument();
     expect(within(recent).getByRole("link", { name: "plan-a2" })).toHaveAttribute(
       "href",
@@ -92,8 +107,24 @@ describe("AgentsScreen", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "unrecorded" }));
     const other = screen.getByRole("region", { name: "Agent unrecorded" });
-    expect(within(other).getByText("rocky audit --actor unrecorded")).toBeInTheDocument();
+    expect(within(other).getByText("rocky audit --actor unrecorded --since 7d")).toBeInTheDocument();
+    expect(within(other).getByText("written before names were recorded · not verified")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "unnamed" }));
+    expect(screen.getByText("nobody named it · not verified")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "unnamed" })).toHaveAttribute("aria-current", "true");
     expect(screen.queryByRole("region", { name: "Agent claude-dev" })).toBeNull();
+  });
+
+  it("shows the first five requests and the rest on demand", async () => {
+    const many = Array.from({ length: 7 }, (_, i) =>
+      entry({ plan_id: `plan-z${i}`, timestamp: `2026-09-05T0${i}:00:00Z` }),
+    );
+    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: many })} now={NOW} />);
+    const list = await screen.findByRole("list", { name: "Recent requests" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(5);
+    fireEvent.click(screen.getByRole("button", { name: "Show all 7" }));
+    expect(within(list).getAllByRole("listitem")).toHaveLength(7);
+    expect(within(list).getByRole("link", { name: "plan-z0" })).toBeInTheDocument();
   });
 
   it("re-reads with the chosen window", async () => {
@@ -106,7 +137,7 @@ describe("AgentsScreen", () => {
   });
 
   it("says so when no agent asked in the window", async () => {
-    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: [AUDIT.decisions[7]] })} now={NOW} />);
+    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: [AUDIT.decisions.find((d) => d.principal === "human")!] })} now={NOW} />);
     expect(await screen.findByText("No agent requests in the last 7 days")).toBeInTheDocument();
   });
 

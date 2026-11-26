@@ -139,7 +139,7 @@ Oversight answers "what did the agents do, and was it allowed?" It has four tabs
 | Tab | Shows | Matches |
 |---|---|---|
 | Agent activity | Allowed, needed-approval and blocked rates for a window. Group by actor, rule or model decided on. Lists the metrics the audit log cannot support, with the reason. | `rocky audit --scorecard` |
-| Agents | Each agent that asked to change something, from the audit log: how it was named, its requests and their outcomes. | `rocky audit` |
+| Agents | Each agent that asked to change something, from the audit log: how it was named, its requests (one per change) and their outcomes. | `rocky audit` |
 | Trace | Every recorded decision about a subject: a model, a run id, a change id, or another recorded id such as `freeze:global`. Shows its decisions, change, applying runs, post-apply checks and impact. | `rocky audit --for <subject>` |
 | Audit log | The whole policy decision log, oldest first. Filter to one data product. | `rocky audit`, `rocky audit --product <name>` |
 
@@ -147,9 +147,13 @@ Oversight answers "what did the agents do, and was it allowed?" It has four tabs
 
 The Agents tab lists each caller that is not a person and asked to change something. It reads the audit log for the last 1, 7 or 30 days. One row is one agent: how it was named, how many requests it made and how they ended (allowed, needed approval, blocked).
 
+A request is one change, found by its plan id. A change that touches several models writes one gate decision per model, so the Requests column shows both counts. The outcome bar counts decisions. Under the table, the Audit log link opens the whole log. The detail panel shows the `rocky audit --actor <id> --since <N>d` command that lists one agent's rows.
+
 Names are self-asserted. An agent names itself with `ROCKY_PRINCIPAL_ID`, a flag or its MCP profile. Rocky records the name but does not verify it. Treat a name as a label, not a proof. Rows with no name show as `unnamed` or `unrecorded`.
 
-The audit log does not record an agent's channel yet, so the Channel column is empty. Rules and change freezes act on all agents as a class, never on one name.
+The audit log does not record an agent's channel yet, so the Channel column shows a dash, with that reason as its tooltip. Rules and change freezes act on all agents as a class, never on one name.
+
+When `rocky run` applies a schema drift on its own, the audit log records it as an agent decision too, under a plan id that starts with `autoapply:`. The tab leaves those decisions out and says how many.
 
 ![The Trace tab for the model revenue_daily: a table of twelve policy decisions, agent proposals and breaking-change evaluations and the human approvals that applied them](/ui-governor-custody.png)
 
