@@ -11,6 +11,7 @@ import {
   useJob,
   type JobClient,
 } from "../operator";
+import { jobKey } from "../jobs/store";
 import { ResourceState } from "../review/ResourceState";
 import { useResource } from "./useResource";
 
@@ -114,7 +115,10 @@ function PromotePanel({
   onDone?: () => void;
 }) {
   const branches = useResource(useCallback(() => loadBranches(), [loadBranches]), [loadBranches]);
-  const plan = useJob("promote", jobs, undefined, { label: "Plan promote branch" });
+  const plan = useJob("promote", jobs, undefined, {
+    label: "Plan promote branch",
+    heldBy: jobKey("apply", "promote-branch"),
+  });
   const apply = useJob("apply", jobs, onDone, { subject: "promote-branch", label: "Promote branch" });
   // A page that comes back to a job it started shows that job again.
   const sentBranch = typeof plan.body?.name === "string" ? plan.body.name : null;

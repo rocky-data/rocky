@@ -231,11 +231,11 @@ function Card({
               sits outside it, so a screen reader is not told every second.
               The page that started the job already alerts a failure. */}
           <p className="text-[13px] break-words text-muted">
-            <span role="status">{line}</span>
+            <span role={failed && elsewhere ? "alert" : "status"}>{line}</span>
             {time !== undefined && <span> · {time}</span>}
           </p>
           {cancel.kind === "refused" && (
-            <p className="text-xs text-fail-ink">
+            <p role="alert" className="text-xs text-fail-ink">
               Cancel refused.{" "}
               {cancel.error instanceof ApiError
                 ? `${cancel.error.envelope.code}: ${cancel.error.envelope.message}`

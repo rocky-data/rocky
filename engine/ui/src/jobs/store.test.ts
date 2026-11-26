@@ -158,13 +158,70 @@ describe("JobStore", () => {
     store.start("run", "run", "Run", client);
     await until(() => store.get("run")?.view.kind === "done");
     first();
+    await Promise.resolve();
     expect(store.get("run")?.forgotten).toBe(false);
     second();
+    // Decided after the commit, so a page that remounts at once keeps it.
+    expect(store.get("run")?.forgotten).toBe(false);
+    await Promise.resolve();
     expect(store.get("run")?.forgotten).toBe(true);
     // The card keeps its own life.
     expect(store.get("run")?.closed).toBe(false);
     store.start("run", "run", "Run", client);
     expect(store.get("run")?.forgotten).toBe(false);
+    store.dispose();
+  });
+
+  it("keeps an ended job when its page detaches and attaches again in one go", async () => {
+    const client: JobClient = {
+      submit: vi.fn(async () => ({ job_id: "job_1" })),
+      status: vi.fn(async () => job("run", "succeeded")),
+      cancel: vi.fn(),
+    };
+    const store = new JobStore(2, 60_000);
+    const leave = store.attach("run");
+    store.start("run", "run", "Run", client);
+    await until(() => store.get("run")?.view.kind === "done");
+    // A keyed refresh (or StrictMode) unmounts and mounts in one commit.
+    leave();
+    const again = store.attach("run");
+    await Promise.resolve();
+    expect(store.get("run")?.forgotten).toBe(false);
+    again();
+    store.dispose();
+  });
+
+  it("keeps a plan while the apply it is shown under runs or has an unseen end", async () => {
+    let applied = false;
+    const client: JobClient = {
+      submit: vi.fn(async (kind: JobKind) => ({ job_id: kind })),
+      status: vi.fn(async (id: string) =>
+        job(id as JobKind, id === "apply" && !applied ? "running" : "succeeded", id),
+      ),
+      cancel: vi.fn(),
+    };
+    const store = new JobStore(2, 60_000);
+    const plan = "compact";
+    const apply = jobKey("apply", "optimize-tables");
+    const leavePlan = store.attach(plan, apply);
+    const leaveApply = store.attach(apply);
+    store.start(plan, "compact", "Plan", client);
+    await until(() => store.get(plan)?.view.kind === "done");
+    store.start(apply, "apply", "Apply", client);
+    await until(() => store.get(apply)?.view.kind === "running");
+    leavePlan();
+    leaveApply();
+    await Promise.resolve();
+    expect(store.get(plan)?.forgotten).toBe(false);
+    applied = true;
+    await until(() => store.get(apply)?.view.kind === "done");
+    expect(store.get(plan)?.forgotten).toBe(false);
+    // Seen on a return visit, then left: both go.
+    const backPlan = store.attach(plan, apply);
+    const backApply = store.attach(apply);
+    backPlan();
+    backApply();
+    await until(() => store.get(plan)?.forgotten === true && store.get(apply)?.forgotten === true);
     store.dispose();
   });
 

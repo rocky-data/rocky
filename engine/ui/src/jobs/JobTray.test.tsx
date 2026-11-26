@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { useState } from "react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { JobKind, JobState, JobStatus } from "@rocky-types/job_status";
 import { WriteAccessProvider, useJob, type WriteAccess } from "../operator";
@@ -85,6 +85,9 @@ describe("JobTray", () => {
 
     // Seen, then left: the next visit starts clean, not on an old result.
     fireEvent.click(screen.getByRole("button", { name: "Switch page" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
     fireEvent.click(screen.getByRole("button", { name: "Switch page" }));
     expect(screen.getByTestId("page-view")).toHaveTextContent("idle");
   });
@@ -132,6 +135,82 @@ describe("JobTray", () => {
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     const card = await screen.findByRole("article", { name: "Apply change abc" });
     expect(card).toHaveTextContent("Not started. Job job_42 holds the project. Try again when it ends.");
+  });
+});
+
+describe("useJob on the shared store", () => {
+  it("keeps a result through a keyed refresh and under StrictMode", async () => {
+    const jobs = controlledJobs("apply");
+    function Keyed() {
+      const [generation, setGeneration] = useState(0);
+      return (
+        <>
+          <button type="button" onClick={() => setGeneration((n) => n + 1)}>
+            Refresh
+          </button>
+          <ApplyPage key={generation} client={jobs.client} />
+        </>
+      );
+    }
+    render(
+      <StrictMode>
+        <WriteAccessProvider value={OPERATOR}>
+          <JobTrayProvider store={new JobStore(5, 60_000)}>
+            <Keyed />
+          </JobTrayProvider>
+        </WriteAccessProvider>
+      </StrictMode>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    jobs.finish("failed", "Error: boom");
+    await waitFor(() => expect(screen.getByTestId("page-view")).toHaveTextContent("done failed"));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("page-view")).toHaveTextContent("done failed");
+  });
+
+  it("refreshes once for a job whose subject the page moved away from, even after coming back", async () => {
+    const jobs = controlledJobs("run");
+    const onDone = vi.fn();
+    function Runner({ model }: { model: string }) {
+      const run = useJob("run", jobs.client, onDone, { subject: model, label: `Run ${model}` });
+      return (
+        <button type="button" onClick={() => run.start({ model })}>
+          Run {model}
+        </button>
+      );
+    }
+    function Picker() {
+      const [model, setModel] = useState("x");
+      return (
+        <>
+          <button type="button" onClick={() => setModel((m) => (m === "x" ? "y" : "x"))}>
+            Pick other
+          </button>
+          <Runner model={model} />
+        </>
+      );
+    }
+    render(
+      <StrictMode>
+        <WriteAccessProvider value={OPERATOR}>
+          <JobTrayProvider store={new JobStore(5, 60_000)}>
+            <Picker />
+          </JobTrayProvider>
+        </WriteAccessProvider>
+      </StrictMode>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Run x" }));
+    await waitFor(() => expect(jobs.client.status).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Pick other" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pick other" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pick other" }));
+    jobs.finish("succeeded");
+    await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(onDone).toHaveBeenCalledTimes(1);
   });
 });
 

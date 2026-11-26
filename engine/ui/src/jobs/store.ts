@@ -152,6 +152,7 @@ export class JobStore {
   private doneListeners = new Map<string, Set<(job: JobStatus) => void>>();
   private closeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private mounts = new Map<string, number>();
+  private heldBy = new Map<string, string>();
   private disposed = false;
   private list: JobRecord[] = [];
 
@@ -178,8 +179,9 @@ export class JobStore {
    * A page shows `key`. Returns the detach: when the last page leaves and
    * the job has ended, the job is forgotten for pages.
    */
-  attach(key: string): () => void {
+  attach(key: string, heldBy?: string): () => void {
     this.mounts.set(key, (this.mounts.get(key) ?? 0) + 1);
+    if (heldBy !== undefined) this.heldBy.set(key, heldBy);
     return () => {
       const left = (this.mounts.get(key) ?? 1) - 1;
       if (left > 0) {
@@ -187,11 +189,29 @@ export class JobStore {
         return;
       }
       this.mounts.delete(key);
-      const record = this.records.get(key);
-      if (record !== undefined && settled(record) && record.view.kind !== "idle" && !record.forgotten) {
-        this.put({ ...record, forgotten: true });
-      }
+      // Decide after the commit: a page that remounts at once (a keyed
+      // refresh, StrictMode in development) attaches again before this runs.
+      queueMicrotask(() => this.forgetIfLeft(key));
     };
+  }
+
+  /**
+   * Forget `key` for pages if no page shows it and its job has ended. A key
+   * held by another (an optimize plan, by its apply) waits for that one:
+   * the plan is what the page draws the apply under.
+   */
+  private forgetIfLeft(key: string): void {
+    if (this.disposed || (this.mounts.get(key) ?? 0) > 0) return;
+    const record = this.records.get(key);
+    if (record === undefined || !settled(record) || record.view.kind === "idle" || record.forgotten) return;
+    const holder = this.heldBy.get(key);
+    const held = holder === undefined ? undefined : this.records.get(holder);
+    if (held !== undefined && held.view.kind !== "idle" && !held.forgotten) return;
+    this.put({ ...record, forgotten: true });
+    // Anything this key was holding can go now too.
+    for (const [other, by] of this.heldBy) {
+      if (by === key) this.forgetIfLeft(other);
+    }
   }
 
   /** Run `listener` once when the job in `key` ends. Returns the unsubscribe. */

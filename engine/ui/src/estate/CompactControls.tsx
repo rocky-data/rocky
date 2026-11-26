@@ -9,6 +9,7 @@ import {
   useJob,
   type JobClient,
 } from "../operator";
+import { jobKey } from "../jobs/store";
 
 const INPUT =
   "h-9 rounded-md border border-zinc-300 bg-white px-2 text-sm dark:border-zinc-700 dark:bg-zinc-900";
@@ -82,7 +83,10 @@ export function CompactControls({
   jobs?: JobClient;
   onDone?: () => void;
 }) {
-  const plan = useJob("compact", jobs, undefined, { label: "Plan optimize tables" });
+  const plan = useJob("compact", jobs, undefined, {
+    label: "Plan optimize tables",
+    heldBy: jobKey("apply", "optimize-tables"),
+  });
   const apply = useJob("apply", jobs, onDone, { subject: "optimize-tables", label: "Optimize tables" });
   // A page that comes back to a job it started shows that job again: the
   // inputs and the plan it is applying come from what the jobs were sent.

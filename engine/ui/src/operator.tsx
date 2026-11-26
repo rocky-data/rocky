@@ -17,7 +17,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, us
 import type { JobKind, JobStatus } from "@rocky-types/job_status";
 import type { MetaTokenScope } from "@rocky-types/meta";
 import { ApiError } from "./api";
-import { JOB_POLL_MS, JobStore, defaultJobClient, idleRecord, jobKey, settled } from "./jobs/store";
+import { JOB_POLL_MS, JobStore, defaultJobClient, idleRecord, jobKey } from "./jobs/store";
 import type { CancelView, JobClient, JobView } from "./jobs/store";
 import { JobStoreContext } from "./jobs/context";
 import { READ_BUTTON } from "./components";
@@ -122,6 +122,11 @@ export interface JobSlot {
   label?: string;
   /** How often a running job is read again (tests shorten it). */
   pollMs?: number;
+  /**
+   * Another slot this one is shown under (an apply, for its plan): this job
+   * is kept for the page while that one runs or has an unseen end.
+   */
+  heldBy?: string;
 }
 
 /**
@@ -160,7 +165,8 @@ export function useJob(
     // An ended job every page has left is not this visit's state.
     return found === undefined || found.forgotten ? idle : found;
   });
-  useEffect(() => store.attach(key), [store, key]);
+  const heldBy = slot.heldBy;
+  useEffect(() => store.attach(key, heldBy), [store, key, heldBy]);
 
   const done = useRef(onDone);
   useEffect(() => {
@@ -173,18 +179,36 @@ export function useJob(
       mounted.current = false;
     };
   }, []);
+  // One pending "refresh when it ends" per key this page moved away from.
+  const pending = useRef(new Map<string, () => void>());
   useEffect(() => {
+    const waits = pending.current;
+    return () => {
+      for (const stop of waits.values()) stop();
+      waits.clear();
+    };
+  }, []);
+  useEffect(() => {
+    const waits = pending.current;
+    // Back on a key: its own listener below replaces the pending one.
+    waits.get(key)?.();
+    waits.delete(key);
     const stop = store.onDone(key, (job) => done.current?.(job));
     return () => {
       stop();
+      if (!mounted.current) return;
       // The subject changed while this key's job runs (another model was
-      // picked): still refresh once when it ends, if this page is shown.
+      // picked): still refresh once when that job ends, if the page is shown.
       const left = store.get(key);
-      if (left === undefined || settled(left)) return;
+      if (left === undefined || left.view.kind !== "running") return;
+      const jobId = left.view.jobId;
       const once = store.onDone(key, (job) => {
+        if (job.job_id !== jobId) return;
         once();
+        waits.delete(key);
         if (mounted.current) done.current?.(job);
       });
+      waits.set(key, once);
     };
   }, [store, key]);
 
