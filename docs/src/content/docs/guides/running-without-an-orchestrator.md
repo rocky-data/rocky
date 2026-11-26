@@ -567,8 +567,8 @@ It lists what the ingress accepted and no tick has consumed, with the `token` yo
 `rocky validate` gives each scheduled pipeline a rerun-safety class. The scheduler will use the class before it retries, re-runs or fails over a run. A pipeline is `rerun_safe` when a second run cannot corrupt the target, even while the first run is still writing. Otherwise it is `not_rerun_safe`, and the message says why.
 
 ```
-  ok pipeline.silver: rerun_safe
-  ok pipeline.raw: not_rerun_safe (replication incremental reads its watermark from the Rocky state store, ...)
+  ok  pipeline.silver: rerun_safe
+  ok  pipeline.raw: not_rerun_safe (replication incremental reads its watermark from the Rocky state store, ...)
 ```
 
 The message has code `V069` and severity `ok`, so it never fails validation. A pipeline with no `[schedule]` block gets no class.

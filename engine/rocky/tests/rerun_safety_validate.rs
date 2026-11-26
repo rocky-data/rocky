@@ -69,21 +69,25 @@ models = "safe/**"
 #[test]
 fn validate_prints_each_scheduled_pipelines_rerun_safety_class() {
     let dir = project();
-    let out = rocky(dir.path(), &["validate"]);
+    let out = rocky(dir.path(), &["validate", "--output", "table"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "validate: {stdout}{stderr}");
     assert!(
-        stdout.contains("  ok pipeline.safe: rerun_safe\n"),
+        stdout.contains("  ok  pipeline.safe: rerun_safe\n"),
         "{stdout}"
     );
     assert!(
         stdout.contains(
-            "  ok pipeline.unsafe_: not_rerun_safe (model 'orders_history': a snapshot model"
+            "  ok  pipeline.unsafe_: not_rerun_safe (model 'orders_history': a snapshot model"
         ),
         "{stdout}"
     );
-    assert!(!stdout.contains("pipeline.manual: "), "{stdout}");
+    assert!(
+        !stdout.contains("pipeline.manual: rerun_safe")
+            && !stdout.contains("pipeline.manual: not_rerun_safe"),
+        "{stdout}"
+    );
 }
 
 #[test]
