@@ -422,6 +422,57 @@ pub fn generate_test_sql_for_table_ref(
     generate_test_sql_unchecked_table(test, table_ref, Some(dialect))
 }
 
+/// One query for several default-config `not_null` tests on the same table
+/// (#2756).
+///
+/// Returns one row with one count per column, in `columns` order, aliased
+/// `rocky_n0`, `rocky_n1`, ... Each count is the number of rows where that
+/// column `IS NULL` — exactly what the single `not_null` query counts.
+/// `COUNT(CASE ...)` is `0` on an empty table, never NULL, as the single
+/// `COUNT(*)` is.
+///
+/// `table_ref` is trusted, as in [`generate_test_sql_for_table_ref`]: the
+/// dialect rendered it. Every column is validated before it is spliced in.
+pub fn generate_batched_not_null_sql(
+    columns: &[&str],
+    table_ref: &str,
+) -> Result<String, TestGenError> {
+    let mut items = Vec::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        validation::validate_identifier(col)?;
+        items.push(format!(
+            "COUNT(CASE WHEN {col} IS NULL THEN 1 END) AS rocky_n{i}"
+        ));
+    }
+    Ok(format!("SELECT {} FROM {table_ref}", items.join(", ")))
+}
+
+/// One query for several default-config `unique` tests on the same table
+/// (#2756).
+///
+/// One `UNION ALL` arm per column. Arm `i` returns the row
+/// `(i, number of duplicate groups)`, where a duplicate group is exactly a
+/// row the single `unique` query returns (`GROUP BY col HAVING COUNT(*) > 1`).
+/// So the NULL group counts when two or more rows are NULL, as it does in
+/// the single query. Read the result by the index column, not by row order.
+///
+/// `table_ref` is trusted, as in [`generate_test_sql_for_table_ref`]: the
+/// dialect rendered it. Every column is validated before it is spliced in.
+pub fn generate_batched_unique_sql(
+    columns: &[&str],
+    table_ref: &str,
+) -> Result<String, TestGenError> {
+    let mut arms = Vec::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        validation::validate_identifier(col)?;
+        arms.push(format!(
+            "SELECT {i} AS rocky_index, COUNT(*) AS rocky_failing FROM \
+             (SELECT {col} FROM {table_ref} GROUP BY {col} HAVING COUNT(*) > 1) AS rocky_d{i}"
+        ));
+    }
+    Ok(arms.join(" UNION ALL "))
+}
+
 fn generate_test_sql_inner(
     test: &TestDecl,
     table: &str,
@@ -845,6 +896,38 @@ fn require_column<'a>(test: &'a TestDecl, test_type: &str) -> Result<&'a str, Te
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    // ----- batched SQL (#2756) -----
+
+    #[test]
+    fn batched_sql_has_one_count_per_column_in_order() {
+        assert_eq!(
+            generate_batched_not_null_sql(&["a", "b"], "main.t").unwrap(),
+            "SELECT COUNT(CASE WHEN a IS NULL THEN 1 END) AS rocky_n0, \
+             COUNT(CASE WHEN b IS NULL THEN 1 END) AS rocky_n1 FROM main.t"
+        );
+        assert_eq!(
+            generate_batched_unique_sql(&["a", "b"], "main.t").unwrap(),
+            "SELECT 0 AS rocky_index, COUNT(*) AS rocky_failing FROM \
+             (SELECT a FROM main.t GROUP BY a HAVING COUNT(*) > 1) AS rocky_d0 UNION ALL \
+             SELECT 1 AS rocky_index, COUNT(*) AS rocky_failing FROM \
+             (SELECT b FROM main.t GROUP BY b HAVING COUNT(*) > 1) AS rocky_d1"
+        );
+    }
+
+    #[test]
+    fn batched_sql_refuses_an_unvalidated_column() {
+        for bad in ["a; DROP TABLE t", "a b", "a)--"] {
+            assert!(matches!(
+                generate_batched_not_null_sql(&["ok", bad], "main.t"),
+                Err(TestGenError::Validation(_))
+            ));
+            assert!(matches!(
+                generate_batched_unique_sql(&["ok", bad], "main.t"),
+                Err(TestGenError::Validation(_))
+            ));
+        }
+    }
 
     // ----- TOML deserialization -----
 

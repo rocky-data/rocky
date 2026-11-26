@@ -7,9 +7,7 @@ sidebar:
 
 `dagster-rocky` maps Rocky's freshness configuration onto Dagster's
 [`FreshnessPolicy`](https://docs.dagster.io/api/dagster/assets#dagster.FreshnessPolicy),
-which says how old an asset's data may get before Dagster calls it stale. The
-Dagster UI then shows stale-data badges, and the declarative-automation
-freshness conditions fire correctly.
+which says how old an asset's data may get before Dagster calls it stale.
 
 Freshness comes from two places. A per-model setting wins over the
 pipeline-level one.
@@ -32,16 +30,7 @@ error_after = "24h"
 ```
 
 `RockyComponent` reads `discover.checks.freshness` and attaches a matching
-`FreshnessPolicy` to every source-replication asset. Nothing else to configure.
-Wire it up in `defs.yaml`:
-
-```yaml
-type: dagster_rocky.RockyComponent
-attributes:
-  config_path: rocky.toml
-```
-
-The functional API works the same way:
+`FreshnessPolicy` to every source-replication asset. The functional API does the same:
 
 ```python
 from dagster_rocky import RockyResource, load_rocky_assets
@@ -152,10 +141,4 @@ resource still returns the report.
 It does **not** use the legacy `FreshnessPolicy(maximum_lag_minutes=...)`, which
 is deprecated.
 
-This means:
-
-- Compare in tests with `policy.fail_window.to_timedelta().total_seconds()`.
-  Dagster wraps the `timedelta` in a `SerializableTimeDelta`, which does not
-  compare equal to a plain `timedelta`.
-- The check shows up under "Freshness" in the asset detail page, with the
-  `fail_window` value.
+In tests, compare with `policy.fail_window.to_timedelta().total_seconds()`. Dagster wraps the `timedelta` in a `SerializableTimeDelta`, which does not equal a plain `timedelta`.

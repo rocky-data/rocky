@@ -1006,7 +1006,7 @@
     "@types/vscode": "1.120.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.1.1",
-    "@xyflow/react": "^12.12.1",
+    "@xyflow/react": "^13.0.2",
     "esbuild": "^0.28.2",
     "eslint": "^10.15.0",
     "glob": "^14.0.6",

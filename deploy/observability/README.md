@@ -1,23 +1,10 @@
 # Rocky observability quickstart
 
-A single-node Grafana + Alloy + Tempo + Loki + Prometheus stack that receives
-Rocky's OpenTelemetry and shows your runs: traces, run metrics, and logs.
-Logs are not linked to traces: Rocky's JSON log lines carry no trace ID
-(see [Log collection](#log-collection)).
+A single-node Grafana + Alloy + Tempo + Loki + Prometheus stack that receives Rocky's OpenTelemetry and shows your runs: traces, run metrics and logs. Logs are not linked to traces: Rocky's JSON log lines carry no trace ID (see [Log collection](#log-collection)).
 
-Rocky exports OpenTelemetry when you set `OTEL_EXPORTER_OTLP_ENDPOINT`. The
-exporter is a default Cargo feature (`otel`), so release binaries and a plain
-`cargo build` include it.
-It emits distributed traces (a span tree per run), run metrics (tables
-processed/failed, error rate, table and query duration histograms, retries),
-and structured logs on stderr. This stack is somewhere to send all of
-that so you can look at it.
+Rocky exports OpenTelemetry when you set `OTEL_EXPORTER_OTLP_ENDPOINT`. The exporter is a default Cargo feature (`otel`), so release binaries and a plain `cargo build` include it. It emits traces (a span tree per run), run metrics (tables processed/failed, error rate, table and query duration histograms, retries) and structured logs on stderr.
 
-> This is a **dev / quickstart** stack, not a hardened production deployment.
-> Storage is local and ephemeral, there is no authentication in front of any
-> component, retention is short, and every service runs single-node with no
-> replication. Use it to try Rocky's telemetry on your laptop or in CI, then
-> point Rocky at your real collector for anything that matters.
+> This is a **dev / quickstart** stack, not a production deployment. Storage is local and ephemeral, nothing is authenticated, retention is short, and every service is single-node. Use it to try Rocky's telemetry, then point Rocky at your real collector.
 
 ## What's in it
 
@@ -41,10 +28,8 @@ grafana <-- tempo / prometheus / loki               (provisioned datasources)
 ## Prerequisites
 
 - Docker with Compose v2 (`docker compose version`).
-- The DuckDB CLI (`duckdb`) — step 2 seeds a local DuckDB file with it.
-- A `rocky` binary with the OpenTelemetry exporter. Release binaries have it,
-  because `otel` is a default feature. Only a build with
-  `--no-default-features` leaves it out.
+- The DuckDB CLI (`duckdb`), which step 2 uses to seed a local file.
+- A `rocky` binary with the OpenTelemetry exporter. Release binaries have it. Only a build with `--no-default-features` leaves it out.
 
 ## Quickstart (3 commands)
 
@@ -62,14 +47,7 @@ Give it a few seconds, then check everything is healthy:
 docker compose ps
 ```
 
-**2. Run a Rocky pipeline with OTel pointed at the stack.** This seeds and
-runs the replication playground POC, which produces a trace, run metrics, and
-the table-duration histogram. `2>` also writes Rocky's stderr logs into
-`./logs` so the log pipeline picks them up.
-
-The log format follows the output format. At a terminal, Rocky prints tables
-and writes colored text logs. `--output json` makes the logs JSON lines, which
-is the shape Alloy parses.
+**2. Run a Rocky pipeline with OTel pointed at the stack.** This seeds and runs the replication playground POC, which produces a trace, run metrics and the table-duration histogram. `2>` writes Rocky's stderr logs into `./logs` for the log pipeline. `--output json` makes the logs JSON lines, the shape Alloy parses. At a terminal, Rocky otherwise prints tables and colored text logs.
 
 ```bash
 cd ../../examples/playground/pocs/00-foundations/01-replication-basics
@@ -85,17 +63,9 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 OTEL_SERVICE_NAME=rocky \
 open http://localhost:3000        # macOS; use xdg-open on Linux
 ```
 
-Grafana is provisioned with anonymous admin access (no login). Open the
-**Rocky Runs** dashboard in the **Rocky** folder. You'll see the run's metrics
-and, in the trace panel at the bottom, the run's trace; click it to open the
-full span tree. The link from a span to its logs in Loki has nothing to match
-on, because the log lines carry no trace ID.
+Grafana is provisioned with anonymous admin access (no login). Open the **Rocky Runs** dashboard in the **Rocky** folder. It shows the run's metrics and, in the bottom trace panel, the run's trace. Click it for the full span tree. The span-to-logs link in Loki has nothing to match on, because log lines carry no trace ID.
 
-Any `rocky run` (or `plan`, `apply`, …) with those two env vars set will land
-here — the replication POC is just a convenient one that exercises every
-panel. A DuckDB run leaves the "Query duration" panel empty because SQL
-statement timing is recorded by the warehouse adapter (Databricks today), not
-by the local DuckDB path.
+Any `rocky run`, `plan` or `apply` with those two env vars lands here. A DuckDB run leaves the "Query duration" panel empty: the warehouse adapter (Databricks today) records statement timing, not the local DuckDB path.
 
 ### Verify from the command line (optional)
 
@@ -117,26 +87,14 @@ curl -s 'http://localhost:9090/api/v1/label/__name__/values' | jq -r '.data[] | 
 docker compose down -v
 ```
 
-`down -v` removes the containers **and** the named volumes, so nothing is left
-behind. Runtime log files you tee'd into `./logs/` are gitignored; delete them
-by hand if you want a truly clean tree.
+`down -v` removes the containers **and** the named volumes. Log files you tee'd into `./logs/` are gitignored. Delete them by hand for a clean tree.
 
 ## Log collection
 
-Rocky writes structured logs to stderr. With JSON output (`--output json`, or
-any run whose stdout is not a terminal) each log is one JSON object per line.
-At a terminal the logs are colored text. The Alloy config ships two log paths:
+Rocky writes structured logs to stderr: one JSON object per line with `--output json` (or any run whose stdout is not a terminal), colored text at a terminal. Alloy has two log paths:
 
-- **OTLP logs** — wired to Loki's native OTLP endpoint for any source that
-  exports OTLP logs. Rocky does not export OTLP logs today (it uses stderr
-  JSON), so this route is there for completeness and forward-compatibility.
-- **File-tail (the one Rocky uses today)** — redirect Rocky's stderr to a file
-  under `./logs/` (as the quickstart does) and Alloy tails `./logs/*.jsonl`,
-  parses each line, promotes `level` to a label, and reads `trace_id` /
-  `span_id` into structured metadata. Rocky's JSON log lines do not contain
-  those fields at the default log level, even with OpenTelemetry on. A line
-  carries span names and span fields, not the OpenTelemetry trace ID. So
-  Grafana cannot jump from a span in Tempo to its log lines in Loki.
+- **OTLP logs** go to Loki's native OTLP endpoint. Rocky does not export OTLP logs today, so this route is for forward-compatibility.
+- **File-tail** (the one Rocky uses): redirect stderr to `./logs/` as the quickstart does. Alloy tails `./logs/*.jsonl`, promotes `level` to a label, and reads `trace_id` / `span_id` into structured metadata. Rocky's JSON lines do not contain those fields at the default log level, even with OpenTelemetry on: a line has span names and span fields, not the OpenTelemetry trace ID. So Grafana cannot jump from a Tempo span to its Loki logs.
 
 See `alloy/config.alloy` for both pipelines; the file-tail block is documented
 inline.
@@ -157,10 +115,7 @@ Prometheus after OTLP conversion):
 | `rocky_table_duration_ms_bucket` / `_sum` / `_count` | `rocky.table_duration_ms` | histogram |
 | `rocky_query_duration_ms_bucket` / `_sum` / `_count` | `rocky.query_duration_ms` | histogram (warehouse adapter) |
 
-The counters are exported as **last-value gauges** — each run pushes the totals
-for that run, so the series is a per-run snapshot over time rather than a
-monotonic counter. Read "runs over time" panels accordingly; do not wrap these
-in `increase()` or `rate()`, which assume a cumulative counter.
+The counters are exported as **last-value gauges**: each run pushes its own totals, so a series is a per-run snapshot, not a monotonic counter. Do not wrap them in `increase()` or `rate()`.
 
 ## Configuration
 

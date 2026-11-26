@@ -144,42 +144,28 @@ class TestFailure(BaseModel):
     name: str
 
 
-class UnitTestResult(BaseModel):
+class UnitTestDialectStatus1(StrEnum):
     """
-    Result of running a single unit test.
-    """
-
-    error: str | None = None
-    """
-    Error message if failed.
-    """
-    mismatches: list[RowMismatch] | None = Field([], validate_default=True)
-    """
-    Mismatched rows (for diagnostics).
-    """
-    model: str
-    """
-    Model name.
-    """
-    passed: bool
-    """
-    Whether the test passed.
-    """
-    test: str
-    """
-    Test name.
+    The model has one target warehouse, and it is not DuckDB.
     """
 
+    non_duckdb_target = "non_duckdb_target"
 
-class UnitTestSummary(BaseModel):
+
+class UnitTestDialectStatus2(StrEnum):
     """
-    Summary of fixture-driven unit-test execution (from `[[test]]` blocks in model sidecars). The per-test `results` reuse the engine's [`rocky_core::unit_test::UnitTestResult`] shape (model, test, passed, error, and row-level mismatches).
+    No target warehouse is configured for the model (no `rocky.toml`, or no warehouse adapter). Rocky does not assume DuckDB.
     """
 
-    failed: conint(ge=0)
-    passed: conint(ge=0)
-    results: list[UnitTestResult]
-    total: conint(ge=0)
+    unresolved_target = "unresolved_target"
+
+
+class UnitTestDialectStatus3(StrEnum):
+    """
+    The model can run on more than one warehouse.
+    """
+
+    multiple_targets = "multiple_targets"
 
 
 class Diagnostic(BaseModel):
@@ -213,6 +199,73 @@ class Diagnostic(BaseModel):
     """
     Suggested fix (if any).
     """
+
+
+class UnitTestDialect(BaseModel):
+    """
+    How the dialect a unit test ran on relates to the model's target warehouse.
+
+    `rocky test` runs every unit test on an in-memory DuckDB. SQL that both DuckDB and the target accept can still behave differently on the target, so a pass here does not prove the model on its warehouse.
+    """
+
+    ran_on_duckdb: bool
+    """
+    `true` once the model's SQL was sent to DuckDB, even if DuckDB rejected it. `false` when the test failed before that: a refusal by `--strict-dialect`, a compile failure, a dependency cycle, or a fixture, function or database setup failure.
+    """
+    refused: bool
+    """
+    `true` when `--strict-dialect` refused the test instead of running it.
+    """
+    status: UnitTestDialectStatus1 | UnitTestDialectStatus2 | UnitTestDialectStatus3
+    """
+    Why the test carries this notice.
+    """
+    targets: list[str]
+    """
+    The model's target warehouses, by dialect name (`Snowflake`) or, for an adapter with no dialect table, by adapter type (`clickhouse`). Empty when no target is known.
+    """
+
+
+class UnitTestResult(BaseModel):
+    """
+    Result of running a single unit test.
+    """
+
+    dialect: UnitTestDialect | None = None
+    """
+    Set when the model's target warehouse is not known to be DuckDB. Absent for a model whose only target is DuckDB: its test ran on its own dialect and needs no notice.
+    """
+    error: str | None = None
+    """
+    Error message if failed.
+    """
+    mismatches: list[RowMismatch] | None = Field([], validate_default=True)
+    """
+    Mismatched rows (for diagnostics).
+    """
+    model: str
+    """
+    Model name.
+    """
+    passed: bool
+    """
+    Whether the test passed.
+    """
+    test: str
+    """
+    Test name.
+    """
+
+
+class UnitTestSummary(BaseModel):
+    """
+    Summary of fixture-driven unit-test execution (from `[[test]]` blocks in model sidecars). The per-test `results` reuse the engine's [`rocky_core::unit_test::UnitTestResult`] shape (model, test, passed, error, and row-level mismatches).
+    """
+
+    failed: conint(ge=0)
+    passed: conint(ge=0)
+    results: list[UnitTestResult]
+    total: conint(ge=0)
 
 
 class TestOutput(BaseModel):

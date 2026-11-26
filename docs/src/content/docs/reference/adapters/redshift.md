@@ -5,9 +5,7 @@ sidebar:
   order: 7
 ---
 
-The Redshift adapter is **Beta**. Rocky tests its SQL in unit tests only. There is no local Redshift to run it against, so no Redshift SQL runs in CI. Rocky logs a warning when you register it.
-
-It shares a crate and a connection with the [PostgreSQL adapter](/reference/adapters/postgres/). Redshift speaks the PostgreSQL wire protocol. This page lists only what differs.
+The Redshift adapter is **Beta**. Its SQL is tested in unit tests only, because no local Redshift exists to run it against. Rocky logs a warning when you register it. It shares a crate and connection with the [PostgreSQL adapter](/reference/adapters/postgres/), and this page lists only what differs.
 
 ## Fields
 
@@ -32,9 +30,7 @@ late_binding_views = true
 
 ## Authentication
 
-Rocky supports password auth. Use a database user, or temporary credentials you fetched yourself.
-
-IAM auth, through `GetClusterCredentials` or the Serverless `GetCredentials` call, is not built in yet. It is planned as a follow-up.
+Rocky supports password auth: a database user, or temporary credentials you fetched yourself. IAM auth (`GetClusterCredentials`, Serverless `GetCredentials`) is not built in.
 
 ## Table distribution and sort keys
 
@@ -89,7 +85,6 @@ Redshift needs every table in a late-binding view to name its schema: `marts.fct
 | Concern | Redshift |
 |---------|----------|
 | `MERGE` | Three statements in one transaction: `CREATE TEMP TABLE rocky_merge_src AS <model SQL>`, then `MERGE INTO <target> USING rocky_merge_src ON <table>.<key> = rocky_merge_src.<key>`, then `DROP TABLE rocky_merge_src`. Redshift refuses a `WITH` clause in a MERGE and a source subquery that reads the target, and model SQL can do both. There is no target alias, and both `WHEN` arms are always present. A model whose only columns are its keys inserts the missing keys with `INSERT … WHERE NOT EXISTS` instead. |
-| Upserts | `MERGE` only. Redshift has no `ON CONFLICT`, so `merge_mode = "on_conflict"` is refused. |
 | Snapshots (SCD2) | Refused. The generic snapshot SQL uses `CREATE TABLE IF NOT EXISTS … AS`, a MERGE target alias and a conditional `WHEN MATCHED`. |
 | Names | Up to 127 bytes. Names fold to lower case. |
 | String literals | A backslash is an escape: Rocky writes `\'` and `\\` (from the Redshift lexer's PostgreSQL 8.0 roots — not verified live) |
@@ -103,18 +98,17 @@ Redshift needs every table in a late-binding view to name its schema: `marts.fct
 
 ## Not verified on a live cluster
 
-Every Redshift rendering on this page comes from the Redshift documentation and is pinned by generated-SQL tests. None has run against a Redshift cluster. These need a live cluster to confirm:
+No Redshift rendering on this page has run against a cluster: each comes from the Redshift documentation and is pinned by generated-SQL tests. These need a live cluster to confirm:
 
 - The `MERGE` temp-table form, including a model with CTEs and an `@incremental_filter`.
 - Backslash escapes in string literals.
-- `delete_insert`: `DELETE … WHERE (a, b) IN (SELECT …)` with more than one partition column.
+- `delete_insert`: `DELETE ... WHERE (a, b) IN (SELECT ...)` with more than one partition column.
 - `svv_columns` types for `SUPER`, `IDENTITY` columns and late-binding views.
-- In-place `VARCHAR` growth (`ALTER COLUMN … TYPE`).
+- In-place `VARCHAR` growth (`ALTER COLUMN ... TYPE`).
 - `sslmode` defaults against a Redshift endpoint.
 
 ## Not supported yet
 
-- IAM authentication.
 - Governance, checksum-bisection `rocky compare`, and Redshift as a discovery source.
 - `AUTO REFRESH`, `BACKUP` and attributes on materialized views.
 - Snapshot pipelines.

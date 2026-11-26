@@ -9,40 +9,11 @@ enforces. For a shorter tour with worked examples, read the
 
 ## Scope
 
-The DSL is one of two ways to write a Rocky transformation model. The other is
-plain SQL in a `.sql` file. Both compile the same way and produce the same
-kind of model. Neither replaces the other, and one project can hold both.
-
-The DSL has no warehouse-specific syntax of its own. Rocky picks the SQL
-dialect later, when it generates the statement it sends to the warehouse.
+The DSL is one of two ways to write a transformation model. The other is plain SQL in a `.sql` file. Both compile the same way, can share a project, and neither replaces the other. The DSL has no warehouse-specific syntax: Rocky picks the dialect when it generates the statement.
 
 ## How a `.rocky` file becomes warehouse SQL
 
-A `.rocky` file passes through two stages that a `.sql` file skips. The parser
-turns tokens into a pipeline AST. `lower_to_sql()` walks that AST and returns
-**one SQL string**. From there a DSL model and a SQL model follow the same
-path.
-
-```
-  models/top_customers.rocky       models/fct_orders.sql
-             │                               │
-   parse     │ tokens ──► pipeline AST       │ used as written
-             │                               │
-   lower     │ lower_to_sql()                │
-             ▼                               ▼
-             └───────► one SQL string ◄──────┘
-                             │
-   compile                   │ type check, resolve depends_on
-                             ▼
-                        one ModelIr ────► compile errors E001-E061
-                             │            (nothing runs)
-   generate                  │ per-dialect SQL generation
-                             ▼
-                        dialect SQL ────► warehouse
-```
-
-There is no separate high-level IR. A model reduces to a single `ModelIr`, and
-the DSL reaches it through the SQL string, not through a direct lowering.
+A `.rocky` file passes through two stages that a `.sql` file skips. The parser turns tokens into a pipeline AST. `lower_to_sql()` walks that AST and returns **one SQL string**. From there a DSL model and a SQL model follow the same path: compile (type check, resolve `depends_on`) into one `ModelIr`, then per-dialect SQL generation. There is no separate high-level IR.
 
 A `.rocky` file that fails to parse never reaches the SQL string. Nor does one
 that parses but cannot lower. Rocky reports the file path and the reason in
@@ -61,33 +32,13 @@ where status != "cancelled"
 select { id, amount }
 ```
 
-The lexer drops newlines before the parser runs. A step therefore starts at its
-own keyword and ends where the next step's keyword begins. Newlines and `|`
-between steps are both cosmetic, so put one step per line for readability.
+The lexer drops newlines before parsing. A step starts at its own keyword and ends where the next step's keyword begins. Newlines and `|` between steps are cosmetic.
 
 A file with no `let` bindings and no pipeline steps is a parse error.
 
 ### The sidecar `.toml` file
 
-A `.rocky` file may sit beside a `.toml` file of the same name. The sidecar
-carries the model's name, its materialization strategy, its target table, and
-its declared tests.
-
-```toml
-name = "filtered_orders"
-
-[strategy]
-type = "full_refresh"
-
-[target]
-catalog = "warehouse"
-schema = "silver"
-table = "filtered_orders"
-```
-
-The sidecar is optional, and so is every key in it. A `_defaults.toml` file in
-the same directory supplies directory-wide values for `[target]` and
-`[strategy]`. Declare a dependency on another model with `depends_on`.
+A `.rocky` file may sit beside a `.toml` file of the same name that carries the model's name, strategy, target and tests (see [Model Format](/reference/model-format/)). The sidecar and every key in it are optional. A `_defaults.toml` in the same directory supplies directory-wide `[target]` and `[strategy]` values. Declare a dependency with `depends_on`. Precedence: sidecar key, then the model's config group, then `_defaults.toml`.
 
 What Rocky fills in depends on whether the sidecar exists at all:
 
@@ -101,9 +52,6 @@ What Rocky fills in depends on whether the sidecar exists at all:
 
 A sidecar that resolves no `catalog` or no `schema` fails to load. Rocky names
 the model and the missing field.
-
-Precedence runs sidecar key first, then the model's config group, then
-`_defaults.toml`.
 
 ## Pipeline steps
 
@@ -134,8 +82,7 @@ where amount >= 100 and order_date >= @2025-01-01
 where email is not null
 ```
 
-A `where` before a `group` lowers to `WHERE`. A `where` after a `group` lowers
-to `HAVING`.
+A `where` before a `group` lowers to `WHERE`, and after it to `HAVING`.
 
 A `WHERE` clause cannot reference a projection alias. So when a `where` names a
 column an earlier `derive` computed, Rocky substitutes the expression behind
@@ -153,16 +100,7 @@ group customer_id {
 }
 ```
 
-Use a comma-separated list for several keys:
-
-```rocky
-group customer_id, region {
-    total: sum(amount)
-}
-```
-
-The keys are optional. `group { total: sum(amount) }` aggregates the whole
-input and emits no `GROUP BY` clause.
+Several keys are comma-separated (`group customer_id, region { … }`). The keys are optional: `group { total: sum(amount) }` aggregates the whole input with no `GROUP BY`.
 
 A `group` replaces the projection with its keys and its aggregations, in that
 order.
@@ -218,15 +156,7 @@ join customers as c on customer_id {
 }
 ```
 
-Use a comma-separated list for several keys:
-
-```rocky
-join products as p on product_id, variant_id {
-    keep p.category, p.price
-}
-```
-
-Rocky builds the join condition from the key names. It qualifies the left side
+Several keys are comma-separated (`join products as p on product_id, variant_id { … }`). Rocky builds the join condition from the key names. It qualifies the left side
 with the `from` alias, or with the `from` name when there is no alias. The first
 example therefore lowers to `JOIN customers AS c ON o.customer_id =
 c.customer_id`.
@@ -247,30 +177,12 @@ underscored word. Both spellings mean the same thing:
 
 A cross join takes no `on` clause. Every other join type requires one.
 
-### `sort`
-
-Order the result. Ascending is the default.
+### `sort`, `take`, `distinct`
 
 ```rocky
-sort amount desc
-sort name asc, created_at desc
-```
-
-### `take`
-
-Limit the row count. The number must fit in an unsigned 64-bit integer.
-
-```rocky
-take 100
-take 1_000
-```
-
-### `distinct`
-
-Deduplicate rows. This adds `DISTINCT` to the `SELECT`.
-
-```rocky
-distinct
+sort name asc, created_at desc   -- ascending is the default
+take 1_000                       -- must fit an unsigned 64-bit integer
+distinct                         -- adds DISTINCT to the SELECT
 ```
 
 ### `replicate`
@@ -288,8 +200,7 @@ projection.
 
 ## `let` bindings
 
-A `let` binding names a sub-pipeline. Rocky lowers each one to a common table
-expression (CTE). Bindings come before the main pipeline.
+A `let` binding names a sub-pipeline and lowers to a common table expression (CTE). Bindings come before the main pipeline.
 
 ```rocky
 let active = from users
@@ -299,30 +210,13 @@ from active
 select { id, name }
 ```
 
-This lowers to:
-
-```sql
-WITH active AS (SELECT *
-FROM users
-WHERE is_active = TRUE)
-SELECT id, name
-FROM active
-```
-
-A binding ends at the next `let`, at the end of the file, or at a `from` step
-when the binding already has one. Several bindings become a comma-separated
-`WITH` list.
+lowers to `WITH active AS (SELECT * FROM users WHERE is_active = TRUE) SELECT id, name FROM active`. A binding ends at the next `let`, at the end of the file, or at a `from` step when the binding already has one. Several bindings become a comma-separated `WITH` list.
 
 ## Expressions
 
-### Column references
-
-```rocky
-column_name
-alias.column_name
-```
-
 ### Literals
+
+Column references are `column_name` or `alias.column_name`.
 
 ```rocky
 42                    -- integer
@@ -337,32 +231,11 @@ null                  -- null
 @2025-01-01T10:30:00Z -- date literal with a time part
 ```
 
-A string literal ends at its own quote character. It has no escape sequences,
-so write a double-quoted string to include an apostrophe. Rocky escapes the
-apostrophe for you: `"it's"` lowers to `'it''s'`.
-Backslashes in `.rocky` string literals are refused at compile time with `E040`,
-pointing to the literal. For a value that needs a backslash, use a `.sql` model
-and the target warehouse's own escaping.
+A string literal ends at its own quote character and has no escape sequences. Use double quotes to include an apostrophe: `"it's"` lowers to `'it''s'`. A backslash is refused at compile time with `E040`, pointing to the literal. Use a `.sql` model and the warehouse's own escaping for it.
 
 ### Date literals
 
-The `@` prefix marks a date literal. It accepts `@YYYY-MM-DD`, optionally
-followed by `THH:MM:SS` and an optional `Z`.
-
-```rocky
-where order_date >= @2025-01-01
-where created_at < @2025-06-15T12:00:00Z
-```
-
-Both forms lower to a `DATE` literal that carries the text verbatim:
-
-```sql
-WHERE order_date >= DATE '2025-01-01'
-WHERE created_at < DATE '2025-06-15T12:00:00Z'
-```
-
-Rocky never emits a `TIMESTAMP` literal here, not even for the form with a time
-part. Check that your warehouse reads that value the way you expect.
+`@YYYY-MM-DD`, optionally followed by `THH:MM:SS` and an optional `Z`. Both forms lower to a `DATE` literal that carries the text verbatim (`@2025-06-15T12:00:00Z` becomes `DATE '2025-06-15T12:00:00Z'`). Rocky never emits a `TIMESTAMP` literal here. Check that your warehouse reads the value as you expect.
 
 ### Comparison operators
 
@@ -394,39 +267,11 @@ Boolean that is nullable when the operand or any list value is nullable.
 A single comparison takes at most one operator. Rocky does not chain them, so
 write `a < b and b < c` rather than `a < b < c`.
 
-### Arithmetic operators
+### Arithmetic and boolean operators
 
-| Operator | Meaning |
-|---|---|
-| `+` | Addition |
-| `-` | Subtraction, and negation as a prefix |
-| `*` | Multiplication |
-| `/` | Division |
-| `%` | Modulo |
+Arithmetic: `+`, `-` (also prefix negation), `*`, `/`, `%`. Boolean: `and`, `or`, `not`, lowering to `AND`, `OR`, `NOT`.
 
-### Boolean operators
-
-| Operator | SQL |
-|---|---|
-| `and` | `AND` |
-| `or` | `OR` |
-| `not` | `NOT` |
-
-### Operator precedence
-
-Operators bind in this order, loosest first:
-
-```
-or
-and
-==  !=  <  <=  >  >=  in  not in
-+   -
-*   /   %
-not  -            (prefix, binds tightest)
-```
-
-Rocky parenthesises a sub-expression in the generated SQL whenever precedence
-requires it. Use your own parentheses to group an expression differently.
+Precedence, loosest first: `or`; `and`; comparisons and `in` / `not in`; `+ -`; `* / %`; prefix `not` and `-`. Rocky parenthesises a sub-expression in the generated SQL when precedence requires it.
 
 ### Function calls
 
@@ -438,13 +283,7 @@ max(price)
 coalesce(email, "unknown")
 ```
 
-Rocky uppercases the function name and lowers each argument in place. It does
-not check the name or the argument count, and it does not rewrite the call for
-a particular warehouse. `coalesce(email, "unknown")` lowers to `COALESCE(email,
-'unknown')`.
-
-The argument list passes through unchanged, so `count()` lowers to `COUNT()`.
-Check that your warehouse accepts that form. `count(1)` lowers to `COUNT(1)`.
+Rocky uppercases the function name and lowers each argument in place. It does not check the name or the argument count, and does not rewrite the call per warehouse: `coalesce(email, "unknown")` lowers to `COALESCE(email, 'unknown')`. The argument list passes through unchanged, so `count()` lowers to `COUNT()`: check that your warehouse accepts it, or write `count(1)`.
 
 ### Window functions
 
@@ -465,60 +304,21 @@ derive {
 A `-` prefix on a window sort column means descending. This differs from the
 `sort` pipeline step, which uses the `asc` and `desc` keywords.
 
-A frame starts with `rows` or `range`, then two bounds joined by `..`. Each
-bound is `unbounded`, `current`, or a number.
-
-| Bound | As a start | As an end |
-|---|---|---|
-| `unbounded` | `UNBOUNDED PRECEDING` | `UNBOUNDED FOLLOWING` |
-| `current` | `CURRENT ROW` | `CURRENT ROW` |
-| `3` | `3 PRECEDING` | `3 FOLLOWING` |
-
-So `rows unbounded..current` lowers to `ROWS BETWEEN UNBOUNDED PRECEDING AND
-CURRENT ROW`.
+A frame starts with `rows` or `range`, then two bounds joined by `..`. Each bound is `unbounded`, `current` or a number. As a start, `unbounded` is `UNBOUNDED PRECEDING`, `3` is `3 PRECEDING`. As an end, `unbounded` is `UNBOUNDED FOLLOWING`, `3` is `3 FOLLOWING`. `current` is `CURRENT ROW` in both. So `rows unbounded..current` lowers to `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 
 ### `match` expressions
 
-A `match` expression lowers to `CASE WHEN`.
+`match` lowers to `CASE WHEN`: `tier: match amount { > 10000 => "enterprise", _ => "smb" }` becomes `CASE WHEN amount > 10000 THEN 'enterprise' ELSE 'smb' END AS tier`. A pattern is one of:
 
-```rocky
-from orders
-derive {
-    tier: match amount {
-        > 10000 => "enterprise",
-        > 1000  => "mid-market",
-        _       => "smb"
-    }
-}
-```
+- `_`: the default arm, which lowers to `ELSE`. It is optional: without it an unmatched row yields `NULL`.
+- A comparison operator followed by a value, such as `> 1000`.
+- A bare value, shorthand for `== value`.
 
-This lowers to:
-
-```sql
-SELECT *, CASE WHEN amount > 10000 THEN 'enterprise' WHEN amount > 1000 THEN 'mid-market' ELSE 'smb' END AS tier
-FROM orders
-```
-
-A pattern is one of these:
-
-- `_` — the default arm, which lowers to `ELSE`
-- A comparison operator followed by a value, such as `> 1000`
-- A bare value, which is shorthand for `== value`
-
-The `_` arm is optional. Without it the `CASE` has no `ELSE`, so an unmatched
-row yields `NULL`.
-
-`!=` in a match arm lowers to `IS DISTINCT FROM`, the same as it does
-everywhere else.
+`!=` in a match arm lowers to `IS DISTINCT FROM`, as everywhere else.
 
 ## Comments
 
 A line comment starts with `--` and runs to the end of the line.
-
-```rocky
--- This is a comment
-from orders  -- inline comment
-```
 
 ## Reserved words
 
@@ -550,42 +350,6 @@ where a `join` keyword follows.
 
 The depth cap covers nested parentheses, chained `not`, and function arguments.
 It bounds the parser's stack use, which matters most in the WebAssembly build.
-
-## Lowering reference
-
-| DSL | SQL |
-|---|---|
-| `from X` | `FROM X` |
-| `from X as a` | `FROM X a` |
-| `where e` before a `group` | `WHERE e` |
-| `where e` after a `group` | `HAVING e` |
-| `group k { n: f(c) }` | `SELECT k, F(c) AS n … GROUP BY k` |
-| `derive { n: e }` as the last step | `SELECT *, e AS n` |
-| `derive { n: e }` before a `group` | `e` is substituted into the later step |
-| `derive { n: e }` after a `group` | `e AS n` joins the projection |
-| `select { a, b }` | `SELECT a, b` |
-| `select { * }` | `SELECT *` |
-| `join X as a on k` | `JOIN X AS a ON <left>.k = a.k` |
-| `left join X as a on k` | `LEFT JOIN X AS a ON <left>.k = a.k` |
-| `cross join X as a` | `CROSS JOIN X AS a` |
-| `{ keep a.c }` | `a.c` joins the projection |
-| `sort c desc` | `ORDER BY c DESC` |
-| `take N` | `LIMIT N` |
-| `distinct` | `SELECT DISTINCT` |
-| `replicate` | `SELECT * FROM <source>` for the whole file |
-| `let n = …` | `WITH n AS (…)` |
-| `a == b` | `a = b` |
-| `a != b` | `a IS DISTINCT FROM b` |
-| `e is null` | `e IS NULL` |
-| `e in [a, b]` | `e IN (a, b)` |
-| `e not in [a, b]` | `e NOT IN (a, b)` |
-| `f(x)` | `F(x)` |
-| `f(x) over (…)` | `F(x) OVER (…)` |
-| `match e { > v => r, _ => d }` | `CASE WHEN e > v THEN r ELSE d END` |
-| `@2025-01-01` | `DATE '2025-01-01'` |
-| `1_000` | `1000` |
-| `true` | `TRUE` |
-| `null` | `NULL` |
 
 ## Grammar
 

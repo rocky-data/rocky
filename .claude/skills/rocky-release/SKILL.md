@@ -27,10 +27,13 @@ Four artifacts ship independently from one monorepo, each with its own tag names
 All four artifacts follow the same pattern:
 
 1. **Land a release PR** that bumps the version file(s) + updates the changelog.
-2. **Tag the merged commit** with the namespaced tag (`engine-v*`, `sdk-v*`, `dagster-v*`, `vscode-v*`).
-3. **Push the tag** — this triggers the matching `*-release.yml` workflow.
+2. **Stop for the maintainer's go-ahead.** Do not tag, push a tag, or run a manual publish until the maintainer approves the release in chat. This applies to every agent, not only the orchestrator.
+3. **Tag the merged commit** with the namespaced tag (`engine-v*`, `sdk-v*`, `dagster-v*`, `vscode-v*`).
+4. **Push the tag** — this triggers the matching `*-release.yml` workflow.
 
 The workflow handles the GitHub Release creation, build, and (for dagster/vscode) the publish to the external registry.
+
+A manual publish (`gh release edit <tag> --draft=false`, or a hand upload) is a release action. It also waits for the maintainer's go-ahead.
 
 `scripts/release.sh` + the `just release-engine|sdk|dagster|vscode` recipes survive as **local-build fallbacks** when CI is unavailable. The local path creates the GH Release as a **draft** with its artifacts attached. The tag push's CI run accepts that draft and publishes it. `ensure-release` refuses a release that is already published, so CI never attaches to, or re-publishes, a live release.
 

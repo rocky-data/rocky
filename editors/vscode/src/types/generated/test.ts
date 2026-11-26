@@ -12,6 +12,10 @@
  */
 export type Severity = "Error" | "Warning" | "Info";
 /**
+ * Why a unit test carries a [`UnitTestDialect`] notice.
+ */
+export type UnitTestDialectStatus = "non_duckdb_target" | "unresolved_target" | "multiple_targets";
+/**
  * Type of row mismatch.
  */
 export type MismatchKind = "missing" | "extra" | "value_diff";
@@ -174,6 +178,10 @@ export interface UnitTestSummary {
  */
 export interface UnitTestResult {
   /**
+   * Set when the model's target warehouse is not known to be DuckDB. Absent for a model whose only target is DuckDB: its test ran on its own dialect and needs no notice.
+   */
+  dialect?: UnitTestDialect | null;
+  /**
    * Error message if failed.
    */
   error?: string | null;
@@ -193,6 +201,30 @@ export interface UnitTestResult {
    * Test name.
    */
   test: string;
+  [k: string]: unknown;
+}
+/**
+ * How the dialect a unit test ran on relates to the model's target warehouse.
+ *
+ * `rocky test` runs every unit test on an in-memory DuckDB. SQL that both DuckDB and the target accept can still behave differently on the target, so a pass here does not prove the model on its warehouse.
+ */
+export interface UnitTestDialect {
+  /**
+   * `true` once the model's SQL was sent to DuckDB, even if DuckDB rejected it. `false` when the test failed before that: a refusal by `--strict-dialect`, a compile failure, a dependency cycle, or a fixture, function or database setup failure.
+   */
+  ran_on_duckdb: boolean;
+  /**
+   * `true` when `--strict-dialect` refused the test instead of running it.
+   */
+  refused: boolean;
+  /**
+   * Why the test carries this notice.
+   */
+  status: UnitTestDialectStatus;
+  /**
+   * The model's target warehouses, by dialect name (`Snowflake`) or, for an adapter with no dialect table, by adapter type (`clickhouse`). Empty when no target is known.
+   */
+  targets: string[];
   [k: string]: unknown;
 }
 /**
