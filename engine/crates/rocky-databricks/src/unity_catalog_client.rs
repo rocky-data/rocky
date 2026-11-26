@@ -496,7 +496,7 @@ impl From<UnityRestError> for CatalogError {
 ///
 /// A column is `nullable = false` only when Unity reports it NOT NULL
 /// *and* the table is a managed Delta table ([`enforces_not_null`]).
-/// Unity reports the declared NOT NULL for foreign tables and non-Delta
+/// Unity may report the declared NOT NULL for foreign tables and non-Delta
 /// external tables too, but those do not enforce it, so their columns
 /// are nullable here. A missing flag also means nullable: historical
 /// table-info responses occasionally omit it.
@@ -1356,7 +1356,7 @@ mod tests {
             "a managed Delta table enforces NOT NULL"
         );
 
-        // Unity reports the declared NOT NULL for these kinds, but the
+        // Unity may report the declared NOT NULL for these kinds, but the
         // warehouse does not enforce it.
         for (table_type, format) in [
             (Some("FOREIGN"), Some("MYSQL_FORMAT")),
@@ -1370,6 +1370,11 @@ mod tests {
             (None, Some("DELTA")),
             (None, None),
             (Some("managed"), Some("delta")),
+            (Some("VIEW"), Some("DELTA")),
+            (Some("MATERIALIZED_VIEW"), Some("DELTA")),
+            (Some("STREAMING_TABLE"), Some("DELTA")),
+            (Some("MANAGED_SHALLOW_CLONE"), Some("DELTA")),
+            (Some("MANAGED"), Some("ICEBERG")),
         ] {
             let schema = schema_from_table_info(&not_null_info(table_type, format));
             assert!(

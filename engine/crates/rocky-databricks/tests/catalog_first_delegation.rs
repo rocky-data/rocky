@@ -74,7 +74,9 @@ fn sample_ir_ref() -> TableRef {
 
 /// REST and SQL paths return the same `Vec<ColumnInfo>` shape for the
 /// same logical table. Mocks both endpoints and asserts the adapter's
-/// output is field-equal regardless of which path was taken.
+/// column names and data types are equal regardless of which path was
+/// taken. Nullability is not compared: the two paths differ on it (see
+/// the `rest_id_nullable` tests below).
 #[tokio::test]
 async fn describe_table_rest_and_sql_paths_project_identically() {
     let server = MockServer::start().await;
