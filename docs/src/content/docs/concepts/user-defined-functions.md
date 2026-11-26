@@ -5,10 +5,7 @@ sidebar:
   order: 7.4
 ---
 
-A user-defined function (UDF) is a reusable SQL expression with a name, typed
-arguments, and a return type. You declare it once in a `functions/` directory.
-Models call it like a built-in function. Rocky checks every call at compile
-time and creates the function in the warehouse before any model that calls it.
+A user-defined function (UDF) is a reusable SQL expression with a name, typed arguments, and a return type. Declare it once in `functions/`. Models call it like a built-in. Rocky checks every call at compile time and creates the function in the warehouse before any model that calls it.
 
 ## How to declare a function
 
@@ -56,10 +53,7 @@ type = "BIGINT"
 | `deterministic` | no | `true` or `false`. Omit it to keep the warehouse default. |
 | `[target]` | no | `schema`, and optionally `catalog`, to create the function in. |
 
-Write types the way the target warehouse spells them: `BIGINT` on DuckDB,
-`INT64` on BigQuery, `NUMBER(38,0)` on Snowflake. Rocky does not translate
-types, just as it does not translate model SQL. Rocky checks each type
-against a character allowlist before it puts the type into DDL.
+Write types the way the target warehouse spells them: `BIGINT` on DuckDB, `INT64` on BigQuery, `NUMBER(38,0)` on Snowflake. Rocky does not translate types. It checks each type against a character allowlist before it puts the type into DDL.
 
 ## How a model calls a function
 
@@ -71,20 +65,12 @@ SELECT order_id, cents_to_dollars(amount_cents) AS amount_usd
 FROM raw.orders
 ```
 
-A qualified call matches a project function only when every qualifier part
-matches the function's `[target]`. With `schema = "util"`,
-`util.cents_to_dollars(x)` matches and `other.cents_to_dollars(x)` does not.
-With no `[target]`, no qualified call matches: `governance.mask_email(s)` is
-someone else's function, so Rocky does not check it.
-
-Rocky creates a function with a `[target] schema` in that schema. An
-unqualified call resolves in the session's current schema, which may be a
-different one, so Rocky reports `W051` for it. Qualify the call.
-
-Rocky ignores a function whose name is a built-in SQL function, such as
-`round` or `coalesce`, and reports `W051`. On the warehouse the built-in wins,
-so treating calls as the project function would refuse valid SQL. Rename the
-function.
+| Call | Result |
+|---|---|
+| Qualified, and every qualifier part matches the function's `[target]` | Matches. With `schema = "util"`, `util.cents_to_dollars(x)` matches and `other.cents_to_dollars(x)` does not. |
+| Qualified, and the function has no `[target]` | Never matches. `governance.mask_email(s)` is someone else's function, so Rocky does not check it. |
+| Unqualified, and the function has a `[target] schema` | `W051`. Rocky creates the function in that schema, but an unqualified call resolves in the session's current schema. Qualify the call. |
+| Name is a built-in SQL function, such as `round` or `coalesce` | Ignored, with `W051`. The built-in wins on the warehouse. Rename the function. |
 
 ## What the compiler checks
 
@@ -107,20 +93,11 @@ then each call:
    declared return type ──► column type ──► downstream models and contracts
 ```
 
-An `E051` is certain from the SQL text and the declared types. Rocky raises
-it for a call with the wrong number of arguments. It also raises it when an
-argument type has no implicit conversion on any supported warehouse, for
-example a `DATE` passed to a `BIGINT` parameter. A model with an `E051` is
-not built.
+`E051` is certain from the SQL text and the declared types: a wrong argument count, or an argument type with no implicit conversion on any supported warehouse (a `DATE` passed to a `BIGINT` parameter). A model with an `E051` is not built.
 
-A `W051` is a warning. Rocky raises it when it cannot infer an argument's
-type, usually because no source schema is known. It also raises it when the
-call depends on the warehouse converting a value, for example a `VARCHAR`
-passed to a `BIGINT` parameter. The warehouse may accept that call, so Rocky
-does not refuse it.
+`W051` is a warning. Rocky raises it when it cannot infer an argument's type (usually no source schema is known), or when the call depends on the warehouse converting a value (a `VARCHAR` passed to a `BIGINT` parameter). The warehouse may accept it, so Rocky does not refuse it.
 
-Rocky checks argument types in the `SELECT` list, including CTEs. It checks
-argument counts everywhere in the statement.
+Rocky checks argument types in the `SELECT` list, including CTEs, and argument counts everywhere in the statement.
 
 ### How the return type reaches contracts
 
@@ -140,15 +117,7 @@ Only a direct call takes the declared type. An expression over a call, such as
 `cents_to_dollars(x) + 1`, stays `Unknown`, because arithmetic result types
 differ between warehouses.
 
-Some return type names mean different types on different warehouses.
-`FLOAT` and `REAL` are 32-bit on DuckDB and Databricks but 64-bit on
-Snowflake. `INT`, `INTEGER` and `BIGINT` are `NUMBER(38,0)` on Snowflake.
-`TIMESTAMP` has no time zone on DuckDB and Snowflake. Rocky reads these
-return types as `Unknown`, so a contract on such a column reports `I003`
-(not checked) instead of a wrong `E011`. Use `DOUBLE`, `FLOAT64`, `INT64`,
-`DECIMAL(p,s)`, `VARCHAR` or `DATE` when you want the contract checked.
-Parameter types are read more loosely, because they only decide whether a
-call is flagged: a `BIGINT` parameter checks as a 64-bit integer.
+Some return type names mean different types on different warehouses. `FLOAT` and `REAL` are 32-bit on DuckDB and Databricks but 64-bit on Snowflake. `INT`, `INTEGER` and `BIGINT` are `NUMBER(38,0)` on Snowflake. `TIMESTAMP` has no time zone on DuckDB and Snowflake. Rocky reads these return types as `Unknown`, so a contract on such a column reports `I003` (not checked) instead of a wrong `E011`. Use `DOUBLE`, `FLOAT64`, `INT64`, `DECIMAL(p,s)`, `VARCHAR` or `DATE` when you want the contract checked. Parameter types are read more loosely, because they only decide whether a call is flagged.
 
 ### How lineage traces a call
 
@@ -177,57 +146,28 @@ so a second run replaces the function in place.
 | BigQuery | ``CREATE OR REPLACE FUNCTION `project`.`dataset`.`name`(cents INT64) RETURNS FLOAT64 AS (…) [OPTIONS (description = '…')]`` |
 | PostgreSQL | `CREATE OR REPLACE FUNCTION name(cents BIGINT) RETURNS NUMERIC LANGUAGE sql [IMMUTABLE \| VOLATILE] AS $rocky$ SELECT … $rocky$` |
 | Redshift | `CREATE OR REPLACE FUNCTION name(BIGINT) RETURNS FLOAT8 { IMMUTABLE \| VOLATILE } AS $$ SELECT … $$ LANGUAGE sql` |
-| Trino | Refused with `E051` |
-| ClickHouse, SQL Server, Spark | Refused with `E051` |
 
-The table shows each statement on one line. In the real statement, the
-parenthesis that closes the body starts a new line, so a trailing
-`-- comment` in the body cannot hide it.
+The table shows each statement on one line. In the real statement, the parenthesis that closes the body starts a new line, so a trailing `-- comment` in the body cannot hide it.
 
-DuckDB macros have no return type, so Rocky wraps the body in a `CAST` to the
-declared type. That makes the column type in the warehouse match the type
-the compiler reports.
+| Warehouse | Notes |
+|---|---|
+| DuckDB | Macros have no return type, so Rocky wraps the body in a `CAST` to the declared type. The warehouse column type then matches the compiler's. |
+| BigQuery | Needs `[target] schema` (the dataset). Rocky refuses a function without one. SQL functions take no determinism clause, so `deterministic` is ignored. |
+| PostgreSQL | The body is quoted with `$rocky$`, so it may contain `$$`. Rocky refuses a body that contains `$rocky$`. Without `deterministic`, the warehouse default (`VOLATILE`) applies. No description is set: PostgreSQL keeps it in a separate `COMMENT ON FUNCTION`. |
+| Redshift | See below. |
+| Trino | Cannot create persistent functions. `E051` from `rocky compile` (when a calling model runs on a Trino target), `rocky run` and the plan preview. |
+| ClickHouse, SQL Server, Spark | Refused with `E051`: Rocky has no function DDL for them. On SQL Server a scalar function takes `@`-prefixed parameters and must be called with its schema (`dbo.f(x)`), so a bare `f(x)` would not reach it. |
 
-BigQuery needs a dataset for a persistent function. Set `[target] schema`.
-Rocky refuses a BigQuery function without one. BigQuery SQL functions take no
-determinism clause, so Rocky ignores `deterministic` there.
-
-PostgreSQL quotes the body with the `$rocky$` tag, so a body may contain
-`$$`. Rocky refuses a body that contains `$rocky$`. Without `deterministic`,
-the warehouse default (`VOLATILE`) applies. PostgreSQL keeps a description
-in a separate `COMMENT ON FUNCTION` statement, so Rocky does not set one.
-
-Redshift SQL functions take no argument names. The body refers to arguments
-as `$1`, `$2`, and so on, in declaration order. Rocky writes the body with
-names and rewrites each argument reference for you. It parses the body
-first, so a string literal or function name that spells an argument stays
-as it is. So does the date part of `DATEADD`, `DATEDIFF` and `DATE_PART`:
-in `DATEADD(day, n, day)` with arguments `day` and `n`, the first `day` is
-the date-part keyword and becomes nothing else. The rewritten body is printed back from the parsed SQL, so
-comments in it are dropped. Rocky refuses a Redshift function when:
+**Redshift.** SQL functions take no argument names: the body uses `$1`, `$2`, in declaration order. Rocky writes the body with names and rewrites each argument reference. It parses the body first, so a string literal, a function name or the date part of `DATEADD`, `DATEDIFF` and `DATE_PART` that spells an argument stays as it is. The rewritten body is printed from the parsed SQL, so comments are dropped. Rocky refuses a Redshift function when:
 
 - the body does not parse as one expression,
 - the body uses an argument in a dotted reference such as `arg.field`,
 - the rewritten body contains `$$`, or
-- the function sets `[target] catalog`. Redshift creates a function in the
-  connected database, so set only `schema`.
+- the function sets `[target] catalog`. Redshift creates a function in the connected database, so set only `schema`.
 
-Redshift requires a volatility clause. `deterministic = true` gives
-`IMMUTABLE`. Otherwise Rocky writes `VOLATILE`, which promises nothing.
-Rocky does not set a description on Redshift either.
+Redshift requires a volatility clause. `deterministic = true` gives `IMMUTABLE`. Otherwise Rocky writes `VOLATILE`. Rocky sets no description on Redshift.
 
-`rocky compile` renders each called function for PostgreSQL and Redshift
-and reports these refusals as `E051` when a warehouse that a calling model
-runs on refuses the function. A model runs on the target of each
-transformation pipeline that loads it.
-
-Rocky's Trino adapter cannot create persistent functions. `rocky compile`
-reports `E051` when a calling model runs on a Trino target.
-`rocky run` and the plan preview refuse with `E051` on a Trino target.
-ClickHouse, SQL Server and Spark are refused the same way, because Rocky has
-no function DDL for them. On SQL Server a
-scalar function takes `@`-prefixed parameters and must be called with its
-schema (`dbo.f(x)`), so a model's bare `f(x)` call would not reach it.
+`rocky compile` renders each called function for PostgreSQL and Redshift and reports these refusals as `E051` when a warehouse that a calling model runs on refuses the function. A model runs on the target of each transformation pipeline that loads it.
 
 ## How to select a function
 

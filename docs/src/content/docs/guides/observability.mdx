@@ -1,41 +1,32 @@
----
-title: Observability
+---title: Observability
 description: Send Rocky's traces and metrics to a collector over OTLP, read its structured logs, and run a local Grafana stack that watches runs.
 sidebar:
   order: 15
 ---
 
-Rocky is instrumented from the inside. A run emits OpenTelemetry traces and metrics, writes structured logs to stderr, and keeps a local record of every log event on disk. Point the exporter at a collector, or read the local files. Either way you see what a run did, without adding a line of code to your models.
+A Rocky run emits OpenTelemetry traces and metrics, writes structured logs to stderr, and keeps a local record of every log event on disk. Point the exporter at a collector, or read the local files.
 
-A few terms recur below. A **span** is a timed record of one piece of work, with a start, an end, and a set of attributes. A **trace** is all the spans of one logical operation, linked parent to child; its outermost span is the **trace root**. **OTLP** is the OpenTelemetry Protocol, the wire format that carries this data. A **collector** is the process that receives it and forwards it to a backend such as Grafana Tempo. The part of Rocky that sends the data is its **exporter**.
-
-This guide covers what Rocky emits, how to turn on OTLP export, and how to stand up a local Grafana stack that renders it.
+Terms: a **span** is a timed record of one piece of work. A **trace** is all the spans of one operation, linked parent to child; its outermost span is the **trace root**. **OTLP** is the OpenTelemetry wire format. A **collector** receives it and forwards it to a backend such as Grafana Tempo. Rocky's **exporter** sends the data.
 
 ## What Rocky emits
 
-Four signals come out of every run:
+- **Traces**: spans for the phases of a run, over OTLP gRPC.
+- **Metrics**: run counters and duration histograms, over OTLP.
+- **Structured logs**: events on stderr, as JSON (one object per line) when producing JSON output, compact human-readable otherwise.
+- **Local trace files**: each log event with its span chain, as JSONL under `.rocky/traces/`.
 
-- **Traces** — spans for the phases of a run, exported over OTLP gRPC.
-- **Metrics** — run counters and duration histograms, also exported over OTLP.
-- **Structured logs** — log events on stderr. Rocky writes them as JSON, one object per line, when it is producing JSON output, and in a compact human-readable form otherwise.
-- **Local trace files** — each log event, with its active span chain, written as JSONL under `.rocky/traces/`.
-
-The OTLP signals are opt-in: you set one environment variable. The structured logs and the local trace files are always on.
+OTLP is opt-in through one environment variable. Logs and local trace files are always on.
 
 ### Spans
 
-Rocky opens a span around each phase of a run, so a trace reads as the shape of the run:
-
 | Span | Emitted by | What it covers |
 |---|---|---|
-| `run` | `rocky run` | the whole run, carrying the `run_id` — the root of a run's trace unless an upstream context was supplied |
-| `discover_sources` | source discovery | resolving configured sources before planning (an entered span — it parents the discovery work) |
-| `materialize.table` | model execution | building one model; one span per model, carrying `rocky.model.fqn` and `rocky.model.kind` |
-| `statement.execute` | warehouse adapter | one SQL statement sent to the warehouse |
-| `state.download` / `state.upload` / `state.probe` | object-store state sync | reading and writing remote state, carrying the `backend` and `bucket` |
-| `scheduler.tick` | resident scheduler | one reconciliation pass of `rocky serve --scheduler`, carrying `rocky.scheduler.outcome` and the pass's due/executed/failed/skipped counts (experimental) |
-
-How the run spans nest:
+| `run` | `rocky run` | The whole run, carrying `run_id`. The trace root unless an upstream context was supplied. |
+| `discover_sources` | source discovery | Resolving sources before planning. Parents the discovery work. |
+| `materialize.table` | model execution | One model, carrying `rocky.model.fqn` and `rocky.model.kind`. |
+| `statement.execute` | warehouse adapter | One SQL statement. |
+| `state.download` / `state.upload` / `state.probe` | object-store state sync | Remote state reads and writes, carrying `backend` and `bucket`. |
+| `scheduler.tick` | resident scheduler | One reconciliation pass of `rocky serve --scheduler` (experimental), carrying `rocky.scheduler.outcome` and the due/executed/failed/skipped counts. |
 
 ```
  scheduler.tick               ← its own trace root, from
@@ -43,42 +34,36 @@ How the run spans nest:
   │ hands TRACEPARENT to the run it launches
   ▼
  run                          ← the trace root of a plain rocky run
-  ├── discover_sources        ← parents the source-discovery work
+  ├── discover_sources
   └── materialize.table       ← one span per model
-       └── statement.execute  ← one span per SQL statement, and only
-                                on a warehouse adapter; an embedded
-                                DuckDB run has none
+       └── statement.execute  ← one per SQL statement, warehouse
+                                adapters only
 ```
 
-A few honest limits are worth knowing.
+Limits:
 
-- **`statement.execute` spans come from the warehouse adapters.** The Databricks, Snowflake, BigQuery, and Trino adapters emit them. The PostgreSQL, Redshift, ClickHouse, SQL Server and Spark adapters do not yet. The embedded DuckDB engine runs statements in-process and does not, so a local DuckDB run shows model-level spans but no per-statement spans. The `rocky.adapter.name`, `rocky.statement.kind`, and `rocky.warehouse.name` attributes ride on the Databricks, Snowflake, and BigQuery spans. Trino emits a simpler `statement.execute` span, plus a separate `statement.execute_arrow` span on its Arrow path.
-- **`scheduler.tick` comes from the resident scheduler, not from a run.** `rocky serve --scheduler` (experimental) emits one per poll interval. Each pass records its outcome and its counts even when nothing ran, so an idle loop and a wedged one stay distinguishable in the trace.
-- **`rocky.query_duration_ms` is populated by the Databricks adapter today.** Other adapters record their statement spans without feeding that metric yet.
-- **`governance_setup` and `batched_checks` are marker spans.** They are declared to delimit the governance and quality-check phases, but they do not parent the events emitted during those phases. Those events stay at the root of the trace. Treat the two as phase markers, not as subtrees.
+- **`statement.execute` comes from warehouse adapters.** Databricks, Snowflake, BigQuery and Trino emit it. PostgreSQL, Redshift, ClickHouse, SQL Server, Spark and embedded DuckDB do not, so a DuckDB run shows model spans only. The `rocky.adapter.name`, `rocky.statement.kind` and `rocky.warehouse.name` attributes ride on the Databricks, Snowflake and BigQuery spans. Trino emits a simpler span plus `statement.execute_arrow` on its Arrow path.
+- **`scheduler.tick` records its outcome and counts on every pass**, even when nothing ran, so an idle loop and a wedged one differ in the trace.
+- **`rocky.query_duration_ms` is populated by the Databricks adapter only.**
+- **`governance_setup` and `batched_checks` are marker spans.** They do not parent the events of their phases, which stay at the trace root.
 
 ### Connected traces
 
-Rocky speaks the W3C trace context convention in both directions, through the `TRACEPARENT` environment variable.
+Rocky reads and passes the W3C trace context through the `TRACEPARENT` environment variable.
 
-**Inbound.** When `TRACEPARENT` is set in a Rocky process's environment, the root spans that process opens become children of the span it names. The run then appears inside the caller's trace rather than starting a new one. That is what connects `rocky serve --scheduler` (experimental) to what it runs: each `scheduler.tick` describes itself, hands the value to the `rocky run` child it launches, and the child's `run` span lands under that tick. One trace then answers both "what did this run do?" and "what decided to run it?".
+- **Inbound.** With `TRACEPARENT` set, the root spans the process opens become children of the span it names. This is how `rocky serve --scheduler` connects to what it runs: each `scheduler.tick` hands the value to the `rocky run` child, whose `run` span lands under the tick. A CI job, wrapper or orchestrator that exports `TRACEPARENT` gets Rocky's spans nested under its own.
+- **Any invocation is affected.** Every Rocky command launched with `TRACEPARENT` exported (`run`, `compile`, `plan`, ...) roots under it. Unset it for an independent trace. `rocky run --watch` holds the parent it started with, so every iteration lands in one trace.
+- **In-process background work opens its own trace**: the scheduler's loop, the periodic state uploader and the replication path's per-table spans.
+- **Subprocesses inherit it.** A job submitted to `rocky serve` runs in a child `rocky run`, so **every job a server runs joins the trace the server was launched with**. Unset the variable for the server process for independent job traces.
+- **Sampling is `ParentBased(AlwaysOn)`.** A `TRACEPARENT` ending in `-00` (not sampled) drops the `run` span and everything under it. Self-rooting spans, such as per-table spans on a replication run, still export. The run executes normally.
+- **A malformed value is ignored.** The process roots its own trace.
+- **The Dagster integration does not set `TRACEPARENT`.** A Dagster-launched run joins Dagster's trace only if something upstream exports it.
 
-**Outbound.** The same variable is how anything else hands Rocky a trace to join. A CI job, a shell wrapper, or an orchestrator that exports `TRACEPARENT` before invoking Rocky gets Rocky's spans nested under its own. Rocky exports observability rather than owning it, so it joins whatever trace it is given.
-
-Worth knowing before you turn it on:
-
-- **Any invocation is affected, not just scheduler children.** If `TRACEPARENT` is exported in an environment, every Rocky command launched there roots its trace under it: `run`, `compile`, `plan`, and the rest. Unset it, or unset it for one invocation, when you want an independent trace. A command that keeps working after it starts, such as `rocky run --watch`, holds the parent it was launched with, so every one of its iterations lands in that same trace.
-- **In-process background work opens its own trace.** Spans a command emits from a spawned task do not join the parent. That covers the resident scheduler's own loop, the periodic state uploader, and the replication path's per-table spans, which already root themselves today, independent of the `run` span. So a connected trace shows the run, not necessarily every span the process emits.
-- **Subprocesses are the opposite case.** They inherit the environment, so they adopt the same context. A job submitted to `rocky serve` does its work in a child `rocky run`, which means **every job a server runs joins the trace that server was launched with**. Start a long-lived `rocky serve` with `TRACEPARENT` exported, and every job it ever runs reports under that one launch-time span. Unset the variable for the server process if you want each job to trace independently.
-- **An upstream sampling decision applies to the spans that inherit it.** Rocky samples with `ParentBased(AlwaysOn)`. A `TRACEPARENT` whose flags say "not sampled" (ending in `-00`) therefore drops the `run` span and everything nested under it. The self-rooting spans in the bullet above are sampled on their own and still export. So a not-sampled upstream quietens a run's trace rather than guaranteeing silence: on a replication run you still see the per-table spans. The run itself is unaffected either way. It executes normally; only what gets exported changes.
-- **A malformed value is ignored.** A truncated or corrupted `TRACEPARENT` never fails a command. The process simply roots its own trace, exactly as if the variable were unset.
-- **The Dagster integration does not set `TRACEPARENT` today.** A Dagster-launched Rocky run joins Dagster's trace only if something upstream of the process exports it, the run launcher's environment for instance.
-
-Inbound context needs OTLP export configured to be visible. Without `OTEL_EXPORTER_OTLP_ENDPOINT` there is no exporter, so there is nothing to connect and nothing is emitted.
+Without `OTEL_EXPORTER_OTLP_ENDPOINT` there is no exporter, so nothing is emitted.
 
 ### Metrics
 
-Rocky records metrics in-process and exports them when the run finishes; it flushes the recorded values as the run exits. Counters go out as gauges, the last value over the run. Durations go out as histograms, so the backend computes its own percentiles.
+Rocky records metrics in-process and flushes them as the run exits. Counters go out as gauges (the last value over the run). Durations go out as histograms.
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -92,36 +77,36 @@ Rocky records metrics in-process and exports them when the run finishes; it flus
 | `rocky.table_duration_ms` | histogram | per-table materialization time, in milliseconds |
 | `rocky.query_duration_ms` | histogram | per-statement warehouse time, in milliseconds |
 
-Not every metric is populated on every run, because instrumentation is adapter- and pipeline-specific today. The Databricks adapter emits `rocky.statements_executed`. The Databricks and BigQuery adapters emit the retry counters. Replication runs emit the table counters and durations (`rocky.tables_processed`, `rocky.tables_failed`, `rocky.table_duration_ms`). Other adapters and pipeline types still emit spans and logs, but they do not feed these particular counters yet. So a metric you do not see means that path is not instrumented, not that nothing happened.
+Instrumentation is adapter- and pipeline-specific. Databricks emits `rocky.statements_executed`. Databricks and BigQuery emit the retry counters. Replication runs emit `rocky.tables_processed`, `rocky.tables_failed` and `rocky.table_duration_ms`. A missing metric means that path is not instrumented, not that nothing happened.
 
 #### Resident scheduler metrics
 
-`rocky serve --scheduler` (experimental) is a long-lived process, so its reconciler exports these for the lifetime of the process rather than at the end of a run. Unlike the run metrics above, these are true monotonic counters: read them with `rate()`, not as a last value. They appear only while the scheduler is running.
+`rocky serve --scheduler` (experimental) exports these for the life of the process. They are monotonic counters: read them with `rate()`. They appear only while the scheduler runs.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `rocky.scheduler.ticks` | counter | reconciliation passes the loop has run, split by an `outcome` label |
-| `rocky.scheduler.due` | counter | demands that came due, summed across ticks |
+| `rocky.scheduler.ticks` | counter | reconciliation passes, split by `outcome` |
+| `rocky.scheduler.due` | counter | demands that came due |
 | `rocky.scheduler.executed` | counter | demands that ran to a terminal outcome |
-| `rocky.scheduler.skipped` | counter | demands suppressed, split by a `reason` label |
+| `rocky.scheduler.skipped` | counter | demands suppressed, split by `reason` |
 | `rocky.scheduler.lag_seconds` | histogram | seconds between a demand's logical time and its execution |
-| `rocky.scheduler.consecutive_failures` | gauge | current run of consecutive failed runs, per `pipeline` |
+| `rocky.scheduler.consecutive_failures` | gauge | consecutive failed runs, per `pipeline` |
 
-The `outcome` label on `rocky.scheduler.ticks` is one of `completed`, `config_error`, `permit_held`, `lock_skipped`, `fault`, or `spool_unreadable`. The last one is a tick that ran its configured schedules (cron, `after`, freshness) but could not read the webhook spool, so no webhook demand was consumed; it is not `completed`, and the shipped Grafana rules include an alert on it. Summed across outcomes it is the loop's liveness signal. Split by outcome it makes an execution-blocking pass visible: a scheduler that ticks every minute but fails to parse `rocky.toml` shows up as `outcome=config_error`, rather than looking identical to a healthy idle loop.
+`outcome` is one of `completed`, `config_error`, `permit_held`, `lock_skipped`, `fault`, `spool_unreadable`. `spool_unreadable` is a tick that ran its schedules but could not read the webhook spool, so it consumed no webhook demand. It is not `completed`, and the shipped Grafana rules alert on it. Summed across outcomes, `ticks` is the liveness signal. Split by outcome, it shows a scheduler that ticks but fails to parse `rocky.toml` (`outcome=config_error`).
 
-The `reason` label on `rocky.scheduler.skipped` is one of a small fixed set: `not_due`, `disabled`, `paused`, `in_flight`, `catchup_skipped`, `failure_backoff`, `partial_backoff`, `freeze_hold`, `dedup`, `config_error`, `history_unavailable`, `state_busy`, `spool_unreadable`. The last is one skip per tick for the whole webhook source when the spool cannot be read, the same entry `rocky tick --output json` lists. The `pipeline` label is a configured pipeline name. So neither label can grow unbounded.
+`reason` is one of `not_due`, `disabled`, `paused`, `in_flight`, `catchup_skipped`, `failure_backoff`, `partial_backoff`, `freeze_hold`, `dedup`, `config_error`, `history_unavailable`, `state_busy`, `spool_unreadable`. The last is one skip per tick for the whole webhook source, the same entry `rocky tick --output json` lists. The `pipeline` label is a configured name, so neither label grows unbounded.
 
-`rocky.scheduler.consecutive_failures` is kept in-process. It resets to zero when the scheduler restarts, and a pipeline removed from config leaves its last value behind as a stale series. Alert on it alongside a freshness check rather than on its own.
+`rocky.scheduler.consecutive_failures` resets on restart, and a pipeline removed from config leaves a stale series. Alert on it together with a freshness check.
 
 ### Structured logs
 
-When Rocky is producing JSON output, it writes logs to stderr as JSON, one object per line. stdout stays reserved for the `--output json` result of `discover`, `plan`, and `run`. Interactive runs use a compact human-readable form instead. The active `run` span carries a `run_id` field, the same id you see in `rocky history` and `rocky trace`, so events emitted within a run tie back to it.
+stdout stays reserved for the `--output json` result of `discover`, `plan` and `run`. The active `run` span carries `run_id`, the id in `rocky history` and `rocky trace`.
 
 ```json
 {"timestamp":"2026-07-17T09:14:22.481Z","level":"INFO","fields":{"message":"idempotency key claimed — proceeding","backend":"local"},"span":{"run_id":"run-20260717-091422-481","name":"run"},"target":"rocky::run"}
 ```
 
-`RUST_LOG` controls log verbosity. The default keeps Rocky's own spans at `info` and quiets the query-cache trace:
+`RUST_LOG` sets verbosity. The default keeps Rocky's spans at `info` and quiets the query-cache trace:
 
 ```bash
 RUST_LOG=info rocky -c rocky.toml run
@@ -129,16 +114,16 @@ RUST_LOG=info rocky -c rocky.toml run
 
 ### Local trace files
 
-Independently of any collector, Rocky writes one JSONL file per process under `.rocky/traces/`, named `{timestamp}-{pid}.jsonl`. Each line is a JSON log event with its timestamp, level, target, fields, and active span chain. This is on by default and needs no configuration.
+Rocky writes one JSONL file per process under `.rocky/traces/`, named `{timestamp}-{pid}.jsonl`. Each line is a log event with timestamp, level, target, fields and span chain. No configuration is needed.
 
-- The last 20 files are kept; set `ROCKY_TRACE_RETAIN_RUNS` to change the count.
-- Set `ROCKY_TRACE_DISABLE=1` to turn the files off entirely, which helps on a shared filesystem or under a tight disk quota.
+- The last 20 files are kept. Set `ROCKY_TRACE_RETAIN_RUNS` to change that.
+- Set `ROCKY_TRACE_DISABLE=1` to turn the files off.
 
-These files are structured event records with span context. Inspect them directly, or ship them to any log tool. They are separate from `rocky trace` and `rocky replay`, which render a run's timeline from the persisted run record in Rocky's state store rather than from these files.
+`rocky trace` and `rocky replay` render a run's timeline from the persisted run record in the state store, not from these files.
 
 ## Turning on OTLP export
 
-Export activates when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. That single variable switches on both traces and metrics. When it is unset, Rocky never constructs the exporter, so there is no runtime cost.
+Export starts when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. It switches on traces and metrics together. When unset, Rocky never builds the exporter.
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
@@ -146,21 +131,17 @@ export OTEL_SERVICE_NAME=rocky   # optional; defaults to "rocky"
 rocky -c rocky.toml run
 ```
 
-- `OTEL_EXPORTER_OTLP_ENDPOINT` is the gRPC endpoint of your OTLP collector. Use an `http://` URL: Rocky's exporter does not use TLS. An `https://` URL, or a bare `host:port` (which is read as `https://`), logs a warning at start-up and exports nothing. Set `OTEL_EXPORTER_OTLP_INSECURE=true` to read a bare `host:port` as `http://`.
-- `OTEL_SERVICE_NAME` sets the `service.name` resource attribute, which is how you filter Rocky's data in the backend. It defaults to `rocky`.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` is the collector's gRPC endpoint. Use `http://`: the exporter does not use TLS. An `https://` URL, or a bare `host:port` (read as `https://`), logs a warning at start-up and exports nothing. `OTEL_EXPORTER_OTLP_INSECURE=true` reads a bare `host:port` as `http://`.
+- `OTEL_SERVICE_NAME` sets `service.name`, the attribute to filter on in the backend.
 
-If the endpoint is unreachable, Rocky logs a warning and keeps running. Each send is tried once, with no retry. Export is best-effort and never fails a run.
-
-OTLP export requires a Rocky release built with the OpenTelemetry exporter. Earlier release binaries were compiled without it, so setting these variables had no effect on them. See the CHANGELOG for the release that adds it.
+If the endpoint is unreachable, Rocky warns and keeps running. Each send is tried once. Export never fails a run. It needs a release built with the OpenTelemetry exporter: see the CHANGELOG for the release that adds it.
 
 ## A local Grafana stack
 
-The repository ships a single-node stack under [`deploy/observability/`](https://github.com/rocky-data/rocky/tree/main/deploy/observability) for watching runs locally: Grafana, Alloy, Tempo, Loki, and Prometheus. It is a development-grade quickstart, not a hardened production deployment.
-
-From that directory:
+[`deploy/observability/`](https://github.com/rocky-data/rocky/tree/main/deploy/observability) ships a single-node development stack: Grafana, Alloy, Tempo, Loki and Prometheus. It is not a hardened production deployment.
 
 ```bash
-# 1. Start the stack (Grafana, Alloy, Tempo, Loki, Prometheus).
+# 1. Start the stack (from deploy/observability/).
 docker compose up -d
 
 # 2. Run a pipeline with export pointed at Alloy's OTLP receiver.
@@ -171,23 +152,15 @@ OTEL_SERVICE_NAME=rocky \
 # 3. Open Grafana at http://localhost:3000.
 ```
 
-In Grafana, open the Tempo data source and search for traces where `service.name` is `rocky`. Pick a recent trace to see the run laid out span by span: the model-level `materialize.table` spans, and the `statement.execute` spans nested under them when the run drives a warehouse.
-
-Two dashboards are provisioned. **Rocky Runs** renders the run metrics from Prometheus: tables processed and failed, the error rate, and the duration histograms. **Rocky Scheduler** renders the resident scheduler's lag, its due/executed/skipped-by-reason counts, and its per-pipeline consecutive failures. It populates once a `rocky serve --scheduler` process is exporting.
-
-Tear the stack down when you are done. The exact commands, ports, and dashboard details live in the `deploy/observability/` README.
+In Grafana, search the Tempo data source for traces where `service.name` is `rocky`. Two dashboards are provisioned: **Rocky Runs** (tables processed and failed, error rate, duration histograms) and **Rocky Scheduler** (lag, due/executed/skipped-by-reason counts, per-pipeline consecutive failures; it fills once `rocky serve --scheduler` exports). Ports and commands are in the `deploy/observability/` README.
 
 ## Collecting the structured logs
 
-Traces and metrics reach the backend over OTLP. To get Rocky's structured JSON logs into the same place, tail them with Alloy and lift the run's `run_id` into a label. Log lines then line up with run records.
-
-Capture Rocky's stderr to a file, for example when cron or a systemd unit runs it:
+To get the JSON logs into the same place, capture stderr to a file, tail it with Alloy, and lift `run_id` into a label:
 
 ```bash
 rocky -c rocky.toml run 2>> /var/log/rocky/run.jsonl
 ```
-
-Then have Alloy tail that file, parse each JSON line, and label it by `run_id`, which the `run` span carries in the span context:
 
 ```
 local.file_match "rocky_logs" {
@@ -200,7 +173,6 @@ loki.source.file "rocky_logs" {
 }
 
 loki.process "rocky" {
-  // Pull run_id out of the run span context on each log line.
   stage.json {
     expressions = { run_id = "span.run_id" }
   }
@@ -217,4 +189,4 @@ loki.write "default" {
 }
 ```
 
-The `run` span carries the same `run_id` that `rocky history` and `rocky trace` report. Events emitted during a run are therefore labeled with it in Loki. Filter by a `run_id` to pull those lines and cross-reference them against the run's record in Rocky's own state. Events emitted outside the run span, early startup lines for instance, carry no label.
+Events inside a run carry the `run_id` label in Loki, so you can filter by it and cross-reference the run's record. Events outside the run span, such as early start-up lines, carry no label.

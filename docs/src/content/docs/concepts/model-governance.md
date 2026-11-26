@@ -5,17 +5,7 @@ sidebar:
   order: 10
 ---
 
-Model governance answers two questions about a shared model. Who may read it?
-And how do you change its shape without breaking the models that read it?
-
-Rocky answers the first with **access levels** and **ownership groups**. It
-answers the second with **model versions**. `rocky compile` checks both. A
-broken rule fails the compile, before any warehouse call.
-
-These features match dbt's
-[model access](https://docs.getdbt.com/docs/mesh/govern/model-access) and
-[model versions](https://docs.getdbt.com/docs/mesh/govern/model-versions).
-A project that sets none of the keys on this page compiles exactly as before.
+Model governance answers two questions about a shared model: who may read it, and how do you change its shape without breaking the models that read it? **Access levels** and **ownership groups** answer the first. **Model versions** answer the second. `rocky compile` checks both, and a broken rule fails the compile before any warehouse call. The features match dbt's [model access](https://docs.getdbt.com/docs/mesh/govern/model-access) and [model versions](https://docs.getdbt.com/docs/mesh/govern/model-versions). A project that sets none of the keys on this page compiles as before.
 
 ## Access levels
 
@@ -34,14 +24,11 @@ access_group = "finance"
 | `protected` | Any model in this project. This is the default. |
 | `public` | Any model in this project, and other projects through `rocky publish-ir`. |
 
-A model with no `access` key is `protected`. That is how every model behaved
-before access levels existed, so adding the feature changes no project.
+A model with no `access` key is `protected`, as every model behaved before access levels existed.
 
 ### How Rocky checks a private model
 
-Rocky checks every edge of the model graph. When a model reads a `private`
-model, the two models must share an ownership group. If they do not, the
-compile fails with `E047` on the model that reads.
+Rocky checks every edge of the model graph. When a model reads a `private` model, the two must share an ownership group, or the compile fails with `E047` on the reader. A `private` model with no group also fails with `E047`: no other model could ever read it, so the setting is almost always a mistake.
 
 ```
 fin_base   (private, group finance)
@@ -50,20 +37,9 @@ fin_base   (private, group finance)
    └──▶ mkt_report   (group marketing)   E047
 ```
 
-A `private` model with no group also fails with `E047`. No other model could
-ever read it, so the setting is almost always a mistake.
-
 ## Ownership groups and owners
 
-An ownership group names the team that owns a model. Set it with
-`access_group`. When `access_group` is absent, Rocky uses the model's config
-`group` instead.
-
-The fallback is safe for existing projects. Rocky reads the ownership group
-only for `private` models, and `private` did not exist before. A config group
-still controls routing and strategy as before; see
-[Folder-level config](/guides/migrate-from-dbt/#folder-level-config-materialized-schema).
-`access_group` inherits no config. It only says who owns the model.
+An ownership group names the team that owns a model. Set it with `access_group`. When absent, Rocky uses the model's config `group`. Rocky reads the ownership group only for `private` models, which did not exist before, so the fallback is safe for existing projects. A config group still controls routing and strategy as before (see [Folder-level config](/guides/migrate-from-dbt/#folder-level-config-materialized-schema)). `access_group` inherits no config: it only says who owns the model.
 
 A group can name an accountable owner. Add an `[owner]` table to the group
 file `models/groups/<group>.toml`:
@@ -125,10 +101,7 @@ v = 2
 | `access`, `access_group` | none | Defaults for each version that does not set its own. |
 | `drop_existing_kind` | none | Lets the alias view replace an existing table named `<name>` (see below). |
 
-Each version is an ordinary model. It materializes to `<name>_v<N>`, and its
-own sidecar sets its strategy and target. A contract applies per version: put
-it in `<name>_v<N>.contract.toml`. Version files must be `.sql` models in the
-same directory as the declaration.
+Each version is an ordinary model that materializes to `<name>_v<N>`. Its own sidecar sets its strategy and target. A contract applies per version, in `<name>_v<N>.contract.toml`. Version files must be `.sql` models in the same directory as the declaration.
 
 ### Reference a version
 
@@ -140,19 +113,9 @@ A reference picks a version by name. Plain SQL needs no new syntax:
 | `FROM orders_v1` | Version 1, pinned. |
 | `depends_on = ["orders@v1"]` | Version 1, pinned. `@v<N>` is a sidecar shorthand for `orders_v1`. |
 
-The `orders` view is `SELECT * FROM orders_v2`. When you raise
-`latest_version`, every reader of `orders` moves to the new version on the
-next run. A reader of `orders_v1` stays on version 1.
+The `orders` view is `SELECT * FROM orders_v2`. Raising `latest_version` moves every reader of `orders` to the new version on the next run. A reader of `orders_v1` stays on version 1.
 
-If you turn a model from unversioned to versioned, a table called `orders` may
-already exist. A run refuses to replace a table with a view unless you allow
-it. Set `drop_existing_kind = "table"` in the declaration to allow it. Like
-the sidecar key of the same name, this works on DuckDB today; on other
-warehouses, drop or rename the old table yourself.
-
-Set `latest_alias = false` when you do not want the view, for example when the
-latest version already materializes to `orders` itself. A reference to the
-bare `orders` then fails with `E048`. Name the version explicitly.
+When you turn an unversioned model into a versioned one, a table called `orders` may already exist. A run refuses to replace a table with a view unless the declaration sets `drop_existing_kind = "table"`. Like the sidecar key of the same name, it works on DuckDB today. On other warehouses, drop or rename the old table yourself. Set `latest_alias = false` when you do not want the view (for example, when the latest version already materializes to `orders`): a reference to bare `orders` then fails with `E048`.
 
 ### Deprecate a version
 

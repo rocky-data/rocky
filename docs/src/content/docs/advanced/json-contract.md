@@ -11,62 +11,21 @@ This page states the rules that keep those payloads stable. It covers how Rocky 
 
 For the per-command field lists, see the [JSON output reference](/reference/json-output/).
 
-## How the `version` field is set
+## Stability rules
 
-Every JSON output carries a top-level `version` field. Rocky sets it from `env!("CARGO_PKG_VERSION")` at compile time, so the field always names the binary that produced the output.
+The `version` field, the semver rules for what each release may change, and the `asset_key` format are in the [JSON output reference](/reference/json-output/#schema-version). In short: patch releases change no schema, minor releases add optional fields only, and major releases may break shape. Parse defensively: tolerate unknown fields, treat an absent optional field as `null`, and do not assume an enum is closed.
 
-The reference docs show an illustrative version string such as `"version": "1.6.0"`. Read it as an example, not as a fixed release:
-
-```json
-{
-  "version": "1.6.0",
-  "command": "discover",
-  ...
-}
-```
-
-## What each release may change
-
-Rocky follows the engine's semver cadence:
-
-- **Patch** (`1.6.x`): bug fixes. No schema changes.
-- **Minor** (`1.x.0`): new optional fields may appear. No existing field is removed or renamed inside a minor series.
-- **Major** (`x.0.0`): field names, types, or structure may break. Pin your parser, or branch it on the major version.
-
-Parse defensively. Tolerate unknown fields. Treat an absent optional field as `null`. Do not assume the set of enum variants is closed.
-
-## How `asset_key` is built
-
-The `asset_key` field appears in materializations and check results. Its shape is fixed:
-
-```
-[source_type, ...component_values, table_name]
-```
-
-For example: `["fivetran", "acme", "us_west", "shopify", "orders"]`
-
-A component can hold several values, such as a list of regions. In the CLI JSON, each value becomes its own array element. Rocky never joins them:
-
-```
-["fivetran", "acme", "us_west", "us_central", "shopify", "orders"]
-```
-
-dagster-rocky consumes this array to build a Dagster `AssetKey`. Its translator is what joins a multi-value component into one key segment with `__`, giving `us_west__us_central`. That join happens in dagster-rocky, not in the CLI JSON contract.
+A component of an `asset_key` that holds several values, such as a list of regions, becomes one array element per value in the CLI JSON: `["fivetran", "acme", "us_west", "us_central", "shopify", "orders"]`. Rocky never joins them. The dagster-rocky translator joins them with `__` (`us_west__us_central`) when it builds a Dagster `AssetKey`.
 
 ## Parsing a payload in Python
 
-Call `parse_rocky_output()` from `rocky-sdk`. It reads the payload's `"command"` field and returns the matching typed model:
+Call `parse_rocky_output()` from `rocky-sdk` (also re-exported as `dagster_rocky.types`). It reads the payload's `"command"` field and returns the matching typed model, and discriminates on the fields present for the few commands that print more than one shape.
 
 ```python
 from rocky_sdk import parse_rocky_output
 
-result = parse_rocky_output(json_str)
-# Returns: DiscoverResult | RunResult | PlanResult | StateResult | ...
+result = parse_rocky_output(json_str)   # DiscoverResult | RunResult | PlanResult | ...
 ```
-
-`dagster_rocky` re-exports the same names through `dagster_rocky.types`, so `from dagster_rocky import parse_rocky_output` also works.
-
-A few commands print more than one shape under the same command name. For those, the function discriminates on the fields that are present, such as column lineage versus model lineage.
 
 ## How a schema change reaches the bindings
 

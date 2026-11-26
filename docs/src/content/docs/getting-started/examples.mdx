@@ -7,7 +7,7 @@ sidebar:
 
 import pocCounts from "../../../data/poc-counts.json";
 
-The playground ships **{pocCounts.total} self-contained POCs** across {pocCounts.categoryCount} categories. A POC here is a small proof-of-concept project that demonstrates one Rocky capability end to end. Each has its own `rocky.toml`, a `models/` directory, and a single `run.sh` that runs the whole thing. Most run on local DuckDB with no credentials, so you can read the code and run it in one step.
+The playground ships **{pocCounts.total} self-contained POCs** across {pocCounts.categoryCount} categories. Each is a small project with its own `rocky.toml`, a `models/` directory and one `run.sh` that shows one capability end to end. Most run on local DuckDB with no credentials.
 
 The [Quickstart](/getting-started/quickstart/) and [Playground](/guides/playground/) walkthroughs teach the workflow. The POCs show one capability each, in isolation.
 
@@ -39,39 +39,18 @@ The demos from the [README](https://github.com/rocky-data/rocky#readme), each a 
 
 ## Browse by category
 
-Each link opens the category folder on GitHub. Every POC in it has a README that states what it shows, the exact command, and the expected output. The line under each heading says what the category covers; the folder holds the full list.
+Each category folder on GitHub holds POCs with a README that states what it shows, the exact command and the expected output.
 
-### [Foundations](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations) ({pocCounts.perCategory["00-foundations"]} POCs)
-
-DSL syntax, materialization basics, branches and replay, file ingest, per-tenant routing, and the plan/apply deployment workflow. Credential-free (DuckDB).
-
-### [Quality](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/01-quality) ({pocCounts.perCategory["01-quality"]} POCs)
-
-Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, the standalone quality pipeline, and freshness SLAs. Credential-free (DuckDB).
-
-### [Performance](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/02-performance) ({pocCounts.perCategory["02-performance"]} POCs)
-
-Incremental, merge, partition checksums, drift recovery, view intermediates, delete+insert, adaptive concurrency, cost and budgets, and `EXPLAIN`-based estimation. Credential-free (DuckDB).
-
-### [AI](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/03-ai) ({pocCounts.perCategory["03-ai"]} POCs)
-
-Model generation, intent extraction, schema-change sync, test generation, schema-grounded validation, MCP data-grounding, agent-policy tests, and the data-product fulfillment loop. Most need an `ANTHROPIC_API_KEY`.
-
-### [Governance](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/04-governance) ({pocCounts.perCategory["04-governance"]} POCs)
-
-Unity Catalog grants, schema patterns, workspace isolation, tagging, classification and masking, and retention. Plus cross-team contracts, auto-created target schemas, tag inheritance from a config group, recipe provenance, and the agent policy plane. Some need a Databricks workspace. Classification and masking, retention, auto-created schemas, tag inheritance, recipe provenance, and the agent policy plane all run on DuckDB.
-
-### [Orchestration](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/05-orchestration) ({pocCounts.perCategory["05-orchestration"]} POCs)
-
-Shell hooks, webhook presets, remote state, checkpoint/resume, the Valkey cache, Dagster DAG mode, the circuit breaker, and idempotency keys. DuckDB, with a few using Docker.
-
-### [Developer Experience](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience) ({pocCounts.perCategory["06-developer-experience"]} POCs)
-
-Column lineage, the HTTP API, dbt import, shadow mode, CI, trace Gantt views, portability lint, PR preview and data diff, and `lineage-diff`. Credential-free (DuckDB).
-
-### [Adapters](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters) ({pocCounts.perCategory["07-adapters"]} POCs)
-
-Snowflake dynamic tables, Databricks materialized views, Fivetran discovery, a custom process adapter, BigQuery, a Rust-native adapter skeleton, and Trino via Docker. Most need the matching warehouse; the process-adapter and Rust-skeleton POCs are credential-free.
+| Category | POCs | Covers |
+|---|---:|---|
+| [Foundations](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations) | {pocCounts.perCategory["00-foundations"]} | DSL syntax, materialization basics, branches and replay, file ingest, per-tenant routing, plan/apply. DuckDB. |
+| [Quality](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/01-quality) | {pocCounts.perCategory["01-quality"]} | Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, the quality pipeline, freshness SLAs. DuckDB. |
+| [Performance](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/02-performance) | {pocCounts.perCategory["02-performance"]} | Incremental, merge, partition checksums, drift recovery, delete+insert, adaptive concurrency, cost and budgets. DuckDB. |
+| [AI](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/03-ai) | {pocCounts.perCategory["03-ai"]} | Model generation, intent, schema-change sync, test generation, MCP data-grounding, agent-policy tests, the fulfillment loop. Most need `ANTHROPIC_API_KEY`. |
+| [Governance](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/04-governance) | {pocCounts.perCategory["04-governance"]} | Unity Catalog grants, workspace isolation, tagging, classification and masking, retention, cross-team contracts, recipe provenance, the policy plane. Some need Databricks. |
+| [Orchestration](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/05-orchestration) | {pocCounts.perCategory["05-orchestration"]} | Hooks, webhook presets, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker, idempotency keys. DuckDB, a few with Docker. |
+| [Developer Experience](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience) | {pocCounts.perCategory["06-developer-experience"]} | Column lineage, HTTP API, dbt import, shadow mode, CI, trace views, portability lint, PR preview, `lineage-diff`. DuckDB. |
+| [Adapters](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters) | {pocCounts.perCategory["07-adapters"]} | Snowflake dynamic tables, Databricks materialized views, Fivetran discovery, process adapter, BigQuery, Rust skeleton, Trino. Most need the warehouse. |
 
 ## The full catalog
 

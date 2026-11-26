@@ -1,26 +1,21 @@
 # Rocky
 
-Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolution, incremental logic, SQL generation, schema management) with a compiled, type-safe approach. No Jinja. No manifest. No parse step.
-
-Rocky is a typed-program layer above the warehouse. It owns the DAG: compile-time types, branches + replay, column-level lineage, drift handling, incremental logic, and per-model cost attribution. Storage and compute stay with the warehouse (Databricks, Snowflake, BigQuery, DuckDB).
-
-**License:** Apache 2.0
+Rust SQL transformation engine: a typed-program layer above the warehouse. It owns the DAG: compile-time types, branches + replay, column-level lineage, drift handling, incremental logic, and per-model cost attribution. No Jinja, no manifest, no parse step. Storage and compute stay with the warehouse. License: Apache 2.0.
 
 **Engine skills** live in `engine/.agents/skills/`: `rocky` (CLI cheat sheet), `databricks`, `fivetran`, and Rust conventions (`rust-style`, `rust-error-handling`, `rust-doc`, `rust-unsafe`, `rust-clippy-triage`, `rust-bench-criterion`, `rust-dep-hygiene`, `rust-async-tokio`, `rust-analyzer-ssr`). If your client does not load them on its own, read the matching `SKILL.md` before that kind of work.
 
 ## Key Concepts
 
-- **Adapter-based ELT** — source adapters discover what data is available (metadata only, no extraction; the Fivetran and Airbyte adapters may start a vendor sync, but only when the key owner's `allow_sync_trigger` and the pipeline's `trigger = true` are both set, and it never moves data through Rocky); warehouse adapters execute SQL and manage governance. Rocky operates on data already in the warehouse — it does not extract from external systems
-- **No model files for raw layer** — Rocky discovers tables at runtime from source adapters (Fivetran, manual config), no SQL files needed
-- **Silver layer models** — either a `.sql` + `.toml` sidecar pair (pure SQL, no templating) or a `.rocky` DSL file; SQL stays first-class
-- **Config-driven** — `rocky.toml` defines source, warehouse, target patterns, checks, and contracts
-- **Schema patterns** — configurable prefix/separator/components parse schema names into structured data for routing
+- **Adapter-based ELT.** Source adapters discover data (metadata only, no extraction). The Fivetran and Airbyte adapters may start a vendor sync, but only when the key owner's `allow_sync_trigger` and the pipeline's `trigger = true` are both set, and no data moves through Rocky. Warehouse adapters execute SQL and manage governance.
+- **No model files for the raw layer.** Rocky discovers tables at runtime from source adapters (Fivetran, manual config).
+- **Silver layer models:** a `.sql` + `.toml` sidecar pair (pure SQL, no templating) or a `.rocky` DSL file.
+- **Config-driven:** `rocky.toml` defines source, warehouse, target patterns, checks and contracts. Schema patterns (prefix/separator/components) parse schema names into structured data for routing.
 
 ## Engine Repository Structure
 
 Cargo workspace: the library crates under `crates/` plus the `rocky` and `rocky-lsp` binary crates. Rust edition 2024, MSRV 1.88:
 
-The legacy `Plan` enum is gone; `ModelIr` is the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
+`ModelIr` is the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
 
 ```
 engine/                         # this directory, inside the rocky monorepo
@@ -99,32 +94,19 @@ Follow "Git conventions" in the root [`AGENTS.md`](../AGENTS.md): no attribution
 
 ## Rocky DSL (.rocky files)
 
-Rocky has its own transformation language as an alternative to SQL. Files use `.rocky` extension with a `.toml` sidecar for metadata.
+An alternative to SQL: `.rocky` files with a `.toml` sidecar. Pipeline steps flow top to bottom: `from <model>`, `where <predicate>` (becomes HAVING after group), `group <keys> { agg: func(...) }`, `derive { name: expr }` (keeps existing columns), `select { col1, col2 }` (replaces the column set), `join <model> as <alias> on <key> { keep ... }`, `sort <col> asc|desc`, `take <n>`, `distinct`, `replicate <source>`.
 
-**Pipeline steps** (top-to-bottom data flow):
-- `from <model>` — Start pipeline from a model/source
-- `where <predicate>` — Filter rows (becomes HAVING after group)
-- `group <keys> { agg: func(...) }` — Aggregate
-- `derive { name: expr }` — Add computed columns (preserves existing)
-- `select { col1, col2 }` — Choose columns (replaces column set)
-- `join <model> as <alias> on <key> { keep ... }` — Join
-- `sort <col> asc|desc` — Order results
-- `take <n>` — Limit rows
-- `distinct` — Deduplicate
-- `replicate <source>` — Replicate a source table
-
-**Key difference from SQL:** `!=` compiles to `IS DISTINCT FROM` (NULL-safe).
-
-The language spec is at `../docs/rocky-lang-spec.md`; the published DSL page is `../docs/src/content/docs/concepts/rocky-dsl.md`.
+`!=` compiles to `IS DISTINCT FROM` (NULL-safe). Spec: `../docs/rocky-lang-spec.md`. Published page: `../docs/src/content/docs/concepts/rocky-dsl.md`.
 
 ## CI/CD
 
-GitHub Actions workflows live at the monorepo root in `../.github/workflows/`, path-filtered to `engine/**`:
-- `engine-ci.yml` — Tests, clippy, fmt (on push/PR to main). Note: `CARGO_BUILD_JOBS=4` due to DuckDB C++ memory constraints.
-- `engine-weekly.yml` — Coverage (tarpaulin) + security audit, runs Monday 08:00 UTC + manual dispatch.
-- `engine-release.yml` — Full 5-target matrix build on tag `engine-v*` (macOS ARM64/Intel, Linux x86_64/ARM64, Windows). `scripts/release.sh` is a local-build fallback.
-- `engine-bench.yml` — Benchmark on PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*`; uploads raw bencher output as an artifact (no baseline comparison — there is deliberately no main-branch bench history).
-- `engine-docs.yml` — Build + deploy Astro docs from `../docs/` to GitHub Pages.
+Workflows live in `../.github/workflows/`, path-filtered to `engine/**`. The table of every workflow is in `../CONTRIBUTING.md`.
+
+- `engine-ci.yml` runs tests, clippy and fmt. `CARGO_BUILD_JOBS=4` because of DuckDB C++ memory limits.
+- `engine-weekly.yml` runs coverage (tarpaulin) and the security audit, Monday 08:00 UTC and by manual dispatch.
+- `engine-release.yml` builds the 5-target matrix on tag `engine-v*`. `scripts/release.sh` is a local fallback.
+- `engine-bench.yml` runs on PRs labeled `perf` that touch `engine/crates/**` or `engine/Cargo.*`. It uploads raw bencher output with no baseline comparison, by design.
+- `engine-docs.yml` builds and deploys the Astro docs from `../docs/`.
 
 ## SQL Patterns Rocky Generates
 
@@ -157,10 +139,6 @@ Test fixtures for the dagster integration are captured from the live binary by `
 
 ## LSP Server
 
-`rocky lsp` runs as a Language Server Protocol server over stdio. Used by the VS Code extension at `../editors/vscode/`.
+`rocky lsp` runs the Language Server Protocol over stdio for the VS Code extension (`../editors/vscode/`). Implementation: `crates/rocky-server/`.
 
-Provides: diagnostics, hover, go-to-definition, find-references, rename, completion, signature help, document symbols, code actions, inlay hints, semantic tokens.
-
-In `initialized` it registers `workspace/didChangeWatchedFiles` for `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql` with any client that advertises dynamic registration, in a spawned task (awaiting the request there would stall the handshake).
-
-Implementation in `crates/rocky-server/`.
+It provides diagnostics, hover, go-to-definition, find-references, rename, completion, signature help, document symbols, code actions, inlay hints and semantic tokens. In `initialized` it registers `workspace/didChangeWatchedFiles` for `**/*.rocky`, `**/*.toml` and `**/models/**/*.sql` with any client that supports dynamic registration, in a spawned task (awaiting the request there would stall the handshake).
