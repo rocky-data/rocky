@@ -53,7 +53,7 @@ A new opt-in mode, `publish = "staged"`. The default, `"in_place"`, is unchanged
 
 ```
 recover  an open publish record of this pipeline?  ->  D3 first
-build    every selected model  ->  <target>__rocky_stage   (production untouched)
+build    every selected model  ->  <target>__rocky_stage  (production untouched)
 test     per model, on its stage: volume check, then [[tests]]
 gate     any failure?  ->  drop this run's stages, clear the record
 swap     every stage   ->  production, in dependency order
@@ -75,7 +75,7 @@ Where the warehouse allows it, the swap and clean steps run in one transaction.
 
 - **State store.** The model's `ModelExecution` gets status `not_published`, never `success`. The status is written in `output.rs` from the materialization; a volume breach or a failed test already writes `failed` there. Every reader compares against `"success"`: the skip gate needs a latest `success` execution (`skip_gate.rs`, clause C), `--retry-failed` keeps out only models with a `success` row (`run_retry.rs`), and `latest_success_executions` (`backfill.rs`) and `plan_cost.rs` look for `success`. So a later run rebuilds the model, and `--retry-failed` reruns it. The run's status is `Failure` or `PartialFailure`, as today.
 - **Hooks.** Today `on_after_model_run` fires right after a model's write, when its volume check and tests passed (`execute_models_phase`). Under staged it fires for each model only after the whole run is published. A model that failed fires `on_model_error`, as today. A model that passed but was not published fires neither.
-- **Governance.** The transformation path applies per-model `[governance.tags]` after the model phase, and only when no model failed (`run_transformation`). Under staged it runs after the publish, on production names. A gated or restored run applies none. The transformation path applies no grants itself; what a rename does to grants the warehouse holds is a D2 spike item.
+- **Governance.** The transformation path applies per-model `[governance.tags]` after the model phase, and only when no model failed (`run_transformation`). Under staged it runs after the publish, on production names. A gated or restored run applies none. The mask, classification, retention and role-grant reconcile runs only after the model phase of a replication `rocky run --all` or `--models` (`run_with_direct_gate`), which cannot be staged (D5). What a rename does to grants the warehouse holds is a D2 spike item.
 
 ### D2 — Per-warehouse atomicity
 
@@ -112,12 +112,20 @@ Where no transaction spans the swap, a failure during it leaves a mix until the 
 
 This section says what the run records, who may act on it, and what recovery does in each state.
 
-**The record.** Before the build, Rocky writes a publish record for the pipeline. It holds the run id, an owner (host, process, lease expiry) and one entry per target. An entry holds the target kind (table, view, or Iceberg table), whether the target existed before the run, a phase, and for a view its old definition. Phases are `built`, `swapping`, `swapped`, `cleaning` and `cleaned`. Rocky writes `swapping` and `cleaning` as intents before the step starts, and the next phase after it ends. The run is **published** once every entry is `swapped`. The record is cleared when every entry is `cleaned`, after the gate drops the stages, or after a restore completes.
+**The record.** Before the build, Rocky writes a publish record for the pipeline. It holds the run id, an owner (host, process, lease expiry) and one entry per target. An entry holds the target kind (table, view, or Iceberg table), whether the target existed before the run, a phase, and for a view its old and new definitions. The phases are:
+
+```
+built ──► swapping ──► swapped ──► cleaning ──► cleaned      (published)
+               │            │
+               └────────────┴──► restoring ──► restored      (not published)
+```
+
+Rocky writes `swapping`, `cleaning` and `restoring` as intents before the step starts, and the next phase after the step ends. The run is **published** once every entry is `swapped`. The record is cleared when every entry is `cleaned`, when the gate has dropped every stage, or when every swapped entry is `restored`.
 
 **Where the record lives, and when it is durable.** A step starts only after its intent is durable. A failed record write stops the run before the step.
 
 - Local state: a state-store table. Each write is one redb commit, which returns only when durable.
-- Remote state: the state object changes only at the end of a run, and not at all if the process dies. So the record is a separate object beside the state object, written with a conditional put at every phase change (the create-once pattern of the freeze markers, `freeze_marker.rs`). The end-of-run upload is not relied on. A backend with no conditional put wired (today `valkey`) refuses `publish = "staged"`.
+- Remote state: the state object changes only at the end of a run, and not at all if the process dies. So the record is a separate object beside the state object, written with a conditional put at every phase change (the create-once pattern of the freeze markers, `freeze_marker.rs`). The end-of-run upload is not relied on. A backend where the startup CAS probe (ADR-CONCURRENCY D6a) finds no working conditional put refuses `publish = "staged"`. That includes `valkey`, which has none wired.
 
 **Who may act on a record.**
 
@@ -132,9 +140,13 @@ This section says what the run records, who may act on it, and what recovery doe
 
 Any other combination refuses and names the `DROP` or `ALTER` to run by hand. Existence probes alone cannot tell an old table from a new one; the tag can.
 
-**In-place runs while a record is open.** An `in_place` run of a pipeline with an open record refuses. It names the run id and the fix: run once with `--publish staged`, which recovers first.
+**In-place runs while a record is open.** An `in_place` run of a pipeline with an open record refuses. It names the run id and the fix: run once with `--publish staged`, which recovers first. Model-only runs (`rocky run --model`), `rocky backfill` and `rocky branch promote` name no pipeline but can write the same targets. v1 makes each of them refuse when an open record lists one of its targets. The tag covers any writer Rocky cannot see.
 
-**What recovery does.** Recovery uses its own probes, not `StagedSwap::execute`, which would refuse with `LeftoverStage`. Per entry, it probes target, stage and backup and reads their tags. "Run" means the tag equals the record's run id; "old" means it does not. Every state not listed refuses.
+**What recovery does.** Recovery uses its own probes, not `StagedSwap::execute`, which would refuse with `LeftoverStage`. Per entry, it probes target, stage and backup and reads their tags. "Run" means the tag equals the record's run id; "old" means it does not. It works in three passes:
+
+1. Resolve each entry whose done-mark was lost. A `swapping` entry whose target carries the run's tag is `swapped` (rows 5 and 15). A `restoring` entry whose old table or view is back is `restored` (rows 12 and 20).
+2. Decide once, for the whole record, whether the run is published.
+3. Act on each entry by the rows below. Every state not listed refuses.
 
 Tables that existed before the run:
 
@@ -144,32 +156,48 @@ Tables that existed before the run:
 | 2 | `built` | target old, no stage | nothing (the gate dropped it) |
 | 3 | `swapping` | target old, no backup, stage run | the step never ran, or its transaction rolled back: drop the stage |
 | 4 | `swapping` | no target, backup old, stage run | rename the backup to target, drop the stage |
-| 5 | `swapping` | target run, backup old, no stage | the swap ran; its done-mark was lost: treat as row 6 or 7 |
-| 6 | `swapped`, not published | target run, backup old | restore: drop the target, rename the backup to target |
+| 5 | `swapping` | target run, backup old, no stage | the swap ran and its done-mark was lost: it is `swapped` |
+| 6 | `swapped`, not published | target run, backup old | restore: write `restoring`, drop the target, rename the backup to target |
 | 7 | `swapped` or `cleaning`, published | target run, backup old or gone | finish the clean: drop the backup; no restore |
 | 8 | `cleaned` | target run, nothing beside it | nothing |
 | 9 | `swapped`, not published | target old, no backup, stage run | the record ran ahead of a rolled-back transaction: drop the stage |
+| 10 | `restoring` | target run, backup old | the restore never ran: as row 6 |
+| 11 | `restoring` | no target, backup old | the drop ran: rename the backup to target |
+| 12 | `restoring` | target old, nothing beside it | the restore ran and its done-mark was lost: it is `restored` |
+| 13 | `restored` | target old, nothing beside it | nothing |
 
 Tables created by this run (no target before):
 
 | # | Phase | Warehouse state | Action |
 |---|---|---|---|
-| 10 | `built` or `swapping` | no target, stage run or none | drop the stage if present |
-| 11 | `swapping` or `swapped`, not published | target run, no stage | restore: drop the target (the pre-run state had no table) |
-| 12 | published | target run | nothing to clean: clear the entry |
+| 14 | `built` or `swapping` | no target, stage run or none | drop the stage if present |
+| 15 | `swapping` or `swapped`, not published | target run, no stage | restore: write `restoring`, drop the target (the pre-run state had no table) |
+| 16 | `restoring` or `restored` | no target, no stage | nothing |
+| 17 | published | target run | nothing to clean |
 
 A one-statement swap (Snowflake `SWAP WITH`, ClickHouse `EXCHANGE TABLES`) leaves the old table under the stage name. Its rows wait for the D2 spike; until then, that state refuses.
 
-Views have no backup. The record holds each view's old definition, read before the view is re-created. Restore re-creates the view from it, and drops a view the run created. An adapter that cannot read a view's definition refuses `staged` for that view at plan time.
+**Views.** A view has no backup. The record holds its old definition, read before the swap, and the new one. The view carries the run's tag where the warehouse allows a comment on a view. Elsewhere "run" means its current definition equals the new one, and "old" that it equals the old one.
 
-DuckDB over an Iceberg REST catalog has no rename, and its in-place overwrite keeps no backup (`recover_interrupted_swap` returns early for `InPlaceOverwrite`). So v1 stages an Iceberg target only when every target exists and one transaction overwrites all of them from their stages. That transaction either commits or rolls back, so there is nothing to restore. Recovery only drops stages. Any other Iceberg pipeline refuses `staged` at plan time.
+| # | Phase | Warehouse state | Action |
+|---|---|---|---|
+| 18 | `swapping` | view old, or no view when created by this run | the step never ran: nothing |
+| 19 | `swapping` or `swapped`, not published | view run | restore: write `restoring`, re-create the old definition, or drop a view this run created |
+| 20 | `restoring` | view old, or no view when created by this run | the restore ran: it is `restored` |
+| 21 | published | view run | nothing |
+
+An adapter that cannot read a view's definition refuses `staged` for that view at plan time.
+
+**DuckDB over an Iceberg REST catalog.** DuckDB-Iceberg refuses a rename inside a write transaction, and its in-place overwrite keeps no backup (`recover_interrupted_swap` returns early for `InPlaceOverwrite`). So v1 stages an Iceberg pipeline only when every target of the pipeline is an existing table in one Iceberg catalog. One transaction then overwrites all of them from their stages. It either commits or rolls back, so there is nothing to restore, and recovery only drops stages. Any other pipeline with an Iceberg target refuses `staged` at plan time, including one that mixes Iceberg and other targets: its Iceberg commit could not be restored.
 
 **Trace: staged, then in place, then staged.** This is the sequence that existence probes alone get wrong.
 
 ```
-S1 (staged)    A swapped, then the process dies    A = new(S1)  A__rocky_old = old
-in place run   record open  ->  refused            nothing written
-S2 (staged)    recovers first: row 6               A = old, record cleared
+S1 staged     A swapped, B built, dies   A = new(S1)   A__rocky_old = old A
+                                         B = old B     B__rocky_stage = new(S1)
+in place      record open  ->  refused   nothing written
+S2 staged     recovers: row 6 for A,     A = old A, B = old B
+              row 1 for B                record cleared
 ```
 
 Without the refusal, the in-place run writes newer A. S2 would then drop it as "new(S1)". With the tag, that A carries no S1 tag, so S2 refuses instead. The tag also covers a write Rocky did not make: another tool, or an older binary.
@@ -182,7 +210,7 @@ B   swapping    B missing      B__rocky_old = old B   B__rocky_stage = new B
 C   built       C = old        C__rocky_stage = new C
 ```
 
-The next staged run first recovers: row 6 for A, row 4 for B, row 1 for C. Production is then old A, B and C. It then rebuilds under a new record. If any recovery step fails, it stops.
+The next staged run first recovers: row 6 for A, row 4 for B, row 1 for C. A restore killed half-way resumes by rows 10 to 13. Production is then old A, B and C. It then rebuilds under a new record. If any recovery step fails, it stops.
 
 If the run had not died, it would have done the same restore at once, before exiting non-zero.
 
@@ -217,7 +245,7 @@ For a user who opts in (nobody else sees a change):
 - A failed model or test leaves production as before the run, and the run exits non-zero.
 - A failed swap restores at once: production is as before the run, views included. A target this run created is dropped. If the process dies or a restore step fails, the next staged run recovers. If recovery cannot match a table, a person must act.
 - `--skip-unchanged` has no effect under staged.
-- While a record is open, `in_place` runs of that pipeline refuse.
+- While a record is open, `in_place` runs of that pipeline refuse, and so do model-only runs, backfills and promotes that write one of its targets.
 - Storage peaks at two copies per rebuilt table. It needs create and rename rights per target schema, and the right to set a table property or comment.
 - The run JSON gains a per-target publish section (`just codegen`).
 
@@ -226,7 +254,7 @@ For a user who opts in (nobody else sees a change):
 Proposed in this revision, for Hugo to confirm. None changes the two 2026-11-22 decisions.
 
 - **First-time targets.** A restore drops a table this run created, because the pre-run state had none. The alternative is to keep it and report it.
-- **New v1 refusals.** `staged` refuses on `valkey` state, on a view whose definition the adapter cannot read, and on any Iceberg pipeline that one transaction cannot overwrite whole.
+- **New v1 refusals.** `staged` refuses on remote state with no working conditional put (`valkey`), on a view whose definition the adapter cannot read, and on any pipeline with an Iceberg target that one transaction cannot overwrite whole. Model-only runs, `rocky backfill` and `rocky branch promote` refuse while an open record lists their target.
 - **Skip gate off.** Turning it off is the simple answer. Running the gate before the rewrite would keep it, at the cost of routing decided per run.
 
 ## Alternatives considered
@@ -238,7 +266,7 @@ Proposed in this revision, for Hugo to confirm. None changes the two 2026-11-22 
 
 - DuckDB: the #2612 recipe under `publish = "staged"` leaves both production tables old.
 - A failing test under the default `tests_on_run = "enforce"` blocks the publish. The next staged run starts with no open record.
-- A scripted adapter killed after each intent write and after each step: recovery reaches the row the D3 tables name, and the crash trace restores.
+- A scripted adapter killed after each intent write and after each step, restore steps included: recovery reaches the row the D3 tables name, and the crash trace restores.
 - Remote state: a run killed mid-swap, with no end-of-run upload, leaves a record that a run on another host recovers.
 - Staged, then in place, then staged: the in-place run refuses; a write by another tool makes S2 refuse, not drop.
 - Restore with a view and with a first-time target: the old view definition is back, and the new table is gone.
