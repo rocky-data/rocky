@@ -389,9 +389,9 @@ pub fn compute_replay_check_request_scoped(
     target: &str,
     model_filter: Option<&str>,
 ) -> Result<ReplayCheckOutput> {
-    let store = super::history::open_request_scoped(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    replay_check_from_store(&store, target, model_filter)
+    super::history::with_request_scoped_store(state_path, |store| {
+        replay_check_from_store(store, target, model_filter)
+    })
 }
 
 fn replay_check_from_store(

@@ -24,8 +24,7 @@ pub fn optimize_output(
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
 ) -> Result<OptimizeOutput> {
-    let store = StateStore::open_read_only_or_empty(state_path)?;
-    optimize_output_from_store(&store, config_path, models_dir, model_filter)
+    optimize_output_inner(state_path, config_path, models_dir, model_filter, false)
 }
 
 /// [`optimize_output`] with the request-local cache budget
@@ -36,15 +35,30 @@ pub fn optimize_output_request_scoped(
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
 ) -> Result<OptimizeOutput> {
-    let store = super::history::open_request_scoped(state_path)?;
-    optimize_output_from_store(&store, config_path, models_dir, model_filter)
+    optimize_output_inner(state_path, config_path, models_dir, model_filter, true)
 }
 
-fn optimize_output_from_store(
-    store: &StateStore,
+/// What `optimize` keeps of one execution: its duration and bytes written.
+type ExecutionStats = (u64, Option<u64>);
+
+/// Everything `optimize` reads from the state store. Read in one short
+/// window so the store's file lock is not held while config and models load
+/// or while the recommendations compute.
+struct StoreReads {
+    run_scope: crate::output::ProductionRunScope,
+    total_runs: usize,
+    /// `started_at` of the oldest and the newest run read.
+    span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    model_names: Vec<String>,
+    histories: HashMap<String, Vec<ExecutionStats>>,
+}
+
+fn optimize_output_inner(
+    state_path: &Path,
     config_path: &Path,
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
+    request_scoped: bool,
 ) -> Result<OptimizeOutput> {
     // `[cost]` pricing: read it from the loaded project config when one
     // exists, and fall back to `CostConfig::default()` only when the
@@ -61,28 +75,15 @@ fn optimize_output_from_store(
     // uses — this command opens no warehouse connection either. A
     // `rocky.toml` that is there but does not load is a hard error: a wrong
     // price is worse than no price.
+    //
+    // Config and models load BEFORE the store opens: redb's exclusive file
+    // lock must not wait on disk work, or a writer retries out to `Busy`.
     let config = match rocky_core::config::load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?
     {
         Some(cfg) => CostConfig::from(cfg.cost),
         None => CostConfig::default(),
     };
-
-    // Get all runs to extract model names and compute stats.
-    //
-    // Production runs only (#2201): a shadow or branch run built a copy
-    // somewhere else, and its timings must not steer the production table's
-    // materialization. Runs recorded before runs carried a scope ARE counted:
-    // they are most of the history right after an upgrade, and dropping them
-    // would leave nothing to recommend from. `run_scope` in the output says
-    // how many of each were read.
-    let (runs, run_scope) = ProductionRunScope::read(store, 100, UnrecordedScope::Count, |_| true)?;
-
-    if runs.is_empty() {
-        let mut out = OptimizeOutput::empty("no production run history available");
-        out.run_scope = run_scope;
-        return Ok(out);
-    }
 
     // Build the DAG + each model's configured strategy from the models on
     // disk (if models_dir is available). This lets us compute
@@ -92,29 +93,76 @@ fn optimize_output_from_store(
     let (dag_nodes, strategies) = load_models_from_disk(models_dir);
     let downstream = downstream_counts(&dag_nodes);
 
-    // Collect unique model names across all runs
-    let mut model_names: Vec<String> = runs
-        .iter()
-        .flat_map(|r| r.models_executed.iter().map(|m| m.model_name.clone()))
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    model_names.sort();
+    let read = |store: &StateStore| -> Result<StoreReads> {
+        // Get all runs to extract model names and compute stats.
+        //
+        // Production runs only (#2201): a shadow or branch run built a copy
+        // somewhere else, and its timings must not steer the production
+        // table's materialization. Runs recorded before runs carried a scope
+        // ARE counted: they are most of the history right after an upgrade,
+        // and dropping them would leave nothing to recommend from.
+        // `run_scope` in the output says how many of each were read.
+        let (runs, run_scope) =
+            ProductionRunScope::read(store, 100, UnrecordedScope::Count, |_| true)?;
+        let span = runs
+            .last()
+            .zip(runs.first())
+            .map(|(oldest, newest)| (oldest.started_at, newest.started_at));
 
-    // Apply filter
-    if let Some(filter) = model_filter {
-        model_names.retain(|name| name.contains(filter));
+        // Collect unique model names across all runs
+        let mut model_names: Vec<String> = runs
+            .iter()
+            .flat_map(|r| r.models_executed.iter().map(|m| m.model_name.clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        model_names.sort();
+
+        // Apply filter
+        if let Some(filter) = model_filter {
+            model_names.retain(|name| name.contains(filter));
+        }
+
+        // One walk of the run table for every model, not one per model.
+        let name_refs: Vec<&str> = model_names.iter().map(String::as_str).collect();
+        let histories = if runs.is_empty() {
+            HashMap::new()
+        } else {
+            store.get_models_history_matching(
+                &name_refs,
+                100,
+                |run| run.counts_as_production(UnrecordedScope::Count),
+                |exec| (exec.duration_ms, exec.bytes_written),
+            )?
+        };
+        Ok(StoreReads {
+            run_scope,
+            total_runs: runs.len(),
+            span,
+            model_names,
+            histories,
+        })
+    };
+    let StoreReads {
+        run_scope,
+        total_runs,
+        span,
+        model_names,
+        mut histories,
+    } = if request_scoped {
+        super::history::with_request_scoped_store(state_path, read)?
+    } else {
+        super::history::with_default_store(state_path, read)?
+    };
+
+    if total_runs == 0 {
+        let mut out = OptimizeOutput::empty("no production run history available");
+        out.run_scope = run_scope;
+        return Ok(out);
     }
 
     // Build stats and recommendations for each model
     let mut recommendations: Vec<MaterializationCost> = Vec::new();
-    let total_runs = runs.len();
-
-    // One walk of the run table for every model, not one per model.
-    let name_refs: Vec<&str> = model_names.iter().map(String::as_str).collect();
-    let mut histories = store.get_models_history_matching(&name_refs, 100, |run| {
-        run.counts_as_production(UnrecordedScope::Count)
-    })?;
 
     for model_name in &model_names {
         let history = histories.remove(model_name).unwrap_or_default();
@@ -122,22 +170,19 @@ fn optimize_output_from_store(
             continue;
         }
 
-        let avg_duration_seconds = history.iter().map(|m| m.duration_ms as f64).sum::<f64>()
-            / history.len() as f64
-            / 1000.0;
+        let avg_duration_seconds =
+            history.iter().map(|(ms, _)| *ms as f64).sum::<f64>() / history.len() as f64 / 1000.0;
 
         // Estimate size from bytes_written if available
         let estimated_size_gb = history
             .iter()
-            .filter_map(|m| m.bytes_written)
+            .filter_map(|(_, bytes)| *bytes)
             .next_back()
             .map(|b| b as f64 / 1_073_741_824.0)
             .unwrap_or(0.1); // default 100MB estimate
 
         // Rough estimate of runs per month
-        let runs_per_month = if total_runs > 1 {
-            let first = runs.last().unwrap().started_at;
-            let last = runs.first().unwrap().started_at;
+        let runs_per_month = if let (true, Some((first, last))) = (total_runs > 1, span) {
             let span_days = (last - first).num_days().max(1) as f64;
             (history.len() as f64 / span_days) * 30.0
         } else {

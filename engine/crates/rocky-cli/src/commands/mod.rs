@@ -159,7 +159,10 @@ pub use compile::{
     run_compile_with_options,
 };
 pub use completions::run_completions;
-pub use compliance::{compute_compliance, run_compliance};
+pub use compliance::{
+    ComplianceRouteError, compute_compliance, compute_compliance_credential_tolerant,
+    run_compliance,
+};
 pub use connector_init::{
     ConnectorLang, HELPER_FILE_NAME, HELPER_PY, run_connector_init, scaffold_connector,
 };

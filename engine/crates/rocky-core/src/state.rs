@@ -5606,25 +5606,34 @@ impl StateStore {
     /// [`Self::get_model_history_matching`] for many models in ONE walk of
     /// the run table.
     ///
-    /// Returns, for each name in `model_names`, exactly what
-    /// `get_model_history_matching(name, limit, &keep)` returns: the same
-    /// executions in the same order, capped at `limit`. The per-model call
-    /// walks every run row once per model; a caller that asks for every
-    /// model of a project (`optimize`) pays that walk N times. This walks
-    /// once and stops when every requested model has `limit` executions.
+    /// Returns, for each name in `model_names`, what
+    /// `get_model_history_matching(name, limit, &keep)` returns, each
+    /// execution passed through `project`: the same executions in the same
+    /// order, capped at `limit`. The per-model call walks every run row once
+    /// per model; a caller that asks for every model of a project
+    /// (`optimize`) pays that walk N times. This walks once and stops when
+    /// every requested model has `limit` executions. `project` runs as each
+    /// execution is collected, so a caller that needs two fields never holds
+    /// the whole `ModelExecution`.
     ///
     /// Every requested name has an entry, empty when the model never ran.
+    ///
+    /// The results are equal to the per-model calls, the failures are not. A
+    /// per-model call stops at its own page; the batch stops at the deepest
+    /// of them. A damaged run row between the two is read by the batch only,
+    /// so the batch errors where the shallower per-model call succeeded.
     ///
     /// # Errors
     ///
     /// Returns a [`StateError`] when run history cannot be read.
-    pub fn get_models_history_matching(
+    pub fn get_models_history_matching<T>(
         &self,
         model_names: &[&str],
         limit: usize,
         keep: impl Fn(&RunRecord) -> bool,
-    ) -> Result<std::collections::HashMap<String, Vec<ModelExecution>>, StateError> {
-        let mut history: std::collections::HashMap<String, Vec<ModelExecution>> = model_names
+        project: impl Fn(ModelExecution) -> T,
+    ) -> Result<std::collections::HashMap<String, Vec<T>>, StateError> {
+        let mut history: std::collections::HashMap<String, Vec<T>> = model_names
             .iter()
             .map(|name| ((*name).to_string(), Vec::new()))
             .collect();
@@ -5644,7 +5653,7 @@ impl StateStore {
                     continue;
                 }
                 if let Some(execs) = history.get_mut(&exec.model_name) {
-                    execs.push(exec);
+                    execs.push(project(exec));
                 }
             }
             // A run's executions of a model all count, as in the per-model
@@ -14599,7 +14608,7 @@ mod tests {
         let names = ["hot", "warm", "parted", "cold", "never", "hot"];
         for limit in [0usize, 1, 7, 100] {
             let batch = store
-                .get_models_history_matching(&names, limit, keep)
+                .get_models_history_matching(&names, limit, keep, |e| e)
                 .unwrap();
             assert_eq!(batch.len(), 5, "one entry per distinct name");
             for name in names {
@@ -14616,7 +14625,7 @@ mod tests {
         for names in [&["hot", "parted"][..], &["hot"], &["warm", "parted"]] {
             for limit in [1usize, 2, 7, 30] {
                 let batch = store
-                    .get_models_history_matching(names, limit, keep)
+                    .get_models_history_matching(names, limit, keep, |e| e)
                     .unwrap();
                 for name in names {
                     let single = store.get_model_history_matching(name, limit, keep).unwrap();
@@ -14630,7 +14639,7 @@ mod tests {
             }
         }
         let batch = store
-            .get_models_history_matching(&names, 100, keep)
+            .get_models_history_matching(&names, 100, keep, |e| e)
             .unwrap();
         assert_eq!(
             batch["hot"].len(),
@@ -14643,6 +14652,49 @@ mod tests {
             batch["cold"].len() < 5,
             "the rejected run's execution is left out"
         );
+    }
+
+    /// The batch walk stops as soon as every requested model has its page. A
+    /// damaged row older than that point is never read, so a name set that
+    /// fills before it succeeds, and one that cannot fill (`never`) walks to
+    /// the damaged row and errors. Without the early stop both would error.
+    #[test]
+    fn batch_model_history_stops_once_every_model_is_full() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+        for i in 0..10i64 {
+            let mut execs = vec![model_execution("hot")];
+            if i % 2 == 0 {
+                execs.push(model_execution("parted"));
+                execs.push(model_execution("parted"));
+            }
+            let mut run = minimal_run_record(&format!("run-{i:02}"), execs);
+            run.started_at = base + chrono::Duration::minutes(i);
+            run.finished_at = run.started_at;
+            store.record_run(&run).unwrap();
+        }
+        let older = (base - chrono::Duration::hours(1)).to_rfc3339();
+        let damaged = format!(
+            r#"{{"run_id":"run-old","started_at":"{older}","finished_at":"{older}",
+                 "status":"Success","models_executed":[{{"not_a_model":true}}],
+                 "trigger":"Manual","config_hash":"h"}}"#
+        );
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(RUN_HISTORY).unwrap();
+            table.insert("run-old", damaged.as_bytes()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let batch = store
+            .get_models_history_matching(&["hot", "parted"], 3, |_| true, |e| e.model_name)
+            .expect("both models fill before the damaged row");
+        assert_eq!(batch["hot"].len(), 3);
+        assert_eq!(batch["parted"].len(), 3);
+
+        store
+            .get_models_history_matching(&["hot", "never"], 3, |_| true, |e| e.model_name)
+            .expect_err("`never` cannot fill, so the walk reaches the damaged row");
     }
 
     /// #1332: a model absent from the recent window still has history.

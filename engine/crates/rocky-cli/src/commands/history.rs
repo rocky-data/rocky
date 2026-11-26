@@ -152,13 +152,34 @@ pub(crate) fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> 
 /// can adopt the policy once measured.
 pub(crate) const HISTORY_REQUEST_CACHE_BYTES: usize = 1 << 20;
 
-/// Open the state store read-only with [`HISTORY_REQUEST_CACHE_BYTES`], or an
-/// empty in-memory view when the file does not exist (nothing is created).
-pub(crate) fn open_request_scoped(state_path: &Path) -> Result<StateStore> {
-    Ok(StateStore::open_read_only_or_empty_with_cache(
-        state_path,
-        HISTORY_REQUEST_CACHE_BYTES,
-    )?)
+/// Run `read` against the state store opened read-only with
+/// [`HISTORY_REQUEST_CACHE_BYTES`] (an empty in-memory view when the file does
+/// not exist; nothing is created), and drop the store before returning.
+///
+/// The one open every request-local read uses: `GET /api/v1/runs`,
+/// `/optimize`, `/runs/{id}/replay-check` and `/recipes/{hash}/history`.
+/// redb holds an exclusive file lock while a handle lives, so `read` must do
+/// store reads only. Load config and models before calling it, compute after.
+pub(crate) fn with_request_scoped_store<T>(
+    state_path: &Path,
+    read: impl FnOnce(&StateStore) -> Result<T>,
+) -> Result<T> {
+    let store =
+        StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?;
+    let out = read(&store);
+    drop(store);
+    out
+}
+
+/// [`with_request_scoped_store`] with redb's default cache, for the CLI.
+pub(crate) fn with_default_store<T>(
+    state_path: &Path,
+    read: impl FnOnce(&StateStore) -> Result<T>,
+) -> Result<T> {
+    let store = StateStore::open_read_only_or_empty(state_path)?;
+    let out = read(&store);
+    drop(store);
+    out
 }
 
 /// Build the project-level run-history output from the state store (the
@@ -184,38 +205,39 @@ pub fn history_runs_output_filtered(
     audit: bool,
     trigger: Option<&str>,
 ) -> Result<HistoryOutput> {
-    let store = open_request_scoped(state_path)?;
-    let since_ts = parse_since(since)?;
+    with_request_scoped_store(state_path, |store| {
+        let since_ts = parse_since(since)?;
 
-    let runs = match trigger {
-        Some(trigger) => {
-            // Match on the same Debug form the output serializes (`"Schedule"`,
-            // `"Webhook"`, ...) so the filter vocabulary IS the wire vocabulary.
-            store.list_runs_matching(50, |run| format!("{:?}", run.trigger) == trigger)?
-        }
-        None => store.list_runs(50)?,
-    };
-    let filtered: Vec<_> = if let Some(ts) = since_ts {
-        runs.into_iter().filter(|r| r.started_at >= ts).collect()
-    } else {
-        runs
-    };
-    let runs: Vec<RunHistoryRecord> = filtered
-        .iter()
-        .map(|r| record_to_history(r, audit))
-        .collect();
-    // A trigger filter selects on a field only a record carries, so a
-    // record-less run can never match it.
-    let unrecorded_runs = match trigger {
-        Some(_) => Vec::new(),
-        None => unrecorded_runs(&store, since_ts)?,
-    };
-    Ok(HistoryOutput {
-        version: VERSION.to_string(),
-        command: "history".to_string(),
-        count: runs.len(),
-        runs,
-        unrecorded_runs,
+        let runs = match trigger {
+            Some(trigger) => {
+                // Match on the same Debug form the output serializes (`"Schedule"`,
+                // `"Webhook"`, ...) so the filter vocabulary IS the wire vocabulary.
+                store.list_runs_matching(50, |run| format!("{:?}", run.trigger) == trigger)?
+            }
+            None => store.list_runs(50)?,
+        };
+        let filtered: Vec<_> = if let Some(ts) = since_ts {
+            runs.into_iter().filter(|r| r.started_at >= ts).collect()
+        } else {
+            runs
+        };
+        let runs: Vec<RunHistoryRecord> = filtered
+            .iter()
+            .map(|r| record_to_history(r, audit))
+            .collect();
+        // A trigger filter selects on a field only a record carries, so a
+        // record-less run can never match it.
+        let unrecorded_runs = match trigger {
+            Some(_) => Vec::new(),
+            None => unrecorded_runs(store, since_ts)?,
+        };
+        Ok(HistoryOutput {
+            version: VERSION.to_string(),
+            command: "history".to_string(),
+            count: runs.len(),
+            runs,
+            unrecorded_runs,
+        })
     })
 }
 
@@ -373,8 +395,9 @@ pub fn recipe_history_output_request_scoped(
     recipe_hash: &str,
     since: Option<&str>,
 ) -> Result<RecipeHistoryOutput> {
-    let store = open_request_scoped(state_path)?;
-    recipe_history_from_store(&store, recipe_hash, since)
+    with_request_scoped_store(state_path, |store| {
+        recipe_history_from_store(store, recipe_hash, since)
+    })
 }
 
 fn recipe_history_from_store(
@@ -848,9 +871,11 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() > 2 * u64::from(1u32 << 20));
 
         let evictions = {
-            let store = open_request_scoped(&path).unwrap();
-            recipe_history_from_store(&store, "recipe-1", None).unwrap();
-            store.cache_evictions()
+            with_request_scoped_store(&path, |store| {
+                recipe_history_from_store(store, "recipe-1", None)?;
+                Ok(store.cache_evictions())
+            })
+            .unwrap()
         };
         assert!(evictions > 0, "the 1 MiB budget never bound");
 

@@ -2447,9 +2447,10 @@ struct ComplianceQuery {
 /// `GET /api/v1/compliance` — canonical [`ComplianceOutput`].
 ///
 /// The same bytes as `rocky compliance --output json` for the project the
-/// bound config names. Reads the config and the models directory; opens no
-/// state store and no warehouse. A config the engine cannot read is
-/// `500 config_invalid`.
+/// bound config names. Reads the config (credential-tolerant, like the rest
+/// of `rocky serve`) and the models directory; opens no state store and no
+/// warehouse. A config the engine cannot read is `500 config_invalid`; a
+/// models directory it cannot read is `500 internal_error`.
 async fn compliance(
     State(state): State<Arc<ServerState>>,
     ApiQuery(query): ApiQuery<ComplianceQuery>,
@@ -2459,7 +2460,7 @@ async fn compliance(
     };
     let models_dir = state.models_dir.clone();
     let output = tokio::task::spawn_blocking(move || {
-        crate::commands::compute_compliance(
+        crate::commands::compute_compliance_credential_tolerant(
             &config_path,
             &models_dir,
             query.env.as_deref(),
@@ -2468,7 +2469,12 @@ async fn compliance(
     })
     .await
     .map_err(|e| map_join_err(&e))?
-    .map_err(|e| ApiError::config_invalid(&format!("{e:#}")))?;
+    .map_err(|e| match e {
+        crate::commands::ComplianceRouteError::Config { .. } => {
+            ApiError::config_invalid(&e.to_string())
+        }
+        crate::commands::ComplianceRouteError::Models(_) => ApiError::internal(e.to_string()),
+    })?;
     Ok(PrettyJson(output))
 }
 
