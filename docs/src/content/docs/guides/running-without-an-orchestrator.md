@@ -479,7 +479,7 @@ It lists what the ingress accepted and no tick consumed, with the `token` to mat
 
 ### One scheduler instance per project
 
-Run exactly one reconciler per state file: one `rocky tick` timer or one `rocky serve --scheduler`. The `.rocky/tick.lock` flock and the state store's writer lock are local to one machine. Scheduler state (cursor and claim tables) is local-only: a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it. Two hosts on one project keep independent cursors and both fire the same occurrence. Remote state is last-writer-wins, with no cross-host compare-and-swap.
+Run exactly one reconciler per state file: one `rocky tick` timer or one `rocky serve --scheduler`. The `.rocky/tick.lock` flock and the state store's writer lock are local to one machine. Scheduler state (cursor and claim tables) is local-only: a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it. Two hosts on one project keep independent cursors and both fire the same occurrence. On S3, GCS and tiered, the state upload uses compare-and-swap by default ([`concurrency_control`](/reference/configuration/#concurrent-writers)), so a writer that loses a race fails. On Valkey the upload is last-writer-wins. Either way, no remote backend fences scheduling across machines.
 
 For timers on several hosts, give each host its own project and state file, or keep one timer and let the other hosts call `rocky run` directly.
 
