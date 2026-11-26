@@ -39,7 +39,8 @@ const AUDIT: AuditOutput = {
     entry({ plan_id: "plan-ap", kind: "approval", principal_id: "claude-dev" }),
     entry({ plan_id: "freeze:global", kind: "freeze", principal_id: "claude-dev" }),
     entry({ plan_id: "plan-v1", kind: "verify_after_custody", principal_id: "claude-dev" }),
-    entry({ plan_id: "plan-m1", model: "orders", timestamp: "2026-09-05T06:00:00Z" }),
+    entry({ plan_id: "plan-m1", model: "orders", effect: "deny", timestamp: "2026-09-05T06:00:00Z" }),
+    entry({ plan_id: "plan-b2", principal_id: "ci-bot", principal_id_source: "flag", timestamp: "2026-09-04T02:00:00Z" }),
     entry({ plan_id: "plan-m1", model: "customers", timestamp: "2026-09-05T06:00:01Z" }),
     entry({ plan_id: "autoapply:run-1", capability: "schema_change.additive", principal_id: "ci-bot", principal_id_source: "env" }),
   ],
@@ -53,8 +54,8 @@ describe("AgentsScreen", () => {
     expect(within(card("Distinct names")).getByText("2")).toBeInTheDocument();
     // 7 single-model requests plus plan-m1; autoapply, freeze and verify rows are out.
     const requests = card("Agent requests");
-    expect(within(requests).getByText("8")).toBeInTheDocument();
-    expect(within(requests).getByText("9 gate decisions, one per model")).toBeInTheDocument();
+    expect(within(requests).getByText("9")).toBeInTheDocument();
+    expect(within(requests).getByText("10 gate decisions, one per model")).toBeInTheDocument();
     expect(within(card("Needed approval")).getByText("2")).toBeInTheDocument();
     expect(within(card("Rows with no name")).getByText("3")).toBeInTheDocument();
     expect(screen.getByText(/leaves 1 such decision out/)).toBeInTheDocument();
@@ -66,22 +67,24 @@ describe("AgentsScreen", () => {
     const rows = within(table).getAllByRole("row").slice(1);
     expect(rows.map((r) => within(r).getAllByRole("cell")[0].textContent)).toEqual([
       "claude-dev",
-      "unnamed",
       "ci-bot",
+      "unnamed",
       "unrecorded",
     ]);
     const first = within(rows[0]).getAllByRole("cell");
     expect(first[1]).toHaveTextContent("MCP profile");
     // plan-m1 has two models: 4 requests, 5 decisions.
     expect(first[3]).toHaveTextContent("4(5 decisions)");
-    expect(first[4]).toHaveTextContent("3 allowed · 1 needed approval · 1 blocked decisions");
+    expect(first[4]).toHaveTextContent("2 allowed · 1 needed approval · 2 blocked decisions");
     for (const row of rows) {
       const channel = within(row).getAllByRole("cell")[2].firstElementChild as HTMLElement;
       expect(channel).toHaveTextContent("-");
       expect(channel).toHaveAttribute("title", "The audit log does not record an agent's channel yet");
     }
-    expect(within(rows[1]).getAllByRole("cell")[1]).toHaveTextContent("nobody named it");
-    expect(within(rows[2]).getAllByRole("cell")[1]).toHaveTextContent("environment variable");
+    expect(within(rows[2]).getAllByRole("cell")[1]).toHaveTextContent("nobody named it");
+    expect(within(rows[1]).getAllByRole("cell")[1]).toHaveTextContent(
+      "--principal-id flag, environment variable",
+    );
     const unrecorded = within(rows[3]).getAllByRole("cell")[1].firstElementChild as HTMLElement;
     expect(unrecorded).toHaveAttribute("title", "No source recorded");
   });
@@ -95,10 +98,12 @@ describe("AgentsScreen", () => {
     const merged = within(within(first).getByRole("list", { name: "Recent requests" })).getAllByRole("listitem");
     expect(merged).toHaveLength(4);
     expect(within(merged[0]).getByText("customers, orders")).toBeInTheDocument();
+    // plan-m1: one deny row and one allow row show the worst outcome.
+    expect(within(merged[0]).getByText("Blocked")).toBeInTheDocument();
     const recent = within(first).getByRole("list", { name: "Recent requests" });
     expect(within(recent).getByText("Needs approval")).toBeInTheDocument();
     expect(within(recent).getAllByText("Allowed").length).toBeGreaterThan(0);
-    expect(within(recent).getByText("Blocked")).toBeInTheDocument();
+    expect(within(recent).getAllByText("Blocked")).toHaveLength(2);
     expect(within(recent).getByRole("link", { name: "plan-a2" })).toHaveAttribute(
       "href",
       "/ui/governor/custody/plan-a2",
@@ -125,6 +130,16 @@ describe("AgentsScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show all 7" }));
     expect(within(list).getAllByRole("listitem")).toHaveLength(7);
     expect(within(list).getByRole("link", { name: "plan-z0" })).toBeInTheDocument();
+  });
+
+  it("says what was left out when only drift auto-apply rows exist", async () => {
+    const only = [
+      entry({ plan_id: "autoapply:r1" }),
+      entry({ plan_id: "autoapply:r1", model: "customers" }),
+    ];
+    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: only })} now={NOW} />);
+    expect(await screen.findByText("No agent requests in the last 7 days")).toBeInTheDocument();
+    expect(screen.getByText("2 decisions from rocky run's own drift fixes are left out.")).toBeInTheDocument();
   });
 
   it("re-reads with the chosen window", async () => {

@@ -198,18 +198,27 @@ function AgentsBody({ audit, days, now }: { audit: AuditOutput; days: number; no
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   if (groups.length === 0) {
-    return <EmptyState title={`No agent requests in the last ${days} ${days === 1 ? "day" : "days"}`} />;
+    return (
+      <EmptyState
+        title={`No agent requests in the last ${days} ${days === 1 ? "day" : "days"}`}
+        detail={
+          autoApplied > 0
+            ? `${plural(autoApplied, "decision", "decisions")} from rocky run's own drift fixes ${autoApplied === 1 ? "is" : "are"} left out.`
+            : undefined
+        }
+      />
+    );
   }
   const selected = groups.find((g) => g.key === selectedKey) ?? groups[0];
   const named = groups.filter((g) => !isNameless(g)).length;
   const allRequests = requestsOf(requests);
-  const needed = allRequests.filter((r) => r.rows.some((row) => row.effect === "require_review")).length;
+  const needed = allRequests.filter((r) => r.worst === "require_review").length;
   const nameless = groups.filter(isNameless).reduce((sum, g) => sum + g.rows.length, 0);
 
   return (
     <div className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <Stat label="Distinct names" value={named} sub="names are self-asserted; + unnamed and unrecorded rows" />
+        <Stat label="Distinct names" value={named} sub="self-asserted; unnamed and unrecorded not counted" />
         <Stat
           label="Agent requests"
           value={allRequests.length}
@@ -248,6 +257,10 @@ function AgentsBody({ audit, days, now }: { audit: AuditOutput; days: number; no
         {autoApplied > 0
           ? ` This page leaves ${plural(autoApplied, "such decision", "such decisions")} out.`
           : " This page leaves those out."}
+      </p>
+      <p className="text-xs text-muted">
+        Decisions about the same change, including retries, count as one request; it shows the worst outcome. A
+        change whose decisions carry two names counts under each name.
       </p>
       <AgentDetail key={selected.key} group={selected} days={days} now={now} />
       <p className="text-xs text-muted">

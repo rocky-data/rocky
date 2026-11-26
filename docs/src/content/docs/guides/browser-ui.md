@@ -147,7 +147,7 @@ Oversight answers "what did the agents do, and was it allowed?" It has four tabs
 
 The Agents tab lists each caller that is not a person and asked to change something. It reads the audit log for the last 1, 7 or 30 days. One row is one agent: how it was named, how many requests it made and how they ended (allowed, needed approval, blocked).
 
-A request is one change, found by its plan id. A change that touches several models writes one gate decision per model, so the Requests column shows both counts. The outcome bar counts decisions. Under the table, the Audit log link opens the whole log. The detail panel shows the `rocky audit --actor <id> --since <N>d` command that lists one agent's rows.
+A request is one change, found by its plan id. A change that touches several models writes one gate decision per model, so the Requests column shows both counts. The outcome bar counts decisions. Decisions about the same change, retries included, count as one request, which shows its worst outcome. A change whose decisions carry two names counts under each name. Under the table, the Audit log link opens the whole log. The detail panel shows the `rocky audit --actor <id> --since <N>d` command that lists one agent's rows.
 
 Names are self-asserted. An agent names itself with `ROCKY_PRINCIPAL_ID`, a flag or its MCP profile. Rocky records the name but does not verify it. Treat a name as a label, not a proof. Rows with no name show as `unnamed` or `unrecorded`.
 
