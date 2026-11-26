@@ -37,6 +37,8 @@ use serde::Deserialize;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, info_span};
 
+use rocky_core::statement_cancel::StatementHandle;
+
 use crate::connector::{TrinoClient, TrinoError};
 
 /// Header advertising client support for the spooling protocol.
@@ -90,74 +92,93 @@ impl TrinoClient {
             .await
     }
 
+    /// The same shape as [`TrinoClient::execute`]: the query id is listed
+    /// in flight from the first page on, and every early stop while the
+    /// query runs (deadline, a failed read, an untrusted `nextUri`, the
+    /// inline-rows fallback, a segment that does not decode) cancels it and
+    /// returns [`TrinoError::Abandoned`].
     async fn execute_arrow_inner(&self, sql: &str) -> Result<RecordBatch, TrinoError> {
         let deadline = Instant::now() + self.config().timeout;
-        let coordinator = self.config().coordinator_url.clone();
-        let submit_url = format!("{coordinator}/v1/statement");
-        debug!(coordinator = %coordinator, "submitting Trino statement (spooled+arrow)");
+        debug!(coordinator = %self.config().coordinator_url, "submitting Trino statement (spooled+arrow)");
 
         let headers = self.spooled_arrow_headers()?;
-        let resp = self
-            .http_client()
-            .post(&submit_url)
-            .headers(headers.clone())
-            .body(sql.to_string())
-            .send()
+        let first = self
+            .submit(sql, &headers, deadline, parse_spooled_response)
             .await?;
-        let mut current = parse_spooled_response(resp).await?;
+        let id = first.id.clone();
+        let _in_flight = self.in_flight().register(StatementHandle::new(id.clone()));
+        match self.collect_batches(first, &headers, deadline).await {
+            Ok(outcome) => outcome,
+            Err(cause) => Err(self.abandon(id, cause).await),
+        }
+    }
 
+    /// Read pages from `current` on until the query ends. `Ok` holds the
+    /// terminal outcome; an `Err` means the client stops waiting on a query
+    /// that may still run.
+    async fn collect_batches(
+        &self,
+        mut current: SpooledQueryResults,
+        headers: &HeaderMap,
+        deadline: Instant,
+    ) -> Result<Result<RecordBatch, TrinoError>, TrinoError> {
         let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut last_state: String;
         let mut attempt = 0_usize;
         loop {
             // Drain whatever segments / inline data the current page
             // carries. If `data` arrived as inline JSON rows the server
             // doesn't support Arrow — surface a clear error rather than
             // emit a synthetic batch.
+            let finished = current.next_uri.is_none();
             if let Some(data) = current.data.take() {
-                match data {
-                    SpooledData::Inline(_) => return Err(TrinoError::ArrowEncodingUnavailable),
-                    SpooledData::Segments(segments) => {
-                        for seg in segments {
-                            let batch = self.fetch_segment(&seg).await?;
-                            batches.push(batch);
-                        }
-                    }
+                let drained = match data {
+                    SpooledData::Inline(_) => Err(TrinoError::ArrowEncodingUnavailable),
+                    SpooledData::Segments(segments) => self.fetch_segments(&segments).await,
+                };
+                match drained {
+                    Ok(mut fetched) => batches.append(&mut fetched),
+                    // The query has ended: this is its outcome.
+                    Err(err) if finished => return Ok(Err(err)),
+                    Err(err) => return Err(err),
                 }
             }
-            last_state = current.stats.state.clone();
+            let last_state = current.stats.state.clone();
 
-            let Some(next) = current.next_uri.clone() else {
+            let Some(next) = current.next_uri.take() else {
                 if current.stats.state == "FINISHED" {
-                    return concat_arrow_batches(&batches);
+                    return Ok(concat_arrow_batches(&batches));
                 }
-                return Err(query_failed(&current));
+                return Ok(Err(query_failed(&current)));
             };
 
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(TrinoError::Timeout {
                     timeout_secs: self.config().timeout.as_secs(),
                     last_state,
                 });
             }
-            if !same_origin(&coordinator, &next) {
-                return Err(TrinoError::UntrustedNextUri {
-                    coordinator: coordinator.clone(),
-                    next,
-                });
-            }
-
-            tokio::time::sleep(poll_delay(attempt)).await;
+            tokio::time::sleep_until((now + poll_delay(attempt)).min(deadline)).await;
             attempt += 1;
 
-            let resp = self
-                .http_client()
-                .get(&next)
-                .headers(headers.clone())
-                .send()
+            current = self
+                .next_page(
+                    &next,
+                    headers,
+                    deadline,
+                    &last_state,
+                    parse_spooled_response,
+                )
                 .await?;
-            current = parse_spooled_response(resp).await?;
         }
+    }
+
+    async fn fetch_segments(&self, segments: &[Segment]) -> Result<Vec<RecordBatch>, TrinoError> {
+        let mut batches = Vec::with_capacity(segments.len());
+        for seg in segments {
+            batches.push(self.fetch_segment(seg).await?);
+        }
+        Ok(batches)
     }
 
     /// Header set for the spooled-Arrow path. Reuses the base auth +
@@ -297,23 +318,6 @@ fn query_failed(qr: &SpooledQueryResults) -> TrinoError {
     }
 }
 
-/// Same-origin check shared with the JSON polling path.
-///
-/// Kept module-local to avoid widening `connector.rs`'s public surface
-/// — this is the only other call site.
-fn same_origin(base: &str, candidate: &str) -> bool {
-    let Ok(base) = url::Url::parse(base) else {
-        return false;
-    };
-    let Ok(cand) = url::Url::parse(candidate) else {
-        return false;
-    };
-    base.scheme() == cand.scheme()
-        && base.host_str().is_some()
-        && base.host_str() == cand.host_str()
-        && base.port_or_known_default() == cand.port_or_known_default()
-}
-
 /// Polling delay ladder mirroring `connector::poll_delay` — duplicated
 /// here so this module doesn't widen `connector.rs`'s public surface
 /// for a 6-line helper.
@@ -340,7 +344,6 @@ fn poll_delay(attempt: usize) -> Duration {
 
 #[derive(Debug, Clone, Deserialize)]
 struct SpooledQueryResults {
-    #[allow(dead_code)]
     id: String,
     #[serde(rename = "nextUri")]
     next_uri: Option<String>,
@@ -681,5 +684,41 @@ mod tests {
     fn decode_arrow_ipc_surfaces_garbage_as_error() {
         let err = decode_arrow_ipc(b"not arrow ipc").unwrap_err();
         assert!(matches!(err, TrinoError::ArrowDecode(_)));
+    }
+
+    /// #2768: the inline-rows fallback on a page of a query that still runs
+    /// stops the wait, so the query is cancelled before the error returns.
+    #[tokio::test]
+    async fn the_inline_fallback_mid_query_cancels_the_query() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "q_inline_mid",
+                "nextUri": format!("{}/v1/statement/executing/q_inline_mid/x/1", server.uri()),
+                "data": [[1, "alice"]],
+                "stats": {"state": "RUNNING"},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/query/q_inline_mid"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = TrinoClientConfig::new(server.uri()).with_timeout(Duration::from_secs(5));
+        let client = TrinoClient::new(cfg, crate::test_helpers::test_basic_auth());
+        let err = client.execute_arrow("SELECT 1").await.unwrap_err();
+        let TrinoError::Abandoned { cause, .. } = &err else {
+            panic!("expected Abandoned, got {err}");
+        };
+        assert!(
+            matches!(**cause, TrinoError::ArrowEncodingUnavailable),
+            "{cause}"
+        );
+        assert!(client.in_flight().snapshot().is_empty());
     }
 }
