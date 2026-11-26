@@ -5,9 +5,7 @@ sidebar:
   order: 1
 ---
 
-This page is symptom-first. Search it for the error message you got, then follow the numbered steps under it.
-
-For the opposite view, categories of failure with a recovery playbook for each, see [Failure modes](/advanced/failure-modes/).
+Search this page for the error message you got, then follow the steps. For failure categories with a recovery playbook, see [Failure modes](/advanced/failure-modes/).
 
 ## Compile errors
 
@@ -30,22 +28,11 @@ Model `Y` lists `X` in its `depends_on`, but the project has no model named `X`.
 
 ### "join key type mismatch on column 'X'"
 
-Two upstream models in a join share a column name but not its type, and the types have no common type (`E001`).
-
-**Fix**
-
-1. Read the diagnostic. It names both models and both types.
-2. Add an explicit `CAST()` on one side of the join, or change the upstream model to produce the expected type.
-3. If the change is intentional schema evolution, run `rocky ai-sync` to propagate it downstream.
+Two upstream models in a join share a column name but have no common type (`E001`). The diagnostic names both models and types. Add an explicit `CAST()` on one side, or change the upstream model. For intentional schema evolution, run `rocky ai-sync` to propagate it downstream.
 
 ### "Contract violation"
 
-A model's output does not satisfy its data contract (`E010`–`E014`). For example: `column 'X' type mismatch: contract expects …`.
-
-**Fix**
-
-1. Open the model's `.contract.toml` file and read the required columns and types.
-2. Choose one side to change. Either update the model to produce the required schema, or update the contract.
+A model's output does not satisfy its data contract (`E010`–`E014`), for example `column 'X' type mismatch: contract expects …`. Read the model's `.contract.toml`, then change the model or the contract. See [Failure modes](/advanced/failure-modes/#2-contract-violations).
 
 ## LSP and IDE problems
 
@@ -55,7 +42,7 @@ The VS Code extension cannot connect to `rocky lsp`.
 
 **Likely causes**
 
-- The Rocky binary is not installed, or it is not on `PATH`.
+- The Rocky binary is not installed or not on `PATH`.
 - The `rocky.server.path` VS Code setting points somewhere wrong.
 - The binary is built for another platform, such as a Linux binary on macOS.
 
@@ -123,80 +110,24 @@ The AI could not produce valid code inside the retry budget.
 
 ## Connection errors
 
-### Databricks: "401 Unauthorized"
+Adapter auth, quota and timeout failures: see [Adapter / runtime failures](/advanced/failure-modes/#5-adapter--runtime-failures). Two quick fixes:
 
-**Likely causes**
-
-- The Personal Access Token expired.
-- The OAuth M2M credentials are wrong.
-- The token has no access to the warehouse you named.
-
-**Fix**
-
-1. Regenerate the token in your Databricks workspace settings.
-2. For OAuth M2M, check the `client_id` and `client_secret` values in the adapter block, and the environment variables they read.
-
-### Databricks: "Statement execution timeout"
-
-A query ran longer than the configured timeout.
-
-**Fix**
-
-1. Raise the timeout on the Databricks adapter:
-
-   ```toml
-   [adapter.prod]
-   type = "databricks"
-   timeout_secs = 600  # 10 minutes
-   ```
-
-2. For a large full-refresh sync, switch the model to an incremental strategy instead of raising the timeout further.
-
-### Fivetran: "403 Forbidden"
-
-**Fix**
-
-1. Check the `api_key` and `api_secret` values in the Fivetran adapter block, and the environment variables they read.
-2. Confirm the API key has access to the `destination_id` you configured.
+- **Databricks "Statement execution timeout":** raise `timeout_secs` on the adapter (`[adapter.prod]`, for example `timeout_secs = 600`). For a large full-refresh sync, switch the model to an incremental strategy.
+- **Fivetran "403 Forbidden":** check `api_key` and `api_secret` in the adapter block and the environment variables they read, and that the key has access to the configured `destination_id`.
 
 ## State store problems
 
 The [state store](/reference/glossary/#state-store) is the embedded redb database where Rocky keeps run records, watermarks, and plans.
 
-### "State file locked"
+### "State file locked" and "State file corrupted"
 
-Another Rocky process holds the state file lock.
+Recovery for both: [State store failures](/advanced/failure-modes/#6-state-store-failures). The state store is at `models/.rocky-state.redb` by default (a legacy project has `.rocky-state.redb` in the working directory). Run `rocky doctor` to confirm the path. Deleting the file resets every watermark, so the next run is a full refresh:
 
-**Fix**
-
-1. Look for a running Rocky process:
-
-   ```bash
-   ps aux | grep rocky
-   ```
-
-2. If one is running, wait for it or stop it. Two Rocky runs cannot hold the lock at the same time.
-3. If none is running, the lock is stale. Remove it:
-
-   ```bash
-   rm -f models/.rocky-state.redb.lock
-   ```
-
-The state store lives at `models/.rocky-state.redb` by default. Run `rocky doctor` to confirm the path. A project on the legacy current-directory state file has `.rocky-state.redb.lock` in the working directory instead.
-
-### "State file corrupted"
-
-The embedded redb state file is damaged.
-
-**Fix**
-
-1. Delete the state file and re-run. This resets every watermark, so the next run is a full refresh:
-
-   ```bash
-   rm models/.rocky-state.redb   # legacy projects: rm .rocky-state.redb in the current directory
-   plan_id=$(rocky plan --filter client=acme --output json | jq -r .plan_id)
-   rocky apply "$plan_id"
-   ```
+```bash
+rm models/.rocky-state.redb
+plan_id=$(rocky plan --filter client=acme --output json | jq -r .plan_id)
+rocky apply "$plan_id"
+```
 
 ## Build problems
 

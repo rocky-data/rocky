@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-`rocky ci` compiles and tests your project in one step. It runs entirely on your CI machine, on DuckDB, so it needs no warehouse credentials and no external service. That makes it a cheap required check on a pull request.
+`rocky ci` compiles and tests your project in one step. It runs on your CI machine, on DuckDB, with no warehouse credentials, so it is a cheap required check on a pull request.
 
 ## 1. The rocky ci Command
 
@@ -18,20 +18,7 @@ With no `--models`, the command covers the models of every transformation pipeli
 1. **Compile**: type-check every model, resolve the DAG, validate contracts. When the project has `data/seed.sql`, the types come from the tables it makes.
 2. **Test**: execute each model's SQL against DuckDB in dependency order, on the seed's tables
 
-```
-Rocky CI Pipeline
-
-  Compile: PASS (12 models)
-  Test:    PASS (12 passed, 0 failed)
-
-  Exit code: 0
-```
-
-Exit codes:
-- **0** -- every check passed
-- **1** -- a compilation or test failure
-
-The two phases catch different faults. Compile catches type mismatches, missing dependencies, and contract violations. Test catches what only shows up when the SQL runs: syntax errors, division by zero, invalid casts.
+Exit `0` means every check passed. Exit `1` means a compilation or test failure. Compile catches type mismatches, missing dependencies and contract violations. Test catches faults that show only when the SQL runs: syntax errors, division by zero, invalid casts.
 
 ### Structural diff against a base ref
 
@@ -42,7 +29,7 @@ rocky ci-diff                    # defaults to main
 rocky ci-diff release/2026-04 --models src/models
 ```
 
-`ci-diff` reads `HEAD` from git, and the base side from the merge base, so uncommitted edits never reach the report. To preview uncommitted work locally, pass `--working-tree`. The JSON output says which ran in `mode`.
+`ci-diff` reads `HEAD` and the merge base from git, so uncommitted edits never reach the report. Pass `--working-tree` to preview uncommitted work. The JSON output says which ran in `mode`.
 
 In GitHub Actions, post that Markdown block straight to the PR:
 
@@ -81,7 +68,7 @@ Three commands run the same breaking-change classifier over the typed IR (the co
 rocky ci-diff --semantic --output json | jq '.breaking_findings'
 ```
 
-Each finding carries a tagged `change.kind` (such as `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking`, `warning`, or `info`). `ci-diff --semantic` is **informational**. A `breaking` finding does not change its exit code. Run it on every PR so reviewers see breaking changes before anyone promotes.
+Each finding carries a tagged `change.kind` (such as `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking`, `warning`, or `info`). `ci-diff --semantic` is **informational**: a `breaking` finding does not change its exit code.
 
 `rocky plan --semantic` gives the author the same verdict at plan time. It diffs your *working tree*, uncommitted edits included, against `--base` (default `main`), and attaches the verdict under `breaking_verdict` in the JSON output:
 
@@ -89,15 +76,15 @@ Each finding carries a tagged `change.kind` (such as `column_dropped`, `column_t
 rocky plan --semantic --base main --output json | jq '.breaking_verdict'
 ```
 
-This reports only. The verdict never gates the plan. When no baseline exists, Rocky omits `breaking_verdict` rather than inventing one. That happens when there is no `models/` directory, or when the `--base` ref's models do not compile. The hard gate is `rocky plan promote`, below.
+This reports only. When no baseline exists (no `models/` directory, or the `--base` ref's models do not compile), Rocky omits `breaking_verdict`. The hard gate is `rocky plan promote`, below.
 
 :::caution[The classifier diffs OUTPUT SCHEMA; it is blind to value changes]
-The breaking-change classifier compares the typed **output schema** of each model: columns, types, nullability, materialization keys, masks, target. It is **blind to schema-stable value changes**. A `WHERE`, `JOIN`-key, or `CASE` rewrite that changes every output row, but leaves the column list and types alone, produces **no finding**. An empty `breaking_verdict.findings` therefore means "no output-schema change was detected". It is **not** a signal that the data is unchanged. The verdict repeats this statement verbatim in its `caveat` field, so a JSON-only consumer cannot miss it. To see whether values moved, pair it with [`rocky preview`](/guides/preview-a-pr/), which diffs rows on real data.
+The classifier compares the typed **output schema** of each model: columns, types, nullability, materialization keys, masks, target. A `WHERE`, `JOIN`-key, or `CASE` rewrite that changes every output row but leaves the columns and types alone produces **no finding**. An empty `breaking_verdict.findings` means "no output-schema change was detected", **not** "the data is unchanged". The verdict repeats this in its `caveat` field. To see whether values moved, use [`rocky preview`](/guides/preview-a-pr/), which diffs rows on real data.
 :::
 
 The hard gate lives on `rocky plan promote` and `rocky apply`. When you promote a branch to production, Rocky runs the same classifier against `--base` (default `main`). Any finding with `severity == "breaking"` blocks the promote **at plan time**.
 
-The gate fires once. A blocked promote produces no `plan_id`, so `rocky apply` has nothing to run. Rocky records the gate result in the persisted plan and does **not** re-evaluate it at apply time; `rocky apply` replays the recorded verdict. To ship a breaking change on purpose, once downstream consumers have migrated, pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event, so the bypass leaves a paper trail.
+The gate fires once. A blocked promote produces no `plan_id`, so `rocky apply` has nothing to run. Rocky records the gate result in the plan and does **not** re-evaluate it at apply time. To ship a breaking change on purpose, pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event.
 
 :::note[Multi-pipeline projects]
 In a project whose `rocky.toml` declares more than one pipeline, pass `--pipeline <name>` to `rocky plan promote`. The plan records the resolved pipeline, so `rocky apply <plan-id>` reads it from the plan and needs no `--pipeline` flag of its own:
@@ -109,15 +96,8 @@ rocky apply "$plan_id"
 :::
 
 ```bash
-# PR-time: detect (informational)
-rocky ci-diff --semantic
-
-# Promote-time: gate (blocks on `breaking` findings)
+# Promote-time gate (blocks on `breaking` findings); add --allow-breaking to override (audited)
 plan_id=$(rocky plan promote fix_price --base main --output json | jq -r .plan_id)
-rocky apply "$plan_id"
-
-# Promote-time override (audited)
-plan_id=$(rocky plan promote fix_price --base main --allow-breaking --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 
@@ -152,80 +132,9 @@ jobs:
         run: rocky ci --models models --contracts contracts
 ```
 
-### With JSON output and artifact upload
+### JSON output and artifacts
 
-Write JSON and upload it as an artifact when you want the detail after the job ends:
-
-```yaml
-name: Rocky CI
-on:
-  pull_request:
-    paths:
-      - "models/**"
-      - "contracts/**"
-      - "rocky.toml"
-
-jobs:
-  rocky:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rocky
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Compile
-        run: rocky compile --models models --contracts contracts -o json > compile-report.json
-
-      - name: Test
-        run: rocky test --models models --contracts contracts -o json > test-report.json
-
-      - name: CI Check
-        run: rocky ci --models models --contracts contracts -o json > ci-report.json
-
-      - name: Upload Reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rocky-reports
-          path: |
-            compile-report.json
-            test-report.json
-            ci-report.json
-```
-
-### PR comment with results
-
-Parse the JSON and post a summary comment on the PR:
-
-```yaml
-      - name: CI Check
-        id: ci
-        run: |
-          rocky ci --models models --contracts contracts -o json > ci-report.json
-          echo "models=$(jq '.models_compiled' ci-report.json)" >> $GITHUB_OUTPUT
-          echo "passed=$(jq '.tests_passed' ci-report.json)" >> $GITHUB_OUTPUT
-          echo "failed=$(jq '.tests_failed' ci-report.json)" >> $GITHUB_OUTPUT
-
-      - name: Comment PR
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const models = '${{ steps.ci.outputs.models }}';
-            const passed = '${{ steps.ci.outputs.passed }}';
-            const failed = '${{ steps.ci.outputs.failed }}';
-            const status = failed === '0' ? 'PASS' : 'FAIL';
-            const body = `### Rocky CI: ${status}\n| Models | Tests Passed | Tests Failed |\n|---|---|---|\n| ${models} | ${passed} | ${failed} |`;
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            });
-```
+Add `-o json > ci-report.json` to any command, then upload the file with `actions/upload-artifact@v4` (`if: always()`) to keep the detail after the job ends. To comment on the PR, use the `rocky ci-diff` step above.
 
 ## 3. GitLab CI
 
@@ -247,59 +156,17 @@ rocky-ci:
         - rocky.toml
 ```
 
-### Separate compile and test stages
-
-Split compile and test into two stages. A compile failure then reports without waiting for the tests:
-
-```yaml
-stages:
-  - compile
-  - test
-
-rocky-compile:
-  stage: compile
-  image: python:3.13-slim
-  before_script:
-    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
-    - curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-    - export PATH="$HOME/.local/bin:$PATH"
-  script:
-    - rocky compile --models models --contracts contracts
-  rules:
-    - changes:
-        - models/**
-        - contracts/**
-
-rocky-test:
-  stage: test
-  image: python:3.13-slim
-  needs: [rocky-compile]
-  before_script:
-    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
-    - curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-    - export PATH="$HOME/.local/bin:$PATH"
-  script:
-    - rocky test --models models --contracts contracts
-  rules:
-    - changes:
-        - models/**
-        - contracts/**
-```
+To report a compile failure early, split `rocky compile` and `rocky test` into two jobs (stages `compile` and `test`, `needs: [rocky-compile]` on the second).
 
 ## 4. Using rocky compile for PR Checks
 
-`rocky compile` skips test execution, so it finishes faster than `rocky ci`. Use it as a cheap required check on PRs:
+`rocky compile` skips tests, so it is faster than `rocky ci`:
 
 ```bash
 rocky compile --models models --contracts contracts
 ```
 
-The compiler catches:
-- **Type mismatches**: a column used as `Int64` in one model and `String` in another
-- **Missing dependencies**: a `depends_on` that names a model which does not exist
-- **Contract violations**: a missing required column, a wrong type, or a removed protected column
-- **DAG cycles**: model A depends on B, and B depends on A
-- **Unresolved references**: SQL that names a table or column Rocky cannot find
+The compiler catches type mismatches (a column `Int64` in one model and `String` in another), a `depends_on` that names a missing model, contract violations, DAG cycles, and SQL that names a table or column Rocky cannot find.
 
 To check one model while you work on it:
 
@@ -323,17 +190,13 @@ rocky ai-explain --all --save --models models
 rocky ai-test --all --save --models models
 ```
 
-This writes one `.sql` file per assertion into the `tests/` directory, a sibling of `models/`. Each file is a standalone SQL assertion. `rocky ci` and `rocky test` do **not** pick them up: those commands execute your models and any `[[test]]` sidecar blocks, never loose `tests/*.sql` files. So commit them and run them in a CI step of your own, executing each assertion against DuckDB. For gating that Rocky runs itself, declare `[[tests]]` in the model sidecars and run `rocky test --declarative`.
+This writes one standalone `.sql` assertion per file into `tests/`, a sibling of `models/`. `rocky ci` and `rocky test` do **not** pick them up: they execute your models and any `[[test]]` sidecar blocks, never loose `tests/*.sql` files. Commit them and run them in your own CI step against DuckDB. For gating that Rocky runs itself, declare `[[tests]]` in the model sidecars and run `rocky test --declarative`.
 
-### Generate tests for a single model
-
-```bash
-rocky ai-test revenue_summary --save --models models
-```
+`rocky ai-test revenue_summary --save --models models` generates tests for one model.
 
 ### CI workflow with AI test generation
 
-Generate the tests on a schedule, and open a PR with the result:
+Generate the tests on a schedule and open a PR. Use the same install step as in [Basic setup](#basic-setup):
 
 ```yaml
 name: Update AI Tests
@@ -346,19 +209,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rocky
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
+      # ...install Rocky as in Basic setup...
       - name: Generate Tests
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           rocky ai-explain --all --save --models models
           rocky ai-test --all --save --models models
-
       - name: Create PR
         uses: peter-evans/create-pull-request@v6
         with:
@@ -369,52 +226,11 @@ jobs:
 
 ## 6. Integration with Dagster CI
 
-If Dagster orchestrates Rocky, run both checks in CI:
+If Dagster orchestrates Rocky, add a second job that runs after `rocky ci` (`needs: [rocky]`): install `dagster dagster-rocky` with `uv add` and run `uv run dg check defs`. `rocky ci` validates the models on their own. `dg check defs` confirms that the orchestration layer can load them into assets.
 
-```yaml
-name: Data Pipeline CI
-on:
-  pull_request:
-    paths:
-      - "models/**"
-      - "contracts/**"
-      - "rocky.toml"
-      - "dagster/**"
+## 7. JSON Output
 
-jobs:
-  rocky:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rocky
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Rocky CI
-        run: rocky ci --models models --contracts contracts
-
-  dagster:
-    runs-on: ubuntu-latest
-    needs: [rocky]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Python dependencies
-        run: uv add dagster dagster-rocky
-
-      - name: Validate Dagster definitions
-        run: uv run dg check defs
-```
-
-The two checks cover different layers. `rocky ci` validates the models on their own. `dg check defs` confirms that the orchestration layer can load those models and wire them into assets.
-
-## 7. JSON Output Schema
-
-Every CI command emits structured JSON.
-
-### rocky ci
+Every CI command emits structured JSON. The [JSON output reference](/reference/json-output/) has the full shapes. `rocky ci` returns:
 
 ```json
 {
@@ -431,50 +247,9 @@ Every CI command emits structured JSON.
 }
 ```
 
-### rocky compile
-
-```json
-{
-  "version": "1.80.0",
-  "command": "compile",
-  "models": 12,
-  "execution_layers": 4,
-  "has_errors": true,
-  "diagnostics": [
-    {
-      "severity": "Error",
-      "code": "E001",
-      "model": "fct_revenue",
-      "message": "unknown column 'nonexistent'",
-      "span": { "file": "models/fct_revenue.sql", "line": 5, "col": 9 },
-      "suggestion": "did you mean 'revenue'?"
-    }
-  ],
-  "compile_timings": { "project_load_ms": 5, "semantic_graph_ms": 1, "typecheck_ms": 12, "typecheck_join_keys_ms": 3, "contracts_ms": 2, "total_ms": 23 }
-}
-```
-
-### rocky test
-
-```json
-{
-  "version": "1.80.0",
-  "command": "test",
-  "total": 12,
-  "passed": 11,
-  "failed": 1,
-  "failures": [
-    { "name": "fct_revenue", "error": "division by zero at line 8" }
-  ]
-}
-```
-
-Parse the payload with `jq` to build your own CI report:
+Parse the payload with `jq`:
 
 ```bash
-# Check if any tests failed
 rocky ci -o json | jq -e '.tests_failed == 0'
-
-# Extract error messages
 rocky compile -o json | jq '.diagnostics[] | select(.severity == "Error") | .message'
 ```

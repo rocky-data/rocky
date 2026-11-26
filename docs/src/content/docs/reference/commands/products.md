@@ -52,22 +52,20 @@ What `rocky run` counts depends on the output model's strategy. The JSON output 
 
 | Strategy | `basis` | What is counted |
 |---|---|---|
-| `full_refresh` | `total_rows` | The table's rows after the build. The build replaces the whole table, so the total is the load. |
-| `incremental` | `rows_added` | The rows this run appended: the count the adapter reported for the `INSERT`. When it reports none, the table's `COUNT(*)` after the write minus its `COUNT(*)` before. |
+| `full_refresh` | `total_rows` | The table's rows after the build. |
+| `incremental` | `rows_added` | The rows this run appended: the count the adapter reported for the `INSERT`, else the table's `COUNT(*)` after the write minus before. |
 | `merge`, or `incremental` with a `unique_key` | `rows_touched` | The rows this run's `MERGE` inserted or updated, as the warehouse reports them. A matched row counts even when its values did not change. Only a run that sent exactly one statement has a count. |
-| `time_interval` | `partition_rows` | The rows in one partition this run wrote, counted after the write with that partition's own time window. Each partition is judged on its own. |
+| `time_interval` | `partition_rows` | The rows in one partition this run wrote, counted with that partition's own time window. Each partition is judged on its own. |
 
 A run that created the table (a first run) or rebuilt it (`rocky run --full-refresh`) counts every row in it, on any basis.
 
-A `COUNT(*)` cannot see an updated row, so `rows_touched` needs the warehouse's own count. DuckDB, PostgreSQL, SQL Server and Spark report it. Databricks, Snowflake, BigQuery, Trino and Redshift do not, so there a merge output is `not_evaluated`, with the reason in `reason`. For `rows_added`, Rocky takes the table's count before the write and after it, and checks the `INSERT`'s reported count against the growth. If the two differ, the check is `not_evaluated`: something else wrote to the table during the run. If the table holds fewer rows after the write than before, that is `not_evaluated` too. This check assumes the run is the table's only writer. A reported count needs no such assumption. Where the adapter reports no `INSERT` count, the growth is the count, and then the single-writer assumption matters. A `MERGE` that matches a row and changes nothing still counts that row.
+DuckDB, PostgreSQL, SQL Server and Spark report a `MERGE` count. Databricks, Snowflake, BigQuery, Trino and Redshift do not, so there a merge output is `not_evaluated`, with the reason in `reason`, and `rocky product verify` refuses it at `error` severity (`volume-merge-count-unavailable`). For `rows_added`, Rocky checks the `INSERT`'s reported count against the table's growth. If they differ, or the table shrank, the check is `not_evaluated`: something else wrote to the table. The check assumes the run is the table's only writer.
 
-A merge output on one of those adapters can never be evaluated. `rocky product verify` refuses it at `error` severity (`volume-merge-count-unavailable`, below).
+A view, an ephemeral model, a materialized view and a dynamic table store no rows Rocky writes. A `delete_insert`, snapshot or content-addressed load has no one count. These strategies are refused (`volume-strategy-unsupported`).
 
-A view, an ephemeral model, a materialized view and a dynamic table store no rows Rocky writes. A `delete_insert`, snapshot or content-addressed load has no one count that is its volume. These strategies are refused (`volume-strategy-unsupported`).
+The parser refuses a block with no bound (`volume-missing-bound`; `min_rows = 0` alone counts as a bound), `min_rows` above `max_rows` (`volume-min-above-max`), a severity other than `warning` or `error` (`volume-severity-unknown`), an unknown key (`unknown-key`), and a negative or non-integer bound (`invalid-value`). The spec does not name the model's strategy, so `rocky product verify` checks it.
 
-The parser refuses a block with no bound (`volume-missing-bound`). `min_rows = 0` alone counts as a bound. It also refuses `min_rows` above `max_rows` (`volume-min-above-max`), a severity other than `warning` or `error` (`volume-severity-unknown`), an unknown key (`unknown-key`), and a negative or non-integer bound (`invalid-value`). The spec does not name the model's strategy, so `rocky product verify` checks it (`volume-strategy-unsupported`, below).
-
-On a full-refresh output, the range also lowers to one `row_count_range` test in the model sidecar, with the same bounds and severity. It replaces any `row_count_range` test the worker wrote over the whole table, so the model has one range: the spec's. `rocky test --declarative` and `rocky run` then judge the same range. On any other output the range writes no test: a `row_count_range` test counts the whole table, and the range is about one load. Only `rocky run` judges it, and a worker's own `row_count_range` stays.
+On a full-refresh output, the range also lowers to one `row_count_range` test in the model sidecar, with the same bounds and severity. It replaces any `row_count_range` test the worker wrote over the whole table, so `rocky test --declarative` and `rocky run` judge the same range. On any other output the range writes no test, because a `row_count_range` test counts the whole table and the range is about one load. Only `rocky run` judges it, and a worker's own `row_count_range` stays.
 
 After each successful production build of the output model, `rocky run` counts the rows once, on the same warehouse connection:
 
@@ -80,15 +78,13 @@ build ok ──▶ count ────▶ in range ──────────
                                                       a `volume_warnings` line says why)
 ```
 
-At `error` severity the table is already written; Rocky cannot undo that. The model is marked failed after the fact. Downstream models are withheld as for any failed model. The run status is `partial_failure`. The build gets no `due_at`, so it never counts as a delivery on time. A time-interval output is judged one partition at a time. If any partition breaches at `error`, the model fails. Only the breaching partitions are marked failed in the run record. The model delivers nothing in that run, so no partition of it gets a `due_at`. The other partitions stay successes in the record. Partitions written before another partition failed to run are judged too.
+At `error` severity the table is already written and Rocky cannot undo it. The model is marked failed after the fact, downstream models are withheld, the run status is `partial_failure`, and the build gets no `due_at`. A time-interval output is judged one partition at a time: a partition that breaches at `error` fails the model and is marked failed in the run record, the others stay successes, and no partition gets a `due_at`. Partitions written before another partition failed to run are judged too.
 
-What an `error` breach does:
+An `error` breach also:
 
-1. It fails the model for the run that wrote the rows. The rows are not rolled back.
-2. It opens a breach marker for the model. A time-interval marker lists the breached partitions.
-3. While a marker is open, every run that builds the model fails it, even when that run's load is in range. Downstream stays withheld. The load still writes its rows. Only the verdict is failed. The error says when the breach opened, which partitions are still breached, and how to clear it.
-4. A rebuild clears the marker, once it is judged in range.
-5. `rocky product clear-breach` deletes the marker by hand.
+1. Opens a breach marker for the model (a time-interval marker lists the breached partitions).
+2. Fails every later run that builds the model while the marker is open, even when that load is in range. Downstream stays withheld, and the load still writes its rows. The error says when the breach opened, which partitions are still breached, and how to clear it.
+3. Clears when a rebuild is judged in range, or when you run `rocky product clear-breach`.
 
 ```
 error breach ──────────────────────▶ marker opened, model fails
@@ -98,22 +94,20 @@ marker open, rebuild in range ─────▶ marker deleted, model passes
 
 What counts as a rebuild:
 
-- **Full-refresh, incremental, merge:** a build that created or replaced the whole table. That is a first run, `rocky run --full-refresh`, or a drift rebuild. The rebuild is judged on the whole table, and it must be in range. A rebuild that is still out of range keeps the marker.
-- **Time interval:** a rewrite of the breached partition, judged in range. Use `rocky run --missing`, `--partition <key>` or `--from`/`--to`. A breached partition is also recorded `failed` in the partition state, so `--missing` plans it again. Each partition leaves the marker as it is rewritten in range. The marker is deleted when its last partition is clear. A default run (latest) of another partition does not clear it, and the model stays failed.
+- **Full-refresh, incremental, merge:** a build that created or replaced the whole table (a first run, `rocky run --full-refresh`, or a drift rebuild), judged on the whole table. A rebuild still out of range keeps the marker.
+- **Time interval:** a rewrite of the breached partition, judged in range (`rocky run --missing`, `--partition <key>` or `--from`/`--to`). A breached partition is recorded `failed` in the partition state, so `--missing` plans it again. The marker is deleted when its last partition is clear. A default run (latest) of another partition does not clear it.
 
-The marker lives in the replicated state table `product_volume_breaches` (state schema 36). Other machines see it once the run that wrote it uploads its state. Rocky writes it to the local state file right after the model's check, not at the end of the run, so a crash later in the run does not lose it locally. If the state store cannot record a new breach, the model fails. If it cannot delete a marker, Rocky warns, the marker stays and the model stays failed.
+The marker lives in the replicated state table `product_volume_breaches` (state schema 36). Rocky writes it to the local state file right after the model's check, so a later crash does not lose it locally. If the state store cannot record a new breach, the model fails. If it cannot delete a marker, Rocky warns, the marker stays and the model stays failed.
 
-With a remote state backend, the marker reaches other machines the way the rest of the run's state does:
+With a remote state backend:
 
-- A run that opens, widens, narrows or clears a marker must upload its state, whatever `on_upload_failure` says. If that upload fails, the run fails with `refusing to exit 0`, so a marker never lives only in a local file a pod can lose. A run that stops on an error after the change still uploads, best effort, and an interrupted run that opened a marker exits non-zero, not 130, when that upload fails. A run that changes no marker keeps the configured `on_upload_failure`.
-- When the state download fails, an ungoverned run continues on its local file, as for every other state table. Its upload is then skipped. If that run opens a marker, the run fails and says the marker was not replicated: rerun once the backend is reachable. A governed run (`rocky apply`) with a `[policy]` block refuses the run instead.
-- The same run cannot see a marker another machine opened. So every output whose product declares an `error` range is held, as if a marker covered the whole output. A run of a downstream model alone withholds it. A build of the output passes only if it rebuilt the whole table in range (a first run, `--full-refresh`, or a drift rebuild). An incremental, merge or `time_interval` load in range stays held, because it says nothing about the rows a remote marker covers. The same holds when the local store was recreated for a newer schema (`on_schema_mismatch = "recreate"`). A `warning` range is not held, so a range lowered from `error` to `warning` while a remote marker is open is not held either.
-- Without conditional writes (`concurrency_control = "off"`, or Valkey), a concurrent run's upload can still overwrite an uploaded marker. Use `concurrency_control = "cas"` where runs overlap.
-- `rocky product clear-breach` uploads with a conditional write on S3, GCS and the tiered backend, so a run that started before the clear cannot put the marker back: its own upload fails with a conflict. Valkey, and any backend with `concurrency_control = "off"`, has no conditional write. There, clear a breach while no run is in flight. `clear-breach` warns about this.
+- A run that opens, widens, narrows or clears a marker must upload its state, whatever `on_upload_failure` says. If the upload fails, the run fails with `refusing to exit 0`. A run that stops on an error after the change still uploads, best effort. An interrupted run that opened a marker exits non-zero, not 130, when that upload fails. A run that changes no marker keeps the configured `on_upload_failure`.
+- When the state download fails, an ungoverned run continues on its local file and skips its upload. If it opens a marker, it fails and says the marker was not replicated: rerun once the backend is reachable. A governed run (`rocky apply`) with a `[policy]` block refuses instead.
+- A run cannot see a marker another machine opened, so every output whose product declares an `error` range is held, as if a marker covered the whole output. A downstream model run alone is withheld. A build of the output passes only if it rebuilt the whole table in range. An in-range incremental, merge or `time_interval` load stays held. The same holds when the local store was recreated for a newer schema (`on_schema_mismatch = "recreate"`). A `warning` range is never held.
+- Without conditional writes (`concurrency_control = "off"`, or Valkey), a concurrent run's upload can overwrite an uploaded marker. Use `concurrency_control = "cas"` where runs overlap.
+- `rocky product clear-breach` uploads with a conditional write on S3, GCS and the tiered backend, so a run that started before the clear cannot put the marker back. Valkey, and `concurrency_control = "off"`, have none: clear a breach while no run is in flight. `clear-breach` warns about this.
 
-A marker is enforced only while the product still declares a range for that output model. If the range is removed or the output model renamed, the marker holds nothing, but `rocky product status` still lists it; delete it with `clear-breach`. A marker that covers the whole output stays when the model changes to `time_interval`, and only `clear-breach` removes it. A severity lowered to `warning` keeps an open marker until a rebuild or `clear-breach`. A backfill (`rocky apply` of a backfill plan) neither judges, clears nor enforces markers.
-
-A `warning` breach opens no marker, and neither does a count that was not evaluated. A marker that is already open still holds the model when a later run is `not_evaluated`. A shadow or branch run neither reads nor writes markers. A run that does not build a held output model, such as `rocky run --model <downstream>`, withholds every model downstream of it, with the same message. Those models do not build over the breached rows. A cancel after the write does not skip the count, so a breach that a cancelled run wrote still opens its marker.
+A marker is enforced only while the product still declares a range for that output model. If the range is removed or the model renamed, the marker holds nothing but `rocky product status` still lists it: delete it with `clear-breach`. A whole-output marker stays when the model becomes `time_interval`. A severity lowered to `warning` keeps an open marker until a rebuild or `clear-breach`. A `warning` breach, or a count that was not evaluated, opens no marker, but an open marker still holds the model when a later run is `not_evaluated`. A shadow, branch or backfill run (`rocky apply` of a backfill plan) neither reads, writes, judges, clears nor enforces markers. A run that does not build a held output model, such as `rocky run --model <downstream>`, withholds every model downstream of it. A cancel after the write does not skip the count.
 
 ### `rocky product clear-breach`
 
@@ -121,11 +115,11 @@ A `warning` breach opens no marker, and neither does a count that was not evalua
 rocky product clear-breach <name> --model <model>
 ```
 
-Deletes the open volume breach of the product's output model, without a rebuild. Use it when you have judged the breached rows acceptable. It reads `[state]` from `rocky.toml`. With a remote state backend it downloads the state first, deletes the marker, and uploads the change before it reports. If the download fails it refuses and changes nothing, because the next download would restore the marker. The next run judges the model as usual. It reports whether a marker was open. With none open it changes nothing and exits 0, so it is safe to repeat. `--output json` returns `product`, `model`, `was_open` and the `cleared` marker.
+Deletes the open volume breach of the product's output model, without a rebuild. Use it when you have judged the breached rows acceptable. With a remote state backend it downloads the state first, deletes the marker, and uploads the change before it reports. If the download fails it refuses and changes nothing, because the next download would restore the marker. With no marker open it changes nothing and exits `0`. `--output json` returns `product`, `model`, `was_open` and the `cleared` marker.
 
-An output whose strategy is refused, reaching `rocky run`, is `not_evaluated` with `volume-strategy-unsupported` in its reason. Every `not_evaluated` check adds a `volume_warnings` line with its reason, at either severity. It never fails the run. Shadow and branch runs count nothing. A backfill (`rocky apply` of a backfill plan) counts nothing either.
+An output whose strategy is refused is `not_evaluated` with `volume-strategy-unsupported` in its reason. Every `not_evaluated` check adds a `volume_warnings` line with its reason, at either severity, and never fails the run.
 
-The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `basis`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. A time-interval output carries one on each partition the run wrote. The run records each check in its history with its basis, and `rocky product status` reports the newest build's check. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name; `rocky product status` finds the count by the model name.
+The result is the `volume` object on the model's entry in `materializations`: `product`, `model`, `basis`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. A time-interval output carries one on each partition the run wrote. The run records each check in its history with its basis, and `rocky product status` reports the newest build's check. When the model's `[target] table` differs from the model name, the history entry is named by the table, so `rocky history --model` takes the table name.
 
 ### Source volume ranges
 
@@ -144,11 +138,9 @@ severity = "warning"         # "warning" (the default) or "error"
 
 The count is the source table's total rows when the run starts, before the run writes anything. It is not the number of rows the build reads.
 
-The parser uses the same codes as the output range, with the path `product.source.volume[i]`: `volume-missing-bound`, `volume-min-above-max`, `volume-severity-unknown`, `unknown-key` and `invalid-value`. It also refuses a `table` that `source.tables` does not list (`volume-source-unknown`), and a second range on one table (`volume-source-duplicate`). Any output strategy can carry source ranges.
+The parser uses the same codes as the output range, with the path `product.source.volume[i]`: `volume-missing-bound`, `volume-min-above-max`, `volume-severity-unknown`, `unknown-key` and `invalid-value`. It also refuses a `table` that `source.tables` does not list (`volume-source-unknown`), a second range on one table (`volume-source-duplicate`), and a table part that is not a plain SQL identifier of letters, digits and `_` (`source-table-invalid`). A source table with no range is not checked. Any output strategy can carry source ranges.
 
-Every part of a table that a source range names must be a plain SQL identifier: letters, digits and `_` only. The parser refuses any other part with `source-table-invalid`. A source table with no range is not checked, because Rocky never addresses it.
-
-A production `rocky run` counts the sources once, at run start:
+A production `rocky run` counts the sources once, at run start, before the model phase writes anything and before the skip gate runs:
 
 ```
 run start ──▶ for each range whose product output is in the selection:
@@ -160,18 +152,12 @@ run start ──▶ for each range whose product output is in the selection:
                     └─▶ run cancelled before the count ──▶ not_evaluated, nothing refused
 ```
 
-Rocky counts before the model phase writes anything and before the skip gate runs. The details:
-
-- A table that two ranges name, in one product or in two, is counted once.
-- Rocky counts the tables one after another, on the run's warehouse connection.
+- A table that two ranges name is counted once. Rocky counts tables one after another, on the run's warehouse connection.
 - On a view, an external table or a federated table, the count scans the whole table. A cancelled run stops waiting for a count that has started. On most warehouses the query stops too; on DuckDB it runs to completion in the background.
-- A production run refuses its model phase when any spec in `products/` cannot be read, parsed or validated, or when `products/` cannot be listed. The error is `[product-spec-unloadable]`. It names the file and the command that confirms the fix (`rocky product verify <name>`). A spec that does not load names no output model, so the whole model phase stops, before any model write. A shadow or branch run checks no range, so it only warns. Keep drafts outside `products/`, and run `rocky product verify` in CI to catch a broken spec before a scheduled run does.
-- Shadow, branch and backfill runs count nothing.
-- A replication pipeline that also builds models copies its tables first. The count then sees the copied rows.
+- A production run refuses its model phase when any spec in `products/` cannot be read, parsed or validated, or when `products/` cannot be listed (`[product-spec-unloadable]`, naming the file and `rocky product verify <name>`). A shadow or branch run checks no range, so it only warns. Keep drafts outside `products/`, and run `rocky product verify` in CI.
+- Shadow, branch and backfill runs count nothing. A replication pipeline that also builds models copies its tables first, so the count sees the copied rows.
 
-At `error` severity, an out-of-range count refuses the output model. A count that Rocky could not take refuses it too: a missing table, a refused name, a query error, or a result Rocky cannot read. A source Rocky cannot read therefore stops the output build before any write. The output table keeps its rows. The model records one failed execution, with the count's time as its duration. The `on_model_error` hook fires; `on_before_model_run` and `on_after_model_run` do not. Downstream models are withheld as for any failed model. The run status is `partial_failure`, and the model gets no `due_at`.
-
-Only the output model is protected. The upstream models in the chain still build in that run, because they are not the delivered output.
+At `error` severity, an out-of-range count refuses the output model, and so does a count Rocky could not take (a missing table, a refused name, a query error, an unreadable result). The output table keeps its rows. The model records one failed execution, with the count's time as its duration. The `on_model_error` hook fires. `on_before_model_run` and `on_after_model_run` do not. Downstream models are withheld, the run status is `partial_failure`, and the model gets no `due_at`. Only the output model is protected: the upstream models in the chain still build.
 
 The result is `source_volumes` on the run output: one row per range, with `product`, `model` (the output model), `table`, `row_count`, `min_rows`, `max_rows`, `severity`, `verdict` (`in_range`, `below_min`, `above_max`, `not_evaluated`) and `reason`. The run records the same rows in its history. A row stays even when the skip gate later skips the output model. An output refused at `error` is never skipped as unchanged: the refusal always reaches it, and the run fails.
 
@@ -216,20 +202,21 @@ Lowering runs in two phases because the drafting tool rewrites the model sidecar
 
 The command picks the phase itself: Phase A on a fresh product, Phase B once `models/<model>.toml` exists. Re-running is safe — the merge is idempotent.
 
-Every generation commits through staged same-directory writes, journaled, with the lowering manifest renamed **last** as the commit marker. The next run recovers from the journal. If the marker landed, the new generation stands and the staging files are cleaned up. If it did not, the previous generation is restored exactly. The journal is treated as untrusted input during recovery — forged, traversing, symlinked, or foreign entries are refused before anything mutates.
+Every generation commits through staged, journaled writes in the same directory. The lowering manifest is renamed last, as the commit marker. The next run recovers from the journal, which it treats as untrusted: forged, traversing, symlinked or foreign entries are refused before anything changes.
 
-Recovery reads the marker first. If it cannot read it at all — a permission fault, a link swapped in — it changes nothing and fails with `commit-io`, because rolling back there would restore backups over a commit that may have succeeded.
+Recovery reads the marker first:
 
-If the marker says the generation **committed**, recovery finishes the job: it deletes each `.ff-staged` and `.ff-prev` sibling and keeps the new files. It does not inspect them, so an orphan `.ff-prev` is removed rather than questioned.
+| Marker | Recovery |
+|---|---|
+| Unreadable (a permission fault, a swapped link) | Changes nothing and fails with `commit-io`, because a rollback could restore backups over a commit that succeeded. |
+| Committed | Deletes each `.ff-staged` and `.ff-prev` sibling and keeps the new files, without inspecting them. |
+| Not committed | Restores the previous generation. |
 
-If the marker says it did **not** commit, recovery restores the previous generation, and refuses instead of guessing in two cases. Each keeps the journal, so the next run asks the same question:
+A restore refuses, and keeps the journal, in two cases. A `.ff-prev` backup the journal does not record fails with `commit-unexpected-backup`, naming the file to inspect. A new file that recovery cannot read is left alone, with `commit-io`.
 
-- A `.ff-prev` backup exists that the journal does not record. Rocky will not restore a backup it did not create, and fails with `commit-unexpected-backup` naming the file to inspect.
-- A new file is in place that recovery cannot read to identify. It is left alone, with `commit-io`.
+A restore reads every recorded backup first, writes the bytes to a new synced file and renames that over the final. It never renames the backup itself. On Unix a backup that is a symlink or has a second hard link is refused with `commit-io`, and nothing is restored. A crash during a restore leaves the backup and journal, so the next run repeats it.
 
-A restore reads every recorded `.ff-prev` backup before it changes anything. It writes the bytes it read to a new file, syncs it, and renames that file over the final. It never renames the backup itself into place. On Unix a backup that is a symlink or has a second hard link is refused with `commit-io`, and nothing is restored. A crash during a restore leaves the backup and the journal, so the next run repeats it.
-
-On Unix, `product compile` also refuses a directory it writes into that is itself a symlink, for example `models -> models_real`, with `commit-io` ("taking directory custody for the commit failed"). This holds even when the link points inside the project. Replace the link with the real directory.
+On Unix, `product compile` also refuses to write into a directory that is itself a symlink (such as `models -> models_real`), even when the link points inside the project. It fails with `commit-io` ("taking directory custody for the commit failed"). Replace the link with the real directory.
 
 If an approval exists, compile re-verifies the snapshot's bytes against the approval digest before doing anything. A mismatch is tamper, and nothing proceeds.
 

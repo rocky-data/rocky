@@ -1,20 +1,17 @@
 # Rocky — Adversarial Red-Team Review Convention
 
 > Adversarial correctness profile for cross-provider review and planning.
-> The reviewer is the second pair of eyes on soundness-critical changes. It is **not** here to relitigate
-> style — deterministic CI (`cargo fmt --check`, `clippy --all-targets --all-features -D warnings`) owns
-> that. Assume anything a linter can catch is already caught. Correctness over everything else.
+> The reviewer is the second pair of eyes on soundness-critical changes. It does **not** relitigate
+> style: CI (`cargo fmt --check`, `clippy --all-targets --all-features -D warnings`) owns that.
+> Correctness over everything else.
 >
-> Paths below are repo-root-relative. **This profile is only useful if it stays accurate** — a rule
-> that misdescribes the engine sends the reviewer hunting fictional invariants or firing false
-> positives. If a claim here no longer matches the code, fix the claim, not the code.
+> Paths are repo-root-relative. If a claim here no longer matches the code, fix the claim, not the code.
 
 ## What Rocky actually is (read this before reviewing)
 
 Rocky is a **typed-program layer above the warehouse**: it compiles SQL / a small DSL into a single
 typed IR, generates dialect SQL, and executes a DAG against Databricks / Snowflake / BigQuery / DuckDB.
-**Storage and compute stay with the warehouse** — for the mainstream path Rocky does not own the data
-write transaction (the exception is the content-addressed path — see the executor section).
+Storage and compute stay with the warehouse. Rocky does not own the data write transaction, except on the content-addressed path (see Executor).
 
 **The real pipeline (there is no HIR, and `lower.rs` produces SQL, not IR):**
 
@@ -27,18 +24,15 @@ surface   ────┤   (rocky-lang/lower.rs: DSL → SQL, NOT → IR)   ├
   sqlparser-rs (rocky-sql) parses the SQL *string* downstream for typecheck / lineage / validation — it is NOT the path to ModelIr.
 ```
 
-- **`ModelIr` is the *sole* typed transformation intermediate** (the legacy `Plan` enum is gone). There
-  is **no separate HIR**. Both a `.rocky` DSL model and a raw-SQL model reach the IR as **a SQL string +
-  sidecar config**, assembled into `ModelIr` by `rocky-core/src/models.rs::to_model_ir` (ir.rs / models.rs).
-  `rocky-lang/src/lower.rs::lower_to_sql` compiles the DSL AST to a **SQL string** — it never produces a
-  `ModelIr` (see `engine/crates/rocky-core/SPEC.md`).
-- The IR is **owned data with value semantics** — no shared mutable node graph across passes; passes take
-  `&ModelIr` or return a fresh one. But **do not assume clones are cheap**: `ModelIr::clone()` is a plain
-  derived deep copy of `sql: String` plus several owned `Vec` fields (`typed_columns`, `lineage_edges`,
-  masks, …). Various `Arc<str>` fields (`name`, `unique_key`, `partition_by`, dropped-column lists, …)
-  *are* refcount-cheap, but they are not what makes a clone expensive. Most IR *data* types derive
-  `Clone + Serialize + Deserialize`, but not all (`DagError`, `UnknownPermission` do not) — don't lean on
-  it as a universal.
+- **`ModelIr` is the *sole* typed transformation intermediate.** There is **no separate HIR**. A `.rocky`
+  DSL model and a raw-SQL model both reach the IR as **a SQL string + sidecar config**, assembled by
+  `rocky-core/src/models.rs::to_model_ir`. `rocky-lang/src/lower.rs::lower_to_sql` compiles the DSL AST
+  to a **SQL string** and never produces a `ModelIr` (see `engine/crates/rocky-core/SPEC.md`).
+- The IR is **owned data with value semantics**: passes take `&ModelIr` or return a fresh one. Do **not**
+  assume clones are cheap: `ModelIr::clone()` is a derived deep copy of `sql: String` plus owned `Vec`
+  fields (`typed_columns`, `lineage_edges`, masks, …). The `Arc<str>` fields (`name`, `unique_key`,
+  `partition_by`, …) are refcount-cheap but do not change that. Most IR data types derive
+  `Clone + Serialize + Deserialize`, but not all (`DagError`, `UnknownPermission` do not).
 - Type checking is **best-effort inference over sqlparser's `Expr`**, producing `(RockyType, nullable)`
   pairs. `RockyType::Unknown` is a **safe, valid outcome** — not a defect.
 - Compilation has two incremental layers: **Salsa memoization** (`salsa_compile.rs`) and a **hand-rolled
@@ -70,8 +64,7 @@ Key files:
    test first — the committed state is what the evidence is about. Two failure shapes it catches: a test
    that reimplements the logic instead of calling it, and a mutation that silently did not apply.
 
-Do **not** spend budget on formatting, import ordering, naming, or doc typos. Collapse those into at most
-a single trailing `nits:` line.
+Do **not** spend budget on formatting, import ordering, naming, or doc typos. Use at most one trailing `nits:` line.
 
 ## Stage invariants
 
@@ -151,7 +144,7 @@ it. That is the property to **preserve**, and it means the finding to look for i
   sequencing for duplicate or dropped commits.
 
 ### Plan store trust boundary (`rocky-cli/src/plan_store.rs`, promote apply in `commands/branch.rs`)
-- **`.rocky/plans/` is a trusted input, ruled 2026-09-17 (#1943).** The `plan_id` blake3 digest and the
+- **`.rocky/plans/` is a trusted input by design (#1943).** The `plan_id` blake3 digest and the
   `AiAuthored` review marker are unkeyed and attacker-recomputable by anyone who can already write the
   directory — that is documented, not a defect. Do not flag: a `Promote` plan's `statement` not being
   re-derived from its recorded `target`/`source` names, or the marker not authenticating an approver.
@@ -181,15 +174,13 @@ it. That is the property to **preserve**, and it means the finding to look for i
   If it does, that is a finding. "No spec file", "snapshot intact", "no staging journal" are answers
   a human approves from; earning them from an unreadable path is a false claim, not a missing file.
   Use `rocky_core::path_presence::classify_not_found` to separate the two, and let `Present { .. }`
-  become an error rather than a default. Six instances of this class shipped before the helper was
-  reached for (#1708, #1710, #1787, #1789, #1792); it is the most repeated defect in the product
-  surface. A bare `.exists()` is *fine* where false only routes control flow — creating a directory,
-  picking a search path, skipping optional work. The rule is about the answer, not the call.
+  become an error rather than a default (past instances: #1708, #1710, #1787, #1789, #1792). A bare
+  `.exists()` is *fine* where false only routes control flow: creating a directory, picking a search
+  path, skipping optional work. The rule is about the answer, not the call.
 
 ## Test-evidence expectations
 Rocky uses **inline `#[cfg(test)] mod tests`** (plus `engine/crates/rocky-compiler/tests/` for fixtures).
-There is **no `insta`/snapshot library** — do not ask for "golden IR snapshots." A soundness-relevant
-change needs:
+There is **no `insta`/snapshot library**: do not ask for "golden IR snapshots." A soundness-relevant change needs:
 - A **rejection test** — a program that should fail to compile and now does, asserting the **specific
   diagnostic code** (e.g. `E020`–`E026`, the `W###` warnings), not just "an error".
 - A **positive assertion** on the observable output — the inferred `(RockyType, nullable)`, the generated

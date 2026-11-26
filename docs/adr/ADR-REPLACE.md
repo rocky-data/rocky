@@ -1,6 +1,6 @@
 # ADR-REPLACE — Staged replace: a full refresh never leaves a missing table
 
-**Status:** Accepted (advisor-ruled 2026-11-11, Hugo to confirm)
+**Status:** Accepted (advisor-ruled 2026-11-11, a maintainer to confirm)
 
 **Scope:** Closes audit finding **RD-009** (package A-09). Sets the replace contract that the open-storage work (L-1 Iceberg through DuckDB, L-2 DuckLake) builds on.
 
@@ -168,7 +168,7 @@ The spike proves this is one atomic catalog commit, and that a failure at any st
 | Quarantine `tag` | Still refused on a swap dialect (it rewrites its own source) |
 | Seeds | Not changed here; see What this does not close |
 
-## Advisor ruling (2026-11-11, Hugo to confirm)
+## Advisor ruling (2026-11-11, a maintainer to confirm)
 
 A fresh read-only Fable agent ruled on the open questions of the draft. Recorded as given; deviations are marked.
 

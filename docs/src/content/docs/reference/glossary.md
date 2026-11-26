@@ -9,7 +9,7 @@ Short definitions of the terms that show up across Rocky's docs, CLI output, and
 
 ### Adapter
 
-A plugin that connects Rocky to a system. Discovery adapters (Fivetran, Airbyte, Iceberg, `manual`, and DuckDB and BigQuery) list what tables exist. Warehouse adapters (DuckDB, Databricks, Snowflake, BigQuery, PostgreSQL, SQL Server, Redshift, ClickHouse, Spark, Trino) run the SQL. The core engine stays warehouse-agnostic. See [Adapters](/guides/adapter-sdk/).
+A plugin that connects Rocky to a system. Discovery adapters (Fivetran, Airbyte, Iceberg, `manual`, and DuckDB and BigQuery) list what tables exist. See [Adapters](/guides/adapter-sdk/).
 
 ### Apply
 
@@ -17,15 +17,14 @@ The execution half of the plan/apply workflow. `rocky apply <plan_id>` runs a pl
 
 ### Backfill
 
-Rebuilding a model over history rather than over the newest rows. `rocky backfill` rebuilds the models you name plus everything downstream of them, and applies a partition window to partitioned models. The plan it writes is always review-gated. See the [governance and reclamation commands](/reference/commands/governance-reclamation/).
+Rebuilding a model over history rather than over the newest rows. `rocky backfill` rebuilds the models you name plus everything downstream of them, and applies a partition window to partitioned models. See the [governance and reclamation commands](/reference/commands/governance-reclamation/).
 
 ### Blast radius
 
-The set of downstream models a change can reach. Rocky computes it from [lineage](#lineage), so you see the cost of an edit before you make it. `rocky lineage-diff` reports it per column, and the `P002` lint warns when a `SELECT *` widens it. A `[policy]` rule can cap it with `max_downstreams`.
-
+The set of downstream models a change can reach. Rocky computes it from [lineage](#lineage), so you see the cost of an edit before you make it.
 ### Branch
 
-A named, isolated copy of your pipeline's output, written to its own schema. You develop and run against a branch, inspect the result, then promote it or drop it. Nothing touches production until you promote. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch) and the `06-branches-replay-lineage` POC.
+A named, isolated copy of your pipeline's output, written to its own schema. You develop and run against a branch, inspect the result, then promote it or drop it. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch) and the `06-branches-replay-lineage` POC.
 
 ### Bronze layer
 
@@ -45,7 +44,7 @@ A schema agreement Rocky enforces before any row is written. A missing required 
 
 ### Config group
 
-A `models/groups/<name>.toml` definition that a fan-out of models opts into by name (`group = "<name>"` in the sidecar). The group supplies shared routing (a `schema_template` filled per model from its `[args]`), a shared `strategy`, and shared `[tags]`. Precedence is per-model sidecar over group over `_defaults.toml`, so a model can still override what the group sets unless the group is enforced. See [Config groups](/reference/model-format/#config-groups) and [Enforced group](#enforced-group).
+A `models/groups/<name>.toml` definition that a fan-out of models opts into by name (`group = "<name>"` in the sidecar). The group supplies shared routing (a `schema_template` filled per model from its `[args]`), a shared `strategy`, and shared `[tags]`. See [Config groups](/reference/model-format/#config-groups) and [Enforced group](#enforced-group).
 
 ### Conformance
 
@@ -65,7 +64,7 @@ The SQL that changes structure rather than rows: `CREATE`, `ALTER`, `DROP`. Rock
 
 ### Declarative
 
-You state the result you want; Rocky works out the statements that get there. A `[[grants]]` block names who should have access, and Rocky issues the `GRANT` statements. The opposite is imperative, where you write each step yourself. See [Reconcile](#reconcile).
+You state the result you want; Rocky works out the statements that get there. A `[[grants]]` block names who should have access, and Rocky issues the `GRANT` statements. See [Reconcile](#reconcile).
 
 ### Deterministic
 
@@ -81,31 +80,30 @@ A short fixed-length value computed from a much larger input, so two large thing
 
 ### Drift
 
-A mismatch between a source table's schema and its target table's schema, usually because a source column was added or changed type. Rocky detects it on every run. It adds the column, widens the type in place, or rebuilds the target. It does not detect a column the source dropped. See [Schema drift](/concepts/schema-drift/).
+A mismatch between a source table's schema and its target table's schema, usually because a source column was added or changed type. Rocky detects it on every run. See [Schema drift](/concepts/schema-drift/).
 
 ### Dry run
 
-Doing every step except the write. `rocky plan` is the dry run of `rocky apply`: it prints SQL without executing it. It needs a replication pipeline, and it reads the live source to discover which tables exist. Both happen before any SQL is printed, and `--model` does not skip either, so a project with no replication pipeline is refused. Bare `rocky plan` prints replication SQL only. `rocky plan --model <name>` prints that one transformation model's SQL in place of it. `rocky emit-sql` prints transformation SQL with no pipeline and no connection. Read it as a preview, not a transcript. The SQL is rendered before anything runs, so parts of it are placeholders. A `MERGE` on any dialect but Databricks shows a canonical shape, not the column list the runner resolves from the live source. An incremental table shows the 1970 sentinel watermark, not the real one. And `rocky apply` recompiles the project rather than replaying stored SQL. `rocky estimate` is a dry-run cost estimate that asks the warehouse to `EXPLAIN` a query rather than run it.
-
+Doing every step except the write. `rocky plan` is the dry run of `rocky apply`: it prints SQL without executing it.
 ### Enforced group
 
-A [config group](#config-group) with `enforce = true`. The group's fields become binding rather than defaults: a member model that locally pins a field the group controls (its target `schema` or its `strategy`) fails the load instead of quietly routing or materializing itself differently from the rest of the group. Enforcement is opt-in; without it, groups stay overridable defaults. See [Enforced groups](/reference/model-format/#enforced-groups).
+A [config group](#config-group) with `enforce = true`. The group's fields become binding rather than defaults: a member model that locally pins a field the group controls (its target `schema` or its `strategy`) fails the load instead of quietly routing or materializing itself differently from the rest of the group. See [Enforced groups](/reference/model-format/#enforced-groups).
 
 ### Ephemeral
 
-A model that is never materialized. `type = "ephemeral"` makes Rocky inline the model's SQL as a CTE into each model that reads it, as dbt does. `rocky run` skips it. Error `E038` marks a use that cannot work, such as `[[tests]]` on the model. See [Ephemeral](/reference/model-format/#ephemeral).
+A model that is never materialized. `type = "ephemeral"` makes Rocky inline the model's SQL as a CTE into each model that reads it, as dbt does. See [Ephemeral](/reference/model-format/#ephemeral).
 
 ### Exit code
 
-The number a command returns to the shell. Rocky uses `0` for success, `1` for a hard failure (bad config, unreachable warehouse), and `2` for partial success, where the run finished but some models failed, or an error-severity check failed after the data had landed. `rocky doctor` returns `3` when a check is critical, and `rocky fulfill` and `rocky product verify` use `2`, `3` and `4` for their own stops. A partial run still writes valid JSON to stdout. See the [full table](/reference/json-output/#exit-codes).
+The number a command returns to the shell. Rocky uses `0` for success, `1` for a hard failure (bad config, unreachable warehouse), and `2` for partial success, where the run finished but some models failed, or an error-severity check failed after the data had landed. See the [full table](/reference/json-output/#exit-codes).
 
 ### Fingerprint
 
-A hash that stands in for a whole definition. Rocky's `recipe_hash` is a BLAKE3 fingerprint of a model's compiled [IR](#ir-intermediate-representation) — its SQL, types, strategy, dependencies, and checks. A whitespace or alias edit changes it, so the model-skip gate compares a separate normalized hash instead. See [Digest](#digest).
+A hash that stands in for a whole definition. Rocky's `recipe_hash` is a BLAKE3 fingerprint of a model's compiled [IR](#ir-intermediate-representation) — its SQL, types, strategy, dependencies, and checks. See [Digest](#digest).
 
 ### Freshness
 
-How far behind the newest row in a table is. Declare `warn_after` or `error_after` and a `time_column`, and Rocky reports a table that has fallen behind. Set it per model, or project-wide under `[freshness]`. See [`[freshness]`](/reference/configuration/#freshness).
+How far behind the newest row in a table is. Declare `warn_after` or `error_after` and a `time_column`, and Rocky reports a table that has fallen behind. See [`[freshness]`](/reference/configuration/#freshness).
 
 ### Idempotent
 
@@ -121,15 +119,15 @@ The map of which columns feed which, traced through every transformation at comp
 
 ### Masking policy
 
-A rule that hides a sensitive column's value. Tag the column with a `[classification]` in its sidecar, then map that classification to a strategy under `[mask]` — `hash`, `redact`, `partial`, or `none`. A `[mask.<env>]` block overrides the strategy per environment. See [`[mask]`](/reference/configuration/#mask).
+A rule that hides a sensitive column's value. Tag the column with a `[classification]` in its sidecar, then map that classification to a strategy under `[mask]` — `hash`, `redact`, `partial`, or `none`. See [`[mask]`](/reference/configuration/#mask).
 
 ### Materialization strategy
 
-How a model's output lands in the warehouse: `view`, `full_refresh`, `incremental`, `merge`, `time_interval`, and others. A transformation model with `incremental` needs a watermark column, or compile fails with `E037`. Set per model. See [Model format](/reference/model-format/).
+How a model's output lands in the warehouse: `view`, `full_refresh`, `incremental`, `merge`, `time_interval`, and others. A transformation model with `incremental` needs a watermark column, or compile fails with `E037`. See [Model format](/reference/model-format/).
 
 ### MCP (Model Context Protocol)
 
-An open protocol that lets an AI agent call tools. `rocky mcp` serves Rocky's tools over it. The read-only ones let an agent check its work against the real project: compile, plan preview, lineage, test, schema inspection, row sampling. Others write into `models/`: `draft_model`, `draft_contract`, and `draft_check` go through the compiler and your `[policy]` rules. Applying an AI-authored plan still needs an approval marker that names that plan. See [MCP authoring](/concepts/mcp-authoring/).
+An open protocol that lets an AI agent call tools. `rocky mcp` serves Rocky's tools over it. See [MCP authoring](/concepts/mcp-authoring/).
 
 ### MERGE
 
@@ -157,11 +155,11 @@ A unit of work declared in `rocky.toml`. Rocky has five types: `replication` (br
 
 ### Plan
 
-A deterministic, reviewable record of what a run will do: compiled SQL, drift actions, and checks, keyed by a `plan_id`. Build it with `rocky plan`, inspect it, then `rocky apply` it. The two steps are the auditable path for production and PR gating; `rocky run` does both at once for local work. See the [core pipeline commands](/reference/commands/core-pipeline/).
+A deterministic, reviewable record of what a run will do: compiled SQL, drift actions, and checks, keyed by a `plan_id`. Build it with `rocky plan`, inspect it, then `rocky apply` it. See the [core pipeline commands](/reference/commands/core-pipeline/).
 
 ### Plan store
 
-Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. The directory is a trusted input: anyone who can write it can author a plan that `rocky apply` runs. See [Branches](/concepts/architecture-of-trust/#branches) for why, and [Upgrade Notes](/advanced/upgrade-notes/).
+Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. See [Branches](/concepts/architecture-of-trust/#branches) for why, and [Upgrade Notes](/advanced/upgrade-notes/).
 
 ### Provenance
 
@@ -169,27 +167,27 @@ The record of where a result came from: which SQL produced it, which inputs it r
 
 ### Quarantine
 
-Separating a model's failing rows from its passing ones, so a downstream reader can read only the passing rows. It does not keep the run green: the error-severity checks that select those rows still fail it under the default `fail_on_error = true`. Nor does every mode move the rows: `tag` marks them and leaves them in the table. Turn it on under `[pipeline.<name>.checks.quarantine]` of a `quality` pipeline. Pick a mode: split the rows into separate tables, tag them in place, or drop them. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
+Separating a model's failing rows from its passing ones, so a downstream reader can read only the passing rows. It does not keep the run green: the error-severity checks that select those rows still fail it under the default `fail_on_error = true`. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
 
 ### Reconcile
 
-Reading what the warehouse actually has, comparing it against what you declared, and issuing only the statements that close the gap. Rocky reconciles Databricks workspace bindings this way: it adds the missing ones and removes the ones you did not declare. Grants are not reconciled: Rocky adds them and never revokes one. See [Permissions](/reference/permissions/).
+Reading what the warehouse actually has, comparing it against what you declared, and issuing only the statements that close the gap. Rocky reconciles Databricks workspace bindings this way: it adds the missing ones and removes the ones you did not declare. See [Permissions](/reference/permissions/).
 
 ### Replay
 
-Inspecting, auditing, and re-executing a past run against its [content-addressed](#content-addressed) record. `rocky replay <run_id>` surfaces per-model SQL hashes, row counts, and bytes; `rocky replay <run_id> --execute --verify` reconstructs each recipe from its provenance and re-runs it to reproduce the recorded output bit-for-bit, on a local DuckDB engine or, with `--warehouse`, on the live warehouse in an isolated replay schema. Re-execution covers deterministic content-addressed models; mutable-source models are classified `non_replayable` and non-deterministic recipes are flagged. See [Verify a run](/guides/verify-a-run/).
+Inspecting, auditing, and re-executing a past run against its [content-addressed](#content-addressed) record. `rocky replay <run_id>` surfaces per-model SQL hashes, row counts, and bytes; `rocky replay <run_id> --execute --verify` reconstructs each recipe from its provenance and re-runs it to reproduce the recorded output bit-for-bit, on a local DuckDB engine or, with `--warehouse`, on the live warehouse in an isolated replay schema. See [Verify a run](/guides/verify-a-run/).
 
 ### SCD (slowly changing dimension)
 
-A table that keeps a row's history instead of overwriting it. A `snapshot` pipeline builds SCD Type 2 history: each change closes the old version and opens a new one, tracked in `valid_from`, `valid_to`, and `is_current` columns. You can then query the table as it stood on any past date. See [`rocky snapshot`](/reference/cli/#rocky-snapshot).
+A table that keeps a row's history instead of overwriting it. A `snapshot` pipeline builds SCD Type 2 history: each change closes the old version and opens a new one, tracked in `valid_from`, `valid_to`, and `is_current` columns. See [`rocky snapshot`](/reference/cli/#rocky-snapshot).
 
 ### Schema evolution
 
-Changing a table's columns over time without breaking the models that read it. Rocky adds a column the source gained and widens a column whose type grew. It does not drop a column the source lost. The `[schema_evolution]` block that used to configure a grace period for such a drop is [removed](/reference/configuration/#schema_evolution-removed). See [Schema drift](/concepts/schema-drift/).
+Changing a table's columns over time without breaking the models that read it. Rocky adds a column the source gained and widens a column whose type grew. See [Schema drift](/concepts/schema-drift/).
 
 ### Seam
 
-A point where Rocky enforces a decision rather than only computing one. The mutating seams are `rocky apply`, branch promote, the MCP write tools, an agent's `rocky run` (the `run` capability), and drift auto-apply in `rocky run` when `auto_apply_additive_drift` is on. Those are exactly the points the `[policy]` plane gates. See [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
+A point where Rocky enforces a decision rather than only computing one. The mutating seams are `rocky apply`, branch promote, the MCP write tools, an agent's `rocky run` (the `run` capability), and drift auto-apply in `rocky run` when `auto_apply_additive_drift` is on. See [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
 
 ### Shadow mode
 

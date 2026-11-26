@@ -160,35 +160,9 @@ These rules decide what happens at the edges of the syntax.
 
 `rocky run --select` builds only the selected models, in dependency order. A selected model reads its unselected upstream models as they already exist in the warehouse. This is dbt's behavior.
 
-```
-  select: fct_revenue           build fct_revenue
-            │                        │
-            ▼                        ▼ reads the existing table
-  stg_orders (not selected) ──► main.stg_orders   (not rebuilt)
-```
-
 Add `--defer` to read unselected upstreams from their production schema instead. Add `--defer-to <schema>` to read them from one schema.
 
 A selection that resolves to one model runs exactly like `--model <name>`. `rocky run --select` cannot be combined with `--dag`, `--watch`, `--all`, `--filter`, `--contracts`, `--resume`, or `--resume-latest`.
-
-## Examples
-
-```sh
-# List staging models and everything downstream of them
-rocky list --select "path:models/staging+" --output json
-
-# Compile the finance models, but not the deprecated ones
-rocky compile --select tag:finance --exclude tag:deprecated
-
-# Build one mart and its upstream models
-rocky run --select +fct_revenue
-
-# Build only what changed on this branch, plus its downstream models
-rocky run --select state:modified+ --state-ref origin/main
-
-# Emit SQL for views that read the raw schema
-rocky emit-sql --select "source:raw,config.materialized:view"
-```
 
 ## Related pages
 

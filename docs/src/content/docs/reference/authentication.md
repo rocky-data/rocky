@@ -19,11 +19,7 @@ Each adapter reads its credentials from its own `[adapter.NAME]` block, except B
 | Fivetran | `api_key` + `api_secret` | [Fivetran](/reference/adapters/fivetran/#authentication) |
 | DuckDB, `manual` | none | — |
 
-The rest of this page covers Databricks. Rocky connects to it two ways. You do not choose between them explicitly: Rocky looks at which credentials you supplied and picks. The choice applies to every Databricks API call — SQL statement execution, Unity Catalog operations, and workspace bindings.
-
-## Detection Order
-
-Rocky checks the personal access token first, and falls back to the service principal:
+The rest of this page covers Databricks. Rocky checks which credentials you supplied and picks the method, for every Databricks API call (SQL statement execution, Unity Catalog operations, workspace bindings):
 
 ```
    read [adapter.NAME]
@@ -44,47 +40,20 @@ Rocky checks the personal access token first, and falls back to the service prin
    error at startup
 ```
 
-## PAT (Personal Access Token)
-
-A single long-lived token. Rocky tries this first. Good for development.
-
-- Set `token` in the adapter block, for example `token = "${DATABRICKS_TOKEN}"`.
-- Rocky sends it as `Authorization: Bearer <token>`.
-
-## OAuth M2M (Service Principal)
-
-A client ID and secret that Rocky exchanges for a short-lived token. Rocky uses this when the PAT is empty. Prefer it in production.
-
-- Set `client_id` and `client_secret` in the adapter block, for example from `${DATABRICKS_CLIENT_ID}` and `${DATABRICKS_CLIENT_SECRET}`.
-- Rocky calls the token endpoint `https://<host>/oidc/v1/token`.
-- Grant type: `client_credentials`. Scope: `all-apis`.
-- The endpoint returns a short-lived access token, and Rocky refreshes it for you.
-
-## Configuration
-
-Both methods live on the Databricks adapter block:
+- **PAT (personal access token).** One long-lived token, good for development. Set `token`. Rocky sends `Authorization: Bearer <token>`.
+- **OAuth M2M (service principal).** Used when the PAT is empty. Prefer it in production. Set `client_id` and `client_secret`. Rocky calls `https://<host>/oidc/v1/token` with grant type `client_credentials` and scope `all-apis`, and refreshes the short-lived token for you.
 
 ```toml
 [adapter.prod]
 type = "databricks"
 host = "${DATABRICKS_HOST}"
 http_path = "${DATABRICKS_HTTP_PATH}"
-
-# PAT (takes precedence)
-token = "${DATABRICKS_TOKEN}"
-
-# OAuth M2M (used if token is empty)
-# client_id = "${DATABRICKS_CLIENT_ID}"
+token = "${DATABRICKS_TOKEN}"                   # PAT (takes precedence)
+# client_id = "${DATABRICKS_CLIENT_ID}"         # OAuth M2M (used if token is empty)
 # client_secret = "${DATABRICKS_CLIENT_SECRET}"
 ```
 
-## Environment Variable Substitution
-
-Rocky replaces every `${VAR_NAME}` reference in `rocky.toml` when it parses the file. Keep the secrets themselves out of the config and inject them from the environment, from CI/CD variables, or from a secrets manager.
-
-## Validation
-
-Run `rocky validate` before a pipeline. It warns when a Databricks block sets neither `token` nor `client_id` (`V013`).
+Rocky resolves every `${VAR_NAME}` when it parses the config ([Environment variables](/reference/configuration/#environment-variables)), so inject secrets from the environment, CI/CD variables or a secrets manager. `rocky validate` warns when a Databricks block sets neither `token` nor `client_id` (`V013`).
 
 ## Source Adapter Authentication
 
