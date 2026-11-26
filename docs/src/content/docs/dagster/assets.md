@@ -12,10 +12,7 @@ list to follow your sources, instead of writing out each table by hand.
 
 ## From `rocky discover` to `AssetSpec`
 
-`load_rocky_assets()` calls `rocky discover`, which asks each configured source
-which tables it holds. Every enabled table becomes one `AssetSpec`. The asset
-key, group, tags, and metadata all come from the source and the table, using the
-rules below.
+`load_rocky_assets()` calls `rocky discover`, which asks each configured source which tables it holds. Every enabled table becomes one `AssetSpec`, filled by the rules below.
 
 ## Default mappings
 
@@ -50,7 +47,7 @@ defs = dg.Definitions(
 
 ## Customize with a translator
 
-Rocky and Dagster name things differently. `RockyDagsterTranslator` decides how one becomes the other. Subclass it and override a method to match your own naming. One method fills each part of the `AssetSpec`:
+Subclass `RockyDagsterTranslator` and override a method to change naming. One method fills each part of the `AssetSpec`:
 
 ```
   Rocky input                             Dagster AssetSpec field

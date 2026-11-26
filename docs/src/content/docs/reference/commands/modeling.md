@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-These commands work on Rocky models. They compile and test the models, trace lineage, render SQL, and compare a change against a base git ref. The last two publish and check schemas across teams.
+These commands compile and test models, trace lineage, render SQL, compare a change against a base git ref, and publish and check schemas across teams.
 
 ---
 
@@ -23,7 +23,7 @@ rocky compile [flags]
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | every pipeline | Compile only the `.sql`, `.rocky` and `.toml` model files in this directory. Without it, Rocky compiles the models of every transformation pipeline together. See [The whole project by default](#the-whole-project-by-default). |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. Default: the project `contracts/` directory beside the models directory, which is `models/` beside the config file when you pass no `--models`. |
-| `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name — whether *that model's own source* is valid, not whether its upstreams can be rebuilt. The full project is still loaded and compile-checked internally for dependency and type context. |
+| `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name. It reports whether that model's own source is valid, not whether its upstreams can be rebuilt. See [Selecting one model](#selecting-one-model). |
 | `--select <SELECTOR>...`, `-s` / `--exclude <SELECTOR>...` / `--state-ref <REF>` / `--state-working-tree` | `string` | | Report and fail on the [selected models](/reference/node-selection/) only. Cannot be combined with `--model`. |
 | `--var <NAME=VALUE>` | `string` (repeatable) | | Bind a run variable, so `rocky compile` checks the same SQL `rocky run --var` executes. A required `@var(name)` with no value and no inline default is a compile error. See [`@var()` run variables](/reference/model-format/#var-run-variables). |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
@@ -52,9 +52,7 @@ With no `--models`, `rocky compile` reads the models of every transformation pip
 [pipeline.reporting]  models = "reporting/**"  ─┘
 ```
 
-Each model is still checked against the warehouse of the pipeline that runs it. Two model files with the same name in different pipelines are an error.
-
-A project with no transformation pipeline compiles the `models` directory. `--models <PATH>` compiles that one directory only, as before.
+Each model is still checked against the warehouse of the pipeline that runs it. Two model files with the same name in different pipelines are an error. A project with no transformation pipeline compiles the `models` directory. `--models <PATH>` compiles that one directory only.
 
 #### Source schemas
 
@@ -64,9 +62,7 @@ Rocky types the models that read source tables from these schemas, in this order
 2. Otherwise: the schema cache, when `[cache.schemas]` is enabled.
 3. Plus, when the project has `data/seed.sql`: every seed table the cache does not hold.
 
-The seed runs in an in-memory DuckDB. Nothing contacts the warehouse. A seed that fails to run is skipped, and the compile goes on without it. Only `--with-seed` makes that an error. The seed is SQL from your repository, so it runs only for the `rocky compile` command itself. The compile behind `rocky serve` and the MCP compile tool does not run it.
-
-`data/seed.sql` is beside `rocky.toml` for a whole-project compile. With `--models <PATH>`, it is one level up from that directory.
+The seed runs in an in-memory DuckDB and contacts no warehouse. A seed that fails to run is skipped, unless you pass `--with-seed`. The seed is SQL from your repository, so only the `rocky compile` command runs it, not the compile behind `rocky serve` or the MCP compile tool. `data/seed.sql` is beside `rocky.toml` for a whole-project compile, and one level above the directory with `--models <PATH>`.
 
 ```json
 {
@@ -98,133 +94,27 @@ The seed runs in an in-memory DuckDB. Nothing contacts the warehouse. A seed tha
 }
 ```
 
-`models_detail` carries each compiled model's declarative shape. Four fields are always there: `name`, the materialization `strategy` (wire form `{"type": "..."}`), the `target` coordinates, and the direct `depends_on` list.
+`models_detail` carries each model's declarative shape: `name`, the materialization `strategy` (wire form `{"type": "..."}`), the `target` coordinates and the direct `depends_on` list always. `freshness`, `contract_source` (`"auto"` for a sibling `.contract.toml`, `"explicit"` for one from `--contracts`) and `cost_hint` (when upstream statistics support an estimate) appear only when they apply. `tags` is the model's `[tags]` merged over any config-group baseline, sidecar winning. Rocky omits empty `tags`, empty `depends_on` and absent optional fields.
 
-Three more appear only when they apply:
+Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E###`, `W###`, `P###` portability lints, or `V###` validation), the owning model, and, when the compiler can locate it, a `span` and `suggestion`.
 
-- `freshness` — the model's freshness expectation.
-- `contract_source` — `"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`.
-- `cost_hint` — set when the upstream statistics support an estimate.
+#### Selecting one model
 
-The `tags` object holds the model's `[tags]` merged over any config-group baseline, with the sidecar winning. Rocky omits an empty `tags`, an empty `depends_on`, and any absent optional field.
+`--model` is exact: an unknown name is an error. Rocky still compile-checks the full project for dependency and type context, but the counts, layers, model details, diagnostics and failure state describe only the selected model. `execution_layers` counts only the layers containing it, so it reports `1`.
 
-Compile a single model with contracts, showing a warning diagnostic:
+The selector filters diagnostics by exact attribution: a diagnostic is reported only when its owning model equals the selector, and the exit status follows that set.
 
-```bash
-rocky compile --model fct_revenue --contracts contracts/
-```
+- A hard compilation failure, such as SQL that cannot be parsed, fails the command whatever the selector. So do failures in semantic-graph construction and contract loading.
+- An error diagnostic attributed to another model is filtered out, so the selected model reads clean even though `rocky run` would exclude that other model as a compile error. Selecting a model tells you nothing about whether its upstreams compile.
+- Import-level diagnostics (`E033`, `E034`, `W012`) carry the import name, and `W011` a contract name, so no selector surfaces them. Run without a selector.
+- A target collision (`E036`) attaches to every participating model, so selecting any one reports it.
 
-```json
-{
-  "version": "1.6.0",
-  "command": "compile",
-  "models": 1,
-  "execution_layers": 1,
-  "has_errors": false,
-  "diagnostics": [
-    {
-      "severity": "warning",
-      "code": "W010",
-      "model": "fct_revenue",
-      "message": "column 'discount_pct' not declared in contract",
-      "span": null,
-      "suggestion": null
-    }
-  ],
-  "compile_timings": { "load_ms": 5, "resolve_ms": 1, "typecheck_ms": 12 }
-}
-```
+To check whether a model can be built, compile without a selector. `rocky run --model` builds only that model and needs `--defer` to resolve upstreams you did not build.
 
-Model selection is exact: an unknown name is an error. Rocky still loads and
-compile-checks the full project internally so the selected model has dependency
-and type context, but the visible counts, layers, model details, diagnostics,
-and failure state describe only the selected model.
-
-**What the exit status does and does not cover.** The selector filters
-diagnostics by **exact attribution** — a diagnostic is reported only when its
-owning model name equals the selector — and the exit status follows that
-filtered set. The dividing line is *how a problem is reported*, not what kind of
-problem it is:
-
-- A **hard compilation failure** — one that aborts compilation rather than
-  emitting a diagnostic, such as a model whose SQL cannot be parsed — fails the
-  command regardless of the selector, because compilation never gets far enough
-  to filter anything. Failures during semantic-graph construction and contract
-  loading behave the same way.
-- An **error diagnostic attributed to another model** is filtered out, so the
-  selected model is reported clean. This holds even though that other model
-  genuinely fails to compile: `rocky run` classifies such a model as a
-  compile error and excludes it from execution. Selecting a model therefore
-  tells you nothing about whether its upstreams compile.
-
-Two consequences worth knowing:
-
-- **Not every diagnostic names a model you can select.** Import-level
-  diagnostics (`E033`, `E034`, `W012`) carry the *import* name, and `W011`
-  carries a contract name that need not correspond to a model at all. Because
-  `--model` requires a real model name, those cannot be surfaced by selecting
-  anything — run without a selector to see them.
-- **A diagnostic can be attributed to more than one model.** A target collision
-  (`E036`) attaches an error to every participating model, so selecting any one
-  of them reports it.
-
-To check whether a model can actually be *built*, compile without a selector.
-`rocky run --model` builds only the selected model and needs `--defer` to
-resolve references to upstreams you did not build; without it the SQL is left
-unchanged and the run succeeds only if the reference already resolves in the
-active namespace.
-
-Note that under `--model`, `execution_layers` counts only the layers containing
-the selected model — so it reports `1`, not the model's depth in the DAG and not
-how many layers rebuilding it would take.
-
-Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E###` errors, `W###` warnings, `P###` portability lints, or `V###` validation), the owning model, and (when the compiler can locate it) a `span` and `suggestion`.
-
-Compile models from a non-default directory:
-
-```bash
-rocky compile --models src/transformations/
-```
-
-Reject SQL that won't run on BigQuery (P001 dialect-portability lint):
-
-```bash
-rocky compile --target-dialect bq
-```
-
-```json
-{
-  "version": "1.11.0",
-  "command": "compile",
-  "has_errors": true,
-  "diagnostics": [
-    {
-      "severity": "error",
-      "code": "P001",
-      "model": "fct_revenue",
-      "message": "NVL is not portable to BigQuery (supported by: Snowflake, Databricks)",
-      "span": { "file": "models/fct_revenue.sql", "line": 1, "col": 1 },
-      "suggestion": "use COALESCE"
-    }
-  ]
-}
-```
-
+`--target-dialect bq` reports each non-portable construct (such as `NVL`) as a `P001` `error` diagnostic with its `span` and a `suggestion`.
 The `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs. See [Portability linting](/concepts/linters/#p001--dialect-portability).
 
-Compile with seeded source schemas so leaf `.sql` models pick up real types:
-
-```bash
-rocky compile --with-seed
-```
-
-`--with-seed` opens an in-memory DuckDB, runs `data/seed.sql`, and gives the compiler the column types of the tables it made. So type inference gets concrete types instead of `RockyType::Unknown`. It stops with an error if `data/seed.sql` is missing or fails to run.
-
-A seed can be out of date. So a reference to a column the seed lacks is the `W041` warning, and a read of a table the seed lacks in a schema it does create (`FROM staging.orderz` when the seed creates `staging.orders`) is the `W045` warning. The compile still exits `0`. Add `--strict-sources` to refuse them with the `E041` and `E045` errors instead:
-
-```bash
-rocky compile --with-seed --strict-sources
-```
+`--with-seed` runs `data/seed.sql` in an in-memory DuckDB and gives the compiler the column types of the tables it made, so inference gets concrete types instead of `RockyType::Unknown`. It errors if `data/seed.sql` is missing or fails. A reference to a column the seed lacks is `W041`. A read of a table the seed lacks, in a schema it creates, is `W045`. The compile still exits `0`. `--strict-sources` makes them the `E041` and `E045` errors.
 
 #### Attach to a dbt project (experimental)
 
@@ -239,20 +129,16 @@ dbt compile --full-refresh
 rocky compile --dbt-project path/to/dbt
 ```
 
-Each run does these steps:
-
 ```
 <DIR>/target/manifest.json ──▶ version check ──▶ import-dbt rules ──▶ temp dir ──▶ compile
    (+ run_results.json)          (v12 only)       (in memory)         (removed)
 ```
 
-- Rocky reads `<DIR>/target/manifest.json` and its sibling `run_results.json` on every run.
-- Rocky writes nothing under `<DIR>`. The translated project lives in a private temp directory. Rocky removes it when the command ends.
-- Rocky refuses the same models that `rocky import-dbt` refuses, with the same reason. The error names each model and its construct, and the command exits non-zero.
-- An incremental model needs a matching `run_results.json` from `dbt compile --full-refresh`. Without it, Rocky refuses the model and names that command.
-- Rocky accepts manifest schema `v12` (dbt 1.8 and later). It refuses any other `dbt_schema_version` by name.
-- `--config` is ignored. The adapter comes from `<DIR>/profiles.yml`, as in `rocky import-dbt`.
-- `--output json` prints the normal `rocky compile` JSON. Attach notes and warnings go to stderr. Diagnostic file paths point into the temp directory.
+- Rocky reads `<DIR>/target/manifest.json` and `run_results.json` on every run, and writes nothing under `<DIR>`. The translated project lives in a temp directory that Rocky removes at the end.
+- Rocky refuses the same models as `rocky import-dbt`, naming each model and construct, and exits non-zero. An incremental model needs a matching `run_results.json` from `dbt compile --full-refresh`.
+- Rocky accepts manifest schema `v12` (dbt 1.8 and later) and refuses any other `dbt_schema_version`.
+- `--config` is ignored. The adapter comes from `<DIR>/profiles.yml`.
+- `--output json` prints the normal compile JSON. Attach notes go to stderr, and diagnostic paths point into the temp directory.
 
 ### Related Commands
 
@@ -312,15 +198,6 @@ rocky lineage fct_revenue
       "target": { "model": "fct_revenue", "column": "customer_id" },
       "transform": "direct"
     },
-    {
-      "source": { "model": "stg_orders", "column": "total_amount" },
-      "target": { "model": "fct_revenue", "column": "revenue_amount" },
-      "transform": "expression"
-    },
-    {
-      "source": { "model": "stg_refunds", "column": "refund_amount" },
-      "target": { "model": "fct_revenue", "column": "revenue_amount" },
-      "transform": "expression"
     }
   ]
 }
@@ -345,55 +222,13 @@ rocky lineage fct_revenue --column revenue_amount
 }
 ```
 
-Trace a specific column and export as Graphviz DOT:
-
-```bash
-rocky lineage fct_revenue --column revenue_amount --format dot
-```
-
-```dot
-digraph lineage {
-  rankdir=LR;
-  "stg_orders.total_amount" -> "fct_revenue.revenue_amount";
-  "stg_refunds.refund_amount" -> "fct_revenue.revenue_amount";
-}
-```
-
-Use the dot syntax shorthand:
+Export a column trace as Graphviz DOT (the `model.column` shorthand works too):
 
 ```bash
 rocky lineage fct_revenue.revenue_amount --format dot | dot -Tpng -o lineage.png
 ```
 
-Walk downstream to see every consumer of a column (the answer to "what breaks if I change this?"):
-
-```bash
-rocky lineage stg_orders.customer_id --downstream
-```
-
-```json
-{
-  "version": "1.11.0",
-  "command": "lineage",
-  "model": "stg_orders",
-  "column": "customer_id",
-  "direction": "downstream",
-  "trace": [
-    {
-      "source": { "model": "stg_orders", "column": "customer_id" },
-      "target": { "model": "fct_revenue", "column": "customer_id" },
-      "transform": "direct"
-    },
-    {
-      "source": { "model": "fct_revenue", "column": "customer_id" },
-      "target": { "model": "mart_ltv",    "column": "customer_id" },
-      "transform": "direct"
-    }
-  ]
-}
-```
-
-Upstream output has `"direction": "upstream"` (the default shape, unchanged). The transitive walker is backed by an `edges_by_source_model` index so cost scales with fan-out rather than total edges.
+`rocky lineage stg_orders.customer_id --downstream` walks forward ("what breaks if I change this?"). The output has `"direction": "downstream"` and a `trace` of edges in the same shape. Upstream output has `"direction": "upstream"`.
 
 #### Value derivation and row selection
 
@@ -408,17 +243,6 @@ FROM stg s JOIN cust c ON s.customer_id = c.customer_id   <- join_key: stg.custo
 WHERE s.status = 'paid'                                   <- filter:   stg.status
 GROUP BY c.region                                         <- group_by: cust.region
                      SUM(s.amount) ─────────────────────▶ value:    stg.amount -> total
-```
-
-```bash
-rocky lineage fct.total -o json | jq '.row_selection'
-```
-
-```json
-[
-  { "source": { "model": "cust", "column": "customer_id" }, "target_model": "fct", "kind": "join_key" },
-  { "source": { "model": "stg",  "column": "status" },      "target_model": "fct", "kind": "filter" }
-]
 ```
 
 Each entry names the `source` column, the `target_model` whose rows it affects, and a `kind`: `join_key`, `filter`, `group_by`, `having`, `qualify`, `window_partition`, `window_order`, `distinct_on`, or `order_limit`. A `distinct_on` key comes from `DISTINCT ON (...)`, or from the `ORDER BY` of a `DISTINCT ON` query, because that order picks which row of each group survives. An `order_limit` key is an `ORDER BY` key in a query that also has `LIMIT`, `OFFSET`, `FETCH`, or `TOP`. A `NATURAL JOIN` records no join key, because the shared columns are known only to the warehouse catalog. A window key also carries `target_column`, the one output column its window feeds. Without `target_column`, the edge affects every column of `target_model`.
@@ -439,12 +263,6 @@ Row selection is read from the model's top-level `SELECT`. These constructs prod
 #### Incomplete lineage
 
 When a model uses one of the constructs above, its lineage is missing edges, and impact through it can be under-reported. `rocky lineage` says so. JSON output has an `incomplete_lineage` list, sorted by model name:
-
-```json
-"incomplete_lineage": [
-  { "model": "mart_scores", "gaps": ["natural_join"] }
-]
-```
 
 - It covers the model and every model upstream and downstream of it, for a model view and for a column trace (upstream or `--downstream`).
 - It follows model dependencies, not column edges, so a reader that joins with `NATURAL JOIN` is listed even though no column edge reaches it.
@@ -486,44 +304,7 @@ rocky lineage-diff [base_ref] [flags]
 
 ### Examples
 
-Diff the current branch against `main` and print the Markdown report:
-
-```bash
-rocky lineage-diff main --output table
-```
-
-```text
-Rocky Lineage Diff (main...HEAD)
-
-### Rocky Lineage Diff
-
-**2 row(s) changed** (2 modified, 0 added, 0 removed, 0 unchanged)
-
-<details>
-<summary><b>fct_revenue</b> — modified (3 column changes)</summary>
-
-| Column | Change | Old Type | New Type | Downstream consumers |
-|--------|--------|----------|----------|----------------------|
-| `total_revenue` | added | - | Unknown | _none_ |
-| `total_tax` | added | - | Unknown | _none_ |
-| `total` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
-
-</details>
-
-<details>
-<summary><b>stg_orders</b> — modified (3 column changes)</summary>
-
-| Column | Change | Old Type | New Type | Downstream consumers |
-|--------|--------|----------|----------|----------------------|
-| `amount_usd` | added | - | Unknown | `fct_revenue.total_revenue` |
-| `tax_amount_usd` | added | - | Unknown | `fct_revenue.total_tax` |
-| `amount` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
-
-</details>
-```
-
-The same diff as JSON, for a CI pipeline:
-
+Diff the current branch against `main`. `--output table` prints the Markdown report directly, with a collapsible table of column changes and downstream consumers for each model. Use JSON in a CI pipeline:
 ```bash
 rocky lineage-diff main -o json
 ```
@@ -549,19 +330,8 @@ rocky lineage-diff main -o json
       "model_name": "stg_orders",
       "status": "modified",
       "column_changes": [
-        {
-          "column_name": "amount_usd",
-          "change_type": "added",
-          "new_type": "Unknown",
-          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_revenue" }]
-        },
-        {
-          "column_name": "tax_amount_usd",
-          "change_type": "added",
-          "new_type": "Unknown",
-          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_tax" }]
-        },
-        { "column_name": "amount", "change_type": "removed", "old_type": "Unknown" }
+        { "column_name": "amount_usd", "change_type": "added", "new_type": "Unknown",
+          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_revenue" }] }
       ]
     }
   ],
@@ -569,7 +339,7 @@ rocky lineage-diff main -o json
 }
 ```
 
-A removed column has no downstream trace on HEAD, because it no longer exists there. JSON omits `downstream_consumers` when it is empty, so default a missing key to an empty list.
+A removed column has no downstream trace on HEAD. JSON omits an empty `downstream_consumers`, so default a missing key to an empty list.
 
 #### Consumers of a removed column
 
@@ -582,26 +352,9 @@ A removed column carries `consumer_impact` instead. Rocky compares the base and 
 | `deleted` | The consumer model no longer exists on HEAD. |
 | `repaired` | The consumer still exists on HEAD and provably no longer reads the column. |
 
-A read counts through either edge kind: a value read, or a row-selection read such as a join key or filter (see [`rocky lineage`](#value-derivation-and-row-selection)). Each entry carries `model`, `status`, `columns` (the consumer's output columns involved), `via` (`value` or a row-selection kind), and a one-line `reason`:
+A read counts through either edge kind: a value read, or a row-selection read such as a join key or filter (see [`rocky lineage`](#value-derivation-and-row-selection)). Each entry carries `model`, `status`, `columns` (the consumer's output columns involved), `via` (`value` or a row-selection kind), and a one-line `reason`. For example `{ "model": "fct_broken", "status": "newly_broken", "columns": ["amount"], "via": ["value"], "reason": "HEAD still reads `stg_orders.amount`, which no longer exists" }`.
 
-```json
-{
-  "column_name": "amount",
-  "change_type": "removed",
-  "consumer_impact": [
-    { "model": "fct_broken", "status": "newly_broken", "columns": ["amount"], "via": ["value"],
-      "reason": "HEAD still reads `stg_orders.amount`, which no longer exists" },
-    { "model": "fct_filtered", "status": "newly_broken", "via": ["filter"],
-      "reason": "HEAD still reads `stg_orders.amount`, which no longer exists" },
-    { "model": "fct_deleted", "status": "deleted", "columns": ["deleted_amount"], "via": ["value"],
-      "reason": "consumer model was removed on HEAD" },
-    { "model": "fct_repaired", "status": "repaired", "columns": ["amount"], "via": ["value"],
-      "reason": "HEAD no longer reads `stg_orders.amount`" }
-  ]
-}
-```
-
-The Markdown report adds a **Consumers of removed columns** table to each model with a classified removal. `unknown` is the conservative answer: Rocky never reports `repaired` unless HEAD's lineage proves it. A model that reads the upstream with `SELECT *`, while HEAD cannot list the upstream's columns, is `unknown`. So is an unqualified column name in a join.
+The Markdown report adds a **Consumers of removed columns** table per model. `unknown` is the conservative answer: Rocky reports `repaired` only when HEAD's lineage proves it. A model that reads the upstream with `SELECT *` while HEAD cannot list the upstream's columns is `unknown`, and so is an unqualified column name in a join.
 
 #### Incomplete lineage in a diff
 
@@ -612,9 +365,9 @@ The impact report reads the same edges as `rocky lineage`, so a model whose line
 - `null` means Rocky does not know: models changed, but the HEAD side did not compile. A payload with no field comes from an older build. Treat both as possibly incomplete, never as complete.
 - The Markdown report, and so the table output, adds a **Lineage incomplete** list, or one line when it is not known.
 
-Rocky reports the list as it is. A filter inside a `WITH` body marks a model incomplete, so the list can be long on CTE-heavy models.
+A filter inside a `WITH` body marks a model incomplete, so the list can be long on CTE-heavy models.
 
-`rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, a `git diff` that fails, or invalid or unreadable project configuration.
+`rocky lineage-diff` reports and never fails a build on changed columns. It exits non-zero only on an error: an invalid `base_ref`, a failed `git diff`, or invalid or unreadable project configuration.
 
 ### Related Commands
 
@@ -625,7 +378,7 @@ Rocky reports the list as it is. A filter inside a `WITH` body marks a model inc
 
 ## `rocky catalog`
 
-Emit a project-wide column-level lineage snapshot to disk. Walks every model in the SemanticGraph and serializes the result as persisted catalog artifacts (a `catalog.json` front door plus `edges.parquet` / `assets.parquet`) so downstream consumers (BI tools, governance dashboards, AI review bots) can query lineage without re-invoking the engine.
+Write a project-wide column-level lineage snapshot to disk: a `catalog.json` front door plus `edges.parquet` and `assets.parquet`. BI tools, governance dashboards and review bots can then query lineage without the engine.
 
 ```bash
 rocky catalog [flags]
@@ -642,45 +395,19 @@ rocky catalog [flags]
 
 ### Behaviour
 
-By default (`--format both`) `rocky catalog` writes `<out>/catalog.json`, `<out>/edges.parquet`, and `<out>/assets.parquet`; pass `--format json` to write only the JSON front door. The CLI's stdout is a short summary in the default `--output table` mode, or the same JSON payload mirrored to stdout in `--output json` mode.
+The stdout is a short summary in `--output table` mode, or the same JSON payload in `--output json` mode. The artifact contains:
 
-The artifact contains:
-
-- `assets` — one entry per model or upstream source, with columns (name plus inferred type and nullability when known, and a per-column `description` from the sidecar `[columns]` table when set), upstream / downstream lists, and the model's intent description when supplied.
-- `edges` — one entry per column-level lineage edge: source column, target column, transform kind (`direct`, `cast`, `try_cast`, `expression`, `aggregation: <fn>`; `aggregation` and `cast` apply directly to a column, and a nested call such as `MAX(LENGTH(n))` or `CAST(MAX(x) AS BIGINT)` is `expression`), and a confidence grade (`High` for explicit projections, `Medium` for star-expanded edges, `Low` reserved for future use).
-- `stats` — aggregate counts (`asset_count`, `edge_count`, `column_count`, `assets_with_star`, `orphan_columns`, `duration_ms`).
-- A `config_hash` fingerprint of `rocky.toml` so consumers can tell whether the catalog was built against the current configuration.
+- `assets`: one entry per model or upstream source, with columns (name, inferred type and nullability when known, sidecar `[columns]` `description`), upstream and downstream lists, and the model's intent description.
+- `edges`: one entry per column-level lineage edge: source column, target column, transform kind (`direct`, `cast`, `try_cast`, `expression`, `aggregation: <fn>`; a nested call such as `MAX(LENGTH(n))` is `expression`), and a confidence grade (`High` for explicit projections, `Medium` for star-expanded edges, `Low` reserved).
+- `stats`: `asset_count`, `edge_count`, `column_count`, `assets_with_star`, `orphan_columns`, `duration_ms`.
+- `config_hash`: a fingerprint of `rocky.toml`, so consumers can tell whether the catalog matches the current configuration.
 
 ### Examples
 
-Build the default snapshot:
-
 ```bash
-rocky catalog
-```
-
-```text
-rocky catalog
-  project:          playground
-  assets:           3
-  columns:          13
-  edges:            13
-  wrote:            .rocky/catalog/catalog.json
-  wrote:            .rocky/catalog/edges.parquet
-  wrote:            .rocky/catalog/assets.parquet
-  duration:         12ms
-```
-
-Pipe the JSON shape directly:
-
-```bash
+rocky catalog                               # the default snapshot
 rocky catalog --output json | jq '.stats'
-```
-
-Write to a custom directory (for example, when building a per-PR artifact):
-
-```bash
-rocky catalog --out build/catalog
+rocky catalog --out build/catalog           # a custom directory, such as a per-PR artifact
 ```
 
 ### Limitations
@@ -707,23 +434,14 @@ rocky dag [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | each pipeline's own configured location | Override the models directory. Omit it and every transformation pipeline uses its own configured `models` location. `rocky run --dag` does the same, which keeps the two in agreement. Passing it overrides the location for **every** transformation pipeline, so Rocky refuses a project that defines more than one rather than build each model twice. |
+| `--models <PATH>` | `PathBuf` | each pipeline's own configured location | Override the models directory for every transformation pipeline. Rocky refuses a project with more than one such pipeline, rather than build each model twice. |
 | `--seeds <PATH>` | `PathBuf` | | Seeds directory. |
 | `--contracts <PATH>` | `PathBuf` | | Contracts directory. |
 | `--column-lineage` | `bool` | `false` | Also emit column-level lineage edges. This one requires a compile, so it costs more than the plain graph. |
 
 ### What a node carries
 
-Each node has an id of the form `{kind}:{name}`, for example `transformation:stg_orders`. The kind is one of `source`, `load`, `transformation`, `quality`, `snapshot`, `seed`, `test`, and `replication`.
-
-A node also carries the fields that apply to its kind:
-
-- the pipeline name from `rocky.toml`;
-- the target table;
-- the materialization strategy;
-- the per-model freshness expectation;
-- the partition shape;
-- the ids it depends on.
+Each node has an id `{kind}:{name}`, for example `transformation:stg_orders`. The kind is `source`, `load`, `transformation`, `quality`, `snapshot`, `seed`, `test` or `replication`. A node also carries the fields that apply to its kind: the pipeline name, target table, materialization strategy, per-model freshness expectation, partition shape, and the ids it depends on.
 
 ### How execution layers work
 
@@ -741,8 +459,6 @@ A node also carries the fields that apply to its kind:
    layer 2  [ E ]          E waits for every layer before it
 ```
 
-Nodes inside one layer have no dependency on each other, so an orchestrator can run them in parallel. Each layer waits for the layer before it.
-
 ### Reading `column_lineage` correctly
 
 `column_lineage` is empty unless you pass `--column-lineage`. An empty list on its own does not mean the project has no lineage.
@@ -753,17 +469,7 @@ Nodes inside one layer have no dependency on each other, so an orchestrator can 
 
 ### Examples
 
-Print the graph for the whole project:
-
-```bash
-rocky dag
-```
-
-Include column-level lineage edges:
-
-```bash
-rocky dag --column-lineage
-```
+Run `rocky dag` for the whole project, and add `--column-lineage` for column-level edges.
 
 ### Related Commands
 
@@ -775,7 +481,7 @@ rocky dag --column-lineage
 
 ## `rocky emit-sql`
 
-Render the runnable SQL each transformation model would emit, without a warehouse connection and without running anything. The SQL is generated through the same path `rocky run` uses, including declared surrogate-key columns wrapped exactly as they are at materialization.
+Render the runnable SQL each transformation model would emit, with no warehouse connection. It uses the same generation path as `rocky run`, including surrogate-key columns wrapped as at materialization.
 
 ```bash
 rocky emit-sql [flags]
@@ -806,15 +512,9 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 
 With a config present, `emit-sql` also runs the per-model-target checks of [`rocky compile`](#rocky-compile) (E042/E043, E044, E049, E051, E053, E054). It refuses to emit SQL that the pipeline's warehouse cannot run, such as a `merge` model on ClickHouse (E053).
 
-One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
+A placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML. That is row three, and the error names `PORT`.
 
-Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Merge and `delete_insert` models emit their steady-state statement instead, which operates on an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so those files carry a leading note:
-
-```sql
--- NOTE: merge/delete_insert statement — operates on an existing target.
--- `rocky run` creates the table on first build; this static SQL does not.
-MERGE INTO ...
-```
+Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Merge and `delete_insert` models emit their steady-state statement, which operates on an existing target. `rocky run` creates the table on first build and a static emit cannot, so those files carry a leading `-- NOTE: merge/delete_insert statement` comment.
 
 `emit-sql` refuses a project with any compile error, before it filters by model. `type = "incremental"` on a transformation model fails with `E037`, and an invalid `ephemeral` use fails with `E038`. Either stops the whole export, even when `--model` names a different model.
 
@@ -830,39 +530,17 @@ Print the whole project's SQL to stdout in dependency order:
 rocky emit-sql
 ```
 
-```sql
--- model: stg_orders
-CREATE OR REPLACE TABLE main.stg_orders AS
-SELECT order_id, customer_id, total_amount FROM raw.orders;
+The output is `-- model: <name>` followed by that model's statement, in dependency order.
 
--- model: fct_revenue
-CREATE OR REPLACE TABLE main.fct_revenue AS
-SELECT customer_id, SUM(total_amount) AS revenue_amount FROM main.stg_orders GROUP BY customer_id;
-```
-
-Write one file per model, ready to commit or hand to another tool:
+Write one file per model (`--out-dir`), render one model, or capture everything in one file:
 
 ```bash
 rocky emit-sql --out-dir build/sql/
-```
-
-```text
-emit-sql: wrote 2 model(s) to build/sql/ in dependency order
-```
-
-Render a single model, and capture the project-wide SQL into one file:
-
-```bash
 rocky emit-sql --model fct_revenue
 rocky emit-sql > build/all.sql
 ```
 
-When some models cannot be emitted as standalone SQL, the skip report goes to stderr:
-
-```text
-emit-sql: 1 model(s) not emitted:
-  - dim_session (cannot render offline: <the dialect's reason>)
-```
+A model that cannot be emitted as standalone SQL is reported on stderr, for example `emit-sql: 1 model(s) not emitted:` followed by `- dim_session (cannot render offline: <the dialect's reason>)`.
 
 ### Related Commands
 
@@ -922,18 +600,6 @@ S001 = "error"
 ```
 
 Severity is `"error"`, `"warning"` or `"info"`. The command exits with code `1` when at least one finding has `error` severity. Warnings and info findings never fail the run.
-
-### Example
-
-```text
-$ rocky lint models/
-models/fct_orders.sql:6:12: warning[S001] column `amount` has no table qualifier in a query that reads 2 tables
-    hint: write `<alias>.amount`
-models/fct_orders.sql:8:1: warning[S002] bare JOIN does not say which kind of join it is
-    hint: write INNER JOIN
-3 file(s) checked: 0 error(s), 2 warning(s), 0 info
-1 finding(s) can be fixed with `rocky lint --fix`
-```
 
 ### JSON output
 
@@ -1020,52 +686,9 @@ rocky test
 }
 ```
 
-Test a single model with contracts:
-
-```bash
-rocky test --model fct_revenue --contracts contracts/
-```
-
-```json
-{
-  "version": "1.6.0",
-  "command": "test",
-  "total": 1,
-  "passed": 1,
-  "failed": 0,
-  "failures": []
-}
-```
+Add `--model fct_revenue --contracts contracts/` to test one model with contracts.
 
 The default `rocky test` path also runs fixture-driven `[[test]]` unit tests declared in model sidecars. Each `[[test]]` block mocks upstream inputs with inline rows (`given`) and asserts the model's output rows (`expect`), executed in-memory against DuckDB. When at least one model declares a `[[test]]` block, the JSON output gains a `unit_tests` summary; the key is omitted entirely when no model declares one. A failing unit test makes `rocky test` exit non-zero, the same as a failing model assertion.
-
-```json
-{
-  "version": "1.11.0",
-  "command": "test",
-  "total": 3,
-  "passed": 3,
-  "failed": 0,
-  "failures": [],
-  "unit_tests": {
-    "total": 2,
-    "passed": 1,
-    "failed": 1,
-    "results": [
-      { "model": "fct_revenue", "test": "discount_caps_at_total", "passed": true, "error": null, "mismatches": [] },
-      {
-        "model": "fct_revenue",
-        "test": "refunds_subtract",
-        "passed": false,
-        "error": "ordered output mismatch (1 expected vs 1 actual row(s))",
-        "mismatches": [
-          { "row_index": 0, "expected": "customer_id=7, revenue_amount=80", "actual": "customer_id=7, revenue_amount=100", "kind": "value_diff" }
-        ]
-      }
-    ]
-  }
-}
-```
 
 Each `results` entry carries the model name, the `[[test]]` block's `test` name, a `passed` flag, an `error` message (`null` when the test passed), and the `mismatches` array of row-level diffs. Each mismatch renders its row as `col=val, col=val`. A mismatch `kind` is `missing` (expected but not produced), `extra` (produced but not expected), or `value_diff` (same positional row, differing values, from an `ordered` expectation).
 
@@ -1083,10 +706,6 @@ Each `results` entry carries the model name, the `[[test]]` block's `test` name,
 Rocky refuses before it writes any output. Under `--output json` stdout stays empty, so read the exit code and stderr rather than the payload.
 
 A model that exists but declares no tests is not an error. It still exits `0` and reports `total: 0`.
-
-:::caution[This is a behavior change]
-Earlier engine versions exited `0` in both rows above. A misspelled or renamed `--model` reported `total: 0` and passed, which looks the same as a real model with no tests. `rocky test --declarative` accepted a models directory that does not exist. A CI job that relied on either no-op now fails. Correct the selector, or remove it to test every model.
-:::
 
 ### Related Commands
 
@@ -1152,34 +771,10 @@ rocky ci
 }
 ```
 
-Run CI with contracts in a GitHub Actions workflow. On a compile error, `tests_passed` / `tests_failed` are `0` because tests don't run, and CI short-circuits and returns a non-zero `exit_code`:
+Run CI with contracts. On a compile error, no tests run: `tests_passed` and `tests_failed` are `0`, and `exit_code` is `1`:
 
 ```bash
 rocky ci --models src/models --contracts src/contracts
-```
-
-```json
-{
-  "version": "1.6.0",
-  "command": "ci",
-  "compile_ok": false,
-  "tests_ok": false,
-  "models_compiled": 13,
-  "tests_passed": 0,
-  "tests_failed": 0,
-  "exit_code": 1,
-  "diagnostics": [
-    {
-      "severity": "error",
-      "code": "E001",
-      "model": "fct_revenue",
-      "message": "unknown column 'total' in model 'stg_orders'",
-      "span": null,
-      "suggestion": "did you mean 'total_amount'?"
-    }
-  ],
-  "failures": []
-}
 ```
 
 ### Related Commands
@@ -1246,50 +841,12 @@ rocky ci-diff
 }
 ```
 
-Diff against a feature-branch base and a non-default models directory:
+Diff against another base and models directory with `rocky ci-diff release/2026-04 --models src/models`. In GitHub Actions, `jq -r .markdown` the JSON output into `gh pr comment`.
 
-```bash
-rocky ci-diff release/2026-04 --models src/models
-```
+The output also has an `incomplete_lineage` list, the same list as in [`rocky lineage-diff`](#incomplete-lineage-in-a-diff). The table output prints it under a `Lineage incomplete` heading.
 
-The `markdown` field holds a ready-to-post report; in a GitHub Actions workflow you can `jq -r .markdown` the JSON output and feed it into `gh pr comment`.
-
-The output also has an `incomplete_lineage` list: the changed models, and the models downstream of them, whose lineage is known to be incomplete. Impact through them may be under-reported. It is the same list as in [`rocky lineage-diff`](#incomplete-lineage-in-a-diff), and the table output prints it under a `Lineage incomplete` heading.
-
-Run with `--semantic` to surface classified breaking-change findings alongside the structural diff:
-
-```bash
-rocky ci-diff --semantic
-```
-
-```json
-{
-  "version": "1.31.0",
-  "command": "ci-diff",
-  "base_ref": "main",
-  "head_ref": "HEAD",
-  "summary": { "added": 0, "modified": 1, "removed": 0 },
-  "models": [ /* ... */ ],
-  "markdown": "...",
-  "breaking_findings": [
-    {
-      "change": {
-        "kind": "column_type_changed",
-        "model": "analytics.marts.fct_orders",
-        "column": "amount_cents",
-        "old_type": "BIGINT",
-        "new_type": "INT",
-        "narrowing": true
-      },
-      "severity": "breaking"
-    }
-  ]
-}
-```
-
-The `breaking_findings` array is omitted from JSON output when empty or when `--semantic` is not set. Each finding carries a tagged `change` object (`kind` discriminator) and a `severity` (`breaking` / `warning` / `info`). Use `--semantic` in `ci-diff` to surface findings on every PR; rely on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) to block promotion when `severity == "breaking"`.
-
-The `breaking_findings` field is JSON-only: `--output table` still renders the structural diff but does not print the semantic findings list. Use `--output json` (and pipe through `jq`) to inspect them.
+`--semantic` adds a `breaking_findings` array, omitted when empty or without the flag. Each finding has a tagged `change` object (a `kind` discriminator such as `column_type_changed`, with `model`, `column`, `old_type`, `new_type` and `narrowing`) and a `severity` (`breaking`, `warning` or `info`).
+Use `--semantic` to surface findings on every PR. [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) blocks the promote. The findings are JSON-only: `--output table` does not print them.
 
 ### Snapshot modes
 
@@ -1359,8 +916,7 @@ rocky preview create --base main
     { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
   ],
   "copy_set": [
-    { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" },
-    { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" }
+    { "model_name": "stg_orders", "source_schema": "main", "target_schema": "branch__pr_preview_fix_price", "copy_strategy": "ctas" }
   ],
   "skipped_set": [],
   "run_id": "",
@@ -1369,7 +925,7 @@ rocky preview create --base main
 }
 ```
 
-`changed_columns` exists in the output type, but Rocky leaves it empty and omits it from JSON today. `copy_strategy` reports `"ctas"` for every successful copy. Databricks uses `SHALLOW CLONE`, BigQuery uses `CREATE TABLE … COPY`, and Snowflake uses `CREATE TABLE … CLONE`. DuckDB uses CTAS. The output does not distinguish these methods yet.
+`changed_columns` exists in the output type but stays empty and is omitted from JSON. `copy_strategy` reports `"ctas"` for every successful copy, though Databricks uses `SHALLOW CLONE`, BigQuery `CREATE TABLE … COPY` and Snowflake `CREATE TABLE … CLONE`.
 
 ### `rocky preview diff`
 
@@ -1392,15 +948,13 @@ Pass `--algorithm bisection` to compare row content. It needs a `Merge` model wh
 | `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
 | `--algorithm <ALGO>` | `sampled` \| `bisection` | `sampled` | Comparison method. Hidden from `--help`. See the `bisection` limits above. |
 
-The old `--sample-size` flag is gone. Nothing read it, so Rocky removed it. A script that still passes it now fails to parse.
-
 **Example.** Print a Markdown report ready to post on a PR:
 
 ```bash
 rocky preview diff --name pr_preview_fix_price --output json | jq -r .markdown
 ```
 
-There is no `--output markdown`. The report lives in the `markdown` field of the JSON output (`PreviewDiffOutput`). The same JSON also carries the per-model `sampling_window` block with `coverage_warning`.
+The report lives in the `markdown` field of `PreviewDiffOutput`, which also carries the per-model `sampling_window` block with `coverage_warning`.
 
 ### `rocky preview cost`
 
@@ -1445,14 +999,7 @@ rocky preview rows --model customer_orders --limit 20
 
 ### Output shapes
 
-Wire contracts for all four subcommands are exported by `rocky export-schemas`:
-
-- `schemas/preview_create.schema.json`
-- `schemas/preview_diff.schema.json`
-- `schemas/preview_cost.schema.json`
-- `schemas/preview_rows.schema.json`
-
-These back the autogenerated Pydantic and TypeScript bindings. See [JSON Output](/reference/json-output/) for the codegen pipeline and version compatibility contract.
+`rocky export-schemas` exports the wire contracts as `schemas/preview_create.schema.json`, `preview_diff.schema.json`, `preview_cost.schema.json` and `preview_rows.schema.json`. See [JSON Output](/reference/json-output/).
 
 ### Related Commands
 

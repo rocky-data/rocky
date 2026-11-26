@@ -5,52 +5,12 @@ sidebar:
   order: 9
 ---
 
-A [compile-time contract](/reference/glossary/#compile-time-contract) is a
-schema agreement that Rocky enforces before it writes a single row.
-`dagster-rocky` surfaces that validation as native Dagster
-[`AssetCheckSpec`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckSpec)
-and [`AssetCheckResult`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckResult)
-events.
-
-`RockyComponent` declares the contract check specs at load time. They show on
-the asset detail page before any compile or run, so a fresh deployment already
-shows which assets have contracts. [Which assets get contract
-checks](#which-assets-get-contract-checks) says where they attach.
+A [compile-time contract](/reference/glossary/#compile-time-contract) is a schema agreement that Rocky enforces before it writes a single row. `dagster-rocky` surfaces that validation as native Dagster [`AssetCheckSpec`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckSpec) and [`AssetCheckResult`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckResult) events. `RockyComponent` declares the specs at load time, so a fresh deployment shows which assets have contracts before any compile or run. See [Which assets get contract checks](#which-assets-get-contract-checks).
 
 ## Quickstart
 
-1. Create a contracts directory next to your `models/`:
-
-```
-project/
-├── rocky.toml
-├── models/
-│   ├── orders.toml
-│   └── orders.sql
-└── contracts/
-    └── orders.contract.toml
-```
-
-2. Declare contract rules in `orders.contract.toml`:
-
-```toml
-# Required columns must be present in the model output
-[rules]
-required = ["id", "amount"]
-protected = ["customer_id"]
-
-# Per-column type and nullability constraints
-[[columns]]
-name = "id"
-type = "Int64"
-nullable = false
-
-[[columns]]
-name = "amount"
-type = "Float64"
-```
-
-3. Tell `RockyComponent` where to find contracts in your `defs.yaml`:
+1. Write `contracts/orders.contract.toml` next to your `models/` directory. The file format (`[rules]`, `[[columns]]`) is in [Data contracts](/concepts/data-quality-checks/#data-contracts).
+2. Point `RockyComponent` at the directory in your `defs.yaml`:
 
 ```yaml
 type: dagster_rocky.RockyComponent
@@ -60,24 +20,11 @@ attributes:
   contracts_dir: contracts  # ← enables contract checks
 ```
 
-After you deploy, each matching asset shows up to three contract checks on its
-asset detail page. Which of the three appear depends on the rule
-kinds the contract declares:
-
-- `contract_required_columns`: passes when there are no E010 diagnostics (or E062, see below)
-- `contract_protected_columns`: passes when there are no E013 diagnostics (or E062, see below)
-- `contract_column_constraints`: passes when there are no E011/E012/E014/E059/E063/W010 diagnostics.
-  It appears when a `[[columns]]` entry sets `type` or `nullable`, or when `[rules]` sets
-  `no_new_nullable` or `no_extra_columns`.
-
-An `E062` fails one of the declared checks. It fails `contract_column_constraints`
-when that check is declared. If it is not, it fails `contract_required_columns`,
-then `contract_protected_columns`.
+After you deploy, each matching asset shows up to three contract checks: `contract_required_columns`, `contract_protected_columns` and `contract_column_constraints`. Which appear depends on the rule kinds the contract declares. `contract_column_constraints` appears when a `[[columns]]` entry sets `type` or `nullable`, or when `[rules]` sets `no_new_nullable` or `no_extra_columns`. The table below says which diagnostic fails which check.
 
 ## Diagnostic code mapping
 
-Rocky's compiler emits a stable code for each kind of contract violation.
-`dagster-rocky` maps each code to one asset check:
+Each compiler code is defined in [Data contracts](/concepts/data-quality-checks/#data-contracts). `dagster-rocky` maps each to one asset check:
 
 | Code | Severity | Meaning | Maps to check |
 |---|---|---|---|
@@ -85,10 +32,10 @@ Rocky's compiler emits a stable code for each kind of contract violation.
 | E011 | ERROR | Column type mismatch | `contract_column_constraints` |
 | E012 | ERROR | Column nullability violated | `contract_column_constraints` |
 | E013 | ERROR | Protected column removed | `contract_protected_columns` |
-| E014 | ERROR | Under `[rules] no_new_nullable`: a nullable column the contract does not declare, or the contract declaring no `[[columns]]` at all, which leaves no baseline for what counts as new | `contract_column_constraints` |
-| E059 | ERROR | Under `--strict-contracts` or `[contracts] strict`: a declared type Rocky cannot check | `contract_column_constraints` |
+| E014 | ERROR | Undeclared nullable column under `no_new_nullable` | `contract_column_constraints` |
+| E059 | ERROR | Under `--strict-contracts` or `[contracts] strict`: a type Rocky cannot check | `contract_column_constraints` |
 | E062 | ERROR | The model output repeats a name the contract constrains | The first declared check: `contract_column_constraints`, then `contract_required_columns`, then `contract_protected_columns` |
-| E063 | ERROR | Under `[rules] no_extra_columns`: an output column the contract does not declare, or a column list Rocky cannot prove | `contract_column_constraints` |
+| E063 | ERROR | Undeclared output column, or an unprovable column list, under `no_extra_columns` | `contract_column_constraints` |
 | W010 | WARN | Contract column not in model output | `contract_column_constraints` |
 
 When a check fails, the `AssetCheckResult` includes:

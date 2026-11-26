@@ -5,15 +5,10 @@ sidebar:
   order: 2
 ---
 
-The bronze layer is Rocky's config-driven replication inside the warehouse. You
-write no SQL. Rocky finds which tables are available, writes the SQL itself, and
-copies rows from the ingestion catalog into the target catalogs and schemas you
-declare.
+The bronze layer is Rocky's config-driven replication inside the warehouse. You write no SQL. Rocky finds the available tables, writes the SQL, and copies rows from the ingestion catalog into the target catalogs and schemas you declare.
 
 :::note
-Rocky does not extract data from external systems. It works on data an ingestion
-tool has already landed in your warehouse (Fivetran, Airbyte, a manual load). The
-discover step finds what is there. It does not move anything.
+Rocky does not extract data from external systems. It works on data an ingestion tool (Fivetran, Airbyte, a manual load) has already landed in your warehouse. Discover finds what is there and moves nothing.
 :::
 
 ## The flow
@@ -26,66 +21,13 @@ rocky discover  →  rocky plan  →  rocky apply
 2. **Plan.** Parses the source schema names, resolves target catalogs and schemas, and writes the SQL statements. Records the result as a deterministic plan, keyed by `plan_id`.
 3. **Apply.** Runs one plan by id. It creates catalogs and schemas, copies data, runs quality checks, and updates watermarks. `rocky run` collapses plan and apply into one call, for local work and automation.
 
-## Schema pattern parsing
+## Schema pattern parsing and target mapping
 
-Source schemas follow a naming convention. Rocky splits the name into parts using
-a pattern you configure.
-
-```
-src__acme__us_west__shopify
-│    │     │        │
-│    │     │        └── source  = "shopify"   (the connector)
-│    │     └── regions = ["us_west"]          (variable-length)
-│    └── tenant  = "acme"
-└── prefix "src__", stripped
-```
-
-Declare the pattern under the pipeline source in `rocky.toml`:
-
-```toml
-[pipeline.bronze.source.schema_pattern]
-prefix = "src__"
-separator = "__"
-components = ["tenant", "regions...", "source"]
-```
-
-## Target mapping
-
-Templates on the pipeline target decide where the rows land.
-
-```toml
-[pipeline.bronze.target]
-adapter = "prod"
-catalog_template = "warehouse"
-schema_template = "stage__{source}"
-```
-
-Rocky fills those templates from the parts it just parsed.
-
-```
-  fivetran_catalog.src__acme__us_west__shopify.orders    ← source table
-                   └───────────┬─────────────┘
-                               │ schema_pattern splits the schema name
-                               ▼
-                    tenant  = "acme"
-                    regions = ["us_west"]
-                    source  = "shopify"
-                               │ templates fill from those parts
-                               │   catalog_template = "warehouse"  (no variable)
-                               │   schema_template  = "stage__{source}"
-                               ▼
-  warehouse.stage__shopify.orders                        ← target table
-```
-
-For a multi-tenant setup where each tenant gets its own catalog, see
-[Schema Patterns](/concepts/schema-patterns/) for the `{tenant}_warehouse` plus
-`components = ["tenant", "regions...", "source"]` pattern.
+A `schema_pattern` on the pipeline source splits a source schema name into parts, and `catalog_template` and `schema_template` on the pipeline target fill from them. Example: `fivetran_catalog.src__acme__us_west__shopify.orders` with `schema_template = "stage__{source}"` and `catalog_template = "warehouse"` lands in `warehouse.stage__shopify.orders`. Full reference: [Schema Patterns](/concepts/schema-patterns/).
 
 ## Auto-creation
 
-Set `auto_create_catalogs` and `auto_create_schemas` under the target's
-`governance` block. Rocky then creates the target catalog and schema before it
-copies anything:
+Set `auto_create_catalogs` and `auto_create_schemas` under the target's `governance` block. Rocky then creates the target catalog and schema before it copies anything:
 
 ```toml
 [pipeline.bronze.target.governance]
@@ -96,48 +38,17 @@ auto_create_schemas = true
 managed_by = "rocky"
 ```
 
-```sql
-CREATE CATALOG IF NOT EXISTS warehouse;
-CREATE SCHEMA IF NOT EXISTS warehouse.stage__shopify;
-```
-
-Rocky applies the tags you declare in `governance.tags` to the catalogs it
-manages. A tag such as `managed_by` lets you find those catalogs later.
+Rocky applies `governance.tags` to the catalogs it manages, so a tag such as `managed_by` finds them later.
 
 ## Incremental strategy
 
-The first run has no watermark (the timestamp of the newest row Rocky has already
-copied), so it does a full refresh. Every run after that copies only the rows
-whose timestamp is newer than the stored watermark:
+The first run has no watermark, so it copies every row except the newest batch. Later runs copy rows newer than the stored watermark. The watermark column is `_fivetran_synced` by default (`timestamp_column` changes it). See [SQL Generation](/concepts/sql-generation/#incremental-copy) and [Incremental Processing](/concepts/incremental/#what-the-hold-back-changes).
 
-```sql
-INSERT INTO warehouse.stage__shopify.orders
-SELECT *, CAST(NULL AS STRING) AS _loaded_by
-FROM fivetran_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
-  AND _fivetran_synced < TIMESTAMP '2026-04-17 10:00:00'
-```
-
-The first literal in that `WHERE` is the previous run's `MAX(_fivetran_synced)`.
-Rocky keeps it in the [state store](/reference/glossary/#state-store) and writes it
-into the query. It does not read the value back from the target with a subquery.
-The second literal is the newest timestamp in the source, read just before the
-copy. Rocky holds back the newest batch until a later run, the first run
-included. See [Incremental Processing](/concepts/incremental/#what-the-hold-back-changes).
-
-`_fivetran_synced` is Fivetran's built-in column recording when each row was
-synced. Rocky uses it as the watermark column by default. Change it with
-`timestamp_column`.
-
-When Rocky detects schema drift, it responds in graded steps. A safe type
-widening becomes `ALTER COLUMN TYPE`. A new column becomes
-`ALTER TABLE ADD COLUMN`. Only an unsafe type change falls back to a full
-refresh, which drops and recreates the target table.
+On schema drift, a safe type widening becomes `ALTER COLUMN TYPE`, a new column becomes `ALTER TABLE ADD COLUMN`, and only an unsafe type change falls back to a full refresh. See [Schema Drift](/concepts/schema-drift/).
 
 ## Metadata columns
 
-Rocky can add metadata columns to the copied tables. Declare them on the pipeline,
-alongside `strategy` and `timestamp_column`:
+Declare metadata columns on the pipeline, beside `strategy` and `timestamp_column`:
 
 ```toml
 [pipeline.bronze]
@@ -155,18 +66,14 @@ Because `value` becomes part of that statement, Rocky checks it when the config 
 
 ## Filtering
 
-Scope a run to one tenant:
-
 ```bash
 plan_id=$(rocky --config rocky.toml plan --filter tenant=acme --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 
-This processes only the schemas whose parsed `tenant` component is `acme`.
+This processes only the schemas whose parsed `tenant` is `acme`.
 
 ## Related
 
-- [Schema Patterns](/concepts/schema-patterns/) — the full pattern and template reference
-- [Incremental Loads](/concepts/incremental/) — how the watermark advances
-- [Schema Drift](/concepts/schema-drift/) — what Rocky does when a source column changes
-- [Configuration](/reference/configuration/) — every `rocky.toml` key
+- [Schema Patterns](/concepts/schema-patterns/): the full pattern and template reference
+- [Configuration](/reference/configuration/): every `rocky.toml` key

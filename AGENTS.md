@@ -48,12 +48,11 @@ Each subproject has its own `AGENTS.md` with build commands, coding standards, a
 ## Agent-tool compatibility
 
 - `AGENTS.md` is the canonical, vendor-neutral source for persistent repository guidance. Tool-specific files and directories exist only for discovery compatibility.
-- Skills follow the Agent Skills format. The source copy lives in `.agents/skills/` (root), `engine/.agents/skills/` or `editors/vscode/.agents/skills/`. Keep workflow text independent of any particular agent client, model, marketplace, or plugin.
-- Each tree has a byte-identical copy in the `.claude/skills/` next to it, for clients that only search there. Edit the `.agents/skills/` copy, then copy the change across. `skills-mirror-drift.yml` fails a PR when a pair differs. The repo tracks no symlinks: `ai-review.yml` refuses them.
-- Subproject skills apply to any agent working in that subproject.
-- If a client does not discover a relevant skill automatically, read its `SKILL.md` directly and follow the nearest applicable `AGENTS.md`.
+- Skills follow the Agent Skills format. The source copy lives in `.agents/skills/` (root), `engine/.agents/skills/` or `editors/vscode/.agents/skills/`. Keep workflow text independent of any agent client, model, marketplace or plugin. Subproject skills apply to any agent working in that subproject.
+- Each tree has a byte-identical copy in the `.claude/skills/` next to it. Edit the `.agents/skills/` copy, then copy the change across. `skills-mirror-drift.yml` fails a PR when a pair differs. The repo tracks no symlinks: `ai-review.yml` refuses them.
+- If a client does not discover a skill, read its `SKILL.md` directly and follow the nearest `AGENTS.md`.
 
-> **Adversarial / red-team code review** (regardless of agent client): read [`AGENT_REVIEW.md`](AGENT_REVIEW.md) before reviewing engine changes. It is the grounded correctness profile — Rocky's real compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants, and the test-evidence bar.
+> **Red-team code review** (any agent client): read [`AGENT_REVIEW.md`](AGENT_REVIEW.md) before reviewing engine changes. It holds the compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants and the test-evidence bar.
 
 ## How they fit together
 
@@ -64,14 +63,11 @@ integrations/dagster ──(RockyClient)──▶  sdk/python ──▶  engine
 examples/playground ──(config)──▶  engine (rocky --config rocky.toml run)
 ```
 
-- `sdk/python` (`rocky-sdk`) invokes the `rocky` CLI via subprocess and parses JSON output into Pydantic models. The Python side does not depend on Rust source — only on the binary on `$PATH`.
-- `integrations/dagster` depends on `rocky-sdk`: `RockyResource` is a thin Dagster adapter that delegates to `RockyClient` and translates the SDK's `RockyError` hierarchy into `dagster.Failure`. In-repo dev/CI resolves the SDK via a `[tool.uv.sources]` path dependency; the published `dagster-rocky` wheel floors on `rocky-sdk>=…` from PyPI.
-- `editors/vscode` spawns `rocky lsp` as a language server over stdio. The TypeScript side does not depend on Rust source either.
-- `examples/playground` is read by `engine` at runtime; it has no code dependency on the engine source.
+Python and TypeScript code depend on the `rocky` binary on `$PATH`, never on Rust source. `integrations/dagster` resolves `rocky-sdk` through a `[tool.uv.sources]` path dependency in dev and CI. The published `dagster-rocky` wheel floors on `rocky-sdk>=…` from PyPI. `examples/playground` is read by the engine at runtime and has no code dependency on it.
 
 ## Cross-project changes (the reason this is one repo)
 
-DSL changes still touch multiple subprojects in lockstep. The monorepo lets you land them as one PR with one CI run.
+JSON-schema and DSL changes touch several subprojects in lockstep. Land them as one PR.
 
 **When modifying the CLI's JSON output schema (codegen-driven):** every `--output json` payload is a typed struct in `engine/crates/rocky-cli/src/output.rs` (or `commands/doctor.rs`) that derives `JsonSchema`. The Pydantic models (`sdk/python/src/rocky_sdk/types_generated/`, re-exported by `dagster_rocky.types`) and TypeScript interfaces (`editors/vscode/src/types/generated/`) are generated from it.
 
@@ -92,7 +88,7 @@ Steps, pitfalls and the per-consumer detail: the `rocky-codegen` skill.
 
 ## Build orchestration
 
-Top-level `justfile` orchestrates common tasks across all subprojects. Install [`just`](https://github.com/casey/just), then:
+The top-level `justfile` orchestrates tasks across subprojects. Install [`just`](https://github.com/casey/just), then:
 
 ```bash
 just build       # cargo build --release + uv build --wheel + npm compile
@@ -101,9 +97,9 @@ just lint        # cargo clippy/fmt + ruff + eslint
 just --list      # all recipes
 ```
 
-Each subproject's tools (`cargo`, `uv`, `npm`) work directly from inside the subproject directory. The `justfile` is a convenience, not a requirement.
+Each subproject's tools (`cargo`, `uv`, `npm`) also work directly in its directory.
 
-Some environments, cloud agent containers among them, have no `just` and no `cargo-nextest`. Then run the commands inside the matching `justfile` recipe directly, or install them (`cargo install just cargo-nextest --locked`). Any agent can install pinned, checksum-verified copies with `bash scripts/setup-agent-tools.sh` (Linux x86_64). It installs only a missing tool, never replaces an existing copy, always exits 0 and never turns on `.git-hooks/`. Run it from your client's setup step; set `AGENT_ENV_FILE` to a file your client sources to persist `PATH`. Claude Code cloud sessions run it automatically through `.claude/hooks/session-start.sh`. The engine CI runs `cargo nextest run --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`. A plain `cargo test` skips feature-gated code. `--all-features` builds need `cmake`, which CI installs.
+Some environments (cloud agent containers among them) have no `just` and no `cargo-nextest`. Run the commands inside the matching `justfile` recipe, or install them (`cargo install just cargo-nextest --locked`). Any agent can install pinned, checksum-verified copies with `bash scripts/setup-agent-tools.sh` (Linux x86_64). It installs only a missing tool, never replaces one, always exits 0 and never turns on `.git-hooks/`. Run it from your client's setup step; set `AGENT_ENV_FILE` to a file your client sources to persist `PATH`. Claude Code cloud sessions run it through `.claude/hooks/session-start.sh`. Engine CI runs `cargo nextest run --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`. A plain `cargo test` skips feature-gated code. `--all-features` builds need `cmake`, which CI installs.
 
 ## Releases
 
@@ -123,11 +119,6 @@ The CI release workflows, `just release-*` recipes and the `scripts/release.sh` 
 
 ## CI
 
-`.github/workflows/` contains path-filtered workflows. Touching a subproject triggers its own CI plus any cross-cutting gates whose path filters match — e.g. `engine/**` triggers both `engine-ci.yml` and `codegen-drift.yml`. Touching multiple subprojects triggers each relevant workflow independently.
-
-Cost-saving measures:
-- `engine-ci.yml` runs its jobs when a PR touches `engine/` or `schemas/`: nextest, clippy, fmt, an adapter-boundary lint, the browser UI checks and a release-build smoke test. The full table is in `CONTRIBUTING.md`. Coverage and security audit are in `engine-weekly.yml` (Monday schedule + manual dispatch).
-- `engine-bench.yml` only runs on PRs labeled `perf`.
-- Engine releases build all platforms in CI via `engine-release.yml`; `scripts/release.sh` is a local fallback.
+`.github/workflows/` holds path-filtered workflows. A subproject change triggers its own CI plus any cross-cutting gate whose filter matches (`engine/**` triggers `engine-ci.yml` and `codegen-drift.yml`). The full table is in `CONTRIBUTING.md`. `engine-weekly.yml` runs coverage and the security audit. `engine-bench.yml` runs only on PRs labeled `perf`.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full development guide.

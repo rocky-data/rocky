@@ -21,7 +21,7 @@ Only `rocky_source_sensor` sets a `run_key`. Dagster uses it to collapse repeat 
 
 ## Schedules
 
-Dagster's [`ScheduleDefinition`](https://docs.dagster.io/api/dagster/schedules-sensors#dagster.ScheduleDefinition) does the whole job. `build_rocky_schedule()` is a thin convenience. It takes the same `target=` shape as `rocky_source_sensor()`.
+`build_rocky_schedule()` wraps Dagster's [`ScheduleDefinition`](https://docs.dagster.io/api/dagster/schedules-sensors#dagster.ScheduleDefinition). It takes the same `target=` shape as `rocky_source_sensor()`. The snippets on this page share this setup:
 
 ```python
 import dagster as dg
@@ -29,6 +29,8 @@ from dagster_rocky import (
     RockyResource,
     build_rocky_schedule,
     load_rocky_assets,
+    rocky_eager_automation,
+    rocky_source_sensor,
 )
 
 rocky = RockyResource(config_path="rocky.toml")
@@ -41,11 +43,7 @@ daily_marts = build_rocky_schedule(
     timezone="America/Los_Angeles",
 )
 
-defs = dg.Definitions(
-    assets=rocky_assets,
-    schedules=[daily_marts],
-    resources={"rocky": rocky},
-)
+defs = dg.Definitions(assets=rocky_assets, schedules=[daily_marts], resources={"rocky": rocky})
 ```
 
 ### `build_rocky_schedule(name, cron_schedule, target, ...)`
@@ -60,35 +58,22 @@ defs = dg.Definitions(
 | `description` | `str \| None` | `None` | Human-readable description. |
 | `default_status` | `DefaultScheduleStatus` | `STOPPED` | Whether the schedule is enabled on deployment. |
 
-Every run gets the tag `rocky/schedule=<name>`. Filter the run history on that tag to see Rocky schedules only. Your own tags merge on top. If you set `rocky/schedule=<other>` yourself, your value wins. That is deliberate.
+Every run gets the tag `rocky/schedule=<name>`. Your own tags merge on top. If you set `rocky/schedule=<other>` yourself, your value wins.
 
 ## Automation conditions
 
 Dagster 1.12+ decides when to materialize an asset with an
-[`AutomationCondition`](https://docs.dagster.io/api/dagster/declarative-automation#dagster.AutomationCondition).
-The rule sits on the asset. Nothing pushes work at it. Both helpers keep you off `AutoMaterializePolicy`, deprecated in Dagster 1.8.
+[`AutomationCondition`](https://docs.dagster.io/api/dagster/declarative-automation#dagster.AutomationCondition) set on the asset. Both helpers replace `AutoMaterializePolicy`, deprecated in Dagster 1.8.
 
 ### `rocky_eager_automation()`
 
-Returns `dg.AutomationCondition.eager()`. The asset materializes whenever an upstream dependency updates. It waits for every upstream dependency to finish first. Attach it to source replication assets so they refresh when a Fivetran sync completes.
+Returns `dg.AutomationCondition.eager()`. The asset materializes whenever an upstream dependency updates, after every upstream dependency finishes. Attach it to source replication assets so they refresh when a Fivetran sync completes.
 
 ```python
-import dagster as dg
-from dagster_rocky import (
-    RockyResource,
-    load_rocky_assets,
-    rocky_eager_automation,
-)
-
-rocky = RockyResource(config_path="rocky.toml")
-specs = load_rocky_assets(rocky)
-
 eager_specs = [
     spec.replace_attributes(automation_condition=rocky_eager_automation())
-    for spec in specs
+    for spec in load_rocky_assets(rocky)
 ]
-
-defs = dg.Definitions(assets=eager_specs, resources={"rocky": rocky})
 ```
 
 ### `rocky_cron_automation(cron_schedule, timezone="UTC")`
@@ -106,31 +91,13 @@ spec = dg.AssetSpec(
 
 ## Sensors
 
-`rocky_source_sensor()` builds a Dagster
-[`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition).
-It polls `rocky discover` on a timer. It emits a `RunRequest` for any source whose upstream connector produced new data since the last tick. Your pipeline starts when Fivetran finishes a sync, not at the next scheduled run.
+`rocky_source_sensor()` builds a Dagster [`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition). It polls `rocky discover` and emits a `RunRequest` for any source whose connector produced new data since the last tick.
 
 ```python
-import dagster as dg
-from dagster_rocky import (
-    RockyResource,
-    load_rocky_assets,
-    rocky_source_sensor,
-)
-
-rocky = RockyResource(config_path="rocky.toml")
-rocky_assets = load_rocky_assets(rocky)
-
 # The sensor resolves the resource key "rocky" at evaluation time.
 fivetran_sync_sensor = rocky_source_sensor(
     target=dg.AssetSelection.assets(*[s.key for s in rocky_assets]),
     minimum_interval_seconds=300,  # poll every 5 minutes
-)
-
-defs = dg.Definitions(
-    assets=rocky_assets,
-    sensors=[fivetran_sync_sensor],
-    resources={"rocky": rocky},
 )
 ```
 
@@ -168,13 +135,9 @@ The warning names every id the engine reported in `failed_sources`. The backlog 
 
 ### Transient discover failures
 
-Source adapters can fail one at a time. A Fivetran 5xx or rate-limit window hits one connector. An Iceberg `list_tables` error hits one namespace. `rocky discover` reports these in `failed_sources` instead of dropping the connector from the output.
+An adapter can fail one source at a time (a Fivetran 5xx or rate limit, an Iceberg `list_tables` error). `rocky discover` reports these in `failed_sources` instead of dropping the source. Without that signal, a transient error looks like a source removed upstream, and a diff-based reconciler would shrink the asset graph.
 
-Without that signal, a transient error looks the same as a source removed upstream. A diff-based reconciler would then shrink the asset graph.
-
-So the sensor skips the cursor advance for failed ids. A flapping connector comes back for evaluation until one of two things happens. It succeeds, and the cursor advances. Or it is removed upstream, and it drops out of both `sources` and `failed_sources`.
-
-Healthy sources in the same tick still produce `RunRequest`s. A partial failure does not block the run.
+The sensor skips the cursor advance for failed ids. A flapping source comes back for evaluation until it succeeds, or until it is removed upstream and leaves both `sources` and `failed_sources`. Healthy sources in the same tick still produce `RunRequest`s.
 
 ### Granularity
 
@@ -187,9 +150,7 @@ Set it with `granularity=`.
 
 ### Cursor format
 
-The cursor is JSON-encoded `{source_id: ISO 8601 timestamp}`. State is per source, so each connector advances on its own. A new source does not replay history for the others.
-
-The sensor parses each timestamp into a Python `datetime` before it compares. It does not sort the strings. Mixed timezone offsets compare correctly.
+The cursor is JSON-encoded `{source_id: ISO 8601 timestamp}`. State is per source, so each connector advances on its own. The sensor compares parsed `datetime` values, so mixed timezone offsets compare correctly.
 
 ### RunRequest tags
 
@@ -199,29 +160,13 @@ The sensor parses each timestamp into a Python `datetime` before it compares. It
 | `rocky/sync_at` | The ISO timestamp that triggered the run |
 | `rocky/sensor` | The emitting sensor's name (used by the backlog cap's self-scoping) |
 
-They show in the run history, so you can see which sync triggered which run.
-
 ### Resource injection
 
-`rocky_resource` accepts either form:
-
-- **String key** (default `"rocky"`): Dagster resolves the resource from `context.resources` at evaluation time. Per-deployment overrides apply. Mock substitution through `dg.build_sensor_context(resources={...})` works without a wrapper. The resource does not need to exist before you build the sensor.
-- **`RockyResource` instance**: the legacy form. The sensor captures it in a closure at build time. It stays supported indefinitely, but use the keyed form in new code.
-
-```python
-# String-key form (recommended)
-sensor = rocky_source_sensor(target=...)
-
-# Custom resource key
-sensor = rocky_source_sensor(rocky_resource="my_rocky", target=...)
-
-# Instance form (legacy, still supported)
-sensor = rocky_source_sensor(rocky_resource=rocky, target=...)
-```
+`rocky_resource` accepts a **string key** (default `"rocky"`), which Dagster resolves from `context.resources` at evaluation time so per-deployment overrides and `dg.build_sensor_context(resources={...})` mocks work, or a **`RockyResource` instance** (legacy: captured at build time). Use the keyed form in new code: `rocky_source_sensor(rocky_resource="my_rocky", target=...)`.
 
 ### Backlog cap
 
-Pass `backlog_cap=BacklogCap(...)` to suppress emits when too many in-flight Dagster runs already share a tag value. Use it when a hung downstream can turn into a runaway queue. Without it, one stuck run piles up dozens of fresh `RunRequest`s for the same tenant.
+Pass `backlog_cap=BacklogCap(...)` to suppress emits when too many in-flight Dagster runs already share a tag value. Use it when a hung downstream can turn into a runaway queue. It is opt-in.
 
 ```python
 from dagster_rocky import BacklogCap, rocky_source_sensor
@@ -235,44 +180,17 @@ sensor = rocky_source_sensor(
 )
 ```
 
-Before each emit, the sensor counts the in-flight runs tagged `tag_key=<value>`. By default it counts the non-terminal statuses: `QUEUED`, `NOT_STARTED`, `STARTING`, and `STARTED`. Override that set with `BacklogCap.statuses`. If the count is at or above `max_in_flight`, the sensor suppresses the `RunRequest`.
+Before each emit, the sensor counts the in-flight runs tagged `tag_key=<value>`. By default it counts `QUEUED`, `NOT_STARTED`, `STARTING` and `STARTED`. Override that set with `BacklogCap.statuses`. At or above `max_in_flight`, the sensor suppresses the `RunRequest`. The count covers **this sensor's own runs** only (the `rocky/sensor=<name>` tag). Pass `BacklogCap(scope_tags={...})` to add exact-match tag filters.
 
-The count covers **this sensor's own runs** only. Every `RunRequest` carries a stable `rocky/sensor=<name>` tag, and the count filters on it. A co-tagged run from an unrelated job never trips the cap. Pass `BacklogCap(scope_tags={...})` to narrow the count with extra exact-match tag filters.
-
-**The cursor still advances on suppression.** The in-flight run picks up the latest data through Rocky's per-source state. A frozen cursor would make the failure worse. The next tick would re-detect the same sync and retry the same suppressed emit. It would never recover until the queue drained below the cap.
-
-`BacklogCap` is opt-in. With no cap, behavior is unchanged.
+**The cursor still advances on suppression.** The in-flight run picks up the latest data through Rocky's per-source state. A frozen cursor would retry the same suppressed emit on every tick until the queue drained.
 
 ### Lifecycle hooks
 
-Three optional best-effort callbacks attach metrics, alerts, or audit logs without wrapping the sensor:
+Three optional best-effort callbacks attach metrics, alerts, or audit logs without wrapping the sensor. Each takes a context object: `on_run_request_emitted` gets `EmitContext` (`run_request`, `sources`, `granularity`, `sensor_context`), `on_failed_sources` gets `FailedSourcesContext` (`failed_sources`, `sensor_context`), and `on_skip` gets `SkipContext` (`reason`, `cursor_size`, `sensor_context`).
 
 ```python
-from dagster_rocky import (
-    EmitContext,
-    FailedSourcesContext,
-    SkipContext,
-    rocky_source_sensor,
-)
-
-def record_emit(ec: EmitContext) -> None:
-    # ec.run_request, ec.sources, ec.granularity, ec.sensor_context
-    ...
-
-def alert_failed(fc: FailedSourcesContext) -> None:
-    # fc.failed_sources, fc.sensor_context
-    ...
-
-def gauge_idle(sc: SkipContext) -> None:
-    # sc.reason, sc.cursor_size, sc.sensor_context
-    ...
-
-sensor = rocky_source_sensor(
-    target=...,
-    on_run_request_emitted=record_emit,
-    on_failed_sources=alert_failed,
-    on_skip=gauge_idle,
-)
+sensor = rocky_source_sensor(target=..., on_run_request_emitted=record_emit,
+                             on_failed_sources=alert_failed, on_skip=gauge_idle)
 ```
 
 - **Best-effort.** Raised exceptions are caught and logged at WARN. A misbehaving hook never blocks an emit.
