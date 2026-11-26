@@ -82,15 +82,23 @@ export function CompactControls({
   jobs?: JobClient;
   onDone?: () => void;
 }) {
-  const plan = useJob("compact", jobs);
-  const apply = useJob("apply", jobs, onDone);
-  const [scope, setScope] = useState<Scope>("table");
-  const [table, setTable] = useState("");
-  const [catalog, setCatalog] = useState("");
+  const plan = useJob("compact", jobs, undefined, { label: "Plan optimize tables" });
+  const apply = useJob("apply", jobs, onDone, { subject: "optimize-tables", label: "Optimize tables" });
+  // A page that comes back to a job it started shows that job again: the
+  // inputs and the plan it is applying come from what the jobs were sent.
+  const sentTable = typeof plan.body?.table === "string" ? plan.body.table : null;
+  const sentCatalog = typeof plan.body?.catalog === "string" ? plan.body.catalog : null;
+  const [scope, setScope] = useState<Scope>(sentCatalog !== null ? "catalog" : "table");
+  const [table, setTable] = useState(sentTable ?? "");
+  const [catalog, setCatalog] = useState(sentCatalog ?? "");
   // What the plan job was started for, so a plan shown beside a different
   // input is dropped rather than applied under the wrong name.
-  const [plannedFor, setPlannedFor] = useState<string | null>(null);
-  const [applyingPlan, setApplyingPlan] = useState<string | null>(null);
+  const [plannedFor, setPlannedFor] = useState<string | null>(
+    sentTable !== null ? `table:${sentTable}` : sentCatalog !== null ? `catalog:${sentCatalog}` : null,
+  );
+  const [applyingPlan, setApplyingPlan] = useState<string | null>(
+    typeof apply.body?.plan_id === "string" ? apply.body.plan_id : null,
+  );
 
   const target = (scope === "table" ? table : catalog).trim();
   const key = `${scope}:${target}`;

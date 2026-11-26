@@ -1,3 +1,4 @@
+import { JobTray, JobTrayProvider, RunningJobs } from "./jobs/JobTray";
 import {
   Component,
   useEffect,
@@ -614,6 +615,7 @@ export function App({
           }
         }
       >
+      <JobTrayProvider>
       <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
         {/* The drawer, below `lg`. Mounted only while open. */}
         <Dialog
@@ -664,7 +666,7 @@ export function App({
           </div>
           <Wordmark className="flex" />
         </div>
-        {access !== null && !expired && <OperatorBanner access={access} />}
+        {access !== null && !expired && <OperatorBanner access={access} jobs={<RunningJobs />} />}
         </div>
 
         <main className="py-10 lg:pl-72">
@@ -681,7 +683,10 @@ export function App({
             )}
           </div>
         </main>
+        {/* A job outlives the page that started it; after expiry nothing can be read. */}
+        {!expired && <JobTray />}
       </div>
+      </JobTrayProvider>
       </WriteAccessProvider>
     </ErrorBoundary>
   );

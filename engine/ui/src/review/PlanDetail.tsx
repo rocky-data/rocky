@@ -470,9 +470,9 @@ function Approval({
   onChanged: () => void;
 }) {
   const access = useWriteAccess();
-  const approve = useJob("approve", jobs, onChanged);
-  const apply = useJob("apply", jobs, onChanged);
   const planId = status.plan_id;
+  const approve = useJob("approve", jobs, onChanged, { subject: planId, label: `Approve change ${planId.slice(0, 12)}` });
+  const apply = useJob("apply", jobs, onChanged, { subject: planId, label: `Apply change ${planId.slice(0, 12)}` });
   // Either key marks the plan as bound. The engine refuses a lone key, and
   // the page treats it as bound too, so it never offers a bare Apply.
   const productBound =

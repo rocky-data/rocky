@@ -104,7 +104,7 @@ export function ProductApprove({
   jobs?: JobClient;
   onDone?: () => void;
 }) {
-  const approve = useJob("product_approve", jobs, onDone);
+  const approve = useJob("product_approve", jobs, onDone, { subject: name, label: `Approve data product ${name}` });
   // The digest the person confirmed, for the comparison with the result.
   const [confirmed, setConfirmed] = useState<string | null>(null);
   const digest = approvableSpec(status);

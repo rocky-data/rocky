@@ -233,9 +233,26 @@ The **Project** screen has an **Optimize tables** panel. It runs `OPTIMIZE` and 
 
 The page never passes `--dry-run`, because that still writes an applicable plan. The plan step is the preview, and it takes no write slot. The panel has no archive option. See [What the UI cannot do](#what-the-ui-cannot-do).
 
+### Jobs in the corner
+
+Every job the page starts also gets a card in the bottom-right corner. The card stays when you open another screen. While any job runs, the top bar says how many: "1 job running". It counts only the jobs this browser tab started, because the engine has no list of jobs to read.
+
+| The job | Its card |
+|---|---|
+| Running | How long it has run, and **Cancel** in operator mode |
+| Succeeded | "Done" and how long it ran. The card closes after 6 seconds. |
+| Failed | The first line of the failure, with the rest under **Details**. It stays until you close it. |
+| Cancelled | "Cancelled". It stays until you close it. |
+| Not started | The job that holds the project. A second write is refused at once, never queued. |
+| Outcome unknown | The page could no longer read the job, which may have finished. Check Runs or the audit log first. |
+
+A card never starts a write again. A failed apply, approval or change freeze is started again from its own screen, behind that screen's confirm step. If you leave a screen while its job runs and come back, the screen shows that job again.
+
+The engine reports no progress while a job runs, and keeps no log the page can read. So a card shows neither.
+
 ### Cancel a running job
 
-While a job runs, operator mode shows a **Cancel** button under it (not on a read-only page). It calls `POST /api/v1/jobs/{id}/cancel`:
+While a job runs, operator mode shows a **Cancel** button under it, and on its card (not on a read-only page). It calls `POST /api/v1/jobs/{id}/cancel`:
 
 ```
 Cancel ─▶ SIGTERM to the job's process group (handled like Ctrl-C) ─▶ the button becomes "Force stop"

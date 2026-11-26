@@ -61,10 +61,11 @@ export function ProjectActions({
   /** Why Plan cannot help here ([`planUnavailable`]). */
   planDisabledReason?: string;
 }) {
-  const run = useJob("run", jobs, onDone);
-  const plan = useJob("plan", jobs, onDone);
-  const test = useJob("test", jobs, onDone);
-  const ci = useJob("ci", jobs, onDone);
+  const subject = model ?? "";
+  const run = useJob("run", jobs, onDone, { subject, label: `Run ${model ?? "the project"}` });
+  const plan = useJob("plan", jobs, onDone, { subject, label: `Plan a change to ${model ?? "the project"}` });
+  const test = useJob("test", jobs, onDone, { subject, label: `Test ${model ?? "the project"}` });
+  const ci = useJob("ci", jobs, onDone, { label: "CI" });
   const body = model === undefined ? {} : { model };
   const scope = model === undefined ? "the project" : model;
   const planned = plan.view.kind === "done" ? planIdOf(plan.view.job) : null;

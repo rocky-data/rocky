@@ -13,10 +13,13 @@
  */
 
 import { EyeIcon, ShieldExclamationIcon } from "@heroicons/react/20/solid";
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { JobKind, JobStatus } from "@rocky-types/job_status";
 import type { MetaTokenScope } from "@rocky-types/meta";
-import { ApiError, apiGet, apiPost } from "./api";
+import { ApiError } from "./api";
+import { JOB_POLL_MS, JobStore, defaultJobClient, idleRecord, jobKey } from "./jobs/store";
+import type { CancelView, JobClient, JobView } from "./jobs/store";
+import { JobStoreContext } from "./jobs/context";
 import { READ_BUTTON } from "./components";
 
 /** What the page may do. */
@@ -66,10 +69,10 @@ export const OPERATOR_MODE_LABEL = "Operator mode — changes run as this server
  * away stops being read. The pill keeps the same words, the same role and
  * the same place — the sticky top, above every lane — and stays amber.
  */
-export function OperatorBanner({ access }: { access: WriteAccess }) {
+export function OperatorBanner({ access, jobs }: { access: WriteAccess; jobs?: ReactNode }) {
   if (access.kind === "operator") {
     return (
-      <div className="flex justify-end border-b border-zinc-200 bg-white/90 px-4 py-1.5 backdrop-blur-sm sm:px-6 lg:px-8 dark:border-white/10 dark:bg-zinc-950/90">
+      <div className="flex flex-wrap items-center justify-end gap-2 border-b border-zinc-200 bg-white/90 px-4 py-1.5 backdrop-blur-sm sm:px-6 lg:px-8 dark:border-white/10 dark:bg-zinc-950/90">
         <div
           role="status"
           aria-label="Operator mode"
@@ -78,6 +81,7 @@ export function OperatorBanner({ access }: { access: WriteAccess }) {
           <ShieldExclamationIcon aria-hidden="true" className="size-3.5 shrink-0" />
           {OPERATOR_MODE_LABEL}
         </div>
+        {jobs}
       </div>
     );
   }
@@ -95,41 +99,8 @@ export function OperatorBanner({ access }: { access: WriteAccess }) {
   );
 }
 
-/** One job as the page follows it. */
-export type JobView =
-  | { kind: "idle" }
-  | { kind: "submitting" }
-  | { kind: "refused"; error: ApiError | Error }
-  | { kind: "running"; jobId: string }
-  | { kind: "done"; job: JobStatus };
-
-/** What `POST /api/v1/jobs/{id}/cancel` asked the job to do. */
-export type CancelSignal = "terminate" | "kill";
-
-/** The routes a job is submitted to, read from and cancelled at. Tests hand in fakes. */
-export interface JobClient {
-  submit: (kind: JobKind, body: Record<string, unknown>) => Promise<{ job_id: string }>;
-  status: (jobId: string) => Promise<JobStatus>;
-  cancel: (jobId: string) => Promise<{ job_id: string; signal: CancelSignal }>;
-}
-
-export const defaultJobClient: JobClient = {
-  submit: (kind, body) => apiPost<{ job_id: string }>(`jobs/${kind}`, body),
-  status: (jobId) => apiGet<JobStatus>(`jobs/${encodeURIComponent(jobId)}`),
-  cancel: (jobId) =>
-    apiPost<{ job_id: string; signal: CancelSignal }>(`jobs/${encodeURIComponent(jobId)}/cancel`, {}),
-};
-
-/**
- * Where the latest cancel request of the running job stands. The engine
- * sends the job SIGTERM on the first request (which `rocky run` handles like
- * Ctrl-C) and SIGKILL on the next.
- */
-export type CancelView =
-  | { kind: "idle" }
-  | { kind: "sending" }
-  | { kind: "sent"; signal: CancelSignal }
-  | { kind: "refused"; error: ApiError | Error };
+export type { CancelSignal, CancelView, JobClient, JobView } from "./jobs/store";
+export { JOB_POLL_MS, defaultJobClient } from "./jobs/store";
 
 /** The cancel control `useJob` hands to `JobLine`. */
 export interface JobCancel {
@@ -139,126 +110,73 @@ export interface JobCancel {
   request: () => void;
 }
 
-/** How often a running job is read again. */
-export const JOB_POLL_MS = 1_000;
+/** Where a job of this kind is kept, and what it is called in the tray. */
+export interface JobSlot {
+  /**
+   * What the job is about: a change id, a product, a model, a branch. Two
+   * controls with the same kind and subject share one job; leave a page and
+   * come back, and the control shows the job it started.
+   */
+  subject?: string;
+  /** The job in words, for its tray card. Defaults to the kind. */
+  label?: string;
+  /** How often a running job is read again (tests shorten it). */
+  pollMs?: number;
+}
 
 /**
- * Submit a job and follow it to the end by polling `GET /api/v1/jobs/{id}`.
- * `onDone` runs once with the terminal record, so the caller can refresh
- * what the job changed.
+ * Submit a job and follow it to the end. The shell's job store owns the
+ * reads (`JobTrayProvider`), so the job outlives this page; without a shell
+ * the hook keeps a private store that ends with the page. `onDone` runs once
+ * with the terminal record while this page is shown, so the caller can
+ * refresh what the job changed.
  */
 export function useJob(
   kind: JobKind,
   client: JobClient = defaultJobClient,
   onDone?: (job: JobStatus) => void,
-  pollMs: number = JOB_POLL_MS,
-): { view: JobView; start: (body?: Record<string, unknown>) => void; cancel: JobCancel } {
-  const [view, setView] = useState<JobView>({ kind: "idle" });
-  const [cancelView, setCancelView] = useState<CancelView>({ kind: "idle" });
-  const [stopping, setStopping] = useState(false);
-  // A second cancel click before the first answers is ignored, like `start`.
-  const cancelInFlight = useRef(false);
+  slot: JobSlot = {},
+): {
+  view: JobView;
+  /** What the job in this slot was submitted with, or `null` before any. */
+  body: Record<string, unknown> | null;
+  start: (body?: Record<string, unknown>) => void;
+  cancel: JobCancel;
+} {
+  const shared = useContext(JobStoreContext);
+  const [own] = useState(() => (shared === null ? new JobStore(slot.pollMs ?? JOB_POLL_MS) : null));
+  useEffect(() => {
+    if (own === null) return;
+    // StrictMode mounts twice in development: the second mount revives it.
+    own.revive();
+    return () => own.dispose();
+  }, [own]);
+  const store = shared ?? (own as JobStore);
+  const key = jobKey(kind, slot.subject);
+  const label = slot.label ?? kind;
+  const [idle] = useState(() => idleRecord(key, kind, label));
+  const record = useSyncExternalStore(
+    store.subscribe,
+    () => store.get(key) ?? idle,
+  );
+
   const done = useRef(onDone);
   useEffect(() => {
     done.current = onDone;
   }, [onDone]);
-  const alive = useRef(true);
-  useEffect(() => {
-    alive.current = true;
-    return () => {
-      alive.current = false;
-    };
-  }, []);
-
-  // A second start while one job is in flight is ignored, even when two
-  // clicks land before React re-renders the button disabled.
-  const inFlight = useRef(false);
-  const settle = useCallback((next: JobView) => {
-    inFlight.current = false;
-    setView(next);
-  }, []);
-
-  const follow = useCallback(
-    (jobId: string) => {
-      const tick = () => {
-        client
-          .status(jobId)
-          .then((job) => {
-            if (!alive.current) return;
-            if (job.state === "running" || job.state === "queued") {
-              setTimeout(tick, pollMs);
-              return;
-            }
-            settle({ kind: "done", job });
-            done.current?.(job);
-          })
-          .catch((error: unknown) => {
-            if (!alive.current) return;
-            settle({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
-          });
-      };
-      tick();
-    },
-    [client, pollMs, settle],
-  );
+  useEffect(() => store.onDone(key, (job) => done.current?.(job)), [store, key]);
 
   const start = useCallback(
-    (body: Record<string, unknown> = {}) => {
-      if (inFlight.current) return;
-      inFlight.current = true;
-      setCancelView({ kind: "idle" });
-      setStopping(false);
-      setView({ kind: "submitting" });
-      client
-        .submit(kind, body)
-        .then(({ job_id }) => {
-          if (!alive.current) return;
-          setView({ kind: "running", jobId: job_id });
-          follow(job_id);
-        })
-        .catch((error: unknown) => {
-          if (!alive.current) return;
-          settle({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
-        });
-    },
-    [client, kind, follow, settle],
+    (body: Record<string, unknown> = {}) => store.start(key, kind, label, client, body),
+    [store, key, kind, label, client],
   );
-
-  // Cancel the job this hook is following. The job keeps being polled: its
-  // final state (`cancelled`, or `succeeded` if it finished first) is what
-  // the line shows in the end.
-  //
-  // An answer is applied only while the same job is still the one shown: a
-  // late answer for an earlier job must not mark a newer one as stopping.
-  const jobId = view.kind === "running" ? view.jobId : null;
-  const shownJob = useRef<string | null>(null);
-  useEffect(() => {
-    shownJob.current = jobId;
-  }, [jobId]);
-  const requestCancel = useCallback(() => {
-    if (jobId === null || cancelInFlight.current) return;
-    cancelInFlight.current = true;
-    setCancelView({ kind: "sending" });
-    const current = () => alive.current && shownJob.current === jobId;
-    client
-      .cancel(jobId)
-      .then(({ signal }) => {
-        cancelInFlight.current = false;
-        if (!current()) return;
-        if (signal === "terminate") setStopping(true);
-        setCancelView({ kind: "sent", signal });
-      })
-      .catch((error: unknown) => {
-        cancelInFlight.current = false;
-        if (!current()) return;
-        setCancelView({ kind: "refused", error: error instanceof Error ? error : new Error(String(error)) });
-      });
-  }, [client, jobId]);
+  const request = useCallback(() => store.cancel(key), [store, key]);
 
   return {
-    view,
+    view: record.view,
+    body: record.body,
     start,
-    cancel: { view: cancelView, stopping, request: requestCancel },
+    cancel: { view: record.cancel, stopping: record.stopping, request },
   };
 }
 
@@ -536,6 +454,13 @@ export function JobLine({ label, view, cancel }: { label: string; view: JobView;
         </p>
       );
     }
+    case "lost":
+      return (
+        <p role="status" className="text-xs text-warn-ink">
+          {label}: outcome unknown. The page lost track of job <code>{view.jobId}</code>, which may have
+          finished. Check Runs or the audit log before you try again.
+        </p>
+      );
     case "done":
       if (view.job.state === "cancelled") {
         return (

@@ -147,7 +147,7 @@ export function PreviewControls({
   jobs?: JobClient;
   onDone?: () => void;
 }) {
-  const preview = useJob("preview", jobs, onDone);
+  const preview = useJob("preview", jobs, onDone, { label: "Create branch" });
   const [name, setName] = useState("");
   const [base, setBase] = useState("");
   const nameValue = name.trim();

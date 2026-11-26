@@ -114,14 +114,18 @@ function PromotePanel({
   onDone?: () => void;
 }) {
   const branches = useResource(useCallback(() => loadBranches(), [loadBranches]), [loadBranches]);
-  const plan = useJob("promote", jobs);
-  const apply = useJob("apply", jobs, onDone);
-  const [chosen, setChosen] = useState("");
+  const plan = useJob("promote", jobs, undefined, { label: "Plan promote branch" });
+  const apply = useJob("apply", jobs, onDone, { subject: "promote-branch", label: "Promote branch" });
+  // A page that comes back to a job it started shows that job again.
+  const sentBranch = typeof plan.body?.name === "string" ? plan.body.name : null;
+  const [chosen, setChosen] = useState(sentBranch ?? "");
   // The branch the plan job was started for. A plan shown beside a different
   // selection would be applied under the wrong name.
-  const [plannedFor, setPlannedFor] = useState<string | null>(null);
+  const [plannedFor, setPlannedFor] = useState<string | null>(sentBranch);
   // The plan the apply job was started for, for the same reason.
-  const [applyingPlan, setApplyingPlan] = useState<string | null>(null);
+  const [applyingPlan, setApplyingPlan] = useState<string | null>(
+    typeof apply.body?.plan_id === "string" ? apply.body.plan_id : null,
+  );
 
   if (branches.kind !== "ready") {
     return <ResourceState resource={branches} loadingLine="reading the branches…" />;

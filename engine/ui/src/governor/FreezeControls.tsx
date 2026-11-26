@@ -133,11 +133,11 @@ function UnfreezeRow({
   jobs: JobClient;
   onChanged: () => void;
 }) {
-  const unfreeze = useJob("unfreeze", jobs, onChanged);
   const unreadable = freeze.unreadable_marker === true;
   const name = unreadable
     ? "unreadable marker (agent and human) on every model"
     : `${freeze.principal} on ${scopeWords(freeze.scope)}`;
+  const unfreeze = useJob("unfreeze", jobs, onChanged, { subject: name, label: `Lift change freeze: ${name}` });
   return (
     <li className="space-y-1">
       <div className="flex flex-wrap items-center gap-2">
@@ -176,7 +176,7 @@ export function FreezeControls({
   jobs?: JobClient;
   onChanged: () => void;
 }) {
-  const freeze = useJob("freeze", jobs, onChanged);
+  const freeze = useJob("freeze", jobs, onChanged, { label: "Start change freeze" });
   const [principal, setPrincipal] = useState<FreezePrincipal>("both");
   const [scope, setScope] = useState("");
   const [reason, setReason] = useState("");
