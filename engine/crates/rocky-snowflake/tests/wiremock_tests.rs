@@ -1779,3 +1779,78 @@ async fn test_list_tables_quotes_the_database_as_written() {
         .expect("list_tables should succeed");
     assert_eq!(tables, ["orders"]);
 }
+
+/// A forced exit cancels a statement still polling: the adapter lists its
+/// handle while the poll runs, and `cancel_statement` sends the cancel request
+/// for exactly that handle. The statement goes through one connector and the
+/// cancel through the adapter's own, sharing one in-flight list, as the
+/// registry wires them.
+#[tokio::test]
+async fn test_in_flight_statement_is_listed_and_cancelled() {
+    use rocky_core::statement_cancel::{CancelOutcome, InFlightStatements, StatementHandle};
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_snowflake::adapter::SnowflakeWarehouseAdapter;
+
+    let server = MockServer::start().await;
+    let executing = serde_json::json!({
+        "statementHandle": "sf-long",
+        "code": "333334",
+        "message": "Asynchronous execution in progress.",
+        "statementStatusUrl": "/api/v2/statements/sf-long",
+        "resultSetMetaData": null,
+        "data": null
+    });
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(executing.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-long"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(executing))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements/sf-long/cancel"))
+        .and(header("Authorization", "Bearer test-sf-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "000604",
+            "message": "Statement canceled.",
+            "statementHandle": "sf-long"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let in_flight = InFlightStatements::new();
+    let running = test_connector(&server).with_in_flight(in_flight.clone());
+    let adapter = SnowflakeWarehouseAdapter::new(test_connector(&server).with_in_flight(in_flight));
+    assert!(adapter.in_flight_statements().is_empty());
+
+    let statement = tokio::spawn(async move { running.execute_statement("SELECT 1").await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let listed = loop {
+        let listed = adapter.in_flight_statements();
+        if !listed.is_empty() {
+            break listed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the statement was never listed as in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(listed, vec![StatementHandle::new("sf-long")]);
+
+    let outcome = adapter.cancel_statement(&listed[0]).await.unwrap();
+    assert_eq!(outcome, CancelOutcome::Requested);
+
+    statement.abort();
+    let _ = statement.await;
+    assert!(
+        adapter.in_flight_statements().is_empty(),
+        "a statement nobody waits on must leave the list"
+    );
+    // `.expect(1)` on the cancel mock asserts the request on drop.
+}

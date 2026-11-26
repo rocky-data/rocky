@@ -537,6 +537,38 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Execute a SQL statement (DDL/DML) without returning rows.
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;
 
+    /// The statements this adapter waits on now, from every connector it
+    /// owns. See [`crate::statement_cancel`].
+    ///
+    /// Default: none. An adapter that overrides
+    /// [`Self::cancel_statement`] must also list its statements here, or
+    /// nothing ever asks it to cancel one.
+    fn in_flight_statements(&self) -> Vec<crate::statement_cancel::StatementHandle> {
+        Vec::new()
+    }
+
+    /// Ask the warehouse to cancel one statement that
+    /// [`Self::in_flight_statements`] listed.
+    ///
+    /// `rocky run` calls this only on a forced exit, the path that stops
+    /// waiting on statements that still run. The caller bounds the call with
+    /// its own timeout.
+    ///
+    /// Default: [`CancelOutcome::Unsupported`](crate::statement_cancel::CancelOutcome::Unsupported),
+    /// with nothing sent. Every adapter in this workspace overrides it, so
+    /// each one states its support where it is implemented.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterError` when the cancel request fails: transport,
+    /// auth, or a non-success response.
+    async fn cancel_statement(
+        &self,
+        _handle: &crate::statement_cancel::StatementHandle,
+    ) -> AdapterResult<crate::statement_cancel::CancelOutcome> {
+        Ok(crate::statement_cancel::CancelOutcome::Unsupported)
+    }
+
     /// Execute a SQL statement and return the warehouse-reported
     /// [`ExecutionStats`] (bytes scanned, bytes written, rows affected).
     ///
