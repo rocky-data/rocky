@@ -145,7 +145,7 @@ describe("BriefScreen", () => {
   it("renders every section by its availability, with every citation as text", async () => {
     const load = vi.fn(async () => BRIEF);
     render(<BriefScreen load={load} now={NOW} />);
-    const needs = await screen.findByRole("region", { name: "Needs you" });
+    const needs = await screen.findByRole("region", { name: "Waiting on you" });
     expect(within(needs).getByRole("link", { name: PLAN })).toHaveAttribute(
       "href",
       `/ui/governor/custody/${PLAN}`,
@@ -161,9 +161,13 @@ describe("BriefScreen", () => {
     expect(within(freeze).getByText("freeze")).toBeInTheDocument();
     expect(within(activity).getByText(/2 policy evaluations: 1 allow/)).toBeInTheDocument();
 
+    // A run that needs attention is acted on from the waiting card; the Runs
+    // section keeps the counts and points there.
+    expect(within(needs).getByText("run-attention-1")).toBeInTheDocument();
+    expect(within(needs).getByText("dim_customer (failed)")).toBeInTheDocument();
+    expect(within(needs).getByText("Run partly failed")).toBeInTheDocument();
     const runs = screen.getByRole("region", { name: "Runs" });
-    expect(within(runs).getByText("run-attention-1")).toBeInTheDocument();
-    expect(within(runs).getByText("dim_customer (failed)")).toBeInTheDocument();
+    expect(within(runs).getByText(/1 run needs attention, listed under Waiting on you/)).toBeInTheDocument();
 
     const drift = screen.getByRole("region", { name: "Drift" });
     expect(within(drift).getByText("nothing in the window")).toBeInTheDocument();
@@ -192,28 +196,83 @@ describe("BriefScreen", () => {
     expect(load).toHaveBeenCalledWith("7d");
   });
 
-  it("leads with one summary line, an inbox card per escalation and an effect bar", async () => {
+  it("leads with one status sentence, a card per plan and an effect bar", async () => {
     render(<BriefScreen load={async () => BRIEF} now={NOW} />);
-    const summary = await screen.findByRole("list", { name: "Summary" });
-    expect(within(summary).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
-      "1 decision waits on you",
-      "1 partial of 3 runs",
-      "1 freeze(s), 1 degraded rule(s)",
-    ]);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(summary.textContent).toBe(
+      "1 plan waits on you (1 decision), 1 run needs attention, 1 freeze in force, 1 degraded rule.",
+    );
 
     // The card opens the plan in Review, and still cites its custody chain:
     // the link shows a cut id and keeps the whole one as its name.
-    const needs = screen.getByRole("region", { name: "Needs you" });
+    const needs = screen.getByRole("region", { name: "Waiting on you" });
     expect(within(needs).getByRole("link", { name: "Review plan" })).toHaveAttribute(
       "href",
       `/ui/review/${PLAN}`,
     );
     expect(within(needs).getByRole("link", { name: PLAN }).textContent).toBe(`${"a".repeat(12)}…`);
+    expect(within(needs).getByText("breaking change to a contract column")).toBeInTheDocument();
 
     const activity = screen.getByRole("region", { name: "Agent activity" });
     expect(within(activity).getByRole("img")).toHaveAccessibleName(
       "1 allowed, 1 needed review, 0 denied",
     );
+  });
+
+  it("groups decisions by plan and says a reason they all share once, as their cause", async () => {
+    const one = BRIEF.escalations.pending[0];
+    const pending = ["customers", "orders", "products"].map((model, index) => ({
+      ...one,
+      model,
+      capability: "apply" as const,
+      reason: "no rule matched; default_agent_effect",
+      decision_ref: `decision:esc-${index}`,
+    }));
+    render(
+      <BriefScreen
+        load={async () => ({ ...BRIEF, escalations: { ...BRIEF.escalations, total: 3, pending } })}
+        now={NOW}
+      />,
+    );
+    const needs = await screen.findByRole("region", { name: "Waiting on you" });
+    expect(within(needs).getByText("Shared cause of all 3 decisions:")).toBeInTheDocument();
+    expect(within(needs).getAllByText("no rule matched; default_agent_effect")).toHaveLength(1);
+    // One plan is one row, whatever the number of models it touches.
+    expect(within(needs).getAllByRole("link", { name: "Review plan" })).toHaveLength(1);
+    expect(within(needs).getByText("2 items · 1 shared cause")).toBeInTheDocument();
+    for (const ref of ["decision:esc-0", "decision:esc-1", "decision:esc-2"]) {
+      expect(within(needs).getByText(ref)).toBeInTheDocument();
+    }
+    expect((await screen.findByRole("region", { name: "Summary" })).textContent).toMatch(
+      /^1 plan waits on you \(3 decisions\)/,
+    );
+  });
+
+  it("says nothing needs you only when every section behind it was read", async () => {
+    const quiet = {
+      ...BRIEF,
+      escalations: { ...BRIEF.escalations, total: 0, pending: [] },
+      runs: { ...BRIEF.runs, partial_failure: 0, succeeded: 3, attention: [] },
+      autonomy: { ...BRIEF.autonomy, degraded_rules: [], active_freezes: [] },
+    };
+    const { unmount } = render(<BriefScreen load={async () => quiet} now={NOW} />);
+    expect((await screen.findByRole("region", { name: "Summary" })).textContent).toBe(
+      "Nothing needs you. 3 of 3 runs succeeded, no freeze, no degraded rule.",
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Waiting on you" })).getByText("You're all caught up"),
+    ).toBeInTheDocument();
+    unmount();
+
+    render(
+      <BriefScreen
+        load={async () => ({ ...quiet, runs: { ...quiet.runs, availability: "unavailable" } })}
+        now={NOW}
+      />,
+    );
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(summary.textContent).not.toMatch(/Nothing needs you/);
+    expect(summary.textContent).toMatch(/Runs: not recorded\./);
   });
 
   it("never counts a section it could not read in the summary line", async () => {
@@ -226,9 +285,12 @@ describe("BriefScreen", () => {
         now={NOW}
       />,
     );
-    const summary = await screen.findByRole("list", { name: "Summary" });
-    expect(summary.textContent).not.toMatch(/waits on you|no escalation/);
-    expect(within(summary).getAllByRole("listitem")[0].textContent).toBe("escalations: not recorded");
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(summary.textContent).not.toMatch(/waits on you|Nothing needs you/);
+    expect(summary.textContent).toMatch(/Escalations: not recorded\./);
+    expect(
+      within(screen.getByRole("region", { name: "Waiting on you" })).getByText(/^Escalations: not recorded/),
+    ).toBeInTheDocument();
   });
 
   it("says a quiet window in the section's own words", async () => {
@@ -242,12 +304,8 @@ describe("BriefScreen", () => {
         now={NOW}
       />,
     );
-    const summary = await screen.findByRole("list", { name: "Summary" });
-    expect(within(summary).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
-      "no escalation is pending",
-      "no runs in the window",
-      "1 freeze(s), 1 degraded rule(s)",
-    ]);
+    const summary = await screen.findByRole("region", { name: "Summary" });
+    expect(summary.textContent).toBe("1 freeze in force, 1 degraded rule. No runs in the window.");
   });
 
   it("renders a hostile reason as text, never as markup", async () => {
@@ -259,7 +317,7 @@ describe("BriefScreen", () => {
   it("changes the window through the selector and shows the window it got", async () => {
     const load = vi.fn(async (since: BriefOutput["since_mode"]) => ({ ...BRIEF, since_mode: since }));
     render(<BriefScreen load={load} now={NOW} />);
-    await screen.findByRole("region", { name: "Needs you" });
+    await screen.findByRole("region", { name: "Waiting on you" });
     fireEvent.change(screen.getByLabelText("Window"), { target: { value: "24h" } });
     await waitFor(() => expect(load).toHaveBeenCalledWith("24h"));
     expect(await screen.findByText("GET /api/v1/brief?since=24h")).toBeInTheDocument();

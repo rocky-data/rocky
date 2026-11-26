@@ -15,3 +15,58 @@
     color-scheme: light dark;
   }
 }
+
+/*
+ * Rocky theme tokens (design: "Rocky UI redesign", Design rules board).
+ * Semantic names, so a screen says what a colour is for, not which shade it
+ * is: `bg-surface`, `text-muted`, `border-line`, `bg-warn-soft text-warn-ink`.
+ * Dark values follow `prefers-color-scheme`, the same rule as `dark:`, so a
+ * token and a `dark:` class never disagree. Screens move to the tokens one at
+ * a time; until then the zinc classes keep working beside them.
+ */
+:root {
+  --r-bg: #f7f7f5;        --r-surface: #ffffff;    --r-surface-2: #fbfbfa;
+  --r-hover: #ededea;     --r-line: #e7e7e4;       --r-divider: #f0f0ed;
+  --r-ink: #18181b;       --r-ink-2: #3f3f46;      --r-muted: #5c5c66;
+  --r-accent: #f97316;    --r-accent-ink: #c2410c;
+  --r-ok: #16a34a;        --r-ok-soft: #dcfce7;    --r-ok-ink: #166534;
+  --r-warn: #f59e0b;      --r-warn-soft: #fef3c7;  --r-warn-ink: #92400e;
+  --r-fail: #dc2626;      --r-fail-soft: #fef2f2;  --r-fail-ink: #991b1b;
+  --r-block: #2563eb;     --r-block-soft: #dbeafe; --r-block-ink: #1e40af;
+  --r-agent-soft: #f3e8ff; --r-agent-ink: #6b21a8;
+  --r-human-soft: #e0f2f1; --r-human-ink: #115e59;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --r-bg: #0e1014;        --r-surface: #171a1f;    --r-surface-2: #121418;
+    --r-hover: #23262c;     --r-line: #2a2e35;       --r-divider: #22252b;
+    --r-ink: #ececef;       --r-ink-2: #c4c4cc;      --r-muted: #9d9da8;
+    --r-accent: #f97316;    --r-accent-ink: #fb923c;
+    --r-ok: #22c55e;        --r-ok-soft: #0f2a1a;    --r-ok-ink: #86efac;
+    --r-warn: #f59e0b;      --r-warn-soft: #3a2c0c;  --r-warn-ink: #fcd34d;
+    --r-fail: #dc2626;      --r-fail-soft: #2a1214;  --r-fail-ink: #fca5a5;
+    --r-block: #2563eb;     --r-block-soft: #14233f; --r-block-ink: #93c5fd;
+    --r-agent-soft: #2a1a3d; --r-agent-ink: #d8b4fe;
+    --r-human-soft: #0e2a28; --r-human-ink: #5eead4;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--r-bg);           --color-surface: var(--r-surface);   --color-surface-2: var(--r-surface-2);
+  --color-hover: var(--r-hover);     --color-line: var(--r-line);         --color-divider: var(--r-divider);
+  --color-ink: var(--r-ink);         --color-ink-2: var(--r-ink-2);       --color-muted: var(--r-muted);
+  --color-accent: var(--r-accent);   --color-accent-ink: var(--r-accent-ink);
+  --color-ok: var(--r-ok);           --color-ok-soft: var(--r-ok-soft);       --color-ok-ink: var(--r-ok-ink);
+  --color-warn: var(--r-warn);       --color-warn-soft: var(--r-warn-soft);   --color-warn-ink: var(--r-warn-ink);
+  --color-fail: var(--r-fail);       --color-fail-soft: var(--r-fail-soft);   --color-fail-ink: var(--r-fail-ink);
+  --color-block: var(--r-block);     --color-block-soft: var(--r-block-soft); --color-block-ink: var(--r-block-ink);
+  --color-agent-soft: var(--r-agent-soft); --color-agent-ink: var(--r-agent-ink);
+  --color-human-soft: var(--r-human-soft); --color-human-ink: var(--r-human-ink);
+  --radius-chip: 6px; --radius-ctl: 8px; --radius-tile: 10px; --radius-card: 12px;
+}
+
+@utility r-card { @apply rounded-card border border-line bg-surface; }
+@utility r-row { @apply flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-divider px-5 py-4; }
+@utility r-tag-agent { @apply rounded-chip bg-agent-soft px-2 py-0.5 text-xs font-medium text-agent-ink; }
+@utility r-tag-human { @apply rounded-chip bg-human-soft px-2 py-0.5 text-xs font-medium text-human-ink; }
+@utility r-id { @apply font-mono text-xs text-muted; }

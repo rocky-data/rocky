@@ -1,8 +1,8 @@
 import { useCallback, useState } from "react";
-import type { BriefOutput, BriefSinceMode, SectionAvailability } from "@rocky-types/brief";
+import type { BriefDecisionEntry, BriefOutput, BriefRunEntry, BriefSinceMode } from "@rocky-types/brief";
 import { apiGet } from "../api";
 import { ArrowPathIcon, ArrowRightIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
-import { Clip, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, type Tone } from "../components";
+import { Clip, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, runStatusTone } from "../components";
 import { useResource } from "../estate/useResource";
 import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded } from "../format";
 import { reviewPath } from "../review/paths";
@@ -119,7 +119,6 @@ function BriefBody({
   onChanged: () => void;
 }) {
   const {
-    escalations,
     agent_activity: activity,
     runs,
     autonomy,
@@ -131,60 +130,18 @@ function BriefBody({
   } = brief;
   return (
     <div className="space-y-5">
-      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+      <StatusLine brief={brief} />
+
+      <p className="text-xs text-muted">
         Digest generated {formatInstant(brief.generated_at, now)}, window <code>{brief.since_mode}</code>
         {brief.since_timestamp ? ` from ${formatInstant(brief.since_timestamp)}` : ", all of recorded history"}
         . Read from <code>GET /api/v1/brief?since={brief.since_mode}</code>.
       </p>
 
-      <Headline brief={brief} />
 
-      <SectionCard
-        title="Needs you"
-        availability={escalations.availability}
-        note={escalations.note}
-        emptyLine="no escalation is pending"
-        summary={`${escalations.total} pending, ranked by ${escalations.ranking}`}
-      >
-        <ul aria-label="Pending escalations" className="space-y-3">
-          {escalations.pending.map((entry) => (
-            <li
-              key={entry.decision_ref}
-              className="flex flex-wrap items-start gap-x-4 gap-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-700"
-            >
-              <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
-                <ExclamationTriangleIcon aria-hidden="true" className="size-5" />
-              </span>
-              <div className="min-w-0 flex-[1_1_20rem] space-y-1">
-                <p className="flex flex-wrap items-center gap-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-                  <span className="font-mono break-all">{entry.model}</span>
-                  <span className="rounded-md bg-zinc-100 px-1.5 py-0.5 font-mono text-xs font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
-                    {entry.capability}
-                  </span>
-                </p>
-                <p className="text-sm text-zinc-700 dark:text-zinc-300">{entry.reason}</p>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                  {entry.principal} · {formatInstant(entry.timestamp, now)} · plan{" "}
-                  <CustodyLink subject={entry.plan_id} clip /> · <Clip value={entry.decision_ref} keepEnds />
-                </p>
-              </div>
-              <a
-                href={reviewPath(entry.plan_id)}
-                onClick={(event) => {
-                  event.preventDefault();
-                  navigateTo(reviewPath(entry.plan_id));
-                }}
-                // A navigation, so the read look: solid orange is kept for
-                // the writes that change something.
-                className={`${READ_BUTTON} shrink-0`}
-              >
-                Review plan
-                <ArrowRightIcon aria-hidden="true" className="size-4" />
-              </a>
-            </li>
-          ))}
-        </ul>
-      </SectionCard>
+      <WaitingCard brief={brief} now={now} />
+
+      <h3 className="pt-2 text-xs font-semibold tracking-wider text-muted uppercase">Details</h3>
 
       <SectionCard
         title="Agent activity"
@@ -238,18 +195,10 @@ function BriefBody({
             no run needs attention
           </p>
         ) : (
-          <Rows
-            ariaLabel="Runs needing attention"
-            columns={["run", "status", "trigger", "started", "finished", "failed models"]}
-            rows={runs.attention.map((run) => [
-              <CustodyLink key={run.run_id} subject={run.run_id} />,
-              run.status,
-              run.trigger,
-              formatInstant(run.started_at, now),
-              formatInstant(run.finished_at, now),
-              run.failed_models.map((m) => `${m.model_name} (${m.status})`).join(", ") || "none",
-            ])}
-          />
+          <p className="text-sm text-ink-2">
+            {runs.attention.length} {runs.attention.length === 1 ? "run needs" : "runs need"} attention, listed
+            under Waiting on you.
+          </p>
         )}
       </SectionCard>
 
@@ -390,76 +339,243 @@ function BriefBody({
   );
 }
 
+function plural(count: number, one: string, many = `${one}s`): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+function capitalize(text: string): string {
+  return text.length === 0 ? text : text[0].toUpperCase() + text.slice(1);
+}
+
 /**
- * One line over the whole digest: what waits on a person, how the runs
- * went, whether autonomy is curtailed. A section that is not available is
- * said so, never counted as zero.
+ * The screen's first line, as one sentence: what waits on a person first,
+ * then what is fine. A section that could not be read is named as such on
+ * its own line and never counted as zero, so "Nothing needs you" is said
+ * only when every section behind it was read.
  */
-function Headline({ brief }: { brief: BriefOutput }) {
+function StatusLine({ brief }: { brief: BriefOutput }) {
   const { escalations, runs, autonomy } = brief;
-  const chips: { key: string; tone: Tone; text: string }[] = [];
-  // `no_data` is a real answer ("nothing in the window") and says so in the
-  // section's own words; `unavailable` is no answer and says only that.
-  const quiet = (key: string, availability: SectionAvailability, empty: string, name: string) => {
-    if (availability === "no_data") chips.push({ key, tone: "ok", text: empty });
-    if (availability === "unavailable") chips.push({ key, tone: "muted", text: `${name}: ${NOT_RECORDED}` });
-  };
-  if (escalations.availability === "available") {
-    chips.push({
-      key: "escalations",
-      tone: escalations.total > 0 ? "warn" : "ok",
-      text:
-        escalations.total === 0
-          ? "no escalation is pending"
-          : `${escalations.total} ${escalations.total === 1 ? "decision waits" : "decisions wait"} on you`,
-    });
-  } else {
-    quiet("escalations", escalations.availability, "no escalation is pending", "escalations");
+  const act: string[] = [];
+  const fine: string[] = [];
+  const unread: string[] = [];
+
+  if (escalations.availability === "available" && escalations.pending.length > 0) {
+    const plans = new Set(escalations.pending.map((entry) => entry.plan_id)).size;
+    act.push(
+      `${plural(plans, "plan")} ${plans === 1 ? "waits" : "wait"} on you (${plural(escalations.total, "decision")})`,
+    );
+  } else if (escalations.availability === "unavailable") {
+    unread.push("escalations");
   }
-  if (runs.availability !== "available") {
-    quiet("runs", runs.availability, "no runs in the window", "runs");
+
+  if (runs.availability === "available") {
+    if (runs.attention.length > 0) {
+      act.push(`${plural(runs.attention.length, "run")} ${runs.attention.length === 1 ? "needs" : "need"} attention`);
+    } else {
+      fine.push(`${runs.succeeded} of ${runs.total} runs succeeded`);
+    }
+  } else if (runs.availability === "no_data") {
+    fine.push("no runs in the window");
   } else {
-    const bad = runs.failed + runs.partial_failure;
-    chips.push({
-      key: "runs",
-      tone: runs.failed > 0 ? "risk" : bad > 0 ? "warn" : "ok",
-      text:
-        bad === 0
-          ? `runs healthy: ${runs.succeeded} of ${runs.total} succeeded`
-          : `${[
-              runs.failed > 0 ? `${runs.failed} failed` : null,
-              runs.partial_failure > 0 ? `${runs.partial_failure} partial` : null,
-            ]
-              .filter((part) => part !== null)
-              .join(", ")} of ${runs.total} runs`,
-    });
+    unread.push("runs");
   }
-  if (autonomy.availability !== "available") {
-    quiet("autonomy", autonomy.availability, "no rule is degraded and no freeze is in force", "autonomy");
+
+  if (autonomy.availability === "available") {
+    const freezes = autonomy.active_freezes.length;
+    const degraded = autonomy.degraded_rules.length;
+    if (freezes + degraded > 0) {
+      act.push(
+        [freezes > 0 ? `${plural(freezes, "freeze")} in force` : null, degraded > 0 ? plural(degraded, "degraded rule") : null]
+          .filter((part) => part !== null)
+          .join(", "),
+      );
+    } else {
+      fine.push("no freeze, no degraded rule");
+    }
+  } else if (autonomy.availability === "no_data") {
+    fine.push("no freeze, no degraded rule");
   } else {
-    const curtailed = autonomy.degraded_rules.length + autonomy.active_freezes.length;
-    chips.push({
-      key: "autonomy",
-      tone: curtailed > 0 ? "warn" : "ok",
-      text:
-        curtailed === 0
-          ? "no freeze, no degraded rule"
-          : `${autonomy.active_freezes.length} freeze(s), ${autonomy.degraded_rules.length} degraded rule(s)`,
-    });
+    unread.push("autonomy");
   }
-  if (chips.length === 0) return null;
+
+  const lead =
+    act.length > 0 ? `${capitalize(act.join(", "))}.` : unread.length === 0 ? "Nothing needs you." : null;
   return (
-    <ul aria-label="Summary" className="flex flex-wrap gap-2">
-      {chips.map((chip) => (
-        <li
-          key={chip.key}
-          className="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1 text-sm text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200"
-        >
-          <ToneDot tone={chip.tone} />
-          <span className="inline-block first-letter:uppercase">{chip.text}</span>
-        </li>
-      ))}
-    </ul>
+    <section aria-label="Summary" className="space-y-1">
+      <p className="text-base">
+        {lead !== null && (
+          <span className={act.length > 0 ? "font-semibold text-ink" : "font-semibold text-ok-ink"}>{lead}</span>
+        )}
+        {fine.length > 0 && <span className="text-muted"> {capitalize(fine.join(", "))}.</span>}
+      </p>
+      {unread.length > 0 && (
+        <p className="text-sm text-warn-ink">
+          {capitalize(unread.join(", "))}: {NOT_RECORDED}.
+        </p>
+      )}
+    </section>
+  );
+}
+
+type PlanGroup = { plan: string; entries: BriefDecisionEntry[] };
+
+/** Pending decisions, one group per plan, in the order the engine ranked them. */
+function groupByPlan(pending: BriefDecisionEntry[]): PlanGroup[] {
+  const groups = new Map<string, BriefDecisionEntry[]>();
+  for (const entry of pending) {
+    const list = groups.get(entry.plan_id);
+    if (list) list.push(entry);
+    else groups.set(entry.plan_id, [entry]);
+  }
+  return [...groups].map(([plan, entries]) => ({ plan, entries }));
+}
+
+function unique<T>(values: T[]): T[] {
+  return [...new Set(values)];
+}
+
+/** A run status in words, through the same reading as its colour (`runStatusTone`). */
+function runStatusWord(status: string): string {
+  switch (runStatusTone(status)) {
+    case "risk":
+      return "failed";
+    case "warn":
+      return "partly failed";
+    default:
+      return status;
+  }
+}
+
+/**
+ * Everything a person has to act on, in one card: each plan that waits on a
+ * review, then each run that failed. When every pending decision gives the
+ * same reason, the reason is said once, above them, as their shared cause,
+ * so a reader sees one problem and not three.
+ */
+function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
+  const { escalations, runs } = brief;
+  const pending = escalations.availability === "available" ? escalations.pending : [];
+  const attention: BriefRunEntry[] = runs.availability === "available" ? runs.attention : [];
+  const groups = groupByPlan(pending);
+  const reasons = unique(pending.map((entry) => entry.reason));
+  const shared = pending.length > 1 && reasons.length === 1 ? reasons[0] : null;
+  const items = groups.length + attention.length;
+
+  return (
+    <section aria-label="Waiting on you" className="r-card overflow-hidden">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-5 py-4">
+        <h3 className="text-base font-semibold text-ink">Waiting on you</h3>
+        {items > 0 && (
+          <span className="text-sm text-muted">
+            {plural(items, "item")}
+            {shared !== null ? " · 1 shared cause" : ""}
+          </span>
+        )}
+      </div>
+
+      {escalations.availability === "unavailable" && (
+        <p className="r-row text-sm text-warn-ink">
+          Escalations: {NOT_RECORDED}
+          {escalations.note ? `: ${escalations.note}` : ""}
+        </p>
+      )}
+
+      {shared !== null && (
+        <p className="flex items-start gap-3 border-t border-warn/40 bg-warn-soft px-5 py-3 text-sm text-warn-ink">
+          <ExclamationTriangleIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+          <span>
+            <span className="font-semibold">Shared cause of all {pending.length} decisions:</span> {shared}
+          </span>
+        </p>
+      )}
+
+      {items > 0 && (
+        <ul aria-label="Waiting items">
+          {groups.map((group) => {
+            const latest = group.entries.map((entry) => entry.timestamp).sort().at(-1);
+            const own = unique(group.entries.map((entry) => entry.reason));
+            return (
+              <li key={group.plan} className="r-row">
+                <span aria-hidden="true" className="size-2.5 shrink-0 rounded-full bg-warn" />
+                <div className="min-w-0 flex-[1_1_22rem] space-y-1">
+                  <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[15px] text-ink">
+                    {unique(group.entries.map((entry) => entry.principal)).map((principal) => (
+                      <span key={principal} className={principal === "agent" ? "r-tag-agent" : "r-tag-human"}>
+                        {principal}
+                      </span>
+                    ))}
+                    <span>wants to</span>
+                    <span className="font-semibold">
+                      {unique(group.entries.map((entry) => entry.capability)).join(", ")}
+                    </span>
+                    {unique(group.entries.map((entry) => entry.model)).map((model, index, all) => (
+                      <span key={model} className="font-mono break-all">
+                        {model}
+                        {index < all.length - 1 ? "," : ""}
+                      </span>
+                    ))}
+                  </p>
+                  {shared === null && <p className="text-sm text-ink-2">{own.join(" · ")}</p>}
+                  <p className="text-xs text-muted">
+                    plan <CustodyLink subject={group.plan} clip /> · {plural(group.entries.length, "decision")} ·{" "}
+                    {formatInstant(latest, now)} ·{" "}
+                    {group.entries.map((entry, index) => (
+                      <span key={entry.decision_ref}>
+                        {index > 0 ? ", " : ""}
+                        <Clip value={entry.decision_ref} keepEnds />
+                      </span>
+                    ))}
+                  </p>
+                </div>
+                <a
+                  href={reviewPath(group.plan)}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    navigateTo(reviewPath(group.plan));
+                  }}
+                  // A navigation, so the read look: solid orange is kept for
+                  // the writes that change something.
+                  className={`${READ_BUTTON} shrink-0`}
+                >
+                  Review plan
+                  <ArrowRightIcon aria-hidden="true" className="size-4" />
+                </a>
+              </li>
+            );
+          })}
+          {attention.map((run) => (
+            <li key={run.run_id} className="r-row">
+              <span
+                aria-hidden="true"
+                className={`size-2.5 shrink-0 rounded-full ${runStatusTone(run.status) === "risk" ? "bg-fail" : "bg-warn"}`}
+              />
+              <div className="min-w-0 flex-[1_1_22rem] space-y-1">
+                <p className="flex flex-wrap items-baseline gap-x-2 text-[15px] text-ink">
+                  <span className="font-semibold">Run {runStatusWord(run.status)}</span>
+                  {run.failed_models.length > 0 && (
+                    <span className="font-mono break-all">
+                      {run.failed_models.map((model) => `${model.model_name} (${model.status})`).join(", ")}
+                    </span>
+                  )}
+                </p>
+                <p className="text-xs text-muted">
+                  run <CustodyLink subject={run.run_id} /> · {run.trigger} · started{" "}
+                  {formatInstant(run.started_at, now)}
+                </p>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {items === 0 && escalations.availability !== "unavailable" && (
+        <p className="r-row text-sm text-muted">
+          <ToneDot tone="ok" />
+          You're all caught up
+          {escalations.availability === "no_data" && escalations.note ? ` (${escalations.note})` : ""}
+        </p>
+      )}
+    </section>
   );
 }
 
