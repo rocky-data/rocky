@@ -6724,6 +6724,11 @@ auto_create_schemas = true
             })
             .unwrap();
         drop(store);
+        // The promote gate reads only runs of this incarnation. The run
+        // recorded above is dated one second after it was recorded; under
+        // load, the steps since then can take longer, so record it again now,
+        // after the new `created_at`.
+        record_passing_branch_run(&state_path, legacy_name);
         run_branch_promote_from_plan(
             dir,
             &config_path,

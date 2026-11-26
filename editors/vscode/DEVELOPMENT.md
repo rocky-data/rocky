@@ -1,15 +1,10 @@
 # Development Guide
 
-This page covers how to build, run, and test the extension from source. For
-coding rules and the architecture notes agents follow, read
-[`AGENTS.md`](./AGENTS.md).
+How to build, run and test the extension from source. Coding rules and architecture notes: [`AGENTS.md`](./AGENTS.md).
 
 ## Prerequisites
 
-- **Node.js 22** and **npm**. CI uses Node 22.
-- **VS Code 1.120.0+**
-- **[Rocky CLI](https://github.com/rocky-data/rocky)** on `$PATH`. The extension
-  spawns it as the language server.
+Node.js 22 and npm (CI uses Node 22), VS Code 1.120.0+, and the [Rocky CLI](https://github.com/rocky-data/rocky) on `$PATH`.
 
 ## Getting started
 
@@ -21,8 +16,7 @@ npm run compile
 npm run bundle
 ```
 
-Then press **F5** in VS Code. It opens an Extension Development Host with the
-extension loaded.
+Then press **F5** in VS Code to open an Extension Development Host with the extension loaded.
 
 ## How the build fits together
 
@@ -34,9 +28,7 @@ extension loaded.
   webview-ui/**/*.tsx ──► esbuild + Tailwind ──► webview bundles (Inspector)
 ```
 
-`package.json` points `main` at `./dist/extension.js`, so the dev host runs the
-esbuild bundle. Run `npm run bundle` (or `npm run bundle:watch`) after a
-change, then reload the dev host. `vscode:prepublish` runs both steps.
+`package.json` points `main` at `./dist/extension.js`, so the dev host runs the esbuild bundle. After a change, run `npm run bundle` (or `npm run bundle:watch`) and reload the dev host. `vscode:prepublish` runs both steps.
 
 ## Project structure
 
@@ -65,31 +57,18 @@ editors/vscode/
 └── package.json           # extension manifest
 ```
 
-`package.json` (`contributes.commands`) is the source of truth for commands.
-The extension contributes 61 of them. The [README](./README.md#commands) lists
-the common ones.
+`package.json` (`contributes.commands`) is the source of truth for the 61 commands. The [README](./README.md#commands) lists the common ones.
 
 ## Architecture
 
 ### LSP client (`lspClient.ts`)
 
-On activation the extension spawns the language server:
-
-```
-rocky lsp [extraArgs...]
-```
-
-It talks JSON-RPC over **stdio**. The binary path and extra arguments come
-from `rocky.server.path` and `rocky.server.extraArgs`. When a `rocky-lsp`
-binary sits next to `rocky`, the extension runs that instead. It falls back
-to `rocky lsp` when `rocky-lsp` is absent.
+On activation the extension spawns `rocky lsp [extraArgs...]` and talks JSON-RPC over **stdio**. The path and extra arguments come from `rocky.server.path` and `rocky.server.extraArgs`. When a `rocky-lsp` binary sits next to `rocky`, the extension runs that, and falls back to `rocky lsp` otherwise.
 
 - **Document selector**: `.rocky` files, and `.sql` files under `**/models/**`.
 - **File watchers**: `**/*.rocky`, `**/*.toml`, `**/models/**/*.sql`.
 
-The server provides diagnostics, hover, go-to-definition, find references,
-rename, completion, signature help, document symbols, code actions, inlay
-hints, and semantic tokens.
+The server's feature list is in the [engine `AGENTS.md`](../../engine/AGENTS.md#lsp-server).
 
 ### Commands
 
@@ -99,12 +78,7 @@ Command handlers live in `src/commands/`, one file per concern, registered in
 
 ### Inspector and lineage canvas
 
-`rocky.showLineage` opens the Rocky Inspector, a bottom-panel React webview
-from `webview-ui/`, on its Lineage tab. The canvas is built from
-`rocky catalog` and `rocky compile` JSON. It renders with `@xyflow/react` and
-lays out with `@dagrejs/dagre`. Overlays show cost, freshness, drift,
-governance, breaking changes, and the last run. Right-click a node for scoped
-AI actions.
+`rocky.showLineage` opens the Rocky Inspector, a bottom-panel React webview from `webview-ui/`, on its Lineage tab. The canvas is built from `rocky catalog` and `rocky compile` JSON, rendered with `@xyflow/react` and laid out with `@dagrejs/dagre`. Overlays show cost, freshness, drift, governance, breaking changes and the last run. Right-click a node for scoped AI actions.
 
 ## Common commands
 
@@ -126,10 +100,7 @@ just record-demo quickstart
 
 ### 1. Extension Development Host (code changes)
 
-Press **F5** (Run > Start Debugging). The configuration is in
-`.vscode/launch.json`. After a TypeScript change, rebuild with
-`npm run bundle` and reload the dev host (Ctrl+Shift+P > "Developer: Reload
-Window").
+Press **F5** (config in `.vscode/launch.json`). After a TypeScript change, run `npm run bundle` and reload the dev host (Ctrl+Shift+P > "Developer: Reload Window").
 
 ### 2. Install a packaged .vsix (packaging checks)
 
@@ -137,8 +108,7 @@ Window").
 npm run install:local
 ```
 
-This packages `rocky.vsix` and installs it with `--force`. Use it to check that
-nothing is missing from the bundle. `npm run uninstall:local` removes it.
+This packages `rocky.vsix` and installs it with `--force`, to check nothing is missing from the bundle. `npm run uninstall:local` removes it.
 
 ### 3. Symlink (grammar, snippet and schema changes)
 
@@ -156,50 +126,19 @@ without a rebuild. Remove the symlink when you are done.
 | Unit | `src/__tests__/`, `webview-ui/**/*.test.{ts,tsx}` | Vitest (jsdom for webviews) | `npm run test:unit` |
 | Integration | `src/test/suite/` | Mocha (TDD UI) in a real VS Code via `@vscode/test-electron` | `npm test` |
 
-`npm test` compiles and bundles first (`pretest`). It downloads a VS Code build
-on the first run. The integration suite checks that the extension activates,
-that its commands and the `rocky` language are registered, and that the task
-type exists. Mocha uses a 10-second timeout per test. Suite setup allows 20
-seconds for activation.
-
-To add an integration test, create a `.test.ts` file in `src/test/suite/`. The
-loader picks up every compiled `**.test.js` file.
+`npm test` compiles and bundles first (`pretest`) and downloads a VS Code build on the first run. The integration suite checks that the extension activates, that its commands and the `rocky` language are registered, and that the task type exists. Mocha allows 10 seconds per test and 20 seconds for activation. To add one, create a `.test.ts` file in `src/test/suite/`.
 
 ## Extension manifest
 
-### Activation
+### Activation, settings, language registration
 
-The extension activates when:
-
-- a `.rocky` file opens (`onLanguage:rocky`);
-- the workspace contains `**/*.rocky` or `rocky.toml`;
-- the Get Started, Extension Info, or Help view opens.
-
-### Settings
-
-`contributes.configuration` declares the settings. The
-[README](./README.md#settings) lists each one with its default.
-
-### Language registration
-
-- Language ID: `rocky`. File extension: `.rocky`.
-- Grammar: `syntaxes/rocky.tmLanguage.json`.
-- Snippets: `snippets/rocky.json`.
-- JSON validation: `rocky.toml` against `schemas/rocky-project.schema.json`, and
-  `*.rocky.toml` against `schemas/rocky-config.schema.json`.
+- The extension activates on `onLanguage:rocky`, on a workspace containing `**/*.rocky` or `rocky.toml`, or when the Get Started, Extension Info or Help view opens.
+- `contributes.configuration` declares the settings. The [README](./README.md#settings) lists each with its default.
+- Language ID `rocky`, extension `.rocky`. Grammar: `syntaxes/rocky.tmLanguage.json`. Snippets: `snippets/rocky.json`. JSON validation: `rocky.toml` against `schemas/rocky-project.schema.json`, and `*.rocky.toml` against `schemas/rocky-config.schema.json`.
 
 ## Modifying the grammar
 
-The TextMate grammar is `syntaxes/rocky.tmLanguage.json`. It highlights:
-
-- comments (`--`);
-- pipeline steps (`from`, `where`, `group`, `derive`, `select`, `join`, `sort`,
-  `take`, `distinct`, `replicate`);
-- keywords (`as`, `on`, `keep`, `asc`, `desc`, join types);
-- literals (strings, numbers, dates `@YYYY-MM-DD`, booleans, null);
-- operators (logical, comparison, arithmetic, arrow `=>`);
-- functions (aggregate, string, numeric, datetime, window);
-- match expressions.
+The TextMate grammar `syntaxes/rocky.tmLanguage.json` highlights comments (`--`), pipeline steps (`from`, `where`, `group`, `derive`, `select`, `join`, `sort`, `take`, `distinct`, `replicate`), keywords (`as`, `on`, `keep`, `asc`, `desc`, join types), literals (strings, numbers, dates `@YYYY-MM-DD`, booleans, null), operators (logical, comparison, arithmetic, arrow `=>`), functions (aggregate, string, numeric, datetime, window) and match expressions.
 
 A DSL syntax change touches the engine parser, the compiler, this grammar, and
 the snippets together. See the root [`AGENTS.md`](../../AGENTS.md).
@@ -209,9 +148,7 @@ When the server runs, its **semantic tokens** overlay the TextMate grammar.
 
 ## Adding snippets
 
-Snippets are in `snippets/rocky.json`. Each one has a prefix (the trigger
-text), a body (a template with tab stops), and a description. Use VS Code
-snippet syntax: `$1`, `$2` for tab stops, `${1|choice1,choice2|}` for choices.
+Snippets are in `snippets/rocky.json`: a prefix (trigger), a body and a description, in VS Code snippet syntax (`$1`, `$2` tab stops, `${1|choice1,choice2|}` choices).
 
 ## Packaging
 
@@ -224,17 +161,7 @@ maps, `node_modules`, and config files out of the package.
 
 ## Main dependencies
 
-`package.json` holds the exact ranges.
-
-| Package | Purpose |
-|---|---|
-| `vscode-languageclient` | LSP client library (the one runtime dependency) |
-| `typescript` | compiler |
-| `esbuild` | bundler for the extension and the webviews |
-| `react`, `react-dom`, `@xyflow/react`, `@dagrejs/dagre` | Inspector webviews and the lineage canvas |
-| `tailwindcss`, `@tailwindplus/elements` | webview styling and headless components |
-| `vitest`, `mocha`, `@vscode/test-electron` | test runners |
-| `@vscode/vsce` | packaging |
+`package.json` holds the exact ranges. `vscode-languageclient` is the one runtime dependency. Build: `typescript`, `esbuild`. Webviews: `react`, `react-dom`, `@xyflow/react`, `@dagrejs/dagre`, `tailwindcss`, `@tailwindplus/elements`. Tests: `vitest`, `mocha`, `@vscode/test-electron`. Packaging: `@vscode/vsce`.
 
 ## Related projects
 

@@ -76,7 +76,7 @@ falls back to `default` when the var is unset or empty.
 
 ## Related
 
-- Canonical config reference: `.claude/skills/rocky-config/SKILL.md` at the
+- Canonical config reference: `.agents/skills/rocky-config/SKILL.md` at the
   monorepo root.
 - The substitution helper lives at
   `engine/crates/rocky-core/src/config.rs::substitute_env_vars`.

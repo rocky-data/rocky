@@ -14,7 +14,7 @@ use crate::output::{
 };
 use crate::registry::{self, AdapterRegistry};
 
-use super::declarative_test::execute_one_test;
+use super::declarative_test::{TestBatching, execute_model_tests};
 use super::{ModelNotFound, ModelScope};
 
 /// Map the engine test runner's `ModelTestResult` to the JsonSchema-derived
@@ -49,6 +49,72 @@ fn unit_summary(run: &rocky_engine::test_runner::UnitTestRun) -> Option<UnitTest
     })
 }
 
+/// The short table-mode marker of one unit test's dialect notice.
+fn dialect_marker(dialect: &rocky_core::unit_test::UnitTestDialect) -> String {
+    use rocky_core::unit_test::UnitTestDialectStatus;
+    let target = match dialect.status {
+        UnitTestDialectStatus::NonDuckdbTarget | UnitTestDialectStatus::MultipleTargets => {
+            format!("target {}", dialect.targets.join(", "))
+        }
+        UnitTestDialectStatus::UnresolvedTarget => "target unresolved".to_string(),
+    };
+    if dialect.refused {
+        format!("refused, {target}")
+    } else if dialect.ran_on_duckdb {
+        format!("ran on DuckDB, {target}")
+    } else {
+        format!("not run, {target}")
+    }
+}
+
+/// The one table-mode warning line for unit tests whose model is not
+/// DuckDB-only, or `None` when every unit test targets DuckDB.
+fn dialect_warning(results: &[rocky_core::unit_test::UnitTestResult]) -> Option<String> {
+    let marked: Vec<&rocky_core::unit_test::UnitTestDialect> =
+        results.iter().filter_map(|r| r.dialect.as_ref()).collect();
+    if marked.is_empty() {
+        return None;
+    }
+    let mut targets: Vec<&str> = marked
+        .iter()
+        .flat_map(|d| d.targets.iter().map(String::as_str))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let unresolved = marked
+        .iter()
+        .any(|d| d.status == rocky_core::unit_test::UnitTestDialectStatus::UnresolvedTarget);
+    let mut named = targets.join(", ");
+    if unresolved {
+        if !named.is_empty() {
+            named.push_str(", ");
+        }
+        named.push_str("unresolved");
+    }
+    let ran = marked.iter().filter(|d| d.ran_on_duckdb).count();
+    let refused = marked.iter().filter(|d| d.refused).count();
+    if ran > 0 {
+        return Some(format!(
+            "warning: {ran} unit test(s) ran on DuckDB, not on their target warehouse \
+             (target: {named}); SQL both accept can behave differently there. \
+             --strict-dialect refuses them"
+        ));
+    }
+    if refused > 0 {
+        return Some(format!(
+            "warning: --strict-dialect refused {refused} unit test(s) that would run on \
+             DuckDB, not on their target warehouse (target: {named})"
+        ));
+    }
+    // Every marked test failed before its model's SQL reached DuckDB (a
+    // compile failure, a cycle, a fixture). They would still run on DuckDB.
+    Some(format!(
+        "warning: {} unit test(s) did not run; they would run on DuckDB, not on their \
+         target warehouse (target: {named}). --strict-dialect refuses them",
+        marked.len()
+    ))
+}
+
 /// Side-effect-free core of `rocky test` (DuckDB-based local tests): run the
 /// tests and assemble the typed [`TestOutput`] without printing.
 ///
@@ -79,7 +145,10 @@ pub fn test_output(
     model_filter: Option<&str>,
     config_path: &Path,
 ) -> Result<TestOutput> {
-    let extensions = crate::registry::duckdb_extensions_for(config_path)?;
+    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let extensions = crate::registry::duckdb_extensions_from(project_config.as_ref());
+    let unit_targets = super::compile::target_dialects(project_config.as_ref(), config_path);
     let result =
         rocky_engine::test_runner::run_tests_with(rocky_engine::test_runner::TestRunInputs {
             models_dir,
@@ -107,8 +176,13 @@ pub fn test_output(
     let mut output = TestOutput::new(result.total, result.passed, failures)
         .with_model_results(model_results)
         .with_diagnostics(result.diagnostics.clone());
-    let unit_run =
-        rocky_engine::test_runner::run_unit_tests(models_dir, model_filter, &extensions)?;
+    let unit_run = rocky_engine::test_runner::run_unit_tests(
+        models_dir,
+        model_filter,
+        &extensions,
+        &unit_targets,
+        false,
+    )?;
     if let Some(summary) = unit_summary(&unit_run) {
         output = output.with_unit_tests(summary);
     }
@@ -131,6 +205,7 @@ pub fn run_test(
         output_json,
         run_vars,
         None,
+        false,
     )
 }
 
@@ -181,6 +256,12 @@ fn consumer_diagnostics_fail_the_run(
 /// applies the per-model-target checks `rocky ci` applies (see
 /// [`super::ci::with_project_gates`]), so `rocky test` refuses what `rocky ci`
 /// refuses. `None`, or no file there, runs no such check.
+///
+/// Every unit test runs on DuckDB. A unit test whose model's target
+/// warehouse is not DuckDB alone (another warehouse, several, or none
+/// resolved) carries a `dialect` notice, and the table output warns once.
+/// `strict_dialect` (`--strict-dialect`) refuses those tests instead.
+#[allow(clippy::too_many_arguments)]
 pub fn run_test_with_selection(
     config_path: Option<&Path>,
     models_dir: &Path,
@@ -192,6 +273,7 @@ pub fn run_test_with_selection(
         &crate::selection::SelectionArgs,
         &crate::selection::StateContext<'_>,
     )>,
+    strict_dialect: bool,
 ) -> Result<()> {
     let selected = match selection {
         Some((args, ctx)) if args.is_active() => Some(crate::selection::resolve_in_dir(
@@ -205,6 +287,10 @@ pub fn run_test_with_selection(
         None => None,
     };
     let extensions = crate::registry::duckdb_extensions_from(project_config.as_ref());
+    let target_dialects = super::compile::target_dialects(
+        project_config.as_ref(),
+        config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+    );
     let mut result = super::ci::with_project_gates(
         project_config.as_ref(),
         config_path.unwrap_or_else(|| Path::new("rocky.toml")),
@@ -221,10 +307,7 @@ pub fn run_test_with_selection(
                 strict_contracts: project_config
                     .as_ref()
                     .is_some_and(|config| config.contracts.strict),
-                target_dialects: super::compile::target_dialects(
-                    project_config.as_ref(),
-                    config_path.unwrap_or_else(|| Path::new("rocky.toml")),
-                ),
+                target_dialects: target_dialects.clone(),
                 extensions: extensions.clone(),
             })
         },
@@ -233,8 +316,13 @@ pub fn run_test_with_selection(
     // `test_output` (see that function's note), so the check has to be made
     // here too — this is the path the CLI actually takes.
     reject_unknown_model(model_filter, &result.all_models)?;
-    let mut unit_run =
-        rocky_engine::test_runner::run_unit_tests(models_dir, model_filter, &extensions)?;
+    let mut unit_run = rocky_engine::test_runner::run_unit_tests(
+        models_dir,
+        model_filter,
+        &extensions,
+        &target_dialects,
+        strict_dialect,
+    )?;
     if let Some(set) = &selected {
         retain_selected(&mut result, &mut unit_run, set);
     }
@@ -297,14 +385,23 @@ pub fn run_test_with_selection(
                 "  Unit tests: {} passed, {unit_failed} failed",
                 unit_run.passed()
             );
+            if let Some(warning) = dialect_warning(&unit_run.results) {
+                println!("  {warning}");
+            }
             for r in &unit_run.results {
+                let marker = r.dialect.as_ref().map(dialect_marker);
                 if !r.passed {
+                    let suffix = marker.map(|m| format!(" [{m}]")).unwrap_or_default();
                     println!(
-                        "  \u{2717} {}::{} — {}",
+                        "  \u{2717} {}::{} — {}{suffix}",
                         r.model,
                         r.test,
                         r.error.as_deref().unwrap_or("output mismatch")
                     );
+                } else if let Some(marker) = marker {
+                    // A pass that ran on another dialect than its target is
+                    // listed too, so every result states where it ran.
+                    println!("  \u{2713} {}::{} [{marker}]", r.model, r.test);
                 }
             }
         }
@@ -762,11 +859,15 @@ impl LoadedCheckSet {
     /// only to name the directory in the empty-project refusal; it is
     /// never opened.
     pub(crate) async fn run(self) -> Result<DeclarativeRun> {
+        // Never batched: this is the custody path, and its digest
+        // (`check_set_digest`) pins what runs, not how it is grouped into
+        // queries. One query per test keeps it exactly as approved.
         execute_declarative(
             &self.models,
             &self.models_dir,
             &self.warehouse,
             Some(&self.model),
+            TestBatching::Off,
         )
         .await
     }
@@ -847,6 +948,7 @@ pub(crate) async fn declarative_run(
     models_dir: &Path,
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> Result<DeclarativeRun> {
     // 1. Load config + adapter registry.
     // The identity is for the custody comparison at observation; a plain
@@ -858,7 +960,14 @@ pub(crate) async fn declarative_run(
     // so a model that declares none of its own inherits it (#1435).
     let all_models = load_all_models(models_dir, Some(&project_freshness))?;
 
-    execute_declarative(&all_models, models_dir, &warehouse_adapter, model_filter).await
+    execute_declarative(
+        &all_models,
+        models_dir,
+        &warehouse_adapter,
+        model_filter,
+        batching,
+    )
+    .await
 }
 
 /// Resolve the warehouse adapter the declarative checks execute against.
@@ -915,6 +1024,7 @@ async fn execute_declarative(
     models_dir: &Path,
     warehouse_adapter: &Arc<dyn WarehouseAdapter>,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> Result<DeclarativeRun> {
     // The loader is deliberately tolerant of a missing or empty directory
     // (`models_loader::load_project_models` returns an empty Vec, pinned by
@@ -933,7 +1043,7 @@ async fn execute_declarative(
     // former must stay exit 0; only the latter is an error.
     reject_unknown_model(model_filter, &model_names(all_models))?;
 
-    Ok(execute_checks(all_models, warehouse_adapter, model_filter).await)
+    Ok(execute_checks(all_models, warehouse_adapter, model_filter, batching).await)
 }
 
 /// Execute the declarative checks of `models` against one warehouse, with
@@ -943,6 +1053,7 @@ async fn execute_checks(
     all_models: &[rocky_core::models::Model],
     warehouse_adapter: &Arc<dyn WarehouseAdapter>,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> DeclarativeRun {
     // The declared count, on the NAME predicate alone — deliberately not
     // the has-tests closure below. A model the selection names but whose
@@ -975,20 +1086,27 @@ async fn execute_checks(
 
     // 4. Execute each test.
     let mut results = Vec::new();
+    let mut queries = 0;
     for model in &models_with_tests {
         debug!(model = %model.config.name, tests = model.config.tests.len(), "running declarative tests");
 
-        for test_decl in &model.config.tests {
-            let result = execute_one_test(
-                test_decl,
-                &model.config.name,
-                &model.config.target,
-                warehouse_adapter.as_ref(),
-            )
-            .await;
-            results.push(result);
-        }
+        let run = execute_model_tests(
+            &model.config.tests,
+            &model.config.name,
+            &model.config.target,
+            warehouse_adapter.as_ref(),
+            batching,
+        )
+        .await;
+        queries += run.queries;
+        results.extend(run.results);
     }
+    debug!(
+        tests = results.len(),
+        queries,
+        ?batching,
+        "declarative test queries sent"
+    );
 
     DeclarativeRun { declared, results }
 }
@@ -1002,6 +1120,7 @@ async fn execute_checks(
 async fn whole_project_declarative_run(
     config_path: &Path,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> Result<Option<DeclarativeRun>> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
@@ -1049,7 +1168,7 @@ async fn whole_project_declarative_run(
             continue;
         }
         let warehouse = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
-        let pipeline_run = execute_checks(&models, &warehouse, model_filter).await;
+        let pipeline_run = execute_checks(&models, &warehouse, model_filter, batching).await;
         run.declared += pipeline_run.declared;
         run.results.extend(pipeline_run.results);
     }
@@ -1069,17 +1188,27 @@ pub async fn run_declarative_tests(
     scope: ModelScope,
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
+    batching: TestBatching,
     output_json: bool,
 ) -> Result<()> {
     let whole_project = match (scope, pipeline_name) {
         (ModelScope::WholeProject, None) => {
-            whole_project_declarative_run(config_path, model_filter).await?
+            whole_project_declarative_run(config_path, model_filter, batching).await?
         }
         (ModelScope::WholeProject, Some(_)) | (ModelScope::Dir, _) => None,
     };
     let run = match whole_project {
         Some(run) => run,
-        None => declarative_run(config_path, models_dir, pipeline_name, model_filter).await?,
+        None => {
+            declarative_run(
+                config_path,
+                models_dir,
+                pipeline_name,
+                model_filter,
+                batching,
+            )
+            .await?
+        }
     };
     let summary = summarize_declarative(run.results);
     let DeclarativeTestSummary {
@@ -1174,7 +1303,14 @@ pub async fn declarative_test_output(
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
 ) -> Result<DeclarativeTestSummary> {
-    let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
+    let run = declarative_run(
+        config_path,
+        models_dir,
+        pipeline_name,
+        model_filter,
+        TestBatching::Off,
+    )
+    .await?;
     Ok(summarize_declarative(run.results))
 }
 
@@ -1256,6 +1392,7 @@ mod tests {
             true,
             &rocky_core::run_vars::RunVars::new(),
             select.map(|_| (&args, &ctx)),
+            false,
         )
     }
 
@@ -1292,6 +1429,8 @@ mod tests {
             &models,
             None,
             &rocky_duckdb::ExtensionOptions::default(),
+            &Default::default(),
+            false,
         )
         .expect("unit run");
         let selected = std::collections::BTreeSet::from(["good_mart".to_string()]);
@@ -1312,6 +1451,167 @@ mod tests {
             &result.diagnostics,
             true
         ));
+    }
+
+    /// A project whose `flagged` model has one passing `[[test]]`, with
+    /// `rocky_toml` as its config. Returns the project dir and its models dir.
+    fn unit_test_project(rocky_toml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::write(models.join("orders.sql"), "SELECT 0 AS id, 0 AS amount").expect("sql");
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"wh\"\nschema = \"main\"\n",
+        )
+        .expect("sidecar");
+        std::fs::write(
+            models.join("flagged.sql"),
+            "SELECT id, amount FROM orders WHERE amount > 100",
+        )
+        .expect("sql");
+        std::fs::write(
+            models.join("flagged.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[test]]\nname = \"keeps_high\"\n\n\
+             [[test.given]]\nref = \"orders\"\n\
+             rows = [ { id = 1, amount = 150 }, { id = 2, amount = 50 } ]\n\n\
+             [test.expect]\nrows = [ { id = 1, amount = 150 } ]\n",
+        )
+        .expect("sidecar");
+        std::fs::write(tmp.path().join("rocky.toml"), rocky_toml).expect("rocky.toml");
+        (tmp, models)
+    }
+
+    /// A Snowflake adapter config. It loads without credentials and nothing
+    /// connects to it: unit tests run on an in-memory DuckDB.
+    const SNOWFLAKE_TOML: &str = "[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+         [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+         [pipeline.trans.target]\nadapter = \"snow\"\n";
+
+    const DUCKDB_TOML: &str = "[adapter]\ntype = \"duckdb\"\n\
+         [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+         [pipeline.trans.target]\n";
+
+    fn unit_results(
+        tmp: &tempfile::TempDir,
+        models: &std::path::Path,
+    ) -> Vec<rocky_core::unit_test::UnitTestResult> {
+        let output = super::test_output(models, None, None, &tmp.path().join("rocky.toml"))
+            .expect("test output");
+        output.unit_tests.expect("unit tests ran").results
+    }
+
+    /// The config's warehouse adapter decides the notice: a Snowflake
+    /// project's unit test says it ran on DuckDB with target Snowflake; a
+    /// DuckDB project's JSON carries no `dialect` key.
+    #[test]
+    fn the_config_target_marks_unit_tests_on_a_non_duckdb_project() {
+        let (tmp, models) = unit_test_project(SNOWFLAKE_TOML);
+        let results = unit_results(&tmp, &models);
+        assert!(results[0].passed, "{results:?}");
+        let dialect = results[0].dialect.as_ref().expect("marked");
+        assert_eq!(dialect.targets, vec!["Snowflake".to_string()]);
+        assert!(dialect.ran_on_duckdb);
+
+        let (tmp, models) = unit_test_project(DUCKDB_TOML);
+        let results = unit_results(&tmp, &models);
+        assert!(results[0].passed, "{results:?}");
+        let json = serde_json::to_string(&results).expect("json");
+        assert!(!json.contains("\"dialect\""), "{json}");
+    }
+
+    /// A project with no `rocky.toml` is unresolved, not DuckDB. A model two
+    /// pipelines load, one on DuckDB and one on Snowflake, has both targets.
+    #[test]
+    fn no_config_is_unresolved_and_two_targets_are_multiple() {
+        use rocky_core::unit_test::UnitTestDialectStatus;
+        let (tmp, models) = unit_test_project(DUCKDB_TOML);
+        std::fs::remove_file(tmp.path().join("rocky.toml")).expect("remove config");
+        let results = unit_results(&tmp, &models);
+        let dialect = results[0].dialect.as_ref().expect("marked");
+        assert_eq!(dialect.status, UnitTestDialectStatus::UnresolvedTarget);
+        assert!(dialect.targets.is_empty());
+
+        let (tmp, models) = unit_test_project(
+            "[adapter.duck]\ntype = \"duckdb\"\n\
+             [adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+             [pipeline.local]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.local.target]\nadapter = \"duck\"\n\
+             [pipeline.prod]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.prod.target]\nadapter = \"snow\"\n",
+        );
+        let results = unit_results(&tmp, &models);
+        let dialect = results[0].dialect.as_ref().expect("marked");
+        assert_eq!(dialect.status, UnitTestDialectStatus::MultipleTargets);
+        assert_eq!(
+            dialect.targets,
+            vec!["DuckDB".to_string(), "Snowflake".to_string()]
+        );
+    }
+
+    /// `--strict-dialect` fails `rocky test` on a Snowflake project and
+    /// passes it on a DuckDB project.
+    #[test]
+    fn strict_dialect_fails_only_a_non_duckdb_project() {
+        let run = |toml: &str| {
+            let (tmp, models) = unit_test_project(toml);
+            super::run_test_with_selection(
+                Some(&tmp.path().join("rocky.toml")),
+                &models,
+                None,
+                None,
+                true,
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                true,
+            )
+        };
+        let err = run(SNOWFLAKE_TOML).expect_err("strict refuses Snowflake");
+        assert!(err.to_string().contains("test failures"), "{err:#}");
+        run(DUCKDB_TOML).expect("strict passes a DuckDB project");
+    }
+
+    #[test]
+    fn the_table_warning_names_the_target() {
+        let (tmp, models) = unit_test_project(SNOWFLAKE_TOML);
+        let results = unit_results(&tmp, &models);
+        let warning = super::dialect_warning(&results).expect("warns");
+        assert!(warning.contains("ran on DuckDB"), "{warning}");
+        assert!(warning.contains("Snowflake"), "{warning}");
+        assert_eq!(
+            super::dialect_marker(results[0].dialect.as_ref().expect("marked")),
+            "ran on DuckDB, target Snowflake"
+        );
+        let (tmp, models) = unit_test_project(DUCKDB_TOML);
+        assert_eq!(super::dialect_warning(&unit_results(&tmp, &models)), None);
+    }
+
+    /// A marked test that never ran (a compile failure or an E058 cycle, not
+    /// a refusal) still gets the warning line.
+    #[test]
+    fn the_warning_prints_for_a_marked_test_that_did_not_run() {
+        use rocky_core::unit_test::{UnitTestDialect, UnitTestDialectStatus, UnitTestResult};
+        let not_run = UnitTestResult {
+            model: "flagged".to_string(),
+            test: "keeps_high".to_string(),
+            passed: false,
+            error: Some("model 'flagged' did not compile".to_string()),
+            mismatches: Vec::new(),
+            dialect: Some(UnitTestDialect {
+                status: UnitTestDialectStatus::NonDuckdbTarget,
+                targets: vec!["Snowflake".to_string()],
+                ran_on_duckdb: false,
+                refused: false,
+            }),
+        };
+        let warning = super::dialect_warning(&[not_run]).expect("warns");
+        assert!(
+            warning.starts_with("warning: 1 unit test(s) did not run"),
+            "{warning}"
+        );
+        assert!(warning.contains("Snowflake"), "{warning}");
     }
 
     /// A project with three pipelines — `transform` (models/**), `reporting`
@@ -1366,10 +1666,14 @@ mod tests {
     #[tokio::test]
     async fn declarative_tests_cover_every_transformation_pipeline() {
         let tmp = three_pipeline_project();
-        let run = whole_project_declarative_run(&tmp.path().join("rocky.toml"), None)
-            .await
-            .expect("run")
-            .expect("transformation pipelines");
+        let run = whole_project_declarative_run(
+            &tmp.path().join("rocky.toml"),
+            None,
+            super::TestBatching::Off,
+        )
+        .await
+        .expect("run")
+        .expect("transformation pipelines");
         let mut models: Vec<&str> = run.results.iter().map(|r| r.model.as_str()).collect();
         models.sort_unstable();
         assert_eq!(models, ["rep", "stg"], "{:?}", run.results);
@@ -1394,7 +1698,7 @@ mod tests {
             text.replace("models = \"reporting/**\"", "models = \"models/**\""),
         )
         .expect("write config");
-        let run = whole_project_declarative_run(&config, None)
+        let run = whole_project_declarative_run(&config, None, super::TestBatching::Off)
             .await
             .expect("run")
             .expect("transformation pipelines");
@@ -1409,14 +1713,16 @@ mod tests {
     async fn whole_project_declarative_run_scopes_and_refuses_unknown_models() {
         let tmp = three_pipeline_project();
         let config = tmp.path().join("rocky.toml");
-        let run = whole_project_declarative_run(&config, Some("rep"))
+        let run = whole_project_declarative_run(&config, Some("rep"), super::TestBatching::Off)
             .await
             .expect("run")
             .expect("transformation pipelines");
         assert_eq!(run.results.len(), 1);
         assert_eq!(run.results[0].model, "rep");
 
-        let Err(err) = whole_project_declarative_run(&config, Some("nope")).await else {
+        let Err(err) =
+            whole_project_declarative_run(&config, Some("nope"), super::TestBatching::Off).await
+        else {
             panic!("an unknown model must be refused");
         };
         assert!(err.to_string().contains("nope"), "{err:#}");

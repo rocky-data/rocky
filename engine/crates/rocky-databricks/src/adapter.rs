@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use rocky_catalog_core::{
     CatalogClient, CatalogError, TableRef as CatalogTableRef, TableSchema as CatalogTableSchema,
 };
+use rocky_core::statement_cancel::{CancelOutcome, StatementHandle};
 use rocky_core::traits::{
     AdapterError, AdapterResult, BatchCheckAdapter, BatchReading, ChunkChecksum, ExecutionStats,
     Freshness, FreshnessResult, ObjectKind, PkRange, QueryResult, RowCountResult, SqlDialect,
@@ -310,6 +311,22 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .await
             .map(|_| ())
             .map_err(AdapterError::new)
+    }
+
+    /// Every statement past its submit response, from each connector that
+    /// shares this adapter's list (see [`DatabricksConnector::with_in_flight`]).
+    fn in_flight_statements(&self) -> Vec<StatementHandle> {
+        self.connector.in_flight().snapshot()
+    }
+
+    /// `POST /api/2.0/sql/statements/{id}/cancel`. Databricks accepts the
+    /// request for a statement that already finished, too.
+    async fn cancel_statement(&self, handle: &StatementHandle) -> AdapterResult<CancelOutcome> {
+        self.connector
+            .cancel_statement(handle.as_str())
+            .await
+            .map_err(AdapterError::new)?;
+        Ok(CancelOutcome::Requested)
     }
 
     fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {

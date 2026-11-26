@@ -808,3 +808,70 @@ mod tests {
         );
     }
 }
+
+/// How a [`CancellableWarehouseAdapter`] answers a cancel request.
+#[derive(Clone, Copy)]
+pub(crate) enum CancelAnswer {
+    Accept,
+    Fail,
+    Hang,
+}
+
+/// Lists what its [`InFlightStatements`] holds and records each cancel.
+pub(crate) struct CancellableWarehouseAdapter {
+    inner: RecordingWarehouseAdapter,
+    pub(crate) in_flight: rocky_core::statement_cancel::InFlightStatements,
+    answer: CancelAnswer,
+    pub(crate) cancelled: Mutex<Vec<rocky_core::statement_cancel::StatementHandle>>,
+}
+
+impl CancellableWarehouseAdapter {
+    pub(crate) fn new(answer: CancelAnswer) -> Self {
+        Self {
+            inner: RecordingWarehouseAdapter::new(&format!(
+                "statement-cancel-{}",
+                uuid::Uuid::new_v4()
+            )),
+            in_flight: rocky_core::statement_cancel::InFlightStatements::new(),
+            answer,
+            cancelled: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WarehouseAdapter for CancellableWarehouseAdapter {
+    fn dialect(&self) -> &dyn SqlDialect {
+        self.inner.dialect()
+    }
+    async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+        self.inner.execute_statement(sql).await
+    }
+    async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+        self.inner.execute_query(sql).await
+    }
+    async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+        self.inner.describe_table(table).await
+    }
+    fn in_flight_statements(&self) -> Vec<rocky_core::statement_cancel::StatementHandle> {
+        self.in_flight.snapshot()
+    }
+    async fn cancel_statement(
+        &self,
+        handle: &rocky_core::statement_cancel::StatementHandle,
+    ) -> AdapterResult<rocky_core::statement_cancel::CancelOutcome> {
+        use rocky_core::statement_cancel::CancelOutcome;
+        self.cancelled.lock().unwrap().push(handle.clone());
+        match self.answer {
+            CancelAnswer::Accept => Ok(CancelOutcome::Requested),
+            CancelAnswer::Fail => Err(AdapterError::msg("cancel refused")),
+            CancelAnswer::Hang => std::future::pending().await,
+        }
+    }
+}
+
+/// Serialises the tests that run a forced exit, or hold a statement the
+/// process-wide tracker lists. A forced exit cancels every tracked adapter's
+/// statements, so under `cargo test` (one process) two such tests would
+/// cancel each other's; `cargo nextest` gives each its own process.
+pub(crate) static FORCED_EXIT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

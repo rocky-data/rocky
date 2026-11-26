@@ -1335,8 +1335,8 @@ pub struct ResilienceConfig {
     #[serde(default = "default_resilience_max_retries_per_run")]
     pub max_retries_per_run: Option<u32>,
     /// Continue disjoint subgraphs when a model fails, instead of aborting the
-    /// whole run at the first failure. Default `false` (fail-fast — the run
-    /// stops at the first failing model, exactly as before this knob existed).
+    /// whole run at the first failure. Default `true`. Set `false` to restore
+    /// fail-fast: the run stops at the first failing model.
     ///
     /// When `true`, a failed model and its downstream closure are *withheld*
     /// (never built on the failure's stale/missing output), while unrelated
@@ -1417,7 +1417,7 @@ fn default_resilience_max_retries_per_run() -> Option<u32> {
     Some(8)
 }
 fn default_contain_failures() -> bool {
-    false
+    true
 }
 fn default_auto_apply_additive_drift() -> bool {
     false
@@ -8112,7 +8112,8 @@ pub struct TransformationPipelineConfig {
     /// Target configuration (adapter + governance).
     pub target: TransformationTargetConfig,
 
-    /// Data quality checks run after model execution.
+    /// Data quality checks. A transformation run does not execute them, and
+    /// `rocky validate` warns (V034) about each one that is set.
     #[serde(default)]
     pub checks: ChecksConfig,
 
@@ -10148,6 +10149,17 @@ mod tests {
             assert_eq!(cfg.tests_on_run, mode);
         }
         assert!(run("tests_on_run = \"always\"").is_err());
+    }
+
+    /// `[resilience] contain_failures` defaults to `true` (#2617): in code and
+    /// for an empty `[resilience]` table.
+    #[test]
+    fn contain_failures_defaults_to_true() {
+        assert!(ResilienceConfig::default().contain_failures);
+        let parsed: ResilienceConfig = toml::from_str("").unwrap();
+        assert!(parsed.contain_failures);
+        let off: ResilienceConfig = toml::from_str("contain_failures = false").unwrap();
+        assert!(!off.contain_failures);
     }
 
     /// The `Debug` output prints a resolved `${VAR}` value as `${NAME}` (#1919).

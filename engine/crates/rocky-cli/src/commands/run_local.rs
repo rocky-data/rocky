@@ -2183,6 +2183,7 @@ mod tests {
             no_sync_trigger: false,
             no_source_sync: false,
             tests_on_run: None,
+            batch_tests: false,
         };
         super::super::run::run(
             config_path,

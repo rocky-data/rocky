@@ -35,11 +35,6 @@ rocky plan --shadow --shadow-suffix _dagster_pr_42
 sandboxed schema; production tables untouched
 ```
 
-The suffix feeds `rocky plan --shadow --shadow-suffix <value>`, followed by
-`rocky apply <plan-id>`. The single-step
-`rocky run --shadow --shadow-suffix <value>` alias does the same in one
-invocation.
-
 ## Quickstart
 
 ```python
@@ -117,18 +112,9 @@ suffix = branch_deploy_shadow_suffix()  # None in production, "_dagster_pr_42" i
 rocky.run(filter="tenant=acme", shadow_suffix=suffix)
 ```
 
-## Why the helpers stop at detection
-
-Posting a diff summary as a PR comment is out of scope. It needs credentials for
-each Git host, and GitHub, GitLab, and Bitbucket all differ. It would also
-repeat the asset diff that Dagster+ already renders in its UI. Detection and
-suffix derivation need no credentials and work with any host.
-
 ## Resource-level auto-shadow
 
-`RockyResource.run()` accepts a `shadow_suffix` keyword argument, so wiring it by
-hand works end to end. To derive the suffix on every `run()`, `run_streaming()`,
-and `run_pipes()` call, pass the exported `shadow_suffix_resolver()` as the
+To derive the suffix on every `run()`, `run_streaming()`, and `run_pipes()` call, pass the exported `shadow_suffix_resolver()` as the
 resource's `shadow_suffix_fn`:
 
 ```python

@@ -496,7 +496,11 @@ impl AdapterRegistry {
                         retry: adapter_cfg.retry.clone(),
                     };
 
-                    let mut connector = DatabricksConnector::new(connector_config, auth);
+                    // One in-flight list for both connectors, so a forced
+                    // exit can cancel a statement sent through either.
+                    let in_flight = rocky_core::statement_cancel::InFlightStatements::new();
+                    let mut connector = DatabricksConnector::new(connector_config, auth)
+                        .with_in_flight(in_flight.clone());
                     if let Some(ref budget) = shared_retry_budget {
                         connector = connector.with_retry_budget(budget.clone());
                     }
@@ -525,6 +529,7 @@ impl AdapterRegistry {
                     if let Some(ref budget) = shared_retry_budget {
                         warehouse_conn = warehouse_conn.with_retry_budget(budget.clone());
                     }
+                    let warehouse_conn = warehouse_conn.with_in_flight(in_flight);
                     let adapter = Arc::new(DatabricksWarehouseAdapter::new(warehouse_conn));
 
                     connectors.insert(name.clone(), connector);
@@ -781,8 +786,12 @@ impl AdapterRegistry {
                     // path. Keeping it separate means the batch describe
                     // query won't contend with in-flight `execute_statement`
                     // calls on the warehouse adapter's connector.
+                    // One in-flight list for both connectors, so a forced
+                    // exit can cancel a statement sent through either.
+                    let in_flight = rocky_core::statement_cancel::InFlightStatements::new();
                     let mut sf_connector_for_batch =
-                        SnowflakeConnector::new(sf_connector_config.clone(), sf_auth.clone());
+                        SnowflakeConnector::new(sf_connector_config.clone(), sf_auth.clone())
+                            .with_in_flight(in_flight.clone());
                     if let Some(ref budget) = shared_retry_budget {
                         sf_connector_for_batch =
                             sf_connector_for_batch.with_retry_budget(budget.clone());
@@ -790,7 +799,8 @@ impl AdapterRegistry {
                     snowflake_connectors.insert(name.clone(), Arc::new(sf_connector_for_batch));
 
                     let mut warehouse_connector =
-                        SnowflakeConnector::new(sf_connector_config, sf_auth);
+                        SnowflakeConnector::new(sf_connector_config, sf_auth)
+                            .with_in_flight(in_flight);
                     if let Some(ref budget) = shared_retry_budget {
                         warehouse_connector = warehouse_connector.with_retry_budget(budget.clone());
                     }
@@ -997,6 +1007,11 @@ impl AdapterRegistry {
                     bail!(msg);
                 }
             }
+        }
+
+        // A forced exit of `rocky run` cancels what these adapters still run.
+        for (name, adapter) in &warehouse {
+            crate::statement_cancel::track(name, adapter);
         }
 
         // Log a warning for any experimental adapters that were registered.
@@ -1549,5 +1564,71 @@ kind = "discovery"
         assert!(msg.contains(
             "Replace `<discovery-adapter-name>` with an adapter configured for discovery."
         ));
+    }
+
+    /// A statement registered through the side connector (the one that
+    /// drives batch checks, and discovery for Databricks) must be listed by
+    /// the warehouse adapter and be reachable from a forced exit. Each
+    /// assertion fails if the matching `with_in_flight` or the `track` loop
+    /// is removed.
+    #[test]
+    fn statements_on_either_connector_reach_the_adapter_and_the_forced_exit_list() {
+        use rocky_core::statement_cancel::StatementHandle;
+
+        // The statements below are listed process-wide; hold the lock so a
+        // forced-exit test cannot send a cancel for them.
+        let _serial = crate::testing::FORCED_EXIT_TESTS.blocking_lock();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let dbx = format!("dbx-{suffix}");
+        let snow = format!("snow-{suffix}");
+        let cfg: RockyConfig = toml::from_str(&format!(
+            r#"
+[adapter.{dbx}]
+type = "databricks"
+host = "example.invalid"
+http_path = "/sql/1.0/warehouses/abc123"
+token = "dapi-test"
+
+[adapter.{snow}]
+type = "snowflake"
+account = "xy12345"
+warehouse = "WH"
+username = "u"
+password = "p"
+"#
+        ))
+        .unwrap();
+        let registry = AdapterRegistry::from_config(&cfg).expect("registry builds offline");
+
+        let _dbx_guard = registry
+            .databricks_connector(&dbx)
+            .unwrap()
+            .in_flight()
+            .register(StatementHandle::new("dbx-1"));
+        let _snow_guard = registry
+            .snowflake_connectors
+            .get(&snow)
+            .expect("snowflake side connector")
+            .in_flight()
+            .register(StatementHandle::new("snow-1"));
+
+        assert_eq!(
+            registry
+                .warehouse_adapter(&dbx)
+                .unwrap()
+                .in_flight_statements(),
+            [StatementHandle::new("dbx-1")]
+        );
+        assert_eq!(
+            registry
+                .warehouse_adapter(&snow)
+                .unwrap()
+                .in_flight_statements(),
+            [StatementHandle::new("snow-1")]
+        );
+
+        let tracked = crate::statement_cancel::tracked_statements();
+        assert!(tracked.contains(&(dbx, StatementHandle::new("dbx-1"))));
+        assert!(tracked.contains(&(snow, StatementHandle::new("snow-1"))));
     }
 }

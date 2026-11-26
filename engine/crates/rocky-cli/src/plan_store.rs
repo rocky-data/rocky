@@ -382,6 +382,24 @@ pub struct EmbeddedCapabilities {
     /// production capture failure and the governed apply REFUSES (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_source_schemas: Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// The external sources `rocky plan` described on the warehouse to settle
+    /// a contract verdict (#2635), as `rocky run` describes them (#2614): the
+    /// sources behind a contract type the compile could not check (`I003`) or
+    /// a `nullable = false` contract it refused (`E012`). Keyed by source
+    /// table, name-sorted for a stable digest.
+    ///
+    /// These schemas only settle contract verdicts. The compile that executes
+    /// and the execution fingerprint read [`Self::reviewed_source_schemas`]
+    /// alone. An agent's apply replays this map and never describes live: an
+    /// `E011` it raises replaces the `I003`, and an `E012` it does not
+    /// reproduce on a NOT NULL column is dropped.
+    ///
+    /// Bound into the `plan_id`. Empty, and left out of the JSON, on a plan
+    /// that described nothing, so its bytes and id do not move. A plan written
+    /// before this field existed reads back as empty, so its apply keeps the
+    /// `E012` (the fail-closed side).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub described_source_schemas: BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
     /// The `time_interval` models whose next run with no partition flag fills
     /// from `first_partition`, because the state store held no partition for
     /// them when the plan was made. `rocky plan` reports each fill
@@ -1036,6 +1054,14 @@ mod tests {
                     },
                 ],
             )])),
+            described_source_schemas: BTreeMap::from([(
+                "ext.customers".to_string(),
+                vec![TypedColumn {
+                    name: "customer_id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                }],
+            )]),
         };
         let plan_id = write_plan_governed(
             dir.path(),
@@ -1049,6 +1075,106 @@ mod tests {
         let plan = read_plan(dir.path(), &plan_id)?;
         assert_eq!(plan.plan_id, plan_id);
         assert_eq!(plan.embedded_capabilities(), caps);
+        Ok(())
+    }
+
+    /// #2635: a plan that described no source leaves `described_source_schemas`
+    /// out of its JSON, so its bytes and `plan_id` are those of a plan written
+    /// before the field existed. A non-empty map is written and moves the id.
+    #[test]
+    fn empty_described_source_schemas_are_omitted_and_keep_the_plan_id() -> anyhow::Result<()> {
+        use rocky_ir::RockyType;
+        use rocky_ir::types::TypedColumn;
+
+        let payload = serde_json::json!({"models": ["fct"]});
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            models_fingerprint: Some("fp".to_string()),
+            config_identity: Some("cfg".to_string()),
+            fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+            reviewed_source_schemas: Some(BTreeMap::new()),
+            ..Default::default()
+        };
+        let caps_json = serde_json::to_value(&caps)?;
+        assert!(
+            caps_json.get("described_source_schemas").is_none(),
+            "an empty map must be left out of the JSON: {caps_json}"
+        );
+
+        // The id of the same plan as an older binary wrote it: the capability
+        // object built by hand, with no `described_source_schemas` key.
+        let legacy_caps = serde_json::json!({
+            "diff_available": true,
+            "changed": {},
+            "models_fingerprint": "fp",
+            "config_identity": "cfg",
+            "fingerprint_version": CURRENT_FINGERPRINT_VERSION,
+            "reviewed_source_schemas": {},
+        });
+        let legacy_payload = payload_with_capabilities(&payload, Some(legacy_caps))?;
+        assert_eq!(
+            governed_plan_id(&PlanKind::Run, &payload, &caps)?,
+            compute_plan_id(&PlanKind::Run, &legacy_payload),
+            "an empty described map must not move the plan_id"
+        );
+
+        let described = EmbeddedCapabilities {
+            described_source_schemas: BTreeMap::from([(
+                "ext.customers".to_string(),
+                vec![TypedColumn {
+                    name: "customer_id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                }],
+            )]),
+            ..caps.clone()
+        };
+        let described_json = serde_json::to_value(&described)?;
+        assert_eq!(
+            described_json["described_source_schemas"]["ext.customers"][0]["nullable"],
+            serde_json::json!(false),
+            "a non-empty map is written: {described_json}"
+        );
+        assert_ne!(
+            governed_plan_id(&PlanKind::Run, &payload, &described)?,
+            governed_plan_id(&PlanKind::Run, &payload, &caps)?,
+            "the described schemas are bound into the plan_id"
+        );
+        Ok(())
+    }
+
+    /// #2635: a plan written before `described_source_schemas` existed reads
+    /// back with an empty map, so its apply replays no describe and keeps the
+    /// `E012` (the fail-closed side).
+    #[test]
+    fn a_plan_without_described_source_schemas_reads_back_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"models": ["fct"]});
+        let legacy_caps = EmbeddedCapabilities {
+            diff_available: true,
+            fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+            reviewed_source_schemas: Some(BTreeMap::new()),
+            ..Default::default()
+        };
+        let plan_id = write_plan_governed(
+            dir.path(),
+            PlanKind::Run,
+            &payload,
+            PolicyPrincipal::Agent,
+            legacy_caps,
+        )?;
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert!(
+            plan.payload[POLICY_CAPABILITIES_KEY]
+                .get("described_source_schemas")
+                .is_none(),
+            "the stored plan has no described_source_schemas key"
+        );
+        assert!(
+            plan.embedded_capabilities()
+                .described_source_schemas
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -1569,6 +1695,7 @@ mod tests {
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
+            described_source_schemas: BTreeMap::new(),
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1593,6 +1720,7 @@ mod tests {
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
+            described_source_schemas: BTreeMap::new(),
         };
         assert!(caps.touched(&[]).is_empty());
     }
@@ -1619,6 +1747,7 @@ mod tests {
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
+            described_source_schemas: BTreeMap::new(),
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1650,6 +1779,7 @@ mod tests {
             config_identity: None,
             fingerprint_version: 0,
             reviewed_source_schemas: None,
+            described_source_schemas: BTreeMap::new(),
         };
         // Only `orders` executes; the change to the non-executing `customers`
         // is absent from the touched set.

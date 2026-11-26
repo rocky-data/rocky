@@ -1073,6 +1073,20 @@ impl WarehouseAdapter for BigQueryAdapter {
         }
     }
 
+    /// BigQuery submits a job and polls it, but cancelling the job is not
+    /// wired yet. Its statements run on after a forced exit.
+    fn in_flight_statements(&self) -> Vec<rocky_core::statement_cancel::StatementHandle> {
+        Vec::new()
+    }
+
+    /// See [`Self::in_flight_statements`].
+    async fn cancel_statement(
+        &self,
+        _handle: &rocky_core::statement_cancel::StatementHandle,
+    ) -> AdapterResult<rocky_core::statement_cancel::CancelOutcome> {
+        Ok(rocky_core::statement_cancel::CancelOutcome::Unsupported)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.run_query(sql)
             .await

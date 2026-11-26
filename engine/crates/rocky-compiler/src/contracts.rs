@@ -396,8 +396,11 @@ pub fn validate_contract_with(
                              discover --with-schemas` fills). If Rocky cannot prove `{0}` is never NULL, \
                              check the data instead: set `nullable = true` in the contract and add a \
                              `[[tests]]` block with `type = \"not_null\"` and `column = \"{0}\"` to the \
-                             model's sidecar. With `rocky run --tests enforce` (or `[run] tests_on_run = \
-                             \"enforce\"`), a NULL fails the model and its downstream models do not build; the \
+                             model's sidecar. If a product spec generated the contract (its first line \
+                             says GENERATED), make the change in the spec, not in the contract file, \
+                             because the next lowering overwrites the contract. `[run] tests_on_run` \
+                             defaults to \"enforce\"; \"report\" and \"off\" turn that down. With \
+                             `rocky run --tests enforce`, or with the default setting, a NULL fails the model and its downstream models do not build; the \
                              rows it wrote stay in the table. `rocky plan promote` refuses a branch when the \
                              model's newest `rocky run --branch` evidence is that failure. A `WHERE {0} IS NOT NULL` filter does not clear `E012`: \
                              Rocky does not read the WHERE clause when it infers nullability. Use the \

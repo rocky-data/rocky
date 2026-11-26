@@ -1,6 +1,6 @@
 # ADR-ICEBERG-DUCKDB — Iceberg tables through DuckDB and a REST catalog
 
-**Status:** Accepted (advisor-ruled 2026-11-11, Hugo to confirm)
+**Status:** Accepted (advisor-ruled 2026-11-11, a maintainer to confirm)
 
 **Scope:** Package L-1 of the open-storage work. A `type = "duckdb"` adapter can attach an Iceberg REST catalog, and `rocky run` writes models whose target catalog is that attachment. It builds on [`ADR-REPLACE.md`](ADR-REPLACE.md), decision D3.
 

@@ -5,19 +5,13 @@ sidebar:
   order: 8
 ---
 
-Rocky's DSL is a pipeline-oriented syntax for transformation models. A `.rocky` file lowers to standard SQL before execution. The warehouse only ever sees SQL.
+Rocky's DSL is a pipeline-oriented syntax for transformation models. A `.rocky` file lowers to standard SQL before execution, so the warehouse only ever sees SQL.
 
 :::note[The DSL is optional]
-Rocky is **SQL-first**. Every feature works with plain `.sql` files. The DSL exists for teams that want a more readable shape for multi-step transformations. Mix and match freely: a DSL model can depend on a SQL model and vice versa.
+Rocky is **SQL-first**. Every feature works with plain `.sql` files. A DSL model can depend on a SQL model and the reverse.
 :::
 
-## Why a DSL
-
-A `SELECT` with several CTEs, window functions, and nested `CASE` expressions gets hard to follow. The DSL gives you a top-to-bottom pipeline instead. Each step transforms the rows flowing through it, so you can read the final shape off the file.
-
-## Pipeline syntax
-
-A Rocky file is a sequence of pipeline steps. Data flows from the top step downward:
+A `SELECT` with several CTEs, window functions and nested `CASE` expressions gets hard to follow. The DSL reads top to bottom: each step transforms the rows flowing through it.
 
 ```
 from orders
@@ -44,137 +38,27 @@ ORDER BY revenue DESC
 LIMIT 100
 ```
 
-Function names are uppercased and their arguments pass through unchanged. So `count()` lowers to `COUNT()`. Check that your warehouse accepts that form, or write `count(1)`.
+Function names are uppercased and arguments pass through unchanged, so `count()` lowers to `COUNT()`. Check that your warehouse accepts that form, or write `count(1)`.
 
 ## Constructs
 
-### from
+| Step | What it does | Lowers to |
+|---|---|---|
+| `from orders`, `from catalog.schema.orders`, `from orders as o` | Starts every pipeline | `FROM` |
+| `where` | Filters. Several steps combine with `AND`. After a `group` it becomes `HAVING`. | `WHERE` / `HAVING` |
+| `group customer_id { revenue: sum(amount) }` | Groups by keys and defines aggregations | `GROUP BY` |
+| `derive { total: amount * quantity }` | Adds computed columns, keeps the existing ones. A later step can reference the name: Rocky inlines it. At the end of a pipeline it appends to `SELECT *`. | `SELECT *, … AS …` |
+| `select { id, o.id, * }` | Replaces the column set | `SELECT` |
+| `join customers as c on customer_id { keep c.name }` | Joins on key columns. `keep` pulls in columns. Put `left`, `right`, `full` or `cross` before `join`, or write `left_join`. A cross join takes no `on`. | `JOIN … ON o.customer_id = c.customer_id` |
+| `sort order_date desc` | Orders | `ORDER BY` |
+| `take 10` | Limits | `LIMIT` |
+| `distinct` | Deduplicates | `SELECT DISTINCT` |
+| `replicate` | `SELECT *` for a bronze-layer pass-through | `SELECT * FROM <source>` |
+| `let active = from users where …` | Names a sub-pipeline, before the main pipeline | CTE (`WITH`) |
 
-Every pipeline starts with `from`. It accepts a model name, a qualified table reference, or a table with an alias:
-
-```
-from orders
-from catalog.schema.orders
-from orders as o
-```
-
-### where
-
-Filters rows. Multiple `where` steps combine with `AND`. A `where` step after `group` becomes a `HAVING` clause:
-
-```
-from orders
-where amount > 0
-where status != "cancelled"
-group customer_id {
-    total: sum(amount)
-}
-where total > 1000     -- this becomes HAVING
-```
-
-### group
-
-Groups rows by one or more keys and defines aggregations in a block:
+`match` lowers to `CASE WHEN`:
 
 ```
-from orders
-group customer_id {
-    revenue: sum(amount),
-    avg_order: avg(amount),
-    first_order: min(order_date),
-    cnt: count()
-}
-```
-
-### derive
-
-Adds computed columns without removing existing ones:
-
-```
-from orders
-derive {
-    total: amount * quantity,
-    is_large: amount > 1000
-}
-```
-
-A later step can reference a derived name: a `group` aggregation, a `where`, a `select`, or another `derive`. Rocky inlines the name to its expression, so `group c { revenue: sum(total) }` becomes `SUM(amount * quantity)`. A `derive` at the end of a pipeline keeps the source columns and appends the computed ones (`SELECT *, ...`).
-
-### select
-
-Chooses which columns to keep. Replaces the current column set:
-
-```
-from orders
-select { id, customer_id, total }
-```
-
-Supports `*` and qualified references:
-
-```
-from orders as o
-join customers as c on customer_id {
-    keep c.name
-}
-select { o.id, c.name }
-```
-
-### join
-
-Joins another model by key columns, with an optional `keep` clause to pull in specific columns:
-
-```
-from orders as o
-join customers as c on customer_id {
-    keep c.name, c.email
-}
-```
-
-This lowers to:
-
-```sql
-SELECT c.name, c.email
-FROM orders o
-JOIN customers AS c ON o.customer_id = c.customer_id
-```
-
-For an outer or cross join, put `left`, `right`, `full` or `cross` before `join`, or write one word such as `left_join`. A cross join takes no `on` clause.
-
-### sort
-
-Orders results. Use `desc` for descending:
-
-```
-from orders
-sort order_date desc
-```
-
-### take
-
-Limits the number of rows:
-
-```
-from orders
-sort amount desc
-take 10
-```
-
-### distinct
-
-Deduplicates rows:
-
-```
-from orders
-select { customer_id }
-distinct
-```
-
-### match
-
-Pattern matching that lowers to `CASE WHEN`:
-
-```
-from orders
 derive {
     tier: match amount {
         > 10000 => "enterprise",
@@ -184,105 +68,32 @@ derive {
 }
 ```
 
-Lowers to:
-
 ```sql
 CASE WHEN amount > 10000 THEN 'enterprise'
      WHEN amount > 1000 THEN 'mid-market'
      ELSE 'smb' END AS tier
 ```
 
-### replicate
+## Literals
 
-Shorthand for `SELECT *`. Use it in a bronze-layer model that passes data through unchanged:
-
-```
-from source.fivetran.orders
-replicate
-```
-
-### let
-
-A `let` binding names a sub-pipeline. It lowers to a common table expression (a `WITH` clause). Bindings come before the main pipeline:
-
-```
-let active = from users
-where is_active == true
-
-from active
-select { id, name }
-```
-
-## String literals
-
-Use single or double quotes for a string. A string ends at the matching quote,
-with no DSL escape sequences. Use double quotes to include an apostrophe:
-`"it's"` lowers to SQL `'it''s'`.
-
-A backslash in a `.rocky` string literal fails compilation with `E040` at the
-literal's file, line, and column. Use a `.sql` model with the target warehouse's
-own escaping when the value needs a backslash.
-
-## Date literals
-
-The `@` prefix creates date literals without quoting:
-
-```
-from orders
-where order_date >= @2025-01-01
-```
-
-Lowers to `WHERE order_date >= DATE '2025-01-01'`.
-
-A time part is allowed: `@2025-01-01T00:00:00Z`. It still lowers to a `DATE` literal (`DATE '2025-01-01T00:00:00Z'`), never a `TIMESTAMP`. Check that your warehouse reads that value the way you expect.
+- **Strings** use single or double quotes, with no escape sequences. `"it's"` lowers to `'it''s'`. A backslash fails compilation with `E040`: use a `.sql` model with the warehouse's own escaping.
+- **Dates** use the `@` prefix: `where order_date >= @2025-01-01` lowers to `DATE '2025-01-01'`. A time part (`@2025-01-01T00:00:00Z`) still lowers to a `DATE` literal, never a `TIMESTAMP`. Check that your warehouse reads it as you expect.
 
 ## NULL-safe operators
-
-Rocky's `!=` operator compiles to SQL's `IS DISTINCT FROM`, not the standard `!=`. A comparison against `NULL` therefore behaves the way you expect:
 
 | Rocky | SQL | NULL behavior |
 |-------|-----|---------------|
 | `a == b` | `a = b` | `NULL = NULL` is `NULL` (standard SQL) |
 | `a != b` | `a IS DISTINCT FROM b` | `NULL IS DISTINCT FROM NULL` is `FALSE` |
-
-This removes a class of bug where `!= 'value'` silently drops every `NULL` row.
-
-`IS NULL` and `IS NOT NULL` work as expected:
-
-```
-from orders
-where email is not null
-```
-
-### List membership: `in` and `not in`
-
-Test a value against a bracketed list:
-
-```
-from orders
-where status in ["active", "pending"] and region not in ["test"]
-```
-
-Lowers to `WHERE status IN ('active', 'pending') AND region NOT IN ('test')`.
-
-`not in` is **not** NULL-safe. It keeps SQL's `NOT IN` semantics, unlike `!=`:
-
-| Rocky | SQL | NULL behavior |
-|-------|-----|---------------|
 | `a in [1, 2]` | `a IN (1, 2)` | `NULL` when `a` is `NULL` |
 | `a not in [1, 2]` | `a NOT IN (1, 2)` | `NULL` when `a` is `NULL`, so `where` drops the row |
 | `a not in [1, null]` | `a NOT IN (1, NULL)` | Never true: `NULL` or `FALSE` for every row |
 
-Keep `NULL` out of a `not in` list. To keep rows where `a` is `NULL`, write `a is null or a not in [...]`.
-
-The list needs at least one value. A trailing comma is allowed. A prefix `not` binds tightest, so write `a not in [...]`, not `not a in [...]`.
+`!=` removes the bug where `!= 'value'` silently drops every `NULL` row. `not in` is **not** NULL-safe: keep `NULL` out of the list, and write `a is null or a not in [...]` to keep `NULL` rows. The list needs at least one value. `IS NULL` and `IS NOT NULL` work as written (`where email is not null`).
 
 ## Window functions
 
-Window functions use an `over` clause with `partition`, `sort`, and optional frame:
-
 ```
-from orders
 derive {
     rn: row_number() over (partition customer_id, sort -order_date),
     running_total: sum(amount) over (partition customer_id, sort order_date, rows unbounded..current),
@@ -290,40 +101,10 @@ derive {
 }
 ```
 
-The `-` prefix on a sort column means descending. Frame bounds use `..` syntax: `unbounded..current`, `3..current`.
-
-## Comments
-
-Line comments use `--`, same as SQL:
-
-```
-from orders
--- Filter to completed orders only
-where status == "completed"
-```
+A `-` prefix on a sort column means descending. Frame bounds use `..`: `unbounded..current`, `3..current`. Comments use `--`.
 
 ## How lowering works
 
-A `.rocky` file goes through two phases before the compiler sees it.
+`.rocky` file ─▶ parse (tokens to a typed AST) ─▶ `lower_to_sql()` (one SQL string) ─▶ the same compile path as a `.sql` model. There is no runtime indirection and no separate IR. See [The Rocky Compiler](/concepts/compiler/#1-load-models).
 
-```
-  models/top_customers.rocky
-        │
-        │ 1. parse: tokens → typed AST, one variant per pipeline step
-        ▼
-    pipeline AST
-        │
-        │ 2. lower: walk the steps, accumulating clauses —
-        │    FROM, joins, WHERE, SELECT, GROUP BY, HAVING,
-        │    ORDER BY, LIMIT
-        ▼
-    a single SQL string   ◄──── a .sql model joins the path here
-        │
-        │ 3. compile: type check, resolve dependencies
-        ▼
-    dialect SQL ─────────► warehouse
-```
-
-The lowered SQL flows into the compiler for type checking and dependency resolution, exactly as if you had written it by hand. There is no runtime indirection. A `.rocky` file and a `.sql` file reach the warehouse the same way.
-
-For the full language grammar, see the [Rocky language spec](https://github.com/rocky-data/rocky/blob/main/docs/rocky-lang-spec.md).
+For the grammar, operator precedence, reserved words and parser limits, see the [Rocky language spec](https://github.com/rocky-data/rocky/blob/main/docs/rocky-lang-spec.md).

@@ -2112,7 +2112,7 @@ export interface TransformationPipelineConfig {
    */
   allow_empty_models?: boolean;
   /**
-   * Data quality checks run after model execution.
+   * Data quality checks. A transformation run does not execute them, and `rocky validate` warns (V034) about each one that is set.
    */
   checks?: ChecksConfig;
   /**
@@ -2721,7 +2721,7 @@ export interface ResilienceConfig {
    */
   circuit_breaker_threshold?: number;
   /**
-   * Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `false` (fail-fast — the run stops at the first failing model, exactly as before this knob existed).
+   * Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `true`. Set `false` to restore fail-fast: the run stops at the first failing model.
    *
    * When `true`, a failed model and its downstream closure are *withheld* (never built on the failure's stale/missing output), while unrelated subtrees still materialize; the run reports `PartialFailure` with a containment manifest naming what failed and its blast radius. This changes no data semantics — everything withheld is already withheld by today's fail-fast run; it only *narrows* the withholding to the actual blast radius. The closure is conservative (computed from the resolved dependency graph, contain-more on any doubt).
    */
