@@ -6676,7 +6676,8 @@ cron = "0 * * * *"
         std::fs::write(&model, "SELECT @var(f)(id) AS d FROM raw.orders").unwrap();
         let message = v069_message_for(&dir);
         assert!(
-            message.starts_with("pipeline.silver: not_rerun_safe (") && message.contains("@var()"),
+            message.starts_with("pipeline.silver: not_rerun_safe (")
+                && message.contains("leaves an `@var(` in its SQL"),
             "{message}"
         );
     }
