@@ -23,10 +23,10 @@
 //! 2. A quality pipeline with no quarantine and no `[[checks.custom]]`: it
 //!    only reads.
 //!
-//! A `[hook.*]` shell command can write anything, so [`with_hooks`] turns a
-//! `Safe` class into `NotSafe` when one is configured. A webhook sends an
-//! HTTP request and issues no warehouse statement, so it does not change the
-//! class.
+//! A `[hook.*]` shell command can write anything, and a webhook (a
+//! `preset = "generic"` one can POST to a warehouse SQL API) can too. So
+//! [`with_hooks`] turns a `Safe` class into `NotSafe` when either is
+//! configured.
 //!
 //! The classification judges the steady-state statements a run executes.
 
@@ -200,15 +200,15 @@ pub fn classify_pipeline(
     }
 }
 
-/// Make a `Safe` class `NotSafe` when the project has `shell_hooks` `[hook.*]`
-/// shell commands. A hook command can write to the warehouse, and Rocky does
-/// not read it. A webhook is not counted: it sends an HTTP request and runs
-/// no warehouse statement.
+/// Make a `Safe` class `NotSafe` when the project has `hooks` `[hook.*]`
+/// entries, shell commands and webhooks together. A shell command can write to
+/// the warehouse, and so can a webhook: a `generic` one can POST to a
+/// warehouse SQL API. Rocky reads neither.
 #[must_use]
-pub fn with_hooks(class: RerunSafety, shell_hooks: usize) -> RerunSafety {
+pub fn with_hooks(class: RerunSafety, hooks: usize) -> RerunSafety {
     match class {
-        RerunSafety::Safe if shell_hooks > 0 => RerunSafety::not_safe(
-            "a [hook.*] shell command can write to the warehouse, and Rocky does not classify it",
+        RerunSafety::Safe if hooks > 0 => RerunSafety::not_safe(
+            "a [hook.*] shell command or webhook can write to the warehouse, and Rocky does not classify it",
         ),
         RerunSafety::Safe | RerunSafety::NotSafe { .. } => class,
     }
@@ -802,10 +802,13 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_hook_makes_a_safe_class_not_safe() {
+    fn a_shell_hook_or_webhook_makes_a_safe_class_not_safe() {
         assert_eq!(with_hooks(RerunSafety::Safe, 0), RerunSafety::Safe);
         let reason = not_safe_reason(with_hooks(RerunSafety::Safe, 1));
-        assert!(reason.contains("[hook.*] shell command"), "{reason}");
+        assert!(
+            reason.contains("[hook.*] shell command or webhook"),
+            "{reason}"
+        );
         let already = RerunSafety::not_safe("why");
         assert_eq!(with_hooks(already.clone(), 3), already);
     }

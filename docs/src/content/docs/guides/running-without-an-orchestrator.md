@@ -592,9 +592,9 @@ The rule is short. A pipeline is `rerun_safe` only when it writes nothing to the
 | `replication` pipeline, any strategy | `not_rerun_safe`. It writes the target tables on every run. On Databricks it also sets `TBLPROPERTIES run_id` after the copy. A `[[checks.custom]]` check adds its own reason. |
 | `snapshot` pipeline, `load` pipeline | `not_rerun_safe`. |
 
-A transformation pipeline can stop being `rerun_safe` even when every model is `ephemeral`. A run still writes in two cases. It creates each project function (`functions/`) that a model calls, with `CREATE OR REPLACE FUNCTION`. It also applies `[governance.tags]` to every model's target. A pipeline with either is `not_rerun_safe`.
+A transformation pipeline can stop being `rerun_safe` even when every model is `ephemeral`. A run still writes in two cases. It creates each project function (`functions/`) that a model calls, with `CREATE OR REPLACE FUNCTION`. Rocky finds the calls after it fills in each `@var()` with its inline default, as a run does. A model with an `@var()` that has no default is `not_rerun_safe`. It also applies `[governance.tags]` to every model's target. A pipeline with either is `not_rerun_safe`.
 
-A `[hook.*]` shell command can write anything, and Rocky does not read it. So when the project has any shell hook, every pipeline is `not_rerun_safe`. A webhook sends an HTTP request and runs no warehouse statement, so it does not change the class. Rocky does not classify what the receiver does.
+A `[hook.*]` shell command can write anything, and Rocky does not read it. A webhook can too: a `preset = "generic"` webhook can POST to a warehouse SQL API. So when the project has any shell hook or webhook, every pipeline is `not_rerun_safe`.
 
 The class judges the statements of a normal run. Other adapter types get the same class, and the message adds that Rocky has not verified the adapter.
 

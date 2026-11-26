@@ -1317,7 +1317,7 @@ fn rerun_safety_message(
     let writes = resolve_rerun_writes(pc, cfg, config_path);
     let class = with_hooks(
         classify_pipeline(pc, &target, &writes),
-        HookRegistry::from_config(&cfg.hooks).shell_hook_count(),
+        HookRegistry::from_config(&cfg.hooks).total_hook_count(),
     );
     let message = match &class {
         RerunSafety::Safe => format!("pipeline.{name}: {}", class.class_name()),
@@ -1372,7 +1372,28 @@ fn resolve_rerun_writes(
                 &glob,
                 Some(&cfg.freshness),
             ) {
-                Ok(models) => {
+                Ok(mut models) => {
+                    // A run substitutes `@var()` into each model's SQL before
+                    // it finds the functions the model calls, so a call written
+                    // as `@var(f, name)(x)` is hidden from the raw text. Apply
+                    // the run's own substitution, with no `--var` (the inline
+                    // defaults). A variable it cannot resolve means the scan
+                    // cannot see the SQL a run executes, so fail closed.
+                    let diagnostics = rocky_compiler::compile::substitute_run_vars_into_models(
+                        &mut models,
+                        &rocky_core::run_vars::RunVars::new(),
+                    );
+                    if let Some(model) = models.iter().find(|m| {
+                        m.sql.contains("@var(")
+                            || diagnostics.iter().any(|d| d.model == m.config.name)
+                    }) {
+                        return ResolvedWrites::Unresolved {
+                            reason: format!(
+                                "model '{}' uses an @var() that has no inline default, so Rocky cannot read the SQL a run executes",
+                                model.config.name
+                            ),
+                        };
+                    }
                     let (functions, _) = rocky_compiler::udf::load_for_models_dir(&dir);
                     ResolvedWrites::Models(
                         models
@@ -6552,8 +6573,8 @@ cron = "0 * * * *"
     }
 
     /// A `[hook.*]` shell command can write anything, so it makes an
-    /// otherwise safe pipeline not safe. A webhook runs no warehouse
-    /// statement, so it does not.
+    /// otherwise safe pipeline not safe. So does a webhook: a `generic`
+    /// one can POST to a warehouse SQL API.
     #[test]
     fn a_shell_hook_makes_a_safe_pipeline_not_rerun_safe() {
         let dir = scheduled_transformation("duckdb", EPHEMERAL);
@@ -6572,14 +6593,19 @@ cron = "0 * * * *"
             "{message}"
         );
 
-        std::fs::write(
-            &path,
-            format!(
-                "{base}\n[hook.webhooks.on_pipeline_complete]\nurl = \"https://example.com/h\"\n"
-            ),
-        )
-        .unwrap();
-        assert_eq!(v069_message_for(&dir), "pipeline.silver: rerun_safe");
+        for webhook in [
+            "[hook.webhooks.on_pipeline_complete]\nurl = \"https://example.com/h\"\n",
+            "[hook.webhooks.on_pipeline_complete]\nurl = \"https://example.com/sql\"\npreset = \"generic\"\nbody_template = \"{}\"\n",
+        ] {
+            std::fs::write(&path, format!("{base}\n{webhook}")).unwrap();
+            let message = v069_message_for(&dir);
+            assert!(
+                message.starts_with(
+                    "pipeline.silver: not_rerun_safe (a [hook.*] shell command or webhook"
+                ),
+                "{message}"
+            );
+        }
     }
 
     /// A run creates the project functions an ephemeral model calls, and
@@ -6616,6 +6642,41 @@ cron = "0 * * * *"
         let message = v069_message_for(&dir);
         assert!(
             message.contains("calls the project function 'cents_to_dollars'"),
+            "{message}"
+        );
+    }
+
+    /// A run substitutes `@var()` before it finds the functions a model calls,
+    /// so a call written through an inline-default `@var` is still a call. A
+    /// variable with no default hides the SQL, so it fails closed.
+    #[test]
+    fn a_function_call_behind_a_var_is_not_rerun_safe() {
+        let dir = scheduled_transformation("duckdb", EPHEMERAL);
+        let functions = dir.path().join("functions");
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(
+            functions.join("cents_to_dollars.toml"),
+            "returns = \"DOUBLE\"\n[[arguments]]\nname = \"cents\"\ntype = \"BIGINT\"\n",
+        )
+        .unwrap();
+        std::fs::write(functions.join("cents_to_dollars.sql"), "cents / 100.0").unwrap();
+        let model = dir.path().join("models").join("orders.sql");
+
+        std::fs::write(
+            &model,
+            "SELECT @var(f, cents_to_dollars)(id) AS d FROM raw.orders",
+        )
+        .unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.contains("calls the project function 'cents_to_dollars'"),
+            "{message}"
+        );
+
+        std::fs::write(&model, "SELECT @var(f)(id) AS d FROM raw.orders").unwrap();
+        let message = v069_message_for(&dir);
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (") && message.contains("@var()"),
             "{message}"
         );
     }
