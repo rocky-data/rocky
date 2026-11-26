@@ -1802,6 +1802,12 @@ pub struct TestArgs {
     /// Pipeline to use for declarative checks when the project has more than one.
     #[serde(default)]
     pub pipeline: Option<String>,
+    /// Refuse each fixture `[[test]]` whose model's target warehouse is not
+    /// DuckDB alone (another warehouse, several, or none resolved), instead of
+    /// running it on DuckDB. A refused test fails the run, as with
+    /// `rocky test --strict-dialect`. Not used with `declarative`.
+    #[serde(default)]
+    pub strict_dialect: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2884,6 +2890,8 @@ impl RockyMcpServer {
                     passed: 0,
                     failed: 0,
                 },
+                dialect_warning: None,
+                unit_dialects: Vec::new(),
                 declarative: Some(DeclarativeSuiteLite {
                     total: summary.total,
                     passed: summary.passed,
@@ -2910,6 +2918,7 @@ impl RockyMcpServer {
             None,
             params.0.model.as_deref(),
             &self.config_path,
+            params.0.strict_dialect,
         )
         .map_err(|e| {
             // Preserve the stable taxonomy the way `compile` and
@@ -2961,6 +2970,27 @@ impl RockyMcpServer {
                 failed: 0,
             },
         };
+        // The same disclosure `rocky test` gives: a unit test whose model
+        // targets a warehouse other than DuckDB ran on DuckDB (or was refused
+        // by `strict_dialect`). A DuckDB project has no marked test, so both
+        // fields stay empty and are omitted from the JSON.
+        let (dialect_warning, unit_dialects) = match &output.unit_tests {
+            Some(summary) => (
+                commands::dialect_warning(&summary.results),
+                summary
+                    .results
+                    .iter()
+                    .filter_map(|r| {
+                        r.dialect.as_ref().map(|d| UnitDialectLite {
+                            model: r.model.clone(),
+                            test: r.test.clone(),
+                            dialect: d.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            None => (None, Vec::new()),
+        };
         if let Some(summary) = output.unit_tests {
             for result in summary.results.into_iter().filter(|r| !r.passed) {
                 // `run_one_unit_test` sets `error` on every failure path, so
@@ -2987,6 +3017,8 @@ impl RockyMcpServer {
             all_passed,
             models,
             unit_tests,
+            dialect_warning,
+            unit_dialects,
             declarative: None,
         }))
     }
