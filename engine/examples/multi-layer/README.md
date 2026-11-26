@@ -53,7 +53,7 @@ rocky compile
   ✓ raw_events (9 columns)
   ✓ stg_events (10 columns)
   ✓ stg_users (6 columns)
-  ✓ fct_user_activity (12 columns)
+  ✓ fct_user_activity (9 columns)
   Compiled: 4 models, 0 errors, 0 warnings
 ```
 
@@ -89,11 +89,6 @@ A declared column that the model does not output is a warning, not an error,
 unless `required` lists it. The code is `W010` and the message is
 `contract column '<name>' not found in model output`. This contract declares
 nine columns, and all nine are in the model output, so no `W010` appears here.
-
-The plain `rocky compile` line above reports 12 columns for
-`fct_user_activity`, not nine. The
-`keep` block in the join outputs `full_name`, `email`, and `country`, and the
-`group` block outputs them again, so each name appears twice.
 
 A contract is loaded only when a command receives `--contracts <dir>`. The
 commands that accept the flag are `compile`, `test`, `ci`, `dag`, `publish-ir`,

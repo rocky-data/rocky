@@ -1,8 +1,6 @@
 -- Gold: per-user activity summary joining events and users
 from stg_events
-join stg_users as u on user_id {
-    keep u.full_name, u.email, u.country
-}
+join stg_users as u on user_id
 group user_id {
     full_name: max(u.full_name),
     email: max(u.email),
