@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-Rocky ships four artifacts, each on its own version number, so each keeps its own changelog. The notes themselves live in the repository and on the release pages below. This page points you at them.
+Rocky ships four artifacts, each with its own version number and changelog. The notes live in the repository and on the release pages below.
 
 ## The four artifacts
 
@@ -20,9 +20,7 @@ Every changelog follows [Keep a Changelog](https://keepachangelog.com/), and the
 
 ## Why four version numbers
 
-The four artifacts move at different speeds and couple to each other loosely, so each ships on its own schedule. The SDK and the extension both call the `rocky` binary as a subprocess, and the Dagster integration is a thin adapter over the SDK. A CLI release therefore forces no release of the others.
-
-Tagging `engine-v1.47.0` builds and publishes the CLI alone. The SDK, Dagster, and extension releases work the same way under their own tags.
+The SDK and the extension call the `rocky` binary as a subprocess, and the Dagster integration is a thin adapter over the SDK. So a CLI release forces no release of the others. A tag builds and publishes its own artifact alone:
 
 ```
    engine-v*  ──►  rocky CLI binary        (GitHub Releases)

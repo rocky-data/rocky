@@ -5,11 +5,9 @@ sidebar:
   order: 11
 ---
 
-Every engine release publishes one container image, `ghcr.io/rocky-data/rocky`. The image holds the release's own `rocky` binary and nothing else. This guide shows you how to run it with `docker run`, what to mount, how to probe it, how to stop it, and how to upgrade it. A Compose example and a build recipe close the page.
+Every engine release publishes one container image, `ghcr.io/rocky-data/rocky`. It holds the release's own `rocky` binary and nothing else: the release workflow copies the Linux binaries out of the release archives, and nothing is compiled in the image build. `docker run ... --version` prints the version you pulled.
 
 ## What the image is
-
-The image is the release, bit for bit. The release workflow copies the Linux binaries out of the release archives into the image; nothing is compiled in the image build. The `docker run --version` output is the version you pulled.
 
 | Property | Value |
 |---|---|
@@ -25,13 +23,11 @@ The image is the release, bit for bit. The release workflow copies the Linux bin
 | Stop signal | `SIGTERM`, then the server drains |
 | Size | about 40 MB |
 
-A pre-release version (one with a `-`, such as `1.74.0-rc.1`) gets only its own tag. It never moves `latest` or `<major>.<minor>`. A tag is never rebuilt in place: a base-image bump ships as a new patch release.
-
-Pin the `<version>` tag for anything that must be reproducible. Pin the digest (`ghcr.io/rocky-data/rocky@sha256:...`) when the pull must be exact; `docker buildx imagetools inspect` prints it.
+A pre-release (such as `1.74.0-rc.1`) gets only its own tag and never moves `latest` or `<major>.<minor>`. A tag is never rebuilt in place: a base-image bump ships as a new patch release. Pin the `<version>` tag to reproduce a run, or the digest (`ghcr.io/rocky-data/rocky@sha256:...`, printed by `docker buildx imagetools inspect`) for an exact pull.
 
 ## Run the server
 
-Run the server from a project directory. The command below publishes the port on loopback only, mounts the project as `/data`, hands the server a token, and turns the browser UI on.
+From a project directory, this publishes the port on loopback, mounts the project as `/data`, sets a token and turns the browser UI on.
 
 ```bash
 docker run --rm \
@@ -43,7 +39,7 @@ docker run --rm \
   serve --host 0.0.0.0 --ui
 ```
 
-The server prints one line with the address to open, `Rocky UI: http://localhost:8080/login?t=...`. Open it. The server checks the token, sets a session cookie, and redirects to `/ui/`. A proxy in front may log the query of `/login`: configure it not to. See [sign-in](/guides/browser-ui/#sign-in-and-the-session-cookie).
+Open the address the server prints (`Rocky UI: http://localhost:8080/login?t=...`). The server checks the token, sets a session cookie and redirects to `/ui/`. A proxy may log the `/login` query: configure it not to. See [sign-in](/guides/browser-ui/#sign-in-and-the-session-cookie).
 
 ```
  browser ── http://localhost:8080/ui/ ──► host :8080 ──► container :8080 (rocky serve)
@@ -56,19 +52,19 @@ The server prints one line with the address to open, `Rocky UI: http://localhost
                                                             └── .rocky-state.redb  (the state store)
 ```
 
-Three rules follow from how the image is built:
+Three rules:
 
-- **Keep `--host 0.0.0.0`** when you pass your own `serve` arguments. Rocky binds loopback by default, and a loopback bind inside the container is unreachable through a published port. The default command sets it for you.
-- **A token is required.** A non-loopback bind needs one, so the default command fails fast without `ROCKY_SERVE_TOKEN` or `--token`. `--ui` also needs `--token-scope read-only` (or `ROCKY_SERVE_TOKEN_SCOPE=read-only`), so a leaked browser token cannot reach a mutating route.
-- **Publish the port on loopback** (`-p 127.0.0.1:8080:8080`) unless you mean to serve the network. To reach the UI by another name or address, add `--allowed-host <name>`; the server answers `421` to any `Host` it was not told about, except on the health route.
+- **Keep `--host 0.0.0.0`** when you pass your own `serve` arguments. Rocky binds loopback by default, which a published port cannot reach. The default command sets it.
+- **A token is required.** A non-loopback bind needs `ROCKY_SERVE_TOKEN` or `--token`, so the default command fails fast without one. `--ui` also needs `--token-scope read-only` (or `ROCKY_SERVE_TOKEN_SCOPE=read-only`), so a leaked browser token cannot reach a mutating route.
+- **Publish on loopback** (`-p 127.0.0.1:8080:8080`) unless you mean to serve the network. To reach the UI by another name, add `--allowed-host <name>`: the server answers `421` to any other `Host`, except on the health route.
 
-The server reads `rocky.toml` from `/data` and the models from `/data/models`. Every path the CLI takes, `--config`, `--models`, `--state-path`, works the same way inside the container, relative to `/data`.
+The server reads `rocky.toml` from `/data` and models from `/data/models`. `--config`, `--models` and `--state-path` resolve relative to `/data`.
 
 ## What to mount
 
-Mount the project directory as `/data`. It is the only path the server writes to: the state store lives under `models/` (`models/.rocky-state.redb`, or `models/.rocky-state/<key>.redb` with `[state] namespacing`), so one mount carries the project and its state.
+Mount the project as `/data`, the only path the server writes to. The state store lives under `models/` (`models/.rocky-state.redb`, or `models/.rocky-state/<key>.redb` with `[state] namespacing`), so one mount carries the project and its state.
 
-On Linux, a bind mount keeps the host's owner, and the server runs as uid `65532`. Give it a directory it can write, one of two ways:
+On Linux a bind mount keeps the host's owner and the server runs as uid `65532`. Give it a writable directory:
 
 ```bash
 # Either run as your own user ...
@@ -78,17 +74,15 @@ docker run --user "$(id -u):$(id -g)" -v "$PWD:/data" ...
 sudo chown -R 65532:65532 models
 ```
 
-Docker Desktop on macOS and Windows maps ownership for you; nothing is needed there. A named volume (`-v rocky-data:/data`) is created owned by `65532` from the image, so it needs nothing either.
+Docker Desktop on macOS and Windows maps ownership for you, and a named volume (`-v rocky-data:/data`) is created owned by `65532`.
 
 ## Run a pipeline once
 
-The image is the CLI, so any command runs the same way. This runs the project's pipelines once and prints the JSON result:
+The image is the CLI, so any command works. The state store is written under `/data/models`, so the next run reuses the watermarks:
 
 ```bash
 docker run --rm -v "$PWD:/data" ghcr.io/rocky-data/rocky:latest run --output json
 ```
-
-The state store is written under `/data/models`, so the next run picks up the watermarks from the first.
 
 ## Probe the health route
 
@@ -98,19 +92,17 @@ The state store is written under `/data/models`, so the next run picks up the wa
 curl -fsS http://127.0.0.1:8080/api/v1/health
 ```
 
-The image carries no `HEALTHCHECK` instruction, and you cannot add one: a Docker health check runs inside the container, and the image has no shell or HTTP client. The same limit applies to a Compose `healthcheck`. A Kubernetes `httpGet` probe comes from the kubelet, outside the container, so it works. The health route answers whatever `Host` the probe sends, so `--ui` needs no `--allowed-host` for a probe; every other route holds the rule.
+The image has no `HEALTHCHECK`, and you cannot add one (nor a Compose `healthcheck`): a health check runs inside the container, which has no shell or HTTP client. A Kubernetes `httpGet` probe runs from the kubelet, so it works. The health route answers any `Host`, so `--ui` needs no `--allowed-host` for a probe.
 
 ## Stop and drain
 
-`docker stop` sends `SIGTERM`. The server stops accepting connections, drains in-flight requests, and, with `--scheduler`, drains a running scheduled child before it exits.
-
-Docker waits 10 seconds by default, then sends `SIGKILL`. A scheduled run can need longer. Set the grace on the container:
+`docker stop` sends `SIGTERM`. The server stops accepting connections, drains in-flight requests and, with `--scheduler`, a running scheduled child. Docker waits 10 seconds, then sends `SIGKILL`, which a scheduled run can outlast. Set the grace on the container:
 
 ```bash
 docker run --stop-timeout 125 ...
 ```
 
-125, not 90. `--drain-timeout-seconds` (default 60) caps how long the server waits for the child. A child still running when that runs out gets its own `SIGTERM` and a **further fixed 60 seconds** before `SIGKILL`, so the worst case is the drain plus 60.
+`--drain-timeout-seconds` (default 60) caps the wait for the child. A child still running then gets its own `SIGTERM` and a **further fixed 60 seconds** before `SIGKILL`.
 
 ```
   drain the child   --drain-timeout-seconds, default 60
@@ -118,18 +110,18 @@ docker run --stop-timeout 125 ...
   worst case        120s with the defaults
 ```
 
-**Set the grace above `--drain-timeout-seconds` + 60.** In Kubernetes the same knob is `terminationGracePeriodSeconds`. A shorter grace kills the child mid-write and records its occurrence as a failure.
+**Set the grace above `--drain-timeout-seconds` + 60** (in Kubernetes, `terminationGracePeriodSeconds`). A shorter grace kills the child mid-write and records its occurrence as a failure.
 
 ## Run the scheduler
 
 `serve --scheduler` runs every pipeline's `[schedule]` in-process, like `rocky tick` on a cron. Two rules:
 
-- **One instance per project directory.** Two containers with `--scheduler` on one mount would both run what is due. Run one replica, and replace it in place rather than side by side. In Kubernetes terms that is `replicas: 1` and `strategy: Recreate`.
+- **One instance per project directory.** Two `--scheduler` containers on one mount both run what is due. Run one, and replace it in place (Kubernetes: `replicas: 1`, `strategy: Recreate`).
 - **`--ui` with `--scheduler` needs `ROCKY_WEBHOOK_SECRET`**, so the scheduler's webhook route cannot be reached with the read-only browser token.
 
 ## Verify what you pull
 
-Each pushed image carries a software bill of materials (SBOM) and a provenance attestation, attached by BuildKit at publish time. Read them with:
+Each image carries a software bill of materials (SBOM) and a provenance attestation, attached by BuildKit:
 
 ```bash
 docker buildx imagetools inspect ghcr.io/rocky-data/rocky:<version>
@@ -137,21 +129,21 @@ docker buildx imagetools inspect ghcr.io/rocky-data/rocky:<version> --format '{{
 docker buildx imagetools inspect ghcr.io/rocky-data/rocky:<version> --format '{{ json .Provenance }}'
 ```
 
-The first command prints the index digest and one digest per platform. The image is not signed yet. Until it is, pin the digest you inspected and compare the binary's version against the release: `docker run --rm ghcr.io/rocky-data/rocky@sha256:... --version`.
+The first command prints the index digest and one digest per platform. The image is not signed yet: pin the digest you inspected and compare `docker run --rm ghcr.io/rocky-data/rocky@sha256:... --version` with the release.
 
 ## Upgrade and roll back
 
-Pull the next version tag and restart the container on the same mount. On the first read, the engine migrates the state store forward when the state schema changed; the [changelog](https://github.com/rocky-data/rocky/blob/main/engine/CHANGELOG.md) names every such change. Stop the old container before you start the new one: the [deployment contract](/advanced/deployment-contract/) says what two overlapping processes and a fleet mid-upgrade do.
+Pull the next version tag and restart on the same mount. On first read the engine migrates the state store forward if the state schema changed (the [changelog](https://github.com/rocky-data/rocky/blob/main/engine/CHANGELOG.md) names each change). Stop the old container before you start the new one: the [deployment contract](/advanced/deployment-contract/) says what overlapping processes do.
 
-Rolling back is running the previous tag. When the upgrade crossed a state-schema change, the older engine finds a store written by a newer one. `rocky serve` and every inspection command refuse it. `rocky run` follows `[state] on_schema_mismatch`. Unset on the default `local` backend, it refuses like the rest. `recreate` moves the newer file to `<file>.v<N>.bak`, starts from a fresh local state and does one full-refresh run. It refuses if that `.bak` already exists. To roll back with the history intact, restore the store from a copy taken before the upgrade. Copy `models/.rocky-state.redb` (or the `models/.rocky-state/` directory) before every upgrade; it is one file per store.
+Rolling back is running the previous tag. If the upgrade crossed a state-schema change, the older engine finds a store written by a newer one. `rocky serve` and every inspection command refuse it. `rocky run` follows `[state] on_schema_mismatch`: unset on the default `local` backend it refuses too, and `recreate` moves the newer file to `<file>.v<N>.bak` (refusing if that exists), starts fresh and does one full-refresh run. To roll back with history, restore a copy taken before the upgrade: copy `models/.rocky-state.redb` (or `models/.rocky-state/`) before every upgrade.
 
 ## A Compose example
 
-The repository ships [`deploy/rocky/`](https://github.com/rocky-data/rocky/tree/main/deploy/rocky): one `compose.yaml` that runs the image as a long-lived process with the UI and the scheduler, an `.env.example` for the two secrets, and a README that walks the three steps to start it. It encodes the rules on this page, one line each: the pinned tag, the loopback port, the volume, the drain grace, one replica. It is community-supported: an example to start from, not a supported deployment.
+[`deploy/rocky/`](https://github.com/rocky-data/rocky/tree/main/deploy/rocky) holds a `compose.yaml` that runs the image with the UI and the scheduler, an `.env.example` for the two secrets and a README with the three start steps. It encodes this page's rules: pinned tag, loopback port, volume, drain grace, one replica. It is community-supported: an example, not a supported deployment.
 
 ## Build the image yourself
 
-The Dockerfile is `engine/Dockerfile` in the repository. It expects a build context that holds one binary per architecture, `<context>/amd64/rocky` and `<context>/arm64/rocky`, and copies the one for the platform being built. To build the image for your machine from a release archive:
+`engine/Dockerfile` expects a build context with one binary per architecture, `<context>/amd64/rocky` and `<context>/arm64/rocky`. To build from a release archive:
 
 ```bash
 mkdir -p ctx/arm64

@@ -2,9 +2,9 @@
 
 **Status:** internal contract. **No semver. No public commitment.** Refactor at will; cross-PR breakages are caught by the golden tests in `engine/crates/rocky-cli/tests/ir_golden.rs`, not by a stability promise.
 
-This document describes the typed intermediate representation (IR) that model loading builds and `rocky-core::sql_gen` consumes. The two load-bearing types are [`ModelIr`] and [`ProjectIr`]. They live in the `rocky-ir` crate, in [`rocky-ir/src/ir.rs`](../rocky-ir/src/ir.rs), together with the canonical-JSON helper, the recipe-hash, and the variant tag. This spec stays in `rocky-core` because `sql_gen` and the golden tests refer to it here.
+This document describes the typed intermediate representation (IR) that model loading builds and `rocky-core::sql_gen` consumes. The load-bearing types are [`ModelIr`] and [`ProjectIr`], in the `rocky-ir` crate ([`rocky-ir/src/ir.rs`](../rocky-ir/src/ir.rs)), with the canonical-JSON helper, the recipe-hash and the variant tag. This spec stays in `rocky-core` because `sql_gen` and the golden tests refer to it here.
 
-The IR is the program-shape representation that sits between model loading and SQL generation. Field-level semantics are documented as Rust doc-comments on the structs themselves; this spec is the synthesizing narrative — boundaries, invariants, gaps, and the operational checklist for evolving the IR. When the doc-comments and this spec disagree, the doc-comments win.
+Field-level semantics live in the Rust doc-comments. This spec covers boundaries, invariants, gaps and the checklist for evolving the IR. When the doc-comments and this spec disagree, the doc-comments win.
 
 [`ModelIr`]: ../rocky-ir/src/ir.rs
 [`ProjectIr`]: ../rocky-ir/src/ir.rs
@@ -23,33 +23,27 @@ The IR is **not** post-typecheck either. Type info lives sidecar in `TypedColumn
 
 The IR is **not** a runtime artifact. The runtime — adapters, secrets, env vars, run IDs, branch overrides, watermark state, and resolved partition windows — flows through other channels (`AdapterConfig`, `StateStore`, the `--branch` flag) and is intentionally absent from the IR. Recipe-hash determinism depends on this absence; see §7.
 
-### Why this exists as a doc
+### Who reads this
 
-Three audiences:
+- **Engine contributors** changing `rocky-ir/src/ir.rs`, `sql_gen.rs` or `models.rs::to_model_ir`: §10 is the checklist for adding a field.
+- **Engine maintainers**: §9 is the gap list.
+- **AI agents** generating IR: §3, §4, §5 give the shape; §6 gives the wire format.
 
-- **Rocky engine contributors** modifying `rocky-ir/src/ir.rs`, `sql_gen.rs`, or `models.rs::to_model_ir` — §10 is the operational checklist for adding a new field without breaking the canonical-JSON rule or recipe-hash determinism.
-- **Engine maintainers tracking the IR's evolution** — §9 is the explicit gap list, with each gap mapped to the future direction that would close it.
-- **AI agents** generating IR for the planned schema-grounded AI emission path — §3, §4, §5 describe the shape; §6 describes the canonical wire format.
-
-Consumers **outside** the engine should depend on the typed `*Output` structs in [`rocky-cli::output`](../rocky-cli/src/output.rs), not on `ModelIr` / `ProjectIr` directly. Those are the public-API surface; the IR is internal.
+Consumers **outside** the engine depend on the typed `*Output` structs in [`rocky-cli::output`](../rocky-cli/src/output.rs), not on `ModelIr` / `ProjectIr`. The IR is internal.
 
 ---
 
 ## 2. Boundaries
 
-Three cuts shape what does and doesn't belong in the IR.
+Three cuts shape what belongs in the IR.
 
 ### IR vs AST
 
-The IR is **downstream of parsing and downstream of model loading**. `Model::to_model_ir()` (`src/models.rs`) builds a `ModelIr` from a loaded `Model` (the SQL string plus the sidecar TOML config). The runtime also builds one directly for replication tables, in `rocky-cli/src/commands/` (`plan.rs`, `run.rs` and others). Parser-level concerns (DSL syntax, raw-SQL parsing) are not visible here.
-
-The DSL has no typed lowering of its own at the IR level: `lower::lower_to_sql` returns `Result<String, String>` — both DSL and raw-SQL models hit the IR as a SQL string + sidecar config. If a future "DSL → typed IR direct" path is wanted, it would slot in *between* lowering and IR construction.
+The IR is **downstream of parsing and model loading**. `Model::to_model_ir()` (`src/models.rs`) builds a `ModelIr` from a loaded `Model` (the SQL string plus the sidecar TOML config). The runtime also builds one directly for replication tables, in `rocky-cli/src/commands/` (`plan.rs`, `run.rs` and others). `lower::lower_to_sql` returns `Result<String, String>`, so DSL and raw-SQL models both hit the IR as a SQL string + sidecar config. A direct DSL-to-IR path would slot in between lowering and IR construction.
 
 ### IR vs emit
 
-The dialect boundary is the [`SqlDialect`](src/traits.rs) trait. Every `sql_gen` entry takes `&dyn SqlDialect`; each warehouse adapter crate ships its own impl. The IR is therefore **dialect-portable by construction**: the same `ModelIr` compiles to each dialect's SQL through the same `sql_gen` entry. The golden suite (§11) pins that SQL for DuckDB, Databricks, BigQuery, and Snowflake, plus Trino for the snapshot fixture.
-
-This is the cleanest boundary in the engine and the one that would survive promotion to a public IR most easily.
+The dialect boundary is the [`SqlDialect`](src/traits.rs) trait. Every `sql_gen` entry takes `&dyn SqlDialect`, and each warehouse adapter crate ships its own impl. The same `ModelIr` compiles to each dialect through the same entry. The golden suite (§11) pins that SQL for DuckDB, Databricks, BigQuery and Snowflake, plus Trino for the snapshot fixture.
 
 ### IR vs runtime
 
@@ -61,7 +55,7 @@ Explicitly **out of the IR by construction**:
 - Resolved partition windows for `MaterializationStrategy::TimeInterval` (the static plan emits `window: None`; the runtime fills `Some(...)` per partition — see §5 and §7).
 - Watermark state for `MaterializationStrategy::Incremental` (the strategy carries only `timestamp_column`; `WatermarkState` lives in the embedded state store, read at execution time via a `WHERE ts > (SELECT MAX(ts) FROM target)` subquery — see §5 and §7).
 
-Runtime concerns leaking into the IR is the most common shape of bug this spec is designed to prevent. Both watermark and partition-window are recurrence-prone; if you find yourself adding a "current run" or "active partition" field to `ModelIr`, stop and re-read this section.
+Runtime concerns leaking into the IR is the most common bug this spec prevents. If you add a "current run" or "active partition" field to `ModelIr`, stop and re-read this section.
 
 ---
 
@@ -115,7 +109,7 @@ The pipeline layer is **not** an IR layer. The hierarchy `RockyConfig → pipeli
 
 Project-level recipe-hash is **derived**, not stored — see §7.
 
-`ProjectIr` is a deliberately thin wrapper. The temptation to grow it into a fat project-shaped struct (storing DAG validation results, project-level cost projections, denormalized materialization-strategy summaries, …) should be resisted: each addition is either a derived fact (compute on demand) or a runtime concern (lives in the state store), and merging it into `ProjectIr` would re-create the per-pipeline-vs-project ambiguity that the per-model IR was designed to resolve.
+Keep `ProjectIr` thin. Each candidate addition (DAG validation results, project-level cost projections, strategy summaries) is either a derived fact (compute on demand) or a runtime concern (state store).
 
 ---
 
@@ -142,13 +136,13 @@ Twelve variants, defined in [`rocky-ir/src/ir.rs`](../rocky-ir/src/ir.rs). The v
 
 ### Recipe-hash invariants
 
-Two strategy fields **must** stay normalized at hash time. Both are runtime-state fields that previously leaked into the strategy and were stripped during the typed-IR migration.
+Two strategy fields **must** stay normalized at hash time. Both are runtime state.
 
 1. **`Incremental` carries no `WatermarkState`.** The only field on `Incremental` is `timestamp_column`. The actual watermark value (`last_value`, `updated_at`) is runtime state read from [`StateStore::get_watermark`](src/state.rs); the SQL generator emits a `WHERE ts > (SELECT MAX(ts) FROM target)` subquery that resolves the bound at execution time. If `WatermarkState` were carried on the strategy, **the recipe-hash would change every successful run** — destroying any content-addressed write semantics built on top of the recipe-hash. This invariant is enforced by construction: there is no `watermark` field on `MaterializationStrategy::Incremental`.
 
 2. **`TimeInterval.window` is `None` at hash time.** The static plan emits `None`; the runtime fills `Some(PartitionWindow { … })` per partition before SQL generation. Recipe-hash must run on the static form — otherwise every partition gets a different hash for the same model, again defeating content-addressed writes. This invariant is **not** enforced by construction (the field is `Option<PartitionWindow>`); it is enforced by convention. Plan-construction sites must leave `window: None`; the runtime mutates the IR after recipe-hash computation. The doc-comment on the variant's `window` field pins this.
 
-These two invariants are the single most common shape of regression in the IR. New variants that need a runtime-supplied field should follow `TimeInterval`'s pattern — declare the field as `Option<T>` and document the "static plan emits `None`; runtime fills `Some(_)` post-hash" contract on the field.
+These two invariants are the most common IR regression. A new variant with a runtime-supplied field follows `TimeInterval`: declare `Option<T>` and document "static plan emits `None`; runtime fills `Some(_)` post-hash" on the field.
 
 ---
 
@@ -160,9 +154,9 @@ Recipe-hash determinism requires a single, predictable serialization shape. The 
 2. **Every `Vec<T>` field that is "conceptually optional" (empty == absent) carries `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.** Examples: `metadata_columns`, `unique_key`, `sources`, `column_masks`. The variant-specific `Vec` fields on `ModelIr` all follow this rule, which is what keeps the per-variant JSON shape compact.
 3. **Every `bool` field whose semantic default is `false` carries `#[serde(default, skip_serializing_if = "std::ops::Not::not")]`.** Example: `invalidate_hard_deletes`. The key is omitted when the value is the default.
 
-### Why "Rule A" rather than "all fields always present"
+### Why "Rule A"
 
-`serde_json` preserves field insertion order on `Map`, but not all orderings are deterministic across different inputs of the same logical value. The canonical-JSON helper ([`canonical_json`](../rocky-ir/src/ir.rs)) round-trips through `serde_json::Value` and rewrites every nested map into a `BTreeMap` (key-sorted). With Rule A, skipped fields are *already absent* at serialize time — there is no `null` to canonicalize. Rule B (always emit explicit `null`) would also be deterministic but would inflate the JSON and create surprising diffs when an `Option` flips state.
+`canonical_json` ([`canonical_json`](../rocky-ir/src/ir.rs)) round-trips through `serde_json::Value` and rewrites every nested map into a key-sorted `BTreeMap`. With Rule A, skipped fields are already absent at serialize time, so there is no `null` to canonicalize. Always emitting explicit `null` would also be deterministic, but it inflates the JSON and creates surprising diffs when an `Option` flips state.
 
 ### Map ordering
 
@@ -170,7 +164,7 @@ Recipe-hash determinism requires a single, predictable serialization shape. The 
 
 ### Adding new fields
 
-Every new field on `ModelIr` / `ProjectIr` must follow Rule A. If a field has no natural empty/default form (a `String` that is always required, an `enum` with no neutral variant), it is mandatory in the JSON — that is fine, but the field semantics need to be load-bearing across every legitimate construction path. See §10 for the full checklist.
+Every new field on `ModelIr` / `ProjectIr` follows Rule A. A field with no natural empty form (a required `String`, an `enum` with no neutral variant) is mandatory in the JSON, so it must be load-bearing on every construction path. See §10.
 
 ---
 
@@ -194,7 +188,7 @@ The sensitivity matrix is regression-tested by the inline `recipe_hash_changes_w
 
 `ProjectIr.dag` and `ProjectIr.lineage_edges` are **not** folded into the project-level hash — they are derived facts about how the per-model recipes relate, not part of any single model's recipe. Changes to the DAG or cross-model lineage that do not change a model's own recipe leave the per-model hashes (and therefore the project-level hash) untouched.
 
-This shape is load-bearing for content-addressed writes: the per-model hash addresses the storage write; the project-level hash addresses the project's "version" without inflating with every DAG-only change.
+The per-model hash addresses the storage write. The project-level hash addresses the project's "version" without changing on DAG-only edits.
 
 ### What the hash sees and doesn't see
 
@@ -211,8 +205,6 @@ This shape is load-bearing for content-addressed writes: the per-model hash addr
 | Lakehouse format + format options | |
 | Replication column selection + metadata columns | |
 | Declared cost ceiling (`cost_ceiling`) | |
-
-The right column is the gap list (§9) viewed from a different angle: each item there is "Rocky owns it elsewhere on the program side, but it doesn't go into the hash, and here is why."
 
 ---
 
@@ -232,29 +224,23 @@ if model_ir.variant() != ModelIrVariant::Replication {
 
 ## 9. Explicit gap list
 
-Things the IR doesn't yet carry that it should — or, more precisely, that the typed-program-info layer needs to carry somewhere and the IR is the natural home for. Each gap maps to an arc work item.
+Things the IR does not yet carry but the typed-program layer needs.
 
 ### Determinism tags
 
-There is no `Determinism` modeling on `TypedColumn` or anywhere else. SQL functions like `NOW()`, `RANDOM()`, `UUID()` produce non-deterministic output; the IR has no way to express this. Closing the gap requires a typed enum (`enum Determinism { Pure, NonDeterministic(Reason) }`) flowing through the SQL parser to detect non-deterministic calls, plus a sidecar field on `TypedColumn` (or an analogous IR-level field).
-
-**Why it matters:** content-addressed writes want determinism guarantees on a per-model basis — a model that contains `NOW()` needs different replay semantics than a model that doesn't.
+Nothing models `Determinism` on `TypedColumn` or elsewhere. `NOW()`, `RANDOM()` and `UUID()` are non-deterministic and the IR cannot say so. Closing the gap needs an enum (`enum Determinism { Pure, NonDeterministic(Reason) }`), SQL-parser detection of such calls, and a sidecar field on `TypedColumn`. Why it matters: content-addressed writes need per-model determinism, because a model with `NOW()` needs different replay semantics.
 
 ### Replay-recipe primitives beyond hash — closed outside the IR
 
 The IR carries `recipe_hash` (§7). `input_hash` and `env_hash` are not IR fields, by design: `input_hash` depends on what the upstream models produced in this run, and `env_hash` describes the environment. Both now live on each model execution record in the state store (`src/state.rs`, schema v11), computed by `src/recipe_identity.rs`. `input_hash` is present only when the run observed its inputs.
 
-### Hooks-in-IR — deferred
+### Hooks-in-IR (deferred)
 
-`HooksConfig` lives on `RockyConfig` as project-level lifecycle policy. There is no per-model hook attachment today, so there is nothing to lift into `ModelIr`. If a future change introduces per-model hooks (e.g. `[hook]` blocks in model sidecar TOMLs that run before/after that specific model materializes), the resolved-per-model `Vec<HookRef>` should land in `ModelIr` to keep the recipe-hash reflecting "what runs for this model."
-
-Until then, hooks are intentionally absent from the IR and from the recipe-hash.
+`HooksConfig` lives on `RockyConfig` as project-level policy. There is no per-model hook attachment, so nothing to lift. If per-model hooks arrive (`[hook]` blocks in sidecars), the resolved `Vec<HookRef>` should land in `ModelIr` so the recipe-hash reflects what runs for the model. Until then hooks stay out of the IR and the hash.
 
 ### Full cost-projection-in-IR
 
-`CostSection` (rates) and `BudgetConfig` (limits) live on `RockyConfig`. The per-model `[budget]` ceiling is on `ModelIr` as `cost_ceiling`. `rocky compile` and `rocky plan` check it against offline cost estimates. A computed cost projection per model is not a field on `ModelIr`.
-
-If cost-projection becomes a stable per-model property (rather than an on-demand computation), the natural shape is `ModelIr.cost_projection: Option<CostProjection>` — `Option` because cost projection requires `EXPLAIN` from the warehouse, which not every callpath can provide.
+`CostSection` (rates) and `BudgetConfig` (limits) live on `RockyConfig`. The per-model `[budget]` ceiling is on `ModelIr` as `cost_ceiling`, and `rocky compile` and `rocky plan` check it against offline estimates. A computed per-model projection is not a field. If it becomes stable, the shape is `ModelIr.cost_projection: Option<CostProjection>`, since projection needs warehouse `EXPLAIN`, which not every call path has.
 
 ### Column-level lineage — `ProjectIr.lineage_edges` is the canonical store
 
@@ -263,7 +249,7 @@ If cost-projection becomes a stable per-model property (rather than an on-demand
 [`ModelIr::lineage_edges`]: ../rocky-ir/src/ir.rs
 [`ProjectIr::lineage_edges`]: ../rocky-ir/src/ir.rs
 
-The denormalization is load-bearing: per-model recipe-hash needs the targeting slice to be deterministic per model. Both fields stay in sync at construction time; if one falls out of sync with the other, the recipe-hash will drift in unexpected ways.
+The slice is load-bearing: the per-model recipe-hash needs it. Keep both fields in sync at construction, or the recipe-hash drifts.
 
 ### Schema declarations beyond names
 
@@ -271,7 +257,7 @@ The denormalization is load-bearing: per-model recipe-hash needs the targeting s
 
 ### Multi-frontend (DSL → IR direct)
 
-The Rocky DSL lowers to a SQL string before reaching the IR. A typed DSL→IR path would let DSL programs surface in the IR with their structural shape preserved (typed lineage from DSL pipelines, deterministic IR JSON for AI emit). This is the LLVM-bitcode-shaped move; today's status quo is the intermediate-SQL path.
+The DSL lowers to a SQL string before the IR. A typed DSL-to-IR path would preserve structural shape (typed lineage from DSL pipelines, deterministic IR JSON for AI emit).
 
 ---
 
@@ -301,42 +287,35 @@ When adding a new field to `ModelIr` or `ProjectIr`:
 
 ## 11. Versioning policy
 
-**No semver. No public commitment. Refactor at will.**
+**No semver. No public commitment. Refactor at will.** The IR is internal. Cross-PR breakages (a renamed field, a moved type, a serde attribute change) are caught by:
 
-The IR is internal to the Rocky engine. Cross-PR breakages — a renamed field, a moved type, a serde attribute change — are caught by:
+- The inline tests in `rocky-ir/src/ir.rs` (byte-stable round-trip, recipe-hash determinism and sensitivity, canonical-JSON Rule A, variant inference) and the `variant_mismatch_*` tests in `src/sql_gen.rs`.
+- The golden tests in `engine/crates/rocky-cli/tests/ir_golden.rs` (IR JSON snapshots, per-dialect SQL snapshots, pinned recipe hashes per fixture).
 
-- The inline tests in `rocky-ir/src/ir.rs` (byte-stable round-trip, recipe-hash determinism + sensitivity, canonical-JSON Rule A enforcement, variant inference) and the `variant_mismatch_*` tests in `src/sql_gen.rs`.
-- The golden tests in `engine/crates/rocky-cli/tests/ir_golden.rs` (IR JSON snapshots + per-dialect SQL snapshots + pinned recipe hashes per fixture).
+After an intentional shape change, regenerate the fixtures and pinned hashes. There is no migration path or shim.
 
-When a refactor changes the IR shape intentionally, regenerate the affected fixtures and the pinned hashes; the tests re-pin to the new shape and the next refactor catches the next shift. There is no migration path or compatibility shim.
-
-Consumers outside the engine — Dagster integration, VS Code extension, third-party tooling — depend on the typed `*Output` structs in [`rocky-cli::output`](../rocky-cli/src/output.rs) (which derive `JsonSchema` and back the autogenerated Pydantic and TypeScript bindings). The IR is not part of that surface.
-
-`rocky-ir` is already a separate crate, but it is versioned with the workspace and makes no stability promise. If a public, versioned IR is ever needed, the path is: add `JsonSchema` derives, define a conformance test suite, and semver the crate from `1.0`. None of that is in scope today.
+Consumers outside the engine (Dagster, VS Code, third-party tools) depend on the `*Output` structs in [`rocky-cli::output`](../rocky-cli/src/output.rs), which derive `JsonSchema` and back the generated bindings. `rocky-ir` is versioned with the workspace. A public IR would need `JsonSchema` derives, a conformance suite and semver from `1.0`. None of that is in scope.
 
 ---
 
 ## 12. Future directions
 
-The IR is the structural anchor for several follow-on workstreams. Each one closes one or more gaps from §9 or relies on the IR's structural guarantees.
+Each direction closes a §9 gap or relies on the IR's guarantees.
 
-| Future direction | What it consumes / produces here |
+| Direction | What it consumes / produces here |
 |---|---|
-| **Content-addressed writes + replay re-execution** | Consumes `ModelIr::recipe_hash` as the per-model write address. The two recipe-hash invariants (§5: no `WatermarkState`, `TimeInterval.window=None` at hash time) are load-bearing here. |
-| **Per-model cost projection** | Closes the `cost-projection-in-IR` gap (§9). The per-model ceiling is already on the IR (`cost_ceiling`); a projection is the demand-gated next step. |
-| **Schema-grounded AI emission** | Emits IR directly. The flat-fields design (§3) and Rule A canonical encoding (§6) make `ModelIr` the natural emit target for an LLM — a JSON-Schema export of `ModelIr` would make the wedge testable. The gap on multi-frontend (§9) closes when the AI emit path reaches IR rather than DSL/SQL. |
-| **Determinism tags** | Closes the `determinism-tags` gap (§9). Adds `Determinism` modeling to `TypedColumn`. (`input_hash` and `env_hash` already ship on execution records.) |
-| **Full cross-model lineage graph** | Closes the `column-level lineage full graph` and `schema declarations beyond names` gaps (§9). Builds out `ProjectIr.lineage_edges` as the load-bearing source of cross-model column lineage. |
-
-Internal planning documents that detail these directions live outside this repo.
+| **Content-addressed writes + replay re-execution** | Consumes `ModelIr::recipe_hash` as the per-model write address. The two §5 invariants are load-bearing. |
+| **Per-model cost projection** | Closes the cost-projection gap (§9). The ceiling is already on the IR. |
+| **Schema-grounded AI emission** | Emits IR directly. The flat-fields design (§3) and Rule A (§6) make `ModelIr` the natural emit target. Closes the multi-frontend gap (§9) when emit reaches IR rather than DSL/SQL. |
+| **Determinism tags** | Closes the determinism gap (§9). (`input_hash` and `env_hash` already ship on execution records.) |
+| **Full cross-model lineage graph** | Closes the lineage and schema-declaration gaps (§9) via `ProjectIr.lineage_edges`. |
 
 ---
 
 ## Where this document lives
 
-- This file: `engine/crates/rocky-core/SPEC.md` — the synthesizing narrative.
-- Field-level semantics: [`engine/crates/rocky-ir/src/ir.rs`](../rocky-ir/src/ir.rs) doc-comments — source of truth.
-- Inline regression tests: same file, `#[cfg(test)] mod tests` block — pin every invariant the spec describes.
-- Golden tests: [`engine/crates/rocky-cli/tests/ir_golden.rs`](../rocky-cli/tests/ir_golden.rs) + [`engine/crates/rocky-cli/tests/ir-golden/`](../rocky-cli/tests/ir-golden/) — fixture set covering the materialization-strategy matrix across the DuckDB, Databricks, BigQuery, and Snowflake dialects (plus Trino for the snapshot fixture), with pinned recipe hashes.
+- This file: the synthesizing narrative.
+- Field-level semantics: [`engine/crates/rocky-ir/src/ir.rs`](../rocky-ir/src/ir.rs) doc-comments, the source of truth. The inline `#[cfg(test)]` tests in that file pin every invariant above.
+- Golden tests: [`ir_golden.rs`](../rocky-cli/tests/ir_golden.rs) and [`ir-golden/`](../rocky-cli/tests/ir-golden/): the strategy matrix across DuckDB, Databricks, BigQuery and Snowflake (plus Trino for the snapshot fixture), with pinned recipe hashes.
 
-When the doc-comments and this spec disagree, the doc-comments win. When the inline tests and the spec disagree, the tests win. When the golden snapshots and the spec disagree, regenerate the snapshots if the change was intentional and update the spec; otherwise the snapshots win.
+Doc-comments beat this spec. Tests beat this spec. If a golden snapshot disagrees with the spec, regenerate it when the change was intentional and update the spec. Otherwise the snapshot wins.

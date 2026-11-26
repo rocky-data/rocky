@@ -2,11 +2,7 @@
 
 Dagster integration for [Rocky](https://github.com/rocky-data/rocky), the typed graph between your code and your warehouse.
 
-`dagster-rocky` runs the `rocky` command-line binary from a Dagster
-`ConfigurableResource` and exposes Rocky-managed tables as materializable
-assets. It is a thin adapter over the
-[`rocky-sdk`](https://pypi.org/project/rocky-sdk/) client, so the guarantees
-Rocky enforces at compile time land in the Dagster asset graph.
+`dagster-rocky` runs the `rocky` binary from a Dagster `ConfigurableResource` and exposes Rocky-managed tables as materializable assets. It is a thin adapter over the [`rocky-sdk`](https://pypi.org/project/rocky-sdk/) client.
 
 ```
   ┌──────────────────┐  selected assets  ┌───────────────────────────┐
@@ -41,23 +37,10 @@ wire, and `dag_mode` emits through its own path.
 | column-level lineage | `TableColumnLineage` metadata | you set `surface_column_lineage: true` |
 | per-model cost recommendations | `AssetSpec` metadata | `surface_optimize_metadata` (on by default), `models_dir` exists, and `rocky optimize` has run history to analyze |
 
-If you build your own assets instead of using the component, the
-`emit_materializations()` helper does the first row for you. It returns a list
-of `AssetMaterialization` events, which you log with `context.log_event`.
+Without the component, `emit_materializations()` does the first row: it returns `AssetMaterialization` events for `context.log_event`.
 
-Two behaviors are worth knowing.
-
-**A check's severity carries across.** Rocky's per-check severity maps to
-Dagster's. A check that Rocky marks `warning` emits `WARN` when it fails. `WARN`
-does not degrade asset health, so an advisory check does not page anyone.
-
-**Failure containment shows up on the timeline.** `contain_failures` under
-`[resilience]` in `rocky.toml` defaults to `true` (set it to `false` for
-fail-fast). With it on, Rocky withholds the models behind a
-failed upstream instead of failing the whole run. Each withheld model gets an
-`AssetObservation` naming what blocked it, so a partial run reads honestly. Only
-the default `execution_mode = "streaming"` emits these. The `pipes` mode and
-`dag_mode` do not.
+- **Check severity carries across.** A check Rocky marks `warning` emits `WARN` when it fails. `WARN` does not degrade asset health.
+- **Failure containment shows on the timeline.** `contain_failures` under `[resilience]` in `rocky.toml` defaults to `true` (`false` is fail-fast). Rocky then withholds the models behind a failed upstream instead of failing the run. Each withheld model gets an `AssetObservation` naming the blocker. Only the default `execution_mode = "streaming"` emits these, not `pipes` or `dag_mode`.
 
 ## Install
 
@@ -89,11 +72,7 @@ That refresh is what calls Rocky. It runs `rocky discover`. It also runs
 `rocky compile` and `rocky optimize` when `models_dir` exists on disk, and it
 caches each result it gets.
 
-Compile and optimize are best-effort for transport failures, such as a missing
-binary or a timeout. The refresh logs those and still writes the discovery
-state. One failure is not best-effort. A schema mismatch between
-`dagster-rocky` and the `rocky` binary raises `dg.Failure`, and no state is
-written at all.
+Compile and optimize are best-effort for transport failures (missing binary, timeout): the refresh logs them and still writes the discovery state. A schema mismatch between `dagster-rocky` and the `rocky` binary raises `dg.Failure`, and no state is written.
 
 Loading the definitions then reads that cached state:
 
@@ -137,13 +116,7 @@ def acme_orders(rocky: RockyResource) -> dg.MaterializeResult:
     )
 ```
 
-`run()` takes the filter first and returns a `RunResult`. A partial failure
-returns a result rather than raising, so read `result.errors` to see what did
-not build.
-
-`run()` buffers the output. For a run longer than a few seconds, call
-`run_streaming(context, filter)` instead. It forwards each engine stderr line to
-`context.log.info` as the run progresses. `RockyComponent` uses it by default.
+`run()` returns a `RunResult`. A partial failure returns a result rather than raising, so read `result.errors`. For a run longer than a few seconds, call `run_streaming(context, filter)`, which forwards engine stderr to `context.log.info` live. `RockyComponent` uses it by default.
 
 ## Public API
 

@@ -5,260 +5,135 @@ sidebar:
   order: 9.4
 ---
 
-`rocky mcp` runs Rocky as a [Model Context Protocol](https://modelcontextprotocol.io)
-server. It exposes 31 typed tools that an MCP-capable agent can call to author and
-evolve Rocky models against your real warehouse. Claude Desktop, an IDE assistant,
-or your own client all connect the same way.
+`rocky mcp` runs Rocky as a [Model Context Protocol](https://modelcontextprotocol.io) server on your machine. It exposes 31 typed tools that an MCP-capable agent (Claude Desktop, an IDE assistant, your own client) calls to author and evolve models against your real warehouse.
 
-This page is the tool-by-tool reference. For the loop an agent runs and the gates
-that check its work, read
-[Operating Rocky with Agents](/concepts/operating-rocky-with-agents/) first.
-
-For the CLI-level `rocky ai` / `ai-sync` / `ai-explain` / `ai-test` commands (a
-separate, non-MCP surface), see [AI Commands](/reference/commands/ai/).
+This page owns the tool list. The loop an agent runs, the gates and the policy model are in [Operating Rocky with Agents](/concepts/operating-rocky-with-agents/). Server flags are in [`rocky mcp`](/reference/commands/ai/#rocky-mcp). The `rocky ai*` CLI verbs are a separate surface: [AI Commands](/reference/commands/ai/).
 
 ## Local, and bring-your-own-key
 
-There is no Rocky-hosted agent and no Rocky-hosted inference. `rocky mcp` is a
-server you run yourself. The boundaries are worth stating plainly:
+There is no Rocky-hosted agent and no Rocky-hosted inference.
 
-- **Your warehouse.** The grounding tools read the same warehouse your
-  `rocky.toml` points at (DuckDB, Snowflake, BigQuery, Databricks, Trino). Rocky
-  is not a proxy in front of it. The server connects directly with your
-  configured credentials.
-- **Your key.** The tools that call a language model need `ANTHROPIC_API_KEY` in
-  the *server's own environment*. Rocky ships no key, bills no inference, and
-  routes no prompt through a Rocky service. Without the key, those tools return
-  empty drafts rather than failing, so the read-only tools keep working.
-- **No vendor egress of your data.** The server runs next to your warehouse. The
-  only place row-derived information leaves your environment is the language-model
-  call you opted into by setting your own key. Even there the payload is
-  constrained (see [What leaves your environment](#what-leaves-your-environment)).
+- **Your warehouse.** Grounding tools connect directly to the warehouse in your `rocky.toml` with your credentials. Rocky is not a proxy.
+- **Your key.** Generators need `ANTHROPIC_API_KEY` in the *server's own environment*. Without it they return an empty draft and a `message` that says why. Read-only tools keep working.
+- **No vendor egress.** Row-derived information leaves your environment only in the language-model call you opted into.
 
-The agent is whatever client you connect. The model is whatever your key points at.
-
-## The tool families
-
-The authoring tools fall into five families. Each family is defined by what it
-reads and what it is allowed to change:
+## The tools
 
 ```
-                    ┌────────────────────────┐
- your warehouse ───►│ verify and ground      │───► facts the agent
- your project       │ read-only, no LLM      │     writes against
-                    └────────────────────────┘
-
-                    ┌────────────────────────┐
- your project ─────►│ preview governance     │───► what a run would
-                    │ and drift, read-only   │     do, run nothing
-                    └────────────────────────┘
-
-                    ┌────────────────────────┐
- ANTHROPIC_API_KEY ►│ generators             │───► draft text,
- aggregate profile  │ the only LLM callers   │     nothing written
-                    └───────────┬────────────┘
-                                │ you pass the draft on,
-                                ▼ or write your own text
-                    ┌────────────────────────┐
-                    │ write path (draft_*)   │───► a file in models/
-                    │ writes + compiles +    │     + diagnostics
-                    │ checks policy rules    │
-                    └────────────────────────┘
-
-                    ┌────────────────────────┐
- a prompt ─────────►│ prompts chain the      │───► a proposed plan or
-                    │ tools above            │     an enumerated gap,
-                    └────────────────────────┘     never an applied change
+ read-only ground ──► facts the agent writes against
+ generators (LLM) ──► draft text, nothing written
+ write path       ──► file in models/ + compile + policy check
+ propose          ──► plan record, executes nothing
+ prompts          ──► chain the tools, stop before apply
 ```
-
-`rocky mcp` also exposes operational tools that this page does not detail, among
-them `catalog`, `history`, `metrics`, `audit_query`, and `review_queue`.
 
 ### Verify and ground (read-only, no LLM)
 
-These reach your project and your warehouse to give an agent the facts it needs
-before it writes anything. None of them change the project or the warehouse, and
-none of them call a language model.
-
-| Tool | What it returns |
+| Tool | What it does |
 |---|---|
-| `compile` | Compiles the project; returns typed model schemas + diagnostics. The compile-verify backbone. |
-| `lineage` | Model- or column-level lineage for a model. |
-| `inspect_schema` | Discovers source/model schemas — including cold start, before anything is materialized. |
-| `sample_rows` | A small row sample from a target or source table. |
-| `profile_column` | Per-column profile (counts, null rate, top values) for a materialized column. |
-| `breaking_change` | Classifies a model's change against a base ref as breaking / non-breaking, with findings. |
-| `dependents` | The downstream models that depend on a given model. |
-
-These are how an agent follows the
-[AI authoring workflow](/concepts/ai-intent/) honestly: it checks the data, not
-just the schema. They are the reason an agent can write a correct `WHERE` filter
-or `CAST` against a column it has actually looked at.
-
-### Preview governance and drift (read-only)
-
-| Tool | What it returns |
-|---|---|
-| `governance_preview` | What masking / classification / grants *would* be applied — without applying them. |
-| `drift_preview` | The schema drift Rocky *would* reconcile on the next run — without reconciling. |
-
-Both are strictly read-only. They show the governed and drift-reconciled shape of
-a change before any plan is proposed, let alone applied.
+| `compile` | Type-check the project. Returns typed model schemas and diagnostics. |
+| `plan_preview` | Render the SQL offline, with no warehouse I/O. A model it cannot render offline is skipped and not named: Snowflake dynamic tables, time-interval models, content-addressed models. |
+| `lineage` | Model- or column-level lineage. |
+| `test` | Run local model and fixture tests. With `declarative = true`, run sidecar `[[tests]]` against the warehouse after apply. |
+| `list` | List `models`, `pipelines`, `adapters` or `sources`. |
+| `inspect_schema` | Typed columns of every model and source. Adds warehouse tables on a best-effort basis. Works at cold start. |
+| `catalog` | The project-wide asset catalog in one call. |
+| `breaking_change` | Classify breaking changes between the working tree and a base ref. |
+| `dependents` | The downstream models of a model. |
+| `history` | Run history from the state store. |
+| `metrics` | A model's quality-metric snapshots. |
+| `optimize` | Materialization recommendations from run history. |
+| `sample_rows` | Sample rows from a target or `schema.table`. Reads your warehouse. |
+| `profile_column` | Profile one column (counts, null rate, top values). Reads your warehouse. |
+| `governance_preview` | Dry run of the classification, masking and retention actions a run would reconcile. Offline. |
+| `drift_preview` | Schema drift between two warehouse tables. Reads your warehouse. |
 
 ### Generators (draft-only, your key)
 
-These call a language model under your `ANTHROPIC_API_KEY` and **return drafts**.
-They never write to disk, never apply, and never touch the warehouse beyond the
-aggregate read they need to ground the draft. Most mirror a `rocky ai-*` CLI
-generator (`ai_contract` ↔ `ai-contract`, `ai_test` ↔ `ai-test`, `explain_model`
-↔ `ai-explain`).
+Generators never write to disk and never apply. They read only the aggregate data they need. Most mirror a `rocky ai-*` verb. Hand a draft to the matching `draft_*` tool.
 
 | Tool | What it drafts |
 |---|---|
-| `ai_contract` | A `.contract.toml` for a model, grounded in the **aggregate per-column profile** of its target table. |
-| `ai_test` | SQL assertions (not-null, grain uniqueness, value-range) for a model. |
-| `explain_model` | A natural-language intent description for a model's SQL. |
+| `ai_contract` | A `.contract.toml` from the aggregate per-column profile of the target table. |
+| `ai_test` | SQL assertions (not-null, grain uniqueness, ranges, referential integrity). |
+| `explain_model` | An intent description from the model's SQL and schema. |
 | `suggest_freshness_block` | A `[freshness]` block for a model with temporal columns. |
 
-The output is a proposal to review and write, not an applied change. Hand it to
-the matching write tool below, or write it yourself. With no key set, each
-returns an empty result rather than failing.
+### Write path (policy-gated, no key needed)
 
-### Write path (draft tools)
-
-These are the governed way for an agent to change the project. Each one writes into
-the project's `models/` directory and **compiles in the same call**, so you get
-the type-check with the write. Each one is also checked against your policy
-rules. A `draft_*` tool never applies a change to the warehouse.
+Each tool writes into `models/`, compiles in the same call and is checked against your `[policy]` rules. None applies a change to the warehouse. Called without its content argument, it returns an error naming the matching `ai_*` generator.
 
 | Tool | What it writes |
 |---|---|
-| `draft_model` | `models/<name>.sql` + a sidecar carrying the intent. On an existing model it replaces the SQL but preserve-merges the sidecar: only `name` and `intent` change; classification, freshness, tests, target, strategy, and tags are kept. Comments are dropped on re-serialize; an unparseable sidecar is never overwritten. |
-| `draft_contract` | `models/<model>.contract.toml`, compile-validated against the model's inferred schema (a column the model doesn't produce comes back as a `W010` diagnostic). |
-| `draft_check` | one or more declarative `[[tests]]` blocks merged into the model's sidecar. It infers the target SQL dialect when every pipeline uses the same one; otherwise pass `pipeline` to select one. After the target is applied, call `test` with `declarative = true` to execute the checks. Pass `pipeline` there when the project has multiple pipelines, as with `rocky test --declarative --pipeline`. |
-| `draft_metadata` | a structured freshness / classification patch, parse-merged into the model's sidecar as TOML. `freshness` replaces the `[freshness]` table; `classifications` merges per-column tags into `[classification]`. Comments in the sidecar are dropped on re-serialize; an unparseable sidecar is never overwritten. The policy check runs against the sidecar **as patched**, so a patch that adds the first `pii` tag is judged by that tag. |
+| `draft_model` | `models/<name>.sql` and a sidecar with the intent. On an existing model the SQL is replaced and the sidecar is merged: only `name` and `intent` change. Classification, freshness, tests, target, strategy and tags stay. |
+| `draft_contract` | `models/<model>.contract.toml`, validated against the inferred schema. A column the model does not produce returns `W010`. |
+| `draft_check` | `[[tests]]` blocks merged into the sidecar. It infers the SQL dialect when every pipeline shares one. Otherwise pass `pipeline`, here and on `test` (as with `rocky test --declarative --pipeline`). |
+| `draft_metadata` | A freshness or classification patch merged into the sidecar. `freshness` replaces `[freshness]`. `classifications` merges per-column tags into `[classification]`. The policy check judges the sidecar **as patched**. |
 
-The split from the generators is deliberate. The `ai_*` generators *propose*
-content with a language model. The `draft_*` tools *write* content, yours or a
-generator's, through the compiler and your policy rules. A `draft_*` call made
-without its content argument returns a structured error naming the matching
-`ai_*` generator, so the two are never confused.
+Sidecar merges drop comments on re-serialize. An unparseable sidecar is never overwritten.
 
-### Prompts: pre-written multi-step recipes
+### Propose and governor
 
-An MCP *prompt* is a recipe that chains the tools above in a fixed order. Each
-one ends at a proposed plan or an enumerated gap, never at an applied change.
+| Tool | What it does |
+|---|---|
+| `propose` | Record an AI-authored plan. Compiles offline, no LLM call, no warehouse write. Returns a `plan_id`. |
+| `estate_brief` | The digest [`rocky brief`](/reference/commands/governance-reclamation/#rocky-brief) prints. Read-only. |
+| `audit_query` | The custody chain for a model, run id or plan id (`rocky audit --for`). Read-only. |
+| `scorecard` | Acceptance, denial and review rates per principal, rule or scope (`rocky audit --scorecard`). Read-only. |
+| `schedule_status` | Stored scheduler state per pipeline and queued webhook demands. Read-only. |
+| `pause_schedule` | Pause a pipeline's schedule. Needs `confirm: true`. Resume is human-only. |
+| `review_queue` | List the pending-review queue. On `--profile approver` only, it can also write an approval marker, and only for a plan that is already in the pending queue. |
+
+### Prompts
+
+A prompt chains the tools in a fixed order and ends at a proposed plan or a listed gap, never at an applied change. It calls only tools from the lists above.
 
 | Prompt | What it walks |
 |---|---|
-| `build_model` | inspect_schema → sample_rows → profile_column → compile → plan preview → propose. Stops at the approval gate. |
-| `find_untested_models` | compile → identify untested models → `ai_test` / `ai_contract` → `draft_check` / `draft_contract` → propose. Stops at the gate. |
-| `add_tests_to_pks` | inspect_schema → identify key columns → `draft_check` (uniqueness + not-null) → propose. |
-| `summarize_project` | A read-only project tour; proposes nothing — points at `find_untested_models` / `build_model` for next steps. |
-| `fix_failing_test` | Investigates a failing test and proposes a fix to review. |
+| `build_model` | `inspect_schema` → `sample_rows` → `profile_column` → `compile` → plan preview → `propose`. |
+| `find_untested_models` | `compile` → find untested models → `ai_test` / `ai_contract` → `draft_check` / `draft_contract` → `propose`. |
+| `add_tests_to_pks` | `inspect_schema` → key columns → `draft_check` (uniqueness, not-null) → `propose`. |
+| `summarize_project` | Read-only project tour. Proposes nothing. |
+| `fix_failing_test` | Investigate a failing test and propose a fix. |
 
-A prompt is a recommended sequence, not a privileged path. It calls exactly the
-tools listed above and it stops at the same gate.
+## Profiles
 
-## Three profiles
+The profile is fixed when the server starts. An agent cannot change it mid-session.
 
-`rocky mcp` serves all 31 tools by default, with one action held back:
-`review_queue` lists the pending review queue, but its approve action —
-`approve_plan_id` + `confirm: true`, which writes the approval marker that
-unblocks `rocky apply` — is refused with `approve_not_enabled`.
+| Profile | Serves | Approve action |
+|---|---|---|
+| `default` | All 31 tools | `review_queue` lists the queue. Approve is refused with `approve_not_enabled`. |
+| `approver` | The same 31 tools | Allowed: `approve_plan_id` + `confirm: true` writes the approval marker, and only for a plan that is pending in the current review queue. Use it only for a server you intend to sign off plans. |
+| `worker` | A fixed allowlist for an untrusted drafting worker | No `review_queue`. |
 
-`rocky mcp --profile approver` serves the same 31 tools and allows that one
-action. Use it only for a server you intend to be able to sign off plans.
-Approving is still attributed to the operator's git identity, not to a verified
-person.
+The `worker` allowlist:
 
-`rocky mcp --profile worker` serves a smaller, fixed list meant for an untrusted drafting worker: the
-read and inspect tools (`plan_preview`, `lineage`, `list`, `inspect_schema`,
-`catalog`, `sample_rows`, `profile_column`), the verification loop (`compile`,
-`test`, `breaking_change`, `dependents`), `draft_model`, and the
-prompts. Everything else — `draft_check`, `draft_contract`, `draft_metadata`,
-`propose`, `review_queue`, `pause_schedule`, the governor reads, and the
-generators — is absent from the listing, and calling one returns
-tool-not-found. The list is an allowlist: a tool added in a future release
-stays out of the worker profile unless it is added deliberately.
+- **Read and inspect:** `plan_preview`, `lineage`, `list`, `inspect_schema`, `catalog`, `sample_rows`, `profile_column`.
+- **Verification loop:** `compile`, `test`, `breaking_change`, `dependents`.
+- **Write:** `draft_model`.
+- **Prompts:** same names, served as worker variants. They use only allowlisted tools and end at a hand-off to the trusted runner, never at `propose`, contract authorship or a generator call.
 
-`draft_check` is not in the worker profile. A check's expression is put
-straight into SQL, and `rocky fulfill` now runs a product's declared checks
-against the live table after every apply, with no human watching. So the
-worker profile does not serve it. Read that for exactly what it is: it
-closes the tool route. It does not confine the worker's filesystem, and the
-lowering keeps a check it finds in a sidecar, so a worker that can write
-files can still write one. What catches a check changed after the plan was
-verified is the fulfillment loop's own custody digest, which refuses to run
-a check set that is not the one it verified. A check already on disk at that
-moment is inside the verified set, so nothing catches that one.
+Every other tool is absent, and calling one returns tool-not-found. A tool added in a later release stays out of `worker` until it is added on purpose.
 
-The prompt names are the same in both profiles, but under the worker profile
-the workflow prompts are served as worker variants: they orchestrate only
-tools on the allowlist and end at a hand-off to the trusted runner — never at
-`propose`, contract authorship, or a generator call.
+`draft_check` is not in `worker`. A check expression goes straight into SQL, and `rocky fulfill` runs a product's declared checks against the live table after every apply. This closes the tool route only. A worker that can write files can still put a check in a sidecar. The fulfillment loop's custody digest refuses a check set that differs from the verified one. A check already on disk at that moment is inside the verified set, so nothing catches it.
 
-## The gates on the write path
+## Gates and errors
 
-The write path has three gates. No single call passes all three. A `draft_*`
-call passes two: the compiler type-checks what it wrote, then Rocky evaluates
-your `[policy]` rules before the call returns. The third gate is the approval
-marker, and it sits at apply time. `propose` records an AI-authored plan and returns a
-`plan_id`; it executes nothing:
-
-```bash
-rocky review <plan_id> --approve    # writes the approval marker
-rocky apply  <plan_id>              # refused until that marker names it
-```
-
-A bare `rocky apply <plan_id>` on an unapproved AI-authored plan is rejected by
-the engine, not by convention.
-[The three gates](/concepts/operating-rocky-with-agents/#the-three-gates)
-describes all three, including what a `deny` verdict rolls back. The
-[`[policy]` reference](/reference/configuration/#policy) shows how the rules
-are written.
+A `draft_*` call passes the compiler and your `[policy]` rules before it returns. `propose` executes nothing, and `rocky apply` refuses an unapproved AI-authored plan. See [The three gates](/concepts/operating-rocky-with-agents/#the-three-gates).
 
 ## Structured errors
 
-When a tool rejects a request it has parsed, the failure comes back as a stable
-envelope: `{ code, message, remediation_hint, policy_rule? }`. When `propose`
-returns `policy_review_required`, the envelope also carries the recorded plan's
-typed reference — `plan_id`, plus `product_id` / `spec_digest` when the propose
-was product-bound — so a runner reads the handoff from fields, not prose. An
-agent branches
-on the `code` and acts on the `remediation_hint` without scraping text. See
-[Structured errors](/concepts/operating-rocky-with-agents/#structured-errors)
-for the field-by-field contract and a worked example.
+A rejected request returns `{ code, message, remediation_hint, policy_rule? }`. The contract is in [Structured errors](/concepts/operating-rocky-with-agents/#structured-errors).
 
-One boundary sits below the envelope. A request can fail to parse before the tool
-even runs, because a field is missing or mistyped. That still comes back as a
-tool-result error, never as a transport-level failure. Its content is a plain
-message rather than the envelope. The input schema each tool publishes in
-`tools/list` is what keeps a well-behaved client from sending one.
+One case sits below the envelope. A request that fails to parse before the tool runs (a missing or mistyped field) returns a tool-result error with a plain message, never a transport failure. The input schema in `tools/list` keeps a well-behaved client from sending one.
 
 ## What leaves your environment
 
-The grounding and generator tools are deliberately constrained in what they send
-out:
+- `ai_contract` over MCP sends counts only (null rate, distinct count). It never sends min/max or sample values. The CLI's `--with-data` opt-in, which sends them, is not exposed over MCP.
+- The other generators send the model's SQL and schema to the model behind your key.
+- `governance_preview`, `drift_preview` and the verify-and-ground tools never call a language model. `sample_rows` and `profile_column` read your warehouse to inform the *agent*. Whether that reaches a model depends on your client and prompts.
 
-- **`ai_contract` sends aggregate statistics only.** It profiles the target table
-  and hands the model **counts and aggregate column statistics**, never raw cell
-  values. The contract is drafted from the *shape* of the data (null rates,
-  distinct counts, ranges), not its contents.
-- **`governance_preview` and `drift_preview` are read-only** and never call a
-  language model at all.
-- **The verify and ground tools never call a language model** either.
-  `sample_rows` and `profile_column` read your warehouse to inform the *agent*.
-  Whether any of that reaches a model is governed by the client you connect and
-  the prompts you run, under your key.
+## Related
 
-The one intended egress is the language-model call you enabled by setting your
-own `ANTHROPIC_API_KEY`.
-
-## Where this sits
-
-`rocky mcp` is the machine-facing counterpart to the human-facing AI features:
-
-- The [AI Commands](/reference/commands/ai/) (`rocky ai`, `ai-sync`, `ai-explain`, `ai-test`) are CLI verbs you run directly. They are a separate surface from MCP, not a reference for the `rocky mcp` tools.
-- [AI and Intent](/concepts/ai-intent/) explains the compiler-as-guardrail compile-verify loop that both surfaces rely on.
-- [Preview a PR](/guides/preview-a-pr/) and [Verify a Run](/guides/verify-a-run/) cover the review and audit steps that sit downstream of any proposed plan.
+- [AI and Intent](/concepts/ai-intent/): the compile-verify loop both surfaces use.
+- [Preview a PR](/guides/preview-a-pr/) and [Verify a Run](/guides/verify-a-run/): the review and audit steps after a proposed plan.

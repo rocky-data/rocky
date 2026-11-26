@@ -7,11 +7,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rocky_compiler::compile::{CompilerConfig, default_type_mapper};
+use rocky_compiler::operand_check::{OperandDialect, OperandTarget, TargetDialects};
 use rocky_compiler::source_refs::{SourceProvenance, SourceSchemaOrigin};
 use rocky_compiler::types::TypedColumn;
 use rocky_core::models::load_unit_tests_from_tree;
 use rocky_core::unit_test::{
-    MismatchKind, RowMismatch, UnitTestDef, UnitTestResult, fixture_to_sql, json_to_sql_literal,
+    MismatchKind, RowMismatch, UnitTestDef, UnitTestDialect, UnitTestDialectStatus, UnitTestResult,
+    fixture_to_sql, json_to_sql_literal,
 };
 use rocky_duckdb::dialect::DuckDbSqlDialect;
 use rocky_duckdb::{DuckDbConnector, ExtensionOptions};
@@ -519,10 +521,19 @@ impl UnitTestRun {
 /// compared to `expect` — a multiset comparison by default, positional when
 /// `expect.ordered` is set. Models are filtered by `model_filter` when set;
 /// models declaring no `[[test]]` blocks are skipped entirely (no compile).
+///
+/// `targets` are the warehouses each model runs on in production (the
+/// project resolver, [`rocky_compiler::model_targets::target_dialects`]).
+/// They do not change the compile or the SQL. They only decide the
+/// [`UnitTestDialect`] notice on each result: a model whose only target is
+/// DuckDB gets none, every other model's tests carry one, and with
+/// `strict_dialect` those tests are refused instead of run.
 pub fn run_unit_tests(
     models_dir: &Path,
     model_filter: Option<&str>,
     extensions: &ExtensionOptions,
+    targets: &TargetDialects,
+    strict_dialect: bool,
 ) -> anyhow::Result<UnitTestRun> {
     let unit_tests = load_unit_tests_from_tree(models_dir)?;
     if unit_tests.is_empty() {
@@ -550,6 +561,7 @@ pub fn run_unit_tests(
                 .into_iter()
                 .filter(|name| include_model(model_filter, name))
                 .flat_map(|name| {
+                    let dialect = not_run_notice(targets.for_model(name));
                     unit_tests[name].iter().map(move |test| UnitTestResult {
                         model: name.clone(),
                         test: test.name.clone(),
@@ -559,6 +571,7 @@ pub fn run_unit_tests(
                              (E058)"
                         )),
                         mismatches: Vec::new(),
+                        dialect: dialect.clone(),
                     })
                 })
                 .collect();
@@ -572,20 +585,42 @@ pub fn run_unit_tests(
         if !include_model(model_filter, name) {
             continue;
         }
-        let compiled_sql = compile_result
-            .project
-            .model(name)
-            .map(|m| rocky_core::sql_gen::local_test_sql(m).into_owned());
+        let plan = plan_model_unit_tests(
+            name,
+            &compile_result,
+            targets.for_model(name),
+            strict_dialect,
+        );
         for test in &unit_tests[name] {
-            match &compiled_sql {
-                Some(sql) => results.push(run_one_unit_test(
-                    name,
-                    sql,
-                    test,
-                    &compile_result,
-                    extensions,
-                )),
-                None => results.push(UnitTestResult {
+            match &plan {
+                ModelUnitTestPlan::Run { sql, dialect } => {
+                    let mut reached_model = false;
+                    let mut result = run_one_unit_test(
+                        name,
+                        sql,
+                        test,
+                        &compile_result,
+                        extensions,
+                        &mut reached_model,
+                    );
+                    // A test that failed before its model's SQL reached
+                    // DuckDB (a fixture, a function, the database) did not
+                    // run on DuckDB: say so.
+                    result.dialect = dialect.clone().map(|mut d| {
+                        d.ran_on_duckdb = reached_model;
+                        d
+                    });
+                    results.push(result);
+                }
+                ModelUnitTestPlan::Refuse { error, dialect } => results.push(UnitTestResult {
+                    model: name.clone(),
+                    test: test.name.clone(),
+                    passed: false,
+                    error: Some(error.clone()),
+                    mismatches: Vec::new(),
+                    dialect: Some(dialect.clone()),
+                }),
+                ModelUnitTestPlan::NotCompiled { dialect } => results.push(UnitTestResult {
                     model: name.clone(),
                     test: test.name.clone(),
                     passed: false,
@@ -593,6 +628,7 @@ pub fn run_unit_tests(
                         "model '{name}' did not compile — cannot run its unit tests"
                     )),
                     mismatches: Vec::new(),
+                    dialect: dialect.clone(),
                 }),
             }
         }
@@ -606,6 +642,125 @@ pub fn run_unit_tests(
     Ok(UnitTestRun { results })
 }
 
+/// What [`run_unit_tests`] does with one model's unit tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelUnitTestPlan {
+    /// Run each test on DuckDB with `sql`. `dialect` is the notice each
+    /// result carries: `None` for a model whose only target is DuckDB.
+    Run {
+        sql: String,
+        dialect: Option<UnitTestDialect>,
+    },
+    /// `--strict-dialect` refuses each test without running it.
+    Refuse {
+        error: String,
+        dialect: UnitTestDialect,
+    },
+    /// The model did not compile, so no test runs.
+    NotCompiled { dialect: Option<UnitTestDialect> },
+}
+
+/// Decide what happens to the unit tests of `model`: the SQL they run on
+/// DuckDB and the notice they carry, or the refusal. The SQL does not depend
+/// on the target. The target only adds a notice or a refusal.
+fn plan_model_unit_tests(
+    model: &str,
+    compile_result: &rocky_compiler::compile::CompileResult,
+    target: &OperandTarget,
+    strict_dialect: bool,
+) -> ModelUnitTestPlan {
+    let Some(ir) = compile_result.project.model(model) else {
+        return ModelUnitTestPlan::NotCompiled {
+            dialect: not_run_notice(target),
+        };
+    };
+    match target_notice(target) {
+        Some((status, targets)) if strict_dialect => ModelUnitTestPlan::Refuse {
+            error: strict_dialect_refusal(status, &targets),
+            dialect: UnitTestDialect {
+                status,
+                targets,
+                ran_on_duckdb: false,
+                refused: true,
+            },
+        },
+        notice => ModelUnitTestPlan::Run {
+            sql: rocky_core::sql_gen::local_test_sql(ir).into_owned(),
+            dialect: notice.map(|(status, targets)| UnitTestDialect {
+                status,
+                targets,
+                ran_on_duckdb: true,
+                refused: false,
+            }),
+        },
+    }
+}
+
+/// The notice for a test that did not run for a reason other than
+/// `--strict-dialect`: a dependency cycle or a compile failure.
+fn not_run_notice(target: &OperandTarget) -> Option<UnitTestDialect> {
+    target_notice(target).map(|(status, targets)| UnitTestDialect {
+        status,
+        targets,
+        ran_on_duckdb: false,
+        refused: false,
+    })
+}
+
+/// How `target` relates to DuckDB, the dialect unit tests run on. `None`
+/// when DuckDB is the model's only target.
+///
+/// ```text
+///   Unconfigured                     -> unresolved_target, []
+///   Targets [DuckDB]                 -> None (no notice)
+///   one target that is not DuckDB    -> non_duckdb_target, [it]
+///   more than one target, any mix    -> multiple_targets, [all of them]
+/// ```
+///
+/// An adapter with no dialect table (`unruled`, such as ClickHouse) is still
+/// a named target that is not DuckDB.
+pub fn target_notice(target: &OperandTarget) -> Option<(UnitTestDialectStatus, Vec<String>)> {
+    let (dialects, unruled) = match target {
+        OperandTarget::Unconfigured => {
+            return Some((UnitTestDialectStatus::UnresolvedTarget, Vec::new()));
+        }
+        OperandTarget::Targets { dialects, unruled } => (dialects, unruled),
+    };
+    if dialects.as_slice() == [OperandDialect::DuckDb] && unruled.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = dialects
+        .iter()
+        .map(|d| d.name().to_string())
+        .chain(unruled.iter().cloned())
+        .collect();
+    let status = match names.len() {
+        0 => UnitTestDialectStatus::UnresolvedTarget,
+        1 => UnitTestDialectStatus::NonDuckdbTarget,
+        _ => UnitTestDialectStatus::MultipleTargets,
+    };
+    Some((status, names))
+}
+
+/// The error a `--strict-dialect` refusal reports.
+fn strict_dialect_refusal(status: UnitTestDialectStatus, targets: &[String]) -> String {
+    let why = match status {
+        UnitTestDialectStatus::NonDuckdbTarget => {
+            format!("its model targets {}", targets.join(", "))
+        }
+        UnitTestDialectStatus::MultipleTargets => format!(
+            "its model targets more than one warehouse ({})",
+            targets.join(", ")
+        ),
+        UnitTestDialectStatus::UnresolvedTarget => {
+            "no target warehouse is resolved for its model".to_string()
+        }
+    };
+    format!(
+        "not run: --strict-dialect refuses this unit test, because it would run on DuckDB and {why}"
+    )
+}
+
 /// Execute one unit test: seed `given` fixtures, materialize the model against
 /// them, and compare the output to `expect`.
 fn run_one_unit_test(
@@ -614,6 +769,7 @@ fn run_one_unit_test(
     test: &UnitTestDef,
     compile_result: &rocky_compiler::compile::CompileResult,
     extensions: &ExtensionOptions,
+    reached_model: &mut bool,
 ) -> UnitTestResult {
     let fail = |msg: String, mismatches: Vec<RowMismatch>| UnitTestResult {
         model: model.to_string(),
@@ -621,6 +777,7 @@ fn run_one_unit_test(
         passed: false,
         error: Some(msg),
         mismatches,
+        dialect: None,
     };
     let pass = || UnitTestResult {
         model: model.to_string(),
@@ -628,6 +785,7 @@ fn run_one_unit_test(
         passed: true,
         error: None,
         mismatches: Vec::new(),
+        dialect: None,
     };
 
     let db = match DuckDbConnector::in_memory_with(extensions) {
@@ -664,8 +822,10 @@ fn run_one_unit_test(
         }
     }
 
-    // Materialize the model output against the mocked inputs.
+    // Materialize the model output against the mocked inputs. From here on
+    // the model's SQL has been sent to DuckDB.
     let sql = compiled_sql.trim().trim_end_matches(';');
+    *reached_model = true;
     if let Err(e) =
         db.execute_statement(&format!("CREATE OR REPLACE TABLE __rocky_actual AS\n{sql}"))
     {
@@ -1252,7 +1412,14 @@ mod tests {
     #[test]
     fn time_interval_unit_test_keeps_rows_at_calendar_edges() {
         let (_tmp, models) = scaffold_time_interval_project();
-        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &duckdb_target(),
+            false,
+        )
+        .unwrap();
         assert_eq!(run.total(), 1);
         assert!(
             run.results[0].passed,
@@ -1266,7 +1433,14 @@ mod tests {
     #[test]
     fn unit_test_passes_when_output_matches() {
         let (_tmp, models) = scaffold_unit_test_project(true);
-        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &duckdb_target(),
+            false,
+        )
+        .unwrap();
         assert_eq!(run.total(), 1);
         assert_eq!(run.passed(), 1, "error: {:?}", run.results[0].error);
         assert!(run.results[0].passed);
@@ -1277,7 +1451,14 @@ mod tests {
     #[test]
     fn unit_test_fails_and_reports_mismatch() {
         let (_tmp, models) = scaffold_unit_test_project(false);
-        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &duckdb_target(),
+            false,
+        )
+        .unwrap();
         assert_eq!(run.total(), 1);
         assert_eq!(run.passed(), 0);
         assert!(!run.results[0].passed);
@@ -1292,7 +1473,14 @@ mod tests {
     #[test]
     fn unit_tests_empty_when_none_declared() {
         let (_tmp, models) = scaffold_two_model_project();
-        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &duckdb_target(),
+            false,
+        )
+        .unwrap();
         assert_eq!(run.total(), 0);
     }
 
@@ -1337,7 +1525,14 @@ mod tests {
         )
         .unwrap();
 
-        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &duckdb_target(),
+            false,
+        )
+        .unwrap();
         assert_eq!(run.total(), 1);
         assert_eq!(
             run.passed(),
@@ -1595,7 +1790,14 @@ mod tests {
     fn a_dependency_cycle_fails_every_unit_test() {
         let (_dir, models) = scaffold_unit_test_project(true);
         std::fs::write(models.join("orders.sql"), "SELECT id, amount FROM flagged").unwrap();
-        let run = run_unit_tests(&models, None, &ExtensionOptions::default()).unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &duckdb_target(),
+            false,
+        )
+        .unwrap();
         assert_eq!(run.results.len(), 1, "{:?}", run.results);
         let result = &run.results[0];
         assert_eq!(result.model, "flagged");
@@ -1642,7 +1844,7 @@ mod tests {
         );
 
         let (_unit_dir, unit_models) = scaffold_unit_test_project(true);
-        let run = run_unit_tests(&unit_models, None, &offline).unwrap();
+        let run = run_unit_tests(&unit_models, None, &offline, &duckdb_target(), false).unwrap();
         assert!(!run.results.is_empty());
         assert!(
             run.results.iter().all(|r| !r.passed
@@ -1780,5 +1982,265 @@ mod tests {
             "{:?}",
             result.model_results
         );
+    }
+
+    /// Every model runs on DuckDB alone: the target of a DuckDB project.
+    fn duckdb_target() -> TargetDialects {
+        TargetDialects::uniform(Some(OperandDialect::DuckDb).into())
+    }
+
+    /// Every model runs on Snowflake alone.
+    fn snowflake_target() -> TargetDialects {
+        TargetDialects::uniform(Some(OperandDialect::Snowflake).into())
+    }
+
+    /// The exact SQL `flagged` authors in [`scaffold_unit_test_project`].
+    const FLAGGED_SQL: &str = "SELECT id, amount, true AS is_high FROM orders WHERE amount > 100";
+
+    fn compile_models(models: &Path) -> rocky_compiler::compile::CompileResult {
+        rocky_compiler::compile::compile(&CompilerConfig {
+            models_dir: models.to_path_buf(),
+            ..Default::default()
+        })
+        .expect("compiles")
+    }
+
+    #[test]
+    fn target_notice_classifies_each_target_shape() {
+        use UnitTestDialectStatus::*;
+        let targets = |dialects: Vec<OperandDialect>, unruled: Vec<&str>| OperandTarget::Targets {
+            dialects,
+            unruled: unruled.into_iter().map(String::from).collect(),
+        };
+        assert_eq!(
+            target_notice(&targets(vec![OperandDialect::DuckDb], vec![])),
+            None
+        );
+        assert_eq!(
+            target_notice(&OperandTarget::Unconfigured),
+            Some((UnresolvedTarget, vec![]))
+        );
+        assert_eq!(
+            target_notice(&targets(vec![OperandDialect::Snowflake], vec![])),
+            Some((NonDuckdbTarget, vec!["Snowflake".to_string()]))
+        );
+        assert_eq!(
+            target_notice(&targets(vec![], vec!["clickhouse"])),
+            Some((NonDuckdbTarget, vec!["clickhouse".to_string()]))
+        );
+        assert_eq!(
+            target_notice(&targets(
+                vec![OperandDialect::DuckDb, OperandDialect::Snowflake],
+                vec![]
+            )),
+            Some((
+                MultipleTargets,
+                vec!["DuckDB".to_string(), "Snowflake".to_string()]
+            ))
+        );
+        assert_eq!(
+            target_notice(&targets(vec![OperandDialect::DuckDb], vec!["clickhouse"])),
+            Some((
+                MultipleTargets,
+                vec!["DuckDB".to_string(), "clickhouse".to_string()]
+            ))
+        );
+        assert_eq!(
+            target_notice(&targets(vec![], vec![])),
+            Some((UnresolvedTarget, vec![]))
+        );
+    }
+
+    /// A DuckDB project's unit test runs the model's SQL text unchanged, and
+    /// its JSON result carries no `dialect` key. A Snowflake target runs the
+    /// same SQL: the target adds a notice, never a different query.
+    #[test]
+    fn a_duckdb_target_runs_the_authored_sql_with_no_marker() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        let compiled = compile_models(&models);
+        let duckdb = plan_model_unit_tests(
+            "flagged",
+            &compiled,
+            duckdb_target().for_model("flagged"),
+            true,
+        );
+        assert_eq!(
+            duckdb,
+            ModelUnitTestPlan::Run {
+                sql: FLAGGED_SQL.to_string(),
+                dialect: None,
+            }
+        );
+        let snowflake = plan_model_unit_tests(
+            "flagged",
+            &compiled,
+            snowflake_target().for_model("flagged"),
+            false,
+        );
+        let ModelUnitTestPlan::Run { sql, dialect } = snowflake else {
+            panic!("a default-mode Snowflake target runs: {snowflake:?}");
+        };
+        assert_eq!(sql, FLAGGED_SQL);
+        assert!(dialect.is_some());
+
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &duckdb_target(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(run.passed(), 1, "{:?}", run.results);
+        let json = serde_json::to_string(&run.results).unwrap();
+        assert!(!json.contains("\"dialect\""), "{json}");
+    }
+
+    /// A Snowflake project's unit test still runs on DuckDB by default, and
+    /// says so.
+    #[test]
+    fn a_snowflake_target_marks_each_result() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &snowflake_target(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(run.passed(), 1, "{:?}", run.results);
+        assert_eq!(
+            run.results[0].dialect,
+            Some(UnitTestDialect {
+                status: UnitTestDialectStatus::NonDuckdbTarget,
+                targets: vec!["Snowflake".to_string()],
+                ran_on_duckdb: true,
+                refused: false,
+            })
+        );
+        let json = serde_json::to_value(&run.results[0]).unwrap();
+        assert_eq!(json["dialect"]["status"], "non_duckdb_target");
+    }
+
+    /// `--strict-dialect` refuses a Snowflake project's unit test instead of
+    /// running it, and the refusal fails the test.
+    #[test]
+    fn strict_dialect_refuses_a_snowflake_target() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &snowflake_target(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(run.total(), 1);
+        assert_eq!(run.passed(), 0);
+        let result = &run.results[0];
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("--strict-dialect"), "{error}");
+        assert!(error.contains("Snowflake"), "{error}");
+        let dialect = result.dialect.as_ref().expect("marked");
+        assert!(dialect.refused && !dialect.ran_on_duckdb, "{dialect:?}");
+    }
+
+    /// A test that fails before its model's SQL reaches DuckDB (here, a
+    /// fixture ref that is not an identifier) is marked as not run.
+    #[test]
+    fn a_test_that_fails_before_the_model_runs_is_marked_not_run() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        let sidecar = models.join("flagged.toml");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(
+            &sidecar,
+            text.replace("ref = \"orders\"", "ref = \"or-ders\""),
+        )
+        .unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &snowflake_target(),
+            false,
+        )
+        .unwrap();
+        let result = &run.results[0];
+        assert!(!result.passed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("invalid fixture ref"),
+            "{result:?}"
+        );
+        let dialect = result.dialect.as_ref().expect("marked");
+        assert!(!dialect.ran_on_duckdb && !dialect.refused, "{dialect:?}");
+    }
+
+    /// A model whose SQL DuckDB rejects did reach DuckDB: `ran_on_duckdb` is
+    /// `true` once the SQL is sent, whatever DuckDB answers.
+    #[test]
+    fn a_model_duckdb_rejects_is_marked_ran_on_duckdb() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        std::fs::write(
+            models.join("flagged.sql"),
+            "SELECT id, CAST('not a number' AS INTEGER) AS amount, true AS is_high FROM orders",
+        )
+        .unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &snowflake_target(),
+            false,
+        )
+        .unwrap();
+        let result = &run.results[0];
+        assert!(!result.passed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("model execution failed"),
+            "{result:?}"
+        );
+        let dialect = result.dialect.as_ref().expect("marked");
+        assert!(dialect.ran_on_duckdb && !dialect.refused, "{dialect:?}");
+    }
+
+    /// No resolved target is never taken as DuckDB: the default mode runs and
+    /// marks the test, strict mode refuses it.
+    #[test]
+    fn an_unresolved_target_is_marked_or_refused() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        let unresolved = TargetDialects::default();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &unresolved,
+            false,
+        )
+        .unwrap();
+        assert_eq!(run.passed(), 1, "{:?}", run.results);
+        let dialect = run.results[0].dialect.as_ref().expect("marked");
+        assert_eq!(dialect.status, UnitTestDialectStatus::UnresolvedTarget);
+        assert!(dialect.ran_on_duckdb);
+
+        let strict = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &unresolved,
+            true,
+        )
+        .unwrap();
+        assert_eq!(strict.passed(), 0);
+        let error = strict.results[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("no target warehouse"), "{error}");
     }
 }
