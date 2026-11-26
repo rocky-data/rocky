@@ -19,7 +19,7 @@ sidebar:
 With the gate on, Rocky skips a transformation model only when **both** hold since its last *successful* build:
 
 1. **Logic unchanged (B2).** The model's cosmetic-invariant logic key (a hash of the normalised SQL plus its typed structural facts) matches the recorded one. Reformatting or re-commenting does not count as a change. Altering what the SQL computes does.
-2. **Upstream data unchanged (B3).** Every upstream is provably stable: a Rocky model that was *skipped* this run, or a raw source whose `MAX(<timestamp>)` matches the recorded signature. Only an `incremental` or `microbatch` model with a timestamp column has one to probe. Any other strategy (`full_refresh` included) with a raw source can skip only when `skip_rowcount_fallback` is on, which compares `COUNT(*)`.
+2. **Upstream data unchanged (B3).** Every upstream is provably stable: a Rocky model that was *skipped* this run, or a raw source whose `MAX(<timestamp>)` matches the recorded signature. Only an `incremental` model with a timestamp column has one to probe. For an `incremental` model with a `lookback` it is not enough: its build re-reads rows below the watermark, so a late row can change its output while `MAX(<timestamp>)` stays the same. Such a model also needs an unchanged `COUNT(*)`, so it can skip only when `skip_rowcount_fallback` is on. Any other model with a raw source (`full_refresh` included) can skip only when `skip_rowcount_fallback` is on, which compares `COUNT(*)`.
 
 If either is in doubt, the model builds.
 
