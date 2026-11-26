@@ -542,11 +542,11 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
       {cost.shared_not_charged.length > 0 && (
         <div className="space-y-1">
           <h5 className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">
-            Shared, not charged
+            Shares readers did not pay
           </h5>
           <Rows
             ariaLabel="Shares of this product's tables that readers did not pay"
-            columns={["table", "reader", partial ? "share it keeps (partial)" : "share it keeps", "split by"]}
+            columns={["table", "reader", partial ? "share it still pays (partial)" : "share it still pays", "split by"]}
             rows={cost.shared_not_charged.map((row) => [
               <span key="t" className="font-mono text-xs">
                 {row.table}

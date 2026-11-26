@@ -496,7 +496,7 @@ function Approval({
           { label: "Proposed", state: "done" },
           { label: "Approve", state: status.reviewed ? "done" : "current" },
           {
-            label: "Apply to production",
+            label: "Apply",
             // The status route records approval, not apply. Applied is
             // known only when this page ran the apply and saw it succeed.
             // After approval it is unknown, not "next": a plan applied in a
@@ -547,13 +547,13 @@ function Approval({
       ) : (
         <div className="space-y-2">
           <WriteButton
-            label="Apply to production"
+            label="Apply change"
             primary={status.reviewed}
             busy={jobBusy(apply.view)}
             disabledReason={status.reviewed ? undefined : "Approve the change first."}
             onClick={() => apply.start({ plan_id: planId })}
           />
-          <JobLine label="Apply to production" view={apply.view} cancel={apply.cancel} />
+          <JobLine label="Apply change" view={apply.view} cancel={apply.cancel} />
           {status.reviewed && (
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Apply runs the models on disk, and first checks they still match this change. If
@@ -623,14 +623,14 @@ function ProductApply({
       />
       {blocked === null ? (
         <ConfirmedWrite
-          label="Apply to production"
+          label="Apply change"
           question={`Apply this change to the warehouse, stating that you approved spec digest ${digest}?`}
           confirmLabel="Yes, apply"
           busy={busy}
           onConfirm={() => start({ plan_id: planId, expect_spec_digest: digest })}
         />
       ) : (
-        <WriteButton label="Apply to production" busy={busy} disabledReason={blocked} onClick={() => undefined} />
+        <WriteButton label="Apply change" busy={busy} disabledReason={blocked} onClick={() => undefined} />
       )}
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         The approved digest is on the <code className="font-mono">approval:</code> line of{" "}
@@ -640,7 +640,7 @@ function ProductApply({
         the change&apos;s own digest from the spec card: the check would then compare the change with
         itself.
       </p>
-      <JobLine label="Apply to production" view={apply} cancel={cancel} />
+      <JobLine label="Apply change" view={apply} cancel={cancel} />
       <p className="text-xs text-zinc-500 dark:text-zinc-400">
         The engine compares your digest with the one the change carries and refuses the apply if
         they differ. Or in a terminal:
@@ -914,7 +914,7 @@ export function PlanDetail({
           <Fact
             label="approval"
             tone={status.value.reviewed ? "ok" : "warn"}
-            value={status.value.reviewed ? "signed off" : "needs approval"}
+            value={status.value.reviewed ? "signed off" : "not approved yet"}
           />
           <Fact label="data product" value={status.value.product_id ?? "not tied to a data product"} />
         </dl>

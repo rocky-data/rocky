@@ -103,6 +103,9 @@ describe("CustodyScreen", () => {
     expect(within(decisions).getByText("rule 1")).toBeInTheDocument();
     const runs = screen.getByRole("region", { name: "Runs" });
     expect(within(runs).getByRole("link", { name: "run-custody-1" })).toBeInTheDocument();
+    // The engine's `Success`, in words.
+    expect(within(runs).getByText("Succeeded")).toBeInTheDocument();
+    expect(within(runs).queryByText("Success")).toBeNull();
     expect(within(runs).getByText(NOT_RECORDED)).toBeInTheDocument();
     const verify = screen.getByRole("region", { name: "Post-apply checks" });
     expect(

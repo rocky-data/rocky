@@ -44,18 +44,18 @@ export const SCENES = {
       await page.waitForURL(/\/ui\//);
 
       await goto(page, "/ui/review");
-      await page.waitForSelector('section[aria-label="The review queue"]');
+      await page.waitForSelector('section[aria-label="Changes waiting for approval"]');
       await pause(page, 2500);
 
-      // The first plan in the queue — the engine's own ranking, not the page's.
-      const first = page.locator('section[aria-label="The review queue"] a').first();
+      // The first change in the queue — the engine's own ranking, not the page's.
+      const first = page.locator('section[aria-label="Changes waiting for approval"] a').first();
       await first.waitFor();
       await first.click();
 
-      await page.waitForSelector('section[aria-label="Why it needs a human"]');
+      await page.waitForSelector('section[aria-label="Why it needs approval"]');
       await pause(page, 2000);
-      await page.waitForSelector('section[aria-label="How to approve"]');
-      await page.locator('section[aria-label="How to approve"]').scrollIntoViewIfNeeded();
+      await page.waitForSelector('section[aria-label="Approval"]');
+      await page.locator('section[aria-label="Approval"]').scrollIntoViewIfNeeded();
       await pause(page, 3000);
     },
   },
@@ -101,7 +101,7 @@ export const SCENES = {
       await page.waitForURL(/\/ui\//);
 
       await goto(page, "/ui/governor/products");
-      await page.waitForSelector("text=/\\d+ products?/");
+      await page.waitForSelector("text=/\\d+ data products?/");
       await pause(page, 2000);
 
       const first = page.locator("main a, body a").filter({ hasText: /^[a-z0-9_]+$/ }).first();
@@ -111,7 +111,7 @@ export const SCENES = {
       await page.waitForSelector('section[aria-label="Where it stands"]');
       await pause(page, 2500);
 
-      const journal = page.locator('section[aria-label="What happened"]');
+      const journal = page.locator('section[aria-label="History"]');
       await journal.waitFor();
       await journal.scrollIntoViewIfNeeded();
       await pause(page, 2000);

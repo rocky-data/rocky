@@ -221,7 +221,7 @@ function planLoaders(status: () => Promise<ReviewStatusOutput>): PlanLoaders {
   };
 }
 
-describe("Approve change and Apply to production on the change page", () => {
+describe("Approve change and Apply change on the change page", () => {
   it("approve over the HTTP API, then show who the marker names", async () => {
     let approved = false;
     const loaders = planLoaders(async () =>
@@ -248,7 +248,7 @@ describe("Approve change and Apply to production on the change page", () => {
     );
     const section = await screen.findByRole("region", { name: "Approval" });
     // Apply waits for the approval.
-    expect(within(section).getByRole("button", { name: "Apply to production" })).toBeDisabled();
+    expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
     // The command stays visible as a secondary hint.
     expect(within(section).getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
     // The steps say where the plan stands, in words: approval is next.
@@ -257,7 +257,7 @@ describe("Approve change and Apply to production on the change page", () => {
         .getAllByRole("listitem")
         .map((item) => item.textContent);
     // A done step shows a check, so only the others carry their number.
-    expect(steps()).toEqual(["Proposed: done", "2Approve: next", "3Apply to production: not yet"]);
+    expect(steps()).toEqual(["Proposed: done", "2Approve: next", "3Apply: not yet"]);
 
     fireEvent.click(within(section).getByRole("button", { name: "Approve change" }));
     await screen.findByText(/approved over the HTTP API by ops@example.com/);
@@ -265,16 +265,16 @@ describe("Approve change and Apply to production on the change page", () => {
     const text = document.body.textContent ?? "";
     expect(text).not.toMatch(/from the browser/i);
     expect(text).not.toMatch(/by a human/i);
-    // Approve is done. Apply to production is not known, never "next" or "done": the
+    // Approve is done. Apply change is not known, never "next" or "done": the
     // status route records approval, not apply, so an applied plan would
     // look the same.
     expect(steps()).toEqual([
       "Proposed: done",
       "Approve: done",
-      "3Apply to production: not knownThe change status does not record apply.",
+      "3Apply: not knownThe change status does not record apply.",
     ]);
     // Now Apply is live, and posts the plan id and nothing else.
-    const apply = screen.getByRole("button", { name: "Apply to production" });
+    const apply = screen.getByRole("button", { name: "Apply change" });
     expect(apply).toBeEnabled();
     fireEvent.click(apply);
     await waitFor(() =>
@@ -282,11 +282,11 @@ describe("Approve change and Apply to production on the change page", () => {
     );
     // Only an apply this page saw succeed marks the last step done.
     await waitFor(() =>
-      expect(steps()).toEqual(["Proposed: done", "Approve: done", "Apply to production: done"]),
+      expect(steps()).toEqual(["Proposed: done", "Approve: done", "Apply: done"]),
     );
   });
 
-  it("never marks Apply to production done after an apply that failed", async () => {
+  it("never marks Apply change done after an apply that failed", async () => {
     const loaders = planLoaders(async () => ({
       ...STATUS,
       reviewed: true,
@@ -299,7 +299,7 @@ describe("Approve change and Apply to production on the change page", () => {
       </WriteAccessProvider>,
     );
     const section = await screen.findByRole("region", { name: "Approval" });
-    fireEvent.click(within(section).getByRole("button", { name: "Apply to production" }));
+    fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
     await within(section).findByRole("alert");
     const steps = within(within(section).getByRole("list", { name: "Steps" }))
       .getAllByRole("listitem")
@@ -307,7 +307,7 @@ describe("Approve change and Apply to production on the change page", () => {
     expect(steps).toEqual([
       "Proposed: done",
       "Approve: done",
-      "3Apply to production: not knownThe change status does not record apply.",
+      "3Apply: not knownThe change status does not record apply.",
     ]);
   });
 
@@ -364,7 +364,7 @@ describe("Approve change and Apply to production on the change page", () => {
       const { section, input, submitted } = await open(bound());
       expect(input.value).toBe("");
       expect(input).toHaveAttribute("placeholder", "sha256:…");
-      expect(within(section).getByRole("button", { name: "Apply to production" })).toBeDisabled();
+      expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
       expect(within(section).getByText("Type the spec digest you approved.")).toBeTruthy();
       // The terminal hint names a placeholder, never a digest.
       expect(section).toHaveTextContent("--expect-spec-digest <the spec digest you approved>");
@@ -387,13 +387,13 @@ describe("Approve change and Apply to production on the change page", () => {
     it("sends exactly the typed digest as expect_spec_digest, after a confirm step", async () => {
       const { section, input, submitted } = await open(bound(), OPERATOR, [job("apply", "succeeded")]);
       fireEvent.change(input, { target: { value: "sha256:typed-by-hand" } });
-      fireEvent.click(within(section).getByRole("button", { name: "Apply to production" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
       // The first press only asks, and the question repeats the typed digest.
       expect(submitted).toEqual([]);
       const question = within(section).getByRole("group");
       expect(question).toHaveTextContent("sha256:typed-by-hand");
       fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
-      await within(section).findByText("Apply to production: done.");
+      await within(section).findByText("Apply change: done.");
       expect(submitted).toEqual([
         { kind: "apply", body: { plan_id: PLAN, expect_spec_digest: "sha256:typed-by-hand" } },
       ]);
@@ -402,25 +402,25 @@ describe("Approve change and Apply to production on the change page", () => {
     it("drops the spaces a paste adds and never sends a blank digest", async () => {
       const { section, input, submitted } = await open(bound());
       fireEvent.change(input, { target: { value: "   " } });
-      expect(within(section).getByRole("button", { name: "Apply to production" })).toBeDisabled();
+      expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
       fireEvent.change(input, { target: { value: "  sha256:pasted " } });
-      fireEvent.click(within(section).getByRole("button", { name: "Apply to production" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
       fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
       await waitFor(() => expect(submitted).toHaveLength(1));
       expect(submitted[0].body).toEqual({ plan_id: PLAN, expect_spec_digest: "sha256:pasted" });
     });
 
-    it("treats a plan with only a spec digest as bound, and offers no bare Apply to production", async () => {
+    it("treats a plan with only a spec digest as bound, and offers no bare Apply change", async () => {
       const loaders = bound({ product_id: undefined });
       const { section, input } = await open(loaders, OPERATOR, undefined, false);
       expect(input.value).toBe("");
-      expect(within(section).getByRole("button", { name: "Apply to production" })).toBeDisabled();
+      expect(within(section).getByRole("button", { name: "Apply change" })).toBeDisabled();
     });
 
-    it("keeps Apply to production off until the change is approved, even with a digest typed", async () => {
+    it("keeps Apply change off until the change is approved, even with a digest typed", async () => {
       const { section, input, submitted } = await open(bound({ reviewed: false, approver: undefined }));
       fireEvent.change(input, { target: { value: "sha256:typed" } });
-      const apply = within(section).getByRole("button", { name: "Apply to production" });
+      const apply = within(section).getByRole("button", { name: "Apply change" });
       expect(apply).toBeDisabled();
       fireEvent.click(apply);
       expect(within(section).getByText("Approve the change first.")).toBeTruthy();
@@ -430,7 +430,7 @@ describe("Approve change and Apply to production on the change page", () => {
     it("draws Apply disabled on a read-only page", async () => {
       const { section, input, submitted } = await open(bound(), READ_ONLY);
       fireEvent.change(input, { target: { value: "sha256:typed" } });
-      const apply = within(section).getByRole("button", { name: "Apply to production" });
+      const apply = within(section).getByRole("button", { name: "Apply change" });
       expect(apply).toBeDisabled();
       expect(apply).toHaveAttribute("title", READ_ONLY_REASON);
       expect(submitted).toEqual([]);
@@ -445,10 +445,10 @@ describe("Approve change and Apply to production on the change page", () => {
       });
       const { section, input } = await open(bound(), OPERATOR, [refusal]);
       fireEvent.change(input, { target: { value: "sha256:bbbb" } });
-      fireEvent.click(within(section).getByRole("button", { name: "Apply to production" }));
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
       fireEvent.click(within(section).getByRole("button", { name: "Yes, apply" }));
       const alert = await within(section).findByRole("alert");
-      expect(alert).toHaveTextContent("Apply to production: failed. Error: spec digest mismatch for plan 'x'");
+      expect(alert).toHaveTextContent("Apply change: failed. Error: spec digest mismatch for plan 'x'");
       // The engine's refusal line stays whole, with both digests it carries.
       expect(alert).toHaveTextContent(
         "Error: spec digest mismatch for plan 'x': the plan was authored against 'sha256:aaaa' but the applier expected 'sha256:bbbb'.",
@@ -467,8 +467,8 @@ describe("Approve change and Apply to production on the change page", () => {
       );
       const section = await screen.findByRole("region", { name: "Approval" });
       expect(within(section).queryByLabelText("Spec digest you approved")).toBeNull();
-      fireEvent.click(within(section).getByRole("button", { name: "Apply to production" }));
-      await within(section).findByText("Apply to production: done.");
+      fireEvent.click(within(section).getByRole("button", { name: "Apply change" }));
+      await within(section).findByText("Apply change: done.");
       expect(submitted).toEqual([{ kind: "apply", body: { plan_id: PLAN } }]);
     });
   });

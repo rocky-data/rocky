@@ -113,7 +113,7 @@ function ScorecardBody({ scorecard, now }: { scorecard: AuditScorecardOutput; no
       >
         <Rows
           ariaLabel="Agent activity groups"
-          columns={["group", "total", "allowed", "needed approval", "blocked", "allowed rate", "approval rate", "blocked rate"]}
+          columns={["group", "total", "allowed", "needed approval", "blocked", "allowed rate", "needed-approval rate", "blocked rate"]}
           rows={scorecard.groups.map((group) => [
             group.key,
             group.total,

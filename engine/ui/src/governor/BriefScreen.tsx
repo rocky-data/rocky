@@ -4,7 +4,7 @@ import { apiGet } from "../api";
 import { ArrowPathIcon, ArrowRightIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
 import { Clip, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, runStatusTone } from "../components";
 import { useResource } from "../estate/useResource";
-import { NOT_RECORDED, effectLabel, formatDuration, formatInstant, orNotRecorded } from "../format";
+import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded, verdictLabel } from "../format";
 import { reviewPath } from "../review/paths";
 import { navigateTo } from "../router";
 import { defaultJobClient, type JobClient } from "../operator";
@@ -174,7 +174,7 @@ function BriefBody({
               // unfreeze or verification row is listed with its kind so its
               // recorded effect never reads as a policy verdict.
               entry.kind,
-              entry.kind === "evaluation" ? effectLabel(entry.effect) : entry.effect,
+              verdictLabel(entry),
               entry.rule_id === null || entry.rule_id === undefined ? "default" : `rule ${entry.rule_id}`,
               entry.decision_ref,
               entry.reason,

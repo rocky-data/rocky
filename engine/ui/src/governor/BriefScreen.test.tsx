@@ -159,6 +159,12 @@ describe("BriefScreen", () => {
     // evaluations only.
     const freeze = within(activity).getByText("decision:act-3").closest("tr") as HTMLElement;
     expect(within(freeze).getByText("freeze")).toBeInTheDocument();
+    // Its recorded `deny` is the operator's act, not a policy verdict: it
+    // shows raw beside its kind, never as "Blocked". An evaluation shows the word.
+    expect(within(freeze).getByText("freeze [effect deny]")).toBeInTheDocument();
+    expect(within(freeze).queryByText("Blocked")).toBeNull();
+    const evaluation = within(activity).getByText("decision:act-2").closest("tr") as HTMLElement;
+    expect(within(evaluation).getByText("Needs approval")).toBeInTheDocument();
     expect(within(activity).getByText(/2 policy evaluations: 1 allowed/)).toBeInTheDocument();
 
     // A run that needs attention is acted on from the waiting card; the Runs
@@ -512,7 +518,7 @@ describe("Change freeze and lift on the brief", () => {
     renderBrief(OPERATOR, busy);
     fireEvent.click(await screen.findByRole("button", { name: "Lift change freeze: agent on model=fct_*" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm lift" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve, freeze, unfreeze, preview or product approval is already in progress");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve, change freeze, lift of a change freeze, branch creation or product approval is already in progress");
 
     const failed = job("freeze", "failed", {
       error: [

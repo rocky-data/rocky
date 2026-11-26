@@ -521,7 +521,7 @@ export function JobLine({ label, view, cancel }: { label: string; view: JobView;
       if (error instanceof ApiError && error.envelope.code === "mutation_in_progress") {
         return (
           <p role="alert" className="text-xs text-amber-800 dark:text-amber-300">
-            {label}: not started. Another run, apply, approve, freeze, unfreeze, preview or product approval is already in progress on this
+            {label}: not started. Another run, apply, approve, change freeze, lift of a change freeze, branch creation or product approval is already in progress on this
             project. Wait for it to finish, then try again.
           </p>
         );

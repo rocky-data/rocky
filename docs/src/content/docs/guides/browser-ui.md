@@ -84,7 +84,7 @@ The Changes screen lists the changes that policy marked **Needs approval**, by a
 
 Open a change to see why it waits:
 
-![One change in the Changes screen: an agent's run change that needs approval, a breaking finding that the email column of dim_customer is dropped, the default policy effect that asked for approval, a sample-rows button, and an Approval panel with the Proposed, Approve and Apply to production steps, an Approve change button and the rocky review --approve command to copy](/ui-review.png)
+![One change in the Changes screen: an agent's run change that needs approval, a breaking finding that the email column of dim_customer is dropped, the default policy effect that asked for approval, a sample-rows button, and an Approval panel with the Proposed, Approve and Apply steps, an Approve change button and the rocky review --approve command to copy](/ui-review.png)
 
 The change screen shows:
 
@@ -92,7 +92,7 @@ The change screen shows:
 - **Why it needs approval.** The rule, the action, the actor and the impact behind the `require_review` decision.
 - **The spec this change was made against.** For a data product change only: whether the product spec changed after the change was made.
 - **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. It appears only when the change names exactly one model to sample.
-- **Approval.** A panel with three steps (Proposed, Approve, Apply to production), the **Approve change** and **Apply to production** buttons, and the command to copy.
+- **Approval.** A panel with three steps (Proposed, Approve, Apply), the **Approve change** and **Apply change** buttons, and the command to copy.
 
 Sample rows are masked before they leave the engine. The workspace `[mask]` block decides first: a strategy masks the column, and `none` returns it raw. `[classifications.allow_unmasked]` is only the fallback for a tag that block does not answer. The engine refuses the whole sample when a classified column has no `[mask]` entry and is not in the list, or is answered only under `[mask.<env>]`. The refusal names every column and tag, and both ways out.
 
@@ -110,7 +110,7 @@ A change bound to a data product shows a **Spec digest you approved** box instea
 rocky apply <plan-id> --expect-spec-digest <the spec digest you approved>
 ```
 
-The change status records approval, not apply. The Apply to production step shows as done only after an apply from this page succeeds. Otherwise, once the change is approved, it shows as not known. The run itself is on Project.
+The change status records approval, not apply. The Apply step shows as done only after an apply from this page succeeds. Otherwise, once the change is approved, it shows as not known. The run itself is on Project.
 
 Apply runs the models as they are on disk, so it checks the change's models first. If a model was added, removed or edited after the change was made, apply refuses with `plan_models_changed`: plan again, review, and apply that. A plan made before the check refuses with `plan_snapshot_missing`. The check compares models only, so a config edit after approval does not refuse it. See [What apply checks for staleness](/reference/commands/core-pipeline/#what-apply-checks-for-staleness).
 
@@ -146,7 +146,7 @@ Oversight answers "what did the agents do, and was it allowed?" It has three tab
 
 ## Areas without a screen
 
-Six of the eleven areas open nothing today. The sidebar folds them under **Not in the UI yet**. Open the fold to see each name with its reason as plain text. The reasons stay hidden until you open it.
+Six of the eleven areas open nothing today. The sidebar folds them under **No page yet**. Open the fold to see each name with its reason as plain text. The reasons stay hidden until you open it.
 
 | Area | What the sidebar says |
 |---|---|

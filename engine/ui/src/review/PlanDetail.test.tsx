@@ -131,7 +131,7 @@ describe("PlanDetail", () => {
     const view = render(
       <PlanDetail planId={PLAN} loaders={loaders({ diff: vi.fn(() => pending) })} />,
     );
-    await screen.findByText("needs approval");
+    await screen.findByText("not approved yet");
     expect(screen.queryByText(`rocky review ${PLAN} --approve`)).toBeNull();
 
     resolveDiff(DIFF);
@@ -529,7 +529,7 @@ describe("PlanDetail", () => {
         queue: vi.fn(async () => queue),
       });
       const view = render(<PlanDetail planId={PLAN} loaders={shared} />);
-      await screen.findByText("needs approval");
+      await screen.findByText("not approved yet");
       expect(screen.getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
       // Consent for A's model, given by a click.
       fireEvent.click(screen.getByRole("button", { name: /Show \d+ rows/ }));
@@ -542,7 +542,7 @@ describe("PlanDetail", () => {
       expect(document.querySelector(`[title="${PLAN_B}"]`)).toBeTruthy();
       expect(document.querySelector(`[title="${PLAN}"]`)).toBeNull();
       expect(screen.queryByText(`rocky review ${PLAN} --approve`)).toBeNull();
-      expect(screen.queryByText("needs approval")).toBeNull();
+      expect(screen.queryByText("not approved yet")).toBeNull();
       expect(screen.getByText("reading the change…")).toBeTruthy();
 
       releaseB({ ...STATUS, plan_id: PLAN_B });
@@ -563,7 +563,7 @@ describe("PlanDetail", () => {
     render(<PlanDetail planId={PLAN} loaders={loaders()} />);
 
     await screen.findByText(STATUS.kind);
-    expect(screen.getByText("needs approval")).toBeTruthy();
+    expect(screen.getByText("not approved yet")).toBeTruthy();
     await waitFor(() =>
       expect(screen.getByText(/orders.total changes type, INT64 to INT32/)).toBeTruthy(),
     );
@@ -762,7 +762,7 @@ describe("PlanDetail", () => {
     }
   });
 
-  it("offers Apply to production for a promote change when the project requires a branch approval", async () => {
+  it("offers Apply change for a promote change when the project requires a branch approval", async () => {
     render(
       <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
         <PlanDetail
@@ -772,7 +772,7 @@ describe("PlanDetail", () => {
       </WriteAccessProvider>,
     );
     await screen.findByRole("region", { name: "Approval" });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Apply to production" })).not.toBeDisabled(), { timeout: 3000 });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Apply change" })).not.toBeDisabled(), { timeout: 3000 });
   });
 
   it("does not read the project for a plan that is not a promote plan", async () => {
@@ -786,7 +786,7 @@ describe("PlanDetail", () => {
     expect(project).not.toHaveBeenCalled();
   });
 
-  it("keeps Apply to production for a change that is not an archive change", async () => {
+  it("keeps Apply change for a change that is not an archive change", async () => {
     render(
       <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
         <PlanDetail
@@ -796,7 +796,7 @@ describe("PlanDetail", () => {
       </WriteAccessProvider>,
     );
     await screen.findByRole("region", { name: "Approval" });
-    expect(screen.getByRole("button", { name: "Apply to production" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Apply change" })).not.toBeDisabled();
     expect(screen.queryByText(`rocky apply ${PLAN}`)).toBeNull();
   });
 
@@ -814,10 +814,10 @@ describe("PlanDetail", () => {
       .map((b) => b.textContent ?? "");
     expect(enabled).toEqual(["Show 20 rows"]);
     expect(screen.getByRole("button", { name: "Approve change" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Apply to production" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Apply change" })).toBeDisabled();
     // One place for the read-only reason (the shell banner); here it is
     // each button's tooltip, never a line under every button.
-    expect(screen.getByRole("button", { name: "Apply to production" })).toHaveAttribute("title", READ_ONLY_REASON);
+    expect(screen.getByRole("button", { name: "Apply change" })).toHaveAttribute("title", READ_ONLY_REASON);
     expect(screen.queryAllByText(READ_ONLY_REASON)).toEqual([]);
     expect(container.querySelector("form")).toBeNull();
   });
