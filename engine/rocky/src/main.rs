@@ -2131,6 +2131,12 @@ enum Command {
         /// and no inline default is a compile error.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+        /// Refuse each fixture `[[test]]` whose model's target warehouse is
+        /// not DuckDB alone (another warehouse, several, or none resolved),
+        /// instead of running it on DuckDB. A refused test fails the run.
+        /// Without it, such a test runs on DuckDB and its result says so.
+        #[arg(long, conflicts_with = "declarative")]
+        strict_dialect: bool,
     },
 
     /// Run CI pipeline: compile + test without warehouse credentials
@@ -5720,6 +5726,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             declarative,
             pipeline,
             var,
+            strict_dialect,
         } => {
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -5754,6 +5761,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     json,
                     &run_vars,
                     selection.as_ref().map(|s| (s, &state_ctx)),
+                    strict_dialect,
                 )
             }
         }
