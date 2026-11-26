@@ -490,6 +490,42 @@ GET /api/v1/schedule/spool          # or: rocky state schedule spool
 
 It lists what the ingress accepted and no tick consumed, with the `token` to match against your provider's delivery log. A present but unreadable spool is reported as an error, not an empty queue.
 
+### Which pipelines are safe to run twice
+
+`rocky validate` gives each scheduled pipeline a rerun-safety class. The scheduler will use the class before it retries, re-runs or fails over a run. A pipeline is `rerun_safe` when a second run leaves the warehouse exactly as one run would. That holds for a second run after the first, and for one that overlaps it. Otherwise the class is `not_rerun_safe`, and the message says why.
+
+```
+  ok  pipeline.silver: rerun_safe
+  ok  pipeline.raw: not_rerun_safe (a replication pipeline writes its target tables ...)
+```
+
+The message has code `V069` and severity `ok`, so it never fails validation. A pipeline with no `[schedule]` block gets no class.
+
+The rule is short. A pipeline is `rerun_safe` only when it writes nothing to the warehouse. Every pipeline that writes is `not_rerun_safe`, on every adapter. Review found a second-run failure in each write path that looked safe, so Rocky proves none of them yet. A later change may prove more strategies safe. Until then the scheduler treats every writing pipeline as not rerun-safe.
+
+| Pipeline or model | Class |
+|---|---|
+| `transformation` pipeline, every model `ephemeral` | `rerun_safe`. An `ephemeral` model is inlined into its consumers and never built. |
+| `quality` pipeline with no `[checks.quarantine]` and no `[[checks.custom]]` check | `rerun_safe`. It only reads the warehouse. |
+| `quality` pipeline with `[checks.quarantine]` on | `not_rerun_safe`. Quarantine writes tables. |
+| `quality` pipeline with a `[[checks.custom]]` check | `not_rerun_safe`. Rocky sends the check SQL as written, so it cannot prove the SQL only reads. |
+| `full_refresh` | `not_rerun_safe`. A model that reads another model of the same pipeline can mix two runs' inputs when runs overlap. Lineage cannot prove a model has no such read. |
+| `merge` | `not_rerun_safe`. A row with a NULL key matches no target row, so every run inserts it again. |
+| `incremental` | `not_rerun_safe`. A `lookback`, or a filter on another column, appends rows again. |
+| `time_interval`, `microbatch` | `not_rerun_safe`. A row outside the window, or a filter on another column, is inserted again. Rocky runs a `microbatch` model as `time_interval`. |
+| `delete_insert` | `not_rerun_safe`. It deletes and inserts in separate statements. |
+| `snapshot` | `not_rerun_safe`. It closes old versions and inserts new ones in separate statements. |
+| `view`, `materialized_view`, `dynamic_table` | `not_rerun_safe`. Each replaces a shared object. An overlapping run can read a half-built input. |
+| `content_addressed` | `not_rerun_safe`. The run commits, then syncs the table with `MSCK REPAIR TABLE`. |
+| `replication` pipeline, any strategy | `not_rerun_safe`. It writes the target tables on every run. On Databricks it also sets `TBLPROPERTIES run_id` after the copy. A `[[checks.custom]]` check adds its own reason. |
+| `snapshot` pipeline, `load` pipeline | `not_rerun_safe`. |
+
+A transformation pipeline can stop being `rerun_safe` even when every model is `ephemeral`. A run still writes in two cases. It creates each project function (`functions/`) that a model calls, with `CREATE OR REPLACE FUNCTION`. Rocky finds the calls after it fills in each `@var()` with its inline default. This matches a run with no `--var`, which is what the scheduler starts. A model with an `@var()` that has no default is `not_rerun_safe`. It also applies `[governance.tags]` to every model's target. A pipeline with either is `not_rerun_safe`.
+
+A `[hook.*]` shell command can write anything, and Rocky does not read it. A webhook can too: a `preset = "generic"` webhook can POST to a warehouse SQL API. So when the project has any shell hook or webhook, every pipeline is `not_rerun_safe`.
+
+The class judges the statements of a normal run. Other adapter types get the same class, and the message adds that Rocky has not verified the adapter.
+
 ### One scheduler instance per project
 
 Run exactly one reconciler per state file: one `rocky tick` timer or one `rocky serve --scheduler`. The `.rocky/tick.lock` flock and the state store's writer lock are local to one machine. Scheduler state (cursor and claim tables) is local-only: a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it. Two hosts on one project keep independent cursors and both fire the same occurrence. On S3, GCS and tiered, the state upload uses compare-and-swap by default ([`concurrency_control`](/reference/configuration/#concurrent-writers)), so a writer that loses a race fails. On Valkey the upload is last-writer-wins. Either way, no remote backend fences scheduling across machines.

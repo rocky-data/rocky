@@ -2112,7 +2112,7 @@ export interface TransformationPipelineConfig {
    */
   allow_empty_models?: boolean;
   /**
-   * Data quality checks run after model execution.
+   * Data quality checks. A transformation run does not execute them, and `rocky validate` warns (V034) about each one that is set.
    */
   checks?: ChecksConfig;
   /**
