@@ -823,6 +823,8 @@ pub(crate) struct CancellableWarehouseAdapter {
     pub(crate) in_flight: rocky_core::statement_cancel::InFlightStatements,
     answer: CancelAnswer,
     pub(crate) cancelled: Mutex<Vec<rocky_core::statement_cancel::StatementHandle>>,
+    /// When set, `execute_query` lists a `query` statement and never answers.
+    hang_queries: bool,
 }
 
 impl CancellableWarehouseAdapter {
@@ -835,6 +837,16 @@ impl CancellableWarehouseAdapter {
             in_flight: rocky_core::statement_cancel::InFlightStatements::new(),
             answer,
             cancelled: Mutex::new(Vec::new()),
+            hang_queries: false,
+        }
+    }
+
+    /// Like [`Self::new`], but `execute_query` lists a `query` statement
+    /// and waits forever, as a long query does.
+    pub(crate) fn with_hanging_queries(answer: CancelAnswer) -> Self {
+        Self {
+            hang_queries: true,
+            ..Self::new(answer)
         }
     }
 }
@@ -848,6 +860,12 @@ impl WarehouseAdapter for CancellableWarehouseAdapter {
         self.inner.execute_statement(sql).await
     }
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+        if self.hang_queries {
+            let _guard = self
+                .in_flight
+                .register(rocky_core::statement_cancel::StatementHandle::new("query"));
+            return std::future::pending().await;
+        }
         self.inner.execute_query(sql).await
     }
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {

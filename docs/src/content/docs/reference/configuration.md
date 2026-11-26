@@ -206,7 +206,7 @@ The adapter makes no network call and does not check that the tables exist. `roc
 
 ### `[adapter.NAME.retry]`
 
-Decide how hard this adapter tries again after a transient error: an HTTP 429 or 503, a rate limit, a timeout. Rocky backs off exponentially between attempts, with jitter by default.
+Decide how hard this adapter tries again after a transient error: an HTTP 429 or 503, a rate limit, a transport timeout. Rocky backs off exponentially between attempts, with jitter by default. A Databricks or Snowflake statement that passed its client deadline is never sent again: it may still run.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -474,7 +474,7 @@ Tune how many tables this pipeline processes at once, and when it gives up. The 
 | `concurrency` | string \| integer | `"adaptive"` | Max tables processed in parallel. `"adaptive"` (default) uses an AIMD throttle starting at 32 and adjusting to rate-limit signals — best for remote warehouses. A fixed integer (e.g. `8`) pins concurrency; `1` is serial. |
 | `fail_fast` | bool | `false` | Abort all remaining tables on first error. |
 | `error_rate_abort_pct` | integer | `50` | Abort if error rate exceeds this percentage (0–100). Set to 0 to disable. |
-| `table_retries` | integer | `1` | Times to retry failed tables after the initial parallel phase. Set to 0 to disable. |
+| `table_retries` | integer | `1` | Times to retry failed tables after the initial parallel phase. Set to 0 to disable. A table whose Databricks or Snowflake statement may still run (it passed its client deadline, or Rocky stopped waiting on it) is not retried. |
 
 ---
 
