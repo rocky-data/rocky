@@ -202,6 +202,11 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
             for msg in schedule_messages(name, pc, &cfg) {
                 out.push(msg);
             }
+
+            // V069: whether the scheduler may run this pipeline a second time.
+            if let Some(msg) = rerun_safety_message(name, pc, &cfg, config_path) {
+                out.push(msg);
+            }
         }
 
         // Validate pipeline dependency graph (depends_on)
@@ -1293,6 +1298,123 @@ fn inert_config_messages(
     }
 
     msgs
+}
+
+/// **V069** — the rerun-safety class of a scheduled pipeline: `rerun_safe`, or
+/// `not_rerun_safe` with the reason. Informational (`ok`): it never fails
+/// validation. Pipelines without a `[schedule]` block get no message.
+fn rerun_safety_message(
+    name: &str,
+    pc: &rocky_core::config::PipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+) -> Option<ValidateMessage> {
+    use rocky_core::rerun_safety::{RerunSafety, TargetWarehouse, classify_pipeline};
+
+    pc.schedule()?;
+    let target = TargetWarehouse::from_adapter(cfg.adapters.get(pc.target_adapter()));
+    let writes = resolve_rerun_writes(pc, cfg, config_path);
+    let class = classify_pipeline(pc, &target, &writes);
+    let message = match &class {
+        RerunSafety::Safe => format!("pipeline.{name}: {}", class.class_name()),
+        RerunSafety::NotSafe { reason } => {
+            format!("pipeline.{name}: {} ({reason})", class.class_name())
+        }
+    };
+    Some(ValidateMessage {
+        severity: "ok".into(),
+        code: "V069".into(),
+        message,
+        file: None,
+        field: Some(format!("pipeline.{name}.schedule")),
+    })
+}
+
+/// What a pipeline writes, for [`rerun_safety_message`]. Replication strategies
+/// go through the same builder `rocky run` uses; transformation models are
+/// loaded from this pipeline's own `models` glob.
+fn resolve_rerun_writes(
+    pc: &rocky_core::config::PipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+) -> rocky_core::rerun_safety::ResolvedWrites {
+    use rocky_core::config::{
+        PipelineConfig, RECOGNIZED_REPLICATION_STRATEGIES, ResolvedTableOverride,
+    };
+    use rocky_core::rerun_safety::ResolvedWrites;
+
+    match pc {
+        PipelineConfig::Replication(pipeline) => {
+            let mut overrides = vec![ResolvedTableOverride::default()];
+            for rule in &pipeline.table_overrides {
+                if rule.strategy.is_none() || rule.enabled == Some(false) {
+                    continue;
+                }
+                overrides.push(ResolvedTableOverride {
+                    strategy: rule.strategy.clone(),
+                    merge_keys: rule.merge_keys.clone(),
+                    merge_keys_fallback: rule.merge_keys_fallback.clone(),
+                    timestamp_column: rule.timestamp_column.clone(),
+                    enabled: None,
+                });
+            }
+            let strategies = overrides
+                .iter()
+                .map(|resolved| {
+                    let strategy = resolved
+                        .strategy
+                        .as_deref()
+                        .unwrap_or(pipeline.strategy.as_str());
+                    if !RECOGNIZED_REPLICATION_STRATEGIES.contains(&strategy) {
+                        return Err(format!(
+                            "strategy \"{}\" is not recognized",
+                            rocky_core::secret_registry::render_placeholders(strategy)
+                        ));
+                    }
+                    super::run::build_replication_strategy_with_override(pipeline, resolved)
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .collect();
+            ResolvedWrites::Strategies(strategies)
+        }
+        PipelineConfig::Transformation(pipeline) => {
+            let dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path) {
+                Ok(crate::models_loader::ModelsDir::Present(dir)) => dir,
+                Ok(crate::models_loader::ModelsDir::Absent(_)) => {
+                    return ResolvedWrites::Unresolved {
+                        reason: "the models directory is missing".to_string(),
+                    };
+                }
+                Err(e) => {
+                    return ResolvedWrites::Unresolved {
+                        reason: format!("the models directory cannot be read: {e:#}"),
+                    };
+                }
+            };
+            let glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
+            match crate::models_loader::load_project_models_matching(
+                &dir,
+                &glob,
+                Some(&cfg.freshness),
+            ) {
+                Ok(models) => ResolvedWrites::Models(
+                    models
+                        .iter()
+                        .map(|model| {
+                            let ir = model.to_model_ir();
+                            (ir.name.to_string(), ir.materialization)
+                        })
+                        .collect(),
+                ),
+                Err(e) => ResolvedWrites::Unresolved {
+                    reason: format!("the models cannot be loaded: {e:#}"),
+                },
+            }
+        }
+        PipelineConfig::Quality(_) | PipelineConfig::Snapshot(_) | PipelineConfig::Load(_) => {
+            ResolvedWrites::NotNeeded
+        }
+    }
 }
 
 /// Validation for a pipeline's optional `[schedule]` block (native demand
@@ -6167,5 +6289,91 @@ auto_create_catalogs = false
             "{:?}",
             out.messages
         );
+    }
+
+    /// A transformation project on `adapter_type` with one scheduled pipeline
+    /// whose single model uses `strategy` (a sidecar `[strategy]` body, or
+    /// empty for the full-refresh default).
+    fn scheduled_transformation(adapter_type: &str, strategy: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rocky.toml"),
+            format!(
+                "[adapter]\ntype = \"{adapter_type}\"\npath = \"wh.duckdb\"\n\n\
+                 [pipeline.silver]\ntype = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\n\
+                 [pipeline.silver.schedule]\ncron = \"0 * * * *\"\n"
+            ),
+        )
+        .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            format!(
+                "name = \"orders\"\n[target]\ncatalog = \"c\"\nschema = \"s\"\n\
+                 table = \"orders\"\n{strategy}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id, now() AS ts").unwrap();
+        dir
+    }
+
+    fn v069(out: &ValidateOutput) -> Vec<&ValidateMessage> {
+        out.messages.iter().filter(|m| m.code == "V069").collect()
+    }
+
+    #[test]
+    fn a_scheduled_pipeline_reports_its_rerun_safety_class() {
+        let dir = scheduled_transformation("duckdb", "");
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert_eq!(hits[0].severity, "ok");
+        assert_eq!(hits[0].message, "pipeline.silver: rerun_safe");
+        assert_eq!(hits[0].field.as_deref(), Some("pipeline.silver.schedule"));
+    }
+
+    #[test]
+    fn a_delete_insert_model_on_databricks_is_not_rerun_safe() {
+        let dir = scheduled_transformation(
+            "databricks",
+            "[strategy]\ntype = \"delete_insert\"\npartition_by = [\"id\"]\n",
+        );
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert!(
+            hits[0]
+                .message
+                .starts_with("pipeline.silver: not_rerun_safe (model 'orders': delete_insert"),
+            "{}",
+            hits[0].message
+        );
+    }
+
+    #[test]
+    fn a_scheduled_replication_incremental_pipeline_is_not_rerun_safe() {
+        let out = validate_toml(&trigger_toml(
+            "",
+            "",
+            "[pipeline.raw.schedule]\ncron = \"0 * * * *\"",
+        ));
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        assert!(
+            hits[0]
+                .message
+                .starts_with("pipeline.raw: not_rerun_safe (replication incremental"),
+            "{}",
+            hits[0].message
+        );
+    }
+
+    #[test]
+    fn an_unscheduled_pipeline_gets_no_rerun_safety_message() {
+        let out = validate_toml(&trigger_toml("", "", ""));
+        assert!(v069(&out).is_empty(), "{:?}", out.messages);
     }
 }

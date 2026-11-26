@@ -562,6 +562,32 @@ GET /api/v1/schedule/spool          # or: rocky state schedule spool
 
 It lists what the ingress accepted and no tick has consumed, with the `token` you can match against your provider's delivery log. Read it when a delivery succeeded on your provider's side and the pipeline never ran. A spool that is present but unreadable is reported as an error rather than an empty queue — "nothing is waiting" and "we cannot tell" are different answers.
 
+### Which pipelines are safe to run twice
+
+`rocky validate` gives each scheduled pipeline a rerun-safety class. The scheduler will use the class before it retries, re-runs or fails over a run. A pipeline is `rerun_safe` when a second run cannot corrupt the target, even while the first run is still writing. Otherwise it is `not_rerun_safe`, and the message says why.
+
+```
+  ok pipeline.silver: rerun_safe
+  ok pipeline.raw: not_rerun_safe (replication incremental reads its watermark from the Rocky state store, ...)
+```
+
+The message has code `V069` and severity `ok`, so it never fails validation. A pipeline with no `[schedule]` block gets no class.
+
+The class depends on four things: the pipeline type, each materialization strategy, the target warehouse, and whether an upsert has a `unique_key`. A pipeline is `rerun_safe` only when every model or table it writes is. When Rocky cannot prove a case, the class is `not_rerun_safe`.
+
+| Writes | Class |
+|---|---|
+| `full_refresh`, `view`, `ephemeral`, `content_addressed` | `rerun_safe` on DuckDB, Databricks, Snowflake and BigQuery |
+| `materialized_view`, `dynamic_table` | `rerun_safe` where the warehouse supports them |
+| `merge`, and `incremental` with a `unique_key` | `rerun_safe` on Databricks and on a DuckDB file |
+| `time_interval` | `rerun_safe` on Databricks and on a DuckDB file |
+| `delete_insert` | `rerun_safe` on a DuckDB file only |
+| `incremental` with no `unique_key` (transformation) | `rerun_safe` on a DuckDB file only |
+| `incremental` (replication), `snapshot`, `load` | never |
+| a `quality` pipeline | `rerun_safe`, unless `[checks.quarantine]` is enabled |
+
+"A DuckDB file" means a local file or memory, with no `[[adapter.NAME.attach]]` and no MotherDuck path. Only one process can open such a file to write, so two runs cannot overlap. Every other adapter type is `not_rerun_safe` for now.
+
 ### One scheduler instance per project
 
 Run exactly one reconciler per project, meaning per state file. One `rocky tick` timer, or one `rocky serve --scheduler`. Not both, and not several.

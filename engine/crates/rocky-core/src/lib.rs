@@ -64,6 +64,7 @@ pub mod quarantine;
 pub mod recipe_identity;
 pub mod redacted;
 pub mod replace;
+pub mod rerun_safety;
 pub mod retention;
 pub mod retry;
 pub mod retry_budget;
