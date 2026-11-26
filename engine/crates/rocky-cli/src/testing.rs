@@ -870,18 +870,8 @@ impl WarehouseAdapter for CancellableWarehouseAdapter {
     }
 }
 
-/// Serialises the tests that raise a real signal at the test process. Under
-/// `cargo test` every test shares one process, so two such tests would see
-/// each other's signal; `cargo nextest` gives each its own process.
-pub(crate) static SIGNAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Raise SIGINT at this process.
-#[cfg(unix)]
-pub(crate) fn raise_sigint() {
-    // SAFETY: `libc::kill` on our own pid with SIGINT is sound. The tests
-    // that call this hold a tokio SIGINT stream, so the default action
-    // (ending the process) is replaced.
-    unsafe {
-        libc::kill(std::process::id() as libc::pid_t, libc::SIGINT);
-    }
-}
+/// Serialises the tests that run a forced exit, or hold a statement the
+/// process-wide tracker lists. A forced exit cancels every tracked adapter's
+/// statements, so under `cargo test` (one process) two such tests would
+/// cancel each other's; `cargo nextest` gives each its own process.
+pub(crate) static FORCED_EXIT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

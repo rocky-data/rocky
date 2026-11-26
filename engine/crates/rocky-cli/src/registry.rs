@@ -1575,6 +1575,9 @@ kind = "discovery"
     fn statements_on_either_connector_reach_the_adapter_and_the_forced_exit_list() {
         use rocky_core::statement_cancel::StatementHandle;
 
+        // The statements below are listed process-wide; hold the lock so a
+        // forced-exit test cannot send a cancel for them.
+        let _serial = crate::testing::FORCED_EXIT_TESTS.blocking_lock();
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let dbx = format!("dbx-{suffix}");
         let snow = format!("snow-{suffix}");
@@ -1582,7 +1585,7 @@ kind = "discovery"
             r#"
 [adapter.{dbx}]
 type = "databricks"
-host = "example.cloud.databricks.com"
+host = "example.invalid"
 http_path = "/sql/1.0/warehouses/abc123"
 token = "dapi-test"
 
