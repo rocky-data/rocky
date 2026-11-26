@@ -205,7 +205,9 @@ pub use list::{
 pub use load::run_load;
 pub use lsp::run_lsp;
 pub use metrics::{metrics_output, run_metrics};
-pub use optimize::{optimize_output, optimize_output_with_cache, run_optimize};
+pub use optimize::{
+    OptimizeConfigError, optimize_output, optimize_output_request_scoped, run_optimize,
+};
 pub use package::{
     PackageBuildOptions, run_package_add, run_package_list, run_package_remove, run_package_update,
 };
@@ -234,7 +236,7 @@ pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
 pub use replay::{
-    ReplayLookupError, compute_replay_check, compute_replay_check_with_cache, run_replay,
+    ReplayLookupError, compute_replay_check, compute_replay_check_request_scoped, run_replay,
     run_replay_check, run_replay_execute, run_replay_execute_warehouse,
 };
 pub use restore::run_restore_plan;

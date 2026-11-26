@@ -1515,7 +1515,13 @@ fn route_table() -> Vec<Route> {
                     body: Body::Component("OptimizeOutput"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
-                PRODUCT_READ_FAILED,
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` could not be read (`config_invalid`), \
+                         or the state store could not be opened for reading (malformed, or \
+                         written by a newer engine).",
+                    body: Body::Component("ErrorEnvelope"),
+                },
                 STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
@@ -1551,6 +1557,7 @@ fn route_table() -> Vec<Route> {
                          or the run did not execute `model`.",
                     body: Body::Component("ErrorEnvelope"),
                 },
+                BAD_QUERY,
                 ENGINE_BUSY_OR_NOT_READY,
                 PRODUCT_READ_FAILED,
                 STATE_NEEDS_MIGRATION,

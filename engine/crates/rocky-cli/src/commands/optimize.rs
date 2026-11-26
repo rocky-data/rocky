@@ -28,17 +28,21 @@ pub fn optimize_output(
     optimize_output_from_store(&store, config_path, models_dir, model_filter)
 }
 
-/// [`optimize_output`] with a redb cache budget for the request-local open.
-/// The HTTP route opens, reads once and drops, so it passes a small budget
-/// (see `HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399).
-pub fn optimize_output_with_cache(
+/// The project config did not load. The HTTP route maps it to
+/// `config_invalid`; the CLI prints it like any other error.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct OptimizeConfigError(String);
+
+/// [`optimize_output`] with the request-local cache budget
+/// (`HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399), for the HTTP route.
+pub fn optimize_output_request_scoped(
     state_path: &Path,
     config_path: &Path,
     models_dir: Option<&Path>,
     model_filter: Option<&str>,
-    cache_bytes: usize,
 ) -> Result<OptimizeOutput> {
-    let store = StateStore::open_read_only_or_empty_with_cache(state_path, cache_bytes)?;
+    let store = super::history::open_request_scoped(state_path)?;
     optimize_output_from_store(&store, config_path, models_dir, model_filter)
 }
 
@@ -64,6 +68,7 @@ fn optimize_output_from_store(
     // `rocky.toml` that is there but does not load is a hard error: a wrong
     // price is worse than no price.
     let config = match rocky_core::config::load_optional_project_config(Some(config_path))
+        .map_err(|e| OptimizeConfigError(format!("{e:#}")))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?
     {
         Some(cfg) => CostConfig::from(cfg.cost),
@@ -112,10 +117,14 @@ fn optimize_output_from_store(
     let mut recommendations: Vec<MaterializationCost> = Vec::new();
     let total_runs = runs.len();
 
+    // One walk of the run table for every model, not one per model.
+    let name_refs: Vec<&str> = model_names.iter().map(String::as_str).collect();
+    let mut histories = store.get_models_history_matching(&name_refs, 100, |run| {
+        run.counts_as_production(UnrecordedScope::Count)
+    })?;
+
     for model_name in &model_names {
-        let history = store.get_model_history_matching(model_name, 100, |run| {
-            run.counts_as_production(UnrecordedScope::Count)
-        })?;
+        let history = histories.remove(model_name).unwrap_or_default();
         if history.is_empty() {
             continue;
         }

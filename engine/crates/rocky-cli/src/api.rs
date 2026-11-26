@@ -2434,11 +2434,6 @@ fn is_bare_product_name(name: &str) -> bool {
     crate::commands::audit::is_bare_product_name(name)
 }
 
-/// redb cache budget for the request-local opens of the read routes below:
-/// open, read once, drop. The default ~1 GiB cache only turns a scan into
-/// retained memory (#1399); 1 MiB is the budget `GET /api/v1/runs` measured.
-const READ_ROUTE_CACHE_BYTES: usize = 1 << 20;
-
 /// Query string of `GET /api/v1/compliance`.
 #[derive(Debug, Deserialize)]
 struct ComplianceQuery {
@@ -2491,16 +2486,20 @@ async fn optimize(
     let state_path = state_path_for(&state);
     let models_dir = state.models_dir.clone();
     let output = store_read(&state, move || {
-        crate::commands::optimize_output_with_cache(
+        crate::commands::optimize_output_request_scoped(
             &state_path,
             &config_path,
             Some(&models_dir),
             None,
-            READ_ROUTE_CACHE_BYTES,
         )
     })
     .await?
-    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    .map_err(
+        |e| match e.downcast_ref::<crate::commands::OptimizeConfigError>() {
+            Some(config) => ApiError::config_invalid(&config.to_string()),
+            None => map_state_err(e, state.mutation_permit.running_job()),
+        },
+    )?;
     Ok(PrettyJson(output))
 }
 
@@ -2523,11 +2522,10 @@ async fn replay_check(
 ) -> Result<PrettyJson<ReplayCheckOutput>, ApiError> {
     let state_path = state_path_for(&state);
     let output = store_read(&state, move || {
-        crate::commands::compute_replay_check_with_cache(
+        crate::commands::compute_replay_check_request_scoped(
             &state_path,
             &id,
             query.model.as_deref(),
-            READ_ROUTE_CACHE_BYTES,
         )
     })
     .await?
@@ -6741,6 +6739,54 @@ mod tests {
             assert_eq!(err.code, "engine_busy", "{path}");
         }
         drop(held);
+    }
+
+    /// A state path that does not exist is `200` on every store-backed read
+    /// route, and the request creates no file.
+    #[tokio::test]
+    async fn ui_store_read_routes_do_not_create_an_absent_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _state_path) = read_routes_fixture(dir.path());
+        let absent = dir.path().join("absent-state.redb");
+        let other = pinned_server(state.models_dir.clone(), state.config_path.clone(), &absent);
+        let base = spawn_router(other).await;
+        for path in [
+            "/api/v1/optimize",
+            "/api/v1/runs/latest/replay-check",
+            "/api/v1/recipes/recipe-abc/history",
+        ] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            // `latest` on an empty store is a 404; the others are 200.
+            let want = if path.contains("replay-check") {
+                404
+            } else {
+                200
+            };
+            assert_eq!(resp.status(), want, "{path}");
+            assert!(!absent.exists(), "{path} created the state file");
+        }
+        let resp = reqwest::get(format!("{base}/api/v1/recipes/recipe-abc/history"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(!absent.exists());
+    }
+
+    /// A `rocky.toml` the engine cannot parse is `500 config_invalid` on
+    /// `/optimize`, as it is on `/compliance`, not `internal_error`.
+    #[tokio::test]
+    async fn optimize_on_unparseable_config_is_config_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _state_path) = read_routes_fixture(dir.path());
+        let config = state.config_path.clone().unwrap();
+        std::fs::write(&config, "this is [not valid toml").unwrap();
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/optimize"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "config_invalid");
     }
 
     // --- /review ---

@@ -382,16 +382,14 @@ pub fn compute_replay_check(
     replay_check_from_store(&store, target, model_filter)
 }
 
-/// [`compute_replay_check`] with a redb cache budget for the request-local
-/// open. The HTTP route opens, reads once and drops, so it passes a small
-/// budget (see `HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399).
-pub fn compute_replay_check_with_cache(
+/// [`compute_replay_check`] with the request-local cache budget
+/// (`HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399), for the HTTP route.
+pub fn compute_replay_check_request_scoped(
     state_path: &Path,
     target: &str,
     model_filter: Option<&str>,
-    cache_bytes: usize,
 ) -> Result<ReplayCheckOutput> {
-    let store = StateStore::open_read_only_or_empty_with_cache(state_path, cache_bytes)
+    let store = super::history::open_request_scoped(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     replay_check_from_store(&store, target, model_filter)
 }

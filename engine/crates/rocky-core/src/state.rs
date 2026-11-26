@@ -1847,8 +1847,9 @@ impl StateStore {
     /// redb gates this counter behind its `cache_metrics` feature, which
     /// this crate enables for test builds only (see `[dev-dependencies]`).
     /// Without it the counter is hard-zero and proves nothing.
-    #[cfg(test)]
-    fn cache_evictions(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn cache_evictions(&self) -> u64 {
         self.db.cache_stats().evictions()
     }
 
@@ -5599,6 +5600,61 @@ impl StateStore {
         })?;
         let mut history: Vec<ModelExecution> = per_run.into_iter().flatten().collect();
         history.truncate(limit);
+        Ok(history)
+    }
+
+    /// [`Self::get_model_history_matching`] for many models in ONE walk of
+    /// the run table.
+    ///
+    /// Returns, for each name in `model_names`, exactly what
+    /// `get_model_history_matching(name, limit, &keep)` returns: the same
+    /// executions in the same order, capped at `limit`. The per-model call
+    /// walks every run row once per model; a caller that asks for every
+    /// model of a project (`optimize`) pays that walk N times. This walks
+    /// once and stops when every requested model has `limit` executions.
+    ///
+    /// Every requested name has an entry, empty when the model never ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] when run history cannot be read.
+    pub fn get_models_history_matching(
+        &self,
+        model_names: &[&str],
+        limit: usize,
+        keep: impl Fn(&RunRecord) -> bool,
+    ) -> Result<std::collections::HashMap<String, Vec<ModelExecution>>, StateError> {
+        let mut history: std::collections::HashMap<String, Vec<ModelExecution>> = model_names
+            .iter()
+            .map(|name| ((*name).to_string(), Vec::new()))
+            .collect();
+        if limit == 0 || history.is_empty() {
+            return Ok(history);
+        }
+        // Models still short of `limit` executions. The scan stops once this
+        // is empty: the closure answers weight 1 for the run that fills the
+        // last model, which meets the scan's limit of 1.
+        let mut open: std::collections::HashSet<String> = history.keys().cloned().collect();
+        self.scan_runs_newest_first(1, usize::MAX, |run| {
+            if !keep(&run) {
+                return None;
+            }
+            for exec in run.models_executed {
+                if !open.contains(&exec.model_name) {
+                    continue;
+                }
+                if let Some(execs) = history.get_mut(&exec.model_name) {
+                    execs.push(exec);
+                }
+            }
+            // A run's executions of a model all count, as in the per-model
+            // call, so a model closes only after its whole run is read.
+            open.retain(|name| history.get(name).is_some_and(|execs| execs.len() < limit));
+            open.is_empty().then_some((1, ()))
+        })?;
+        for execs in history.values_mut() {
+            execs.truncate(limit);
+        }
         Ok(history)
     }
 
@@ -14498,6 +14554,77 @@ mod tests {
             due_at: None,
             wait_for_upstream_ms: None,
         }
+    }
+
+    /// The batch read returns exactly what one `get_model_history_matching`
+    /// call per model returns: same executions, same order, same cap, same run
+    /// filter. The fixture interleaves models across runs, gives one model
+    /// two executions per run (partitions) and one model more than 100
+    /// executions, and rejects some runs through `keep`.
+    #[test]
+    fn batch_model_history_equals_the_per_model_calls() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+        for i in 0..130i64 {
+            let mut execs = Vec::new();
+            let mut exec = |name: &str, tag: i64| {
+                let mut e = model_execution(name);
+                e.duration_ms = (i * 10 + tag) as u64;
+                execs.push(e);
+            };
+            exec("hot", 0);
+            if i % 3 == 0 {
+                exec("warm", 1);
+            }
+            if i % 2 == 0 {
+                // Two partitions of one model in one run.
+                exec("parted", 2);
+                exec("parted", 3);
+            }
+            if i < 5 {
+                exec("cold", 4);
+            }
+            let run_id = if i % 7 == 0 {
+                format!("run-{i:03}-skip")
+            } else {
+                format!("run-{i:03}")
+            };
+            let mut run = minimal_run_record(&run_id, execs);
+            run.started_at = base + chrono::Duration::minutes(i);
+            run.finished_at = run.started_at;
+            store.record_run(&run).unwrap();
+        }
+
+        let keep = |run: &RunRecord| !run.run_id.ends_with("-skip");
+        let names = ["hot", "warm", "parted", "cold", "never", "hot"];
+        for limit in [0usize, 1, 7, 100] {
+            let batch = store
+                .get_models_history_matching(&names, limit, keep)
+                .unwrap();
+            assert_eq!(batch.len(), 5, "one entry per distinct name");
+            for name in names {
+                let single = store.get_model_history_matching(name, limit, keep).unwrap();
+                assert_eq!(
+                    serde_json::to_string(&batch[name]).unwrap(),
+                    serde_json::to_string(&single).unwrap(),
+                    "{name} at limit {limit}"
+                );
+            }
+        }
+        let batch = store
+            .get_models_history_matching(&names, 100, keep)
+            .unwrap();
+        assert_eq!(
+            batch["hot"].len(),
+            100,
+            "a model with more than 100 executions is capped"
+        );
+        assert_eq!(batch["parted"].len(), 100);
+        assert!(batch["never"].is_empty());
+        assert!(
+            batch["cold"].len() < 5,
+            "the rejected run's execution is left out"
+        );
     }
 
     /// #1332: a model absent from the recent window still has history.
