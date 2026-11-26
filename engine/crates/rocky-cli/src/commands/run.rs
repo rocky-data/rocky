@@ -7662,6 +7662,10 @@ pub(crate) async fn run_with_direct_gate(
     }
     if interrupted {
         output.interrupted = true;
+        // No statement to cancel here: the final drain leaves its loop only
+        // when the set is empty, or after `abort_fan_out` already cancelled
+        // and aborted what it held. Pinned by
+        // `the_one_fan_out_shutdown_in_run_rs_follows_a_drain_or_a_sweep`.
         join_set.shutdown().await;
 
         // Terminal SIGINT flush: the fan-out has drained and this returns
