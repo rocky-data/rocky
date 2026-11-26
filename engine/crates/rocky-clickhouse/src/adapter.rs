@@ -78,6 +78,20 @@ impl WarehouseAdapter for ClickHouseWarehouseAdapter {
         Ok(CaseSignificance::Significant)
     }
 
+    /// This adapter cannot cancel a statement. Its statements run on after a
+    /// forced exit.
+    fn in_flight_statements(&self) -> Vec<rocky_core::statement_cancel::StatementHandle> {
+        Vec::new()
+    }
+
+    /// See [`Self::in_flight_statements`].
+    async fn cancel_statement(
+        &self,
+        _handle: &rocky_core::statement_cancel::StatementHandle,
+    ) -> AdapterResult<rocky_core::statement_cancel::CancelOutcome> {
+        Ok(rocky_core::statement_cancel::CancelOutcome::Unsupported)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.client.execute(sql).await.map(|_| ()).map_err(wrap)
     }
