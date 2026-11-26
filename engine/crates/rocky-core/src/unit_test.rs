@@ -82,6 +82,45 @@ pub struct UnitTestResult {
     /// Mismatched rows (for diagnostics).
     #[serde(default)]
     pub mismatches: Vec<RowMismatch>,
+    /// Set when the model's target warehouse is not known to be DuckDB.
+    /// Absent for a model whose only target is DuckDB: its test ran on its
+    /// own dialect and needs no notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<UnitTestDialect>,
+}
+
+/// How the dialect a unit test ran on relates to the model's target
+/// warehouse.
+///
+/// `rocky test` runs every unit test on an in-memory DuckDB. SQL that both
+/// DuckDB and the target accept can still behave differently on the target,
+/// so a pass here does not prove the model on its warehouse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnitTestDialect {
+    /// Why the test carries this notice.
+    pub status: UnitTestDialectStatus,
+    /// The model's target warehouses, by dialect name (`Snowflake`) or, for
+    /// an adapter with no dialect table, by adapter type (`clickhouse`).
+    /// Empty when no target is known.
+    pub targets: Vec<String>,
+    /// `true` when the test ran on DuckDB. `false` when it was not run:
+    /// `--strict-dialect` refused it, or the model could not run at all.
+    pub ran_on_duckdb: bool,
+    /// `true` when `--strict-dialect` refused the test instead of running it.
+    pub refused: bool,
+}
+
+/// Why a unit test carries a [`UnitTestDialect`] notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitTestDialectStatus {
+    /// The model has one target warehouse, and it is not DuckDB.
+    NonDuckdbTarget,
+    /// No target warehouse is configured for the model (no `rocky.toml`, or
+    /// no warehouse adapter). Rocky does not assume DuckDB.
+    UnresolvedTarget,
+    /// The model can run on more than one warehouse.
+    MultipleTargets,
 }
 
 /// A single row mismatch between expected and actual output.

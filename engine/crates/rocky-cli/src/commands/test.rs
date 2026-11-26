@@ -49,6 +49,66 @@ fn unit_summary(run: &rocky_engine::test_runner::UnitTestRun) -> Option<UnitTest
     })
 }
 
+/// The short table-mode marker of one unit test's dialect notice.
+fn dialect_marker(dialect: &rocky_core::unit_test::UnitTestDialect) -> String {
+    use rocky_core::unit_test::UnitTestDialectStatus;
+    let target = match dialect.status {
+        UnitTestDialectStatus::NonDuckdbTarget | UnitTestDialectStatus::MultipleTargets => {
+            format!("target {}", dialect.targets.join(", "))
+        }
+        UnitTestDialectStatus::UnresolvedTarget => "target unresolved".to_string(),
+    };
+    if dialect.refused {
+        format!("refused, {target}")
+    } else if dialect.ran_on_duckdb {
+        format!("ran on DuckDB, {target}")
+    } else {
+        format!("not run, {target}")
+    }
+}
+
+/// The one table-mode warning line for unit tests whose model is not
+/// DuckDB-only, or `None` when every unit test targets DuckDB.
+fn dialect_warning(results: &[rocky_core::unit_test::UnitTestResult]) -> Option<String> {
+    let marked: Vec<&rocky_core::unit_test::UnitTestDialect> =
+        results.iter().filter_map(|r| r.dialect.as_ref()).collect();
+    if marked.is_empty() {
+        return None;
+    }
+    let mut targets: Vec<&str> = marked
+        .iter()
+        .flat_map(|d| d.targets.iter().map(String::as_str))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let unresolved = marked
+        .iter()
+        .any(|d| d.status == rocky_core::unit_test::UnitTestDialectStatus::UnresolvedTarget);
+    let mut named = targets.join(", ");
+    if unresolved {
+        if !named.is_empty() {
+            named.push_str(", ");
+        }
+        named.push_str("unresolved");
+    }
+    let ran = marked.iter().filter(|d| d.ran_on_duckdb).count();
+    let refused = marked.iter().filter(|d| d.refused).count();
+    if ran > 0 {
+        return Some(format!(
+            "warning: {ran} unit test(s) ran on DuckDB, not on their target warehouse \
+             (target: {named}); SQL both accept can behave differently there. \
+             --strict-dialect refuses them"
+        ));
+    }
+    if refused > 0 {
+        return Some(format!(
+            "warning: --strict-dialect refused {refused} unit test(s) that would run on \
+             DuckDB, not on their target warehouse (target: {named})"
+        ));
+    }
+    None
+}
+
 /// Side-effect-free core of `rocky test` (DuckDB-based local tests): run the
 /// tests and assemble the typed [`TestOutput`] without printing.
 ///
@@ -79,7 +139,10 @@ pub fn test_output(
     model_filter: Option<&str>,
     config_path: &Path,
 ) -> Result<TestOutput> {
-    let extensions = crate::registry::duckdb_extensions_for(config_path)?;
+    let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let extensions = crate::registry::duckdb_extensions_from(project_config.as_ref());
+    let unit_targets = super::compile::target_dialects(project_config.as_ref(), config_path);
     let result =
         rocky_engine::test_runner::run_tests_with(rocky_engine::test_runner::TestRunInputs {
             models_dir,
@@ -107,8 +170,13 @@ pub fn test_output(
     let mut output = TestOutput::new(result.total, result.passed, failures)
         .with_model_results(model_results)
         .with_diagnostics(result.diagnostics.clone());
-    let unit_run =
-        rocky_engine::test_runner::run_unit_tests(models_dir, model_filter, &extensions)?;
+    let unit_run = rocky_engine::test_runner::run_unit_tests(
+        models_dir,
+        model_filter,
+        &extensions,
+        &unit_targets,
+        false,
+    )?;
     if let Some(summary) = unit_summary(&unit_run) {
         output = output.with_unit_tests(summary);
     }
@@ -131,6 +199,7 @@ pub fn run_test(
         output_json,
         run_vars,
         None,
+        false,
     )
 }
 
@@ -181,6 +250,12 @@ fn consumer_diagnostics_fail_the_run(
 /// applies the per-model-target checks `rocky ci` applies (see
 /// [`super::ci::with_project_gates`]), so `rocky test` refuses what `rocky ci`
 /// refuses. `None`, or no file there, runs no such check.
+///
+/// Every unit test runs on DuckDB. A unit test whose model's target
+/// warehouse is not DuckDB alone (another warehouse, several, or none
+/// resolved) carries a `dialect` notice, and the table output warns once.
+/// `strict_dialect` (`--strict-dialect`) refuses those tests instead.
+#[allow(clippy::too_many_arguments)]
 pub fn run_test_with_selection(
     config_path: Option<&Path>,
     models_dir: &Path,
@@ -192,6 +267,7 @@ pub fn run_test_with_selection(
         &crate::selection::SelectionArgs,
         &crate::selection::StateContext<'_>,
     )>,
+    strict_dialect: bool,
 ) -> Result<()> {
     let selected = match selection {
         Some((args, ctx)) if args.is_active() => Some(crate::selection::resolve_in_dir(
@@ -205,6 +281,10 @@ pub fn run_test_with_selection(
         None => None,
     };
     let extensions = crate::registry::duckdb_extensions_from(project_config.as_ref());
+    let target_dialects = super::compile::target_dialects(
+        project_config.as_ref(),
+        config_path.unwrap_or_else(|| Path::new("rocky.toml")),
+    );
     let mut result = super::ci::with_project_gates(
         project_config.as_ref(),
         config_path.unwrap_or_else(|| Path::new("rocky.toml")),
@@ -221,10 +301,7 @@ pub fn run_test_with_selection(
                 strict_contracts: project_config
                     .as_ref()
                     .is_some_and(|config| config.contracts.strict),
-                target_dialects: super::compile::target_dialects(
-                    project_config.as_ref(),
-                    config_path.unwrap_or_else(|| Path::new("rocky.toml")),
-                ),
+                target_dialects: target_dialects.clone(),
                 extensions: extensions.clone(),
             })
         },
@@ -233,8 +310,13 @@ pub fn run_test_with_selection(
     // `test_output` (see that function's note), so the check has to be made
     // here too — this is the path the CLI actually takes.
     reject_unknown_model(model_filter, &result.all_models)?;
-    let mut unit_run =
-        rocky_engine::test_runner::run_unit_tests(models_dir, model_filter, &extensions)?;
+    let mut unit_run = rocky_engine::test_runner::run_unit_tests(
+        models_dir,
+        model_filter,
+        &extensions,
+        &target_dialects,
+        strict_dialect,
+    )?;
     if let Some(set) = &selected {
         retain_selected(&mut result, &mut unit_run, set);
     }
@@ -297,14 +379,23 @@ pub fn run_test_with_selection(
                 "  Unit tests: {} passed, {unit_failed} failed",
                 unit_run.passed()
             );
+            if let Some(warning) = dialect_warning(&unit_run.results) {
+                println!("  {warning}");
+            }
             for r in &unit_run.results {
+                let marker = r.dialect.as_ref().map(dialect_marker);
                 if !r.passed {
+                    let suffix = marker.map(|m| format!(" [{m}]")).unwrap_or_default();
                     println!(
-                        "  \u{2717} {}::{} — {}",
+                        "  \u{2717} {}::{} — {}{suffix}",
                         r.model,
                         r.test,
                         r.error.as_deref().unwrap_or("output mismatch")
                     );
+                } else if let Some(marker) = marker {
+                    // A pass that ran on another dialect than its target is
+                    // listed too, so every result states where it ran.
+                    println!("  \u{2713} {}::{} [{marker}]", r.model, r.test);
                 }
             }
         }
@@ -1256,6 +1347,7 @@ mod tests {
             true,
             &rocky_core::run_vars::RunVars::new(),
             select.map(|_| (&args, &ctx)),
+            false,
         )
     }
 
@@ -1292,6 +1384,8 @@ mod tests {
             &models,
             None,
             &rocky_duckdb::ExtensionOptions::default(),
+            &Default::default(),
+            false,
         )
         .expect("unit run");
         let selected = std::collections::BTreeSet::from(["good_mart".to_string()]);
@@ -1312,6 +1406,112 @@ mod tests {
             &result.diagnostics,
             true
         ));
+    }
+
+    /// A project whose `flagged` model has one passing `[[test]]`, with
+    /// `rocky_toml` as its config. Returns the project dir and its models dir.
+    fn unit_test_project(rocky_toml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::write(models.join("orders.sql"), "SELECT 0 AS id, 0 AS amount").expect("sql");
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"wh\"\nschema = \"main\"\n",
+        )
+        .expect("sidecar");
+        std::fs::write(
+            models.join("flagged.sql"),
+            "SELECT id, amount FROM orders WHERE amount > 100",
+        )
+        .expect("sql");
+        std::fs::write(
+            models.join("flagged.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[test]]\nname = \"keeps_high\"\n\n\
+             [[test.given]]\nref = \"orders\"\n\
+             rows = [ { id = 1, amount = 150 }, { id = 2, amount = 50 } ]\n\n\
+             [test.expect]\nrows = [ { id = 1, amount = 150 } ]\n",
+        )
+        .expect("sidecar");
+        std::fs::write(tmp.path().join("rocky.toml"), rocky_toml).expect("rocky.toml");
+        (tmp, models)
+    }
+
+    /// A Snowflake adapter config. It loads without credentials and nothing
+    /// connects to it: unit tests run on an in-memory DuckDB.
+    const SNOWFLAKE_TOML: &str = "[adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+         [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+         [pipeline.trans.target]\nadapter = \"snow\"\n";
+
+    const DUCKDB_TOML: &str = "[adapter]\ntype = \"duckdb\"\n\
+         [pipeline.trans]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+         [pipeline.trans.target]\n";
+
+    fn unit_results(
+        tmp: &tempfile::TempDir,
+        models: &std::path::Path,
+    ) -> Vec<rocky_core::unit_test::UnitTestResult> {
+        let output = super::test_output(models, None, None, &tmp.path().join("rocky.toml"))
+            .expect("test output");
+        output.unit_tests.expect("unit tests ran").results
+    }
+
+    /// The config's warehouse adapter decides the notice: a Snowflake
+    /// project's unit test says it ran on DuckDB with target Snowflake; a
+    /// DuckDB project's JSON carries no `dialect` key.
+    #[test]
+    fn the_config_target_marks_unit_tests_on_a_non_duckdb_project() {
+        let (tmp, models) = unit_test_project(SNOWFLAKE_TOML);
+        let results = unit_results(&tmp, &models);
+        assert!(results[0].passed, "{results:?}");
+        let dialect = results[0].dialect.as_ref().expect("marked");
+        assert_eq!(dialect.targets, vec!["Snowflake".to_string()]);
+        assert!(dialect.ran_on_duckdb);
+
+        let (tmp, models) = unit_test_project(DUCKDB_TOML);
+        let results = unit_results(&tmp, &models);
+        assert!(results[0].passed, "{results:?}");
+        let json = serde_json::to_string(&results).expect("json");
+        assert!(!json.contains("\"dialect\""), "{json}");
+    }
+
+    /// `--strict-dialect` fails `rocky test` on a Snowflake project and
+    /// passes it on a DuckDB project.
+    #[test]
+    fn strict_dialect_fails_only_a_non_duckdb_project() {
+        let run = |toml: &str| {
+            let (tmp, models) = unit_test_project(toml);
+            super::run_test_with_selection(
+                Some(&tmp.path().join("rocky.toml")),
+                &models,
+                None,
+                None,
+                true,
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                true,
+            )
+        };
+        let err = run(SNOWFLAKE_TOML).expect_err("strict refuses Snowflake");
+        assert!(err.to_string().contains("test failures"), "{err:#}");
+        run(DUCKDB_TOML).expect("strict passes a DuckDB project");
+    }
+
+    #[test]
+    fn the_table_warning_names_the_target() {
+        let (tmp, models) = unit_test_project(SNOWFLAKE_TOML);
+        let results = unit_results(&tmp, &models);
+        let warning = super::dialect_warning(&results).expect("warns");
+        assert!(warning.contains("ran on DuckDB"), "{warning}");
+        assert!(warning.contains("Snowflake"), "{warning}");
+        assert_eq!(
+            super::dialect_marker(results[0].dialect.as_ref().expect("marked")),
+            "ran on DuckDB, target Snowflake"
+        );
+        let (tmp, models) = unit_test_project(DUCKDB_TOML);
+        assert_eq!(super::dialect_warning(&unit_results(&tmp, &models)), None);
     }
 
     /// A project with three pipelines — `transform` (models/**), `reporting`
