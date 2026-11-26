@@ -531,7 +531,10 @@ enum IterStop {
 /// On a signal, cancel the iteration's token and give it
 /// [`SIGNAL_SETTLE_GRACE`] to stop and settle through its own terminal path
 /// (#1606). Past the grace, drop it as before. A second signal during the
-/// grace exits 130 at once.
+/// grace exits 130 without the settle. Both of those stop waiting on
+/// statements the warehouse still runs, so each first asks the adapters to
+/// cancel them ([`crate::statement_cancel`], at most
+/// [`CANCEL_ON_EXIT_BUDGET`](crate::statement_cancel::CANCEL_ON_EXIT_BUDGET)).
 ///
 /// ```text
 ///   signal ──▶ cancel.cancel() ──▶ wait ≤ grace for the iteration
@@ -606,10 +609,14 @@ async fn stop_iteration<F: std::future::Future>(
                             "[watch] the run did not settle within {}s; stopping it",
                             SIGNAL_SETTLE_GRACE.as_secs()
                         );
+                        // Before the drop below: dropping the iteration
+                        // removes its statements from the in-flight lists.
+                        crate::statement_cancel::cancel_before_exit("[watch]").await;
                     }
                 }
                 Some(()) = second => {
                     eprintln!("\n[watch] second signal — terminating");
+                    crate::statement_cancel::cancel_before_exit("[watch]").await;
                     std::process::exit(130);
                 }
             }

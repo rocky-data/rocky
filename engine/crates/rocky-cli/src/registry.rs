@@ -496,7 +496,11 @@ impl AdapterRegistry {
                         retry: adapter_cfg.retry.clone(),
                     };
 
-                    let mut connector = DatabricksConnector::new(connector_config, auth);
+                    // One in-flight list for both connectors, so a forced
+                    // exit can cancel a statement sent through either.
+                    let in_flight = rocky_core::statement_cancel::InFlightStatements::new();
+                    let mut connector = DatabricksConnector::new(connector_config, auth)
+                        .with_in_flight(in_flight.clone());
                     if let Some(ref budget) = shared_retry_budget {
                         connector = connector.with_retry_budget(budget.clone());
                     }
@@ -525,6 +529,7 @@ impl AdapterRegistry {
                     if let Some(ref budget) = shared_retry_budget {
                         warehouse_conn = warehouse_conn.with_retry_budget(budget.clone());
                     }
+                    let warehouse_conn = warehouse_conn.with_in_flight(in_flight);
                     let adapter = Arc::new(DatabricksWarehouseAdapter::new(warehouse_conn));
 
                     connectors.insert(name.clone(), connector);
@@ -781,8 +786,12 @@ impl AdapterRegistry {
                     // path. Keeping it separate means the batch describe
                     // query won't contend with in-flight `execute_statement`
                     // calls on the warehouse adapter's connector.
+                    // One in-flight list for both connectors, so a forced
+                    // exit can cancel a statement sent through either.
+                    let in_flight = rocky_core::statement_cancel::InFlightStatements::new();
                     let mut sf_connector_for_batch =
-                        SnowflakeConnector::new(sf_connector_config.clone(), sf_auth.clone());
+                        SnowflakeConnector::new(sf_connector_config.clone(), sf_auth.clone())
+                            .with_in_flight(in_flight.clone());
                     if let Some(ref budget) = shared_retry_budget {
                         sf_connector_for_batch =
                             sf_connector_for_batch.with_retry_budget(budget.clone());
@@ -790,7 +799,8 @@ impl AdapterRegistry {
                     snowflake_connectors.insert(name.clone(), Arc::new(sf_connector_for_batch));
 
                     let mut warehouse_connector =
-                        SnowflakeConnector::new(sf_connector_config, sf_auth);
+                        SnowflakeConnector::new(sf_connector_config, sf_auth)
+                            .with_in_flight(in_flight);
                     if let Some(ref budget) = shared_retry_budget {
                         warehouse_connector = warehouse_connector.with_retry_budget(budget.clone());
                     }
@@ -997,6 +1007,11 @@ impl AdapterRegistry {
                     bail!(msg);
                 }
             }
+        }
+
+        // A forced exit of `rocky run` cancels what these adapters still run.
+        for (name, adapter) in &warehouse {
+            crate::statement_cancel::track(name, adapter);
         }
 
         // Log a warning for any experimental adapters that were registered.

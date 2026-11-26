@@ -75,6 +75,19 @@ Exit `1` is generic. It often means nothing materialized, but it can also fire *
 
 Exit `130` means an interrupt cut the run short, usually a deploy or a machine restart. Treat it as informational unless it repeats.
 
+**What an interrupt does to running statements.** The first signal stops new work. Rocky then waits for the statements already running, so their watermarks get written. A forced exit does not wait: a second signal, or a run that does not settle within 5 seconds. A watched run (`--watch`) that does not stop in its grace exits the same way. On a forced exit, Rocky asks the warehouse to cancel each statement it still waits on. It waits at most 3 seconds for those requests. It prints one line per statement on stderr.
+
+| Adapter | Cancels on a forced exit |
+|---------|--------------------------|
+| Databricks | Yes, once the statement has an id: after the first 30 seconds |
+| Snowflake | Yes, once the statement has a handle: after the first 45 seconds |
+| BigQuery, Trino | No. A later release adds it |
+| PostgreSQL, Redshift | No. The server statement timeout that Rocky sets from `timeout_secs` still stops it |
+| SQL Server, ClickHouse, Spark, process adapters | No. The statement runs on |
+| DuckDB | Not needed. It runs inside the `rocky` process and ends with it |
+
+A Databricks or Snowflake statement younger than that limit has no id yet, so Rocky cannot cancel it. A statement Rocky stopped waiting on after its own client timeout also runs on. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
+
 A small wrapper makes the routing explicit, and it is reusable across every scheduler:
 
 ```bash

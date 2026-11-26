@@ -39,7 +39,12 @@
 //! bounded: past [`SIGNAL_SETTLE_GRACE`] the listener exits 130 without the
 //! settle (crash parity, the pre-#1606 behaviour). The replication fan-out is
 //! the one exception; see [`RunCancel::hold_unbounded`]. A second signal of
-//! either kind exits 130 at once.
+//! either kind exits 130 without waiting for the settle.
+//!
+//! Both of those exits stop waiting on statements the warehouse still runs.
+//! Before it exits, the listener asks each adapter to cancel them
+//! ([`crate::statement_cancel`]), for at most
+//! [`CANCEL_ON_EXIT_BUDGET`](crate::statement_cancel::CANCEL_ON_EXIT_BUDGET).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -310,6 +315,9 @@ fn spawn_signal_listener(
                 );
             }
         }
+        // The run's futures are still alive here, so their statements are
+        // still listed. The first signal never reaches this: it drains.
+        crate::statement_cancel::cancel_before_exit("[rocky]").await;
         std::process::exit(130);
     })
 }
