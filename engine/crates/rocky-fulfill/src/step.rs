@@ -1199,8 +1199,7 @@ impl Runner {
         // table; the adapter is resolved from whatever `rocky.toml`
         // names right now. Re-routing the config after the apply and
         // before the observation therefore certifies a different
-        // warehouse. That gap is open, reported, and Hugo's call — see
-        // the F3 review notes.
+        // warehouse. That gap is open, reported, and a maintainer's call.
         let bound = fulfill_api::LoadedCheckSet::bind(
             &self.models_dir,
             &model,

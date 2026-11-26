@@ -557,7 +557,7 @@ pub struct RunRecordNotPersisted {
 }
 
 /// The exit rule for a successful run whose record did not land (#1884,
-/// ruled 2026-09-30: option D).
+/// option D).
 ///
 /// - Record persisted ⇒ `Ok`.
 /// - Lost, on an ordinary run under the default `[state] on_upload_failure =
@@ -3817,7 +3817,7 @@ pub(crate) async fn run_with_direct_gate(
     // (`DriftGovernor`, `finalize_drift_verify_after`). A label only: the
     // custody rows are still evaluated as the `agent` class.
     actor: &rocky_core::config::PrincipalRef,
-    // #1609 (ruled 2026-09-17, shape A): an adapter registry the caller
+    // #1609 (shape A): an adapter registry the caller
     // already holds, used instead of building one from the config. `None`
     // for every production caller. It reaches the model-only and replication
     // arms, which build their registry here; the transformation, quality,
@@ -22923,7 +22923,7 @@ max_retries = 0
         })
     }
 
-    /// #1884 (ruled 2026-09-30: D plus B), transformation half. A SUCCESSFUL
+    /// #1884 (D plus B), transformation half. A SUCCESSFUL
     /// transformation run whose record write failed still finalizes — the
     /// committed models' state must travel — and its exit code follows the
     /// rule: 0 under the default `skip` on an ordinary run, non-zero under
@@ -57034,7 +57034,7 @@ timestamp_column = "ts"
         }
     }
 
-    /// #1884 (ruled 2026-09-30: D plus B), replication half. A SUCCESSFUL
+    /// #1884 (D plus B), replication half. A SUCCESSFUL
     /// replication run whose record write failed still uploads: the
     /// watermark and the `run_progress` checkpoint header ride the terminal
     /// upload. Only the exit code follows the rule — 0 under the default
