@@ -137,6 +137,20 @@ impl WarehouseAdapter for TrinoAdapter {
         crate::connector::classify_trino_failure(err)
     }
 
+    /// Trino polls each query, but cancelling one is not wired yet. Its
+    /// statements run on after a forced exit.
+    fn in_flight_statements(&self) -> Vec<rocky_core::statement_cancel::StatementHandle> {
+        Vec::new()
+    }
+
+    /// See [`Self::in_flight_statements`].
+    async fn cancel_statement(
+        &self,
+        _handle: &rocky_core::statement_cancel::StatementHandle,
+    ) -> AdapterResult<rocky_core::statement_cancel::CancelOutcome> {
+        Ok(rocky_core::statement_cancel::CancelOutcome::Unsupported)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.client
             .execute(sql)
@@ -350,6 +364,21 @@ mod tests {
                 rows: vec![vec![serde_json::Value::Null]],
             })
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_is_unsupported_and_nothing_is_in_flight() {
+        let cfg = TrinoClientConfig::new("http://localhost:8080");
+        let adapter = TrinoAdapter::new(cfg, crate::test_helpers::test_basic_auth());
+        assert!(adapter.in_flight_statements().is_empty());
+        let outcome = adapter
+            .cancel_statement(&rocky_core::statement_cancel::StatementHandle::new("any"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            rocky_core::statement_cancel::CancelOutcome::Unsupported
         );
     }
 

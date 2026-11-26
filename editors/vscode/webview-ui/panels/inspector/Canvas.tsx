@@ -92,11 +92,12 @@ export function Canvas({
   // Re-fit when the canvas becomes visible. It may have first mounted while its
   // tab was hidden (display:none, 0×0), where ReactFlow can't frame the graph;
   // fitting once it has real dimensions centers it. No maxZoom cap so a small
-  // graph fills a maximized panel; padding gives the nodes breathing room.
+  // graph fills a maximized panel; padding gives the nodes breathing room (a string with %
+  // is a share of the viewport; xyflow v13 reads a bare number as pixels).
   useEffect(() => {
     if (!active) return;
     const timer = setTimeout(
-      () => void fitView({ duration: 200, padding: 0.2 }),
+      () => void fitView({ duration: 200, padding: "8%" }),
       250,
     );
     return () => clearTimeout(timer);

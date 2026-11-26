@@ -7,7 +7,7 @@ sidebar:
 
 import pocCounts from "../../../data/poc-counts.json";
 
-The Rocky playground creates a self-contained sample project that runs entirely on DuckDB. It needs no warehouse credentials, no Fivetran account, and no external services. It is the quickest way to try Rocky's compiler, type system, lineage engine, and AI features.
+The playground creates a sample project that runs on DuckDB with no warehouse credentials or external services. It is the quickest way to try the compiler, type system, lineage engine and AI features.
 
 ## 1. Create the Playground
 
@@ -33,23 +33,13 @@ my-project/
     └── seed.sql                         # DuckDB seed data
 ```
 
-The default template, `quickstart`, is the only template. `rocky playground` loads its seed into `playground.duckdb` when it creates the project, so `rocky run` builds every model on the first try.
-
-:::note
-Earlier releases also offered `--template ecommerce` and `--template showcase`. Their projects built no models on `rocky run`, so they were removed ([issue #1983](https://github.com/rocky-data/rocky/issues/1983)). Those names, and their aliases, now fail with a message that lists the remaining templates.
-:::
-
-Enter the project directory:
-
-```bash
-cd my-project
-```
+`quickstart` is the only template. `rocky playground` loads its seed into `playground.duckdb`, so `rocky run` builds every model on the first try. The names `--template ecommerce` and `--template showcase` and their aliases fail with a message that lists the remaining templates ([issue #1983](https://github.com/rocky-data/rocky/issues/1983)). Then `cd my-project`.
 
 ## 2. Explore the Generated Files
 
 ### rocky.toml
 
-The pipeline config uses a local DuckDB adapter instead of Databricks. No credentials are required:
+A local DuckDB adapter, no credentials:
 
 ```toml
 [adapter]
@@ -70,9 +60,7 @@ auto_create_schemas = true
 concurrency = 4
 ```
 
-This is a `transformation` pipeline. The unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the model DAG from the `models/` directory.
-
-The same `playground.duckdb` file backs the whole run. `rocky test` ignores `path`: it runs models against an in-memory database and loads `data/seed.sql` on the fly. `rocky run` materializes models into the file, which `rocky playground` already seeded when it created the project. So the playground works end to end with no manual seeding step. Re-seed the file at any time with `duckdb playground.duckdb < data/seed.sql`.
+The unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the DAG from `models/`. `rocky test` ignores `path`: it runs models in an in-memory database and loads `data/seed.sql` on the fly. `rocky run` materializes into `playground.duckdb`, already seeded. Re-seed with `duckdb playground.duckdb < data/seed.sql`.
 
 ### raw_orders.sql + raw_orders.toml
 
@@ -106,7 +94,7 @@ schema = "main"
 
 ### customer_orders.rocky
 
-This model uses the Rocky DSL, a compact syntax for common aggregation patterns. The playground includes both kinds of model: two are plain SQL, and this one is DSL.
+The Rocky DSL is a compact syntax for common aggregations. Two playground models are SQL and this one is DSL.
 
 ```
 -- Customer orders aggregation (Rocky DSL)
@@ -120,7 +108,7 @@ group customer_id {
 where total_revenue > 0
 ```
 
-The Rocky DSL compiles to standard SQL. The compiler type-checks column references, validates aggregation semantics, and resolves the `raw_orders` dependency automatically.
+The DSL compiles to standard SQL. The compiler type-checks columns, validates aggregation semantics and resolves the `raw_orders` dependency.
 
 ### revenue_summary.sql
 
@@ -167,11 +155,10 @@ required = ["customer_id", "total_revenue", "order_count"]
 protected = ["customer_id"]
 ```
 
-The contract declares two rules:
 - **required**: these columns must exist. The compiler checks a declared type only when it can infer the output type.
-- **protected**: these columns cannot be removed by a later change. The compiler fails with error `E013` if a protected column disappears from the model's output.
+- **protected**: a later change cannot remove these columns. The compiler fails with `E013` if one disappears.
 
-The columns are marked `nullable = true`, and the TOML comment above explains why. A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
+A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
 
 ## 3. Compile the Models
 
@@ -181,18 +168,9 @@ Run the compiler to type-check all models, resolve dependencies, and validate co
 rocky compile --contracts contracts
 ```
 
-The command exits `0`, but this template reports `I003` information notices.
-The compiler cannot infer every type from `raw__orders.orders` during this
-compile. It still checks the required output-column names.
+The command exits `0`, but this template reports `I003` information notices: the compiler cannot infer every type from `raw__orders.orders`, so it checks a declared type only when it can infer it. It still checks the required output-column names. It also builds the DAG (`customer_orders` depends on `raw_orders`, `revenue_summary` on `customer_orders`).
 
-The compiler performs three checks:
-- **Dependency resolution**: it builds a DAG from the model configs. `customer_orders` depends on `raw_orders`, and `revenue_summary` depends on `customer_orders`.
-- **Type inference**: it carries known types through the model graph. This template leaves some types unknown, so it reports `I003` notices.
-- **Contract validation**: it checks required and protected output columns. It checks a declared type only when it can infer that type. An `I003` notice says when it could not.
-
-The template's local transformation pipeline does not support `rocky plan`.
-Use `rocky emit-sql` to inspect the statements before you run them. It does not
-create a saved plan or an approval.
+This pipeline does not support `rocky plan`. Use `rocky emit-sql` to inspect the statements before you run them.
 
 ### Try introducing an error
 
@@ -220,20 +198,7 @@ Run `rocky compile --contracts contracts` again:
   Compiled: 3 models, 1 errors, 0 warnings
 ```
 
-Restore the line before continuing. Use the compile command as a gate before
-you run models:
-
-```bash
-rocky compile --contracts contracts && rocky run
-```
-
-The `&&` runs `rocky run` only when the contract compile exits `0`.
-The two commands read the project separately. A model or contract edit between them can change what runs.
-For a selected `full_refresh` model, `rocky run --pipeline <NAME> --model <NAME> --contracts contracts` checks the contract in the run's own compile. This template runs the whole model graph here, so it still needs the separate compile gate.
-
-A failed compile leaves tables from a previous run in `playground.duckdb`.
-`rocky preview rows` shows those stored rows. It does not prove the current
-source passed the contract check.
+Restore the line, then use compile as a gate: `rocky compile --contracts contracts && rocky run`. The two commands read the project separately, so an edit between them can change what runs. For a selected `full_refresh` model, `rocky run --pipeline <NAME> --model <NAME> --contracts contracts` checks the contract in the run's own compile. A failed compile leaves tables from a previous run in `playground.duckdb`, and `rocky preview rows` shows those stored rows.
 
 ## 4. Run the Tests
 
@@ -253,11 +218,7 @@ Testing 3 models...
   Result: 3 passed, 0 failed
 ```
 
-The test runner does four things:
-1. Compiles all models.
-2. Executes each model's SQL against DuckDB, in dependency order.
-3. Validates contract assertions against the actual output, when you pass `--contracts contracts`.
-4. Reports pass or fail for each model.
+`rocky test` compiles all models, runs each model's SQL on DuckDB in dependency order, validates contracts when you pass `--contracts contracts`, and reports pass or fail per model.
 
 ### Test a single model
 
@@ -267,21 +228,10 @@ rocky test --model revenue_summary
 
 ### Run the Models and Inspect the Rows
 
-Materialize the model graph into `playground.duckdb` after the contract check
-passes:
-
 ```bash
 rocky compile --contracts contracts && rocky run
+rocky preview rows --model revenue_summary   # output columns and up to 100 rows
 ```
-
-Inspect the materialized result:
-
-```bash
-rocky preview rows --model revenue_summary
-```
-
-The command shows the output columns and up to 100 rows from the local DuckDB
-file. Run it again after a change to verify the materialized result.
 
 ## 5. View Column Lineage
 
@@ -319,104 +269,26 @@ Column trace: revenue_summary.total_revenue
       <- raw__orders.orders.amount (direct)
 ```
 
-### Generate Graphviz output
-
-```bash
-rocky lineage revenue_summary --format dot
-```
-
-```dot
-digraph lineage {
-  rankdir=LR;
-  "customer_orders.customer_id" -> "revenue_summary.customer_id";
-  "customer_orders.total_revenue" -> "revenue_summary.total_revenue";
-  "customer_orders.order_count" -> "revenue_summary.order_count";
-  "customer_orders.first_order" -> "revenue_summary.first_order";
-}
-```
-
-Pipe this to Graphviz to generate an SVG: `rocky lineage revenue_summary --format dot | dot -Tsvg -o lineage.svg`
+`rocky lineage revenue_summary --format dot | dot -Tsvg -o lineage.svg` renders Graphviz output.
 
 ## 6. Try AI Features
 
-If you have an Anthropic API key, you can generate models from natural language:
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-### Generate a new model
-
-```bash
-rocky ai "monthly revenue per customer from raw_orders, only completed orders"
-```
-
-Rocky sends your intent to Claude, receives generated code, and compiles it
-against the available project context. Compilation can find supported static
-problems. It does not prove warehouse behavior or business correctness.
-Review the SQL and run relevant checks before you use the generated model.
-
-### Add intent to existing models
-
-```bash
-rocky ai-explain --all --save
-```
-
-This reads each model's SQL, generates a plain-English description, and saves it to the model's TOML config as an `intent` field. `ai-sync` later reads that intent to update models when upstream schemas change.
-
-### Generate tests from intent
-
-```bash
-rocky ai-test --all --save
-```
-
-Generates test assertions based on each model's SQL logic and intent description, and saves them to the `tests/` directory.
-
-See the [AI Features guide](/guides/ai-features/) for a complete walkthrough.
+With an `ANTHROPIC_API_KEY` set, `rocky ai "<intent>"` generates and compiles a model, `rocky ai-explain --all --save` writes an `intent` field per model, and `rocky ai-test --all --save` generates tests. Compilation does not prove warehouse behavior or business correctness, so review the output. See the [AI Features guide](/guides/ai-features/).
 
 ## 7. Run CI Locally
 
-The `ci` command runs compilation and local tests in one pass. Pass the
-contracts directory when contract checks are part of the job:
-
-```bash
-rocky ci --contracts contracts
-```
-
-```
-Rocky CI Pipeline
-
-  Compile: PASS (3 models)
-  Test:    PASS (3 passed, 0 failed)
-
-  Exit code: 0
-```
-
-Exit code `0` means the configured supported checks passed. It does not prove
-warehouse execution or business correctness. A non-zero exit code fails the CI
-job.
+`rocky ci --contracts contracts` runs compilation and local tests in one pass. Exit `0` means the supported checks passed. It does not prove warehouse execution or business correctness. See [CI/CD](/guides/ci-cd/).
 
 ## 8. Explore the POC Catalog
 
-Beyond this walkthrough, the playground ships {pocCounts.total} self-contained POCs across {pocCounts.categoryCount} categories. Each one demonstrates a single Rocky capability end to end. Browse them, grouped by category with a link to every one, in the [Examples & POC catalog](/getting-started/examples/). Or run one directly:
+The playground ships {pocCounts.total} self-contained POCs across {pocCounts.categoryCount} categories. Browse them in the [Examples & POC catalog](/getting-started/examples/), or run one:
 
 ```bash
 cd examples/playground
 ./pocs/02-performance/01-incremental-watermark/run.sh
 ```
 
-Most run on local DuckDB with no credentials. The exceptions: AI (`ANTHROPIC_API_KEY`), Governance (a Databricks workspace), and the warehouse-specific adapter POCs.
-
-## 9. Benchmarks
-
-The playground ships a benchmark suite. The `bench-rocky` target measures Rocky's compile time and peak memory:
-
-```bash
-cd examples/playground/benchmarks
-make bench-rocky
-```
-
-See [Benchmarks](/getting-started/benchmarks/) for the methodology and the numbers.
+Most run on local DuckDB with no credentials. The exceptions: AI (`ANTHROPIC_API_KEY`), Governance (a Databricks workspace), and the warehouse-specific adapter POCs. For compile-time and memory numbers, run `make bench-rocky` in `examples/playground/benchmarks`. See [Benchmarks](/getting-started/benchmarks/).
 
 ## Next Steps
 
@@ -425,5 +297,4 @@ See [Benchmarks](/getting-started/benchmarks/) for the methodology and the numbe
 - [IDE Setup](/guides/ide-setup/) — install the VS Code extension for hover types, go-to-definition, and inline lineage
 - [CI/CD Integration](/guides/ci-cd/) — add Rocky to your GitHub Actions or GitLab CI pipeline
 - [Migrating from dbt](/guides/migrate-from-dbt/) — import an existing dbt project
-- [AI Features](/guides/ai-features/) — generate models, sync schema changes, and create tests with AI
 - [Data Governance](/guides/governance/) — configure contracts, permissions, and quality checks

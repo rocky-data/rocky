@@ -5,13 +5,13 @@ sidebar:
   order: 4
 ---
 
-These commands support local development. Build a sample project, import a dbt project or package, or scaffold an adapter. Run the HTTP server with its browser UI, or the language server. Check the project's health, and list what it holds.
+These commands support local development: sample projects, dbt import, adapter scaffolding, the HTTP server and browser UI, the language server, health checks and project listings.
 
 ---
 
 ## `rocky playground`
 
-Create a self-contained sample project that runs on DuckDB in process. It needs no warehouse credentials and no external service. Use it to learn Rocky, to try model logic, and to prototype.
+Create a sample project that runs on in-process DuckDB. It needs no credentials and no external service.
 
 ```bash
 rocky playground [path]
@@ -27,7 +27,7 @@ rocky playground [path]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--template <TEMPLATE>` | `string` | `quickstart` | Sample project template. `quickstart` is the only one. The removed `ecommerce` and `showcase` templates fail with a message that lists the remaining templates. |
+| `--template <TEMPLATE>` | `string` | `quickstart` | Sample project template. `quickstart` is the only one. |
 
 ### Examples
 
@@ -52,25 +52,7 @@ rocky playground
     rocky preview rows --model customer_orders  # peek at materialized rows
 ```
 
-Create a playground with a custom name:
-
-```bash
-rocky playground my-experiment
-```
-
-```
-  Rocky Playground
-
-  Created sample project at ./my-experiment/
-  Template: Quickstart (3 models)
-  Using DuckDB (local, no warehouse needed)
-
-  Try:
-    cd my-experiment
-    rocky compile
-    rocky test
-    rocky run
-```
+Pass a path, for example `rocky playground my-experiment`, to name the directory.
 
 ### Related Commands
 
@@ -144,21 +126,21 @@ On the raw path, the other Jinja in the file must convert too. From a manifest, 
 
 On the raw path, an incremental model that uses `is_incremental()` in any other way is still imported. The block is commented out under a `-- TODO: dbt is_incremental() block not translated:` line, and the sidecar has no watermark. `rocky compile` refuses the model with `E037` until you add `timestamp_column` and the placeholder.
 
-Any other append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. The fallback covers four cases:
+Any other append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. This covers:
 
 - `incremental` with no `unique_key`
 - `incremental_strategy = 'append'`, even with a `unique_key`
 - `incremental_strategy = 'merge'` with no `unique_key`
-- an `incremental_strategy` the importer does not recognise, even with a `unique_key`
+- an unrecognised `incremental_strategy`, even with a `unique_key`
 
-A `unique_key` maps a model to `merge` only when `incremental_strategy` is unset or `'merge'`. An explicit `'append'` keeps the fallback.
+A `unique_key` maps to `merge` only when `incremental_strategy` is unset or `'merge'`.
 
-Where the fallback is reported depends on the import path. From a manifest, each model is listed in `MIGRATION-NOTES.md` under "Items to translate manually", and under "Warnings". With `--no-manifest`, the importer keeps only the warning text, so the model appears under "Warnings" alone. That includes a model with no `config()` block that inherits `materialized = 'incremental'` from `dbt_project.yml`.
+The fallback is reported in `MIGRATION-NOTES.md` under "Items to translate manually" and "Warnings" for a manifest import, and under "Warnings" alone with `--no-manifest`. That includes a model that inherits `materialized = 'incremental'` from `dbt_project.yml`.
 
-Some fallbacks are refused instead. A manifest import keeps dbt's compiled SQL, and dbt compiles `is_incremental()` as true against an existing table. So the compiled SQL can keep an incremental filter, and as `full_refresh` each run would replace the table with only the recent rows. When an `incremental` or `microbatch` model would fall back to `full_refresh` and its raw SQL uses `is_incremental()`, the importer does not import it. The model is listed under `failed_details`. Rewrite it by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key`, or a `time_interval` model.
+Some fallbacks are refused instead. A manifest import keeps dbt's compiled SQL, and dbt compiles `is_incremental()` as true against an existing table. As `full_refresh`, each run would replace the table with only the recent rows. When an `incremental` or `microbatch` model would fall back and its raw SQL uses `is_incremental()`, the importer does not import it and lists it under `failed_details`. Rewrite it by hand: remove the filter, then use `merge` with a `unique_key`, or `time_interval`.
 
 :::caution[A keyed model has the same filter problem]
-An `incremental` model with a `unique_key` is imported as `merge` from the same compiled SQL. `merge` creates its table from that SQL on the first run, and so does `delete_insert`. If the SQL kept an `is_incremental()` filter, that first run goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). The common filter, `MAX(...)` over the model's own table, fails because that table does not exist yet. A literal cutoff loads only the recent rows. The importer does not refuse this case. Remove the filter from the model's SQL before the first run.
+An `incremental` model with a `unique_key` imports as `merge` from the same compiled SQL. `merge` (like `delete_insert`) creates its table from that SQL on the first run. A kept `is_incremental()` filter then goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). A `MAX(...)` over the model's own table fails because that table does not exist yet. A literal cutoff loads only recent rows. The importer does not refuse this case. Remove the filter before the first run.
 :::
 
 Apart from the incremental conversion above, Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.
@@ -187,7 +169,6 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 
 ```json
 {
-  "version": "1.30.0",
   "command": "import-dbt",
   "import_method": "regex",
   "project_name": "demo_project",
@@ -197,38 +178,18 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
   "imported_models": ["orders"],
   "warning_details": [],
   "failed_details": [],
-  "emission": {
-    "out_dir": "rocky-out",
-    "rocky_toml_path": "rocky-out/rocky.toml",
-    "migration_notes_path": "rocky-out/MIGRATION-NOTES.md",
-    "models_translated_count": 1,
-    "models_skipped_count": 0,
-    "seeds_copied_count": 0,
-    "adapter_type": "duckdb",
-    "original_dbt_adapter_type": "duckdb",
-    "required_env_vars": []
-  }
+  "emission": { "out_dir": "rocky-out", "rocky_toml_path": "rocky-out/rocky.toml",
+    "migration_notes_path": "rocky-out/MIGRATION-NOTES.md", "models_translated_count": 1,
+    "adapter_type": "duckdb", "required_env_vars": [] }
 }
 ```
 
 `import_method` is `"manifest"` when a compiled `target/manifest.json` was found (pre-resolved Jinja), or `"regex"` when Rocky parsed the raw `.sql` files directly. The `emission` block is populated whenever `--output-dir` writes succeeded. Model-level import failures use the command's partial-import contract and do not make the process exit non-zero, so automation must check `failed` and `failed_details` before consuming the emitted repository.
 
-Import into a custom directory and override the target adapter (e.g. migrating a Postgres dbt project to Rocky-on-Snowflake):
+Import into another directory with another adapter, replace a previous emit, then verify it compiles:
 
 ```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --target-adapter snowflake
-```
-
-Re-run after fixing the dbt source, replacing the previous emit:
-
-```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite
-```
-
-End-to-end migration in one shot (emit, then compile to verify the result is loadable):
-
-```bash
-rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite \
+rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --target-adapter snowflake --overwrite \
     && rocky compile --models ./acme-rocky/models/
 ```
 
@@ -298,11 +259,7 @@ The lockfile records the build mode: `compile-only`, `build-empty` or `compiled`
     "target_schema": "main",
     "vars_hash": "blake3:af13…",
     "mode": "build-empty",
-    "includes": [],
     "models": ["int_stripe__account_daily", "..."],
-    "models_added": ["int_stripe__account_daily", "..."],
-    "models_removed": [],
-    "sources": [{ "name": "stripe.charge", "catalog": "dev", "schema": "stripe", "table": "charge" }],
     "tests_mapped": 15,
     "tests_dropped": [],
     "incremental_fallbacks": [],
@@ -321,215 +278,54 @@ The lockfile records the build mode: `compile-only`, `build-empty` or `compiled`
 
 ## `rocky serve`
 
-Start an HTTP server for the project. It answers under `/api/v1` with typed, schema-backed payloads: models, lineage and the DAG, runs and schedules, products, the review queue, and the governor's brief, audit and custody reads. A route that matches a CLI command returns what that command's `--output json` prints. The routes with no CLI counterpart, such as `/models` and `/dag/layers`, have their own shapes. It also runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](#the-browser-ui), and `--scheduler` adds the resident scheduler. The [Embedding guide](/guides/embedding/#serve-api) covers the routes, and the [OpenAPI document](/openapi.json) lists every one.
+Start an HTTP server for the project. It answers under `/api/v1` with typed payloads and runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](/guides/browser-ui/), and `--scheduler` adds the resident scheduler (experimental). Routes, jobs, error codes and the security rules (binding, tokens, host and origin checks, webhook) are in the [Embedding guide](/guides/embedding/#serve-api). The [OpenAPI document](/openapi.json) lists every route.
 
 ```bash
 rocky serve [flags]
 ```
 
-### Security defaults
-
-`rocky serve` binds **`127.0.0.1` (loopback) by default**. Whether a request needs a Bearer token depends on one thing: whether a token is configured.
-
-- **No token configured (the loopback default)** — nothing checks a Bearer token: the middleware passes every request to its handler. Any process on the machine can read model SQL, run history and the governor ledger, and can call the mutating routes. A handler's own checks still apply — a body it cannot parse is `400`, a second `run` while one is in flight is `409`, and the webhook route still verifies its HMAC when `ROCKY_WEBHOOK_SECRET` is set. This is the development posture. It is refused on a non-loopback bind, so a misconfigured network cannot expose the server this way. A web page in a browser on the machine cannot use it either: the host check below refuses its requests.
-- **A token configured** — `--token <secret>`, or the `ROCKY_SERVE_TOKEN` env var. The Bearer check runs on every request whose path is not exempt. Two paths are exempt, whatever the method: `/api/v1/health`, and `/api/v1/hooks/trigger/{pipeline}` (exactly one path segment after the prefix), where the handler verifies an `X-Rocky-Signature` HMAC instead — and accepts an unsigned `POST` only on a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET` (the edge below). Two more things carry no token by design: a CORS preflight (`OPTIONS`) is answered before the check runs, and the browser UI's own files under `/ui/` are public — they carry no data.
-- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires a token**; `rocky serve` refuses to start otherwise. `--ui` requires a read-only token on a non-loopback bind. On a loopback bind with no token configured, `--ui` generates one for the process (see [the browser UI](#the-browser-ui)).
-- **The host check** — on every loopback bind, with or without `--ui`, and on every `--ui` bind, a request whose `Host` is not a loopback name (`localhost`, `127.0.0.1`, `[::1]`, any port), the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. This stops DNS rebinding: a web page cannot point its own domain at `127.0.0.1` and then call `POST /api/v1/jobs/run` on a server with no token. `GET /api/v1/health` skips the check. A non-loopback bind without `--ui` runs no host check: it is reached by names it cannot know, such as a container's service name or a pod IP, and it must carry a token. To reach a loopback server through a reverse proxy that sends its own name as `Host`, pass that name with `--allowed-host`.
-
-A token is full-scope by default: it reaches every route. `--token-scope read-only` narrows it. A read-only token authenticates the same way, then gets `403` on any non-exempt request that is not `GET`, `HEAD`, or `OPTIONS`. Give that token to a browser UI on a shared server, so a leaked token cannot start a run:
-
-```text
-read-only token
-  ├─ GET  /api/v1/dag        → 200
-  ├─ GET  /api/v1/compile    → 200
-  ├─ POST /api/v1/jobs/run   → 403 forbidden_read_only_token
-  └─ POST /api/v1/compile    → 403 forbidden_read_only_token
-```
-
-The check reads the HTTP method, not a list of paths, so a route added later with a mutating method is refused the moment it exists. Two limits are worth knowing: the check classifies the METHOD, not the handler, so a `GET` that mutates would pass; and it only covers routes registered inside the authenticated router, not one added after that layer. Two things it does not touch: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
-
-The webhook exemption has three more clauses, and they are stated here rather than left to be assembled from three sections.
-
-**On a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET`, the route accepts an unsigned `POST`** and queues work for the scheduler. No token is involved, so a read-only token does not stop it. This is the dev-convenience path.
-
-**On a non-loopback bind with no secret, the route is refused outright** — `404 webhook_disabled`, not accepted-unsigned. So the unsigned path cannot be reached from the network by binding wider; widening the bind closes it rather than exposing it.
-
-**`rocky serve --ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`.** A browser can reach the webhook route, so the combination that would let page script queue unsigned work is rejected at startup rather than served.
-
-```text
---scheduler, no ROCKY_WEBHOOK_SECRET:
-  loopback bind          → unsigned POST ACCEPTED   (dev convenience)
-  non-loopback bind      → 404 webhook_disabled     (refused, not unsigned)
-  loopback bind + --ui   → refuses to START
-```
-
-Set `ROCKY_WEBHOOK_SECRET` whenever a browser or an untrusted process can reach the server.
-
-CORS is empty-by-default. Browser apps must declare every allowed origin via `--allowed-origin <ORIGIN>`. Permitted methods: `GET`, `POST`, `OPTIONS`. Permitted headers: `Authorization`, `Content-Type`. CORS authenticates nothing: it decides what a browser may read from a response, and it answers `OPTIONS` before the token check runs.
+The server binds `127.0.0.1` and, with no token, asks no request for one. A non-loopback `--host` requires `--token`. See [Security defaults](/guides/embedding/#security-defaults).
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. When omitted and `rocky.toml` declares a transformation pipeline, the server compiles every transformation pipeline's own `models` set, the same set `GET /api/v1/dag` and `rocky dag` read. If those models cannot be loaded (for example two files with one model name in two pipelines, or a malformed sidecar), the server compiles `models/` alone and reports the load error as a `W014` warning that names the pipeline and file; `/models` and `/dag` then show only `models/` until the error is fixed. If `models/` is absent or has no model, the server answers `engine_not_ready` with the load error instead. A pipeline whose models directory does not exist is not a load error: the other pipelines are still served, and the server adds a `W014` warning naming that pipeline unless it sets `allow_empty_models = true`. When given, only this directory is compiled. |
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. When omitted and `rocky.toml` declares a transformation pipeline, the server compiles every transformation pipeline's own `models` set, the same set `GET /api/v1/dag` and `rocky dag` read. If those models cannot be loaded (for example two files with one model name in two pipelines, or a malformed sidecar), the server compiles `models/` alone and reports the load error as a `W014` warning that names the pipeline and file. If `models/` is absent or has no model, the server answers `engine_not_ready` with the load error. A pipeline whose models directory does not exist is not a load error: the others are still served, with a `W014` warning unless the pipeline sets `allow_empty_models = true`. When given, only this directory is compiled. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
-| `--token <SECRET>` | `String` | | Bearer token. When set, the check runs on every request whose path is not exempt (`/api/v1/health`, and the HMAC-checked webhook route); the UI's own files are public. When unset, no request is asked for a token — see Security defaults. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback, including with `--ui`.** With `--ui` on loopback and no token, the server generates a per-process token: full scope (operator mode), or read-only with `--read-only` or when `--allowed-host`/`--allowed-origin` is given. |
-| `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. The one exception is `--ui` on loopback, which generates a token with that scope. With `--ui` on loopback and `--allowed-host` or `--allowed-origin`, `full` is refused. |
-| `--read-only` | `bool` | `false` | Alias for `--token-scope read-only`. Conflicts with `--token-scope full`. Use it for a view-only UI. |
-| `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
-| `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. On loopback with no token, the server generates one for the process: full scope (operator mode), or read-only with `--read-only`. On any other host, pass `--token` with `--read-only`. A server with `--allowed-host` or `--allowed-origin` is shared, so it stays read-only. Requires `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
-| `--allowed-host <HOST>` | `String` (repeatable) | `[]` | An extra `Host` header value to accept, for a reverse proxy in front of the server. Loopback names and the bind host are always accepted; any other `Host` is refused `421` on a loopback bind or a `--ui` bind (see Security defaults). A non-loopback bind without `--ui` checks no `Host`. With `--ui`, makes the server count as shared, so the UI token stays read-only. |
-| `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. Without `--models`, also watch each transformation pipeline's models directory that exists at startup. A pipeline root that does not exist at startup, or a pipeline added to `rocky.toml` later, is compiled but watched only after a restart. A missing default `models/` is skipped when pipeline roots exist. |
+| `--token <SECRET>` | `String` | | Bearer token. Falls back to `ROCKY_SERVE_TOKEN`. **Required when `--host` is non-loopback, including with `--ui`.** With `--ui` on loopback and no token, the server generates a per-process token: full scope, or read-only with `--read-only` or when `--allowed-host` / `--allowed-origin` is given. |
+| `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD` and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. A scope without a token is an error, except `--ui` on loopback, which generates a token with that scope. With `--ui` on loopback and `--allowed-host` or `--allowed-origin`, `full` is refused. |
+| `--read-only` | `bool` | `false` | Alias for `--token-scope read-only`. Conflicts with `--token-scope full`. |
+| `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist (e.g. `--allowed-origin http://localhost:5173`). With `--ui`, makes the server count as shared, so the UI token stays read-only. |
+| `--allowed-host <HOST>` | `String` (repeatable) | `[]` | An extra `Host` header value to accept, for a reverse proxy in front of the server. With `--ui`, makes the server count as shared. |
+| `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. On loopback with no token, the server generates one for the process: full scope (operator mode), or read-only with `--read-only`. On any other host, pass `--token` with `--read-only`. A shared server stays read-only. Requires `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. See [Open the UI](/guides/browser-ui/#open-the-ui). |
+| `--watch` | `bool` | `false` | Watch the models directory, `functions/` beside it and the bound `rocky.toml`, and recompile on a change. Without `--models`, also watch each transformation pipeline's models directory that exists at startup. A pipeline root that does not exist at startup, or a pipeline added later, is compiled but watched only after a restart. A missing default `models/` is skipped when pipeline roots exist. |
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
-| `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only meaningful with `--scheduler`. |
-| `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only meaningful with `--scheduler`. |
-| `--open` | `bool` | `false` | With `--ui`: open the printed address in the default browser once the listener is bound — after the startup sweep, never before. The address, token included, is handed to the system opener (`open`, `xdg-open`, `rundll32`) as an argument, so it is visible in the process list while the opener runs. At full scope, another local OS user could act with it. On a shared machine, pass `--token` and `--read-only`. A missing opener, or one that exits non-zero, is a warning; the server still starts and still prints the address. Refused without `--ui`. |
-
-### The browser UI
-
-`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries (cargo feature `ui`; a plain `cargo build` has no UI and refuses the flag with the build command to run).
-
-On your own machine, `--ui` alone is enough:
-
-```bash
-rocky serve --ui
-# Rocky UI: http://127.0.0.1:8080/login?t=<64 hex characters>
-```
-
-With no token configured on a loopback bind (`127.0.0.1`, `::1`, `localhost`), the server generates a per-process token. It works for every request until the server stops, and each start makes a new one. Once the listener is bound, the server prints the `Rocky UI:` address with the token on stdout, and a note on stderr.
-
-The generated token has full scope. This is operator mode: the UI can run, plan, test, run CI, approve, apply, freeze or unfreeze policy, create a preview, promote a branch (only when `[branch.approval] required = true`), approve a product's spec, and plan and apply a compaction as the OS user who started the server, like the VS Code extension. The stderr note says so. A plan bound to a data product applies only with a spec digest the person types into the page. The page never reads that digest from the plan. For a view-only UI, add `--read-only`. A server with `--allowed-host` or `--allowed-origin` is shared, so it generates a read-only token and refuses `--token-scope full`.
-
-An SSH `-L` tunnel or `kubectl port-forward` to a loopback port cannot be detected: the server still looks local. Use `--read-only` whenever someone else can reach your port. With `--open`, the opener's command line holds the address and its token, and other local users can read it with `ps`. The address is also printed on stdout, so it lands in anything that captures stdout (a terminal log, `docker logs`, a service journal) and in browser history. On a shared host, choose the token yourself. Do the same to keep one token across restarts, or to serve on any other host:
-
-```bash
-rocky serve --ui --token s3cret --read-only
-# Rocky UI: http://127.0.0.1:8080/login?t=s3cret
-```
-
-```text
---ui, no --token and no ROCKY_SERVE_TOKEN:
-  loopback, not fronted                 → generates a full token (operator mode)
-  loopback, not fronted, --read-only    → generates a read-only token
-  loopback, fronted                     → generates a read-only token
-  loopback, fronted, scope full         → refuses to start
-  non-loopback bind                     → refuses to start
-("fronted" = --allowed-host or --allowed-origin given)
-```
-
-The rules, each refused at start with its fix:
-
-- `--ui` needs a token. On a non-loopback bind, the token must be read-only and you must pass it. On loopback, a server with a token you gave accepts `full` (or no scope, which means full) unless it is fronted. A fronted server refuses a full-scope token, because writes from the UI need a token for each person. One token can plan, approve and apply, as the CLI user can: approving in the UI is not a second person's sign-off.
-- The printed address is `/login?t=<token>`. The server checks the token and answers `303` to `/ui/` with a session cookie, `rocky_ui_<tag>` (the tag differs per server; `HttpOnly`, `SameSite=Strict`, a session cookie; `Secure` behind a TLS proxy that sends `X-Forwarded-Proto: https`). The cookie holds a keyed hash of the token, so a restart ends every session. The server logs no request URIs, and the answers send `no-store` and `no-referrer`. A reverse proxy may log the query of `/login`: configure it not to. A bad token gets a `401` page with a token field that posts to `POST /login`, which needs an allowed `Origin`.
-- The page and its files are public: they carry no data. Every API call the page makes carries the cookie. A route accepts `Authorization: Bearer <token>` or the cookie. A write by cookie must also carry an `Origin` that names this server exactly (or an `--allowed-origin` entry) and `X-Rocky-UI: 1`, or the answer is `403 ui_write_not_from_ui`. The read-only scope applies to cookie sessions too.
-- With `--ui`, a request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. Both refusals carry the error envelope. The same checks run on a loopback bind without `--ui`; only a non-loopback bind without `--ui` skips them (see Security defaults). `GET /api/v1/health` skips both checks, so a load balancer or a Kubernetes probe that sends the pod IP as `Host` still gets `200`. The route carries no data.
-- Every UI response carries a Content Security Policy that allows scripts, styles, images, fonts and connections from this server only and forbids framing. The page loads nothing from any other host.
-- `--ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`: a browser can reach the webhook route.
-
-A reverse proxy in front of the UI names itself with `--allowed-host proxy.internal`; a page served from another origin lists it with `--allowed-origin https://app.example`.
-
-The [browser UI guide](/guides/browser-ui/) shows what each screen displays.
-
-### Ask the server what it is doing
-
-`GET /api/v1/settings` reports the posture of the running server. Read it when you want to check what a server is actually enforcing, rather than what its start command looked like.
-
-```bash
-curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" \
-  http://127.0.0.1:8080/api/v1/settings
-```
-
-It reports the bind host, the CORS allowlist, the `Host` values the host check accepts, whether the scheduler and the UI are on, the token's scope, and the state backend.
-
-No secret is in the response. The token appears as its name and scope. The webhook secret appears only as whether it can sign a webhook:
-
-```text
-  webhook_secret       what it means
-  ------------------   --------------------------------------------------
-  present              webhook requests must carry a signature
-  absent               loopback accepts UNSIGNED; non-loopback answers 404
-  set_but_unusable     blank or not valid UTF-8 -- --scheduler will REFUSE
-                       to start
-```
-
-That field is reported even when the scheduler is off. It tells you what will happen when you turn the scheduler on, which is the point.
-
-Two fields have a different freshness from the rest. `state_backend` and `concurrency_control` come from `rocky.toml`, and are read once on the **first request to this route**, then fixed for the life of the process. They are not read at startup on purpose. On a plain `rocky serve`, nothing on the path to binding the listener reads a file, and reading `rocky.toml` eagerly would put one there — letting a `rocky.toml` on a stalled mount stop the server binding at all. (`--scheduler` without an explicit `--poll-interval` already reads the config before binding; that is unchanged.) When `concurrency_control` is unset, the field reports the backend default (`cas` on `s3`, `gcs`, `tiered`; `off` on `local`, `valkey`). It is the requested mode: the writers' startup probe does not run here, so a store that falls back to `off` shows up in `rocky doctor` instead.
-
-That read runs one at a time under a 5 second deadline, so a stuck file cannot starve the server either:
-
-```text
-  503 engine_busy               another settings read is in flight -- retry
-  504 settings_config_timeout   the read blew its deadline; usually a file
-                                that will not return, so retrying will not help
-```
-
-Every other field on the route is unaffected by either.
-
-So a config edited after that first request is not reflected here, while the scheduler — which re-reads the file every tick — acts on the new one. They are `null` when there was no readable config, and `config_status` says which:
-
-```text
-  loaded       read and parsed
-  absent       no rocky.toml -- an ordinary fact, not a failure
-  unreadable   present but would not parse; the scheduler will skip every
-               tick until it does
-```
-
-`allowed_hosts` and `allowed_origins` both report what is **enforced**, not what was typed. `--allowed-host` only becomes a check on a loopback or `--ui` bind, so that list is empty on a non-loopback bind without `--ui`. `--allowed-origin` values that are not valid header values are dropped when the CORS layer is built, and an origin that could not be installed grants nothing, so they are absent here too.
+| `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only with `--scheduler`. |
+| `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only with `--scheduler`. |
+| `--open` | `bool` | `false` | With `--ui`: open the printed address in the default browser once the listener is bound. The address, token included, goes to the system opener (`open`, `xdg-open`, `rundll32`) as an argument, so other local users can read it in the process list. On a shared machine, pass `--token` and `--read-only`. A missing or failing opener is a warning. Refused without `--ui`. |
 
 ### Examples
 
-Start the server with defaults (loopback, token via env var):
+Start on loopback with a token from the environment, then call an endpoint:
 
 ```bash
 export ROCKY_SERVE_TOKEN=$(openssl rand -hex 32)
 rocky serve
-```
-
-```
-Compiled 14 models in 42ms
-Listening on http://127.0.0.1:8080
-Endpoints:
-  GET /api/v1/models              - List all compiled models
-  GET /api/v1/models/:name        - Get model details
-  GET /api/v1/models/:name/lineage - Column-level lineage
-  GET /api/v1/dag                 - Full dependency graph
-```
-
-Call an authenticated endpoint:
-
-```bash
 curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/v1/models
 ```
 
-Start with file watching on a custom port:
+Watch files on a custom port, with contracts:
 
 ```bash
-rocky serve --port 3000 --watch --token "$ROCKY_SERVE_TOKEN"
+rocky serve --models src/models --contracts src/contracts --port 3000 --watch --token "$ROCKY_SERVE_TOKEN"
 ```
 
-```
-Compiled 14 models in 42ms
-Watching models/ for changes...
-Listening on http://127.0.0.1:3000
-```
-
-Expose to the LAN with explicit token + origin allowlist:
+Expose to the LAN with a token and an origin allowlist:
 
 ```bash
-rocky serve \
-  --host 0.0.0.0 \
-  --token "$ROCKY_SERVE_TOKEN" \
-  --allowed-origin https://dashboard.internal \
-  --port 9090
-```
-
-Start with contracts:
-
-```bash
-rocky serve --models src/models --contracts src/contracts --port 9090 --watch
+rocky serve --host 0.0.0.0 --token "$ROCKY_SERVE_TOKEN" --allowed-origin https://dashboard.internal --port 9090
 ```
 
 ### Related Commands
@@ -583,23 +379,7 @@ rocky init-adapter <name>
 |----------|------|---------|-------------|
 | `name` | `string` | **(required)** | Adapter name, for example `redshift`. The crate is `rocky-<name>`. |
 
-```bash
-rocky init-adapter redshift
-```
-
-```
-Created adapter scaffold at crates/rocky-redshift/
-
-  crates/rocky-redshift/
-  ├── Cargo.toml
-  ├── src/
-  │   ├── lib.rs
-  │   ├── dialect.rs     ← SqlDialect trait (TODO: implement methods)
-  │   ├── adapter.rs     ← WarehouseAdapter trait (TODO: implement)
-  │   └── types.rs       ← TypeMapper trait
-  └── tests/
-      └── integration.rs ← Live tests (#[ignore])
-```
+Example: `rocky init-adapter redshift` creates `crates/rocky-redshift/` with `Cargo.toml`, `src/{lib,dialect,adapter,types}.rs` and `tests/integration.rs` (live tests, `#[ignore]`).
 
 The command then prints the next steps: add the crate to the workspace, choose `literal_escape` in `dialect.rs` (the crate does not compile until you do), implement the traits, and register the adapter in `registry.rs`.
 
@@ -626,10 +406,6 @@ rocky connector init <name> [--dir <path>] [--lang python]
 
 ```bash
 rocky connector init orders
-```
-
-```
-Created connector `orders` in connectors/orders
 ```
 
 The directory holds five files:
@@ -713,15 +489,6 @@ rocky hooks test <event>
 
 `hooks test` builds a synthetic context for the event, prints it, and runs every hook configured for that event.
 
-```bash
-$ rocky hooks test on_pipeline_start
-Firing test event: on_pipeline_start
-Context JSON:
-{ ... }
-
-All hooks passed.
-```
-
 See [Hooks](/concepts/hooks/) for the events and the config.
 
 ---
@@ -745,15 +512,10 @@ rocky validate-migration --dbt-project <PATH> [flags]
 ### Examples
 
 ```bash
-$ rocky validate-migration --dbt-project ~/dbt-project
-Migration Validation Report
-===========================
-
-Models:  12 imported, 0 failed
-
-Results:
-  12 models validated successfully
+rocky validate-migration --dbt-project ~/dbt-project
 ```
+
+The report lists models imported and failed, and conversion results.
 
 ### Related Commands
 
@@ -805,13 +567,6 @@ rocky test-adapter --command <PATH> [--adapter-config <JSON>]
 | `--adapter <NAME>` | `string` | | Adapter name. Built-in names are `databricks`, `snowflake`, `duckdb`, `postgres`, `redshift`, `clickhouse`, `sqlserver` and `spark`. Any other name resolves to a `rocky-<name>` executable on your `PATH`. |
 | `--command <PATH>` | `string` | | Path to a process adapter binary. |
 | `--adapter-config <JSON>` | `string` | | Adapter config as a JSON string. |
-
-```bash
-$ rocky test-adapter --adapter duckdb
-Adapter Conformance: duckdb (SDK 1.x)
-==================================================
-...
-```
 
 Most specs report `skipped` today. The suite declares 26 specs. Three of them (`format_table_ref`, `watermark_where` and `row_hash`) run real dialect calls, and only against a process adapter. On a built-in adapter, those three are skipped too. A skipped spec never counts as a pass. A run that verified nothing prints a warning. It still exits `0`, because the exit status keys on failures only.
 
@@ -901,28 +656,7 @@ rocky list consumers <model>   # what depends on a model
 
 Bare `rocky list` lists models, so `rocky list --select +fct_orders` works like `dbt ls`. Its JSON is the same as `rocky list models`. Rocky finds models in the models directory and its direct subdirectories, which covers the common `models/{layer}/` layout.
 
-```
-$ rocky -o table list pipelines
-NAME                      TYPE             TARGET               SOURCE               DEPENDS ON
-playground                replication      default              default              -
-```
-
-```json
-{
-  "version": "1.80.0",
-  "command": "list_pipelines",
-  "pipelines": [
-    {
-      "name": "playground",
-      "pipeline_type": "replication",
-      "target_adapter": "default",
-      "source_adapter": "default",
-      "depends_on": [],
-      "concurrency": "16"
-    }
-  ]
-}
-```
+`rocky -o table list pipelines` prints `NAME`, `TYPE`, `TARGET`, `SOURCE` and `DEPENDS ON` columns. The JSON has `command: "list_pipelines"` and a `pipelines` array of `name`, `pipeline_type`, `target_adapter`, `source_adapter`, `depends_on` and `concurrency`.
 
 ### Related Commands
 

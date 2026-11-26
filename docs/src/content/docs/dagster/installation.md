@@ -5,13 +5,7 @@ sidebar:
   order: 2
 ---
 
-`dagster-rocky` is the Python package that lets Dagster run Rocky. Install it
-into the same environment as your Dagster code location, then install the
-`rocky` binary it calls. A code location is the Python process where Dagster
-loads your definitions.
-
-You install two things because Rocky itself is a Rust program. The Python
-package only builds the commands and reads the JSON that comes back.
+Install `dagster-rocky` into the same environment as your Dagster code location, then install the `rocky` binary it calls. Rocky is a Rust program. The Python package only builds the commands and reads the JSON that comes back.
 
 ```
 ┌──────────────────┐  Python call  ┌────────────────────┐
@@ -57,9 +51,7 @@ older.
 
 ### Vendor binary for deployment
 
-Vendor the binary next to your Dagster code when you want to pin one Rocky
-version. This suits containers and cloud deployments, where the host machine
-has nothing installed.
+Vendor the binary next to your Dagster code to pin one Rocky version, for example in containers.
 
 ```
 my_dagster_project/

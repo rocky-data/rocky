@@ -383,6 +383,20 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         self.default_catalog.clone()
     }
 
+    /// DuckDB runs in this process, so its statements end when the process
+    /// ends. There is nothing to cancel.
+    fn in_flight_statements(&self) -> Vec<rocky_core::statement_cancel::StatementHandle> {
+        Vec::new()
+    }
+
+    /// See [`Self::in_flight_statements`].
+    async fn cancel_statement(
+        &self,
+        _handle: &rocky_core::statement_cancel::StatementHandle,
+    ) -> AdapterResult<rocky_core::statement_cancel::CancelOutcome> {
+        Ok(rocky_core::statement_cancel::CancelOutcome::Unsupported)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         let conn = Arc::clone(&self.connector);
         let sql = sql.to_string();
@@ -1006,6 +1020,20 @@ pub fn classify_duckdb_failure(err: &AdapterError) -> FailureClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancel_is_unsupported_and_nothing_is_in_flight() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        assert!(adapter.in_flight_statements().is_empty());
+        let outcome = adapter
+            .cancel_statement(&rocky_core::statement_cancel::StatementHandle::new("any"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            rocky_core::statement_cancel::CancelOutcome::Unsupported
+        );
+    }
 
     #[tokio::test]
     async fn real_describe_missing_error_confirms_absence() {

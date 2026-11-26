@@ -7,11 +7,9 @@ sidebar:
 
 `dagster-rocky` is a thin adapter. It calls the `rocky` command-line binary through [`rocky-sdk`](/python-sdk/introduction/)'s `RockyClient`, then turns each result into Dagster assets and asset checks.
 
-Rocky and Dagster do different jobs. Rocky checks and runs your SQL. It type-checks each model, traces [column lineage](/reference/glossary/#lineage), and detects schema [drift](/reference/glossary/#drift). It also enforces [compile-time contracts](/reference/glossary/#compile-time-contract), which are schema agreements it checks before any row is written.
+Rocky type-checks and runs your SQL, traces [column lineage](/reference/glossary/#lineage), detects schema [drift](/reference/glossary/#drift), and enforces [compile-time contracts](/reference/glossary/#compile-time-contract). Dagster schedules, retries, alerts, and draws the asset graph. `dagster-rocky` reports each Rocky result as a native Dagster event.
 
-Dagster schedules the work, retries it, alerts on it, and draws the asset graph. `dagster-rocky` reports each Rocky result as a native Dagster event, so the asset graph shows what Rocky checked.
-
-`RockyResource` builds a `RockyClient` from your config and delegates every command to it. To drive Rocky from a notebook, a script, or a non-Dagster orchestrator, use the [SDK](/python-sdk/introduction/) directly.
+To drive Rocky from a notebook, a script, or a non-Dagster orchestrator, use the [SDK](/python-sdk/introduction/) directly.
 
 ## Quick start
 
@@ -57,7 +55,7 @@ defs = dg.Definitions(assets=[acme_orders], resources={"rocky": rocky})
 
 ## Architecture
 
-Every Rocky call travels down the same chain.
+Every Rocky call travels down this chain. Results travel back up it.
 
 ```
   ┌────────────────────────────────────────────────────────┐
@@ -91,7 +89,7 @@ Every Rocky call travels down the same chain.
   └────────────────────────────────────────────────────────┘
 ```
 
-Results travel back up the same chain. The CLI prints typed JSON on stdout. `RockyClient` parses that JSON into Pydantic models. `RockyResource` turns the models into asset materializations, asset check results, and metadata.
+The CLI prints typed JSON on stdout. `RockyClient` parses it into Pydantic models. `RockyResource` and the helpers turn the models into Dagster events.
 
 ## Requirements
 

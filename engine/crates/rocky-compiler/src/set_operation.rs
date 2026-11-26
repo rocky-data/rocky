@@ -28,8 +28,8 @@
 use std::collections::HashSet;
 
 use sqlparser::ast::{
-    Expr, InTarget, JoinConstraint, JoinOperator, Query, SelectItem, SetExpr, SetQuantifier,
-    Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    Expr, Function, InTarget, JoinConstraint, JoinOperator, Query, SelectItem, SetExpr,
+    SetQuantifier, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
 
@@ -105,52 +105,151 @@ impl Visitor for Places<'_> {
 /// - a subquery in the select list, `WHERE`, `HAVING` or a join's `ON`,
 ///   reached only through the expression forms [`keeps_binding`] lists.
 fn bound_subqueries(body: &SetExpr, out: &mut HashSet<*const Query>) {
+    let mut exprs = Vec::new();
+    bound_places(body, &mut exprs, out);
+    for expr in exprs {
+        let _ = expr.visit(&mut ExprSubqueries(out, 0, 0));
+    }
+}
+
+/// The places of `body` on the bound list: the expressions DuckDB binds
+/// whenever it binds `body` (the select list, `WHERE`, `HAVING` and a join's
+/// `ON`) go to `exprs`, and the queries directly in it at a bound place (a
+/// set-operation branch in parentheses, a derived table) go to `queries`.
+/// The one list both [`bound_subqueries`] and [`bound_calls`] read.
+fn bound_places<'a>(
+    body: &'a SetExpr,
+    exprs: &mut Vec<&'a Expr>,
+    queries: &mut HashSet<*const Query>,
+) {
     match body {
         SetExpr::Select(select) => {
             // A wildcard's `REPLACE` and `EXCLUDE` are not on the list.
             for item in &select.projection {
                 if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item
                 {
-                    let _ = expr.visit(&mut ExprSubqueries(out, 0, 0));
+                    exprs.push(expr);
                 }
             }
-            for expr in select.selection.iter().chain(&select.having) {
-                let _ = expr.visit(&mut ExprSubqueries(out, 0, 0));
-            }
+            exprs.extend(select.selection.iter().chain(&select.having));
             for from in &select.from {
-                bound_in_from(from, out);
+                bound_in_from(from, exprs, queries);
             }
         }
         SetExpr::SetOperation { left, right, .. } => {
-            bound_subqueries(left, out);
-            bound_subqueries(right, out);
+            bound_places(left, exprs, queries);
+            bound_places(right, exprs, queries);
         }
         SetExpr::Query(query) => {
-            out.insert(std::ptr::from_ref(&**query));
+            queries.insert(std::ptr::from_ref(&**query));
         }
         // Not on the list: `VALUES`, `TABLE`, `FROM`-first and the rest.
         _ => {}
     }
 }
 
-fn bound_in_from(from: &TableWithJoins, out: &mut HashSet<*const Query>) {
-    bound_in_factor(&from.relation, out);
+fn bound_in_from<'a>(
+    from: &'a TableWithJoins,
+    exprs: &mut Vec<&'a Expr>,
+    queries: &mut HashSet<*const Query>,
+) {
+    bound_in_factor(&from.relation, exprs, queries);
     for join in &from.joins {
-        bound_in_factor(&join.relation, out);
+        bound_in_factor(&join.relation, exprs, queries);
         if let Some(JoinConstraint::On(on)) = on_constraint(&join.join_operator) {
-            let _ = on.visit(&mut ExprSubqueries(out, 0, 0));
+            exprs.push(on);
         }
     }
 }
 
-fn bound_in_factor(factor: &TableFactor, out: &mut HashSet<*const Query>) {
+/// The function calls in `query` that DuckDB binds whenever it binds the
+/// model's query, by the rule `E071` uses: a call in a place on the bound
+/// list of a bound query ([`bound_places`]), reached only through the forms
+/// [`keeps_binding`] lists. A call passed as an argument to another call is
+/// not one: a macro drops an argument its body does not use. Read by the
+/// argument-count check `E068` (#2690); a call not returned here is at most
+/// a warning (`W068`). The pointers are only valid for this parse of the SQL.
+pub(crate) fn bound_calls(query: &Query) -> HashSet<*const Function> {
+    struct BoundCalls {
+        root: *const Query,
+        bound: HashSet<*const Query>,
+        calls: HashSet<*const Function>,
+    }
+    impl Visitor for BoundCalls {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+            let this = std::ptr::from_ref(query);
+            if this == self.root || self.bound.contains(&this) {
+                bound_subqueries(&query.body, &mut self.bound);
+                let mut exprs = Vec::new();
+                bound_places(&query.body, &mut exprs, &mut HashSet::new());
+                for expr in exprs {
+                    let _ = expr.visit(&mut ExprCalls(&mut self.calls, 0, 0));
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let mut visitor = BoundCalls {
+        root: std::ptr::from_ref(query),
+        bound: HashSet::new(),
+        calls: HashSet::new(),
+    };
+    let _ = query.visit(&mut visitor);
+    visitor.calls
+}
+
+/// Collects the outermost calls in an expression reached only through
+/// [`keeps_binding`] forms, outside any subquery. Fields: output, query
+/// depth, depth of other forms (a call is one).
+struct ExprCalls<'o>(&'o mut HashSet<*const Function>, usize, usize);
+
+impl Visitor for ExprCalls<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<()> {
+        self.1 += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<()> {
+        self.1 -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+        if self.1 == 0
+            && self.2 == 0
+            && let Expr::Function(function) = expr
+        {
+            self.0.insert(std::ptr::from_ref(function));
+        }
+        if !keeps_binding(expr) {
+            self.2 += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<()> {
+        if !keeps_binding(expr) {
+            self.2 -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn bound_in_factor<'a>(
+    factor: &'a TableFactor,
+    exprs: &mut Vec<&'a Expr>,
+    queries: &mut HashSet<*const Query>,
+) {
     match factor {
         TableFactor::Derived { subquery, .. } => {
-            out.insert(std::ptr::from_ref(&**subquery));
+            queries.insert(std::ptr::from_ref(&**subquery));
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => bound_in_from(table_with_joins, out),
+        } => bound_in_from(table_with_joins, exprs, queries),
         // Not on the list: table functions, `UNNEST`, `PIVOT` and the rest.
         _ => {}
     }

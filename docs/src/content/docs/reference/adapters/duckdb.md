@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as both at once. One adapter instance can serve discovery and execution together, because both sides read the same database.
+DuckDB runs inside the Rocky process. Use it as a warehouse, a source, or both: one adapter instance serves discovery and execution, because both read the same database.
 
 ## Fields
 
@@ -16,28 +16,17 @@ DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as 
 | `offline` | bool | No | `false` | Rocky never runs `INSTALL` and turns DuckDB's auto-install off. See [Offline mode](#offline-mode). |
 | `attach` | list of tables | No | (none) | Iceberg REST and DuckLake catalogs to attach on connect. See [Iceberg catalogs](#iceberg-catalogs) and [DuckLake catalogs](#ducklake-catalogs). |
 
-Pick one. Each example is a complete adapter declaration, not a complete `rocky.toml`.
-
-**In-memory.** DuckDB opens an in-memory database instead of a database file.
-
 ```toml
 [adapter.local]
-type = "duckdb"
-```
-
-**Persistent file.**
-
-```toml
-[adapter.local]
-type = "duckdb"
-path = "warehouse.duckdb"
+type = "duckdb"                  # in-memory: omit `path`
+path = "warehouse.duckdb"        # persistent file
 ```
 
 ## Offline mode
 
-By default, Rocky loads DuckDB's `icu` extension at connect. `icu` provides `current_date` and the time-zone functions. If `icu` is not in the extension directory, DuckDB downloads it. On a machine with no network, that download fails, Rocky logs a warning and carries on, and a query that uses a time-zone function then fails.
+By default, Rocky loads DuckDB's `icu` extension at connect. `icu` provides `current_date` and the time-zone functions. If `icu` is not in the extension directory, DuckDB downloads it. With no network, the download fails, Rocky logs a warning and carries on, and a query that uses a time-zone function then fails.
 
-Set `offline = true` to make that case explicit. DuckDB's auto-install is turned off, and Rocky never runs `INSTALL`. It runs `LOAD icu` from the extension directory only. If `icu` is not there, the connect fails with an error that names the directory and says how to fill it.
+Set `offline = true` to make that case explicit. DuckDB's auto-install is off and Rocky never runs `INSTALL`. It runs `LOAD icu` from the extension directory only. If `icu` is not there, the connect fails with an error that names the directory, the DuckDB version and the platform it expects.
 
 ```toml
 [adapter.local]
@@ -46,7 +35,7 @@ extension_directory = "/opt/rocky/duckdb-extensions"
 offline = true
 ```
 
-Fill the directory once, on a machine with network access:
+Fill the directory once on a machine with network access, then copy it to the offline machine. DuckDB stores files under `<version>/<platform>/`, so use the same DuckDB build that Rocky runs.
 
 ```sql
 SET extension_directories = ['/opt/rocky/duckdb-extensions'];
@@ -55,13 +44,9 @@ INSTALL icu;
 
 Rocky sets that path as DuckDB's `extension_directories` (a list of one path). DuckDB 2.0 deprecates the older `extension_directory` setting. The Rocky config key stays `extension_directory`.
 
-Offline mode applies to every DuckDB connection Rocky opens for the project: the adapter itself, and the local in-memory databases of `rocky test`, `rocky ci`, `rocky compile` (the seed it runs for source schemas), `rocky publish-ir --with-seed` and `rocky replay --execute`. These read the settings of the `type = "duckdb"` adapters in `rocky.toml`. With several DuckDB adapters, the local database is offline when any of them sets `offline = true`, and uses the first `extension_directory` found. For `rocky compile`, a missing extension only logs a warning, and compile goes on without the seed schemas.
+Offline mode applies to every DuckDB connection Rocky opens for the project: the adapter, and the local in-memory databases of `rocky test`, `rocky ci`, `rocky compile` (the seed for source schemas), `rocky publish-ir --with-seed` and `rocky replay --execute`. With several DuckDB adapters, the local database is offline when any of them sets `offline = true`, and uses the first `extension_directory` found. For `rocky compile`, a missing extension only logs a warning, and compile goes on without the seed schemas. `rocky playground` seeds its project before a `rocky.toml` exists, so it uses DuckDB's defaults.
 
-Offline mode limits what Rocky does. It does not sandbox a model's own SQL: a model that runs `INSTALL` or `SET autoinstall_known_extensions = true` can still reach the network. `rocky validate` warns with `V059` when `extension_directory` or `offline` is set on an adapter whose `type` is not `duckdb`, because no other adapter reads them.
-
-One path stays online. `rocky playground` seeds its new project database before a `rocky.toml` exists, so it uses DuckDB's defaults.
-
-Then copy the directory to the offline machine. DuckDB stores files under `<version>/<platform>/`, so the directory must come from the same DuckDB build that Rocky runs. The connect error prints the version and platform it expects.
+Offline mode does not sandbox a model's own SQL: a model that runs `INSTALL` or `SET autoinstall_known_extensions = true` can still reach the network. `rocky validate` warns with `V059` when `extension_directory` or `offline` is set on an adapter whose `type` is not `duckdb`.
 
 ## Iceberg catalogs
 
@@ -112,7 +97,7 @@ What Rocky writes to an attached catalog:
   COMMIT                              any failure → ROLLBACK; the old table and rows stay
   ```
 
-  The model's rows are held in a temporary table first, so a model that reads its own table sees the old rows, as with `CREATE OR REPLACE` elsewhere. The temporary table uses DuckDB's memory and spills to disk when it is large.
+  The model's rows are held in a temporary table first (DuckDB memory, spilling to disk), so a model that reads its own table sees the old rows.
 
   Types are compared the way Iceberg stores them (`TINYINT`, `SMALLINT`, `UTINYINT` and `USMALLINT` are `INTEGER`; `UINTEGER` is `BIGINT`; `HUGEINT` is `DECIMAL(38,0)`), so a re-run with no change runs no `ALTER`. A type may widen from `INTEGER` to `BIGINT`, from `FLOAT` to `DOUBLE`, or to a wider `DECIMAL` precision. Any other type change, a nested type change, a new nested column (`LIST`, `STRUCT` or `MAP`; DuckDB cannot add one to an Iceberg table), or dropping a partition column fails the model and leaves the table as it was. If a `COMMIT` fails without saying why, the error says the catalog may have committed it; running the model again is safe. New columns go at the end of the table. A commit conflict with another writer runs the transaction again, up to 3 times.
 - **`incremental` without `unique_key`.** Appends, like on a plain DuckDB file.
@@ -144,9 +129,7 @@ data_path = "lake/data/"
 | `metadata_path` | string | Yes | The DuckDB file that holds the catalog. It is created on the first attach. It must not be the adapter's own `path`, and it must not hold a `:` (`sqlite:`, `postgres:` and `:memory:` are not supported). |
 | `data_path` | string | No | A local directory. When unset, DuckLake uses the path it stored when the catalog was created (`<metadata_path>.files/` for a new one). An `s3://` data path is not supported yet. |
 
-Rocky makes a relative `metadata_path` and `data_path` absolute against the working directory before it attaches. DuckLake stores the data path as written, and a relative one would resolve differently in each later process. For the same reason Rocky refuses a lake whose stored data path is relative. Rocky never overrides the stored data path, so a different `data_path` for an existing lake fails at attach.
-
-A lake stays at the absolute directory it was created in. If the project moves, the attach fails until `data_path` names the stored path or the data moves back.
+Rocky makes a relative `metadata_path` and `data_path` absolute against the working directory before it attaches, because DuckLake stores the data path as written. It refuses a lake whose stored data path is relative, and never overrides a stored data path: a different `data_path` for an existing lake fails at attach. A lake stays at the absolute directory it was created in, so if the project moves, the attach fails until `data_path` names the stored path or the data moves back.
 
 `rocky run` loads the `ducklake` extension. With `offline = true`, it must already be in the extension directory.
 
