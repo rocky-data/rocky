@@ -107,7 +107,7 @@ pub enum BigQueryError {
     /// failure kind is unknown), and the run reports it as failed with this
     /// message.
     #[error(
-        "BigQuery job {job_id} finished without error, but Rocky could not read its result; its changes are applied, so do not run it again: {cause}"
+        "BigQuery job {job_id} finished successfully on BigQuery, but Rocky lost its result; any changes it made are applied, so do not run it again: {cause}"
     )]
     ResultLost {
         job_id: String,

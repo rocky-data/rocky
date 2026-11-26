@@ -713,9 +713,9 @@ impl std::fmt::Display for PartialFailure {
             return write!(
                 f,
                 "{} table(s) failed during parallel execution (run_id: {}); at least one \
-                 statement may still be running on the warehouse, or finished without Rocky \
-                 reading its result, so confirm it has stopped and check what it applied before \
-                 you use --resume {}",
+                 statement may still be running on the warehouse, or has already finished without \
+                 Rocky reading its result (do not run that one again); check the table on the \
+                 warehouse, and use --resume {} only if the change is not there",
                 self.count, self.run_id, self.run_id
             );
         }
@@ -9103,9 +9103,9 @@ pub(crate) async fn run_with_direct_gate(
         if may_still_run {
             anyhow::bail!(
                 "{count} table(s) failed during parallel execution (run_id: {run_id}); at least one \
-                 statement may still be running on the warehouse, or finished without Rocky \
-                 reading its result, so confirm it has stopped and check what it applied before \
-                 you use --resume {run_id}"
+                 statement may still be running on the warehouse, or has already finished without \
+                 Rocky reading its result (do not run that one again); check the table on the \
+                 warehouse, and use --resume {run_id} only if the change is not there"
             );
         }
         anyhow::bail!(
@@ -37752,8 +37752,8 @@ backend = "local"
         .to_string();
         assert!(
             running.contains("may still be running")
-                && running.contains("finished without Rocky reading its result")
-                && running.contains("check what it applied before you use --resume run-1")
+                && running.contains("already finished without Rocky reading its result")
+                && running.contains("use --resume run-1 only if the change is not there")
                 && !running.contains("to retry"),
             "a statement that may still run must not be told to resume: {running}"
         );
