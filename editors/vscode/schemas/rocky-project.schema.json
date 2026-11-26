@@ -5151,7 +5151,7 @@
             "quarantine": null,
             "row_count": false
           },
-          "description": "Data quality checks run after model execution."
+          "description": "Data quality checks. A transformation run does not execute them, and `rocky validate` warns (V034) about each one that is set."
         },
         "depends_on": {
           "default": [],
