@@ -62,14 +62,19 @@ Alert on any non-zero exit. Give exit `2` its own channel.
 
 | Adapter | Cancels on a forced exit |
 |---------|--------------------------|
-| Databricks | Yes, once the statement has an id: after the first 30 seconds |
-| Snowflake | Yes, once the statement has a handle: after the first 45 seconds |
+| Databricks | Yes, from the start: the submit returns the id at once |
+| Snowflake | Yes, from the start: the submit is asynchronous and returns the handle at once |
 | BigQuery, Trino | No. A later release adds it |
 | PostgreSQL, Redshift | No. The server statement timeout that Rocky sets from `timeout_secs` still stops it |
 | SQL Server, ClickHouse, Spark | No. The statement runs on |
 | DuckDB | Not needed. It runs inside the `rocky` process and ends with it |
 
-A Databricks or Snowflake statement younger than that limit has no id yet, so Rocky cannot cancel it. Other adapters do not cancel: they list no statements, so Rocky prints nothing for them. Only a forced exit cancels. A fan-out abort inside the run, a client timeout and a poll error do not cancel yet. Rocky stops waiting on such a statement, and the warehouse runs it on. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
+Other adapters do not cancel: they list no statements, so Rocky prints nothing for them. On Databricks and Snowflake, Rocky also cancels on the other paths that stop waiting on a statement:
+
+- **A fan-out abort** (`fail_fast`, or the error-rate abort) cancels the copies still running, then drops them. It logs one warning per statement.
+- **The client deadline** (`timeout_secs`) and **a poll error that re-polling does not fix** cancel the statement before the error is returned. Rocky never submits that statement again, and the run does not retry it, because it may still run. A transient poll error polls the same statement again.
+
+Each cancel waits at most 3 seconds for an answer. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
 
 One wrapper makes the routing reusable across every scheduler:
 
