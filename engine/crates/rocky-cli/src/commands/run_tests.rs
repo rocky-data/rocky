@@ -102,3 +102,28 @@ pub(crate) async fn evaluate_model_tests(
         blocking.join("; ")
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TestBatching;
+    use crate::commands::run::{SkipGateConfig, SkipRunOptions};
+
+    /// `rocky run --batch-tests` reaches the evaluator; without it the run
+    /// keeps one query per test (#2756).
+    #[test]
+    fn the_batch_tests_flag_reaches_the_gate_config() {
+        let config = rocky_core::config::RunConfig::default();
+        let on = SkipRunOptions {
+            batch_tests: true,
+            ..SkipRunOptions::default()
+        };
+        assert_eq!(
+            SkipGateConfig::resolve(&on, &config, false).test_batching,
+            TestBatching::PerModel
+        );
+        assert_eq!(
+            SkipGateConfig::resolve(&SkipRunOptions::default(), &config, false).test_batching,
+            TestBatching::Off
+        );
+    }
+}

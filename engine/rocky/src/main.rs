@@ -1344,8 +1344,8 @@ enum Command {
 
         /// Batch each built model's default-config `unique` tests into one
         /// query, and its `not_null` tests into another, when it has at
-        /// least two of that type. A test with `severity`, `filter` or any
-        /// other option still runs alone. If a batch query fails, its tests
+        /// least two of that type. A test with `severity = "warning"`, a
+        /// `filter` or a `composite` test still runs alone. If a batch query fails, its tests
         /// rerun one by one. The per-test results are the same; only the
         /// number of queries changes. Off by default.
         #[arg(long)]
@@ -2135,8 +2135,8 @@ enum Command {
         pipeline: Option<String>,
         /// With `--declarative`: batch each model's default-config `unique`
         /// tests into one query, and its `not_null` tests into another, when
-        /// it has at least two of that type. A test with `severity`,
-        /// `filter` or any other option still runs alone. If a batch query
+        /// it has at least two of that type. A test with
+        /// `severity = "warning"`, a `filter` or a `composite` test still runs alone. If a batch query
         /// fails, its tests rerun one by one. The per-test results are the
         /// same; only the number of queries changes. Off by default.
         #[arg(long, requires = "declarative")]

@@ -488,6 +488,69 @@ fn test_type_label(tt: &TestType) -> &'static str {
 }
 
 #[cfg(test)]
+mod batch_shape_tests {
+    use super::{not_null_batch_counts, unique_batch_counts};
+    use rocky_core::traits::QueryResult;
+    use serde_json::{Value, json};
+
+    fn rows(rows: Vec<Vec<Value>>) -> QueryResult {
+        QueryResult {
+            columns: vec![],
+            rows,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_batch_result_is_read_by_index() {
+        assert_eq!(
+            not_null_batch_counts(&rows(vec![vec![json!(0), json!("3")]]), 2),
+            Some(vec![0, 3])
+        );
+        // Rows out of order and a string-typed index still map by index.
+        assert_eq!(
+            unique_batch_counts(
+                &rows(vec![vec![json!("1"), json!(4)], vec![json!(0), json!(0)]]),
+                2
+            ),
+            Some(vec![0, 4])
+        );
+    }
+
+    /// Every surprise falls back to single queries; none reads as a pass.
+    #[test]
+    fn an_unexpected_batch_shape_is_refused() {
+        let not_null = [
+            rows(vec![]),
+            rows(vec![vec![json!(0)]]),
+            rows(vec![vec![json!(0), json!(0), json!(0)]]),
+            rows(vec![vec![json!(0), Value::Null]]),
+            rows(vec![vec![json!(0), json!(-1)]]),
+            rows(vec![vec![json!(0), json!(1.5)]]),
+            rows(vec![vec![json!(0), json!(0)], vec![json!(0), json!(0)]]),
+        ];
+        for result in &not_null {
+            assert_eq!(not_null_batch_counts(result, 2), None, "{result:?}");
+        }
+        let unique = [
+            rows(vec![vec![json!(0), json!(0)]]),
+            rows(vec![vec![json!(0), json!(0)], vec![json!(0), json!(1)]]),
+            rows(vec![vec![json!(0), json!(0)], vec![json!(2), json!(1)]]),
+            rows(vec![vec![json!(0), json!(0)], vec![json!(1)]]),
+            rows(vec![vec![json!(0), json!(0)], vec![json!(1), Value::Null]]),
+            rows(vec![vec![json!(0), json!(0)], vec![Value::Null, json!(0)]]),
+            rows(vec![
+                vec![json!(0), json!(0)],
+                vec![json!(1), json!(0)],
+                vec![json!(1), json!(0)],
+            ]),
+        ];
+        for result in &unique {
+            assert_eq!(unique_batch_counts(result, 2), None, "{result:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::interpret_result;
     use rocky_core::tests::TestType;
