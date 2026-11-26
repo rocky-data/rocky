@@ -76,11 +76,11 @@ Other adapters do not cancel: they list no statements, so Rocky prints nothing f
 - **The client deadline** (`timeout_secs`) and **a poll error that re-polling does not fix** cancel the statement before the error is returned. Rocky never submits that statement again, and the run does not retry it (`table_retries` skips the table too), because it may still run. Rocky never resends it within a run. A scheduler `retry.max` (default 0) still restarts a failed run; set it only for pipelines marked `retry_safe`. A transient poll error polls the same statement again.
 - **A cancel during a source row count** (`[[product.source.volume]]`) cancels the `SELECT COUNT(*)` before Rocky drops it.
 
-On BigQuery, a load job (`jobs.insert`) is cancelled the same way. Trino cancels through `DELETE /v1/query/{id}`, which the coordinator allows for a query you own. A Trino page read that fails with a `502`, `503` or `504`, or a transport error, reads the same page again.
+On BigQuery, a poll error that re-polling does not fix first asks `jobs.get` how the job ended (at most 3 more seconds). A job that failed returns its own error, with no cancel. A job that succeeded is not cancelled and not sent again: its changes are applied, but Rocky could not read its result, so the table fails with an error that says so (`failure_kind: "unknown"`). Only a job that has not ended, or one `jobs.get` cannot answer for, is cancelled. A load job (`jobs.insert`) is cancelled the same way. Trino cancels through `DELETE /v1/query/{id}`, which the coordinator allows for a query you own. A Trino page read that fails with a `502`, `503` or `504`, or a transport error, reads the same page again.
 
 One gap stays: a submit that times out at the transport, or that gets a `429`, `502`, `503` or `504` answer, is sent again. The warehouse may have accepted the first one, and with no id Rocky cannot cancel it (#2774).
 
-Each cancel waits at most 3 seconds for an answer. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
+Each cancel waits at most 3 seconds for an answer (on BigQuery, after the `jobs.get` wait above). An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
 
 One wrapper makes the routing reusable across every scheduler:
 

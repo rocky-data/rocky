@@ -2296,8 +2296,8 @@ async fn a_transient_poll_error_polls_the_same_job_again() {
     assert_eq!(result.rows.len(), 1);
 }
 
-/// #2768: a poll error that polling again does not fix cancels the job.
-/// The submit is never repeated.
+/// #2768: a poll error that polling again does not fix, on a job that still
+/// runs, cancels the job. The submit is never repeated.
 #[tokio::test]
 async fn poll_errors_that_persist_cancel_and_do_not_resubmit() {
     let server = MockServer::start().await;
@@ -2308,6 +2308,7 @@ async fn poll_errors_that_persist_cancel_and_do_not_resubmit() {
         .expect(3)
         .mount(&server)
         .await;
+    mount_job_status(&server, "job-lost", json!({"state": "RUNNING"})).await;
 
     let adapter = retrying_adapter(&server, 2);
     let err = adapter
@@ -2323,51 +2324,145 @@ async fn poll_errors_that_persist_cancel_and_do_not_resubmit() {
     }
 }
 
-/// Mount `jobs.get` for `job_id` answering `state`.
-async fn mount_job_state(server: &MockServer, job_id: &str, state: &str) {
+/// Mount `jobs.get` for `job_id`, answered once with `status` as the job's
+/// `status` block.
+async fn mount_job_status(server: &MockServer, job_id: &str, status: serde_json::Value) {
     Mock::given(method("GET"))
         .and(path(format!("{JOBS_PATH}/{job_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobReference": {"projectId": "test-project", "jobId": job_id},
-            "status": {"state": state}
+            "status": status
         })))
         .expect(1)
         .mount(server)
         .await;
 }
 
-/// #2768: an error on the poll of a job that has ended (`jobs.get` says
-/// `DONE`) is the job's own failure, whatever its status: no cancel is sent
-/// and the error stays BigQuery's answer, so `is_missing_object_error` and
-/// the `failure_kind` mapping still see it.
+/// A `DONE` job status that failed with `reason` and `message`.
+fn failed_status(reason: &str, message: &str) -> serde_json::Value {
+    json!({
+        "state": "DONE",
+        "errorResult": {"reason": reason, "message": message},
+        "errors": [{"reason": reason, "message": message}]
+    })
+}
+
+/// #2768: an error on the poll of a job that failed (`jobs.get` says `DONE`
+/// with an `errorResult`) is the job's own failure. The error is built from
+/// the `errorResult`, not the poll error: no cancel is sent, it is not
+/// retried, and a missing table is still seen as one.
 #[tokio::test]
-async fn an_error_on_the_poll_of_an_ended_job_is_its_outcome_not_an_abandon() {
+async fn an_error_on_the_poll_of_a_failed_job_is_its_own_error() {
     let missing_table = json!({"error": {"code": 404, "errors": [
         {"reason": "notFound", "message": "Not found: Table test-project:raw.orders"}
     ]}})
     .to_string();
-    for (status, body, missing) in [
-        (400, "invalidQuery".to_string(), false),
-        (403, "accessDenied".to_string(), false),
-        (404, missing_table, true),
+    for (status, body, reason, message, missing) in [
+        (
+            400,
+            "invalidQuery".to_string(),
+            "invalidQuery",
+            "Syntax error",
+            false,
+        ),
+        (
+            403,
+            "accessDenied".to_string(),
+            "accessDenied",
+            "Access Denied",
+            false,
+        ),
+        (
+            404,
+            missing_table,
+            "notFound",
+            "Not found: Table test-project:raw.orders was not found in location EU",
+            true,
+        ),
+        // A 5xx past the poll retries: never the transient poll error.
+        (
+            503,
+            "unavailable".to_string(),
+            "backendError",
+            "Internal error",
+            false,
+        ),
     ] {
         let server = MockServer::start().await;
         mount_submit_and_cancel(&server, "job-bad", 1, 0).await;
         Mock::given(method("GET"))
             .and(path(queries_path("job-bad")))
             .respond_with(ResponseTemplate::new(status).set_body_string(body))
-            .expect(1)
+            .expect(if status == 503 { 4 } else { 1 })
             .mount(&server)
             .await;
-        mount_job_state(&server, "job-bad", "DONE").await;
+        mount_job_status(&server, "job-bad", failed_status(reason, message)).await;
 
         let adapter = retrying_adapter(&server, 3);
-        let err = adapter.execute_statement("SELECT x").await.unwrap_err();
-        assert!(
-            matches!(as_bq_error(&err), BigQueryError::ApiError { status: s, .. } if s.starts_with(&status.to_string())),
-            "{status}: {err}"
+        let err = adapter
+            .execute_statement("INSERT INTO t SELECT x")
+            .await
+            .unwrap_err();
+        match as_bq_error(&err) {
+            BigQueryError::JobError {
+                reason: r,
+                message: m,
+            } => {
+                assert_eq!((r.as_str(), m.as_str()), (reason, message), "{status}");
+            }
+            other => panic!("{status}: expected JobError, got: {other:?}"),
+        }
+        assert!(!as_bq_error(&err).may_still_run(), "{status}");
+        assert_eq!(
+            adapter.classify_failure(&err),
+            rocky_core::failure_class::FailureClass::Permanent,
+            "{status}"
         );
         assert_eq!(adapter.is_missing_object_error(&err), missing, "{status}");
+    }
+}
+
+/// #2768: an error on the poll of a job that succeeded (`jobs.get` says
+/// `DONE` with no `errorResult`) means its changes are applied but Rocky lost
+/// its result. It is `ResultLost`: no cancel, never resubmitted, and never
+/// retried by the run loop or the `table_retries` arm (`may_still_run`).
+#[tokio::test]
+async fn an_error_on_the_poll_of_a_job_that_succeeded_is_result_lost() {
+    for (status, polls) in [(503, 4), (502, 4), (403, 1)] {
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, "job-done", 1, 0).await;
+        Mock::given(method("GET"))
+            .and(path(queries_path("job-done")))
+            .respond_with(ResponseTemplate::new(status).set_body_string("lost"))
+            .expect(polls)
+            .mount(&server)
+            .await;
+        mount_job_status(&server, "job-done", json!({"state": "DONE"})).await;
+
+        let adapter = retrying_adapter(&server, 3);
+        let err = adapter
+            .execute_statement("MERGE INTO t USING s ON TRUE WHEN MATCHED THEN DELETE")
+            .await
+            .unwrap_err();
+        match as_bq_error(&err) {
+            BigQueryError::ResultLost { job_id, cause } => {
+                assert_eq!(job_id, "job-done");
+                assert!(
+                    matches!(**cause, BigQueryError::ApiError { status: ref s, .. } if s.starts_with(&status.to_string())),
+                    "{cause:?}"
+                );
+            }
+            other => panic!("{status}: expected ResultLost, got: {other:?}"),
+        }
+        assert!(as_bq_error(&err).may_still_run(), "{status}");
+        assert_eq!(
+            adapter.classify_failure(&err),
+            rocky_core::failure_class::FailureClass::Permanent,
+            "{status}"
+        );
+        assert!(adapter.in_flight_statements().is_empty());
+        // `.expect(1)` on the submit and `.expect(0)` on the cancel are
+        // asserted when the server drops.
     }
 }
 
@@ -2385,7 +2480,7 @@ async fn an_error_on_the_poll_of_a_running_job_cancels_it() {
         .expect(1)
         .mount(&server)
         .await;
-    mount_job_state(&server, "job-404", "RUNNING").await;
+    mount_job_status(&server, "job-404", json!({"state": "RUNNING"})).await;
 
     let adapter = retrying_adapter(&server, 3);
     let err = adapter.execute_statement("SELECT 1").await.unwrap_err();
@@ -2393,6 +2488,37 @@ async fn an_error_on_the_poll_of_a_running_job_cancels_it() {
         matches!(as_bq_error(&err), BigQueryError::Abandoned { .. }),
         "{err}"
     );
+}
+
+/// #2768: when `jobs.get` fails too, Rocky cannot tell how the job ended, so
+/// it cancels the job and reports `Abandoned`.
+#[tokio::test]
+async fn a_failed_job_lookup_cancels_the_job() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-dark", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-dark")))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{JOBS_PATH}/job-dark")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = retrying_adapter(&server, 2);
+    let err = adapter
+        .execute_statement("INSERT INTO t SELECT 1")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(as_bq_error(&err), BigQueryError::Abandoned { .. }),
+        "{err}"
+    );
+    assert!(as_bq_error(&err).may_still_run());
 }
 
 /// #2768: a rate-limited poll (429) does not count as a failed poll, even

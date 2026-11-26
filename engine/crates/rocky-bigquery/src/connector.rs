@@ -95,6 +95,26 @@ pub enum BigQueryError {
         cause: Box<BigQueryError>,
     },
 
+    /// Job `job_id` finished without error (`jobs.get` says `DONE` with no
+    /// `status.errorResult`), but polling for its result failed with `cause`
+    /// and polling again did not help. Its changes, if any, are applied.
+    ///
+    /// Not [`Self::Abandoned`]: the job does not still run, so a cancel would
+    /// be pointless and "cancel requested" would be false. Not the poll error
+    /// itself either: that one is often transient, and a resend would apply
+    /// the job twice. So, like `Abandoned`, it is never retried, by the
+    /// connector or the run loop ([`Self::may_still_run`] is `true`, its
+    /// failure kind is unknown), and the run reports it as failed with this
+    /// message.
+    #[error(
+        "BigQuery job {job_id} finished without error, but Rocky could not read its result; its changes are applied, so do not run it again: {cause}"
+    )]
+    ResultLost {
+        job_id: String,
+        /// Not `#[source]`, for the same reason as on [`Self::Abandoned`].
+        cause: Box<BigQueryError>,
+    },
+
     /// BigQuery accepted the job but did not finish it in the submit's wait,
     /// and sent no `jobReference`. Nothing can poll or cancel the job, which
     /// may still run. BigQuery always sends one when it creates a job (Rocky
@@ -116,16 +136,20 @@ pub enum BigQueryError {
 }
 
 impl BigQueryError {
-    /// Whether the job this error names may still run on BigQuery: a
-    /// [`Self::Timeout`] (the submit did not answer by the deadline, so it may
-    /// have been accepted), an [`Self::Abandoned`] (the client stopped
-    /// waiting) or a [`Self::NoJobReference`]. No layer may resubmit such a
-    /// job: it could run twice.
+    /// Whether the job this error names may still run on BigQuery, or ran
+    /// and lost its result: a [`Self::Timeout`] (the submit did not answer by
+    /// the deadline, so it may have been accepted), an [`Self::Abandoned`]
+    /// (the client stopped waiting), a [`Self::NoJobReference`] or a
+    /// [`Self::ResultLost`] (the job finished without error). No layer may
+    /// resubmit such a job: it could run twice.
     #[must_use]
     pub fn may_still_run(&self) -> bool {
         matches!(
             self,
-            Self::Timeout { .. } | Self::Abandoned { .. } | Self::NoJobReference
+            Self::Timeout { .. }
+                | Self::Abandoned { .. }
+                | Self::NoJobReference
+                | Self::ResultLost { .. }
         )
     }
 }
@@ -436,8 +460,12 @@ impl BigQueryAdapter {
     /// ```text
     ///   jobs.query (waits ≤ 1 s) ──▶ jobReference ──▶ register ──▶ poll ... ──▶ done ──▶ Ok / JobError
     ///                                                                │
-    ///                          deadline, or a poll error that polling
-    ///                          again did not fix ──▶ jobs.cancel (bounded) ──▶ Abandoned
+    ///                          a poll error that polling again did not fix
+    ///                                 │
+    ///                          jobs.get (bounded) ──▶ DONE + errorResult ──▶ JobError
+    ///                                 │           └─▶ DONE, no error ──▶ ResultLost
+    ///                                 ▼
+    ///         deadline, not DONE, or no answer ──▶ jobs.cancel (bounded) ──▶ Abandoned
     /// ```
     async fn run_query_once(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
@@ -582,14 +610,21 @@ impl BigQueryAdapter {
             } else if failed_polls < self.retry.max_retries && is_transient(&err) {
                 failed_polls += 1;
                 compute_backoff(&self.retry, failed_polls - 1)
-            } else if self.job_has_ended(&job_ref.job_id).await {
-                // `jobs.getQueryResults` reports a failed job's error as its
-                // HTTP status (a 400, a 403, a 404 for a missing table, a
-                // 5xx for an internal error). A job that has ended is
-                // reported as it came, not cancelled.
-                return Ok(Err(err));
             } else {
-                return Err(err);
+                // Polling again will not help. `jobs.getQueryResults` reports
+                // a failed job's error as its HTTP status (a 400, a 403, a
+                // 404 for a missing table, a 5xx for an internal error), so
+                // the poll error alone cannot tell a failed job from a lost
+                // poll of a job that still runs or already succeeded. Ask
+                // `jobs.get`, and never report the poll error as the outcome.
+                return match self.job_end(&job_ref.job_id).await {
+                    JobEnd::Failed(job_error) => Ok(Err(job_error)),
+                    JobEnd::Succeeded => Ok(Err(BigQueryError::ResultLost {
+                        job_id: job_ref.job_id.clone(),
+                        cause: Box::new(err),
+                    })),
+                    JobEnd::NotEnded => Err(err),
+                };
             };
             warn!(
                 job_id = %job_ref.job_id,
@@ -634,22 +669,30 @@ impl BigQueryAdapter {
         Ok(resp.json().await?)
     }
 
-    /// Whether job `job_id` has ended (`jobs.get` says `status.state ==
-    /// "DONE"`). Asked once, after a poll failed in a way polling again will
-    /// not fix, to tell the job's own failure from a lost poll. Bounded by
-    /// [`ABANDON_CANCEL_BUDGET`]; no answer, or any error, counts as not
-    /// ended, so the job is then cancelled.
-    async fn job_has_ended(&self, job_id: &str) -> bool {
+    /// How job `job_id` ended, from `jobs.get`. Asked once, after a poll
+    /// failed in a way polling again will not fix. Bounded by
+    /// [`ABANDON_CANCEL_BUDGET`]; no answer, or any error, counts as
+    /// [`JobEnd::NotEnded`], so the job is then cancelled.
+    async fn job_end(&self, job_id: &str) -> JobEnd {
         let url = format!(
             "{}/bigquery/v2/projects/{}/jobs/{job_id}",
             self.base_url(),
             self.project_id,
         );
-        match tokio::time::timeout(ABANDON_CANCEL_BUDGET, self.get_job_once(&url)).await {
-            Ok(Ok(job)) => job
-                .status
-                .is_some_and(|status| status.state.as_deref() == Some("DONE")),
-            Ok(Err(_)) | Err(_) => false,
+        let Ok(Ok(job)) =
+            tokio::time::timeout(ABANDON_CANCEL_BUDGET, self.get_job_once(&url)).await
+        else {
+            return JobEnd::NotEnded;
+        };
+        let Some(status) = job.status else {
+            return JobEnd::NotEnded;
+        };
+        if status.state.as_deref() != Some("DONE") {
+            return JobEnd::NotEnded;
+        }
+        match status_error(&status) {
+            Some((reason, message)) => JobEnd::Failed(BigQueryError::JobError { reason, message }),
+            None => JobEnd::Succeeded,
         }
     }
 
@@ -1242,23 +1285,8 @@ impl BigQueryAdapter {
         let Some(status) = status else {
             return Ok(());
         };
-        let Some(err) = &status.error_result else {
+        let Some((reason, message)) = status_error(status) else {
             return Ok(());
-        };
-        let reason = err.reason.clone().unwrap_or_else(|| "unknown".into());
-        // Aggregate per-row / per-file reasons from `errors[]` when present
-        // so the operator sees the underlying cause, not just the summary
-        // `errorResult`. Fall back to `errorResult.message`.
-        let detail: Vec<String> = status
-            .errors
-            .iter()
-            .flatten()
-            .filter_map(|e| e.message.clone())
-            .collect();
-        let message = if detail.is_empty() {
-            err.message.clone().unwrap_or_default()
-        } else {
-            detail.join("; ")
         };
         Err(BigQueryError::LoadJobError { reason, message })
     }
@@ -2178,6 +2206,39 @@ struct JobStatus {
     errors: Option<Vec<JobErrorProto>>,
 }
 
+/// What `jobs.get` says of a job whose poll failed for good.
+enum JobEnd {
+    /// `DONE` with a `status.errorResult`: the job's own failure, as a
+    /// [`BigQueryError::JobError`].
+    Failed(BigQueryError),
+    /// `DONE` with no `status.errorResult`: the job succeeded.
+    Succeeded,
+    /// Not `DONE`, or `jobs.get` gave no answer: the job may still run.
+    NotEnded,
+}
+
+/// The `(reason, message)` of a job's `status.errorResult`, or `None` when
+/// the status carries none. The message aggregates the per-row / per-file
+/// reasons from `status.errors[]` when present, so the operator sees the
+/// underlying cause, not just the summary `errorResult`; it falls back to
+/// `errorResult.message`.
+fn status_error(status: &JobStatus) -> Option<(String, String)> {
+    let err = status.error_result.as_ref()?;
+    let reason = err.reason.clone().unwrap_or_else(|| "unknown".into());
+    let detail: Vec<String> = status
+        .errors
+        .iter()
+        .flatten()
+        .filter_map(|e| e.message.clone())
+        .collect();
+    let message = if detail.is_empty() {
+        err.message.clone().unwrap_or_default()
+    } else {
+        detail.join("; ")
+    };
+    Some((reason, message))
+}
+
 /// An `ErrorProto` under `Job.status`. Distinct from the query path's
 /// top-level [`ErrorProto`] only in where it lives on the wire; the shape
 /// (`reason` + `message`) is the same subset.
@@ -2307,8 +2368,9 @@ struct ErrorProto {
 /// - A job-level [`BigQueryError::JobError`] — a rejected query won't pass
 ///   on retry.
 /// - A job that may still run: a [`BigQueryError::Timeout`], an
-///   [`BigQueryError::Abandoned`] or a [`BigQueryError::NoJobReference`].
-///   A resubmit could run it twice (#2768).
+///   [`BigQueryError::Abandoned`] or a [`BigQueryError::NoJobReference`],
+///   and a job that succeeded but lost its result
+///   ([`BigQueryError::ResultLost`]). A resubmit could run it twice (#2768).
 pub(crate) fn is_transient(err: &BigQueryError) -> bool {
     match err {
         BigQueryError::ApiError { status, .. } => {
@@ -2327,6 +2389,7 @@ pub(crate) fn is_transient(err: &BigQueryError) -> bool {
         | BigQueryError::Auth(_)
         | BigQueryError::Timeout { .. }
         | BigQueryError::Abandoned { .. }
+        | BigQueryError::ResultLost { .. }
         | BigQueryError::NoJobReference
         | BigQueryError::RetryBudgetExhausted { .. }
         | BigQueryError::StorageRead(_) => false,
@@ -3071,6 +3134,13 @@ mod tests {
         // #2768: a job that may still run is never resubmitted, whatever
         // stopped the wait.
         assert!(!is_transient(&BigQueryError::NoJobReference));
+        assert!(!is_transient(&BigQueryError::ResultLost {
+            job_id: "j".into(),
+            cause: Box::new(BigQueryError::ApiError {
+                status: "503 Service Unavailable".into(),
+                message: String::new(),
+            }),
+        }));
         assert!(!is_transient(&BigQueryError::Abandoned {
             job_id: "j".into(),
             cancel: AbandonCancel::NoAnswer,

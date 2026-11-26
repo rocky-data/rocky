@@ -686,7 +686,8 @@ pub struct PartialFailure {
     /// never the exit code — both shapes are exit 2.
     pub check_gate_failed: bool,
     /// Whether a failed table's statement may still run on the warehouse (a
-    /// connector `Timeout` or `Abandoned`). Changes the resume advice only.
+    /// connector `Timeout` or `Abandoned`), or finished without Rocky reading
+    /// its result (a BigQuery `ResultLost`). Changes the resume advice only.
     pub statement_may_still_run: bool,
     /// Whether this run's record is persisted (#1836). Read by
     /// [`session_disposition`]; never changes the exit code, which stays 2
@@ -712,8 +713,9 @@ impl std::fmt::Display for PartialFailure {
             return write!(
                 f,
                 "{} table(s) failed during parallel execution (run_id: {}); at least one \
-                 statement may still be running on the warehouse, so confirm it has stopped \
-                 before you use --resume {}",
+                 statement may still be running on the warehouse, or finished without Rocky \
+                 reading its result, so confirm it has stopped and check what it applied before \
+                 you use --resume {}",
                 self.count, self.run_id, self.run_id
             );
         }
@@ -9033,7 +9035,8 @@ pub(crate) async fn run_with_direct_gate(
         if may_still_run {
             anyhow::bail!(
                 "{count} table(s) failed during parallel execution (run_id: {run_id}); at least one \
-                 statement may still be running on the warehouse, so confirm it has stopped before \
+                 statement may still be running on the warehouse, or finished without Rocky \
+                 reading its result, so confirm it has stopped and check what it applied before \
                  you use --resume {run_id}"
             );
         }
@@ -37681,7 +37684,8 @@ backend = "local"
         .to_string();
         assert!(
             running.contains("may still be running")
-                && running.contains("confirm it has stopped before you use --resume run-1")
+                && running.contains("finished without Rocky reading its result")
+                && running.contains("check what it applied before you use --resume run-1")
                 && !running.contains("to retry"),
             "a statement that may still run must not be told to resume: {running}"
         );
@@ -38027,8 +38031,9 @@ backend = "local"
 
     /// #2768, part B: the same skip for BigQuery and Trino. A copy whose job
     /// or query may still run (`Timeout`, `Abandoned`, or a BigQuery
-    /// `NoJobReference`) keeps its first error; an ordinary transient
-    /// failure of either adapter is still retried.
+    /// `NoJobReference`), or a BigQuery job that finished without error but
+    /// lost its result (`ResultLost`), keeps its first error; an ordinary
+    /// transient failure of either adapter is still retried.
     #[test]
     fn auto_retry_skips_a_bigquery_or_trino_copy_whose_statement_may_still_run() {
         use rocky_bigquery::connector::BigQueryError as BqE;
@@ -38082,20 +38087,27 @@ backend = "local"
                     last_state: "RUNNING".into(),
                 }),
             ),
+            entry(
+                5,
+                wrapped(BqE::ResultLost {
+                    job_id: "j5".into(),
+                    cause: Box::new(bq_503()),
+                }),
+            ),
             // Ordinary transient failures of each adapter.
-            entry(5, wrapped(bq_503())),
-            entry(6, wrapped(trino_503())),
+            entry(6, wrapped(bq_503())),
+            entry(7, wrapped(trino_503())),
         ];
 
         assert_eq!(
             super::auto_retry_indices(&errors),
-            vec![5, 6],
+            vec![6, 7],
             "only the ordinary failures are retried"
         );
-        for retried in &errors[5..] {
+        for retried in &errors[6..] {
             assert_eq!(retried.failure_kind, FailureKind::Transient);
         }
-        for skipped in &errors[..5] {
+        for skipped in &errors[..6] {
             assert_eq!(skipped.failure_kind, FailureKind::Unknown);
         }
     }

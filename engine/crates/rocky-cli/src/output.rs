@@ -1056,7 +1056,11 @@ impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
             E::TableNotFound { .. } => Self::NotFound,
             E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
             // See the databricks branch: the job may still run (#2768).
-            E::Timeout { .. } | E::Abandoned { .. } | E::NoJobReference => Self::Unknown,
+            // `ResultLost`: the job succeeded but its result was lost, so its
+            // outcome is unknown to Rocky and it must not be retried.
+            E::Timeout { .. } | E::Abandoned { .. } | E::NoJobReference | E::ResultLost { .. } => {
+                Self::Unknown
+            }
             E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,
             E::StorageRead(_) => Self::Unknown,
         }
@@ -1243,7 +1247,8 @@ fn cause_may_still_run(cause: &(dyn std::error::Error + 'static)) -> Option<bool
 
 /// Whether `err` carries a connector error that says its statement may still
 /// run on the warehouse (a Databricks, Snowflake, BigQuery or Trino `Timeout`
-/// or `Abandoned`, or a BigQuery `NoJobReference`).
+/// or `Abandoned`, or a BigQuery `NoJobReference`), or that finished without
+/// Rocky reading its result (a BigQuery `ResultLost`).
 /// A caller must not resubmit that work: it could run twice (#2768).
 ///
 /// Walks the chain the way [`classify_anyhow_error`] does, through both
@@ -15660,6 +15665,13 @@ mod failure_kind_tests {
                 FailureKind::Unknown,
             ),
             (BqE::NoJobReference, FailureKind::Unknown),
+            (
+                BqE::ResultLost {
+                    job_id: "j2".into(),
+                    cause: Box::new(api("503 Service Unavailable")),
+                },
+                FailureKind::Unknown,
+            ),
             (
                 BqE::RetryBudgetExhausted { limit: 3 },
                 FailureKind::QuotaExceeded,
