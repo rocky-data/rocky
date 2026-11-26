@@ -6321,7 +6321,28 @@ auto_create_catalogs = false
             ),
         )
         .unwrap();
-        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id, now() AS ts").unwrap();
+        // A time_interval or microbatch model must bound its rows with
+        // `@start_date` / `@end_date` (E024); other models read a source
+        // column straight through, so the incremental watermark filter has a
+        // column to land on (E046).
+        let sql = if strategy.contains("time_interval") || strategy.contains("microbatch") {
+            "SELECT id, ts FROM raw.orders WHERE ts >= @start_date AND ts < @end_date"
+        } else {
+            "SELECT id, ts FROM raw.orders"
+        };
+        std::fs::write(models.join("orders.sql"), sql).unwrap();
+        // Every positive `rerun_safe` assertion must sit on a model that
+        // compiles, so the fixture fails here if it would not run.
+        let compiled = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: models,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !compiled.has_errors,
+            "the fixture model must compile: {:?}",
+            compiled.diagnostics
+        );
         dir
     }
 
@@ -6410,9 +6431,10 @@ auto_create_catalogs = false
         );
     }
 
-    /// A keyless incremental model with a lookback re-appends its window on
-    /// every run, so it is not safe even on a single-writer DuckDB file. A
-    /// zero lookback re-reads nothing.
+    /// A keyless incremental model is never rerun-safe, on any adapter: with a
+    /// lookback it re-appends its window on every run, and with the
+    /// `@incremental_filter` placeholder or a `filter_column` a mis-specified
+    /// model re-appends rows even on a sequential run.
     #[test]
     fn a_loaded_keyless_lookback_model_is_not_rerun_safe_on_duckdb() {
         let lookback = |amount: &str| {
@@ -6427,8 +6449,31 @@ auto_create_catalogs = false
                 && message.contains("lookback"),
             "{message}"
         );
+        let zero = v069_message("duckdb", &lookback("0 days"));
+        assert!(
+            zero.starts_with("pipeline.silver: not_rerun_safe (model 'orders': ")
+                && zero.contains("no unique_key"),
+            "{zero}"
+        );
+    }
+
+    #[test]
+    fn a_loaded_incremental_model_is_safe_only_with_a_key() {
+        let keyless = v069_message(
+            "duckdb",
+            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n",
+        );
+        assert!(
+            keyless.starts_with("pipeline.silver: not_rerun_safe (model 'orders': ")
+                && keyless.contains("no unique_key"),
+            "{keyless}"
+        );
         assert_eq!(
-            v069_message("duckdb", &lookback("0 days")),
+            v069_message(
+                "duckdb",
+                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\
+                 unique_key = [\"id\"]\n",
+            ),
             "pipeline.silver: rerun_safe"
         );
     }

@@ -582,16 +582,19 @@ The class depends on four things: the pipeline type, each materialization strate
 | `ephemeral` | `rerun_safe` on every adapter. It writes nothing. |
 | `materialized_view` | `rerun_safe` on Databricks, Snowflake and BigQuery |
 | `dynamic_table` | `rerun_safe` on Snowflake |
-| `merge`, `incremental` with a `unique_key`, `time_interval`, `delete_insert` | `rerun_safe` on a DuckDB file only |
-| `incremental` with no `unique_key` and no `lookback`, or a `lookback` of 0 (transformation) | `rerun_safe` on a DuckDB file only |
-| `incremental` with no `unique_key` and a `lookback` above 0 | never. Each run appends the lookback window again. |
+| `merge` or `incremental` with a `unique_key`, `time_interval`, `delete_insert` | `rerun_safe` on a DuckDB file only |
+| `merge` with no `unique_key` | never |
+| `incremental` with no `unique_key` (transformation), with or without a `lookback` | never, on any adapter. With a `lookback` above 0 each run appends the window again. Without one, a model that does not filter on the watermark exactly can still append rows again on a sequential run. |
 | `microbatch` | the same as `time_interval`. Rocky runs a microbatch model as `time_interval`. |
 | `incremental` (replication), `snapshot`, `load` | never |
+| a `replication` pipeline with a `[[checks.custom]]` check | never. A replication run sends the check SQL to the warehouse as written. |
 | a `quality` pipeline | `rerun_safe` on every adapter. It only reads the warehouse. Not when `[checks.quarantine]` is on, or when the pipeline has a `[[checks.custom]]` check. |
 
 On Databricks, `merge`, `incremental` with a `unique_key` and `time_interval` are `not_rerun_safe` for now. Rocky has not proven what two overlapping writes do there. The message says "not proven under concurrent writers".
 
-"A DuckDB file" means a DuckDB adapter with no `[[adapter.NAME.attach]]`. Its `path` is a plain file path, `:memory:`, or not set. A `path` with a `:` in it, such as `md:prod` or `ducklake:meta.ducklake`, is not a DuckDB file. The exceptions are `:memory:` and a Windows drive letter such as `C:\`. Each scheduled run is a separate process, and only one process can open a DuckDB file to write. So two runs cannot overlap.
+"A DuckDB file" means a DuckDB adapter with no `[[adapter.NAME.attach]]`. Its `path` is a plain file path, `:memory:`, or not set. A `path` with a `:` in it, such as `md:prod` or `ducklake:meta.ducklake`, is not a DuckDB file. The exceptions are `:memory:` and a Windows drive letter such as `C:\`. Each scheduled run is a separate process, and only one process can open a DuckDB file to write. So two runs cannot overlap. That holds only while DuckDB enforces its file lock, as it does on a local disk. A network mount may not enforce it. A `path` with no `:` that points at a SQLite file is also treated as a DuckDB file.
+
+The class judges the statements of a normal run. It does not cover the first-run bootstrap or the rebuild after schema drift.
 
 Other adapter types are `not_rerun_safe` for every write, except `ephemeral` and a `quality` pipeline as shown above.
 

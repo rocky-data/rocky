@@ -209,6 +209,9 @@ pub enum ResolvedWrites {
     NotNeeded,
 }
 
+const CUSTOM_CHECK_REASON: &str =
+    "a [[checks.custom]] check runs its SQL as written, so Rocky cannot prove it only reads";
+
 /// Classify a pipeline. A pipeline is safe only when every materialization
 /// it writes is safe; a transformation pipeline that builds no models, and
 /// any write that cannot be resolved, is not safe.
@@ -218,6 +221,13 @@ pub fn classify_pipeline(
     target: &TargetWarehouse,
     writes: &ResolvedWrites,
 ) -> RerunSafety {
+    // A replication run also runs `[[checks.custom]]`, whose SQL goes to the
+    // warehouse as written. A transformation run does not run pipeline checks.
+    if let PipelineConfig::Replication(replication) = pipeline
+        && !replication.checks.custom.is_empty()
+    {
+        return RerunSafety::not_safe(CUSTOM_CHECK_REASON);
+    }
     match pipeline {
         PipelineConfig::Replication(_) => match writes {
             ResolvedWrites::Strategies(strategies) => {
@@ -300,10 +310,7 @@ fn classify_quality(checks: &ChecksConfig) -> RerunSafety {
         };
     }
     if !checks.custom.is_empty() {
-        return RerunSafety::not_safe(
-            "a [[checks.custom]] check runs its SQL as written, so Rocky cannot prove it \
-             only reads",
-        );
+        return RerunSafety::not_safe(CUSTOM_CHECK_REASON);
     }
     RerunSafety::Safe
 }
@@ -395,17 +402,15 @@ pub fn classify_strategy(
                      the rows of the lookback window again",
                 )
             }
-            WriterPipeline::Transformation if unique_key.is_empty() => match target {
-                TargetWarehouse::DuckDbSingleWriter => RerunSafety::Safe,
-                TargetWarehouse::DuckDbShared
-                | TargetWarehouse::Databricks
-                | TargetWarehouse::Snowflake
-                | TargetWarehouse::BigQuery
-                | TargetWarehouse::Unverified { .. } => RerunSafety::not_safe(format!(
-                    "incremental append with no unique_key: two overlapping runs read the \
-                     same MAX of the watermark and both append the new rows on {warehouse}"
-                )),
-            },
+            // Even on a DuckDB file a keyless append is not proven: with the
+            // `@incremental_filter` placeholder or a `filter_column`, a
+            // mis-specified model re-appends rows on every sequential run.
+            WriterPipeline::Transformation if unique_key.is_empty() => {
+                RerunSafety::not_safe(format!(
+                    "incremental append with no unique_key: a second run can append the same \
+                     rows again on {warehouse}"
+                ))
+            }
             WriterPipeline::Transformation => classify_upsert(target, warehouse),
         },
         MaterializationStrategy::Merge { unique_key, .. } => {
@@ -657,11 +662,11 @@ mod tests {
         rows.extend([
             (incremental(Vec::new()), R, [N, N, N, N, N, N]),
             (incremental(key()), R, [N, N, N, N, N, N]),
-            (incremental(Vec::new()), T, [S, N, N, N, N, N]),
+            (incremental(Vec::new()), T, [N, N, N, N, N, N]),
             (
                 incremental_lookback(Vec::new(), Some("0 days")),
                 T,
-                [S, N, N, N, N, N],
+                [N, N, N, N, N, N],
             ),
             (
                 incremental_lookback(Vec::new(), Some("3 days")),
@@ -812,7 +817,7 @@ mod tests {
     fn a_transformation_pipeline_is_safe_only_when_every_model_is() {
         let models = ResolvedWrites::Models(vec![
             ("a".to_string(), MaterializationStrategy::FullRefresh),
-            ("b".to_string(), incremental(Vec::new())),
+            ("b".to_string(), incremental(key())),
         ]);
         let duckdb = classify_pipeline(
             &transformation(),
@@ -824,7 +829,7 @@ mod tests {
         let databricks =
             classify_pipeline(&transformation(), &TargetWarehouse::Databricks, &models);
         let RerunSafety::NotSafe { reason } = databricks else {
-            panic!("an append model on Databricks is not safe");
+            panic!("an upsert model on Databricks is not safe");
         };
         assert!(reason.starts_with("model 'b': "), "{reason}");
     }
@@ -881,6 +886,23 @@ mod tests {
             let class = classify_pipeline(&replication(), &target, &writes);
             assert!(!class.is_safe(), "{writes:?}: {class:?}");
         }
+    }
+
+    #[test]
+    fn a_replication_pipeline_with_a_custom_check_is_not_safe() {
+        let with_custom = pipeline(&format!(
+            "type = \"replication\"\n\
+             [source]\nadapter = \"src\"\n\
+             [source.schema_pattern]\nprefix = \"src__\"\nseparator = \"__\"\ncomponents = [\"source\"]\n\
+             [target]\nadapter = \"wh\"\ncatalog_template = \"c\"\nschema_template = \"s\"\n\
+             [[checks.custom]]\nname = \"c\"\nsql = \"DELETE FROM t\"\n"
+        ));
+        let safe = ResolvedWrites::Strategies(vec![Ok(MaterializationStrategy::FullRefresh)]);
+        let class = classify_pipeline(&with_custom, &TargetWarehouse::Databricks, &safe);
+        let RerunSafety::NotSafe { reason } = class else {
+            panic!("custom check SQL runs as written");
+        };
+        assert!(reason.contains("checks.custom"), "{reason}");
     }
 
     #[test]
