@@ -2495,8 +2495,8 @@ async fn optimize(
     })
     .await?
     .map_err(
-        |e| match e.downcast_ref::<crate::commands::OptimizeConfigError>() {
-            Some(config) => ApiError::config_invalid(&config.to_string()),
+        |e| match e.downcast_ref::<rocky_core::config::ConfigError>() {
+            Some(_) => ApiError::config_invalid(&format!("{e:#}")),
             None => map_state_err(e, state.mutation_permit.running_job()),
         },
     )?;

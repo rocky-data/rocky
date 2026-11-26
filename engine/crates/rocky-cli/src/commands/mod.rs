@@ -205,9 +205,7 @@ pub use list::{
 pub use load::run_load;
 pub use lsp::run_lsp;
 pub use metrics::{metrics_output, run_metrics};
-pub use optimize::{
-    OptimizeConfigError, optimize_output, optimize_output_request_scoped, run_optimize,
-};
+pub use optimize::{optimize_output, optimize_output_request_scoped, run_optimize};
 pub use package::{
     PackageBuildOptions, run_package_add, run_package_list, run_package_remove, run_package_update,
 };

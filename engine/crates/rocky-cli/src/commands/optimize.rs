@@ -28,12 +28,6 @@ pub fn optimize_output(
     optimize_output_from_store(&store, config_path, models_dir, model_filter)
 }
 
-/// The project config did not load. The HTTP route maps it to
-/// `config_invalid`; the CLI prints it like any other error.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct OptimizeConfigError(String);
-
 /// [`optimize_output`] with the request-local cache budget
 /// (`HISTORY_REQUEST_CACHE_BYTES` in `history.rs`, #1399), for the HTTP route.
 pub fn optimize_output_request_scoped(
@@ -68,7 +62,6 @@ fn optimize_output_from_store(
     // `rocky.toml` that is there but does not load is a hard error: a wrong
     // price is worse than no price.
     let config = match rocky_core::config::load_optional_project_config(Some(config_path))
-        .map_err(|e| OptimizeConfigError(format!("{e:#}")))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?
     {
         Some(cfg) => CostConfig::from(cfg.cost),
@@ -345,6 +338,23 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource};
+
+    /// A rocky.toml that does not load stays a typed `ConfigError` in the
+    /// error chain, so the CLI's miette span report
+    /// (`try_upgrade_config_error`) can still find it.
+    #[test]
+    fn a_broken_config_error_downcasts_to_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        write(&config, "this is [not valid toml");
+        let err = optimize_output(&dir.path().join("absent.redb"), &config, None, None)
+            .expect_err("a broken config must fail");
+        assert!(
+            err.downcast_ref::<rocky_core::config::ConfigError>()
+                .is_some(),
+            "lost the ConfigError: {err:#}"
+        );
+    }
 
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {

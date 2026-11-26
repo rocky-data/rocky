@@ -14611,6 +14611,24 @@ mod tests {
                 );
             }
         }
+        // Name sets that fill well before the end of the table: the scan
+        // stops early, and the result must still equal the per-model calls.
+        for names in [&["hot", "parted"][..], &["hot"], &["warm", "parted"]] {
+            for limit in [1usize, 2, 7, 30] {
+                let batch = store
+                    .get_models_history_matching(names, limit, keep)
+                    .unwrap();
+                for name in names {
+                    let single = store.get_model_history_matching(name, limit, keep).unwrap();
+                    assert_eq!(
+                        serde_json::to_string(&batch[*name]).unwrap(),
+                        serde_json::to_string(&single).unwrap(),
+                        "{name} in {names:?} at limit {limit}"
+                    );
+                    assert_eq!(single.len(), limit, "fixture fills {name}");
+                }
+            }
+        }
         let batch = store
             .get_models_history_matching(&names, 100, keep)
             .unwrap();
