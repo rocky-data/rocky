@@ -58,27 +58,7 @@ Every hash is lowercase hex over 32 BLAKE3 bytes, so each identity field is exac
 
 ## The document shape
 
-A minimal manifest from a general run, where the input side was observed through a freshness signal:
-
-```json
-{
-  "manifest_version": "0.1",
-  "hash_scheme": "v1",
-  "producer": { "name": "rocky", "version": "1.56.0" },
-  "subject": {
-    "model": "orders_clean",
-    "run_id": "run-20260708-015241-256",
-    "produced_at": "2026-07-08T01:52:41.274162Z",
-    "status": "success"
-  },
-  "program_hash": "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036",
-  "inputs_hash": "75ee2a328c52b2361aec2c1649cfd774e14ebbeb3f7e0bd99805e8e42c21b9c6",
-  "inputs_proof_class": "heuristic",
-  "env_hash": "bbf2c2045328f738683a6336df5fa61b5f00076aeaed7c495c04f9d6991d92bd"
-}
-```
-
-On a content-addressed write path, the manifest also carries the output byte-hashes, which are what make the output half byte-verifiable offline:
+A manifest from a general run omits `output_hashes`. On a content-addressed write path it also carries the output byte-hashes, which are what make the output half byte-verifiable offline (shown here with `inputs_proof_class: "strong"`):
 
 ```json
 {
@@ -122,17 +102,7 @@ The canonical machine-readable definitions are the JSON Schemas (draft 2020-12) 
 
 ## What each field maps to in a run
 
-Every field corresponds to something the engine records today. Nothing here is aspirational.
-
-| Manifest field | Where it comes from |
-|---|---|
-| `hash_scheme` | The recorded hash-scheme tag on the execution. |
-| `producer.name` / `producer.version` | The producing engine and the version it reports. |
-| `subject.model` / `run_id` / `produced_at` / `status` | The model execution's own record within its run. |
-| `program_hash` | The recorded recipe-identity program key. |
-| `inputs_hash` / `inputs_proof_class` | The recorded input-match key and its proof class, populated when the run observed its inputs. |
-| `env_hash` | The recorded environment key. |
-| `output_hashes` | The recorded output BLAKE3(s), on the content-addressed write path only. |
+Every field corresponds to something the engine records today: `producer` and `subject` from the model execution's own record, `program_hash`, `inputs_hash`, `inputs_proof_class` and `env_hash` from the recorded recipe identity, and `output_hashes` from the recorded output BLAKE3(s) on the content-addressed write path only.
 
 The recipe-identity triple is surfaced directly by `rocky history --recipe <program_hash> --output json`, and on every model record of `rocky history` and `rocky trace`. A manifest is that surfaced identity, reshaped into the open format. The content-addressed output hashes come from the content-addressed write path, which names each output file by the BLAKE3 of its bytes; see [Verify a run](/guides/verify-a-run/) for how that path records and exposes them.
 

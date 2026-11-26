@@ -90,5 +90,4 @@ dagster wheel resolves the SDK from PyPI, not the monorepo path source.
 
 ## Git conventions
 
-- **Never** include `Co-Authored-By` trailers. Conventional commits, scoped
-  `feat(sdk): …` / `fix(sdk): …`.
+- Follow "Git conventions" in the root `../../AGENTS.md`. Scope: `feat(sdk): …`.

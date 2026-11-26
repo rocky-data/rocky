@@ -1,176 +1,65 @@
 ---
 title: Roadmap
-description: What Rocky ships today, what is still Beta, and what comes next.
+description: What Rocky ships today, what is still Beta, and what an integration handles instead.
 sidebar:
   order: 4
 ---
 
 The trust primitives (compiler, branches, run records, lineage, contracts, cost
-attribution) are GA (live-tested) on Databricks. Here is the state of everything
-else.
+attribution) are GA (live-tested) on Databricks.
 
 **GA (live-tested)** means two things. The adapter has a live test suite that
 runs against a real warehouse. And each feature in that section runs end to end
-on it. It is a maturity grade for the code. It is not a claim about who uses Rocky.
+on it. It is a maturity grade for the code, not a claim about who uses Rocky.
 **Beta** means the core run loop works, but conformance coverage is not complete.
 
 ## Shipped and GA (live-tested)
 
-- **Databricks** is the production target for 2026: SQL Statement API, Unity
-  Catalog, OAuth M2M, adaptive concurrency, and schema-prefix branches.
-  `rocky preview create` copies tables into the preview schema with a
-  metadata-only `SHALLOW CLONE`.
-- **The compiler.** Typed column-level inference, the diagnostic codes, and the
-  language server all behave the same in CI and in your editor.
-- **Branches and run records.** A named branch is an isolated schema. Each run
-  writes a content-addressed record, meaning the artifacts are keyed by the hash
-  of their bytes. `rocky replay` inspects that record. For a deterministic
-  model, `rocky replay --execute --verify` re-runs the recorded recipe locally
-  on DuckDB and reproduces the output bit for bit. Add `--warehouse` to re-run
-  it in an isolated replay schema on the live warehouse instead.
-- **Cost attribution.** Per-model cost lands on every run record, and `[budget]`
-  blocks fail a run on overspend.
-- **The AI compile-validate loop.** `rocky ai` generates a model, compiles it,
-  and auto-fixes parse errors before it lands.
-- **Deterministic surrogate keys.** A model declares a
-  [`[[surrogate_key]]`](/reference/model-format/#surrogate_key) block, and
-  `rocky run` injects a dialect-correct hash column at materialization on
-  DuckDB, Databricks, Snowflake, and BigQuery. On a given warehouse the value
-  matches what dbt Core's `dbt_utils.generate_surrogate_key` produces over the
-  same columns. A key therefore joins across a Rocky / dbt Core boundary either
-  way.
-- **Named and inline tests.** Define a data-quality assertion once in
-  `models/test_definitions.toml` and apply it by name with
-  [`[[use_test]]`](/reference/model-format/#use_test), overriding the column,
-  severity, or filter at the use site. It is the declarative analogue of dbt
-  Core's generic tests. Inline [`[[tests]]`](/reference/model-format/#tests)
-  keep working alongside. References resolve when the project loads, so a typo
-  fails the load instead of silently dropping a check. See
-  [data quality checks](/concepts/data-quality-checks/#reusable-named-tests).
-- **Fixture-driven unit tests.** A model's sidecar declares
-  [`[[test]]`](/reference/model-format/#test) blocks with mocked upstream inputs
-  (`given`) and an expected output (`expect`). `rocky test` seeds a fresh
-  in-memory DuckDB, materializes the model against the fixtures, and compares
-  the result. No warehouse connection is needed. See
-  [testing](/concepts/data-quality-checks/).
-- **Config groups.** A [config group](/reference/model-format/#config-groups) in
-  `models/groups/<name>.toml` fans shared routing and strategy out to every
-  model that opts in with `group = "<name>"`, so a one-line change reaches the
-  whole group. With `enforce = true` the group's fields become binding. A member
-  that diverges locally from the group-controlled schema or strategy fails the
-  load instead of drifting silently.
-- **Model tags.** A model declares a [`[tags]`](/reference/model-format/#tags)
-  block of governance attributes (`domain`, `tier`, `owner`). A config group can
-  supply a `[tags]` baseline that every member inherits, and the model's own
-  tags override it per key. Resolved tags appear on
-  `rocky compile --output json` for orchestrators to read.
-- **`rocky emit-sql`.** Renders the runnable SQL each transformation model would
-  produce, offline and with no warehouse connection, to stdout or one file per
-  model. A Rocky project always reduces to plain SQL in dependency order, so
-  adopting Rocky is never a one-way door. See
-  [No lock-in](/guides/no-lock-in/).
-- **The agent policy plane.** A `[policy]` block grades what a principal (a
-  person, CI, or an AI agent) may do, by capability and scope: allow, require
-  review, or deny. Enforcement runs at `apply`, at `promote`, and on the MCP
-  write tools, and every decision, including a denial, goes to the ledger.
-  Blast-radius ceilings downgrade an allow to a review. `verify_after` holds an
-  apply to its own run's checks. Autonomy budgets tighten on repeated failure
-  and recover only as those failures age out of the configured window.
-  `rocky policy freeze` is the kill switch, and `rocky policy test` runs pinned
-  `[[policy.tests]]` scenarios through the real evaluator so CI catches a
-  loosened rule. See
-  [Operating Rocky with agents](/concepts/operating-rocky-with-agents/) and
-  [Testing policies](/guides/testing-policies/).
-- **Self-healing, rung by rung.** A proven-transient failure (a warming
-  warehouse, a 429, a lock conflict) is retried within a small bounded budget,
-  on by default. Opt-in containment withholds a failed model's downstream
-  closure, still materializes the disjoint subgraphs, and reports an honest
-  partial failure. Auto-apply is confined to provably additive source drift,
-  behind an explicit opt-in plus a policy grant. A backfill is always a
-  review-gated plan.
-- **Reclamation with proof.** `rocky gc --derivable` inventories artifacts whose
-  recorded recipe is bound to their exact bytes. Eviction is review-gated, even
-  for a person, and leaves a tombstone. `rocky restore` re-derives the artifact
-  and reinstates it only when the rebuilt bytes match the recorded hash exactly.
-  Otherwise it refuses. Restore covers unpartitioned recipes that read no
-  recorded upstreams, and gc evicts only that shape. Restore can still refuse on
-  live state, so eviction is not reversible for every artifact.
-- **The governor's surface.** `rocky brief` renders an estate digest with every
-  line cited to the ledger. `rocky audit --for <table|run|plan>` walks a custody
-  chain end to end. `rocky audit --scorecard` reports acceptance and escalation
-  rates per principal or rule, and `rocky review --queue` ranks pending
-  escalations. A signal the ledger does not hold renders as *not recorded*,
-  never as a fabricated number.
-- **A browser UI.** `rocky serve --ui` shows the same recorded data in your
-  browser: the estate and its DAG, the review queue with one plan in full, and
-  the governor's brief, scorecard, custody, audit, and product journal. It is
-  read-only, or it can make changes in operator mode on your own machine. See
-  the [browser UI guide](/guides/browser-ui/).
-- **An embeddable engine.** `rocky serve` exposes `/api/v1` with outputs
-  byte-identical to the CLI's `--output json`, an async job model, and a
-  generated OpenAPI 3.1 document. The [Embedding guide](/guides/embedding/)
-  covers the four integration patterns. `rocky mcp` is the agent-facing surface
-  (31 tools). The [recipe-manifest spec](/reference/rocky-manifest-spec/) and
-  the standalone `rocky-verify` binary let a third party check a manifest
-  offline, with no engine installed.
+| Area | What ships |
+|---|---|
+| Databricks | The production target: SQL Statement API, Unity Catalog, OAuth M2M, adaptive concurrency, schema-prefix branches. `rocky preview create` copies tables with a metadata-only `SHALLOW CLONE`. |
+| Compiler | Typed column-level inference, diagnostic codes and the language server. They behave the same in CI and in your editor. |
+| Branches and run records | A named branch is an isolated schema. Each run writes a content-addressed record. `rocky replay --execute --verify` re-runs a deterministic model locally on DuckDB and reproduces the output bit for bit. `--warehouse` re-runs it in an isolated replay schema instead. |
+| Cost attribution | Per-model cost on every run record. `[budget]` blocks fail a run on overspend. |
+| AI compile-validate loop | `rocky ai` generates a model, compiles it and auto-fixes parse errors before it lands. |
+| Surrogate keys | [`[[surrogate_key]]`](/reference/model-format/#surrogate_key) injects a dialect-correct hash column on DuckDB, Databricks, Snowflake and BigQuery. The value matches `dbt_utils.generate_surrogate_key` on the same warehouse. |
+| Tests | Named tests ([`[[use_test]]`](/reference/model-format/#use_test)), inline [`[[tests]]`](/reference/model-format/#tests) and fixture-driven [`[[test]]`](/reference/model-format/#test) unit tests run in DuckDB with no warehouse. See [data quality checks](/concepts/data-quality-checks/#reusable-named-tests). |
+| Config groups and tags | A [config group](/reference/model-format/#config-groups) fans shared routing and strategy out to its members. `enforce = true` makes it binding. [`[tags]`](/reference/model-format/#tags) carry governance attributes onto `rocky compile --output json`. |
+| `rocky emit-sql` | Renders each transformation model as plain SQL, offline. Adopting Rocky is never a one-way door. See [No lock-in](/guides/no-lock-in/). |
+| Agent policy plane | `[policy]` grades what a principal may do by capability and scope: allow, require review, or deny. It runs at `apply`, at `promote` and on the MCP write tools. Every decision goes to the ledger. `rocky policy freeze` is the kill switch. See [Operating Rocky with agents](/concepts/operating-rocky-with-agents/) and [Testing policies](/guides/testing-policies/). |
+| Self-healing | A proven-transient failure is retried within a bounded budget, on by default. Containment withholds a failed model's downstream and builds the disjoint subgraphs. Auto-apply covers only provably additive drift, behind an opt-in and a policy grant. A backfill is always a review-gated plan. |
+| Reclamation with proof | `rocky gc --derivable` evicts artifacts whose recorded recipe is bound to their exact bytes, behind review, and leaves a tombstone. `rocky restore` reinstates one only when the rebuilt bytes match the recorded hash. Restore covers unpartitioned recipes that read no recorded upstreams, and can still refuse on live state. |
+| Governance surface | `rocky brief`, `rocky audit --for <table\|run\|plan>`, `rocky audit --scorecard` and `rocky review --queue`. A signal the ledger does not hold renders as *not recorded*. |
+| Browser UI | `rocky serve --ui` shows the recorded data. It is read-only, or can make changes in operator mode on your own machine. See the [browser UI guide](/guides/browser-ui/). |
+| Embeddable engine | `rocky serve` exposes `/api/v1` with outputs byte-identical to `--output json`, an async job model and a generated OpenAPI 3.1 document. See the [Embedding guide](/guides/embedding/). `rocky mcp` serves 31 tools. The [recipe-manifest spec](/reference/rocky-manifest-spec/) and the `rocky-verify` binary check a manifest offline. |
+
+The custody ledger is best-effort: a failed ledger write warns and lets the
+operation continue, and a refusal issued before the rules are evaluated writes
+no row.
 
 ## Beta
 
-- **Snowflake, BigQuery, and Trino.** Connection, execution, and the core run
-  loop work. Conformance coverage is still growing. We test against live
-  warehouses, so corner cases get reported and fixed quickly. If your enterprise
-  warehouse is Snowflake or BigQuery and you need it at GA today,
-  [open a discussion](https://github.com/rocky-data/rocky/discussions). We want
-  the failure reports.
-- **PostgreSQL, Redshift, ClickHouse, SQL Server, and Apache Spark.**
-  PostgreSQL, ClickHouse, SQL Server 2022, and Spark are tested against a live
-  server. Redshift, Azure SQL, and Fabric are tested by generated SQL only.
+- **Snowflake, BigQuery and Trino.** Connection, execution and the core run loop
+  work. Conformance coverage is still growing. If you need one of them at GA,
+  [open a discussion](https://github.com/rocky-data/rocky/discussions).
+- **PostgreSQL, Redshift, ClickHouse, SQL Server and Apache Spark.**
+  PostgreSQL, ClickHouse, SQL Server 2022 and Spark are tested against a live
+  server. Redshift, Azure SQL and Fabric are tested by generated SQL only.
   Not every strategy runs on every warehouse. See
   [Connect a warehouse](/guides/connect-a-warehouse/).
 - **Iceberg.** REST-catalog source discovery works. Content-addressed writes
-  round-trip as Iceberg through Delta UniForm, end to end.
-
-## On the 2026 roadmap
-
-- **Iceberg-native writes**, without the Delta intermediate.
-- **The wider AI surface.** The compile-validate loop is shipped. The larger
-  workflow comes next: rename a column, regenerate the downstream models and
-  their assertions, run the tests, ship.
-- **A semantic layer.** Rocky's typed IR is the right home for one. Until it
-  exists, integrate with Cube, the dbt Semantic Layer, or your existing metric
-  store.
-
-## Where this is going
-
-Data platforms are heading somewhere specific. Most pipeline changes will be
-authored by agents rather than people. The question that matters shifts from
-"can we build it" to "can we trust what was built."
-
-Rocky's long arc is the governed estate. Humans declare the invariants:
-contracts, policies, budgets. Agents do the operating: author, run, diagnose,
-remediate. The engine checks each mutating step and records what it decided, so
-any consumer, human or machine, can read a table's recorded custody before
-relying on it. Read that record as best-effort: a failed ledger write warns and
-lets the operation continue, and a refusal issued before the rules are
-evaluated writes no row at all.
-
-The pieces above are that arc's foundation, shipped in their first form: the
-policy plane, the custody ledger, bit-exact replay, and the engine-free manifest
-verifier. The [recipe-manifest spec](/reference/rocky-manifest-spec/) is
-deliberately an open format. The proof a table carries should outlive any one
-tool, including this one.
+  round-trip as Iceberg through Delta UniForm.
 
 ## Handled by an integration, not built in
 
-- **Extraction from SaaS sources.** Use Fivetran, Airbyte, Stitch, or
-  warehouse-native CDC. Rocky discovers what they land and takes over from
-  there.
+- **Extraction from SaaS sources.** Use Fivetran, Airbyte, Stitch or
+  warehouse-native CDC. Rocky discovers what they land.
 - **Orchestration beyond Dagster.** Dagster has a native integration, and
   `rocky serve` covers small standalone teams. Airflow and Prefect call the
-  `rocky` binary like any other CLI; native integrations are not shipped.
+  `rocky` binary like any other CLI.
+- **A semantic layer.** Use Cube, the dbt Semantic Layer or your metric store.
 
 ## Tell us where it hurts
 
-The roadmap is shaped by where production pipelines are getting hurt. If one of
-these gaps blocks your team,
+If a gap blocks your team,
 [open a discussion](https://github.com/rocky-data/rocky/discussions).

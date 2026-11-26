@@ -6721,6 +6721,9 @@ mod tests {
             "[run] tests_on_run",
             "set `nullable = true` in the contract",
             "the rows it wrote stay in the table",
+            "`[run] tests_on_run` defaults to \"enforce\"",
+            "If a product spec generated the contract",
+            "make the change in the spec, not in the contract file",
             "`rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence",
             "`WHERE c IS NOT NULL` filter does not clear `E012`",
         ] {

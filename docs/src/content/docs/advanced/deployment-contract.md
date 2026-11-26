@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-This page is the contract between Rocky and the machine that runs it. It states what the engine does when the process dies, when two processes overlap, and when a rollout replaces one with another. Each statement names the mechanism behind it. Where the engine cannot promise something, the page says so.
+This page is the contract between Rocky and the machine that runs it: what the engine does when the process dies, when two processes overlap, and when a rollout replaces one with another. Where the engine cannot promise something, the page says so.
 
 The engine parts this page is about:
 
@@ -58,16 +58,7 @@ This is why the rule says persistent volume. The state backend does not change i
 
 **Same volume, network storage.** The two locks above are `flock` calls. Rocky has not probed `flock` on NFS or another network filesystem, so "shared volume" on this page means block storage: one node, or a volume that moves whole with the pod.
 
-**Separate volumes.** Both fire. The state backend decides only how loud the collision is:
-
-| `[state] concurrency_control` | Backend | What the loser's run does at the end |
-|---|---|---|
-| `"off"` (default on `local`, `valkey`) | any | Uploads unconditionally. Last writer wins, silently: the other run's watermarks are overwritten. On an object store, the upload is refused instead once a `cas` writer has created the `cas-required` marker. |
-| `"cas"` (default on `s3`, `gcs`, `tiered`) | `s3`, `gcs`, `tiered` | Uploads only if the remote still carries the generation this run downloaded. The loser fails closed: a nonzero exit and an error naming the race, and the winner's state stands. |
-| `"cas"` | `valkey` | No generation to compare against; falls back to an unconditional upload and warns once at the start of the run. |
-| `"cas"` | `local` | No remote write at all; the file on the volume is the state. |
-
-`cas` turns a silent overwrite into a loud failure. It does not stop the second run from happening; only the rule above does.
+**Separate volumes.** Both fire. `[state] concurrency_control` decides only how loud the collision is. With `"cas"` (the default on `s3`, `gcs`, `tiered`) the loser's end-of-run upload fails closed: a nonzero exit, an error naming the race, and the winner's state stands. With `"off"` (the default on `local`, `valkey`) the last writer wins silently and the other run's watermarks are overwritten (on an object store, the upload is refused once a `cas` writer has created the `cas-required` marker). `cas` on `valkey` has no generation to compare, so it falls back to an unconditional upload and warns once. `cas` on `local` writes nothing remote. `cas` turns a silent overwrite into a loud failure. It does not stop the second run from happening: only the rule above does. Mechanism: [State management](/concepts/state-management/#concurrent-writers).
 
 ## When a rollout replaces the process
 
@@ -90,14 +81,9 @@ Compare-and-swap on the state backend does not make a rolling update safe. The d
 
 ## Mixed versions during an upgrade
 
-The state store carries a schema version. Two directions:
+A newer engine migrates an older store forward on first open. An older engine opens a newer store only as the `[state] on_schema_mismatch` setting allows: `rocky serve` and every inspection command (`state`, `history`, `doctor`, `metrics`, the branch commands) refuse. `rocky run` and `rocky load` follow the setting: `recreate` moves the newer file to `<file>.v<N>.bak`, warns once, starts fresh, runs one full refresh and never writes the downgraded state to a shared backend, and `fail` refuses. Unset means `fail` on `local` and `recreate` on remote and tiered backends. On a remote backend a newer engine that finds no state under its own schema version restores the newest older version's state and never writes or deletes the older copy: [Schema upgrade and remote state](/concepts/state-management/#schema-upgrade-and-remote-state).
 
-- **A newer engine opens an older store.** It migrates the store forward on first open. Every command does this; there is no separate migration step.
-- **An older engine opens a newer store.** `rocky serve` and every inspection command (`state`, `history`, `doctor`, `metrics`, the branch commands) refuse to open it. `rocky run` and `rocky load` follow `[state] on_schema_mismatch`. `recreate` moves the newer file to `<file>.v<N>.bak`, logs one warning that names it, starts from a fresh local state, runs once as a full refresh, and never writes that downgraded state back to a shared backend. It refuses if that `.bak` already exists. `fail` refuses like the rest. Unset means `fail` on the `local` backend, where the file is the only copy, and `recreate` on the remote and tiered backends.
-
-On a remote backend, the newer engine finds no state under its own schema version and restores the newest older version's state instead. It never writes or deletes the older copy. See [What a schema upgrade does to remote state](/concepts/state-management/#what-a-schema-upgrade-does-to-remote-state).
-
-So a fleet mid-upgrade is safe in one direction only. Upgrade every process that shares a volume or a remote backend together, old stopped before new started, and keep a copy of the store from before the upgrade: rolling back with the history intact means restoring that copy under the older engine. The changelog names every release that changes the schema version.
+A fleet mid-upgrade is therefore safe in one direction only. Upgrade every process that shares a volume or a remote backend together, old stopped before new started, and keep a copy of the store from before the upgrade: rolling back with history intact means restoring that copy under the older engine. The changelog names every release that changes the schema version.
 
 ## Webhooks and timers
 
@@ -127,5 +113,5 @@ The persistent volume is required on every row. The backend chooses the blast ra
 
 - [Run the Container Image](/guides/run-the-image/): the image, `docker run`, and the Compose example that follows this contract.
 - [State management](/concepts/state-management/#remote-state-persistence): the backends and the sync lifecycle.
-- [Configuration](/reference/configuration/#concurrent-writers): `concurrency_control`, `on_schema_mismatch`, `catchup`.
+- [Configuration](/reference/configuration/#state): `concurrency_control`, `on_schema_mismatch`, `catchup`.
 - [Failure modes](/advanced/failure-modes/): what a failed run looks like from the outside.

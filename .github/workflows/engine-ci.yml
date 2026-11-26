@@ -11,7 +11,7 @@ on:
       # what `rocky mcp` serves, and renaming or deleting it fails the build —
       # so it needs engine CI, and without it the five required contexts never
       # run and the PR cannot merge at all (#1557).
-      - '.claude/skills/rocky-ai-workflow/SKILL.md'
+      - '.agents/skills/rocky-ai-workflow/SKILL.md'
       - '.github/workflows/engine-ci.yml'
   # No `paths:` filter on pull_request — deliberately. Four required merge
   # contexts live in this workflow (Test, Clippy, Format, Adapter boundary).
@@ -84,7 +84,7 @@ jobs:
         env:
           # Mirrors the push trigger paths: engine/**, schemas/**, the skill
           # compiled into the binary (#1557), and this workflow itself.
-          ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
+          ENGINE_PATHS_RE: ^(engine/|schemas/|\.agents/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
           # Only the `connector-test` job reads this: the connector code it
           # runs (the manifest, the runner and verifier, and the `rocky
           # connector` commands), this workflow, and the two connector POCs it
@@ -229,7 +229,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
       # nextest runs all test binaries in one global scheduler instead of

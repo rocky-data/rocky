@@ -71,7 +71,7 @@ A clean compile does not prove that every warehouse query is valid. It does not 
 | Compiler, branches, replay, lineage, contracts, cost on Databricks | GA (live-tested) |
 | DuckDB | Supported. Powers the playground and `rocky test`. |
 | Every other warehouse adapter | Beta. The core run loop works. Conformance coverage is still growing. |
-| Wider AI workflow, Iceberg-native writes, semantic layer | [Roadmap](/getting-started/roadmap/) |
+| Beta and integration-handled areas | [Roadmap](/getting-started/roadmap/) |
 
 Adapter list and capabilities: [Capability matrix](/concepts/capability-matrix/).
 

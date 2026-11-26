@@ -364,7 +364,16 @@ pub async fn run_watch(
                 }
             } => IterStop::Signal,
         };
-        if stop_iteration(stop, &cancel, first_run, &sink).await? {
+        if stop_iteration(
+            stop,
+            &cancel,
+            first_run,
+            &sink,
+            StopSignals::os,
+            exit_process,
+        )
+        .await?
+        {
             eprintln!("\n[watch] stopped");
             return Ok(());
         }
@@ -499,7 +508,7 @@ pub async fn run_watch(
                         }
                     } => IterStop::Signal,
                 };
-                if stop_iteration(stop, &cancel, rerun, &sink).await? {
+                if stop_iteration(stop, &cancel, rerun, &sink, StopSignals::os, exit_process).await? {
                     eprintln!("\n[watch] stopped");
                     return Ok(());
                 }
@@ -514,7 +523,8 @@ pub async fn run_watch(
 /// crash parity, settled by [`stop_interrupted_iteration`] — and `main`'s
 /// five-second blocking-pool grace follows, so a stalled iteration exits
 /// within ten seconds.
-use super::run_cancel::SIGNAL_SETTLE_GRACE;
+use super::run_cancel::{SIGNAL_SETTLE_GRACE, StopSignals};
+use crate::statement_cancel::{ExitProcess, exit_process};
 
 /// What ended the wait on one watch iteration.
 enum IterStop {
@@ -531,7 +541,10 @@ enum IterStop {
 /// On a signal, cancel the iteration's token and give it
 /// [`SIGNAL_SETTLE_GRACE`] to stop and settle through its own terminal path
 /// (#1606). Past the grace, drop it as before. A second signal during the
-/// grace exits 130 at once.
+/// grace exits 130 without the settle. Both of those stop waiting on
+/// statements the warehouse still runs, so each first asks the adapters to
+/// cancel them ([`crate::statement_cancel`], at most
+/// [`CANCEL_ON_EXIT_BUDGET`](crate::statement_cancel::CANCEL_ON_EXIT_BUDGET)).
 ///
 /// ```text
 ///   signal ──▶ cancel.cancel() ──▶ wait ≤ grace for the iteration
@@ -546,6 +559,8 @@ async fn stop_iteration<F: std::future::Future>(
     cancel: &CancellationToken,
     mut iteration: std::pin::Pin<Box<F>>,
     sink: &DroppedSessionSink,
+    second_signals: impl FnOnce() -> StopSignals,
+    exit: ExitProcess,
 ) -> Result<bool> {
     match stop {
         IterStop::Finished { interrupted: false } => return Ok(false),
@@ -554,51 +569,15 @@ async fn stop_iteration<F: std::future::Future>(
             // Registered before the notice, so a second SIGINT sent after the
             // operator sees it is never lost. A fresh stream sees only signals
             // delivered after it exists, not the one that brought us here.
-            #[cfg(unix)]
-            let mut second_sigint =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-            #[cfg(unix)]
-            let mut second_sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-            #[cfg(windows)]
-            let mut second_stop = super::run_cancel::WindowsStopEvents::register(true);
+            let mut second_signals = second_signals();
             cancel.cancel();
             eprintln!(
                 "\n[watch] shutdown signal received — letting the run settle (up to {}s); press \
                  Ctrl-C again to terminate",
                 SIGNAL_SETTLE_GRACE.as_secs()
             );
-            let second = async {
-                // Either kind of signal counts as the second one.
-                #[cfg(unix)]
-                {
-                    let sigint = async {
-                        match second_sigint.as_mut() {
-                            Some(stream) => stream.recv().await,
-                            None => std::future::pending().await,
-                        }
-                    };
-                    let sigterm = async {
-                        match second_sigterm.as_mut() {
-                            Some(stream) => stream.recv().await,
-                            None => std::future::pending().await,
-                        }
-                    };
-                    tokio::select! {
-                        Some(()) = sigint => Some(()),
-                        Some(()) = sigterm => Some(()),
-                        else => None,
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    second_stop.recv().await
-                }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    tokio::signal::ctrl_c().await.ok()
-                }
-            };
+            // Either kind of signal counts as the second one.
+            let second = second_signals.recv();
             tokio::select! {
                 settled = tokio::time::timeout(SIGNAL_SETTLE_GRACE, iteration.as_mut()) => {
                     if settled.is_err() {
@@ -606,11 +585,17 @@ async fn stop_iteration<F: std::future::Future>(
                             "[watch] the run did not settle within {}s; stopping it",
                             SIGNAL_SETTLE_GRACE.as_secs()
                         );
+                        // Before the drop below: dropping the iteration
+                        // removes its statements from the in-flight lists.
+                        crate::statement_cancel::cancel_before_exit("[watch]").await;
                     }
                 }
                 Some(()) = second => {
                     eprintln!("\n[watch] second signal — terminating");
-                    std::process::exit(130);
+                    crate::statement_cancel::cancel_before_exit("[watch]").await;
+                    exit(130);
+                    // Reached only when a test passes an `exit` that returns.
+                    return Ok(true);
                 }
             }
         }
@@ -1907,5 +1892,103 @@ mod tests {
         paths.sort();
         paths.dedup();
         paths
+    }
+
+    use std::sync::Arc;
+
+    static WATCH_EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    fn record_watch_exit(code: i32) {
+        WATCH_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn never_exit(code: i32) {
+        panic!("the process must not exit here, got {code}");
+    }
+
+    /// An adapter with one statement in flight, tracked for the forced exit.
+    fn tracked_adapter(
+        name: &str,
+        statement: &str,
+    ) -> (
+        Arc<crate::testing::CancellableWarehouseAdapter>,
+        rocky_core::statement_cancel::InFlightGuard,
+    ) {
+        use crate::testing::{CancelAnswer, CancellableWarehouseAdapter};
+        use rocky_core::statement_cancel::StatementHandle;
+        use rocky_core::traits::WarehouseAdapter;
+
+        let concrete = Arc::new(CancellableWarehouseAdapter::new(CancelAnswer::Accept));
+        let guard = concrete.in_flight.register(StatementHandle::new(statement));
+        let adapter: Arc<dyn WarehouseAdapter> = concrete.clone();
+        crate::statement_cancel::track(name, &adapter);
+        (concrete, guard)
+    }
+
+    /// An iteration that outlives the settle grace is dropped (`--watch`).
+    /// Its statements must be cancelled first, while the iteration still
+    /// lists them. Takes the full grace: tokio's test clock is not enabled.
+    #[tokio::test]
+    async fn a_stalled_iteration_has_its_statements_cancelled_before_it_is_dropped() {
+        use rocky_core::statement_cancel::StatementHandle;
+
+        let _serial = crate::testing::FORCED_EXIT_TESTS.lock().await;
+        let (adapter, _guard) = tracked_adapter("watch-grace-test", "watch-grace-1");
+        let iteration = Box::pin(std::future::pending::<()>());
+        let sink = DroppedSessionSink::new();
+        let (_signal, signals) = StopSignals::injected();
+
+        let stopped = stop_iteration(
+            IterStop::Signal,
+            &CancellationToken::new(),
+            iteration,
+            &sink,
+            || signals,
+            never_exit,
+        )
+        .await
+        .unwrap();
+
+        assert!(stopped);
+        assert_eq!(
+            *adapter.cancelled.lock().unwrap(),
+            [StatementHandle::new("watch-grace-1")]
+        );
+    }
+
+    /// A second signal during the settle: cancel what still runs, then exit 130.
+    #[tokio::test]
+    async fn a_second_signal_cancels_the_statements_then_exits_130() {
+        use rocky_core::statement_cancel::StatementHandle;
+
+        let _serial = crate::testing::FORCED_EXIT_TESTS.lock().await;
+        let (adapter, _guard) = tracked_adapter("watch-second-test", "watch-second-1");
+        let iteration = Box::pin(std::future::pending::<()>());
+        let sink = DroppedSessionSink::new();
+        let token = CancellationToken::new();
+        let (signal, signals) = StopSignals::injected();
+        signal.send(()).unwrap();
+
+        let stopped = stop_iteration(
+            IterStop::Signal,
+            &token,
+            iteration,
+            &sink,
+            || signals,
+            record_watch_exit,
+        )
+        .await
+        .unwrap();
+
+        assert!(stopped);
+        assert!(token.is_cancelled());
+        assert_eq!(
+            WATCH_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst),
+            130
+        );
+        assert_eq!(
+            *adapter.cancelled.lock().unwrap(),
+            [StatementHandle::new("watch-second-1")]
+        );
     }
 }

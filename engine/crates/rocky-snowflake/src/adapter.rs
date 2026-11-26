@@ -22,6 +22,7 @@
 
 use async_trait::async_trait;
 
+use rocky_core::statement_cancel::{CancelOutcome, StatementHandle};
 use rocky_core::traits::{
     AdapterError, AdapterResult, CaseSignificance, ChunkChecksum, ObjectKind, PkRange, QueryResult,
     SqlDialect, WarehouseAdapter,
@@ -167,6 +168,21 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
             .await
             .map(|_| ())
             .map_err(AdapterError::new)
+    }
+
+    /// Every statement past its submit response, from each connector that
+    /// shares this adapter's list (see [`SnowflakeConnector::with_in_flight`]).
+    fn in_flight_statements(&self) -> Vec<StatementHandle> {
+        self.connector.in_flight().snapshot()
+    }
+
+    /// `POST /api/v2/statements/{handle}/cancel`.
+    async fn cancel_statement(&self, handle: &StatementHandle) -> AdapterResult<CancelOutcome> {
+        self.connector
+            .cancel_statement(handle.as_str())
+            .await
+            .map_err(AdapterError::new)?;
+        Ok(CancelOutcome::Requested)
     }
 
     fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {

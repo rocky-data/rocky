@@ -95,7 +95,7 @@ rocky apply <plan-id>
 
 The plan is review-gated even for a person. At apply time, Rocky rebuilds the artifact from the recipe its tombstone references. It checks that the recomputed blake3 hash equals the tombstoned hash before any write becomes visible. Then it writes the bytes at the tombstoned path, never over mismatched bytes, and reinstates the ledger row.
 
-Restore rebuilds only a recipe that is content-addressed, not partitioned, and reads no recorded upstream. See [What restore can and cannot undo](#what-restore-can-and-cannot-undo) for every case that refuses.
+See [What restore can and cannot undo](#what-restore-can-and-cannot-undo) for every case that refuses.
 
 ---
 
@@ -163,26 +163,12 @@ The capabilities are `read`, `propose`, `apply`, `promote`, `backfill`, `gc`, `r
 
 Policy can only tighten at runtime: freeze and the autonomy-budget degradation move effects toward `require_review` / `deny`, never toward `allow`.
 
-Two things `show` reports rather than hides.
+`show` reports two things rather than hiding them:
 
-**No `[policy]` block means nothing is in force.** The enforcement gate answers
-`NotConfigured` before it reads a freeze source, so a freeze recorded earlier
-enforces nothing until a `[policy]` block exists. `show` reads no source either
-and reports both as `not_consulted`, so it never lists a freeze the engine would
-not honour.
+- **No `[policy]` block means nothing is in force.** The enforcement gate answers `NotConfigured` before it reads a freeze source, so a freeze recorded earlier enforces nothing until a `[policy]` block exists. `show` reads no source and reports both as `not_consulted`.
+- **On a remote `[state]` backend the ledger is read from the local mirror.** A governed apply downloads the authoritative remote ledger before it gates, and that download replaces the local ledger file. `show` is read-only and does not do it. It reports `freeze_sources.ledger` as `local_mirror`, so a freeze recorded by another pod can be missing from the list while an apply still denies on it. A command that downloads remote state first, such as `rocky run` or a governed apply, refreshes the mirror. No separate command only pulls it.
 
-**On a remote `[state]` backend the ledger is read from the local mirror.** A
-governed apply downloads the authoritative remote ledger before it gates. `show`
-is read-only and that download replaces the local ledger file, so `show` does
-not do it. It reports `freeze_sources.ledger` as `local_mirror` to say so: a
-freeze recorded by another pod can be missing from the list while an apply still
-denies on it. A command that downloads remote state first, such as `rocky run`
-or a governed apply, refreshes the local mirror; there is no separate command
-that only pulls it.
-
-Durable freeze markers are read wherever the `[state]` backend has an object
-tier, whatever `freeze_marker_writes` says. That flag gates writes only, and a
-marker written while it was on stays enforced after it is turned off.
+Durable freeze markers are read wherever the `[state]` backend has an object tier, whatever `freeze_marker_writes` says. That flag gates writes only, and a marker written while it was on stays enforced after it is turned off.
 
 `rocky serve` answers `rocky policy show --output json` byte for byte at `GET /api/v1/policy`.
 

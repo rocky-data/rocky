@@ -5,8 +5,7 @@ sidebar:
   order: 15
 ---
 
-There are two ways to bootstrap a new project. Take the first for a bare
-start, the second for a skeleton that already runs.
+There are two ways to bootstrap a project: a bare start, or a skeleton that already runs.
 
 1. **`dg scaffold defs dagster_rocky.RockyComponent <name>`**: uses Dagster's
    built-in scaffolder via the registered entry point. Writes a bare
@@ -74,23 +73,12 @@ a [freshness policy](/dagster/freshness/).
 init_rocky_project(Path("my_pipeline"), overwrite=True)
 ```
 
-This stops an accidental re-run from clobbering your own edits to
-`rocky.toml`, `defs.yaml`, or `README.md`.
-
-## Quickstart for end users
-
-After scaffolding, the README guides users through:
+## Next steps
 
 ```bash
-# Install the rocky binary (once)
-curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-
-# Check the pipeline config (DuckDB, no credentials required)
-rocky --config rocky.toml validate
-
-# Run the pipeline locally
-rocky --config rocky.toml run
-
-# Launch the Dagster UI
-dg dev
+rocky --config rocky.toml validate   # check the config (DuckDB, no credentials)
+rocky --config rocky.toml run        # run the pipeline locally
+dg dev                               # launch the Dagster UI
 ```
+
+Install the `rocky` binary first. See [Installation](/dagster/installation/).

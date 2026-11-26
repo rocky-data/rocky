@@ -2,8 +2,9 @@
 //! against the table the run just built (#2611).
 //!
 //! The evaluator is the one `rocky test --declarative` uses
-//! ([`super::declarative_test::execute_one_test`]). This module only decides
-//! when it runs and what a result does to the run.
+//! ([`super::declarative_test::execute_model_tests`]), batching included
+//! (`--batch-tests`, #2756). This module only decides when it runs and what a
+//! result does to the run.
 //!
 //! - `off` never reaches here with work to do: no query, no output field.
 //! - `report` records every result and never fails the model.
@@ -18,16 +19,20 @@
 
 use rocky_core::config::TestsOnRun;
 use rocky_core::traits::WarehouseAdapter;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use super::declarative_test::execute_one_test;
+use super::declarative_test::{TestBatching, execute_model_tests};
 use crate::output::{RunOutput, RunTestResultOutput};
 
 /// Run `model`'s `[[tests]]` against its target and record the results on
 /// `output`. Returns the error the caller must treat as the model's failure,
 /// only in `enforce` mode and only for an error-severity `fail` or `error`.
+///
+/// `batching` is `rocky run --batch-tests`; it changes how many queries run,
+/// never a result.
 pub(crate) async fn evaluate_model_tests(
     mode: TestsOnRun,
+    batching: TestBatching,
     warehouse: &dyn WarehouseAdapter,
     model: &rocky_core::models::Model,
     output: &mut RunOutput,
@@ -38,8 +43,20 @@ pub(crate) async fn evaluate_model_tests(
     let name = model.config.name.as_str();
 
     let mut blocking: Vec<String> = Vec::new();
-    for decl in &model.config.tests {
-        let result = execute_one_test(decl, name, &model.config.target, warehouse).await;
+    let run = execute_model_tests(
+        &model.config.tests,
+        name,
+        &model.config.target,
+        warehouse,
+        batching,
+    )
+    .await;
+    debug!(
+        model = name,
+        queries = run.queries,
+        "tests_on_run queries sent"
+    );
+    for result in run.results {
         let record = RunTestResultOutput {
             model: result.model,
             test_type: result.test_type,
@@ -84,4 +101,29 @@ pub(crate) async fn evaluate_model_tests(
         blocking.len(),
         blocking.join("; ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TestBatching;
+    use crate::commands::run::{SkipGateConfig, SkipRunOptions};
+
+    /// `rocky run --batch-tests` reaches the evaluator; without it the run
+    /// keeps one query per test (#2756).
+    #[test]
+    fn the_batch_tests_flag_reaches_the_gate_config() {
+        let config = rocky_core::config::RunConfig::default();
+        let on = SkipRunOptions {
+            batch_tests: true,
+            ..SkipRunOptions::default()
+        };
+        assert_eq!(
+            SkipGateConfig::resolve(&on, &config, false).test_batching,
+            TestBatching::PerModel
+        );
+        assert_eq!(
+            SkipGateConfig::resolve(&SkipRunOptions::default(), &config, false).test_batching,
+            TestBatching::Off
+        );
+    }
 }

@@ -5,12 +5,7 @@ sidebar:
   order: 9.5
 ---
 
-A dashboard, a notebook, an ML job or an application reads your models. Rocky
-does not run it. A **consumer** is a small file that records that it exists, who
-owns it, and which models it reads.
-
-With the record in place, Rocky can answer "who reads this model?" It can also
-refuse a build when a consumer points at a model that no longer exists.
+A dashboard, a notebook, an ML job or an application reads your models. Rocky does not run it. A **consumer** is a small file that records that it exists, who owns it, and which models it reads. With the record, Rocky answers "who reads this model?" and refuses a build when a consumer points at a model that no longer exists.
 
 ## Declare a consumer
 
@@ -66,32 +61,13 @@ error[E060]: consumer `weekly_board` depends on `fct_order`, which is not a mode
 `depends_on` takes model names only. A source table or a seed is not a model.
 This check is what catches a dashboard that still reads a model someone removed.
 
-`E060` is an ordinary compile error. `rocky compile`, `rocky ci` and
-`rocky test` fail on it, and so do strict compiles. `rocky ci` and `rocky test`
-report it as a diagnostic, not as a failed model: it never appears in
-`model_results`, and the model tests still run before the command exits with an
-error.
+`E060` is an ordinary compile error. `rocky compile`, `rocky ci` and `rocky test` fail on it, and so do strict compiles. `rocky ci` and `rocky test` report it as a diagnostic, not a failed model: it never appears in `model_results`, and the model tests still run first.
 
-`rocky test` fails on `E060` only when it covers the whole project. With
-`--model`, `--select` or `--exclude` it still lists the problem in
-`diagnostics`, but does not fail on it, so a scoped test is not blocked by a
-consumer file it never selected. `rocky ci` always covers the whole project.
+`rocky test` fails on `E060` only when it covers the whole project. With `--model`, `--select` or `--exclude` it lists the problem in `diagnostics` but does not fail. `rocky ci` always covers the whole project.
 
-`rocky run`, `rocky run --select`, `rocky run --dag`, `rocky plan`, the MCP
-`propose` tool and the compile check of `rocky fulfill` do not stop for it. A
-consumer is metadata about the readers of your models, so a wrong record cannot
-make a model unsafe to write. The run writes the models, does not count the
-consumer as a failed table, and lists each problem in the
-`consumer_diagnostics` array of its JSON output. Run `rocky compile` or
-`rocky ci` first if you want the refusal. `rocky docs`, `rocky emit-sql` and
-`rocky publish-ir` also ignore `E060` and work from the models.
+`rocky run` (also `--select`, `--dag`), `rocky plan`, the MCP `propose` tool and the compile check of `rocky fulfill` do not stop for it. A consumer is metadata about readers, so a wrong record cannot make a model unsafe to write. The run lists each problem in the `consumer_diagnostics` array of its JSON output. Run `rocky compile` or `rocky ci` first if you want the refusal. `rocky docs`, `rocky emit-sql` and `rocky publish-ir` also ignore `E060`.
 
-Rocky reads `consumers/` from the project root, the directory of `rocky.toml`.
-A scoped command reads the same consumers as a whole-project one: `--models
-models/marts`, a pipeline `models` glob, and a project with several pipelines
-all see them. A `depends_on` entry is valid when it names a model anywhere in
-the project, not only a model in the part being compiled. Without a
-`rocky.toml`, Rocky looks beside the models directory.
+Rocky reads `consumers/` from the project root, the directory of `rocky.toml`, or beside the models directory when there is no `rocky.toml`. A scoped command reads the same consumers as a whole-project one, and a `depends_on` entry is valid when it names a model anywhere in the project.
 
 ## Where consumers show up
 

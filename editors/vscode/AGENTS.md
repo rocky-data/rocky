@@ -2,7 +2,7 @@
 
 VS Code extension for the Rocky SQL transformation engine. LSP client that communicates with `rocky lsp` over stdio, plus commands for AI features, diagnostics, and operational tasks.
 
-**Local skill:** `editors/vscode/.agents/skills/tailwind-plus-elements/` (mirrored in `.claude/skills/`) covers `@tailwindplus/elements` web components in the React webviews under `webview-ui/`. Read its `SKILL.md` before building or upgrading an interactive webview surface.
+**Local skill:** `editors/vscode/.agents/skills/tailwind-plus-elements/` covers `@tailwindplus/elements` web components in the React webviews under `webview-ui/`. Read its `SKILL.md` before building or upgrading an interactive webview surface.
 
 ## Architecture
 
@@ -74,29 +74,20 @@ recording/                       # Playwright-driven demo GIF recorder
 ## Common Commands
 
 ```bash
-# Build
+# Build and test
 npm install
-npm run compile           # TypeScript → JS (out/)
+npm run compile           # TypeScript to JS (out/)
 npm run watch             # Continuous compile
-
-# Test
 npm run test:unit         # Vitest unit tests (fast, preferred)
-npm test                  # Full Electron integration tests (~344 MB download)
-
-# Lint
+npm test                  # Electron integration tests (~344 MB download)
 npm run lint              # ESLint
 
 # Package
 npm run package           # Build .vsix
 code --install-extension rocky-*.vsix
 
-# Debug
-# Press F5 in VS Code → launches Extension Development Host
-
-# Demo GIFs
-# recording/ — Playwright drives a real VS Code to auto-record extension demos.
-# `just record-demo <scenario>` from the monorepo root; output in recording/out/.
-# (see recording/README.md for the gotchas).
+# Debug: press F5 (Extension Development Host). Build steps: DEVELOPMENT.md
+# Demo GIFs: `just record-demo <scenario>` from the monorepo root; output in recording/out/ (recording/README.md)
 ```
 
 ## Extension Commands
@@ -111,18 +102,7 @@ To add a command: implement it in the matching `src/commands/<concern>.ts`, regi
 
 ## Configuration Settings
 
-Generated from `package.json` (`contributes.configuration`), which wins if the two differ.
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `rocky.server.path` | `"rocky"` | Path to the Rocky binary |
-| `rocky.server.extraArgs` | `[]` | Extra arguments to pass to rocky lsp |
-| `rocky.inlayHints.enabled` | `true` | Show inferred types inline |
-| `rocky.statusBar.segments` | `[]` | Optional status bar segments to show after the LSP state |
-| `rocky.diagnostics.enabled` | `true` | Enable drift diagnostics (inline errors/warnings from `rocky compile`) |
-| `rocky.costAnnotations.enabled` | `true` | Show inline cost annotations (CodeLens) above model files |
-| `rocky.preview.rowLimit` | `100` | Maximum rows returned by **Rocky: Preview** (`rocky preview rows --limit`) |
-| `rocky.preview.allowWarehouse` | `false` | Allow row previews to execute against a non-DuckDB warehouse (Databricks/Snowflake/BigQuery/Trino) |
+`package.json` (`contributes.configuration`) is the source. The [README](README.md#settings) lists each setting with its default.
 
 ## File Associations
 
@@ -130,9 +110,4 @@ Generated from `package.json` (`contributes.configuration`), which wins if the t
 - **Document Selector**: `.rocky` files + `.sql` files under `**/models/**`
 - **File Watchers**: `**/*.rocky`, `**/*.toml`, `**/models/**/*.sql`. The server registers these itself in `initialized` (dynamic registration); the client sets no `synchronize.fileEvents`, which would send every event twice.
 
-## Related Projects
-
-- [rocky](https://github.com/rocky-data/rocky) — Core CLI + engine (Rust)
-- [dagster-rocky](https://github.com/rocky-data/rocky/tree/main/integrations/dagster) — Dagster integration (Python)
-
-Git conventions are in the monorepo-root `AGENTS.md`.
+Related: the engine (`../../engine/`) and `dagster-rocky` (`../../integrations/dagster/`). Git conventions are in the monorepo-root `AGENTS.md`.
