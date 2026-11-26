@@ -594,9 +594,22 @@ pub fn run_unit_tests(
         for test in &unit_tests[name] {
             match &plan {
                 ModelUnitTestPlan::Run { sql, dialect } => {
-                    let mut result =
-                        run_one_unit_test(name, sql, test, &compile_result, extensions);
-                    result.dialect = dialect.clone();
+                    let mut reached_model = false;
+                    let mut result = run_one_unit_test(
+                        name,
+                        sql,
+                        test,
+                        &compile_result,
+                        extensions,
+                        &mut reached_model,
+                    );
+                    // A test that failed before its model's SQL reached
+                    // DuckDB (a fixture, a function, the database) did not
+                    // run on DuckDB: say so.
+                    result.dialect = dialect.clone().map(|mut d| {
+                        d.ran_on_duckdb = reached_model;
+                        d
+                    });
                     results.push(result);
                 }
                 ModelUnitTestPlan::Refuse { error, dialect } => results.push(UnitTestResult {
@@ -756,6 +769,7 @@ fn run_one_unit_test(
     test: &UnitTestDef,
     compile_result: &rocky_compiler::compile::CompileResult,
     extensions: &ExtensionOptions,
+    reached_model: &mut bool,
 ) -> UnitTestResult {
     let fail = |msg: String, mismatches: Vec<RowMismatch>| UnitTestResult {
         model: model.to_string(),
@@ -808,8 +822,10 @@ fn run_one_unit_test(
         }
     }
 
-    // Materialize the model output against the mocked inputs.
+    // Materialize the model output against the mocked inputs. From here on
+    // the model's SQL has been sent to DuckDB.
     let sql = compiled_sql.trim().trim_end_matches(';');
+    *reached_model = true;
     if let Err(e) =
         db.execute_statement(&format!("CREATE OR REPLACE TABLE __rocky_actual AS\n{sql}"))
     {
@@ -2128,6 +2144,40 @@ mod tests {
         assert!(error.contains("Snowflake"), "{error}");
         let dialect = result.dialect.as_ref().expect("marked");
         assert!(dialect.refused && !dialect.ran_on_duckdb, "{dialect:?}");
+    }
+
+    /// A test that fails before its model's SQL reaches DuckDB (here, a
+    /// fixture ref that is not an identifier) is marked as not run.
+    #[test]
+    fn a_test_that_fails_before_the_model_runs_is_marked_not_run() {
+        let (_tmp, models) = scaffold_unit_test_project(true);
+        let sidecar = models.join("flagged.toml");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(
+            &sidecar,
+            text.replace("ref = \"orders\"", "ref = \"or-ders\""),
+        )
+        .unwrap();
+        let run = run_unit_tests(
+            &models,
+            None,
+            &ExtensionOptions::default(),
+            &snowflake_target(),
+            false,
+        )
+        .unwrap();
+        let result = &run.results[0];
+        assert!(!result.passed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("invalid fixture ref"),
+            "{result:?}"
+        );
+        let dialect = result.dialect.as_ref().expect("marked");
+        assert!(!dialect.ran_on_duckdb && !dialect.refused, "{dialect:?}");
     }
 
     /// No resolved target is never taken as DuckDB: the default mode runs and

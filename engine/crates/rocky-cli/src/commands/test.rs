@@ -1477,6 +1477,35 @@ mod tests {
         assert!(!json.contains("\"dialect\""), "{json}");
     }
 
+    /// A project with no `rocky.toml` is unresolved, not DuckDB. A model two
+    /// pipelines load, one on DuckDB and one on Snowflake, has both targets.
+    #[test]
+    fn no_config_is_unresolved_and_two_targets_are_multiple() {
+        use rocky_core::unit_test::UnitTestDialectStatus;
+        let (tmp, models) = unit_test_project(DUCKDB_TOML);
+        std::fs::remove_file(tmp.path().join("rocky.toml")).expect("remove config");
+        let results = unit_results(&tmp, &models);
+        let dialect = results[0].dialect.as_ref().expect("marked");
+        assert_eq!(dialect.status, UnitTestDialectStatus::UnresolvedTarget);
+        assert!(dialect.targets.is_empty());
+
+        let (tmp, models) = unit_test_project(
+            "[adapter.duck]\ntype = \"duckdb\"\n\
+             [adapter.snow]\ntype = \"snowflake\"\naccount = \"example\"\n\
+             [pipeline.local]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.local.target]\nadapter = \"duck\"\n\
+             [pipeline.prod]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             [pipeline.prod.target]\nadapter = \"snow\"\n",
+        );
+        let results = unit_results(&tmp, &models);
+        let dialect = results[0].dialect.as_ref().expect("marked");
+        assert_eq!(dialect.status, UnitTestDialectStatus::MultipleTargets);
+        assert_eq!(
+            dialect.targets,
+            vec!["DuckDB".to_string(), "Snowflake".to_string()]
+        );
+    }
+
     /// `--strict-dialect` fails `rocky test` on a Snowflake project and
     /// passes it on a DuckDB project.
     #[test]
