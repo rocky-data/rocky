@@ -2797,3 +2797,216 @@ async fn test_finished_statement_leaves_in_flight_list() {
     adapter.execute_statement("SELECT 1").await.unwrap();
     assert!(adapter.in_flight_statements().is_empty());
 }
+
+/// A connector with `timeout` as its deadline and `max_retries` retries,
+/// with fast backoff and no circuit breaker.
+fn deadline_connector(
+    server: &MockServer,
+    timeout: Duration,
+    max_retries: u32,
+) -> DatabricksConnector {
+    let auth = Auth::from_config(AuthConfig {
+        host: "test.databricks.com".into(),
+        token: Some("test-token".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .unwrap();
+    let config = ConnectorConfig {
+        host: "test.databricks.com".into(),
+        warehouse_id: "test-warehouse".into(),
+        timeout,
+        retry: RetryConfig {
+            max_retries,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 50,
+            backoff_multiplier: 1.0,
+            jitter: false,
+            circuit_breaker_threshold: 0,
+            ..Default::default()
+        },
+    };
+    DatabricksConnector::new(config, auth).with_base_url(server.uri())
+}
+
+fn statement_state(id: &str, state: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "statement_id": id,
+        "status": { "state": state },
+        "manifest": null,
+        "result": null
+    }))
+}
+
+/// Mount the submit (exactly `submits` times) and the cancel (exactly
+/// `cancels` times) of statement `id`.
+async fn mount_submit_and_cancel(server: &MockServer, id: &str, submits: u64, cancels: u64) {
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(statement_state(id, "PENDING"))
+        .expect(submits)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/2.0/sql/statements/{id}/cancel")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(cancels)
+        .mount(server)
+        .await;
+}
+
+/// #2768: the submit asks for no wait, so the id comes back at once and the
+/// statement is listed in flight while its first poll is still open. A
+/// forced exit can then cancel a statement in its first seconds.
+#[tokio::test]
+async fn test_submit_does_not_wait_and_lists_the_id_before_the_first_poll_ends() {
+    use rocky_core::statement_cancel::StatementHandle;
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_databricks::adapter::DatabricksWarehouseAdapter;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("\"wait_timeout\":\"0s\""))
+        .respond_with(statement_state("stmt-young", "PENDING"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-young"))
+        .respond_with(statement_state("stmt-young", "SUCCEEDED").set_delay(Duration::from_secs(1)))
+        .mount(&server)
+        .await;
+
+    let adapter = Arc::new(DatabricksWarehouseAdapter::new(test_connector(&server)));
+    let running = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.execute_statement("SELECT 1").await })
+    };
+    let listed = wait_for_in_flight(&adapter).await;
+    assert_eq!(listed, vec![StatementHandle::new("stmt-young")]);
+    assert!(
+        !running.is_finished(),
+        "listed while the first poll is open"
+    );
+    running.await.unwrap().unwrap();
+    assert!(adapter.in_flight_statements().is_empty());
+}
+
+/// #2768: the client deadline cancels the statement and does not resubmit
+/// it, even with retries left. Before, the timeout counted as transient and
+/// a duplicate statement was submitted while the first still ran.
+#[tokio::test]
+async fn test_client_deadline_cancels_and_does_not_resubmit() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "stmt-slow", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-slow"))
+        .respond_with(statement_state("stmt-slow", "RUNNING"))
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_millis(700), 3);
+    let err = connector
+        .execute_statement("MERGE INTO t")
+        .await
+        .unwrap_err();
+    match &err {
+        ConnectorError::Abandoned { id, cancel, cause } => {
+            assert_eq!(id, "stmt-slow");
+            assert_eq!(cancel, "cancel requested");
+            assert!(matches!(**cause, ConnectorError::Timeout { .. }), "{cause}");
+        }
+        other => panic!("expected Abandoned, got {other}"),
+    }
+    assert!(connector.in_flight().snapshot().is_empty());
+    // `.expect(1)` on the submit and the cancel mocks assert on drop.
+}
+
+/// #2768: a transient poll error polls the same statement again. It never
+/// submits a second copy, and sends no cancel when the statement then ends.
+#[tokio::test]
+async fn test_transient_poll_error_polls_again_and_does_not_resubmit() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "stmt-flaky", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-flaky"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-flaky"))
+        .respond_with(statement_state("stmt-flaky", "SUCCEEDED"))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_secs(30), 3);
+    let id = connector.execute_statement("INSERT INTO t").await.unwrap();
+    assert_eq!(id, "stmt-flaky");
+}
+
+/// #2768: a poll error that re-polling does not fix cancels the statement and
+/// returns `Abandoned`. The submit is never repeated, and the run loop does
+/// not retry it either.
+#[tokio::test]
+async fn test_poll_errors_that_persist_cancel_and_do_not_resubmit() {
+    use rocky_core::failure_class::FailureClass;
+    use rocky_core::traits::{AdapterError, WarehouseAdapter};
+
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "stmt-lost", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-lost"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let connector = deadline_connector(&server, Duration::from_secs(30), 2);
+    let err = connector
+        .execute_statement("INSERT INTO t")
+        .await
+        .unwrap_err();
+    let ConnectorError::Abandoned { ref cause, .. } = err else {
+        panic!("expected Abandoned, got {err}");
+    };
+    assert!(
+        matches!(**cause, ConnectorError::ApiError { status: 503, .. }),
+        "{cause}"
+    );
+    let adapter =
+        rocky_databricks::adapter::DatabricksWarehouseAdapter::new(test_connector(&server));
+    assert_eq!(
+        adapter.classify_failure(&AdapterError::new(err)),
+        FailureClass::Permanent,
+        "a statement that may still run is never retried by the run loop"
+    );
+}
+
+/// #2768: the single-attempt read cancels its statement when its own
+/// timeout passes. Before, the future was dropped and the id was lost.
+#[tokio::test]
+async fn test_single_attempt_timeout_cancels_the_statement() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "stmt-read", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-read"))
+        .respond_with(statement_state("stmt-read", "RUNNING"))
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let err = connector
+        .execute_sql_single_attempt("DESCRIBE HISTORY t LIMIT 1", Duration::from_millis(700))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::Abandoned { ref id, .. } if id == "stmt-read"),
+        "{err}"
+    );
+}

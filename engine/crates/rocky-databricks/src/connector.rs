@@ -8,7 +8,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
 use rocky_core::retry::compute_backoff;
-use rocky_core::statement_cancel::{InFlightStatements, StatementHandle};
+use rocky_core::statement_cancel::{ABANDON_CANCEL_BUDGET, InFlightStatements, StatementHandle};
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
 };
@@ -33,6 +33,18 @@ pub enum ConnectorError {
 
     #[error("statement {id} timed out after {seconds}s")]
     Timeout { id: String, seconds: u64 },
+
+    /// The client stopped waiting on statement `id` while it may still run:
+    /// its deadline passed, or a poll failed and re-polling did not help. A
+    /// cancel was sent first; `cancel` says what came of it. Never retried,
+    /// by the connector or the run loop: a resubmit could run the statement
+    /// twice.
+    #[error("stopped waiting on statement {id} ({cancel}): {cause}")]
+    Abandoned {
+        id: String,
+        cancel: String,
+        cause: Box<ConnectorError>,
+    },
 
     #[error("statement {id} was canceled")]
     Canceled { id: String },
@@ -127,6 +139,20 @@ pub struct DatabricksConnector {
     /// Override for the base URL scheme + host (used by tests to point at wiremock).
     #[cfg(any(test, feature = "test-support"))]
     base_url_override: Option<String>,
+}
+
+/// How the submit asks Databricks to wait: not at all. The statement id
+/// comes back at once, so the statement can be cancelled from its first
+/// moment. The cost is at least one poll per statement.
+const SUBMIT_WAIT_TIMEOUT: &str = "0s";
+
+/// How long one statement may take and how often a failed poll is retried.
+#[derive(Debug, Clone, Copy)]
+struct StatementWait {
+    /// The whole call, submit and polls.
+    timeout: Duration,
+    /// Transient poll errors in a row that poll the same statement again.
+    repolls: u32,
 }
 
 // --- API types ---
@@ -594,7 +620,11 @@ impl DatabricksConnector {
         }
 
         for attempt in 0..=retry.max_retries {
-            match self.submit_and_wait_once(sql, result_format).await {
+            let wait = StatementWait {
+                timeout: self.config.timeout,
+                repolls: retry.max_retries,
+            };
+            match self.submit_and_wait_once(sql, result_format, wait).await {
                 Ok(resp) => {
                     if self.circuit_breaker.record_success() == TransitionOutcome::Recovered {
                         let evt = PipelineEvent::new("circuit_breaker_recovered")
@@ -701,7 +731,64 @@ impl DatabricksConnector {
         unreachable!("retry loop should always return")
     }
 
+    /// Submit `sql` and wait for it to reach a terminal state.
+    ///
+    /// The submit asks for no wait (`wait_timeout: "0s"`), so the statement
+    /// id comes back at once and is listed in flight before the first poll.
+    /// A forced exit or a fan-out abort can then cancel even a young
+    /// statement.
+    ///
+    /// ```text
+    ///   submit ──▶ id ──▶ register ──▶ poll ... ──▶ terminal ──▶ Ok / StatementFailed
+    ///                                    │
+    ///                     deadline, or a poll error that re-polling
+    ///                     did not fix ──▶ cancel (bounded) ──▶ Abandoned
+    /// ```
+    ///
+    /// A transient poll error polls the same statement again (at most
+    /// `wait.repolls` times in a row), never submits it again. Once the id is
+    /// known, every early return sends a cancel first and returns
+    /// [`ConnectorError::Abandoned`], which no retry layer resubmits.
     async fn submit_and_wait_once(
+        &self,
+        sql: &str,
+        result_format: ResultFormat,
+        wait: StatementWait,
+    ) -> Result<StatementResponse, ConnectorError> {
+        let deadline = tokio::time::Instant::now() + wait.timeout;
+        let response = tokio::time::timeout_at(deadline, self.submit(sql, result_format))
+            .await
+            // No id yet, so nothing to cancel. The server may have accepted
+            // the statement, so this is never resubmitted either.
+            .map_err(|_| ConnectorError::Timeout {
+                id: "<not yet assigned>".to_string(),
+                seconds: wait.timeout.as_secs(),
+            })??;
+
+        // A statement that ended before the submit answered.
+        if is_terminal(&response.status.state) {
+            return check_terminal_state(response);
+        }
+
+        let id = response.statement_id;
+        // Listed until this function returns, on every path, so a forced
+        // exit or a fan-out abort can cancel it.
+        let _in_flight = self.in_flight.register(StatementHandle::new(id.clone()));
+        match self.poll_until_terminal(&id, deadline, wait).await {
+            Ok(terminal) => check_terminal_state(terminal),
+            Err(cause) => {
+                let cancel = self.cancel_abandoned(&id).await;
+                Err(ConnectorError::Abandoned {
+                    id,
+                    cancel,
+                    cause: Box::new(cause),
+                })
+            }
+        }
+    }
+
+    /// POST the statement. Returns as soon as Databricks has given it an id.
+    async fn submit(
         &self,
         sql: &str,
         result_format: ResultFormat,
@@ -714,7 +801,7 @@ impl DatabricksConnector {
         let body = SubmitRequest {
             warehouse_id: self.config.warehouse_id.clone(),
             statement: sql.to_string(),
-            wait_timeout: "30s".to_string(),
+            wait_timeout: SUBMIT_WAIT_TIMEOUT.to_string(),
             disposition: result_format.disposition().to_string(),
             format: result_format.format().to_string(),
         };
@@ -733,67 +820,110 @@ impl DatabricksConnector {
             return Err(ConnectorError::ApiError { status, body });
         }
 
-        let mut response: StatementResponse = resp.json().await?;
+        Ok(resp.json().await?)
+    }
 
-        // If the statement completed inline, return immediately
-        if is_terminal(&response.status.state) {
-            return check_terminal_state(response);
-        }
-
-        // Listed until this function returns, on every path, so a forced
-        // exit can cancel it. Before the submit returns there is no id: a
-        // statement in its first `wait_timeout` cannot be cancelled.
-        let _in_flight = self
-            .in_flight
-            .register(StatementHandle::new(response.statement_id.clone()));
-
-        // Poll until complete
-        let poll_url = format!(
-            "{}/api/2.0/sql/statements/{}",
-            self.api_base_url(),
-            response.statement_id
-        );
-        let deadline = tokio::time::Instant::now() + self.config.timeout;
+    /// Poll statement `id` until it reaches a terminal state, and return that
+    /// last response. An `Err` means the client stops waiting while the
+    /// statement may still run: the deadline passed, or a poll failed and
+    /// re-polling did not help.
+    async fn poll_until_terminal(
+        &self,
+        id: &str,
+        deadline: tokio::time::Instant,
+        wait: StatementWait,
+    ) -> Result<StatementResponse, ConnectorError> {
+        let poll_url = format!("{}/api/2.0/sql/statements/{id}", self.api_base_url());
+        let timed_out = || ConnectorError::Timeout {
+            id: id.to_string(),
+            seconds: wait.timeout.as_secs(),
+        };
         let mut step = 0;
+        let mut failed_polls: u32 = 0;
 
         loop {
-            if tokio::time::Instant::now() > deadline {
-                return Err(ConnectorError::Timeout {
-                    id: response.statement_id,
-                    seconds: self.config.timeout.as_secs(),
-                });
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(timed_out());
             }
-
-            let delay = poll_delay(step);
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep_until((now + poll_delay(step)).min(deadline)).await;
             step += 1;
 
-            debug!(
-                statement_id = response.statement_id,
-                state = response.status.state,
-                "polling statement"
-            );
+            debug!(statement_id = id, "polling statement");
 
-            let token = self.auth.get_token().await?;
-            let poll_resp = self
-                .client
-                .get(&poll_url)
-                .bearer_auth(&token)
-                .send()
-                .await?;
-
-            if !poll_resp.status().is_success() {
-                let status = poll_resp.status().as_u16();
-                let body = poll_resp.text().await.unwrap_or_default();
-                return Err(ConnectorError::ApiError { status, body });
-            }
-
-            response = poll_resp.json().await?;
-
-            if is_terminal(&response.status.state) {
-                return check_terminal_state(response);
+            let polled = tokio::time::timeout_at(deadline, self.poll_once(&poll_url))
+                .await
+                .map_err(|_| timed_out())?;
+            match polled {
+                Ok(response) => {
+                    failed_polls = 0;
+                    if is_terminal(&response.status.state) {
+                        return Ok(response);
+                    }
+                }
+                Err(err) if failed_polls < wait.repolls && is_transient(&err) => {
+                    failed_polls += 1;
+                    // See the matching branch in `submit_and_wait_inner`.
+                    if matches!(
+                        &err,
+                        ConnectorError::ApiError {
+                            status: 401 | 403,
+                            ..
+                        }
+                    ) {
+                        self.auth.invalidate_cache().await;
+                    }
+                    let backoff_ms = compute_backoff(&self.config.retry, failed_polls - 1);
+                    warn!(
+                        statement_id = id,
+                        attempt = failed_polls,
+                        max_repolls = wait.repolls,
+                        backoff_ms,
+                        error = %err,
+                        "poll failed, polling the same statement again"
+                    );
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(backoff_ms))
+                            .min(deadline),
+                    )
+                    .await;
+                }
+                Err(err) => return Err(err),
             }
         }
+    }
+
+    /// One status read of a submitted statement.
+    async fn poll_once(&self, poll_url: &str) -> Result<StatementResponse, ConnectorError> {
+        let token = self.auth.get_token().await?;
+        let resp = self.client.get(poll_url).bearer_auth(&token).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ConnectorError::ApiError { status, body });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Ask Databricks to cancel a statement this client stops waiting on.
+    /// Best effort and bounded by [`ABANDON_CANCEL_BUDGET`]: returns what
+    /// happened, for the error, and never fails.
+    async fn cancel_abandoned(&self, id: &str) -> String {
+        let outcome =
+            match tokio::time::timeout(ABANDON_CANCEL_BUDGET, self.cancel_statement(id)).await {
+                Ok(Ok(())) => "cancel requested".to_string(),
+                Ok(Err(e)) => format!("cancel failed: {e}"),
+                Err(_) => format!(
+                    "no answer to the cancel within {}s",
+                    ABANDON_CANCEL_BUDGET.as_secs()
+                ),
+            };
+        warn!(
+            statement_id = id,
+            cancel = %outcome,
+            "stopped waiting on a statement that may still run"
+        );
+        outcome
     }
 
     /// Run one optional, read-only statement with a single attempt.
@@ -801,8 +931,10 @@ impl DatabricksConnector {
     /// Unlike [`Self::execute_sql`], this never retries, never draws from the
     /// run-level retry budget and never touches the circuit breaker, so a
     /// failing optional read cannot cost a later real write anything. The
-    /// whole call (submit and poll) is capped at `timeout`; on expiry it
-    /// returns [`ConnectorError::Timeout`] and the client stops waiting.
+    /// whole call (submit and poll) is capped at `timeout`. On expiry it sends
+    /// a bounded cancel for the statement and returns
+    /// [`ConnectorError::Abandoned`] (or [`ConnectorError::Timeout`] when the
+    /// submit itself did not answer in time).
     ///
     /// Used for the after-write version read (RV1-P1b), whose failure is
     /// recorded, not raised.
@@ -811,20 +943,16 @@ impl DatabricksConnector {
         sql: &str,
         timeout: Duration,
     ) -> Result<QueryResult, ConnectorError> {
-        let response = match tokio::time::timeout(
-            timeout,
-            self.submit_and_wait_once(sql, ResultFormat::InlineJson),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(ConnectorError::Timeout {
-                    id: "<single-attempt>".to_string(),
-                    seconds: timeout.as_secs(),
-                });
-            }
-        };
+        let response = self
+            .submit_and_wait_once(
+                sql,
+                ResultFormat::InlineJson,
+                StatementWait {
+                    timeout,
+                    repolls: 0,
+                },
+            )
+            .await?;
         rocky_observe::metrics::METRICS.inc_statements_executed();
         let total_row_count = response.manifest.as_ref().and_then(|m| m.total_row_count);
         let columns = response
@@ -1247,7 +1375,10 @@ fn check_terminal_state(response: StatementResponse) -> Result<StatementResponse
 /// - HTTP 429 (Too Many Requests), 502/503/504 (server errors)
 /// - Network connection or timeout errors
 /// - Databricks-specific: warehouse starting, rate limits, temporary unavailability
-/// - Statement execution timeouts (may succeed on retry with a warmed-up warehouse)
+///
+/// Never transient: a [`ConnectorError::Timeout`] or
+/// [`ConnectorError::Abandoned`]. The statement may still run, so a retry
+/// could run it twice.
 pub(crate) fn is_transient(err: &ConnectorError) -> bool {
     match err {
         // 401 and 403 are transient-on-first-retry — the connector drops
@@ -1271,7 +1402,10 @@ pub(crate) fn is_transient(err: &ConnectorError) -> bool {
                 || msg.contains("CONNECTION RESET")
                 || msg.contains("RESOURCE_DOES_NOT_EXIST")
         }
-        ConnectorError::Timeout { .. } => true,
+        // The statement may still run on the warehouse (or, for a submit that
+        // did not answer, may have been accepted). A resubmit could run it
+        // twice.
+        ConnectorError::Timeout { .. } | ConnectorError::Abandoned { .. } => false,
         ConnectorError::Auth(_)
         | ConnectorError::Canceled { .. }
         | ConnectorError::UnexpectedState { .. }
@@ -1299,6 +1433,7 @@ pub(crate) fn classify_error(err: &ConnectorError) -> ErrorClass {
         ConnectorError::Http(e) if e.is_connect() => ErrorClass::Transient,
         ConnectorError::Http(_) => ErrorClass::Transient,
         ConnectorError::Timeout { .. } => ErrorClass::Timeout,
+        ConnectorError::Abandoned { cause, .. } => classify_error(cause),
         ConnectorError::Auth(_) => ErrorClass::Auth,
         ConnectorError::CircuitBreakerOpen { .. } => ErrorClass::Transient,
         ConnectorError::RetryBudgetExhausted { .. } => ErrorClass::Permanent,
@@ -1588,13 +1723,6 @@ mod tests {
                 TransientKind::RateLimit,
             ),
             (
-                ConnectorError::Timeout {
-                    id: "s1".to_string(),
-                    seconds: 30,
-                },
-                TransientKind::Timeout,
-            ),
-            (
                 ConnectorError::StatementFailed {
                     id: "s2".to_string(),
                     message: "WAREHOUSE IS STARTING".to_string(),
@@ -1622,6 +1750,19 @@ mod tests {
             ConnectorError::ApiError {
                 status: 400,
                 body: "bad request".to_string(),
+            },
+            // The statement may still run: a run-loop retry could run it twice.
+            ConnectorError::Timeout {
+                id: "s1".to_string(),
+                seconds: 30,
+            },
+            ConnectorError::Abandoned {
+                id: "s4".to_string(),
+                cancel: "cancel requested".to_string(),
+                cause: Box::new(ConnectorError::ApiError {
+                    status: 503,
+                    body: "unavailable".to_string(),
+                }),
             },
         ];
         for err in permanent_cases {
@@ -1822,13 +1963,15 @@ mod tests {
         assert!(!is_transient(&err));
     }
 
+    /// A timed-out statement may still run on the warehouse, so it is never
+    /// resubmitted (#2768): a resubmit could run it twice.
     #[test]
-    fn test_transient_timeout() {
+    fn test_not_transient_timeout() {
         let err = ConnectorError::Timeout {
             id: "id-1".into(),
             seconds: 120,
         };
-        assert!(is_transient(&err));
+        assert!(!is_transient(&err));
     }
 
     #[test]

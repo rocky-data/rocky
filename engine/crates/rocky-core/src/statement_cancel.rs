@@ -21,6 +21,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+/// How long a caller that stops waiting on a statement waits for the answer
+/// to its cancel request. A connector that gives up on a statement (its
+/// deadline passed, or polling failed) and a fan-out abort both send one
+/// cancel and wait at most this long, so giving up stays prompt.
+pub const ABANDON_CANCEL_BUDGET: Duration = Duration::from_secs(3);
 
 /// The warehouse's own id for one running statement.
 ///
