@@ -8,6 +8,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use reqwest::Client;
 use rocky_core::config::RetryConfig;
 use rocky_core::retry::compute_backoff;
+use rocky_core::statement_cancel::{InFlightStatements, StatementHandle};
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
 };
@@ -119,6 +120,10 @@ pub struct DatabricksConnector {
     /// Shared retry budget across the run (§P2.7). Unbounded by default —
     /// set via [`ConnectorConfig::retry::max_retries_per_run`].
     retry_budget: rocky_core::retry_budget::RetryBudget,
+    /// The statements this connector waits on now (clones share it). Each
+    /// statement is listed from the submit response until it reaches a
+    /// terminal state or the client stops waiting.
+    in_flight: InFlightStatements,
     /// Override for the base URL scheme + host (used by tests to point at wiremock).
     #[cfg(any(test, feature = "test-support"))]
     base_url_override: Option<String>,
@@ -304,6 +309,7 @@ impl DatabricksConnector {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             circuit_breaker,
             retry_budget,
+            in_flight: InFlightStatements::new(),
             #[cfg(any(test, feature = "test-support"))]
             base_url_override: None,
         }
@@ -316,6 +322,20 @@ impl DatabricksConnector {
     pub fn with_retry_budget(mut self, budget: rocky_core::retry_budget::RetryBudget) -> Self {
         self.retry_budget = budget;
         self
+    }
+
+    /// Record in-flight statements in `in_flight` instead of a list of this
+    /// connector's own. Give every connector of one adapter the same list, so
+    /// the adapter can name a statement sent through any of them.
+    #[must_use]
+    pub fn with_in_flight(mut self, in_flight: InFlightStatements) -> Self {
+        self.in_flight = in_flight;
+        self
+    }
+
+    /// The statements this connector waits on now.
+    pub fn in_flight(&self) -> &InFlightStatements {
+        &self.in_flight
     }
 
     /// Creates a connector that points at a custom base URL (for testing with wiremock).
@@ -719,6 +739,13 @@ impl DatabricksConnector {
         if is_terminal(&response.status.state) {
             return check_terminal_state(response);
         }
+
+        // Listed until this function returns, on every path, so a forced
+        // exit can cancel it. Before the submit returns there is no id: a
+        // statement in its first `wait_timeout` cannot be cancelled.
+        let _in_flight = self
+            .in_flight
+            .register(StatementHandle::new(response.statement_id.clone()));
 
         // Poll until complete
         let poll_url = format!(

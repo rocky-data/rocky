@@ -178,6 +178,20 @@ impl WarehouseAdapter for SparkWarehouseAdapter {
         }
     }
 
+    /// This adapter cannot cancel a statement. Its statements run on after a
+    /// forced exit.
+    fn in_flight_statements(&self) -> Vec<rocky_core::statement_cancel::StatementHandle> {
+        Vec::new()
+    }
+
+    /// See [`Self::in_flight_statements`].
+    async fn cancel_statement(
+        &self,
+        _handle: &rocky_core::statement_cancel::StatementHandle,
+    ) -> AdapterResult<rocky_core::statement_cancel::CancelOutcome> {
+        Ok(rocky_core::statement_cancel::CancelOutcome::Unsupported)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.run(sql).await.map(|_| ())
     }
@@ -396,6 +410,20 @@ mod tests {
         )
         .unwrap();
         SparkWarehouseAdapter::new(cfg, TableFormat::Delta).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_is_unsupported_and_nothing_is_in_flight() {
+        let a = adapter();
+        assert!(a.in_flight_statements().is_empty());
+        let outcome = a
+            .cancel_statement(&rocky_core::statement_cancel::StatementHandle::new("any"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            rocky_core::statement_cancel::CancelOutcome::Unsupported
+        );
     }
 
     #[test]
