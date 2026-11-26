@@ -577,16 +577,23 @@ The class depends on four things: the pipeline type, each materialization strate
 
 | Writes | Class |
 |---|---|
-| `full_refresh`, `view`, `ephemeral`, `content_addressed` | `rerun_safe` on DuckDB, Databricks, Snowflake and BigQuery |
-| `materialized_view`, `dynamic_table` | `rerun_safe` where the warehouse supports them |
-| `merge`, and `incremental` with a `unique_key` | `rerun_safe` on Databricks and on a DuckDB file |
-| `time_interval` | `rerun_safe` on Databricks and on a DuckDB file |
-| `delete_insert` | `rerun_safe` on a DuckDB file only |
-| `incremental` with no `unique_key` (transformation) | `rerun_safe` on a DuckDB file only |
+| `view`, `content_addressed` | `rerun_safe` on DuckDB, Databricks, Snowflake and BigQuery |
+| `full_refresh` | `rerun_safe` on a DuckDB file, Databricks, Snowflake and BigQuery |
+| `ephemeral` | `rerun_safe` on every adapter. It writes nothing. |
+| `materialized_view` | `rerun_safe` on Databricks, Snowflake and BigQuery |
+| `dynamic_table` | `rerun_safe` on Snowflake |
+| `merge`, `incremental` with a `unique_key`, `time_interval`, `delete_insert` | `rerun_safe` on a DuckDB file only |
+| `incremental` with no `unique_key` and no `lookback`, or a `lookback` of 0 (transformation) | `rerun_safe` on a DuckDB file only |
+| `incremental` with no `unique_key` and a `lookback` above 0 | never. Each run appends the lookback window again. |
+| `microbatch` | the same as `time_interval`. Rocky runs a microbatch model as `time_interval`. |
 | `incremental` (replication), `snapshot`, `load` | never |
-| a `quality` pipeline | `rerun_safe`, unless `[checks.quarantine]` is enabled |
+| a `quality` pipeline | `rerun_safe` on every adapter. It only reads the warehouse. Not when `[checks.quarantine]` is on, or when the pipeline has a `[[checks.custom]]` check. |
 
-"A DuckDB file" means a local file or memory, with no `[[adapter.NAME.attach]]` and no MotherDuck path. Only one process can open such a file to write, so two runs cannot overlap. Every other adapter type is `not_rerun_safe` for now.
+On Databricks, `merge`, `incremental` with a `unique_key` and `time_interval` are `not_rerun_safe` for now. Rocky has not proven what two overlapping writes do there. The message says "not proven under concurrent writers".
+
+"A DuckDB file" means a DuckDB adapter with no `[[adapter.NAME.attach]]`. Its `path` is a plain file path, `:memory:`, or not set. A `path` with a `:` in it, such as `md:prod` or `ducklake:meta.ducklake`, is not a DuckDB file. The exceptions are `:memory:` and a Windows drive letter such as `C:\`. Each scheduled run is a separate process, and only one process can open a DuckDB file to write. So two runs cannot overlap.
+
+Other adapter types are `not_rerun_safe` for every write, except `ephemeral` and a `quality` pipeline as shown above.
 
 ### One scheduler instance per project
 

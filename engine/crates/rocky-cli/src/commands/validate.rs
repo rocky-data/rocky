@@ -1333,6 +1333,11 @@ fn rerun_safety_message(
 /// What a pipeline writes, for [`rerun_safety_message`]. Replication strategies
 /// go through the same builder `rocky run` uses; transformation models are
 /// loaded from this pipeline's own `models` glob.
+///
+/// This loads the models a second time. `validate_inner` loads them once more
+/// after the pipeline loop, but it flattens and deduplicates every pipeline's
+/// selection into one list, so it cannot tell which models belong to which
+/// pipeline. Reusing it would need a per-pipeline load there first.
 fn resolve_rerun_writes(
     pc: &rocky_core::config::PipelineConfig,
     cfg: &rocky_core::config::RockyConfig,
@@ -6369,6 +6374,79 @@ auto_create_catalogs = false
             "{}",
             hits[0].message
         );
+    }
+
+    fn v069_message(adapter_type: &str, strategy: &str) -> String {
+        let dir = scheduled_transformation(adapter_type, strategy);
+        let out = validate_inner(&dir.path().join("rocky.toml")).unwrap();
+        let hits = v069(&out);
+        assert_eq!(hits.len(), 1, "{:?}", out.messages);
+        hits[0].message.clone()
+    }
+
+    /// The loader lowers a declared `microbatch` to `time_interval`, so the
+    /// class V069 prints for it is the time_interval class, on every adapter.
+    #[test]
+    fn a_loaded_microbatch_model_gets_the_time_interval_class() {
+        let microbatch = "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n";
+        let interval =
+            "[strategy]\ntype = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"hour\"\n";
+        for adapter_type in ["duckdb", "databricks"] {
+            assert_eq!(
+                v069_message(adapter_type, microbatch),
+                v069_message(adapter_type, interval),
+                "{adapter_type}"
+            );
+        }
+        assert_eq!(
+            v069_message("duckdb", microbatch),
+            "pipeline.silver: rerun_safe"
+        );
+        let databricks = v069_message("databricks", microbatch);
+        assert!(
+            databricks.contains("not_rerun_safe")
+                && databricks.contains("not proven under concurrent writers"),
+            "{databricks}"
+        );
+    }
+
+    /// A keyless incremental model with a lookback re-appends its window on
+    /// every run, so it is not safe even on a single-writer DuckDB file. A
+    /// zero lookback re-reads nothing.
+    #[test]
+    fn a_loaded_keyless_lookback_model_is_not_rerun_safe_on_duckdb() {
+        let lookback = |amount: &str| {
+            format!(
+                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\
+                 lookback = \"{amount}\"\n"
+            )
+        };
+        let message = v069_message("duckdb", &lookback("3 days"));
+        assert!(
+            message.starts_with("pipeline.silver: not_rerun_safe (model 'orders': ")
+                && message.contains("lookback"),
+            "{message}"
+        );
+        assert_eq!(
+            v069_message("duckdb", &lookback("0 days")),
+            "pipeline.silver: rerun_safe"
+        );
+    }
+
+    /// The V069 call site, like the classifier, must name every variant: a
+    /// catch-all arm would class a new pipeline type or write without a
+    /// compile error.
+    #[test]
+    fn the_rerun_safety_call_site_has_no_catch_all_arm() {
+        const SOURCE: &str = include_str!("validate.rs");
+        let start = SOURCE
+            .find("fn rerun_safety_message(")
+            .expect("the V069 builder is present");
+        let len = SOURCE[start..]
+            .find("/// Validation for a pipeline's optional `[schedule]` block")
+            .expect("the V069 builders end before the schedule validation");
+        let arms = rocky_core::rerun_safety::catch_all_match_arms(&SOURCE[start..start + len]);
+        assert!(arms.is_empty(), "a catch-all match arm crept in: {arms:#?}");
     }
 
     #[test]
