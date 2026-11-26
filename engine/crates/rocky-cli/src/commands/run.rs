@@ -62,12 +62,53 @@ struct MissingTimestampColumn {
     columns: String,
 }
 
-fn classify_table_error(err: &anyhow::Error) -> (FailureKind, Option<u64>) {
-    if err.is::<MissingTimestampColumn>() {
+/// How a failed replication copy is reported, and whether the auto-retry arm
+/// may run it again.
+struct CopyErrorClass {
+    failure_kind: FailureKind,
+    cooldown_seconds: Option<u64>,
+    /// The copy's statement may still run on the warehouse (a connector
+    /// `Timeout` or `Abandoned`). The `table_retries` arm must not resubmit
+    /// it: the copy could run twice (#2768).
+    may_still_run: bool,
+}
+
+fn classify_table_error(err: &anyhow::Error) -> CopyErrorClass {
+    let (failure_kind, cooldown_seconds) = if err.is::<MissingTimestampColumn>() {
         (FailureKind::CompileError, None)
     } else {
         classify_anyhow_error_with_cooldown(err)
+    };
+    CopyErrorClass {
+        failure_kind,
+        cooldown_seconds,
+        may_still_run: crate::output::statement_may_still_run(err),
     }
+}
+
+/// Settle `table_errors` after the `table_retries` arm: drop the first error
+/// of each table in `retried` (its retry either succeeded or is in
+/// `still_failed`), then add `still_failed`. A table the arm did not retry
+/// keeps its first error: one `auto_retry_indices` left out (its statement may
+/// still run, #2768), or one a cancel stopped before its turn (#1606).
+fn settle_table_retries(
+    table_errors: &mut Vec<TableError>,
+    retried: &[usize],
+    still_failed: Vec<TableError>,
+) {
+    table_errors.retain(|e| e.task_index.is_none_or(|idx| !retried.contains(&idx)));
+    table_errors.extend(still_failed);
+}
+
+/// The task indices the `table_retries` arm runs again: every failed copy that
+/// has a task, except one whose statement may still run on the warehouse. A
+/// resubmit of that copy could apply it twice (#2768).
+fn auto_retry_indices(table_errors: &[TableError]) -> Vec<usize> {
+    table_errors
+        .iter()
+        .filter(|e| !e.may_still_run)
+        .filter_map(|e| e.task_index)
+        .collect()
 }
 
 fn source_has_timestamp_column(source_cols: &[ColumnInfo], timestamp_column: &str) -> bool {
@@ -453,6 +494,10 @@ struct TableError {
     /// `circuit_breaker_recovery_timeout_secs`). Mirrors the
     /// source-side hint on `FailedSource.cooldown_seconds`.
     cooldown_seconds: Option<u64>,
+    /// The failed statement may still run on the warehouse, so the
+    /// `table_retries` arm skips this entry (see [`auto_retry_indices`]).
+    /// `false` for every entry no copy produced.
+    may_still_run: bool,
 }
 
 /// Sentinel error signalling that `rocky run` was cancelled by a shutdown
@@ -640,6 +685,9 @@ pub struct PartialFailure {
     /// Whether the same run ALSO failed its check gate. Changes the advice,
     /// never the exit code — both shapes are exit 2.
     pub check_gate_failed: bool,
+    /// Whether a failed table's statement may still run on the warehouse (a
+    /// connector `Timeout` or `Abandoned`). Changes the resume advice only.
+    pub statement_may_still_run: bool,
     /// Whether this run's record is persisted (#1836). Read by
     /// [`session_disposition`]; never changes the exit code, which stays 2
     /// either way — the run failed the same amount, and downgrading it to the
@@ -657,6 +705,15 @@ impl std::fmt::Display for PartialFailure {
                  check gate (run_id: {}); `--resume {}` re-copies only the failed table(s) and \
                  re-runs none of the checks that gated this run, so a resume cannot clear the \
                  gate — fix the data and re-run the pipeline",
+                self.count, self.run_id, self.run_id
+            );
+        }
+        if self.statement_may_still_run {
+            return write!(
+                f,
+                "{} table(s) failed during parallel execution (run_id: {}); at least one \
+                 statement may still be running on the warehouse, so confirm it has stopped \
+                 before you use --resume {}",
                 self.count, self.run_id, self.run_id
             );
         }
@@ -942,6 +999,7 @@ pub(crate) fn run_status_exit_result(
             // (#1720). `false` on the transformation / model-only paths, which
             // never stamp the gate — those messages are unchanged.
             check_gate_failed: output.check_gate_failed,
+            statement_may_still_run: false,
             custody,
         }
         .into()),
@@ -2333,6 +2391,51 @@ async fn try_claim_idempotency(
                 status: rocky_core::state::RunStatus::SkippedInFlight,
                 prior_run_id,
             })
+        }
+    }
+}
+
+/// The prior run id when `key` holds completed work: the claim would answer
+/// `SkipCompleted`. Reads the key and claims nothing. `None` when the key is
+/// absent, in flight, stale, or cannot be read; a read error is logged, and
+/// the caller then refuses as it would have.
+async fn completed_idempotency_key(
+    state_cfg: &rocky_core::config::StateConfig,
+    state_path: &Path,
+    key: &str,
+) -> Option<String> {
+    use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck};
+
+    let backend = IdempotencyBackend::from_state_config(state_cfg);
+    // Only the local backend reads redb; `tiered` reads its Valkey primary,
+    // as the claim does.
+    let state_store = match backend {
+        IdempotencyBackend::Local => match StateStore::open_read_only(state_path) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                warn!(
+                    idempotency_key = key,
+                    error = %error,
+                    "could not open the state store to read the idempotency key; refusing"
+                );
+                return None;
+            }
+        },
+        _ => None,
+    };
+    match backend
+        .peek(state_store.as_ref(), key, &state_cfg.idempotency)
+        .await
+    {
+        Ok(IdempotencyCheck::SkipCompleted { run_id }) => Some(run_id),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                idempotency_key = key,
+                error = %error,
+                "could not read the idempotency key; refusing"
+            );
+            None
         }
     }
 }
@@ -3972,7 +4075,7 @@ pub(crate) async fn run_with_direct_gate(
     // again after discovery (below); this gate refuses it up front only when
     // no `run` rule could allow any table.
     let branch_run = shadow_config.is_some_and(|c| c.branch.is_some());
-    super::run_policy_gate::gate_pre_run(
+    if let Err(refusal) = super::run_policy_gate::gate_pre_run(
         direct_gate,
         &loaded.config,
         config_path,
@@ -3988,7 +4091,30 @@ pub(crate) async fn run_with_direct_gate(
         },
         branch_run,
     )
-    .await?;
+    .await
+    {
+        // Ruled 2026-11-26: a retry whose key already completed keeps
+        // reporting `skipped_idempotent` (exit 0), as before the run gate
+        // refused `require_review`. Skipping writes nothing. The key is read,
+        // never claimed, so a refused run still leaves no stamp. A `deny`,
+        // an unloadable policy, or any other error refuses as it did.
+        if let Some(key) = idempotency_key
+            && refusal
+                .downcast_ref::<super::run_policy_gate::ReviewRequired>()
+                .is_some()
+            && let Some(prior_run_id) =
+                completed_idempotency_key(&loaded.config.state, state_path, key).await
+        {
+            emit_skipped_run_output(
+                key,
+                &prior_run_id,
+                rocky_core::state::RunStatus::SkippedIdempotent,
+                output_json,
+            )?;
+            return Ok(RunTermination::SkippedIdempotent { prior_run_id });
+        }
+        return Err(refusal);
+    }
 
     // -------------------------------------------------------------------
     // Idempotency check + claim (before any state mutation / run_id mint).
@@ -7082,6 +7208,10 @@ pub(crate) async fn run_with_direct_gate(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let shared_batch_check = batch_check_adapter.clone();
     let shared_warehouse = warehouse_adapter.clone();
+    // Every early stop of the fan-out below goes through
+    // `statement_cancel::abort_fan_out`, never a bare `abort_all`: a bare
+    // abort drops the copies' futures and leaves their statements running on
+    // the warehouse (#2768).
     // `Arc<StateStore>` (not `Arc<Mutex<…>>`): every StateStore method takes
     // `&self` and redb serialises writers internally, so a shared reference is
     // sound. Concurrent state I/O runs on the blocking pool via `spawn_blocking`
@@ -7196,6 +7326,7 @@ pub(crate) async fn run_with_direct_gate(
             copy: None,
             failure_kind: crate::output::FailureKind::Unknown,
             cooldown_seconds: None,
+            may_still_run: false,
         });
     }
 
@@ -7276,7 +7407,12 @@ pub(crate) async fn run_with_direct_gate(
                             "error rate exceeded threshold, aborting remaining tables"
                         ),
                     }
-                    join_set.abort_all();
+                    crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                     drain_abort = Some(cause);
                     break;
                 }
@@ -7447,7 +7583,11 @@ pub(crate) async fn run_with_direct_gate(
                 // variant is preserved on `TableError.failure_kind` and
                 // the optional engine-supplied cooldown hint
                 // (warehouse-side breaker trip) is captured.
-                let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+                let CopyErrorClass {
+                    failure_kind,
+                    cooldown_seconds,
+                    may_still_run,
+                } = classify_table_error(&e);
                 // The copy's own time and attempt, for its run record (#2470).
                 let copy = tables_to_process.get(idx).map(|task| CopyFailure {
                     table: task.target_table_name.clone(),
@@ -7535,9 +7675,15 @@ pub(crate) async fn run_with_direct_gate(
                     copy,
                     failure_kind,
                     cooldown_seconds,
+                    may_still_run,
                 });
                 if fail_fast {
-                    join_set.abort_all();
+                    crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -7570,9 +7716,15 @@ pub(crate) async fn run_with_direct_gate(
                     copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
+                    may_still_run: false,
                 });
                 if fail_fast {
-                    join_set.abort_all();
+                    crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -7587,7 +7739,12 @@ pub(crate) async fn run_with_direct_gate(
                     threshold = error_rate_abort_pct,
                     "error rate exceeded threshold, aborting remaining tables"
                 );
-                join_set.abort_all();
+                crate::statement_cancel::abort_fan_out(
+                        &mut join_set,
+                        &pipeline.target.adapter,
+                        shared_warehouse.as_ref(),
+                    )
+                    .await;
                 break;
             }
         }
@@ -7608,6 +7765,10 @@ pub(crate) async fn run_with_direct_gate(
     }
     if interrupted {
         output.interrupted = true;
+        // No statement to cancel here: the final drain leaves its loop only
+        // when the set is empty, or after `abort_fan_out` already cancelled
+        // and aborted what it held. Pinned by
+        // `the_one_fan_out_shutdown_in_run_rs_follows_a_drain_or_a_sweep`.
         join_set.shutdown().await;
 
         // Terminal SIGINT flush: the fan-out has drained and this returns
@@ -7803,7 +7964,9 @@ pub(crate) async fn run_with_direct_gate(
     // Auto-retry failed tables
     let table_retries = pipeline.execution.table_retries;
     if table_retries > 0 && !table_errors.is_empty() {
-        let retryable: Vec<usize> = table_errors.iter().filter_map(|e| e.task_index).collect();
+        // A copy whose statement may still run keeps its first error and is
+        // not resubmitted (#2768).
+        let retryable = auto_retry_indices(&table_errors);
 
         if !retryable.is_empty() {
             info!(
@@ -7813,15 +7976,16 @@ pub(crate) async fn run_with_direct_gate(
             let mut still_failed = Vec::new();
             // A cancel stops the retries (#1606): a table not yet retried
             // keeps its first-attempt error, and the run settles as
-            // interrupted at its terminal exit.
-            let mut not_retried: Vec<usize> = Vec::new();
-            let mut pending = retryable.into_iter();
-            for idx in pending.by_ref() {
+            // interrupted at its terminal exit. So does a table
+            // `auto_retry_indices` left out. Only a retried table's first
+            // error is replaced.
+            let mut retried: Vec<usize> = Vec::new();
+            for idx in retryable {
                 if cancel.is_cancelled() {
                     output.interrupted = true;
-                    not_retried.push(idx);
                     break;
                 }
+                retried.push(idx);
                 let task = &tables_to_process[idx];
                 let retry_start = Instant::now();
                 match retry_table_after_recovery(
@@ -7908,7 +8072,11 @@ pub(crate) async fn run_with_direct_gate(
                         info!(table = task.target_table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
-                        let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+                        let CopyErrorClass {
+                            failure_kind,
+                            cooldown_seconds,
+                            may_still_run,
+                        } = classify_table_error(&e);
                         let msg = format!("{e:#}");
                         warn!(
                             table = task.target_table_name.as_str(),
@@ -7930,13 +8098,12 @@ pub(crate) async fn run_with_direct_gate(
                             }),
                             failure_kind,
                             cooldown_seconds,
+                            may_still_run,
                         });
                     }
                 }
             }
-            not_retried.extend(pending);
-            table_errors.retain(|e| e.task_index.is_none_or(|idx| not_retried.contains(&idx)));
-            table_errors.extend(still_failed);
+            settle_table_retries(&mut table_errors, &retried, still_failed);
         }
     }
 
@@ -8319,6 +8486,7 @@ pub(crate) async fn run_with_direct_gate(
                         copy: None,
                         failure_kind,
                         cooldown_seconds,
+                        may_still_run: false,
                     });
                     None
                 }
@@ -8346,6 +8514,7 @@ pub(crate) async fn run_with_direct_gate(
                     copy: None,
                     failure_kind: crate::output::FailureKind::Unknown,
                     cooldown_seconds: None,
+                    may_still_run: false,
                 });
             }
 
@@ -8908,6 +9077,7 @@ pub(crate) async fn run_with_direct_gate(
         // "use --resume to retry" alone is wrong there: a resume re-copies the
         // failed table and re-runs none of the checks that gated the run.
         let gated = output.check_gate_failed;
+        let may_still_run = table_errors.iter().any(|e| e.may_still_run);
         if matches!(
             output.derive_run_status(),
             rocky_core::state::RunStatus::PartialFailure
@@ -8916,6 +9086,7 @@ pub(crate) async fn run_with_direct_gate(
                 count,
                 run_id: run_id.clone(),
                 check_gate_failed: gated,
+                statement_may_still_run: may_still_run,
                 custody: record_custody,
             }
             .into());
@@ -8925,6 +9096,13 @@ pub(crate) async fn run_with_direct_gate(
                 "{count} table(s) failed during parallel execution and this run also failed \
                  its check gate (run_id: {run_id}); a resume re-runs none of the checks that \
                  gated this run — fix the data and re-run the pipeline"
+            );
+        }
+        if may_still_run {
+            anyhow::bail!(
+                "{count} table(s) failed during parallel execution (run_id: {run_id}); at least one \
+                 statement may still be running on the warehouse, so confirm it has stopped before \
+                 you use --resume {run_id}"
             );
         }
         anyhow::bail!(
@@ -21674,7 +21852,11 @@ async fn process_completed_result(
             // Classify before stringification so the typed connector
             // variant is preserved on `TableError.failure_kind` (plus
             // the optional warehouse-breaker cooldown hint).
-            let (failure_kind, cooldown_seconds) = classify_table_error(&e);
+            let CopyErrorClass {
+                failure_kind,
+                cooldown_seconds,
+                may_still_run,
+            } = classify_table_error(&e);
             // The copy's own time and attempt, for its run record (#2470).
             let copy = tables_to_process.get(idx).map(|task| CopyFailure {
                 table: task.target_table_name.clone(),
@@ -21773,6 +21955,7 @@ async fn process_completed_result(
                 copy,
                 failure_kind,
                 cooldown_seconds,
+                may_still_run,
             });
             failed = true;
         }
@@ -21805,6 +21988,7 @@ async fn process_completed_result(
                 copy: None,
                 failure_kind: FailureKind::Unknown,
                 cooldown_seconds: None,
+                may_still_run: false,
             });
             failed = true;
         }
@@ -36660,6 +36844,7 @@ backend = "local"
                 count: 1,
                 run_id: "r".to_string(),
                 check_gate_failed: false,
+                statement_may_still_run: false,
                 custody,
             })
         };
@@ -36743,6 +36928,7 @@ backend = "local"
             copy: None,
             failure_kind: crate::output::FailureKind::QueryRejected,
             cooldown_seconds: None,
+            may_still_run: false,
         }
     }
 
@@ -37543,6 +37729,7 @@ backend = "local"
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: false,
+            statement_may_still_run: false,
             custody: super::RecordCustody::Persisted,
         }
         .to_string();
@@ -37552,10 +37739,26 @@ backend = "local"
             "an ungated copy failure keeps its exact message"
         );
 
+        let running = super::PartialFailure {
+            count: 1,
+            run_id: "run-1".to_string(),
+            check_gate_failed: false,
+            statement_may_still_run: true,
+            custody: super::RecordCustody::Persisted,
+        }
+        .to_string();
+        assert!(
+            running.contains("may still be running")
+                && running.contains("confirm it has stopped before you use --resume run-1")
+                && !running.contains("to retry"),
+            "a statement that may still run must not be told to resume: {running}"
+        );
+
         let gated = super::PartialFailure {
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: true,
+            statement_may_still_run: false,
             custody: super::RecordCustody::Persisted,
         }
         .to_string();
@@ -37801,6 +38004,155 @@ backend = "local"
             "an entry with no copy record adds nothing"
         );
         assert!(CopyFailure::prior_attempts(&errors, 9).is_empty());
+    }
+
+    /// #2768: `table_retries` defaults to 1, and the auto-retry arm used to
+    /// re-run every failed copy. A copy whose statement may still run (a
+    /// connector `Timeout` or `Abandoned`) must keep its first error and not
+    /// be resubmitted: the copy could apply twice. An ordinary failure is
+    /// still retried.
+    ///
+    /// Each error has the production shape: the connector error wrapped in
+    /// `rocky_core`'s `AdapterError`, then in `anyhow` with context, and
+    /// classified by the same `classify_table_error` the copy arms call.
+    #[test]
+    fn auto_retry_skips_a_copy_whose_statement_may_still_run() {
+        use rocky_core::statement_cancel::AbandonCancel;
+        use rocky_core::traits::AdapterError;
+        use rocky_databricks::connector::ConnectorError as DbE;
+        use rocky_snowflake::connector::ConnectorError as SnE;
+
+        fn wrapped(e: impl std::error::Error + Send + Sync + 'static) -> anyhow::Error {
+            anyhow::Error::from(AdapterError::new(e)).context("copying the table")
+        }
+        let entry = |idx: usize, err: anyhow::Error| {
+            let class = classify_table_error(&err);
+            let mut entry = copy_table_error("t");
+            entry.task_index = Some(idx);
+            entry.failure_kind = class.failure_kind;
+            entry.cooldown_seconds = class.cooldown_seconds;
+            entry.may_still_run = class.may_still_run;
+            entry
+        };
+        let errors = vec![
+            entry(
+                0,
+                wrapped(DbE::Abandoned {
+                    id: "s0".into(),
+                    cancel: AbandonCancel::Requested,
+                    cause: Box::new(DbE::Timeout {
+                        id: "s0".into(),
+                        seconds: 60,
+                    }),
+                }),
+            ),
+            entry(
+                1,
+                wrapped(DbE::Timeout {
+                    id: "s1".into(),
+                    seconds: 60,
+                }),
+            ),
+            entry(
+                2,
+                wrapped(SnE::Abandoned {
+                    handle: "h2".into(),
+                    cancel: AbandonCancel::NoAnswer,
+                    cause: Box::new(SnE::ApiError {
+                        status: 503,
+                        body: "unavailable".into(),
+                    }),
+                }),
+            ),
+            entry(
+                3,
+                wrapped(SnE::Timeout {
+                    handle: "h3".into(),
+                    seconds: 60,
+                }),
+            ),
+            // Ordinary failures: a transient 503 and an unclassified error.
+            entry(
+                4,
+                wrapped(DbE::ApiError {
+                    status: 503,
+                    body: "unavailable".into(),
+                }),
+            ),
+            entry(5, anyhow::anyhow!("the warehouse said no")),
+        ];
+
+        assert_eq!(
+            super::auto_retry_indices(&errors),
+            vec![4, 5],
+            "only the ordinary failures are retried"
+        );
+        assert_eq!(errors[4].failure_kind, FailureKind::Transient);
+        for skipped in &errors[..4] {
+            assert_eq!(skipped.failure_kind, FailureKind::Unknown);
+        }
+    }
+
+    /// #2768: after the retry arm, a table it skipped because its statement
+    /// may still run keeps its first error, so the run still reports it as
+    /// failed. A retried table's first error is replaced by its retry's.
+    #[test]
+    fn a_skipped_table_keeps_its_first_error_after_the_retry_arm() {
+        let failed = |idx: usize, may_still_run: bool| {
+            let mut entry = copy_table_error(&format!("t{idx}"));
+            entry.task_index = Some(idx);
+            entry.may_still_run = may_still_run;
+            entry
+        };
+        let mut errors = vec![
+            failed(0, true),
+            failed(1, false),
+            copy_table_error("<freeze>"),
+        ];
+        let retried = super::auto_retry_indices(&errors);
+        assert_eq!(retried, vec![1]);
+        let mut retry_error = failed(1, false);
+        retry_error.error = "retry of t1 failed".to_string();
+
+        super::settle_table_retries(&mut errors, &retried, vec![retry_error]);
+
+        let left: Vec<(Vec<String>, String)> = errors
+            .iter()
+            .map(|e| (e.asset_key.clone(), e.error.clone()))
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                (vec!["t0".to_string()], "copy of t0 failed".to_string()),
+                (
+                    vec!["<freeze>".to_string()],
+                    "copy of <freeze> failed".to_string()
+                ),
+                (vec!["t1".to_string()], "retry of t1 failed".to_string()),
+            ],
+            "the skipped table keeps its error, the entry with no task stays, \
+             the retried table carries its retry's error"
+        );
+    }
+
+    /// #2768: the auto-retry arm takes its task list from
+    /// [`super::auto_retry_indices`], the one place that drops a copy whose
+    /// statement may still run. An inline `filter_map` over `task_index` at
+    /// the arm would bypass that filter.
+    #[test]
+    fn the_auto_retry_arm_selects_through_auto_retry_indices() {
+        let compact = production_source();
+        assert_eq!(
+            compact
+                .matches("letretryable=auto_retry_indices(&table_errors);")
+                .count(),
+            1
+        );
+        assert_eq!(
+            compact.matches(".filter_map(|e|e.task_index)").count(),
+            1,
+            "only `auto_retry_indices` may list failed tasks for the retry"
+        );
     }
 
     /// #2470: a failed replication copy reaches the run record under its
@@ -54197,6 +54549,7 @@ timestamp_column = "ts"
                     copy: None,
                     failure_kind: FailureKind::Unknown,
                     cooldown_seconds: None,
+                    may_still_run: false,
                 })
                 .collect();
             let mut total_completed = prior_completed;

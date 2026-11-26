@@ -238,15 +238,16 @@ The page never passes `--dry-run`, because that still writes an applicable plan.
 While a job runs, operator mode shows a **Cancel** button under it (not on a read-only page). It calls `POST /api/v1/jobs/{id}/cancel`:
 
 ```
-Cancel ─▶ SIGTERM to the job's process group (handled like Ctrl-C) ─▶ the button becomes "Force stop"
-Force stop ─▶ SIGKILL to the job's process group                ─▶ the job stops at once
+Cancel     ─▶ SIGTERM (handled like Ctrl-C)                    ─▶ the button becomes "Force stop"
+Force stop ─▶ SIGTERM again: cancel warehouse statements, exit  ─▶ SIGKILL after 15 s if still running
+Force stop ─▶ (pressed again) SIGKILL to the job's process group ─▶ the job stops at once
 ```
 
 The job ends `cancelled`, or `succeeded` if it exits 0 anyway. It keeps the write slot until its process has exited. The error codes (`409 job_not_running`, `409 job_not_cancellable`) are in the [Embedding guide](/guides/embedding/#mutations-are-jobs-you-poll). What a cancelled job leaves:
 
 - **A run or apply of a replication pipeline, after Cancel**, stops like Ctrl-C. It starts no new table copies, lets the copies in flight finish, saves their watermarks, marks the other tables `Interrupted` and exits `130`. Run history shows a partial failure. `rocky run --resume-latest` copies the rest.
 - **Any other job, after Cancel** (models, a plan, an approval), stops at once. Rocky has no clean-stop step for these yet ([#1606](https://github.com/rocky-data/rocky/issues/1606)). A warehouse statement in flight is cut, and the warehouse keeps or drops it whole. A state write in flight is all or nothing. Models that finished stay built.
-- **After Force stop**, any job stops like a crash. An incremental replication table can have its rows landed before its watermark was saved. On DuckDB, Databricks, Snowflake and BigQuery, the next run reads the watermark back from the target table first, so it does not copy the same rows twice. On other warehouses, prefer Cancel.
+- **After Force stop**, a run first asks Databricks and Snowflake to cancel the statements it still waits on. Then any job stops like a crash. An incremental replication table can have its rows landed before its watermark was saved. On DuckDB, Databricks, Snowflake and BigQuery, the next run reads the watermark back from the target table first, so it does not copy the same rows twice. On other warehouses, prefer Cancel.
 
 A plan file cut part-way is refused at apply. Cancel reaches only jobs this server process started (a scheduled run answers `409 job_not_cancellable`). On Windows there is no SIGTERM, so Cancel kills the job at once. Stopping `rocky serve` with Ctrl-C or `SIGTERM` sends each running job the same SIGTERM as Cancel, and waits up to 5 seconds for it to be sent.
 

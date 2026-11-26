@@ -662,10 +662,24 @@ describe("Cancel on a running job", () => {
     jobs.answer("terminate");
     const force = await screen.findByRole("button", { name: FORCE_STOP_LABEL });
     expect(force).toBeEnabled();
+    expect(screen.getByText("Asked the job to stop, as Ctrl-C does.", { exact: false })).toBeInTheDocument();
     // While the forced stop is being sent, the button keeps its label.
     fireEvent.click(force);
     expect(jobs.client.cancel).toHaveBeenCalledTimes(2);
     expect(screen.getByRole("button", { name: `${FORCE_STOP_LABEL}: stopping…` })).toBeDisabled();
+
+    // The forced stop is a second terminate; the hint says what follows it.
+    jobs.answer("terminate");
+    expect(await screen.findByText("Forced stop sent.", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText("the engine kills it", { exact: false })).toBeInTheDocument();
+    expect(screen.queryByText("Asked the job to stop, as Ctrl-C does.", { exact: false })).toBeNull();
+    expect(screen.getByText("Press again to kill it now.", { exact: false })).toBeInTheDocument();
+
+    // After the kill was sent, the hint no longer offers a kill.
+    fireEvent.click(screen.getByRole("button", { name: FORCE_STOP_LABEL }));
+    jobs.answer("kill");
+    expect(await screen.findByText("Kill sent.", { exact: false })).toBeInTheDocument();
+    expect(screen.queryByText("Press again to kill it now.", { exact: false })).toBeNull();
 
     jobs.settle();
     expect(
@@ -681,7 +695,7 @@ describe("Cancel on a running job", () => {
         <JobLine
           label="Run the project"
           view={{ kind: "running", jobId: "job_1" }}
-          cancel={{ view: { kind: "idle" }, stopping: false, request: () => void jobs.client.cancel("job_1") }}
+          cancel={{ view: { kind: "idle" }, stopping: false, forced: false, request: () => void jobs.client.cancel("job_1") }}
         />
       </WriteAccessProvider>,
     );
@@ -701,6 +715,7 @@ describe("Cancel on a running job", () => {
               error: new ApiError(409, { code: "job_not_running", message: "job 'job_1' is not running" }),
             },
             stopping: false,
+            forced: false,
             request: () => {},
           }}
         />
