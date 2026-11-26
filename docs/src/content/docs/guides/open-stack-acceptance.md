@@ -1,17 +1,15 @@
 ---
 title: Open-Stack Acceptance Runbook
-description: Run the open-stack acceptance journey by hand, one step at a time, check each result, and record pass or fail. Covers the Postgres child connector, a product deadline, volume ranges, monthly cost by product, a budget breach, and the browser UI's HTTP API.
+description: Run the open-stack acceptance journey by hand and check each result. Covers the Postgres child connector, a product deadline, volume ranges, monthly cost by product, a budget breach, and the browser UI HTTP API.
 sidebar:
   order: 15
 ---
 
-This runbook is for an operator who accepts Rocky's open data platform features. You run one project by hand, step by step. At each step you check a fact in the JSON output and record pass or fail. The same journey also runs as a script, so you can compare your result with the script's.
+This runbook runs one project by hand. At each step you check a fact in the JSON output. The same journey runs as a script.
 
-The project is the POC [`05-orchestration/13-open-stack-acceptance`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/05-orchestration/13-open-stack-acceptance). It needs no warehouse credentials. It brings its own Postgres in a Docker container and writes to a local DuckDB file.
+The project is the POC [`05-orchestration/13-open-stack-acceptance`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/05-orchestration/13-open-stack-acceptance). It needs no warehouse credentials. It starts its own Postgres in Docker and writes to a local DuckDB file.
 
 ## What the journey tests
-
-The journey moves data from Postgres into a data product, and checks each feature on the way.
 
 ```
  Postgres ──rocky load──▶ poc.main.events ──rocky run──▶ poc.main.events_by_type
@@ -27,30 +25,11 @@ The journey moves data from Postgres into a data product, and checks each featur
                                          rocky serve ──▶ GET /api/v1/...
 ```
 
-| Feature | Where it is set | What you check |
-|---|---|---|
-| Child connector | `[connector.pg_events]` in `rocky.toml` | Rows loaded and the commit sequence |
-| Delivery deadline | `deliver_by` in `products/events_by_type.toml` | `on_time`, `late_by_seconds`, `at_risk` |
-| Source volume range | `[[product.source.volume]]` | `in_range`, then `above_max` |
-| Output volume range | `[product.output.volume]` | `in_range` |
-| Schedule | `[pipeline.events.schedule]` | The scheduler warns that the cron starts too late |
-| Prices | `[cost]` | Money is model time times your price |
-| Monthly budget | `[product_budget.events_by_type]` | `breached`, one breach event, one hook call |
-| HTTP API | `rocky serve` | The API returns the same facts as the CLI |
-
-The deadline is every minute (`deliver_by = "* * * * *"`). So you can see an on-time delivery and a late one in a few minutes. The budget limit is 0.72 ms of model time, so the first run breaches it.
+The deadline is every minute (`deliver_by = "* * * * *"`), so you see an on-time and a late delivery in minutes. The budget limit is 0.72 ms of model time, so the first run breaches it.
 
 ## Before you start
 
-You need these tools on `PATH`:
-
-- `rocky`, the version under test. Run `rocky --version` and write the version in your record.
-- `docker` with `docker compose`, and a running Docker daemon.
-- `python3` 3.8 or newer.
-- the `duckdb` CLI. The connector runs its SQL through it.
-- `curl`.
-
-The first run downloads two things: the `postgres:16-alpine` image from Docker Hub, and the DuckDB `postgres` extension from `extensions.duckdb.org`.
+Put `rocky`, `docker` (with `docker compose` and a running daemon), `python3` 3.8+, the `duckdb` CLI and `curl` on `PATH`. The first run downloads the `postgres:16-alpine` image and the DuckDB `postgres` extension.
 
 Open a terminal in the POC directory. Set the Postgres settings. They match `docker-compose.yml`.
 
@@ -62,19 +41,15 @@ alias r='rocky -c rocky.toml --state-path .rocky/state.redb --output json'
 rm -rf .rocky expected poc.duckdb && mkdir expected
 ```
 
-Every check below reads one JSON file. The commands use `python3 -m json.tool` to print it. Read the named field.
-
 ## Run the scripted journey
 
-Run the script first. It does every step below and checks every fact.
+Run the script first. It does every step below and asserts every fact.
 
 ```bash
 REQUIRE_DOCKER=1 ./run.sh
 ```
 
-It takes about 4 minutes, most of it one wait for a deadline to pass. It ends with `ACCEPTANCE PASS`. It prints `FAIL:` and the failed facts at the first step that fails. Without Docker it prints `SKIP`; `REQUIRE_DOCKER=1` turns that into a failure.
-
-The script leaves its JSON in `expected/`. Then run the steps by hand, from a clean start:
+It takes about 4 minutes and ends with `ACCEPTANCE PASS`. It prints `FAIL:` at the first failed step. Without Docker it prints `SKIP`; `REQUIRE_DOCKER=1` turns that into a failure. Then reset and run the steps by hand:
 
 ```bash
 rm -rf .rocky expected poc.duckdb && mkdir expected
@@ -82,7 +57,7 @@ rm -rf .rocky expected poc.duckdb && mkdir expected
 
 ## Steps
 
-Do the steps in order. Each step names the command and the facts that make it pass.
+Do the steps in order. Each step names the facts that make it pass.
 
 ### 1. Check the config
 
@@ -223,7 +198,7 @@ Start the server in a second terminal, with the same state store.
 rocky -c rocky.toml --state-path .rocky/state.redb serve --port 8093
 ```
 
-The product page's **Delivery and cost** panel reads these routes. Fetch each one.
+The product page's **Delivery and cost** panel reads these routes.
 
 ```bash
 curl -s "http://127.0.0.1:8093/api/v1/cost/month?month=2026-11" > expected/api-cost-month.json
@@ -236,8 +211,6 @@ Pass:
 - `api-cost-month.json` has the same product row as step 13: the same `compute_ms` in `charged`, `kept` and `built`, the same budget verdict, the same breach events. Storage byte-hours grow with time, so they can differ.
 - `api-product.json` has the same `delivery` facts, `volume` and `source_volumes` as step 10. `next_due_at` and `at_risk` move with the clock.
 - In `api-schedule.json`, the pipeline `events` has `delivery.product` `events_by_type` and `delivery.on_time` `false`. Its `latest_start` has `cron_check` `too_late`, `cron_too_late` `true` and a `warning`. A cron at 23:59 cannot meet a deadline every minute.
-
-If your `rocky` build has the browser UI, you can also start the server with `--ui`, open the product page and read the panel. The HTTP checks above are the pass criteria.
 
 ### 15. No secret in the output
 
@@ -253,31 +226,9 @@ Pass: `0 hits`.
 docker compose down -v
 ```
 
-## Record the result
+## Result
 
-Copy this table into your record. Fill in one row per step.
-
-| Step | Pass or fail | Note |
-|---|---|---|
-| `rocky --version` | | |
-| 1 Check the config | | |
-| 2 Start Postgres | | |
-| 3 Load 1 | | |
-| 4 Run 1 | | |
-| 5 Status after one delivery | | |
-| 6 Runs 2 to 5 | | |
-| 7 Load 2 | | |
-| 8 Wait for a deadline | | |
-| 9 Run 6 | | |
-| 10 Status after the late delivery | | |
-| 11 Load 3 | | |
-| 12 Tick | | |
-| 13 Cost by product | | |
-| 14 HTTP API | | |
-| 15 No secret in the output | | |
-| Scripted run (`./run.sh`) | | |
-
-The journey passes when every row passes. For a failed step, keep the JSON file and the matching `.log` from `expected/`, and note the step number.
+The journey passes when every step passes. For a failed step, keep its JSON file and `.log` from `expected/`.
 
 ## Related
 

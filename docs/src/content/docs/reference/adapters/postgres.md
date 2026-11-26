@@ -5,13 +5,11 @@ sidebar:
   order: 5
 ---
 
-The PostgreSQL warehouse adapter runs your SQL over a native PostgreSQL connection. It needs no libpq and no OpenSSL. TLS uses rustls.
+The PostgreSQL adapter runs your SQL over a native PostgreSQL connection (no libpq, no OpenSSL; TLS uses rustls).
 
 The adapter is tested live against PostgreSQL 16. `MERGE` needs PostgreSQL 15 or later. Older servers can use `merge_mode = "on_conflict"` (see [Merge](#merge)).
 
 ## Fields
-
-The adapter reads the shared `[adapter]` fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -21,7 +19,7 @@ The adapter reads the shared `[adapter]` fields:
 | `password` | string | No | Password. Leave it out when the server asks for none, for example under `trust` auth. |
 | `timeout_secs` | integer | No | Connect timeout and per-statement `statement_timeout`. Default `300`. |
 
-Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses a key it does not know, so a typo fails loudly:
+Adapter-specific keys go in `[adapter.NAME.extra]`. Rocky refuses an unknown key. `rocky validate` runs the same parse the adapter runs, so a bad field or key shows up there first.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -42,8 +40,6 @@ password = "${PGPASSWORD}"
 [adapter.pg.extra]
 sslmode = "verify-full"
 ```
-
-`rocky validate` runs the same parse the adapter runs, so a missing field or an unknown `extra` key shows up there first.
 
 ## Authentication
 
@@ -72,7 +68,7 @@ A name that is also a reserved word, such as `order`, fails at the server.
 
 ## How each strategy runs
 
-Rocky sends a write that needs more than one statement as one string. PostgreSQL runs a multi-statement string as one transaction. So the write commits fully or not at all, even on a pooled connection.
+Rocky sends a write that needs more than one statement as one string, which PostgreSQL runs as one transaction. The write commits fully or not at all, even on a pooled connection.
 
 | Strategy | SQL | Atomic |
 |----------|-----|--------|
@@ -85,35 +81,19 @@ Rocky sends a write that needs more than one statement as one string. PostgreSQL
 | snapshot (SCD2) | `MERGE` plus `INSERT` / `UPDATE` statements | Each statement; needs PostgreSQL 15+ |
 | `dynamic_table` | — | Refused: Snowflake only |
 
-**Materialized views.** PostgreSQL has no `CREATE OR REPLACE MATERIALIZED VIEW`. Each run drops and recreates the view in one transaction. That applies a changed definition and refreshes the data. A bare `REFRESH MATERIALIZED VIEW` would keep a stale definition.
+**Materialized views.** PostgreSQL has no `CREATE OR REPLACE MATERIALIZED VIEW`. Each run drops and recreates the view in one transaction, which applies a changed definition and refreshes the data.
 
-**Dependent views.** PostgreSQL does not let you drop a table that a view reads. A `full_refresh` of such a table fails with the server's "other objects depend on it" error. Rocky does not add `CASCADE`, because that would drop views Rocky does not manage. Use `merge`, `time_interval` or `delete_insert` for a table that views read.
+**Dependent views.** PostgreSQL does not let you drop a table that a view reads, so a `full_refresh` of such a table fails with "other objects depend on it". Rocky adds no `CASCADE`, because that would drop views Rocky does not manage. Use `merge`, `time_interval` or `delete_insert` for a table that views read.
 
-**Grants on a rebuilt table.** A `full_refresh` drops and recreates the table, so grants and comments on it are lost on each run. The adapter does not manage grants yet. Re-grant after the run, or grant on the schema with `ALTER DEFAULT PRIVILEGES`.
+**Grants on a rebuilt table.** A `full_refresh` drops and recreates the table, so grants and comments are lost on each run. The adapter does not manage grants yet. Re-grant after the run, or use `ALTER DEFAULT PRIVILEGES` on the schema.
 
-**Views and columns.** `CREATE OR REPLACE VIEW` can add columns at the end, but it cannot drop or rename one. A view model that removes a column fails until you drop the view.
+**Views and columns.** `CREATE OR REPLACE VIEW` can add columns at the end, but cannot drop or rename one. A view model that removes a column fails until you drop the view.
 
 ## Merge
 
-By default `strategy = "merge"` renders standard `MERGE` (PostgreSQL 15+):
+By default `strategy = "merge"` renders standard `MERGE INTO <t> AS t USING (<model SQL>) AS s ON ... WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT ...` (PostgreSQL 15+). For PostgreSQL 9.5 to 14, set `merge_mode = "on_conflict"`, which renders `INSERT INTO ... SELECT ... FROM (<model SQL>) AS s ON CONFLICT (<unique_key>) DO UPDATE SET c = EXCLUDED.c`.
 
-```sql
-MERGE INTO marts.customers AS t
-USING (<model SQL>) AS s
-ON t.customer_id = s.customer_id
-WHEN MATCHED THEN UPDATE SET name = s.name, email = s.email
-WHEN NOT MATCHED THEN INSERT (customer_id, name, email) VALUES (s.customer_id, s.name, s.email)
-```
-
-For PostgreSQL 9.5 to 14, set `merge_mode = "on_conflict"`:
-
-```sql
-INSERT INTO marts.customers (customer_id, name, email)
-SELECT customer_id, name, email FROM (<model SQL>) AS s
-ON CONFLICT (customer_id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email
-```
-
-`ON CONFLICT` needs a unique index on exactly the `unique_key` columns. Rocky creates one in the same transaction (`CREATE UNIQUE INDEX IF NOT EXISTS <table>__rocky_mk_<hash>`), so a table Rocky built works on the first merge. If the table already holds duplicate keys, the index build fails and the merge stops. That is correct: an upsert by those keys is undefined.
+`ON CONFLICT` needs a unique index on exactly the `unique_key` columns. Rocky creates one in the same transaction (`CREATE UNIQUE INDEX IF NOT EXISTS <table>__rocky_mk_<hash>`), so a table Rocky built works on the first merge. If the table already holds duplicate keys, the index build fails and the merge stops: an upsert by those keys is undefined.
 
 Snapshots use `MERGE`, so `merge_mode = "on_conflict"` refuses snapshot pipelines.
 
@@ -146,15 +126,14 @@ These source types give the type checker a concrete type: `SMALLINT`, `INTEGER`,
 
 ## Run the live tests
 
-The adapter's integration tests run against a real server when `ROCKY_POSTGRES_TEST_HOST` is set:
+Integration tests run against a real server when `ROCKY_POSTGRES_TEST_HOST` is set:
 
 ```bash
-ROCKY_POSTGRES_TEST_HOST=localhost:5432 \
-ROCKY_POSTGRES_TEST_PASSWORD=secret \
-cargo test -p rocky-postgres --test live_postgres
+ROCKY_POSTGRES_TEST_HOST=localhost:5432 ROCKY_POSTGRES_TEST_PASSWORD=secret \
+  cargo test -p rocky-postgres --test live_postgres
 ```
 
-Optional: `ROCKY_POSTGRES_TEST_DB`, `ROCKY_POSTGRES_TEST_USER`, `ROCKY_POSTGRES_TEST_SSLMODE` and `ROCKY_POSTGRES_TEST_SSLROOTCERT`.
+Optional: `ROCKY_POSTGRES_TEST_DB`, `ROCKY_POSTGRES_TEST_USER`, `ROCKY_POSTGRES_TEST_SSLMODE`, `ROCKY_POSTGRES_TEST_SSLROOTCERT`.
 
 ## See also
 

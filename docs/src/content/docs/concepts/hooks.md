@@ -5,7 +5,7 @@ sidebar:
   order: 12
 ---
 
-Rocky fires a lifecycle event at each notable point in a run. Attach a shell script or an HTTP webhook to any event. Use it to send a notification, write an audit record, or drive your own integration.
+Rocky fires a lifecycle event at each notable point in a run. Attach a shell script or an HTTP webhook to any event, for a notification, an audit record or your own integration.
 
 :::note[Not the same as seed hooks]
 The lifecycle hooks on this page fire **shell commands and webhooks** on pipeline events. They are separate from the `pre_hook` / `post_hook` fields on a seed sidecar, which run **SQL statements** on the warehouse around a single [`rocky seed`](/reference/cli/#rocky-seed) load.
@@ -42,55 +42,28 @@ Every event follows the same path, whichever kind of hook you attach to it.
 
 ## Lifecycle events
 
-Rocky fires 18 events, grouped into six phases:
+Rocky fires 18 events, in six phases:
 
-### Pipeline phase
-
-| Event | When | Use case |
-|-------|------|----------|
-| `pipeline_start` | Pipeline begins | Slack notification |
-| `discover_complete` | Source discovery finishes | Log connector/table counts |
-| `compile_complete` | Compilation finishes | Validate types before execution |
-| `pipeline_complete` | Pipeline succeeds | Success notification, metrics push |
-| `pipeline_error` | Pipeline fails | PagerDuty alert, incident creation |
-
-### Table phase
-
-| Event | When | Use case |
-|-------|------|----------|
-| `before_materialize` | Before table copy | Audit logging |
-| `after_materialize` | After table copy | Publish to data catalog |
-| `materialize_error` | Table copy fails | Per-table alerting |
-
-### Model phase
-
-| Event | When | Use case |
-|-------|------|----------|
-| `before_model_run` | Before compiled model runs | Feature flag checks |
-| `after_model_run` | After compiled model runs | Lineage metadata push |
-| `model_error` | Model execution fails | Debug notification |
-
-### Quality phase
-
-| Event | When | Use case |
-|-------|------|----------|
-| `before_checks` | Quality checks begin | Mute downstream alerts during expected check windows |
-| `check_result` | A quality check completes | Per-check threshold alerting |
-| `after_checks` | All checks finish | Aggregate summary to dashboards, pass-rate summary |
-| `drift_detected` | Schema drift found | Schema change notification |
-| `anomaly_detected` | Row count anomaly | Data quality alert |
-
-### State phase
-
-| Event | When | Use case |
-|-------|------|----------|
-| `state_synced` | State store synced | Backup confirmation |
-
-### Budget phase
-
-| Event | When | Use case |
-|-------|------|----------|
-| `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) | Page oncall on overspend |
+| Phase | Event | When |
+|---|---|---|
+| Pipeline | `pipeline_start` | Pipeline begins |
+| | `discover_complete` | Source discovery finishes |
+| | `compile_complete` | Compilation finishes |
+| | `pipeline_complete` | Pipeline succeeds |
+| | `pipeline_error` | Pipeline fails |
+| Table | `before_materialize` | Before table copy |
+| | `after_materialize` | After table copy |
+| | `materialize_error` | Table copy fails |
+| Model | `before_model_run` | Before compiled model runs |
+| | `after_model_run` | After compiled model runs |
+| | `model_error` | Model execution fails |
+| Quality | `before_checks` | Quality checks begin |
+| | `check_result` | A quality check completes |
+| | `after_checks` | All checks finish |
+| | `drift_detected` | Schema drift found |
+| | `anomaly_detected` | Row count anomaly |
+| State | `state_synced` | State store synced |
+| Budget | `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) |
 
 `budget_breach` also fires when a data product goes over its monthly budget, declared in [`[product_budget.NAME]`](/reference/configuration/#product_budgetname). It fires once for each exceeded limit, at the end of the production run after which the product was first over. It does not fire again while the product stays over. An interrupted run and a backfill do not check budgets, so a breach they cause fires no hook; it still shows as an event in `rocky cost --month`. Its `metadata` then has three more keys, so a hook can tell the two apart:
 
@@ -146,23 +119,19 @@ The script receives JSON like:
 
 ### Failure handling
 
-| Mode | Behavior |
+| `on_failure` | Behavior |
 |------|----------|
-| `abort` | Mark the hook result as abort |
+| `abort` | Mark the hook result as abort. Only `rocky hooks test` acts on it. |
 | `warn` | Log a warning and continue (default) |
 | `ignore` | Silently continue |
 
-Today `rocky run` ignores every hook outcome. A failing hook is logged and the run continues. Only `rocky hooks test` acts on `abort`.
-
-A hook cannot gate a run today. Do not use a hook for a deploy freeze or an approval gate. Use hooks for notifications and audit records.
+`rocky run` ignores every hook outcome. A hook cannot gate a run. Do not use a hook for a deploy freeze or an approval gate. Use hooks for notifications and audit records.
 
 ### Security: trust the `command` source
 
-Rocky passes the `command` string to `sh -c` verbatim. It delivers the event context to your script as JSON on **stdin**, never interpolated into the command line. The runtime values Rocky exposes, such as `run_id` and `event`, therefore cannot inject shell metacharacters into your command.
+Rocky passes the `command` string to `sh -c` verbatim. It delivers the event context as JSON on **stdin**, never interpolated into the command line, so values such as `run_id` and `event` cannot inject shell metacharacters.
 
-Even so, **never build a hook `command` by string-formatting untrusted input**. That covers a webhook payload, a Fivetran response, a value pulled from a row, and anything else you do not fully control. Use a static command, or template it from values you control yourself.
-
-To react to dynamic input, pass it through the JSON context to a script you wrote. Let that script decide how to quote and validate it.
+**Never build a hook `command` by string-formatting untrusted input**: a webhook payload, a Fivetran response, a value from a row, or anything else you do not control. Use a static command. To react to dynamic input, pass it through the JSON context to a script you wrote, and let that script quote and validate it.
 
 ## Webhooks
 
@@ -194,7 +163,7 @@ When you set `secret`, Rocky signs the request body with HMAC-SHA256 and sends t
 X-Rocky-Signature: sha256=<hex-encoded digest>
 ```
 
-Rocky only adds the header. Verifying it is the receiving service's job, and Rocky cannot tell whether it happens. To verify, recompute HMAC-SHA256 over the raw request body with the same secret. Compare your result against the header's lower-case hex digest.
+Rocky only adds the header. The receiver verifies it: recompute HMAC-SHA256 over the raw request body with the same secret, and compare it with the header's lower-case hex digest.
 
 ### Body templates
 
@@ -212,14 +181,4 @@ Supported: `{{field}}`, `{{metadata.key}}`, `{{#if field}}...{{/if}}`.
 
 ## Testing hooks
 
-Check your hook configuration without running a real pipeline:
-
-```bash
-# List all configured hooks
-rocky hooks list
-
-# Fire a test event
-rocky hooks test on_pipeline_start
-```
-
-`rocky hooks test` sends a synthetic event context, so you can confirm your script runs and reads the JSON correctly.
+`rocky hooks list` lists the configured hooks. `rocky hooks test on_pipeline_start` fires a synthetic event context, so you can confirm your script runs and reads the JSON without a real pipeline.

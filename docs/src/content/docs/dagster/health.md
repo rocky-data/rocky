@@ -67,8 +67,7 @@ def rocky_healthcheck_asset(context, rocky: RockyResource):
 
 ## As a Dagster+ code-location health probe
 
-Dagster+ supports custom health endpoints for code locations. Wire the
-healthcheck into your code location startup:
+Wire the healthcheck into a Dagster+ custom code-location health endpoint:
 
 ```python
 from dagster_rocky import RockyResource, rocky_healthcheck
@@ -77,9 +76,6 @@ def is_code_location_healthy() -> bool:
     rocky = RockyResource(config_path="rocky.toml")
     return rocky_healthcheck(rocky).healthy
 ```
-
-If `is_code_location_healthy()` returns `False`, Dagster+ marks the code
-location as unhealthy and routes traffic away from it.
 
 ## State-backend health
 
