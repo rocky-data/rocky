@@ -987,9 +987,10 @@ fn apply_operand_gates(
 /// The seed files a compile can have been typed from: `<root>/data/seed.sql`
 /// for `project_root`, and for each model, the first directory above its
 /// file that holds a `data/seed.sql` or a `rocky.toml` (a `--models`
-/// directory beside another project's seed). Every one found is read, since
-/// a name from a seed that is not the project's only loses a check. A path
-/// that is there but cannot be read is kept, so the caller reports it.
+/// directory beside another project's seed). Every one found is read: a
+/// name from a seed that is not the project's only loses a check. A path
+/// that is there but cannot be read is kept, so the caller fails the check
+/// closed on it (E073, #2753).
 fn reachable_seed_files(
     result: &compile::CompileResult,
     project_root: Option<&Path>,
@@ -1025,7 +1026,12 @@ fn reachable_seed_files(
 fn may_be_present(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        // A path under a file (`data` is a file) is absent too: no seed
+        // can be there, so it must not fail the check closed (E073).
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
     }
 }
 
@@ -2992,6 +2998,21 @@ schema_template = "s"
             );
             assert!(result.has_errors, "{form:?}");
         }
+    }
+
+    /// A seed path under a file (`data` is a file, not a directory) is
+    /// absent, not unreadable: no seed can be there, so it must not fail the
+    /// function check closed with E073. A missing path is absent too.
+    #[test]
+    fn a_seed_path_under_a_file_is_absent() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("data"), "not a directory").unwrap();
+        assert!(!may_be_present(&seed_file(dir.path())));
+        assert!(!may_be_present(&dir.path().join("nope/seed.sql")));
+        fs::remove_file(dir.path().join("data")).unwrap();
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        fs::write(seed_file(dir.path()), "").unwrap();
+        assert!(may_be_present(&seed_file(dir.path())));
     }
 
     /// The gate `rocky serve` and `rocky lsp` install fails closed on a seed

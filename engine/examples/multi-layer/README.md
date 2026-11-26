@@ -53,9 +53,16 @@ rocky compile
   ✓ raw_events (9 columns)
   ✓ stg_events (10 columns)
   ✓ stg_users (6 columns)
-  ✓ fct_user_activity (9 columns)
-  Compiled: 4 models, 0 errors, 0 warnings
+  ✗ fct_user_activity
+  x error[E029]: column 'user_id' is ambiguous: the joined relations 'stg_events', 'u' all have a column called 'user_id', so the warehouse cannot tell which one the bare name means
+  x error[E012]: column 'user_id' must be non-nullable per contract, but is nullable
+  x error[E012]: column 'first_event_date' must be non-nullable per contract, but is nullable
+  x error[E012]: column 'last_event_date' must be non-nullable per contract, but is nullable
+  Compiled: 4 models, 4 errors, 0 warnings
 ```
+
+This example does not compile yet (#2625). `group user_id` after the join is
+ambiguous (`E029`), and the contract in `contracts/` fails (`E012`).
 
 ## The contract gate
 

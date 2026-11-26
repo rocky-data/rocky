@@ -208,8 +208,8 @@ A call to a function DuckDB has, with a number of arguments it takes, is
 not affected. A `W068` call stays a warning. Other warehouses check the call
 as before. This holds for `rocky compile`, `rocky emit-sql`, `rocky serve`
 and `rocky lsp`. The commands that run the seed (`rocky compile --with-seed`,
-`rocky ci`, `rocky test`) refuse the whole run instead, with a message that
-names the seed file.
+`rocky ci`, `rocky test`) refuse the whole run instead when the seed does not
+read, with a message that names the seed file.
 
 #### Calls with an argument count DuckDB refuses (`E068`, `W068`)
 
