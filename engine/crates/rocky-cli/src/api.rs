@@ -2491,21 +2491,28 @@ async fn optimize(
     };
     let state_path = state_path_for(&state);
     let models_dir = state.models_dir.clone();
-    let output = store_read(&state, move || {
-        crate::commands::optimize_output_request_scoped(
+    // Three steps, so the process-wide store permit (and redb's file lock)
+    // covers only the state reads: config loads first, the reads run under the
+    // permit, and the models load and the maths run after both are released.
+    let config =
+        tokio::task::spawn_blocking(move || crate::commands::load_cost_config(&config_path))
+            .await
+            .map_err(|e| map_join_err(&e))?
+            .map_err(|e| ApiError::config_invalid(&format!("{e:#}")))?;
+    let reads = store_read(&state, move || {
+        crate::commands::read_optimize_history(
             &state_path,
-            &config_path,
-            Some(&models_dir),
             None,
+            crate::commands::StoreBudget::RequestScoped,
         )
     })
     .await?
-    .map_err(
-        |e| match e.downcast_ref::<rocky_core::config::ConfigError>() {
-            Some(_) => ApiError::config_invalid(&format!("{e:#}")),
-            None => map_state_err(e, state.mutation_permit.running_job()),
-        },
-    )?;
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    let output = tokio::task::spawn_blocking(move || {
+        crate::commands::finish_optimize(reads, &config, Some(&models_dir))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?;
     Ok(PrettyJson(output))
 }
 
@@ -6788,6 +6795,56 @@ mod tests {
         std::fs::write(&config, "this is [not valid toml").unwrap();
         let base = spawn_router(state).await;
         let resp = reqwest::get(format!("{base}/api/v1/optimize"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "config_invalid");
+    }
+
+    /// `/compliance` loads the config the way the rest of `rocky serve` does:
+    /// an unset adapter `${VAR}` credential is `200`. A config that does not
+    /// parse is `config_invalid`. A models directory that cannot be read is
+    /// `internal_error`, never `config_invalid`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compliance_route_error_wiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, state_path) = read_routes_fixture(dir.path());
+        let config = state.config_path.clone().unwrap();
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\
+             token = \"${ROCKY_TEST_UNSET_CREDENTIAL_7C1}\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let models = dir.path().join("models-dir");
+        std::fs::create_dir_all(&models).unwrap();
+
+        let ok = pinned_server(models.clone(), Some(config.clone()), &state_path);
+        let base = spawn_router(ok).await;
+        let resp = reqwest::get(format!("{base}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "an unset credential must not 500");
+
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+        let broken_models = pinned_server(dangling, Some(config.clone()), &state_path);
+        let base = spawn_router(broken_models).await;
+        let resp = reqwest::get(format!("{base}/api/v1/compliance"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "internal_error");
+
+        std::fs::write(&config, "this is [not valid toml").unwrap();
+        let broken_config = pinned_server(models, Some(config), &state_path);
+        let base = spawn_router(broken_config).await;
+        let resp = reqwest::get(format!("{base}/api/v1/compliance"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 500);

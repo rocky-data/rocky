@@ -152,34 +152,56 @@ pub(crate) fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> 
 /// can adopt the policy once measured.
 pub(crate) const HISTORY_REQUEST_CACHE_BYTES: usize = 1 << 20;
 
-/// Run `read` against the state store opened read-only with
-/// [`HISTORY_REQUEST_CACHE_BYTES`] (an empty in-memory view when the file does
-/// not exist; nothing is created), and drop the store before returning.
+/// How a request-local read opens the state store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreBudget {
+    /// redb's cache capped at [`HISTORY_REQUEST_CACHE_BYTES`]: the HTTP routes.
+    RequestScoped,
+    /// redb's default cache: the CLI.
+    Default,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The budget [`with_store`] last opened with on this thread. A test that
+    /// calls a route's read path reads it back to prove the route passed the
+    /// budget it claims.
+    pub(crate) static LAST_STORE_BUDGET: std::cell::Cell<Option<StoreBudget>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `read` against the state store opened read-only with `budget` (an
+/// empty in-memory view when the file does not exist; nothing is created),
+/// and drop the store before returning.
 ///
 /// The one open every request-local read uses: `GET /api/v1/runs`,
 /// `/optimize`, `/runs/{id}/replay-check` and `/recipes/{hash}/history`.
 /// redb holds an exclusive file lock while a handle lives, so `read` must do
 /// store reads only. Load config and models before calling it, compute after.
-pub(crate) fn with_request_scoped_store<T>(
+pub(crate) fn with_store<T>(
     state_path: &Path,
+    budget: StoreBudget,
     read: impl FnOnce(&StateStore) -> Result<T>,
 ) -> Result<T> {
-    let store =
-        StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?;
+    #[cfg(test)]
+    LAST_STORE_BUDGET.with(|last| last.set(Some(budget)));
+    let store = match budget {
+        StoreBudget::RequestScoped => {
+            StateStore::open_read_only_or_empty_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?
+        }
+        StoreBudget::Default => StateStore::open_read_only_or_empty(state_path)?,
+    };
     let out = read(&store);
     drop(store);
     out
 }
 
-/// [`with_request_scoped_store`] with redb's default cache, for the CLI.
-pub(crate) fn with_default_store<T>(
+/// [`with_store`] with [`StoreBudget::RequestScoped`].
+pub(crate) fn with_request_scoped_store<T>(
     state_path: &Path,
     read: impl FnOnce(&StateStore) -> Result<T>,
 ) -> Result<T> {
-    let store = StateStore::open_read_only_or_empty(state_path)?;
-    let out = read(&store);
-    drop(store);
-    out
+    with_store(state_path, StoreBudget::RequestScoped, read)
 }
 
 /// Build the project-level run-history output from the state store (the

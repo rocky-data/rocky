@@ -177,7 +177,10 @@ pub fn run_replay(
 ///   never records a watermark upstream on a provenance record — the reuse
 ///   spine indexes a model only when every read is a strong content hash — so
 ///   this arm is defensive against a future heuristic-population change.)
-fn classify_input(store: &StateStore, upstream: &UpstreamIdentity) -> ReplayCheckInputOutput {
+fn classify_input(
+    artifact_present: &dyn Fn(&str) -> Result<bool, String>,
+    upstream: &UpstreamIdentity,
+) -> ReplayCheckInputOutput {
     match upstream {
         UpstreamIdentity::Content {
             upstream_key,
@@ -187,9 +190,9 @@ fn classify_input(store: &StateStore, upstream: &UpstreamIdentity) -> ReplayChec
             // (fail-closed on resolvability, honest in the reason) instead of
             // letting a corrupt/failing store masquerade as "bytes were never
             // recorded".
-            let (present, reason) = match store.list_artifacts_by_hash(blake3_hash) {
-                Ok(rows) if !rows.is_empty() => (true, None),
-                Ok(_) => (
+            let (present, reason) = match artifact_present(blake3_hash) {
+                Ok(true) => (true, None),
+                Ok(false) => (
                     false,
                     Some(format!(
                         "upstream '{upstream_key}' output (blake3 {}) is absent from the artifact ledger",
@@ -241,6 +244,36 @@ pub(crate) fn classify_model(
     run_id: &str,
     model_name: &str,
 ) -> ReplayCheckModelOutput {
+    classify_model_from(
+        model_name,
+        store
+            .get_provenance(run_id, model_name)
+            .map_err(|e| e.to_string()),
+        &|| store.get_run(run_id).ok().flatten(),
+        &|hash| {
+            store
+                .list_artifacts_by_hash(hash)
+                .map(|rows| !rows.is_empty())
+                .map_err(|e| e.to_string())
+        },
+        &|producer| matches!(store.get_provenance(run_id, producer), Ok(None)),
+    )
+}
+
+/// [`classify_model`] over values already read from the store: the model's
+/// provenance (or the text of the error that read failed with), the run
+/// record, whether an artifact hash is in the ledger, and whether a model of
+/// the run recorded no provenance. It does the CPU work (IR deserialisation,
+/// SQL parsing) and touches no store, so the HTTP route can run it after the
+/// store is dropped, and `rocky gc` can run it against the live store with
+/// the same verdicts.
+fn classify_model_from(
+    model_name: &str,
+    provenance: Result<Option<ProvenanceRecord>, String>,
+    run: &dyn Fn() -> Option<RunRecord>,
+    artifact_present: &dyn Fn(&str) -> Result<bool, String>,
+    producer_unrecorded: &dyn Fn(&str) -> bool,
+) -> ReplayCheckModelOutput {
     let non_replayable = |reason: String| ReplayCheckModelOutput {
         model_name: model_name.to_string(),
         verdict: "non_replayable".to_string(),
@@ -254,7 +287,7 @@ pub(crate) fn classify_model(
     // A provenance READ error is not "no provenance": say so (fail-closed
     // verdict either way, but the reason must not claim reuse was disabled
     // when the store failed to answer).
-    let provenance: Option<ProvenanceRecord> = match store.get_provenance(run_id, model_name) {
+    let provenance: Option<ProvenanceRecord> = match provenance {
         Ok(p) => p,
         Err(e) => {
             return non_replayable(format!(
@@ -299,7 +332,7 @@ pub(crate) fn classify_model(
     let mut inputs: Vec<ReplayCheckInputOutput> = prov
         .upstreams
         .iter()
-        .map(|u| classify_input(store, u))
+        .map(|u| classify_input(artifact_present, u))
         .collect();
 
     // Check ↔ execute parity for the all-in-run case: `--execute` (DAG)
@@ -311,7 +344,7 @@ pub(crate) fn classify_model(
     // executor always refuses. In-run producers are probed by the target
     // FQN's table segment against the run's executed names (absent or
     // unreadable run record ⇒ probe skipped, current semantics kept).
-    if let Ok(Some(run)) = store.get_run(run_id) {
+    if let Some(run) = run() {
         for input in &mut inputs {
             if !input.resolvable || input.kind != "content" {
                 continue;
@@ -328,7 +361,7 @@ pub(crate) fn classify_model(
                 .filter(|n| *n != model_name)
                 .find(|n| n.eq_ignore_ascii_case(table));
             if let Some(producer) = in_run_producer
-                && matches!(store.get_provenance(run_id, producer), Ok(None))
+                && producer_unrecorded(producer)
             {
                 input.resolvable = false;
                 input.reason = Some(format!(
@@ -389,9 +422,101 @@ pub fn compute_replay_check_request_scoped(
     target: &str,
     model_filter: Option<&str>,
 ) -> Result<ReplayCheckOutput> {
-    super::history::with_request_scoped_store(state_path, |store| {
-        replay_check_from_store(store, target, model_filter)
+    // Read inside the store's lock, classify (IR parsing, SQL parsing) after
+    // it is dropped.
+    let facts = super::history::with_request_scoped_store(state_path, |store| {
+        read_replay_facts(store, target, model_filter)
+    })?;
+    Ok(replay_check_from_facts(facts))
+}
+
+/// A model's provenance read: the record, or the text of the read error.
+type ProvenanceRead = Result<Option<ProvenanceRecord>, String>;
+
+/// Everything `replay --check` reads from the store, taken in one pass so the
+/// store can be dropped before any classification work.
+struct ReplayFacts {
+    record: RunRecord,
+    /// One entry per execution that passes the model filter, in run order.
+    models: Vec<(String, ProvenanceRead)>,
+    /// Models of the run whose provenance read answered "none".
+    unrecorded: std::collections::HashSet<String>,
+    /// Every blake3 hash in the artifact ledger (one scan), or the scan's
+    /// error text.
+    artifact_hashes: Result<std::collections::HashSet<String>, String>,
+}
+
+fn read_replay_facts(
+    store: &StateStore,
+    target: &str,
+    model_filter: Option<&str>,
+) -> Result<ReplayFacts> {
+    let record = resolve(store, target)?;
+    let selected: Vec<&str> = record
+        .models_executed
+        .iter()
+        .map(|m| m.model_name.as_str())
+        .filter(|name| model_filter.is_none_or(|filter| *name == filter))
+        .collect();
+    if let Some(name) = model_filter
+        && selected.is_empty()
+    {
+        return Err(ReplayLookupError::ModelNotInRun {
+            run_id: record.run_id.clone(),
+            model: name.to_string(),
+        }
+        .into());
+    }
+    let models: Vec<(String, ProvenanceRead)> = selected
+        .iter()
+        .map(|name| {
+            let read = store
+                .get_provenance(&record.run_id, name)
+                .map_err(|e| e.to_string());
+            ((*name).to_string(), read)
+        })
+        .collect();
+    // The in-run producer probe needs "does this model have provenance" for
+    // every model of the run, not only the selected ones.
+    let unrecorded = record
+        .models_executed
+        .iter()
+        .map(|m| m.model_name.as_str())
+        .filter(|name| matches!(store.get_provenance(&record.run_id, name), Ok(None)))
+        .map(str::to_string)
+        .collect();
+    let artifact_hashes = store.list_artifact_hashes().map_err(|e| e.to_string());
+    Ok(ReplayFacts {
+        record,
+        models,
+        unrecorded,
+        artifact_hashes,
     })
+}
+
+fn replay_check_from_facts(facts: ReplayFacts) -> ReplayCheckOutput {
+    let ReplayFacts {
+        record,
+        models,
+        unrecorded,
+        artifact_hashes,
+    } = facts;
+    let models: Vec<ReplayCheckModelOutput> = models
+        .into_iter()
+        .map(|(name, provenance)| {
+            classify_model_from(
+                &name,
+                provenance,
+                &|| Some(record.clone()),
+                &|hash| match &artifact_hashes {
+                    Ok(hashes) => Ok(hashes.contains(hash)),
+                    Err(e) => Err(e.clone()),
+                },
+                &|producer| unrecorded.contains(producer),
+            )
+        })
+        .collect();
+    replay_check_output(&record, models)
 }
 
 fn replay_check_from_store(
@@ -421,10 +546,17 @@ fn replay_check_from_store(
         .into());
     }
 
+    Ok(replay_check_output(&record, models))
+}
+
+fn replay_check_output(
+    record: &RunRecord,
+    models: Vec<ReplayCheckModelOutput>,
+) -> ReplayCheckOutput {
     let replayable_count = models.iter().filter(|m| m.verdict == "replayable").count();
     let all_replayable = replayable_count == models.len();
 
-    Ok(ReplayCheckOutput {
+    ReplayCheckOutput {
         version: VERSION.to_string(),
         command: "replay --check".to_string(),
         run_id: record.run_id.clone(),
@@ -433,7 +565,7 @@ fn replay_check_from_store(
         model_count: models.len(),
         replayable_count,
         models,
-    })
+    }
 }
 
 /// `rocky replay --check`: [`compute_replay_check`], rendered as JSON or
@@ -2458,6 +2590,112 @@ mod tests {
             "nondeterminism is a flag, not a demotion"
         );
         assert!(v.nondeterministic);
+    }
+
+    /// The route's read-then-classify path (`read_replay_facts` +
+    /// `replay_check_from_facts`, which classifies after the store is
+    /// dropped) answers exactly what the live-store path
+    /// (`replay_check_from_store`, which `rocky replay --check` and
+    /// `rocky gc` share through `classify_model`) answers: several models,
+    /// upstreams, deterministic and non-deterministic SQL, a missing
+    /// artifact, and an in-run upstream that recorded no provenance.
+    #[test]
+    fn route_facts_path_equals_the_live_store_path() {
+        const HC: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const HD: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        seed(&store, "r", "root", "SELECT 1 AS id", &[], HA, true);
+        seed(
+            &store,
+            "r",
+            "leaf",
+            "SELECT id FROM tgt.raw.root",
+            &[content("root", HA)],
+            HB,
+            true,
+        );
+        seed(
+            &store,
+            "r",
+            "nd",
+            "SELECT id, now() AS t FROM tgt.raw.root",
+            &[content("root", HA)],
+            "e1",
+            true,
+        );
+        // Upstream HC has no artifact row.
+        seed(
+            &store,
+            "r",
+            "missing",
+            "SELECT id FROM tgt.raw.ghost",
+            &[content("ghost", HC)],
+            "e2",
+            true,
+        );
+        // `orphan` ran in this run but recorded no provenance; its artifact
+        // exists, so only the in-run producer probe makes `consumer` fail.
+        store
+            .record_artifact(&ArtifactRecord {
+                blake3_hash: HD.to_string(),
+                run_id: "r".to_string(),
+                model_name: "orphan".to_string(),
+                file_path: "s3://b/orphan.parquet".to_string(),
+                commit_version: 0,
+                size_bytes: 1,
+                written_at: Utc::now(),
+            })
+            .unwrap();
+        seed(
+            &store,
+            "r",
+            "consumer",
+            "SELECT id FROM tgt.raw.orphan",
+            &[content("orphan", HD)],
+            "e3",
+            true,
+        );
+        store
+            .record_run(&sample_run(
+                "r",
+                vec![
+                    ("root", "success"),
+                    ("leaf", "success"),
+                    ("nd", "success"),
+                    ("missing", "success"),
+                    ("orphan", "success"),
+                    ("consumer", "success"),
+                ],
+            ))
+            .unwrap();
+
+        for filter in [None, Some("leaf"), Some("consumer"), Some("orphan")] {
+            let live = replay_check_from_store(&store, "r", filter).unwrap();
+            let facts = read_replay_facts(&store, "r", filter).unwrap();
+            let routed = replay_check_from_facts(facts);
+            assert_eq!(
+                serde_json::to_string(&live).unwrap(),
+                serde_json::to_string(&routed).unwrap(),
+                "filter {filter:?}"
+            );
+        }
+        let all = replay_check_from_store(&store, "r", None).unwrap();
+        let verdict = |name: &str| {
+            all.models
+                .iter()
+                .find(|m| m.model_name == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        assert_eq!(verdict("leaf").verdict, "replayable");
+        assert!(verdict("nd").nondeterministic);
+        assert_eq!(verdict("missing").verdict, "non_replayable");
+        assert_eq!(verdict("orphan").verdict, "non_replayable");
+        assert_eq!(
+            verdict("consumer").verdict,
+            "non_replayable",
+            "the in-run producer probe must still bite"
+        );
     }
 
     #[test]

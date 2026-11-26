@@ -8937,6 +8937,22 @@ impl StateStore {
         Ok(results)
     }
 
+    /// Every distinct `blake3_hash` in the artifact ledger, from ONE scan.
+    ///
+    /// For a caller that asks "is this hash recorded?" for many hashes:
+    /// [`Self::list_artifacts_by_hash`] scans the whole table per hash.
+    pub fn list_artifact_hashes(&self) -> Result<std::collections::HashSet<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut hashes = std::collections::HashSet::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+            hashes.insert(record.blake3_hash);
+        }
+        Ok(hashes)
+    }
+
     /// List every artifact recorded for a given run.
     ///
     /// Walks the table keyed-prefix-style on `"{run_id}|"`. Useful for
