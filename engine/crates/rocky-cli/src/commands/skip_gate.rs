@@ -449,9 +449,9 @@ impl<'a> SkipGate<'a> {
     /// A signature carrying neither a usable timestamp nor (when enabled) a
     /// rowcount is **unprovable** ⇒ `false` ⇒ build.
     ///
-    /// When `max_ts_sufficient` is `false` (see [`max_ts_is_sufficient`]), a
-    /// moved `MAX(ts)` still means changed, but an unchanged one falls
-    /// through to the rowcount fallback.
+    /// When `max_ts_sufficient` is `false` (see [`max_ts_is_sufficient`]),
+    /// both readings must be present and within tolerance, and then the
+    /// rowcount fallback decides. A missing reading means changed.
     fn sig_unchanged(
         &self,
         prev: &UpstreamSig,
@@ -466,6 +466,10 @@ impl<'a> SkipGate<'a> {
             if max_ts_sufficient {
                 return true;
             }
+        } else if !max_ts_sufficient {
+            // A model that needs both signals has no proof without both
+            // readings: a failed probe never hands the decision to COUNT.
+            return false;
         }
         // Rowcount fallback, only when explicitly enabled.
         if self.cfg.rowcount_fallback
@@ -499,7 +503,7 @@ impl<'a> SkipGate<'a> {
     /// bug the gate exists to prevent.
     ///
     /// For each raw source we read `MAX(<ts>)` when the model declares a
-    /// timestamp column (incremental / microbatch strategies) and `COUNT(*)`
+    /// timestamp column (the incremental strategy) and `COUNT(*)`
     /// when `skip_rowcount_fallback` is enabled. Read failures leave the
     /// corresponding field `None` (⇒ that upstream is later judged unprovable
     /// ⇒ build) — they never collapse to "stable".
@@ -888,6 +892,14 @@ mod tests {
                 },
                 &project,
             );
+            // One-sided readings: a failed `MAX(ts)` probe on either side.
+            let no_ts: UpstreamSig = serde_json::from_value(serde_json::json!({
+                "upstream_key": "c.raw.events",
+                "row_count": 10,
+            }))
+            .unwrap();
+            assert!(!gate.sig_unchanged(&prev, &no_ts, false));
+            assert!(!gate.sig_unchanged(&no_ts, &prev, false));
             for (ts, n) in [
                 ("2026-11-15T12:00:00Z", 10),
                 ("2026-11-15T12:00:00Z", 11),
