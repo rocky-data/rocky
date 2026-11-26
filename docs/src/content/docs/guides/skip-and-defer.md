@@ -94,7 +94,7 @@ lag_tolerance_seconds = 0        # default: any MAX(ts) movement forces a rebuil
 ```
 
 - `skip_rowcount_fallback` allows a `COUNT(*)`-only stability signal when an upstream has no timestamp to probe. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE`, or a matched insert plus delete.
-- `lag_tolerance_seconds` treats an upstream `MAX(ts)` that moved by at most this many seconds as unchanged. A `MAX(ts)` that went backwards forces a rebuild whatever the value.
+- `lag_tolerance_seconds` (default `0`) is the largest forward move of a raw source's `MAX(ts)`, against the prior build, that still counts as unchanged. At `300`, a move from `10:00:00` to `10:03:00` can skip; a move to `10:06:00` rebuilds. A `MAX(ts)` that went backwards forces a rebuild whatever the value. It is not a wait-before-rebuild window like the `lag_tolerance` setting in other tools: Rocky never delays a build.
 
 The full `[run]` reference is in the [configuration reference](/reference/configuration/#run).
 
