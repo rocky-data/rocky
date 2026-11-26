@@ -46,7 +46,7 @@
     "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
   ],
   "SETUP_UV_SOURCE": [
-    "astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884",
+    "astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d",
     "astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2"
   ],
   "SETUP_ZIG_SOURCE": [

@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-The Databricks warehouse adapter runs your SQL through the Statement Execution REST API. It also manages Unity Catalog governance: catalogs, schemas, tags, and grants.
+The Databricks adapter runs your SQL through the Statement Execution REST API. It also manages Unity Catalog governance: catalogs, schemas, tags, and grants.
 
 ## Fields
 
@@ -24,26 +24,14 @@ type = "databricks"
 host = "${DATABRICKS_HOST}"
 http_path = "${DATABRICKS_HTTP_PATH}"
 token = "${DATABRICKS_TOKEN}"
-```
-
-OAuth M2M instead of PAT:
-
-```toml
-[adapter.prod]
-type = "databricks"
-host = "${DATABRICKS_HOST}"
-http_path = "${DATABRICKS_HTTP_PATH}"
-client_id = "${DATABRICKS_CLIENT_ID}"
-client_secret = "${DATABRICKS_CLIENT_SECRET}"
+# or OAuth M2M: client_id = "${DATABRICKS_CLIENT_ID}", client_secret = "${DATABRICKS_CLIENT_SECRET}"
 ```
 
 ## Authentication
 
 Rocky tries the personal access token (PAT) first. If `token` is empty, it falls back to OAuth machine-to-machine (M2M), which authenticates a service principal with `client_id` and `client_secret`.
 
-Whichever one wins covers every Databricks call Rocky makes: SQL statement execution, Unity Catalog operations, and workspace bindings.
-
-[Authentication](/reference/authentication/) covers the detection order, token refresh, and validation in full.
+Whichever one wins covers every Databricks call: SQL statements, Unity Catalog operations and workspace bindings. [Authentication](/reference/authentication/) covers the detection order, token refresh, and validation in full.
 
 ## See also
 

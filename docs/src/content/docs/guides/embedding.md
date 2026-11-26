@@ -17,11 +17,7 @@ Rocky is an engine you drive from your own software. Every command emits machine
                     (served by `rocky serve`)
 ```
 
-This guide covers all four patterns, how to choose between them, and the operational details that matter when you build Rocky into a larger system.
-
 ## Choose an integration pattern
-
-The four patterns differ in how your code calls Rocky and in what process lifecycle they assume.
 
 | Pattern | How you call it | Best fit |
 |---|---|---|
@@ -30,7 +26,7 @@ The four patterns differ in how your code calls Rocky and in what process lifecy
 | **MCP** | `rocky mcp` over stdio | AI agents that inspect, author, or verify models |
 | **Serve API** | `rocky serve`, then HTTP `GET`/`POST /api/v1/...` | Long-lived services that need a persistent read surface and async job submission |
 
-Reach for the **subprocess** pattern first. It needs nothing but the binary on `$PATH`. Move to the **SDK** when you write Python and want typed results. Use **MCP** when the caller is an LLM agent. Stand up the **serve API** when you need a process that stays warm across many requests. Use it too when you want to submit long-running work as a job and poll for it.
+Start with **subprocess**: it needs only the binary on `$PATH`. Move to the **SDK** for typed Python results. Use **MCP** when the caller is an LLM agent. Use the **serve API** when you need a warm process, or want to submit long work as a job and poll for it.
 
 ## Subprocess
 
@@ -40,11 +36,11 @@ Run a command with `--output json` and read the payload from stdout. The exit co
 rocky plan --output json --filter client=acme > plan.json
 ```
 
-Every command's JSON shape is a typed contract, not an ad-hoc dump. The field reference lives in [JSON output](/reference/json-output/). The rules that keep those shapes stable are in the [JSON contract](/advanced/json-contract/). Parse the payload, branch on the exit code, and you have a working integration in any language.
+Every command's JSON shape is a typed contract. See [JSON output](/reference/json-output/) for the fields and the [JSON contract](/advanced/json-contract/) for the stability rules.
 
 ## Python SDK
 
-The `rocky-sdk` package wraps the subprocess pattern in a typed client. `RockyClient` runs the binary for you and parses each payload into a Pydantic model. You get autocompletion and validation instead of raw dictionaries.
+`RockyClient` in the `rocky-sdk` package runs the binary for you and parses each payload into a Pydantic model.
 
 ```python
 from rocky_sdk import RockyClient
@@ -57,33 +53,56 @@ result = client.apply(plan.plan_id)
 
 A [plan](/reference/glossary/#plan) is a reviewable record of what a run will do, keyed by a `plan_id`. You build it, inspect it, then apply it.
 
-Start with the [SDK introduction](/python-sdk/introduction/) for setup and the client surface. The [recipes](/python-sdk/recipes/) cover common tasks. The Dagster integration is a thin adapter over this same client, so anything you express with `RockyClient` maps onto assets and checks.
+See the [SDK introduction](/python-sdk/introduction/) and the [recipes](/python-sdk/recipes/). The Dagster integration is a thin adapter over this client.
 
 ## MCP
 
-`rocky mcp` runs a Model Context Protocol server over stdio. It hands an LLM agent Rocky's read and authoring tools: compile, plan preview, lineage, schema inspection, and the write-path tools that draft and apply models. The agent then works from real engine data instead of guessing.
-
-See [authoring with MCP](/concepts/mcp-authoring/) for the tool surface, and [operating Rocky with agents](/concepts/operating-rocky-with-agents/) for the workflow an agent should follow. Use MCP when the caller reasons about your project in natural language. For deterministic automation, prefer the subprocess or SDK patterns.
+`rocky mcp` runs a Model Context Protocol server over stdio. It gives an LLM agent Rocky's read and authoring tools: compile, plan preview, lineage, schema inspection, and the tools that draft and apply models. See [authoring with MCP](/concepts/mcp-authoring/) and [operating Rocky with agents](/concepts/operating-rocky-with-agents/). For deterministic automation, prefer subprocess or the SDK.
 
 ## Serve API
 
-`rocky serve` starts an HTTP server that holds a compiled graph in memory and answers requests under `/api/v1`. Use it for a long-lived service. It compiles once at startup, serves reads from the warm graph, and runs mutating work as a background job.
+`rocky serve` starts an HTTP server under `/api/v1`. It compiles once at startup, serves reads from the warm graph, and runs mutating work as a background job.
 
 ```bash
 rocky --config rocky.toml serve --port 8080
 ```
 
-The read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints. `GET /api/v1/compile` matches `rocky compile --output json`. `GET /api/v1/products` matches `rocky product list --output json`, and `GET /api/v1/products/{name}` matches `rocky product status <name> --output json`, and `GET /api/v1/products/{name}/journal` matches `rocky product journal <name> --output json`. `GET /api/v1/review/queue` matches `rocky review --queue --output json`, except the two fields that derive from the request instant (`staleness_seconds` and `score`), and `GET /api/v1/review/{plan_id}/status` matches `rocky review <plan-id> --status --output json`. `GET /api/v1/review/{plan_id}` matches `rocky review <plan-id> --output json`: the plan's kind and its breaking-change findings against `HEAD`, with `approved` always false. This read route never approves and never writes the sign-off marker. To approve, use `POST /api/v1/jobs/approve` (below) or `rocky review <plan-id> --approve`. The governor's three reads match too: `GET /api/v1/brief` matches `rocky brief --output json` except `generated_at` and `since_timestamp`, and never advances the digest cursor, so its `since` defaults to `7d` rather than the CLI's `last`; `GET /api/v1/audit/scorecard` matches `rocky audit --scorecard --output json` except `window_start`; `GET /api/v1/custody/{subject}` matches `rocky audit --for <subject> --output json`; `GET /api/v1/audit` matches `rocky audit --output json`, and with `?product=<name>` matches `rocky audit --product <name> --output json`. `GET /api/v1/cost/month?month=<YYYY-MM>` matches `rocky cost --month <YYYY-MM> --by product --output json` except `as_of`; without `month` it reports the current month in `[schedule].timezone`. `GET /api/v1/policy` matches `rocky policy show --output json`: the rules in file order with the fields that decide an outcome, and the freezes in force that the read could see. It carries a rule's scope, effect and `verify_after`, not its `conditions`, which the engine parses and never evaluates. It reads and never writes, so it cannot freeze or thaw, and for the same reason it does not download the authoritative ledger on a remote `[state]` backend, where that download would replace the local file. There it reports `freeze_sources.ledger` as `local_mirror`, so a caller can tell a complete answer from a possibly stale one. The window, grouping and product are query parameters, and the OpenAPI document lists their accepted values. A caller on the HTTP API and a caller on the SDK see identical data.
+Read routes return the same payloads as the matching CLI command, byte for byte. A caller on the HTTP API and a caller on the SDK see identical data. The window, grouping and product are query parameters. The OpenAPI document lists their accepted values.
 
-Six routes have no CLI command to match: `GET /api/v1/health`, `/project`, `/models`, `/models/{name}`, `/dag/layers` and `/dag/status`. They still return typed payloads with published schemas; `GET /api/v1/meta` lists the `estate` capability for the five estate routes and `project` for the project route. `/project` is what the retired dashboard at `/` used to show: the config directory's name, the pipelines and adapters, the compiled model count, the diagnostics counts and the newest run. Model detail caps the SQL text at 256 KiB. A cut is reported in the body through `sql_truncated` and `sql_bytes`, so a reader never mistakes a cut text for the whole. Each type-checked column carries its structured `data_type`, which keeps a struct field's own nullability, and a `data_type_display` label such as `DECIMAL(10,2)` for showing to a person.
+| Route | Matches | Differs by |
+|---|---|---|
+| `GET /api/v1/models/{name}/lineage` | `rocky lineage <name> --output json` | - |
+| `GET /api/v1/compile` | `rocky compile --output json` | - |
+| `GET /api/v1/products` | `rocky product list --output json` | - |
+| `GET /api/v1/products/{name}` | `rocky product status <name> --output json` | - |
+| `GET /api/v1/products/{name}/journal` | `rocky product journal <name> --output json` | - |
+| `GET /api/v1/review/queue` | `rocky review --queue --output json` | `staleness_seconds` and `score` derive from the request instant |
+| `GET /api/v1/review/{plan_id}/status` | `rocky review <plan-id> --status --output json` | - |
+| `GET /api/v1/review/{plan_id}` | `rocky review <plan-id> --output json` | `approved` is always false. It never approves and never writes the sign-off marker. |
+| `GET /api/v1/brief` | `rocky brief --output json` | `generated_at`, `since_timestamp`. It never advances the digest cursor, so `since` defaults to `7d`, not `last`. |
+| `GET /api/v1/audit/scorecard` | `rocky audit --scorecard --output json` | `window_start` |
+| `GET /api/v1/custody/{subject}` | `rocky audit --for <subject> --output json` | - |
+| `GET /api/v1/audit` | `rocky audit --output json` (`?product=<name>` matches `--product <name>`) | - |
+| `GET /api/v1/cost/month?month=<YYYY-MM>` | `rocky cost --month <YYYY-MM> --by product --output json` | `as_of`. With no `month`, it reports the current month in `[schedule].timezone`. |
+| `GET /api/v1/policy` | `rocky policy show --output json` | See below |
+
+To approve a plan, use `POST /api/v1/jobs/approve` or `rocky review <plan-id> --approve`.
+
+`GET /api/v1/policy` returns the rules in file order with the fields that decide an outcome (scope, effect, `verify_after`, not `conditions`, which the engine parses and never evaluates), and the freezes in force that the read could see. It never writes. On a remote `[state]` backend it does not download the authoritative ledger, because that would replace the local file. It then reports `freeze_sources.ledger` as `local_mirror`, so a caller can tell a complete answer from a possibly stale one.
+
+Six routes have no CLI command to match: `GET /api/v1/health`, `/project`, `/models`, `/models/{name}`, `/dag/layers` and `/dag/status`. They return typed payloads with published schemas. `GET /api/v1/meta` lists the `estate` capability for the five estate routes and `project` for the project route.
+
+- `/project` returns the config directory's name, the pipelines and adapters, the compiled model count, the diagnostics counts and the newest run.
+- Model detail caps the SQL text at 256 KiB. A cut is reported through `sql_truncated` and `sql_bytes`.
+- Each type-checked column carries its structured `data_type`, which keeps a struct field's own nullability, and a `data_type_display` label such as `DECIMAL(10,2)`.
 
 ### Two reads that compute, and what they cost
 
-Most read routes project state the engine already has. Two of them do work per request, so they carry bounds the others do not.
+Most read routes project state the engine already has. Two do work per request, so they carry bounds.
 
-`GET /api/v1/review/{plan_id}` compiles the project twice, once at the working tree and once at `HEAD`, to find what a plan would break. On a project of a thousand models each compile is about 140 milliseconds. One diff runs at a time; a second waits about two seconds and is then refused with `503` and a `Retry-After`. The base is always `HEAD` and is not a parameter, because a ref from a query string would become an argument to `git`.
+`GET /api/v1/review/{plan_id}` compiles the project twice, at the working tree and at `HEAD`, to find what a plan would break. On a project of a thousand models each compile takes about 140 milliseconds. One diff runs at a time. A second waits about two seconds, then gets `503` with a `Retry-After`. The base is always `HEAD` and is not a parameter, because a ref from a query string would become an argument to `git`.
 
-`GET /api/v1/models/{name}/rows` runs the model's compiled `SELECT` against the warehouse and returns at most `limit` rows, with classification-tagged columns masked. It is the same code `rocky preview rows` runs, so the two cannot answer differently.
+`GET /api/v1/models/{name}/rows` runs the model's compiled `SELECT` against the warehouse and returns at most `limit` rows, with classification-tagged columns masked. It runs the same code as `rocky preview rows`.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
@@ -93,14 +112,14 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 Four things bound it:
 
-- **Consent, per request.** A remote adapter needs the `X-Rocky-Allow-Warehouse: true` header on every call. Without it the answer is `403 warehouse_gated`, before anything compiles. A local DuckDB adapter needs none. The header is not a formality: a `GET` is issued by things that are not the user, such as a browser prefetch or a restored tab, and none of those can set a custom header.
+- **Consent, per request.** A remote adapter needs the `X-Rocky-Allow-Warehouse: true` header on every call. Without it the answer is `403 warehouse_gated`, before anything compiles. A local DuckDB adapter needs none. A `GET` can come from a browser prefetch or a restored tab, and those cannot set a custom header.
 - **A row cap.** `limit` is 1 to 500. Anything else is `400`.
-- **A timeout, and one at a time.** The call is given 30 seconds, the compile included; past that the answer is `504 sample_timeout`, and the warehouse may still be running the query. A second concurrent sample is refused at once with `503` and a `Retry-After`, rather than queued behind a call that might take the full 30 seconds. A compile that outlives the deadline finishes on its own and keeps the sample lane until it does, so the next sample may be refused `503` until then.
-- **No caching.** The response carries `Cache-Control: no-store`, because the body is warehouse rows.
+- **A timeout, and one at a time.** The call gets 30 seconds, the compile included. After that the answer is `504 sample_timeout`, and the warehouse may still be running the query. A second concurrent sample gets `503` with a `Retry-After`. A compile that outlives the deadline keeps the sample lane until it finishes.
+- **No caching.** The response carries `Cache-Control: no-store`.
 
-Masking is applied inline, and a sample that cannot be masked is refused rather than served. Two limits are worth knowing. Rocky can express a mask on Databricks, Snowflake and DuckDB; on any other adapter a model with a masked column is refused with `422 masking_unsupported_by_adapter`, every time. And the `hash` strategy is an unsalted SHA-256, so a column drawn from a small or guessable set, an email address or a phone number, is recoverable from its digest. Treat a hashed column as pseudonymous, not anonymous.
+A sample that cannot be masked is refused. Rocky can express a mask on Databricks, Snowflake and DuckDB. On any other adapter, a model with a masked column gets `422 masking_unsupported_by_adapter`. The `hash` strategy is an unsalted SHA-256, so a hashed email address or phone number is recoverable from its digest. Treat a hashed column as pseudonymous, not anonymous.
 
-Ad-hoc SQL is not exposed over HTTP. The CLI's `--sql-file` has no route: a compiled model's `SELECT` is a different thing from arbitrary SQL, whatever the token.
+Ad-hoc SQL is not exposed over HTTP. The CLI's `--sql-file` has no route.
 
 ### Mutations are jobs you poll
 
@@ -125,76 +144,135 @@ A mutating route does not block. You submit the work, get an id back, and poll f
                                            RunOutput or PlanOutput
 ```
 
-The polled result is the same payload the CLI would have produced.
+The polled result is the same payload the CLI would have produced. A submitted job becomes `running` right away. The schema also declares `queued`, but this server never uses it. Poll until the state is `succeeded`, `failed` or `cancelled`.
 
-`POST /api/v1/jobs/test` runs `rocky test` in local DuckDB. The optional body `{"model": "<name>"}` tests one model. `POST /api/v1/jobs/ci` runs `rocky ci` (compile and test, no warehouse credentials) and ignores the body. Neither takes the single-mutation lock, so a `test` or `ci` job is never blocked by a run. Both sit behind the same write gate as `run`. A read-only token gets `403`.
+The routes `/jobs/promote` and `/jobs/compact` are not in the diagram. They plan and mutate nothing. Every route validates its body first and answers `400 bad_request` before the job starts, or before it takes the lock. All sit behind the same write gate as `run`: a read-only token gets `403`.
 
-`POST /api/v1/jobs/freeze` and `POST /api/v1/jobs/unfreeze` run `rocky policy freeze` and `rocky policy unfreeze`. The optional body is `{"principal": "agent" | "human", "scope": "<selector>", "reason": "<text>"}`. With no `principal`, both are named. With no `scope`, every model is. The server checks the fields first and answers `400 bad_request` for a principal that is not `agent` or `human`, a scope `rocky policy` does not recognise (or one padded with spaces), or a reason that is empty, starts with `-`, holds control characters or is over 500 characters. To lift a freeze, send the `principal` and `scope` it was made with. A freeze marker whose body cannot be read is lifted only with no `principal` and `scope` `any` (the brief marks its rows with `unreadable_marker`). Both jobs open the local state store, even on a remote `[state]` backend, and a run holds it for its whole run. So both take the same single-mutation lock as `run` and answer `409 mutation_in_progress` while a run, apply or approve holds it. Retry a refused freeze once that job finishes; to stop a running run, cancel that job. A run this server did not start, such as one from a terminal or an orchestrator, also holds the local store but not the server's slot. A freeze then fails on the store lock; on a remote `[state]` backend with durable markers, its marker is already written and the run stops at its next fence, but a retry writes a second marker. Retry after that run ends. The job result carries the command's `notes`, such as "freeze recorded but NOT enforced" when the project has no `[policy]` block. Both routes sit behind the same write gate as `run`. The ledger row names the server's principal id, read from `ROCKY_PRINCIPAL_ID` in the server's environment (else `unnamed`; a `--principal-id` flag on `rocky serve` does not reach the job), not the caller. The row does not record that the call came from the HTTP API or the browser.
+| Route | Runs | Body | Lock |
+|---|---|---|---|
+| `/jobs/test` | `rocky test` in local DuckDB | optional `{"model": "<name>"}` | none |
+| `/jobs/ci` | `rocky ci` (compile and test, no warehouse credentials) | ignored | none |
+| `/jobs/freeze`, `/jobs/unfreeze` | `rocky policy freeze`, `rocky policy unfreeze` | optional `{"principal": "agent" \| "human", "scope": "<selector>", "reason": "<text>"}` | mutation |
+| `/jobs/preview` | `rocky preview create` | optional `{"name": "<branch>", "base": "<ref>"}` | mutation |
+| `/jobs/promote` | `rocky plan promote <name>` | `{"name": "<branch>", "base": "<ref>", "pipeline": "<name>"}`, `name` required | none |
+| `/jobs/compact` | `rocky compact <table>` or `rocky compact --catalog <name>` | exactly one of `{"table": "<catalog.schema.table>"}` or `{"catalog": "<name>"}` | none |
+| `/jobs/product_approve` | `rocky product approve <name>` | `{"name": "<product>", "expect_spec_digest": "<digest>"}`, both required | mutation |
+| `/jobs/approve` | `rocky review <plan_id> --approve` | `{"plan_id": "<64 lowercase hex>"}` | mutation |
+| `/jobs/apply` | `rocky apply <plan_id>` | `plan_id`, optional `expect_spec_digest` | mutation |
 
-`POST /api/v1/jobs/preview` runs `rocky preview create`. The optional body is `{"name": "<branch>", "base": "<ref>"}`. The `name` is 1 to 64 letters, digits or underscores; with none, the server derives it from the current branch of the git checkout it runs in, so every call from the same checkout derives the same name and only the first succeeds. The `base` is a ref (default `main`) with no spaces or control characters, at most 200 characters, and not starting with `-`. The server checks both first and answers `400 bad_request` otherwise. The job registers the branch in the local state store file (not uploaded to a remote `[state]` backend; its creator is the server's OS user, not the caller) and copies the unchanged models from their production schema into the warehouse schema `branch__<name>`, using the warehouse credentials in `rocky.toml`. Production tables are only read. The job writes warehouse objects and opens the state store for write, so it takes the same single-mutation lock as `run` and answers `409 mutation_in_progress` while a run, apply, approve, freeze or unfreeze holds it. It does not re-run the changed models (`run_status` is `planned`). A copy that fails for one model is `copy_strategy: "failed"` in the result and the job still succeeds, so check each `copy_set` entry. A name already in use fails the job. A job that fails after it registered the branch leaves the branch, so a retry needs a new name. The changed models come from `git diff` between `base` and `HEAD`, resolved against the repository root, so the project may be a subfolder of the repository. The child gets the server's `--models` when one was given. It reads no contracts. The route sits behind the same write gate as `run`.
+Jobs that take the mutation lock answer `409 mutation_in_progress` while another one holds it. A run holds the local state store for its whole run, even on a remote `[state]` backend, so retry a refused freeze when that run ends. To stop a running job, cancel it.
 
-`POST /api/v1/jobs/promote` runs `rocky plan promote <name>`. The body is `{"name": "<branch>", "base": "<ref>", "pipeline": "<name>"}`, and `name` is required: 1 to 64 letters, digits, `_`, `.` or `-`, not starting with `-`. The optional `base` is a git ref (default `main`), and `pipeline` is a pipeline name. The server checks them and answers `400 bad_request` before the job starts. The job runs the branch's approval and breaking-change gates and writes a promote plan. It replaces no table, so it takes no lock. The result is the plan output: `plan_id` and one `statements` entry per production table the plan would replace (`target` is the table). The server refuses the job with `409 branch_approval_not_required` unless `rocky.toml` sets `[branch.approval] required = true`. It reads the config on each request, and it answers `500 project_read_failed` when it cannot. The child runs without `ROCKY_BRANCH_APPROVAL_SKIP`. Apply the plan with `POST /api/v1/jobs/apply`.
+**Freeze and unfreeze.** With no `principal`, both are named. With no `scope`, every model is. The server answers `400 bad_request` for a principal that is not `agent` or `human`, a scope `rocky policy` does not recognise (or one padded with spaces), or a reason that is empty, starts with `-`, holds control characters or is over 500 characters. To lift a freeze, send the `principal` and `scope` it was made with. A freeze marker whose body cannot be read is lifted only with no `principal` and scope `any` (the brief marks its rows `unreadable_marker`). The result carries the command's `notes`, such as "freeze recorded but NOT enforced" when the project has no `[policy]` block. A run this server did not start holds the local store but not the server's lock, so a freeze then fails on the store lock. See [Freeze and unfreeze](/guides/browser-ui/#freeze-and-unfreeze) for the remote-backend case.
 
-`POST /api/v1/jobs/apply` reads the plan before it takes the lock. It answers `409 archive_apply_terminal_only` for an archive plan: archive deletes rows and vacuums with no retention window, so it is applied in a terminal only. It answers `409 branch_approval_not_required` for a promote plan when the config does not set `required = true`, and `409 promote_plan_not_approved` when the plan holds no valid approval (or fewer than `min_approvers`, or was built with the gate skipped). A plan it cannot read goes on to the child, which fails on it. `GET /api/v1/branches` returns the branch list, the same bytes as `rocky branch list --output json`, and `GET /api/v1/project` carries `branch_approval_required`.
+**Preview.** `name` is 1 to 64 letters, digits or underscores. With none, the server derives it from the current branch of its git checkout, so only the first call from a checkout succeeds. `base` is a ref (default `main`), at most 200 characters, with no spaces or control characters, not starting with `-`. The job registers the branch in the local state store file (not uploaded to a remote `[state]` backend) and copies the unchanged models from their production schema into `branch__<name>`, using the warehouse credentials in `rocky.toml`. Production tables are only read. It does not re-run the changed models (`run_status` is `planned`). A failed copy for one model is `copy_strategy: "failed"` and the job still succeeds, so check each `copy_set` entry. A name already in use fails the job. A job that fails after it registered the branch leaves the branch, so a retry needs a new name. The changed models come from `git diff` between `base` and `HEAD`. The child gets the server's `--models` when given and reads no contracts.
 
-`POST /api/v1/jobs/compact` runs `rocky compact <table>` or `rocky compact --catalog <name>`. The body is `{"table": "<catalog.schema.table>"}` or `{"catalog": "<name>"}`: give exactly one. A table has three parts and a catalog has one; each part is letters, digits or `_`. The server answers `400 bad_request` otherwise, before the job starts. The job writes a compaction plan and runs no statement, so it takes no lock. For a replication pipeline, a `catalog` plan asks the source adapter to discover tables. The result is the `compact` output: `plan_id` (absent when the plan could not be saved), `statements`, and for a catalog also `tables` and `totals`. Apply the plan with `POST /api/v1/jobs/apply` and that `plan_id`; the apply runs `OPTIMIZE` and `VACUUM` on Databricks and takes the lock. There is no `dry_run` field, because the command's `--dry-run` still writes an applicable plan.
+**Promote.** `name` is 1 to 64 letters, digits, `_`, `.` or `-`, not starting with `-`. The optional `base` is a git ref (default `main`). The job runs the approval and breaking-change gates and writes a promote plan. It replaces no table. The result is the plan output: `plan_id` and one `statements` entry per production table the plan would replace. The server answers `409 branch_approval_not_required` unless `rocky.toml` sets `[branch.approval] required = true`, which it reads on each request (`500 project_read_failed` when it cannot). The child runs without `ROCKY_BRANCH_APPROVAL_SKIP`. Apply the plan with `POST /api/v1/jobs/apply`. `GET /api/v1/branches` returns the bytes of `rocky branch list --output json`, and `GET /api/v1/project` carries `branch_approval_required`.
 
-`POST /api/v1/jobs/product_approve` runs `rocky product approve <name>`. The body is `{"name": "<product>", "expect_spec_digest": "<digest>"}`. The `name` is required: an ASCII letter or `_`, then letters, digits or `_`. The `expect_spec_digest` is required too, with the same shape rules as the apply digest (one word, no control characters, not starting with `-`, at most 200 characters). The server answers `400 bad_request` otherwise, before it takes the lock. It is passed as `--expect-digest`. The job approves the working spec only if its digest is exactly that value. If the spec on disk has changed, the job fails with `approval-digest-mismatch` and writes nothing. It takes the same single-mutation lock as `run`. The approval records the approver as `<server git email> (http_api)`, the channel and not the person. If the server's git identity cannot be read, or is literally `unknown`, the job fails with `approver_identity_unresolved` and writes nothing. The result is the `product approve` output.
+**Compact.** A table has three parts and a catalog has one, each letters, digits or `_`. The job writes a compaction plan and runs no statement. The result is the `compact` output: `plan_id` (absent when the plan could not be saved), `statements`, and for a catalog also `tables` and `totals`. Apply it with `POST /api/v1/jobs/apply`. The apply runs `OPTIMIZE` and `VACUUM` on Databricks and takes the lock. There is no `dry_run` field, because `--dry-run` still writes an applicable plan.
 
-`POST /api/v1/jobs/approve` takes `{"plan_id": "<64 lowercase hex>"}`. It runs `rocky review <plan_id> --approve` as a subprocess and takes the same single-mutation lock as `run` and `apply`. While one of them runs, it answers `409 mutation_in_progress`. `/jobs/apply` and `/jobs/approve` answer `400 invalid_plan_id` for any other `plan_id`. `/jobs/apply` also takes an optional `expect_spec_digest`, passed as `rocky apply --expect-spec-digest <digest>`. A plan bound to a data product is refused without it, and a plan that is not bound is refused with it. The engine's refusals are plain errors, not coded ones. The plan's digest is not a secret. The check only works when the digest comes from the caller's own record of the approved spec (`approval.spec_digest` in `rocky product status`), never filled in by the UI. Read it from the approval record (`rocky product status`, the `approval:` line), not from the plan. The server answers `400 bad_request` before it takes the lock if the value is empty, holds a space or a control character, starts with `-`, or is over 200 characters. The browser UI sends only a digest the person typed. The approval records the approver source `http_api` and the server's git identity. If `git config user.email` cannot be resolved, or it is literally `unknown`, the job fails with `approver_identity_unresolved`. Job subprocesses carry `ROCKY_SESSION_SOURCE=http_api`, so run records show the session source `http_api`. That names the HTTP API as the source. It does not prove a browser made the call.
+**Apply.** `/jobs/apply` reads the plan before it takes the lock, then answers:
 
-A submitted job becomes `running` right away. The schema also declares a `queued` state, but this server never uses it, because submissions never sit in a queue. Poll until the state is `succeeded`, `failed` or `cancelled` rather than matching on the full set.
+| Status | When |
+|---|---|
+| `409 archive_apply_terminal_only` | Archive plan. Archive deletes rows and vacuums with no retention window: apply it in a terminal. |
+| `409 branch_approval_not_required` | Promote plan, and the config does not set `required = true`. |
+| `409 promote_plan_not_approved` | Promote plan with no valid approval, fewer than `min_approvers`, or built with the gate skipped. |
 
-`POST /api/v1/jobs/{id}/cancel` stops a job this server process started. It takes no body. The first request sends the job's process group `SIGTERM` and answers `202 {"job_id": ..., "signal": "terminate"}`. A run of a replication pipeline handles it like Ctrl-C: it finishes the copies in flight, saves their state and exits. Other jobs stop at once. Once a `SIGTERM` was delivered, the next request sends `SIGKILL` and answers `"signal": "kill"`. On Windows every request kills the job. The route answers `202` only after the signal reached the job. The job then ends `cancelled`, or `succeeded` if it still exits 0. It keeps the mutation lane until its subprocess has exited. A finished job, or one that exited before the signal reached it, answers `409 job_not_running`. A job this process did not start, such as a scheduled run, answers `409 job_not_cancellable`. An unknown id answers `404 job_not_found`. The [browser UI guide](/guides/browser-ui/#cancel-a-running-job) lists what a cancelled job leaves behind.
+A plan it cannot read goes on to the child, which fails on it. `/jobs/apply` and `/jobs/approve` answer `400 invalid_plan_id` for any other `plan_id`.
 
-There is no timeout route today. A mutating job holds the single mutation lane until its subprocess exits. While that lane is held, the next `run` or `apply` submission returns `409`, so a hung job blocks the next one until it is cancelled. On restart the server reconciles its durable job ledger: it marks any job the previous process left `running` or `queued` as `failed`, with the error `interrupted by engine restart`. A client that polls for a terminal state therefore always terminates — a state this version does not recognise is reported as `failed` when the record is read, so polling ends either way.
+**Spec digests.** A plan bound to a data product needs `expect_spec_digest`, passed as `rocky apply --expect-spec-digest <digest>`. The engine's refusals are plain errors, not coded ones. The digest must come from the caller's own record of the approved spec (`approval.spec_digest` in `rocky product status`), never from the plan. The server answers `400 bad_request` before it takes the lock if the value is empty, holds a space or control character, starts with `-`, or is over 200 characters. `/jobs/product_approve` passes the digest as `--expect-digest`. Its `name` is an ASCII letter or `_`, then letters, digits or `_`. The job approves the working spec only if its digest is exactly that value. Otherwise it fails with `approval-digest-mismatch` and writes nothing.
+
+**Approver identity.** An approval records the approver as `<server git email> (http_api)`: the channel, not the person. If `git config user.email` cannot be resolved, or is `unknown`, the job fails with `approver_identity_unresolved` and writes nothing. Job subprocesses carry `ROCKY_SESSION_SOURCE=http_api`. That does not prove a browser made the call. The ledger row names the server's principal id, read from `ROCKY_PRINCIPAL_ID` in the server's environment (else `unnamed`; a `--principal-id` flag on `rocky serve` does not reach the job).
+
+`POST /api/v1/jobs/{id}/cancel` stops a job this server process started. It takes no body. The first request sends the job's process group `SIGTERM` and answers `202 {"job_id": ..., "signal": "terminate"}`. A run of a replication pipeline handles it like Ctrl-C: it finishes the copies in flight, saves their state and exits. Other jobs stop at once. Once a `SIGTERM` was delivered, the next request sends `SIGKILL` and answers `"signal": "kill"`. On Windows every request kills the job. The route answers `202` only after the signal reached the job. The job then ends `cancelled`, or `succeeded` if it still exits 0. It keeps the mutation lane until its subprocess has exited. Errors:
+
+| Status | When |
+|---|---|
+| `409 job_not_running` | The job finished, or exited before the signal reached it. |
+| `409 job_not_cancellable` | This process did not start the job, such as a scheduled run. |
+| `404 job_not_found` | Unknown id. |
+
+The [browser UI guide](/guides/browser-ui/#cancel-a-running-job) lists what a cancelled job leaves behind.
+
+There is no timeout route today. A mutating job holds the single mutation lane until its subprocess exits, so a hung job blocks the next `run` or `apply` (`409`) until it is cancelled. On restart the server marks any job the previous process left `running` or `queued` as `failed`, with the error `interrupted by engine restart`. A state this version does not recognise is reported as `failed`, so polling always ends.
 
 ### Every failure carries an error envelope
 
-Every route except `GET /api/v1/health` returns a structured error body on failure, never an empty response. The body carries a stable `code`, a human `message`, and an optional `remediation_hint`. Switch on the code in your own code, and show the hint to an operator.
+Every route except `GET /api/v1/health` returns a structured error body on failure. The body carries a stable `code`, a human `message`, and an optional `remediation_hint`. Switch on the code. An unknown path answers `404` with `code: "route_not_found"`. A wrong method answers `405` with `code: "method_not_allowed"`. A request the HTTP stack rejects before the router, such as malformed framing, has no envelope.
 
-Router-level failures use the same envelope. An unknown path answers `404` with `code: "route_not_found"`. A known path called with the wrong method answers `405` with `code: "method_not_allowed"`. One case has no envelope: a request the HTTP stack rejects before it reaches the router, such as malformed HTTP framing or a connection dropped mid-body.
-
-The full route reference, request and response schemas, and status codes are published as a generated OpenAPI 3.1 document: **[openapi.json](/openapi.json)**. It is generated from the same typed schemas that back the CLI, so it cannot drift from what the server returns. Load it into any OpenAPI tool to explore the surface or generate a client.
+The generated OpenAPI 3.1 document, **[openapi.json](/openapi.json)**, lists every route, schema and status code. It comes from the same typed schemas as the CLI, so it cannot drift.
 
 ### The browser UI
 
-`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries. The page signs in through `GET /login` and a session cookie, and holds no token. Embedders keep using `Authorization: Bearer <token>`. The UI files themselves are public. The [browser UI guide](/guides/browser-ui/) covers sign-in, [operator mode](/guides/browser-ui/#operator-mode) and the host and origin checks.
-
-For the command flags, see [`rocky serve`](/reference/commands/development/). For where the server sits in the engine, see the [architecture overview](/concepts/architecture/).
+`rocky serve --ui` serves a browser UI at `/ui/`. It signs in through `GET /login` and a session cookie. Embedders keep using `Authorization: Bearer <token>`. The [browser UI guide](/guides/browser-ui/) owns sign-in, operator mode and the UI flows. The flags are in [`rocky serve`](/reference/commands/development/#rocky-serve).
 
 ## Pinning and upgrades
 
-CI holds the shape of every `/api/v1` payload stable. The `codegen-drift` check fails any change that alters a payload's shape without regenerating the committed schemas, so a shape change cannot land silently. New fields arrive in a backward-compatible way: they are serde-defaulted and optional. **Your parser must tolerate unknown fields.** Adding a field, without removing or retyping any other, does not change the API version.
+The `codegen-drift` check fails any change to a payload's shape that does not regenerate the committed schemas. New fields are serde-defaulted and optional. **Your parser must tolerate unknown fields.** Adding a field does not change the API version. A removed field, a rename or a type change would arrive as a new API version.
 
-CI guarantees **shape**, not values. The drift check compares the structure of each payload. It does not compare the specific values inside a primitive field. A string field stays a string across a minor release, but the exact string it carries is best-effort. Pin against shape, and expect value semantics to change within a minor version. A frozen-value corpus that would trip on any value change is planned, and is not in force yet.
+CI guarantees **shape**, not values. A string field stays a string across a minor release, but the exact string is best-effort. A frozen-value corpus is planned and not in force yet.
 
-Read `GET /api/v1/meta` to identify the engine you are talking to at runtime. It reports the engine version, the state-schema version, and a hash of the full schema set. It also reports `token_scope` (`"full"`, `"read_only"`, or `null` when no token is configured). It also reports a per-request hash of the resolved config, and the routes and capabilities this build serves. Feature-detect against `capabilities` and `routes` rather than parsing the version string. Compare `schemas_hash` between deployments to see whether any payload shape moved.
+`GET /api/v1/meta` reports the engine version, the state-schema version, a hash of the full schema set (`schemas_hash`), `token_scope` (`"full"`, `"read_only"`, or `null` when no token is configured), a per-request hash of the resolved config, and the routes and capabilities this build serves. Feature-detect against `capabilities` and `routes`, not the version string.
 
-Recommended practice:
-
-- Pin the engine to a minor version and read `/api/v1/meta` on startup to confirm the deployed build matches what you tested against.
-- Tolerate unknown fields in every parser.
-- Watch `schemas_hash` across upgrades; a change there is your signal to re-review payloads.
-- A backward-incompatible reshape (a removed field, a rename, a type change) would arrive as a new API version, not as a silent change to `/api/v1`.
+- Pin the engine to a minor version. Read `/api/v1/meta` on startup to confirm the build matches what you tested.
+- Watch `schemas_hash` across upgrades. A change is your signal to re-review payloads.
 
 ## Running the API as a sidecar
 
-Run `rocky serve` next to your application as a single-tenant sidecar. It is not a shared multi-tenant server.
+Run `rocky serve` next to your application, one process per project.
 
-**Binding.** The server binds to `127.0.0.1:8080` by default, loopback only. It refuses to bind a non-loopback host such as `0.0.0.0` unless you also configure a bearer token. An unauthenticated API therefore cannot leak model SQL and run history onto the network by accident.
+### Security defaults
 
-**Authentication.** Auth is one optional shared-secret bearer token, passed with `--token` or the `ROCKY_SERVE_TOKEN` environment variable. When you set a token, the check runs on every request whose path is not exempt. Two paths are exempt, whatever the method: `/api/v1/health`, and the webhook `/api/v1/hooks/trigger/{pipeline}` — bearer-exempt because it authenticates with its own HMAC over the raw body (and, on a loopback bind with `--scheduler` and no secret, accepts an unsigned `POST`). A CORS preflight is answered before the check, and the browser UI's own files under `/ui/` are public. When you set no token, a loopback server asks no request for one. It still refuses a request whose `Host` does not name it (`421`) or whose `Origin` is another site (`403`), so a web page cannot reach it by DNS rebinding; a client that calls `http://127.0.0.1:<port>` or `http://localhost:<port>` is unaffected. Behind a reverse proxy that sends its own name as `Host`, pass that name with `--allowed-host`. This is a single secret, not a user system.
+`rocky serve` is a single-tenant sidecar, not a shared server. It binds `127.0.0.1` by default. One optional shared-secret bearer token (`--token` or `ROCKY_SERVE_TOKEN`) is the only auth. It is not a user system.
 
-**Token scope.** A token reaches every route by default. `--token-scope read-only` (or `--read-only`, or `ROCKY_SERVE_TOKEN_SCOPE`) narrows it to `GET`, `HEAD`, and `OPTIONS`; every other method gets `403 forbidden_read_only_token`. Hand that token to anything you do not fully trust with a warehouse write — a browser UI above all, where a leaked token would otherwise reach `POST /api/v1/jobs/run`. The rule is the HTTP method, not a list of paths, so routes added in future are covered as well.
+| Setup | What happens |
+|---|---|
+| Loopback, no token | No request is asked for a token. Any process on the machine can read model SQL, run history and the governor ledger, and call the mutating routes. A handler's own checks still apply (`400` for an unparseable body, `409` for a second `run`, the webhook HMAC when `ROCKY_WEBHOOK_SECRET` is set). The host check blocks web pages. |
+| Token set | The Bearer check runs on every request whose path is not exempt. |
+| Non-loopback `--host` | Requires a token, or `rocky serve` refuses to start. `--ui` also requires a read-only token. |
 
-The scope restricts the token. It is not a whole-server perimeter, and one gap is worth knowing before a browser reaches this sidecar: the webhook route authenticates itself and ignores the token. Run `--scheduler` on loopback without `ROCKY_WEBHOOK_SECRET` and it accepts an unsigned `POST`, then queues work for the scheduler. Script running in the page can do that with no token at all. Set `ROCKY_WEBHOOK_SECRET`. Put the sidecar behind your own gateway if you need per-user identity, TLS, rate limiting, or a public perimeter. The server does not terminate TLS. The `X-Rocky-Principal` header is recorded for audit only, and never authorizes anything.
+Exempt from the token, whatever the method: `GET /api/v1/health`, and `POST /api/v1/hooks/trigger/{pipeline}` (one path segment), which checks an `X-Rocky-Signature` HMAC instead. A CORS preflight (`OPTIONS`) is answered before the check. The UI's own files under `/ui/` are public: they carry no data.
+
+**Host and origin checks.** On every loopback bind and every `--ui` bind, a request whose `Host` is not a loopback name (`localhost`, `127.0.0.1`, `[::1]`, any port), the bind host or an `--allowed-host` entry gets `421 host_not_allowed` before routing. A present `Origin` that is neither the server's own nor an `--allowed-origin` entry gets `403 origin_not_allowed`. The check reads the origin's host, so any port on an allowed host passes. Both stop DNS rebinding, where a web page points its own domain at `127.0.0.1` and calls `POST /api/v1/jobs/run`. `GET /api/v1/health` skips both. A non-loopback bind without `--ui` runs no host check, because names such as a service name or pod IP are unknowable: it must carry a token. Behind a reverse proxy that sends its own name as `Host`, pass it with `--allowed-host`.
+
+**CORS** is empty by default. Declare each browser origin with `--allowed-origin <ORIGIN>`. Methods: `GET`, `POST`, `OPTIONS`. Headers: `Authorization`, `Content-Type`. CORS authenticates nothing: it decides what a browser may read.
+
+**Token scope.** A token reaches every route by default. `--token-scope read-only` (or `--read-only`, or `ROCKY_SERVE_TOKEN_SCOPE`) allows `GET`, `HEAD` and `OPTIONS` only. Any other non-exempt request gets `403 forbidden_read_only_token`. Hand that token to anything you do not fully trust with a warehouse write, a browser UI above all.
+
+```text
+read-only token
+  ├─ GET  /api/v1/dag        → 200
+  └─ POST /api/v1/jobs/run   → 403 forbidden_read_only_token
+```
+
+The rule reads the HTTP method, not a path list, so future routes are covered. It classifies the method, not the handler, so a `GET` that mutates would pass. It covers only routes inside the authenticated router.
+
+**The webhook route** authenticates itself and ignores the token, so a read-only token does not stop it:
+
+```text
+--scheduler, no ROCKY_WEBHOOK_SECRET:
+  loopback bind          → unsigned POST ACCEPTED, work queued (dev convenience)
+  non-loopback bind      → 404 webhook_disabled
+  loopback bind + --ui   → refuses to START
+```
+
+Script in a page can reach the unsigned path with no token. Set `ROCKY_WEBHOOK_SECRET` whenever a browser or an untrusted process can reach the server. `--ui --scheduler` refuses to start without it.
+
+The server does not terminate TLS. For per-user identity, TLS, rate limiting or a public perimeter, put the sidecar behind your own gateway. `X-Rocky-Principal` is recorded for audit only and never authorizes anything.
+
+### Ask the server what it enforces
+
+`GET /api/v1/settings` reports what a running server enforces, not what its start command said: the bind host, the CORS allowlist, the accepted `Host` values (`allowed_hosts`, empty on a non-loopback bind without `--ui`), whether the scheduler and the UI are on, the token's scope and the state backend. It holds no secret. `webhook_secret` is `present` (requests need a signature), `absent` (loopback accepts unsigned requests, non-loopback answers `404`) or `set_but_unusable` (blank or not valid UTF-8; `--scheduler` refuses to start). It is reported even when the scheduler is off. An `--allowed-origin` value that is not a valid header value is dropped and grants nothing.
+
+`state_backend` and `concurrency_control` come from `rocky.toml`, read once on the first request and fixed for the life of the process, one read at a time under a 5 second deadline. `503 engine_busy` means another read is in flight: retry. `504 settings_config_timeout` means the deadline blew: retrying will not help. Both fields are `null` when no readable config exists. `config_status` says why: `loaded`, `absent` (no `rocky.toml`) or `unreadable` (present but would not parse; the scheduler skips every tick until it does). The scheduler re-reads the file every tick. This route does not.
+
+### Principals, tenancy and load
 
 **Job principals and policy gating.** A job submitted over HTTP runs `rocky <verb>` as a subprocess. That subprocess inherits the *sidecar's* environment, and takes nothing from the request. The `X-Rocky-Principal` header does not set the principal the policy plane evaluates.
 
 So if agent-scoped `[policy]` rules gate `run` and `apply` in your setup, set `ROCKY_PRINCIPAL=agent` in the sidecar's environment when you launch it. Without that variable, jobs run as the default `human` principal and the agent-scoped rules never fire, whatever the header says. Run one sidecar per principal class if you need both: one with `ROCKY_PRINCIPAL=agent` for agent traffic, and a separate one for human-driven automation.
 
-**Multi-tenancy.** One `rocky serve` process serves one project configuration. For several tenants, run one sidecar per tenant with that tenant's config. Do not multiplex tenants through one server. One process per tenant keeps each tenant's state store, compiled graph, and credentials apart.
+**Multi-tenancy.** One `rocky serve` process serves one project configuration. For several tenants, run one sidecar per tenant with that tenant's config. This keeps each tenant's state store, compiled graph and credentials apart.
 
 **One mutation at a time.** The server admits one mutating job (`run`, `apply` or `approve`) per project at a time. A second mutating submission during that job returns `409` and puts the in-flight job's id in `running_job_id`. Your client can then poll that job instead of colliding with it. A `plan` job mutates nothing and is never blocked. Reads stay available throughout. A read that finds the state store held by another process, a `rocky run` in a terminal for example, returns a retryable `503 engine_busy` rather than an error.
 
@@ -204,17 +282,7 @@ So if agent-scoped `[policy]` rules gate `run` and `apply` in your setup, set `R
 
 ### What one process carries
 
-Measured with `scripts/serve-ceiling.py` on 2026-09-05, against the playground project, on an Apple M3 Pro: a staircase of concurrent clients, each looping over the reads the browser UI makes, 20 seconds per step.
-
-| Concurrent clients | Requests per second | p99 latency |
-|---|---|---|
-| 1 | 90 | 20 ms |
-| 2 | 95 | 45 ms |
-| 4 | 97 | 69 ms |
-| 8 | 96 | 140 ms |
-| 16 | 97 | 274 ms |
-
-Zero errors at every step, and the process's memory did not move. Throughput saturates near 95 store-backed reads per second on that machine, about 10 ms per read; latency then grows with the queue, about 15 ms per waiting request. A viewer costs its refresh rate times the reads per refresh: at one read per second per viewer, that machine carries about 90 viewers, and 8 viewers refreshing at the same instant wait 140 ms. The number is machine-specific by construction. Reproduce it on yours:
+Measured with `scripts/serve-ceiling.py` against the playground project on an Apple M3 Pro: concurrent clients looping over the reads the browser UI makes, 20 seconds per step. Throughput saturates near 95 store-backed reads per second (about 10 ms per read). p99 latency grows with the queue: 20 ms at 1 client, 69 ms at 4, 140 ms at 8, 274 ms at 16, with zero errors and flat memory. At one read per second per viewer, that machine carries about 90 viewers. The number is machine-specific. Reproduce it on yours:
 
 ```bash
 rocky serve --port 8420 --token T &

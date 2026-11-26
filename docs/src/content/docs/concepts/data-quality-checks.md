@@ -12,7 +12,7 @@ Rocky checks a model at four points. Each point runs different checks and has a 
 | [Contract](#data-contracts) | `{model}.contract.toml` | `rocky compile` | Nothing | Compares the inferred schema. Reads no rows. |
 | [Model execution](#rocky-test) | None | `rocky test`, `rocky ci` | Nothing | Runs each model on in-memory DuckDB. |
 | [Unit test](#unit-tests-test) | `[[test]]` | `rocky test` | Nothing | Runs one model on DuckDB per test, with your fixtures. |
-| [Declarative test](#declarative-tests-tests) | `[[tests]]` | `rocky test --declarative` | `rocky.toml` and a reachable warehouse | One SQL query per assertion. |
+| [Declarative test](#declarative-tests-tests) | `[[tests]]` | `rocky test --declarative` | `rocky.toml` and a reachable warehouse | One SQL query per assertion. `--batch-tests` groups `unique` and `not_null` per model. |
 | [Pipeline-level check](#pipeline-level-checks) | `[pipeline.<name>.checks]` | `rocky run`, `rocky apply` | The warehouse | A few queries per table. See each check. |
 | [Assertion](#assertions-in-a-run) | `[[assertions]]` | `rocky run`, `rocky apply` | The warehouse | One SQL query per assertion. |
 | [Cross-source overlap](#cross-source-overlap) | `checks.cross_source_overlap` | `rocky run` | The warehouse | One `UNION ALL` query per sibling group. |
@@ -33,8 +33,6 @@ Rocky checks a model at four points. Each point runs different checks and has a 
 
 ![rocky compile surfaces E010 and E013 contract diagnostic codes on a broken model](/demo-data-contracts.gif)
 
-Assertions run on every pipeline type, replication included. A target table doubled by the same source arriving twice is caught at load time.
-
 Two blocks differ by one letter. Do not mix them up.
 
 | Block | Where | What it checks | Runs |
@@ -47,12 +45,7 @@ Two blocks differ by one letter. Do not mix them up.
 
 A data contract declares what a model's output schema must look like. The compiler compares the schema it inferred against the contract. It catches a missing column, a wrong type, and a nullability violation before any row is written.
 
-A contract is a `{model_name}.contract.toml` file. The compiler reads it from two places:
-
-1. Next to the model file, as `<model>.contract.toml`.
-2. The project `contracts/` directory beside the models directory. `--contracts <DIR>` replaces this directory.
-
-A file in the directory wins over a file next to the model. The example below is such a file:
+A contract is a `{model_name}.contract.toml` file. The compiler reads it from next to the model file, or from the project `contracts/` directory beside the models directory (`--contracts <DIR>` replaces it). A file in the directory wins. Example:
 
 ```toml
 # orders_summary.contract.toml
@@ -93,6 +86,23 @@ Each `[[columns]]` entry takes `name` (required), `type`, `nullable`, and `descr
 | `W010` | Warning | The contract defines a column that is not in the output and is not required |
 | `W011` | Warning | A contract exists for a model not found in the project |
 
+### When Rocky cannot prove a column is never NULL
+
+`nullable = false` is a compile-time proof. Rocky reads no rows. It passes only when the SQL shows the column is never NULL, for example a `COALESCE` with a value that is never NULL, or a column that is NOT NULL in a source schema Rocky has. A `WHERE col IS NOT NULL` filter does not count, because Rocky does not read the WHERE clause when it infers nullability.
+
+When the data keeps the column non-null but the SQL cannot show it, check the data instead. Set `nullable = true` in the contract, and add a `not_null` test to the model sidecar:
+
+```toml
+# models/orders_summary.toml
+[[tests]]
+type = "not_null"
+column = "customer_id"
+```
+
+With `rocky run --tests enforce`, or `[run] tests_on_run = "enforce"`, a NULL fails the model, and its downstream models do not build. `[run] tests_on_run` defaults to `enforce`, so a run enforces tests unless you set `report` or `off`. The test runs after the write, so the rows stay in the model's table. `rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence is that failure. A later run that rebuilds the model without tests replaces that evidence, and promote then only warns. See [Tests during a run](/reference/commands/core-pipeline/#tests-during-a-run) and [Declarative tests](#declarative-tests-tests).
+
+Two cases differ. A data-product model gets its contract from the product spec: edit the spec, not the generated contract (a spec column with `nullable = false` already lowers to a `not_null` test). A `content_addressed` model writes no warehouse table, so its `[[tests]]` do not run.
+
 :::caution
 Contract files ignore unknown keys. Rocky does not reject them.
 
@@ -107,19 +117,7 @@ A column can end up with type `Unknown`. The compiler could not infer its type, 
 
 ## rocky test
 
-`rocky test` compiles your models and runs them on a local DuckDB. It needs no warehouse connection.
-
-1. **Compile.** Rocky runs the full pipeline: load, resolve, semantic graph, type check, contracts.
-2. **Execute.** Rocky runs each model's SQL on in-memory DuckDB, in dependency order.
-3. **Validate.** Where a contract exists, Rocky checks the output schema. It reports the compile diagnostics too.
-4. **Report.** Rocky prints a pass or fail line per model.
-
-```bash
-rocky test --models models/
-rocky test --models models/ --contracts contracts/
-rocky test --models models/ --model orders_summary    # one model
-rocky test --models models/ --output json             # total, passed, failed, failures[]
-```
+`rocky test` compiles your models and runs them on a local DuckDB. It needs no warehouse connection. It reports a pass or fail line per model. Flags and JSON: [`rocky test`](/reference/commands/modeling/#rocky-test).
 
 :::note[Time-interval models under `rocky test`]
 A `time_interval` model's SQL uses the `@start_date` and `@end_date` bounds. `rocky test` replaces them with the widest window the local engine holds: `'0001-01-01 00:00:00'` to `'9999-12-31 23:59:59'`. This applies to model execution and to `[[test]]` unit tests. `rocky ci` runs model execution only.
@@ -166,7 +164,7 @@ The runner seeds DuckDB with each `[[test.given]]` as a table named after its `r
 - **Only asserted columns are compared.** Extra columns in the model output are ignored.
 - **Empty `rows`** asserts that the model produces no rows for the given inputs.
 
-With any `[[test]]` block, the `--output json` payload gains a `unit_tests` object (`total`, `passed`, `failed`, `results[]`). A failed result carries `model`, `test`, `error`, and a `mismatches` array of row-level diagnostics. A failed unit test fails the run with a non-zero exit code, the same as a model-execution failure.
+With any `[[test]]` block, the `--output json` payload gains a `unit_tests` object. A failed unit test fails the run with a non-zero exit code.
 
 ## Declarative tests (`[[tests]]`)
 
@@ -185,36 +183,13 @@ values = ["pending", "shipped", "delivered"]
 severity = "warning"
 ```
 
-Run them with `--declarative`. They execute on the configured warehouse adapter, not DuckDB, so they need a `rocky.toml` and a warehouse Rocky can reach.
+Run them with `rocky test --declarative`. They execute on the configured warehouse adapter, not DuckDB, so they need a `rocky.toml` and a warehouse Rocky can reach. With no `--pipeline` and no `--models`, each transformation pipeline runs the tests of its own models, against the warehouse that pipeline targets. Rocky reports `pass`, `fail`, or `error`. A failed `error`-severity assertion (the default) exits non-zero. A `warning` reports without failing the run.
 
-```bash
-rocky test --declarative
-rocky test --declarative --pipeline silver     # that pipeline's models, on its warehouse
-rocky test --declarative --model orders_summary
-```
-
-With no `--pipeline` and no `--models`, each transformation pipeline runs the tests of its own models, against the warehouse that pipeline targets. Each assertion compiles to a query in the adapter's dialect. Rocky reports `pass`, `fail`, or `error`. A failed `error`-severity assertion (the default) exits non-zero. A `warning` reports without failing the run. The `--output json` payload carries a `declarative` summary with the SQL that ran.
+Add `--batch-tests` to send fewer queries. A model's default-config `unique` tests then share one query, and its `not_null` tests share another, when it has two or more of that type. The results are the same as without the flag.
 
 ## rocky ci
 
-`rocky ci` is built for a CI system. It returns a non-zero exit code on failure.
-
-```bash
-rocky ci --contracts contracts/
-```
-
-With no `--models`, it covers every transformation pipeline in `rocky.toml`. `--models <PATH>` limits it to one directory. All three steps must pass.
-
-1. **Seed.** Run `data/seed.sql`, when the project has one, in an in-memory DuckDB.
-2. **Compile.** Run the full compiler, typed from the seed's tables. This covers type checking and contracts.
-3. **Test.** Run every model in that database, upstream pipelines first.
-
-| Exit code | Meaning |
-|---|---|
-| 0 | All checks passed |
-| 1 | Compilation or tests failed: type errors, contract violations, or models that failed to run locally |
-
-Warnings do not change the exit code. The JSON `exit_code` is the number the process exits with. The JSON also carries `compile_ok`, `tests_ok`, `models_compiled`, `tests_passed`, `tests_failed`, `diagnostics`, and `failures`.
+`rocky ci` is `rocky compile` plus model execution, in that order, for a CI system. It exits `1` on a type error, a contract violation or a model that fails locally. Warnings do not change the exit code. Flags, steps and JSON: [`rocky ci`](/reference/commands/modeling/#rocky-ci).
 
 ## Pipeline-level checks
 
@@ -232,19 +207,13 @@ freshness = { error_after = "24h" }
 
 Compares `COUNT(*)` between the source and target tables. The check passes when the counts match. Its result carries `source_count` and `target_count`.
 
-On Databricks, Rocky batches row count and freshness with `UNION ALL`. Without batching, N tables cost 5N queries. With up to 200 tables per query, a typical pipeline costs about 3. No other warehouse batches these two checks. Snowflake and BigQuery batch the schema describe only. Every other adapter runs one query per table.
+On Databricks, Rocky batches row count and freshness with `UNION ALL`, up to 200 tables per query. A typical pipeline costs about 3 queries instead of 5N. Snowflake and BigQuery batch the schema describe only. Every other adapter runs one query per table.
 
 ### Anomaly detection
 
 Compares this run's target row count against the table's recent history in the state store. A deviation above `anomaly_threshold_pct` (default 50) goes into the run's `anomalies` list. An anomaly is a warning, not a failed run. A row-count swing is often real business behavior.
 
-The detector runs for a table only when all of these are true:
-
-- Row-count checks are on for the pipeline.
-- At least one table in the batch was checked for row counts.
-- `anomaly_threshold_pct` is above 0. A value of 0 or less switches detection off.
-- The run has a state store, which holds the history.
-- This table's row count was measured, and its history could be read.
+The detector runs for a table only when row-count checks are on, at least one table in the batch was row-counted, `anomaly_threshold_pct` is above 0 (0 or less switches it off), the run has a state store with readable history, and this table's count was measured.
 
 `rocky run` reports per table whether the detector looked, in `anomaly_evaluated` (`table`, `evaluated`, and `not_evaluated_reason` when false). Read it with `anomalies`:
 
@@ -276,13 +245,7 @@ Rocky does not always measure freshness:
 
 `prune_unchanged` is off by default. An absent check looks the same as a table with no `freshness` configured: it is absent, not failing.
 
-Dagster fills the gap differently. In Pipes mode the check is absent, as in the JSON. Outside Pipes mode a configured check has a declared spec, so Dagster adds a placeholder:
-
-| Cause | Placeholder |
-|---|---|
-| The table was pruned | It carries forward the last verdict, or passes with a note that it was never checked. |
-| The table was checked and produced no freshness result | It fails at `WARN` severity, marked `not produced by rocky`. |
-| The table was never materialized | It fails at `WARN` severity, with its own reason. |
+Dagster fills the gap in `check_results` per its own rules. See [Check Results](/dagster/checks/).
 
 ### Null rate
 
@@ -323,21 +286,23 @@ filter = "region = 'US'"
 
 ### Assertion kinds
 
-| Type | Level | Parameters | Passes when |
-|---|---|---|---|
-| `not_null` | row | none | The column has no NULL. |
-| `unique` | set | none | The column has only unique values. |
-| `unique_expr` | set | `key_expr` | A computed key is unique (`GROUP BY <expr> HAVING COUNT(*) > 1`). Use it when neither `unique` nor `composite` can express the identity. NULL keys are not excluded. Use `filter` to scope them out. |
-| `accepted_values` | row | `values` | Every non-NULL value is in the set. |
-| `relationships` | row | `to_table`, `to_column` | Every non-NULL value exists in `to_table.to_column`. |
-| `expression` | row | `expression` | The SQL boolean predicate holds per row. It is one expression over the row's own columns. It calls only allowlisted pure scalar functions. It has no subquery and no qualified function. |
-| `row_count_range` | table | `min`, `max` (optional) | The row count is in the inclusive range. |
-| `in_range` | row | `min`, `max` (optional, numeric) | Values are in the numeric range. NULLs pass. |
-| `regex_match` | row | `pattern` | The column matches the dialect regex. NULLs pass. The pattern allows no single quote, backtick, or semicolon. |
-| `aggregate` | table | `op`, `cmp`, `value` | `op(column) cmp value` is `TRUE`. `op` is `sum`, `count`, `avg`, `min`, or `max`. `cmp` is `lt`, `lte`, `gt`, `gte`, `eq`, or `ne` (or symbolic aliases). |
-| `composite` | set | `kind: "unique"`, `columns` | A column tuple is unique. It needs at least two columns. Use `unique` for one. |
-| `not_in_future` | row | none | The timestamp is not in the future (`col <= CURRENT_TIMESTAMP()`). NULLs pass. |
-| `older_than_n_days` | row | `days` | Every timestamp is at least `days` old. NULLs pass. |
+| Type | Level | Passes when |
+|---|---|---|
+| `not_null` | row | The column has no NULL. |
+| `unique` | set | The column has only unique values. |
+| `unique_expr` | set | A computed key is unique (`GROUP BY <expr> HAVING COUNT(*) > 1`). Use it when neither `unique` nor `composite` can express the identity. NULL keys are not excluded. Use `filter` to scope them out. |
+| `accepted_values` | row | Every non-NULL value is in the set. |
+| `relationships` | row | Every non-NULL value exists in `to_table.to_column`. |
+| `expression` | row | The SQL boolean predicate holds per row. It is one expression over the row's own columns. It calls only allowlisted pure scalar functions. It has no subquery and no qualified function. |
+| `row_count_range` | table | The row count is in the inclusive range. |
+| `in_range` | row | Values are in the numeric range. NULLs pass. |
+| `regex_match` | row | The column matches the dialect regex. NULLs pass. The pattern allows no single quote, backtick, or semicolon. |
+| `aggregate` | table | `op(column) cmp value` is `TRUE`. `op` is `sum`, `count`, `avg`, `min`, or `max`. `cmp` is `lt`, `lte`, `gt`, `gte`, `eq`, or `ne` (or symbolic aliases). |
+| `composite` | set | A column tuple is unique. It needs at least two columns. Use `unique` for one. |
+| `not_in_future` | row | The timestamp is not in the future (`col <= CURRENT_TIMESTAMP()`). NULLs pass. |
+| `older_than_n_days` | row | Every timestamp is at least `days` old. NULLs pass. |
+
+Parameters per type: [Assertions](/reference/configuration/#pipelinenamechecksassertions).
 
 Seven row-level kinds are quarantinable: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`. See [Row quarantine](#row-quarantine). The set, table, and referential kinds (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`, `relationships`) run after the fact and cannot be quarantined. `relationships` needs a join, not a per-row predicate.
 
@@ -351,8 +316,6 @@ Each assertion takes `severity`: `error` (the default) or `warning`. Each pipeli
 | `severity = "warning"` | The result has `passed = false` and `severity = "warning"`. It never fails the pipeline. |
 | `fail_on_error = false` | Every `error` becomes a non-fatal result. Use it for shadow runs and observation modes. |
 
-For the replication checks, `severity` describes a check that ran and found a problem. It does not apply to a check Rocky could not run.
-
 A check whose query fails has `passed = false` and a `not_evaluated` field that says why. It always has `severity = "error"`, whatever the config says. It fails the run while `fail_on_error` is on. This holds for every kind: `row_count`, `column_match`, `freshness`, `null_rate`, `[[checks.custom]]`, `[[assertions]]`, `cross_source_overlap`, and a quarantine plan Rocky could not compile.
 
 ```
@@ -361,7 +324,7 @@ the query never ran                  -> always error    (gates, unless
                                                          fail_on_error = false)
 ```
 
-`severity = "warning"` on `freshness` means "a stale table is only a warning". It does not mean "a freshness query I could not run is only a warning". That is an unknown, not a tolerated result.
+`severity = "warning"` on `freshness` means a stale table is only a warning. It does not make a freshness query that could not run a warning.
 
 ### Reusable named tests
 
@@ -402,40 +365,31 @@ min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 ```
 
-The filter is your SQL and must be valid in the target dialect. Rocky does not rewrite it. Rocky checks it with one gate. The gate covers:
+The filter is your SQL and must be valid in the target dialect. Rocky does not rewrite it. One gate checks every SQL fragment you supply, before anything runs:
 
-- an assertion's `filter` and `expression`;
+- an assertion `filter` and `expression`;
 - a `unique_expr` `key_expr` and a `cross_source_overlap` `key_expr`;
-- the same `expression` and `filter` when quarantine lowers the assertion into its own statements;
+- the same `expression` and `filter` when quarantine lowers the assertion;
 - a `metadata_columns[].value`;
-- a check an agent drafts through the `draft_check` MCP tool. Rocky validates under the target adapter's dialect before it writes. With several pipelines, it infers the dialect when they all agree. Otherwise pass `pipeline`.
+- a check an agent drafts through the `draft_check` MCP tool, validated under the target adapter's dialect. With several pipelines, Rocky infers the dialect when they all agree. Otherwise pass `pipeline`.
 
-Rocky parses the fragment under the target dialect. It accepts exactly one expression over the row's own columns. It refuses:
+The gate parses the fragment under the target dialect. It accepts exactly one expression over the row's own columns. It refuses:
 
-- anything after that one expression, so the fragment cannot close Rocky's wrapping parenthesis and add clauses;
-- any subquery, in any position;
-- any qualified function name, such as `schema.fn(...)`. That is how user-defined, remote and plugin functions are reached;
-- any function not on Rocky's allowlist of pure scalar functions;
-- a lambda;
-- a placeholder (`$name`, `$1`, `?`), and an unquoted session-identity word such as `current_user`, `session_user`, `current_role`, `current_catalog` or `current_warehouse`. Each reads session state, not the row.
+| Refused | Reason |
+|---|---|
+| Anything after the one expression | The fragment cannot close Rocky's wrapping parenthesis and add clauses. |
+| A subquery, in any position | |
+| A qualified function name, such as `schema.fn(...)` | That is how user-defined, remote and plugin functions are reached. |
+| A function not on the allowlist of pure scalar functions | `random()` and `uuid()` are not on it. DuckDB `read_text`, Snowflake `GETVARIABLE` and Databricks `secret` are refused by name. |
+| A lambda | |
+| A placeholder (`$name`, `$1`, `?`), or an unquoted `current_user`, `session_user`, `current_role`, `current_catalog`, `current_warehouse` | Each reads session state, not the row. |
+| A `;` outside a string literal, a quoted identifier or a comment, including a trailing one | It could end the query Rocky builds. |
+| An unbalanced quote, or a `/* */` comment that never closes | |
+| A backslash in a quoted literal, a triple-quoted string, a `$$...$$` quote, a backtick, a `//` or `#` line comment, or a nested `/*` | Snowflake, Databricks, BigQuery, DuckDB and Trino lex these differently. Rocky refuses rather than guess. |
 
-Before that, Rocky refuses a fragment that could end the query it builds, or that the five target dialects do not lex the same way:
+Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `md5` and `date_trunc` pass.
 
-- a `;` outside a string literal, a quoted identifier or a comment, including a trailing one;
-- an unbalanced quote, or a `/* */` comment that never closes;
-- a backslash inside a quoted literal, a triple-quoted string, a `$$…$$` dollar quote, a backtick, a `//` or `#` line comment, or a nested `/*`. Snowflake, Databricks, BigQuery, DuckDB and Trino do not agree on these, so Rocky refuses rather than guess.
-
-Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `md5` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like. DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` are refused by name. `random()` and `uuid()` are not on the allowlist, so they are refused in every position.
-
-**The allowlist checks a function's name, not the code behind it.** A warehouse can let a session rebind a built-in under an unqualified call. Then an allowlisted call runs the rebound body. Rocky measured this per dialect:
-
-| Dialect | Unqualified rebind wins over the built-in? | Measured on |
-|---|---|---|
-| DuckDB | Yes. It shadows the built-in, even for a new session. | v1.5.5, persistent file |
-| Databricks | No. A qualified override exists, but Rocky refuses qualified names. | Unity Catalog |
-| Snowflake, BigQuery, Trino | Not probed. | No sandbox available |
-
-On a persistent, file-backed DuckDB, creating that binding needs the file-write access that already lets you edit the data. So the allowlist is not a boundary against that admin. Rocky's in-memory DuckDB, Snowflake, BigQuery and Trino have not been probed, so the same privilege link is not established for them.
+**The allowlist checks a function's name, not the code behind it.** A session can rebind a built-in under an unqualified call, and then the allowlisted call runs the rebound body. Rocky measured this on DuckDB v1.5.5 with a persistent file: the rebind wins, even for a new session. On Databricks (Unity Catalog) it does not, because only a qualified override exists and Rocky refuses qualified names. Snowflake, BigQuery and Trino are not probed. On a persistent DuckDB file the binding needs file-write access that already lets you edit the data. So the allowlist is not a boundary against that admin.
 
 Six allowlisted names are refused in one shape, because that shape reads a Snowflake session parameter:
 
@@ -445,16 +399,11 @@ Six allowlisted names are refused in one shape, because that shape reads a Snowf
 | `date_trunc`, `datediff` (and `date_diff`) | A `week` part or synonym (`w`, `wk`, `weekofyear`, `woy`, `wy`). It reads `WEEK_START`. | Any other part, such as `day`, `month`, `year`, or the Monday-start `week_iso` |
 | `date_part` | A `week` part or synonym reads `WEEK_START`. A `dayofweek` (`weekday`, `dow`, `dw`) or `yearofweek` part reads `WEEK_OF_YEAR_POLICY` and `WEEK_START`. | Any other part, including `dayofyear`, the `epoch_*` and `timezone_*` parts, and the ISO-fixed `week_iso`, `dayofweekiso`, `yearofweekiso` |
 
-`EXTRACT(<part> FROM <expr>)` is refused on the same three part families. On Snowflake, `EXTRACT(<part>, <expr>)` is refused too. It parses as its own construct, not a function call.
+`EXTRACT(<part> FROM <expr>)` is refused on the same three part families. On Snowflake, `EXTRACT(<part>, <expr>)` is refused too.
 
-Two key positions add a rule:
+Two positions add a rule. A `unique_expr` or `cross_source_overlap` `key_expr` takes no clock function (`now()`, `current_timestamp`) and no `COLLATE`: a changing value is not a key, and a collation changes what equality means. A quarantine `expression` or `filter`, `not_in_future` and `older_than_n_days` accept a clock function in every mode, because `split` evaluates each predicate once.
 
-| Position | Extra rule |
-|---|---|
-| `unique_expr` `key_expr`, `cross_source_overlap` `key_expr` | No clock function (`now()`, `current_timestamp`) and no `COLLATE`. A value that changes between evaluations is not a key. A collation changes what equality means. |
-| quarantine `expression` or `filter`, `not_in_future`, `older_than_n_days` | A clock function such as `now()` is accepted in every mode. `split` evaluates each predicate once, so a clock read cannot put a row in both outputs. |
-
-The gate runs before anything executes. What a refusal does depends on the field:
+What a refusal does depends on the field:
 
 | Field | A refusal |
 |---|---|
@@ -475,47 +424,38 @@ mode = "split"   # or "tag" or "drop"
 
 | Mode | Behavior |
 |---|---|
-| `split` | Rocky writes `<target>__valid` (passing rows) and `<target>__quarantine` (failing rows, plus an `_error_<name>` label column per assertion). When the run completes, and the two suffixes name two different tables, each row lands in exactly one. `<target>` is untouched. Point downstream models at `<target>__valid`. Not available on Trino. |
+| `split` | Rocky writes `<target>__valid` (passing rows) and `<target>__quarantine` (failing rows, plus an `_error_<name>` label column per assertion). When the two suffixes name two different tables, each row lands in exactly one. `<target>` is untouched. Point downstream models at `<target>__valid`. Not available on Trino. |
 | `tag` | Rocky rewrites `<target>` in place and adds an `_error_<name>` column per assertion. It is populated on failing rows and NULL on passing rows. Every row stays. It rewrites the source, so use it with care on a raw replication target. Not available on Trino. |
-| `drop` | Rocky writes only `<target>__valid`. It discards failing rows. The quarantine count is still in `check_results[]`. On Trino, Rocky drops the previous valid table before it creates the new one. |
+| `drop` | Rocky writes only `<target>__valid` and discards failing rows. The quarantine count is still in `check_results[]`. On Trino, Rocky drops the previous valid table before it creates the new one. |
 
-Rocky builds the quarantine predicate from every quarantinable assertion, joined with AND. A filter composes as `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`. An out-of-scope row stays on the valid side, even when the base predicate would fail it. Set, table, and referential assertions always run as after-the-fact checks, whatever the mode.
+Rocky builds the predicate from every quarantinable assertion, joined with AND. A filter composes as `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`, so an out-of-scope row stays on the valid side. Set, table, and referential assertions always run after the fact, whatever the mode.
 
-`split` evaluates the predicate once. It writes the source rows plus one label column per assertion to `_quarantine_labels_<token>` in the source's schema. It builds `__valid` and `__quarantine` from those labels, then drops the label table. The token is a random UUID for each run. A run killed between those statements leaves the label table behind. Two runs of one pipeline at the same time can still overwrite each other's `__valid` and `__quarantine`.
+`split` evaluates the predicate once. It writes the source rows plus one label column per assertion to `_quarantine_labels_<token>` in the source's schema (the token is a random UUID per run). It builds `__valid` and `__quarantine` from those labels, then drops the label table. A run killed in between leaves the label table behind. Two runs of one pipeline at the same time can overwrite each other's outputs.
 
-`__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. A dialect with no such form refuses `split` with a `quarantine:compile` check. Trino is one, and so is any adapter whose dialect lacks it.
+`__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. A dialect with no such form, Trino included, refuses `split` with a `quarantine:compile` check.
 
-**Rocky never overwrites a column it cannot prove it wrote.** Before any statement runs, it reads the source's columns and compares each label name with them, ignoring case.
+**Rocky never overwrites a column it cannot prove it wrote.** Before any statement runs, it compares each label name with the source's columns, ignoring case.
 
-- `split` refuses any source column named like a label. It never writes its source, so the column is not Rocky's.
-- `tag` rewrites its own source, so the second run sees the first run's labels. After each successful `tag`, Rocky records in the state store the label columns it wrote and the table's full column list. On the next run it replaces a recorded column, but only while the table still has exactly the recorded columns. Appended or updated rows keep that true. A table that was replaced, or gained or lost a column, does not. Its label columns are refused.
-- If the state store is lost, nothing proves ownership, so `tag` refuses. This includes every existing `tag` table on its first run after an upgrade. Remove the column, and the next run writes and records it again.
+| Mode | Rule |
+|---|---|
+| `split` | Refuses any source column named like a label. It never writes its source, so the column is not Rocky's. |
+| `tag` | After each successful run, Rocky records the label columns and the table's full column list in the state store. On the next run it replaces a recorded column only while the table has exactly the recorded columns. A table that was replaced, or gained or lost a column, has its label columns refused. |
+| `tag`, state store lost | Nothing proves ownership, so `tag` refuses. This includes every existing `tag` table on its first run after an upgrade. Remove the column, and the next run writes and records it again. |
 
 A refusal names the column and the label. Rename or remove the column, or give the assertion a `name` so its label is `_error_<name>`. Where the warehouse cannot drop or rename a column (a Databricks table without column mapping, say), rebuild the table without it.
 
-Every name quarantine creates must fit in 255 characters, the identifier limit of Snowflake and Databricks. This covers the suffixed tables and the label columns. A longer name is refused with a `quarantine:compile` check before any statement runs.
+Every name quarantine creates (suffixed tables and label columns) must fit in 255 characters. A longer name is refused with a `quarantine:compile` check before any statement runs.
 
-A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The table counts in `tables_failed` and is listed in `errors`. What it leaves behind depends on when it failed:
+A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The table counts in `tables_failed` and is listed in `errors`.
 
-- **Refused** (`quarantine:compile`): nothing runs and no table is written. Downstream reads the previous run's rows.
-- **Failed at the warehouse** (`quarantine:execute`): the check names the statement's role and the warehouse error. `split` runs the label table, then `__quarantine`, then `__valid`, then the drop. Finished statements keep what they wrote, so `__quarantine` can be new while `__valid` is the previous run's. Rocky still tries to drop the label table. A failed drop leaves it behind. A statement that times out may still have committed.
+| Failure | What it leaves behind |
+|---|---|
+| Refused (`quarantine:compile`) | Nothing runs. No table is written. Downstream reads the previous run's rows. |
+| Failed at the warehouse (`quarantine:execute`) | The check names the statement's role and the warehouse error. `split` runs the label table, `__quarantine`, `__valid`, then the drop. Finished statements keep what they wrote, so `__quarantine` can be new while `__valid` is old. A failed drop leaves the label table. A statement that times out may still have committed. |
 
 ### Output
 
-Every assertion writes one `check_results[]` entry in the `rocky apply` JSON:
-
-```json
-{
-  "name": "not_null:order_id",
-  "passed": false,
-  "severity": "error",
-  "kind": "not_null",
-  "column": "order_id",
-  "failing_rows": 3
-}
-```
-
-The `name` is the assertion's own `name`, or else `"{kind}:{column}"`. Pipeline-level checks and assertions share this shape, so an orchestrator does not need to tell them apart. See the [JSON Output](/reference/json-output/) reference.
+Every assertion writes one `check_results[]` entry in the `rocky apply` JSON, named by the assertion's `name` or else `"{kind}:{column}"` (for example `not_null:order_id`, with `kind`, `column`, `failing_rows`, `passed` and `severity`). Pipeline-level checks share this shape. See [JSON Output](/reference/json-output/).
 
 ## Cross-source overlap
 
@@ -531,36 +471,9 @@ sample = 20                   # overlapping keys attached to the result
 
 Give exactly one of `keys` (a column tuple) or `key_expr` (a SQL expression). `key_expr` goes through the same gate, including the key-position rules under [Per-assertion `filter`](#per-assertion-filter).
 
-The runner groups the pipeline's managed source tables into **sibling groups**. Siblings share a source type and a table name, and landed in more than one target schema. Rocky tags each sibling's rows with its source and runs:
+The runner groups the pipeline's managed source tables into **sibling groups**. Siblings share a source type and a table name, and landed in more than one target schema. Rocky tags each sibling's rows with its source, `UNION ALL`s them, groups by key, and keeps keys where `COUNT(DISTINCT _src) > 1`. One source's own duplicates never raise a flag.
 
-```sql
-SELECT order_id, COUNT(DISTINCT _src) AS _n_src
-FROM (
-  SELECT order_id, '<table_1>' AS _src FROM <table_1> WHERE order_id IS NOT NULL
-  UNION ALL
-  SELECT order_id, '<table_2>' AS _src FROM <table_2> WHERE order_id IS NOT NULL
-  -- one arm per sibling
-) _u
-GROUP BY order_id
-HAVING COUNT(DISTINCT _src) > 1
-```
-
-`COUNT(DISTINCT _src)` counts the distinct sources a key appears in. One source's own duplicates never raise a flag. With a `key_expr` or multi-column `keys`, the key list changes to match.
-
-Rocky skips a sibling table it cannot evaluate, because the key column is missing or the table is keyless. It logs the reason and does not fail the check. The result is named `cross_source_overlap:<source_type>.<table>`:
-
-```json
-{
-  "name": "cross_source_overlap:shopify.orders",
-  "passed": false,
-  "severity": "warning",
-  "overlap_count": 3,
-  "contributing_tables": ["raw__us__shopify.orders", "raw__eu__shopify.orders"],
-  "sample": ["ord_1001", "ord_1002", "ord_1003"]
-}
-```
-
-Rocky counts how many siblings in a group carry the key. Then it splits three ways:
+Rocky skips a sibling table it cannot evaluate (the key column is missing, or the table is keyless). It logs the reason and does not fail the check. The result is named `cross_source_overlap:<source_type>.<table>` and carries `overlap_count`, `contributing_tables` and `sample` (see [JSON Output](/reference/json-output/)). Rocky counts how many siblings in a group carry the key:
 
 ```
 0 siblings carry the key  -> not evaluated, error severity, fails   (a typo)
@@ -568,31 +481,17 @@ Rocky counts how many siblings in a group carry the key. Then it splits three wa
 2 or more carry it        -> measured across those siblings, and it can fail
 ```
 
-A group of three where two share a duplicate key still fails, even if the third has no such column. A group whose query failed, or whose key expression was refused, is an unevaluated failure like every other kind.
+A group whose query failed, or whose key expression was refused, is an unevaluated failure like every other kind.
 
 Rocky catches cross-source duplication at two points:
 
 | Layer | Mechanism | Runs | Config |
 |---|---|---|---|
-| Preventive | `on_collision` | `rocky discover`, before a stray catalog is created | `[pipeline.NAME.source.discovery] on_collision` → `collision_candidates` |
+| Preventive | `on_collision` | `rocky discover`, before a stray catalog is created | `[pipeline.NAME.source.discovery] on_collision` -> `collision_candidates` |
 | Detective | `cross_source_overlap` | `rocky run`, after the sibling tables are written | `[pipeline.NAME.checks.cross_source_overlap]` |
 
-The preventive layer needs an adapter that resolves external object ids, such as Fivetran, and inspects connector metadata. The detective layer works on any warehouse, because it queries the written tables. Use both. Use the detective check alone if your sources expose no object ids at discover time. See [discovery configuration](/reference/configuration/#pipelinenamesourcediscovery).
+The preventive layer needs an adapter that resolves external object ids, such as Fivetran. The detective layer works on any warehouse. See [discovery configuration](/reference/configuration/#pipelinenamesourcediscovery).
 
 ## AI-generated tests
 
-`rocky ai-test` generates assertions from a model's intent and schema. See [AI and Intent](/concepts/ai-intent/). Each generated assertion is a SQL query that returns 0 rows when it holds:
-
-```sql
--- test: orders_summary_no_null_customer_id
-SELECT * FROM warehouse.silver.orders_summary WHERE customer_id IS NULL
-```
-
-Generated tests cover not-null keys, grain uniqueness, value ranges, and referential integrity. Rocky saves them to a `tests/` directory.
-
-## Typical loop
-
-1. Write a model and a contract.
-2. Run `rocky test` locally.
-3. Push. CI runs `rocky ci`.
-4. Optionally run `rocky ai-test --save` for more assertions.
+`rocky ai-test` generates assertions from a model's intent and schema, each a SQL query that returns 0 rows when it holds. Rocky saves them to a `tests/` directory. See [AI and Intent](/concepts/ai-intent/).

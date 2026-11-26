@@ -1,6 +1,6 @@
 # ADR-DUCKLAKE — DuckLake as a working store behind the DuckDB adapter
 
-**Status:** Accepted (advisor-ruled 2026-11-12, Hugo to confirm)
+**Status:** Accepted (advisor-ruled 2026-11-12, a maintainer to confirm)
 
 **Scope:** Package L-2 of the open-storage work. A `type = "duckdb"` adapter can attach a DuckLake catalog, and `rocky run` writes models whose target catalog is that attachment. It builds on [`ADR-ICEBERG-DUCKDB.md`](ADR-ICEBERG-DUCKDB.md) (the `[[attach]]` list and the config-carrying dialect) and [`ADR-REPLACE.md`](ADR-REPLACE.md).
 

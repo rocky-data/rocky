@@ -2112,7 +2112,7 @@ export interface TransformationPipelineConfig {
    */
   allow_empty_models?: boolean;
   /**
-   * Data quality checks run after model execution.
+   * Data quality checks. A transformation run does not execute them, and `rocky validate` warns (V034) about each one that is set.
    */
   checks?: ChecksConfig;
   /**
@@ -2721,7 +2721,7 @@ export interface ResilienceConfig {
    */
   circuit_breaker_threshold?: number;
   /**
-   * Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `false` (fail-fast — the run stops at the first failing model, exactly as before this knob existed).
+   * Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `true`. Set `false` to restore fail-fast: the run stops at the first failing model.
    *
    * When `true`, a failed model and its downstream closure are *withheld* (never built on the failure's stale/missing output), while unrelated subtrees still materialize; the run reports `PartialFailure` with a containment manifest naming what failed and its blast radius. This changes no data semantics — everything withheld is already withheld by today's fail-fast run; it only *narrows* the withholding to the actual blast radius. The closure is conservative (computed from the resolved dependency graph, contain-more on any doubt).
    */
@@ -2833,7 +2833,7 @@ export interface RunConfig {
   /**
    * Run each model's sidecar `[[tests]]` against the table the run just built (#2611).
    *
-   * - `"off"` (default): no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `"report"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `"enforce"`: as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.
+   * - `"off"`: no test query runs and the run output is unchanged. `rocky test --declarative` is then the only runner. - `"report"`: after each successful build, and before the model's downstream builds, the model's tests run and their results are recorded on the run (`test_results`). A failing test never fails the model. - `"enforce"` (default): as `report`, and an error-severity test that fails, or whose query cannot run, fails the model. Downstream models do not build, exactly as for a failed build. The table the model wrote stays in place: nothing is rolled back.
    *
    * A `severity = "warning"` test is reported in every mode and never fails a model. `rocky run --tests <off|report|enforce>` overrides this key for one invocation.
    */

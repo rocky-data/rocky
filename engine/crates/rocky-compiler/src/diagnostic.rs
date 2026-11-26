@@ -210,7 +210,9 @@ pub const E044: &str = "E044";
 /// warehouse with a list gets the
 /// warning [`W057`] instead. Schema-qualified calls (`main.my_macro(x)`) and quoted names are
 /// not checked, nor is a model whose SQL `[portability] target_dialect` says
-/// was written for another warehouse.
+/// was written for another warehouse. On DuckDB, a name the project's
+/// `data/seed.sql` creates as a function or macro is not checked either
+/// (#2691).
 pub const E057: &str = "E057";
 /// The models form a dependency cycle: a model reads, directly or through
 /// other models, a model that depends on it (for example `fct_orders` reads
@@ -280,6 +282,20 @@ pub const E066: &str = "E066";
 /// select list has a known length. Emitted by `rocky compile` from
 /// [`crate::clause_placement`].
 pub const E067: &str = "E067";
+/// A call to a DuckDB built-in with a number of arguments no overload of it
+/// takes, as in `lower(name, 'x')` (#2690). DuckDB refuses the statement at
+/// bind time. Emitted by `rocky compile` from [`crate::function_check`] when
+/// the model runs on DuckDB; the counts come from
+/// [`crate::duckdb_signatures`], generated from the bundled engine. It is an
+/// error only for a call in a place on the bound list of
+/// [`crate::set_operation`], the list [`E071`] uses; anywhere else it is
+/// [`W068`].
+pub const E068: &str = "E068";
+/// The warning form of [`E068`], for a call in a place DuckDB may skip: a CTE
+/// body, a named `WINDOW`, an argument of another call (a macro drops an
+/// argument its body does not use), or any place not on the bound list of
+/// [`crate::set_operation`]. It never fails a compile on its own.
+pub const W068: &str = "W068";
 /// The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different
 /// numbers of columns (#2661). SQL requires the same number in every branch,
 /// so it is checked whatever the warehouse. Emitted by
@@ -746,7 +762,7 @@ pub const W058: &str = "W058";
 /// A unit test checks this list against the constants in this file.
 pub const WARNING_CODES: &[&str] = &[
     W001, W002, W004, W005, W006, W010, W011, W012, W013, W014, W030, W031, W041, W042, W043, W044,
-    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W071, P002,
+    W045, W046, W048, W049, W050, W051, W052, W053, W056, W057, W068, W071, P002,
 ];
 
 /// Warning codes other commands emit, never `rocky compile`, so

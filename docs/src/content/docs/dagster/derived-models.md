@@ -81,8 +81,7 @@ dim_products.toml         merge            →  rocky_models_unpartitioned
                                               (no partition definition)
 ```
 
-Four models produce three multi-assets. Each takes its name from its partition
-shape, so the three coexist without a name collision.
+Four models produce three multi-assets, each named from its partition shape.
 
 ## Materialization
 
@@ -126,37 +125,11 @@ across several `RockyComponent` instances with different `models_dir` values.
 
 ## Standalone helpers
 
-Three pure-function builders are exported. Use them when you hand-roll your own
-multi-assets and want the same logic without `RockyComponent`:
-
-```python
-from dagster_rocky import (
-    build_model_specs,
-    split_model_specs_by_partition_shape,
-    RockyDagsterTranslator,
-    RockyResource,
-)
-
-rocky = RockyResource(config_path="rocky.toml", models_dir="models")
-compile_result = rocky.compile()
-
-# Build per-model AssetSpec
-specs = build_model_specs(
-    compile_result,
-    translator=RockyDagsterTranslator(),
-)
-
-# Group by partition shape
-groups = split_model_specs_by_partition_shape(specs)
-for group in groups:
-    print(f"{group.shape_key}: {len(group.specs)} specs, partition={group.partitions_def}")
-```
+Three pure-function builders are exported for hand-rolled multi-assets: `build_model_specs(compile_result, translator=RockyDagsterTranslator())` builds the per-model `AssetSpec` list from `rocky.compile()`, and `split_model_specs_by_partition_shape(specs)` groups them (each group has `shape_key`, `specs` and `partitions_def`). `RockyDagsterTranslator` is the third.
 
 ## Customizing the translator
 
-Override the `RockyDagsterTranslator.get_model_*` methods to control asset key
-derivation, group naming, tags, and metadata. The defaults are reasonable, but
-most teams want to namespace asset keys differently:
+Override the `RockyDagsterTranslator.get_model_*` methods (see [Customize with a translator](/dagster/assets/#customize-with-a-translator)) to change asset keys, groups, tags, and metadata:
 
 ```python
 from dagster_rocky import RockyDagsterTranslator
@@ -174,14 +147,4 @@ class MyTranslator(RockyDagsterTranslator):
         ])
 ```
 
-Wire the translator into `RockyComponent` with the `translator_class` attribute
-in `defs.yaml`:
-
-```yaml
-# defs.yaml
-type: dagster_rocky.RockyComponent
-attributes:
-  config_path: rocky.toml
-  translator_class: my_module.MyTranslator
-  surface_derived_models: true
-```
+Wire it into `RockyComponent` with `translator_class: my_module.MyTranslator` in `defs.yaml`.

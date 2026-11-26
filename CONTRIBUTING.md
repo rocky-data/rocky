@@ -14,13 +14,9 @@ Rocky is a monorepo. Every subproject shares one repository, one issue tracker, 
 
 ## Share a first attempt
 
-You can contribute without writing code.
-Use the [first-run feedback form](https://github.com/rocky-data/rocky/issues/new?template=first_run_feedback.yml) to describe a completed workflow or where you stopped.
-Include your goal, Rocky version, installation method, and the step that helped or blocked you.
-A feature proposal is optional. A small example with synthetic data is enough.
+You can contribute without code. Use the [first-run feedback form](https://github.com/rocky-data/rocky/issues/new?template=first_run_feedback.yml) to describe a completed workflow or where you stopped. Include your goal, Rocky version, installation method, and the step that helped or blocked you. A small example with synthetic data is enough.
 
-The form creates a public issue only when you submit it. Remove credentials, private data, and internal addresses before posting.
-Use [private security reporting](https://github.com/rocky-data/rocky/security/advisories/new) for vulnerabilities.
+The form creates a public issue only when you submit it. Remove credentials, private data, and internal addresses first. Use [private security reporting](https://github.com/rocky-data/rocky/security/advisories/new) for vulnerabilities.
 
 ## Getting started
 
@@ -40,21 +36,26 @@ just lint        # cargo clippy/fmt + ruff + eslint (vscode and UI)
 just --list      # every recipe
 ```
 
-Three gaps to know about. `just build` does not build the browser UI; `just build-engine-ui` builds it and embeds it in a release binary. `just test` runs the VS Code unit tests only; the electron suite has its own recipe, `just test-vscode-electron`. `just build` compiles the extension but does not bundle it, so it does not produce the `dist/extension.js` that debugging needs.
+Three gaps:
+
+- `just build` does not build the browser UI. `just build-engine-ui` builds it and embeds it in a release binary.
+- `just test` runs the VS Code unit tests only. The electron suite is `just test-vscode-electron`.
+- `just build` compiles the extension but does not bundle it, so it does not produce the `dist/extension.js` that debugging needs.
 
 You can also build one subproject directly. The sections below give the commands.
 
-Optional: run `just install-hooks` to point `core.hooksPath` at `.git-hooks/`. Every hook check is conditional. A check runs only when the change touches the subproject it covers.
+### Git hooks (optional)
 
-`post-checkout` is a warning, not a check: `git checkout <branch>` does not stop for a dirty worktree — it carries non-conflicting changes across, and they end up committed on whichever branch you landed on. git has no pre-checkout hook, so the switch cannot be refused; the hook makes the carry loud instead of silent.
-
-To start a branch, `scripts/new-branch.sh <name> [base]` refuses on a dirty tree and defaults the base to a freshly-fetched `origin/main`. Branching from whatever happened to be checked out is the other half of the same problem: the new branch inherits the current one's commits, so it conflicts when that branch merges — and a squash-merge of the child can land the parent's work, including its `Closes #NNN` trailers, under the child's number.
+Run `just install-hooks` to point `core.hooksPath` at `.git-hooks/`. A check runs only when the change touches the subproject it covers.
 
 - **pre-commit:** `cargo fmt --check` for `engine/`, `ruff format --check` for `integrations/dagster/`, eslint for `editors/vscode/`.
 - **pre-commit, codegen drift:** runs only when you stage `output.rs`, `commands/doctor.rs`, or `commands/export_schemas.rs` under `engine/crates/rocky-cli/src/`.
 - **pre-push:** `cargo clippy` for `engine/`, `ruff check` for `integrations/dagster/`.
+- **post-checkout:** a warning only. `git checkout <branch>` carries a dirty worktree across, and the changes end up committed on the branch you landed on. git has no pre-checkout hook, so the hook makes the carry loud.
 
-Neither hook checks `sdk/python/`, and neither lints `engine/ui/`. A check also skips silently when its tool is not installed, so a missing `uv` turns the ruff check into a pass. The drift check compares fewer paths than `codegen-drift.yml` does, so a commit can pass the hook and still fail CI. Treat the hooks as a fast first pass, not as the gate. Set `ROCKY_SKIP_HOOKS=1` to skip every hook, or `ROCKY_SKIP_CODEGEN_HOOK=1` to skip the drift check alone.
+Neither hook checks `sdk/python/` or lints `engine/ui/`. A check skips silently when its tool is missing, so no `uv` turns the ruff check into a pass. The drift check compares fewer paths than `codegen-drift.yml`, so a commit can pass the hook and still fail CI. Treat the hooks as a fast first pass, not the gate. `ROCKY_SKIP_HOOKS=1` skips every hook. `ROCKY_SKIP_CODEGEN_HOOK=1` skips the drift check alone.
+
+To start a branch, run `scripts/new-branch.sh <name> [base]`. It refuses on a dirty tree and defaults the base to a freshly fetched `origin/main`. A branch cut from another feature branch inherits its commits, and a squash-merge can land the parent's work, including its `Closes #NNN` trailers, under the child's number.
 
 ### Engine (`engine/`)
 
@@ -131,11 +132,11 @@ npm run build    # the same build CI runs
 
 ### POC catalog (`examples/playground/`)
 
-A catalog of small POCs, one per Rocky feature. Each POC is a complete project you can run through `./run.sh`, and most need only DuckDB and no credentials. The weekly `poc-smoke` job builds a fresh binary and runs the credential-free POCs against it. It skips any POC that needs credentials, Docker, or a Rust toolchain. A second step parse-checks the credential-gated POCs, but that step is `continue-on-error`, so it cannot fail the job. `just regen-fixtures` captures the Dagster test fixtures from specific POCs here. The catalog has no build step.
+A catalog of small POCs, one per Rocky feature. Each POC is a complete project you run with `./run.sh`. Most need only DuckDB. The weekly `poc-smoke` job runs the credential-free POCs against a fresh binary. It skips any POC that needs credentials, Docker, or a Rust toolchain. A second step parse-checks the credential-gated POCs, but it is `continue-on-error` and cannot fail the job. `just regen-fixtures` captures the Dagster test fixtures from specific POCs here. The catalog has no build step.
 
 ## Cross-project changes
 
-A change to the engine's CLI JSON output, or to the DSL, reaches every consumer. The monorepo lets you land all of it in one pull request.
+A change to the CLI JSON output, or to the DSL, reaches every consumer. Land it in one pull request.
 
 **When you change CLI JSON output**, edit the typed `*Output` struct in `engine/crates/rocky-cli/src/output.rs`. The doctor types live in `engine/crates/rocky-cli/src/commands/doctor.rs`. Then run `just codegen` from the repo root.
 
@@ -161,7 +162,7 @@ The OpenAPI document comes straight from the engine's schema registry and its ro
 
 Commit everything the cascade writes, `schemas/` included, in the same PR as the Rust change. `codegen-drift.yml` re-runs `just codegen` and `just regen-fixtures` on your PR, then fails it on any diff. Use `just codegen-all` locally when your change also alters the shape of command output; it bundles both steps.
 
-Three shims keep older imports working: `dagster_rocky.types` and `dagster_rocky.types_generated` re-export the Pydantic models from `rocky_sdk`, and `editors/vscode/src/types/rockyJson.ts` re-exports the generated TypeScript under its earlier names.
+Three shims keep older imports working: `dagster_rocky.types` and `dagster_rocky.types_generated` re-export the models from `rocky_sdk`, and `editors/vscode/src/types/rockyJson.ts` re-exports the generated TypeScript.
 
 **When you change Rocky DSL syntax** (`.rocky` files), update all five in lockstep:
 
@@ -173,25 +174,7 @@ Three shims keep older imports working: `dagster_rocky.types` and `dagster_rocky
 
 ## Releases
 
-Each artifact ships on its own tag prefix. Releases are CI-driven: you land a release PR, then push a tag, and the matching workflow does the rest.
-
-```
-  1. release PR        version bump + CHANGELOG entry
-        │
-        │ merge
-        ▼
-  2. commit on main    the commit you will tag
-        │
-        │ tag it <prefix>-v<x.y.z>, then push the tag
-        ▼
-  3. release workflow  builds every artifact for that prefix
-        │
-        │ publish
-        ▼
-  4. GitHub Release, plus PyPI or the Marketplace for three of them
-```
-
-Tag the merge commit, then push the tag. Take the version from the release PR. Git refuses a tag that already exists, so a stale version number fails loudly rather than silently.
+Releases are CI-driven. Land a release PR (version bump + CHANGELOG entry), tag the merge commit `<prefix>-v<x.y.z>`, and push the tag. The matching workflow builds, creates a GitHub Release and publishes. Git refuses a tag that exists, so a stale version fails loudly.
 
 ```bash
 git tag -a engine-v0.2.0 -m "Release engine-v0.2.0"
@@ -205,19 +188,13 @@ git push origin engine-v0.2.0
 | `dagster-rocky` wheel | `dagster-v*` | `dagster-release.yml` | PyPI, via OIDC |
 | Rocky VSIX | `vscode-v*` | `vscode-release.yml` | VS Code Marketplace |
 
-Each of these four workflows creates a GitHub Release and attaches what it built. Three of them also publish to a package registry.
+- The engine matrix builds five targets: macOS ARM64, macOS Intel, Linux x86_64, Linux ARM64, Windows x86_64. Each gets a `rocky` and a `rocky-lsp` archive.
+- When a `dagster-v*` release raises its `rocky-sdk` floor, push the `sdk-v*` tag first. The published dagster wheel resolves the SDK from PyPI, not the path source.
+- `engine-wasm-release.yml` builds the compiler to WebAssembly on an `engine-wasm-v*` tag. Nothing has shipped from it: `@rocky-data/compiler` is not on npm, and the publish step exits early without an `NPM_TOKEN` secret. Treat it as unreleased.
+- `scripts/release.sh engine|sdk|dagster|vscode <version>` is a local fallback for a hotfix when CI is down. Run the engine path on an Apple Silicon Mac: it packages the host build as the macOS ARM64 archive without checking the architecture, and builds Linux x86_64 in Docker.
+- Recipes that wrap it: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`. Without `--publish`, the GitHub Release stays a draft and nothing reaches PyPI or the Marketplace; the tag push's CI run publishes it. The engine has no `--publish`: it ships to GitHub Releases only.
 
-A fifth workflow, `engine-wasm-release.yml`, builds the compiler pipeline to WebAssembly on an `engine-wasm-v*` tag. Nothing has shipped from it. `@rocky-data/compiler` is not in the npm registry. The one `engine-wasm-v*` tag has no GitHub Release. The publish step exits early, because the repository has no `NPM_TOKEN` secret. Treat the WebAssembly package as unreleased.
-
-The engine matrix builds five targets: macOS ARM64, macOS Intel, Linux x86_64, Linux ARM64, and Windows x86_64. It attaches a `rocky` archive and a `rocky-lsp` archive for each one.
-
-`dagster-rocky` depends on `rocky-sdk`. When a `dagster-v*` release raises its `rocky-sdk` floor, push the `sdk-v*` tag first. The published dagster wheel resolves the SDK from PyPI, not from the path source in this repository.
-
-`scripts/release.sh engine|sdk|dagster|vscode <version>` is a local-build fallback for a hotfix when CI is unavailable. Run the engine path on an Apple Silicon Mac. It packages the native host build as the macOS ARM64 archive without checking the host architecture, and builds Linux x86_64 in Docker.
-
-Four `just` recipes wrap that same script: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`. Without `--publish`, the sdk, dagster, and vscode paths build the artifact and create the GitHub Release as a draft, but never reach PyPI or the Marketplace; the tag push's CI run publishes the draft after its own registry upload. `just release-engine` takes no `--publish`, because the engine publishes to GitHub Releases only.
-
-Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirrored at `.agents/skills/rocky-release/` and `.claude/skills/rocky-release/`, walks the full checklist.
+Prefer the tag-driven flow. The `rocky-release` skill (`.agents/skills/rocky-release/`) has the full checklist. For live-warehouse checks, see [`RELEASE_SMOKE.md`](RELEASE_SMOKE.md).
 
 ## Pull requests
 
@@ -226,7 +203,7 @@ Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirr
 - Conventional commits required: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`. Scope by subproject or crate where it helps: `feat(engine/rocky-databricks): add OAuth M2M auth`, `fix(dagster): handle partial-success exit codes`, `docs(vscode): update README screenshots`.
 - **Never** include `Co-Authored-By` trailers in commit messages.
 
-If this is your first pull request from a fork, GitHub holds its CI workflow runs until a maintainer approves them. Required checks may be missing while the runs wait. You do not need to approve anything. A maintainer will approve the held runs. If you push another commit, the new runs need approval too.
+On a first pull request from a fork, GitHub holds the CI runs until a maintainer approves them. Required checks may be missing meanwhile. Each new push needs approval again. You do nothing.
 
 ### What CI runs
 
@@ -247,36 +224,37 @@ CI is path-filtered. The paths your PR touches decide which workflows run. Every
 | `engine/evals/**` or `engine/crates/rocky-mcp/**` | `engine-evals.yml` | the eval harness self-test and the structured-error contract |
 | the recipe-manifest surface (`rocky-verify`, `recipe_identity.rs`, `history.rs`, `examples/audit-sample/**`) | `manifest-conformance.yml` | builds `rocky` and `rocky-verify`, then runs the conformance script |
 
-The table covers the common cases, not every path. Each workflow in `.github/workflows/` holds its own exact `paths:` list. Read it there when you need certainty.
+The table covers the common cases. Each workflow in `.github/workflows/` holds its exact `paths:` list. Most PRs trigger several workflows:
 
-Expect more than one workflow on most PRs. Any `engine/**` change triggers at least `engine-ci.yml` and `codegen-drift.yml`, and a narrower engine path can add more. `schemas/**` triggers `engine-ci.yml`, `sdk-ci.yml`, `dagster-ci.yml`, and `vscode-ci.yml`, plus `codegen-drift.yml`. `sdk/python/**` also triggers `dagster-ci.yml`, because the Dagster integration depends on the SDK. The credential-containment policy checks run on every PR, whatever it touches.
+- `engine/**` triggers at least `engine-ci.yml` and `codegen-drift.yml`.
+- `schemas/**` triggers `engine-ci.yml`, `sdk-ci.yml`, `dagster-ci.yml`, `vscode-ci.yml` and `codegen-drift.yml`.
+- `sdk/python/**` also triggers `dagster-ci.yml`, because Dagster depends on the SDK.
+- The credential-containment policy checks run on every PR.
 
 Benchmarks run only on a PR labelled `perf` (`engine-bench.yml`). Coverage, the dependency audit, and a POC smoke run happen weekly (`engine-weekly.yml`).
 
 ### Maintainer: approve CI for a first-time fork contributor
 
-Check a first-time fork contributor's pull request for held workflow runs. Match each run to the pull request and current head commit before approving it. Run these commands for each held run:
+Match each held run to the pull request and current head commit before you approve it. Approve again after each push.
 
 ```bash
 gh api 'repos/rocky-data/rocky/actions/runs?status=action_required'
 gh api --method POST repos/rocky-data/rocky/actions/runs/<id>/approve
 ```
 
-Approve new held runs after each push. A fork does not add a separate approving-review requirement. The ruleset's extra approval for unattributed Copilot pull requests is a different rule.
+A fork adds no separate approving-review requirement. The ruleset's extra approval for unattributed Copilot pull requests is a different rule.
 
 ### Merge strategy
 
-GitHub offers a merge-strategy dropdown on the merge button. This repository allows squash and rebase, and disables merge commits. Squash is the default. Choose deliberately, because the right choice depends on the PR's shape.
+The repository allows squash and rebase, and disables merge commits. Squash is the default.
 
 | PR shape | Strategy | Why |
 |---|---|---|
-| Single commit | **Squash** | Mechanically equivalent to rebase for a single-commit PR; you get the `(#N)` suffix on `main` for PR traceability |
-| Docs, chore, tooling, small fixes | **Squash** | No `git bisect` value from intra-PR granularity; one atomic revert point is easier |
-| Multi-commit feature crossing subprojects (DSL cascade, new adapter, new CLI command) | **Rebase** | Preserves per-subproject conventional-commit scopes in `git log` (e.g. `feat(engine/rocky-lang):` → `feat(engine/rocky-compiler):` → `feat(vscode):`) so `git log --grep` by crate still works |
-| Refactor series where intermediate states build meaningfully | **Rebase** | Preserves the step-by-step narrative and keeps `git bisect` granular for debugging future regressions |
-| WIP-heavy branches with "fix typo" / "oops" commits | **Squash** (or clean up via interactive rebase before opening the PR) | Collapses noise into one coherent commit |
+| Single commit; docs, chore, tooling, small fixes; WIP-heavy branches | **Squash** | One atomic revert point and the `(#N)` suffix on `main`. For WIP noise, you can also clean up with an interactive rebase first. |
+| Multi-commit feature crossing subprojects (DSL cascade, new adapter, new CLI command) | **Rebase** | Keeps per-subproject scopes in `git log` (`feat(engine/rocky-lang):`, `feat(vscode):`), so `git log --grep` by crate works |
+| Refactor series where intermediate states build | **Rebase** | Keeps the step-by-step narrative and `git bisect` granular |
 
-**Heuristic:** rebase when every commit carries a distinct, meaningful conventional-commit scope. Squashing would collapse those scopes into one commit, and `git log --grep` by crate would stop finding them. Otherwise squash.
+Rebase when every commit carries a distinct, meaningful scope. Otherwise squash.
 
 ## Code style
 

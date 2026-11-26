@@ -5,60 +5,34 @@ sidebar:
   order: 16
 ---
 
-Rocky's AI commands call Claude to generate models, describe existing models,
-propagate schema changes, and write test assertions. `rocky ai` validates a
-candidate against the project context it has, then writes generated files. Treat
-those files as a draft. Review them and run relevant checks before execution.
+Rocky's AI commands call Claude to generate models, describe existing models, propagate schema changes, and write test assertions. Treat generated files as a draft. Review them and run relevant checks before execution. Flags and JSON output: [AI Commands](/reference/commands/ai/). The mechanism: [AI and Intent](/concepts/ai-intent/).
 
 ## 1. Setup
-
-The AI commands need an Anthropic API key. Set it in your environment:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Add it to your shell profile (`~/.zshrc`, `~/.bashrc`) so it survives a new terminal:
+Add it to your shell profile to keep it. Rocky uses `claude-sonnet-4-6` by default. Nothing else needs configuring.
 
-```bash
-echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
-source ~/.zshrc
-```
-
-Rocky uses `claude-sonnet-4-6` by default. Nothing else needs configuring.
-
-### Token budget (optional)
-
-Each AI command runs the compile-verify loop for up to 3 attempts. Rocky caps the output tokens across those attempts, so a runaway response cannot run up your bill. The default budget is `4096`. Raise it in `rocky.toml` if your project needs more:
+Each command runs the compile-verify loop for up to 3 attempts and caps output tokens across them. The default budget is `4096`. Raise it in `rocky.toml`:
 
 ```toml
 [ai]
 max_tokens = 8192
 ```
 
-`max_tokens` is also the per-request cap Rocky sends to the Anthropic Messages API. When a command exceeds the cumulative budget, it stops with a `TokenBudgetExceeded` error instead of paying for another retry. See [`[ai]`](/reference/configuration/#ai) in the configuration reference.
+`max_tokens` is also the per-request cap sent to the Anthropic Messages API. A command that exceeds the cumulative budget stops with a `TokenBudgetExceeded` error. See [`[ai]`](/reference/configuration/#ai).
 
-### Verify the setup
+Verify the setup with `rocky ai "hello world model that selects 1 as id"`. Without a key you see `Error: ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.`
 
-```bash
-rocky ai "hello world model that selects 1 as id"
-```
+## 2. Generate a model from intent
 
-If the API key is missing or invalid, you will see:
-
-```
-Error: ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.
-```
-
-## 2. Generate a Model from Intent
-
-An **intent** is a plain-English description of what a model does. Give `rocky ai` one and it **writes both the model body and a matching `.toml` sidecar into the models directory**. The sidecar carries the materialization strategy and the target coordinates, so Rocky's loader picks the model up on the next `rocky apply`. You edit nothing by hand.
+An **intent** is a plain-English description of what a model does. `rocky ai` writes the model body and a matching `.toml` sidecar into the models directory, so the next `rocky apply` loads it.
 
 ```bash
 rocky ai "monthly revenue by product category from orders and products, completed orders only"
 ```
-
-Output:
 
 ```
 Generated model: monthly_category_revenue (rocky)
@@ -67,31 +41,11 @@ Wrote: models/monthly_category_revenue.rocky
 Wrote: models/monthly_category_revenue.toml
 ```
 
-The sidecar defaults to `[strategy] type = "full_refresh"` and `[target] = generated.ai.<model_name>`. Override either one with the flags below.
-
-### Choose the output format
-
-Rocky generates Rocky DSL by default. Pass `--format sql` for standard SQL. Either way you get a body file and a `.toml` sidecar:
-
-```bash
-rocky ai "monthly revenue by product category" --format sql
-```
-
-```sql
-SELECT
-    DATE_TRUNC('month', o.order_date) AS month,
-    p.category,
-    SUM(o.quantity * o.unit_price) AS total_revenue,
-    COUNT(*) AS order_count
-FROM orders o
-JOIN products p ON o.product_id = p.product_id
-WHERE o.status = 'completed'
-GROUP BY DATE_TRUNC('month', o.order_date), p.category
-```
+The sidecar defaults to `[strategy] type = "full_refresh"` and `[target] = generated.ai.<model_name>`. The output is Rocky DSL. Pass `--format sql` for standard SQL.
 
 ### Pick a materialization + target
 
-`--materialization` takes `full_refresh` (the default) or `merge`. `incremental` and `ephemeral` fail before any LLM call. `incremental` is `E037`; `ephemeral` builds nothing until another model reads it. Pair `merge` with `--unique-key`, the columns that identify a row. Add `--target` to land the output in a real catalog and schema instead of the `generated.ai.*` default:
+`--materialization` takes `full_refresh` (default) or `merge`. Pair `merge` with `--unique-key`. Add `--target` to land the output in a real catalog and schema. `--overwrite` replaces an existing body or sidecar. The rules for `incremental` (`E037`) and `ephemeral` are in the [flag table](/reference/commands/ai/#rocky-ai).
 
 ```bash
 rocky ai "daily order facts from stg_orders" \
@@ -99,7 +53,7 @@ rocky ai "daily order facts from stg_orders" \
   --target analytics.marts.fct_orders_daily
 ```
 
-The sidecar (`models/fct_orders_daily.toml`) then carries the materialization, the key, and the target:
+The sidecar (`models/fct_orders_daily.toml`) then carries:
 
 ```toml
 name = "fct_orders_daily"
@@ -114,94 +68,36 @@ schema = "marts"
 table = "fct_orders_daily"
 ```
 
-Pass `--overwrite` to replace a body or sidecar that already exists at the destination. Without that flag the command fails instead of overwriting a model you wrote yourself. See [`rocky ai`](/reference/commands/ai/#rocky-ai) for the full flag table, including the v1 `--materialization merge` limitation.
+Pass `-o json` for the machine-readable result.
 
-### JSON output
+## 3. Grounding and validation
 
-For programmatic use:
-
-```bash
-rocky ai "monthly revenue by category" -o json
-```
-
-```json
-{
-  "version": "1.30.0",
-  "command": "ai",
-  "intent": "monthly revenue by category",
-  "format": "rocky",
-  "name": "monthly_category_revenue",
-  "source": "from orders\njoin products on ...",
-  "attempts": 1,
-  "body_path": "models/monthly_category_revenue.rocky",
-  "sidecar_path": "models/monthly_category_revenue.toml"
-}
-```
-
-## 3. Schema-Grounded Prompts
-
-`rocky ai` tries to compile your project before it sends your intent to the LLM.
-When that compile succeeds, it puts typed schemas in the prompt. This can give
-the model useful column names, types, and graph context. It does not guarantee
-that generated SQL references real columns or returns correct values.
-
-```bash
-rocky ai "monthly revenue by category" --models models
-```
-
-`--models <PATH>` names the directory to compile for this grounding step. It defaults to `models`. If that directory is missing or fails to compile, `rocky ai` falls back to generation without schemas rather than refusing.
-
-A second validation step can type-check candidate SQL against the compiled
-project graph. Its errors become retry feedback. A candidate that introduces no
-new validation error is written. Absent context or unresolved inference can let
-a candidate meet that condition.
-
-The type checker is lenient about unresolved columns. A missing reference or
-unsupported inference can produce `Unknown`, which can suppress type-based
-findings. `I002` reports only a partially unknown output schema. An entirely
-unknown output need not emit `I002`.
-
-## 4. Candidate validation and review
-
-Candidate validation gives the model feedback about some structural problems. It
-does not make AI-generated code safe to accept on its own:
+`rocky ai` compiles the project in `--models` (default `models`) before it sends your intent. When that succeeds, the prompt carries typed schemas: column names, types and graph context. If the directory is missing or fails to compile, `rocky ai` generates without schemas.
 
 ```
    your intent
         │
         ▼
-  ┌─────────────────┐   candidate    ┌───────────────────┐
-  │ LLM writes      │───  model  ───►│ Rocky validator   │
-  │ the model       │                │ checks available  │
-  └─────────────────┘                │ project context   │
-                                     └─────────┬─────────┘
-        ▲                                      │
-        │ errors become retry feedback         │ no new error
-        └──────────────  error  ───────────────┤
-           (up to 3 attempts)                  ▼
-       exhausted: refuse, no files      files written for review
+  ┌─────────────┐  candidate  ┌────────────────────┐
+  │ LLM writes  │────────────►│ Rocky validator    │
+  │ the model   │             │ (project context)  │
+  └─────────────┘             └─────────┬──────────┘
+        ▲        errors = feedback      │ no new error
+        └──────── (up to 3 attempts) ◄──┤
+        exhausted: refuse, no files     ▼
+                                files written for review
 ```
 
-The validator can report syntax errors, type mismatches, and some resolvable
-references. It does not establish that a warehouse supports every function or
-that the SQL returns the intended values. A candidate can still contain
-unresolved types or a plausible wrong-result query.
+Validation does not make generated code safe to accept:
 
-If all three attempts introduce validation errors, Rocky refuses and writes no
-generated files. Generating a model does not execute warehouse SQL. Review the
-files, run the relevant tests, and use `rocky plan` and `rocky apply` for
-controlled execution.
+- The type checker is lenient about unresolved columns. A missing reference can produce `Unknown`, which suppresses type-based findings. `I002` reports only a partially unknown output schema.
+- It does not establish that your warehouse supports every function, or that the SQL returns the intended values.
 
-## 5. Add Intent to Existing Models
+Generating a model executes no warehouse SQL. If all three attempts fail, Rocky refuses and writes no files. Review the files, run the tests, then use `rocky plan` and `rocky apply`.
 
-Intent is a plain-English description stored in the model's TOML config. It does two jobs:
+## 4. Add intent to existing models
 
-1. **Documentation**: it says what the model does in business terms
-2. **AI context**: `ai-sync` and `ai-test` read it to understand the model's purpose
-
-### Write intent manually
-
-Add an `intent` field to any model's TOML config:
+Intent is a plain-English description stored in the model's TOML config. `ai-sync` and `ai-test` read it as context.
 
 ```toml
 name = "fct_daily_revenue"
@@ -222,54 +118,33 @@ schema = "warehouse"
 table = "fct_daily_revenue"
 ```
 
-### Generate intent with AI
-
-Rocky can read the SQL and write the intent for you:
+`rocky ai-explain` writes the intent for you:
 
 ```bash
-# Explain a single model
-rocky ai-explain fct_daily_revenue --save
+rocky ai-explain fct_daily_revenue --save      # one model
+rocky ai-explain --all --save --models models  # every model with no intent yet
+rocky ai-explain --all --models models         # review only, change no file
 ```
 
-```
-Saved intent for fct_daily_revenue: Calculate daily revenue aggregated by product
-category. Joins staging orders with product dimension on product_id. Filters to
-completed orders only. Revenue computed as quantity * unit_price * (1 - discount).
-Grain: one row per order_date per category.
-```
+`--save` writes each description into the `.toml` sidecar. Models that already have an `intent` are skipped. Read and correct generated intent before you save it.
 
-### Bulk-generate intent for all models
+A good intent helps `ai-sync` and `ai-test`. Write it for a colleague who has not seen the model:
+
+- **State the grain:** `Grain: one row per customer per month`.
+- **Define key columns** by business meaning.
+- **Say why you filter:** `Filter to completed orders only because revenue counts fulfilled transactions`.
+- **Give the formula** for each calculated column.
+- **Name the source models** you join.
+
+`intent = "Revenue model."` is too vague: `ai-sync` cannot propose a sound update from it.
+
+## 5. Schema change sync
+
+When an upstream model renames a column, changes a type or adds a column, `rocky ai-sync` proposes matching edits to the downstream models that carry intent. How it works: [AI and Intent](/concepts/ai-intent/#rocky-ai-sync).
 
 ```bash
-rocky ai-explain --all --save --models models
-```
-
-This runs over every model that has no `intent` field yet, and skips the models that have one. `--save` writes each generated description into that model's `.toml` sidecar.
-
-### Review without saving
-
-Omit `--save` to see the generated intent without changing any file:
-
-```bash
-rocky ai-explain --all --models models
-```
-
-```
-fct_daily_revenue: Calculate daily revenue aggregated by product category...
-dim_customers: Customer dimension with lifetime value and segment classification...
-stg_orders: Stage raw Shopify orders selecting order_id, customer, date, amount...
-```
-
-Read the descriptions and correct them before you save. Treat the generated intent as a first draft. You know the business domain and the LLM does not.
-
-## 6. Schema Change Sync
-
-When an upstream model renames a column, changes a type, or adds a column, `rocky ai-sync` proposes matching edits to the models downstream. It works from each downstream model's stored intent.
-
-### Preview proposals (dry run)
-
-```bash
-rocky ai-sync --models models
+rocky ai-sync --models models           # dry run
+rocky ai-sync --models models --apply   # write the proposals
 ```
 
 ```
@@ -281,88 +156,16 @@ Model: fct_daily_revenue (intent: "Calculate daily revenue by product category..
 Run with --apply to update models.
 ```
 
-### Apply proposals
+Filter with `--model <name>`. Pass `--with-intent` to process only models that have intent. Rocky skips a model with no intent, because the LLM would have no context.
+
+## 6. Generate test assertions
 
 ```bash
-rocky ai-sync --models models --apply
+rocky ai-test fct_daily_revenue          # print
+rocky ai-test --all --save --models models   # write to tests/
 ```
 
-```
-Updated: models/fct_daily_revenue.sql
-Updated: models/fct_monthly_summary.sql
-```
-
-### Filter to a specific model
-
-```bash
-rocky ai-sync --models models --model fct_daily_revenue
-```
-
-### Only process models with intent
-
-```bash
-rocky ai-sync --models models --with-intent
-```
-
-Rocky skips a model with no intent, because the LLM would have no context for a proposal.
-
-### How sync works
-
-1. Rocky compiles the project and builds the semantic graph
-2. For each model with intent, Rocky finds the upstream schema changes: renamed columns, changed types, new columns
-3. Rocky sends the LLM the model's SQL, its intent, and those upstream changes
-4. The LLM proposes the smallest diff that keeps the model's intent and adapts to the change
-5. Rocky compiles the proposed code
-6. With `--apply`, Rocky writes the updated SQL back to the file
-
-### Example scenario
-
-An upstream model `stg_orders` renames `unit_price` to `unit_price_local`. A
-downstream reference can become unresolved. When the compiler can resolve that
-reference, it reports a diagnostic. `rocky ai-sync --models models` can use the
-recorded schema change to propose a small diff:
-
-```diff
---- models/fct_daily_revenue.sql
-+++ models/fct_daily_revenue.sql
-@@ -4,7 +4,7 @@
- SELECT
-     o.order_date,
-     p.category,
--    SUM(o.quantity * o.unit_price * (1 - o.discount)) as revenue,
-+    SUM(o.quantity * o.unit_price_local * (1 - o.discount)) as revenue,
-     COUNT(*) as order_count
- FROM stg_orders o
-```
-
-Read the diff, apply it with `--apply`, and `rocky compile` passes again.
-
-## 7. Generate Test Assertions
-
-`rocky ai-test` writes test assertions from a model's SQL and its intent:
-
-```bash
-rocky ai-test fct_daily_revenue
-```
-
-```
-Tests for fct_daily_revenue:
-  - grain_uniqueness: No duplicate rows per date and category
-  - revenue_positive: Revenue should be non-negative for completed orders
-  - no_future_dates: Order dates should not be in the future
-```
-
-### Save tests to disk
-
-```bash
-rocky ai-test fct_daily_revenue --save
-```
-
-```
-Saved 3 tests for fct_daily_revenue
-```
-
-Rocky saves each test to the `tests/` directory, a sibling of your models directory. Each one is a flat SQL file named `<model>_<assertion>.sql`, and it returns 0 rows when the assertion holds:
+`--save` writes each assertion to `tests/`, a sibling of your models directory, as a flat `<model>_<assertion>.sql` file that returns 0 rows when the assertion holds.
 
 ```sql
 -- Test: grain_uniqueness
@@ -373,109 +176,10 @@ GROUP BY order_date, category
 HAVING n > 1
 ```
 
-### Generate tests for all models
-
-```bash
-rocky ai-test --all --save --models models
-```
-
 ### Run the generated tests
 
-Each generated file is a standalone SQL assertion that returns 0 rows when it passes. `rocky test` and `rocky ci` do **not** pick these files up. `rocky test` executes your models on DuckDB and runs the `[[tests]]` declared in model TOML sidecars; it never reads the `tests/` directory. So do one of three things: run the generated assertions yourself against DuckDB, wire them into your own CI step, or rewrite them as `[[tests]]` blocks that `rocky test` executes:
+`rocky test` and `rocky ci` do **not** pick these files up. `rocky test` runs your models on DuckDB and the `[[tests]]` in model sidecars, and never reads `tests/`. Run the assertions yourself against DuckDB, wire them into your own CI step, or rewrite them as `[[tests]]` blocks.
 
-```bash
-rocky test --models models
-```
+## 7. Intent in the IDE
 
-```
-Testing 12 models...
-
-  All 12 models passed
-
-  Result: 12 passed, 0 failed
-```
-
-## 8. Intent in the IDE
-
-The [VS Code extension](/guides/ide-setup/) surfaces a model's intent in two places:
-
-- **Hover**: hovering a model name shows the intent above the column list
-- **Document Symbols**: the intent is the model's first child in the Outline panel
-
-## 9. Best Practices for Intent Descriptions
-
-A precise intent makes `ai-sync` and `ai-test` more useful. Write it for a colleague who has not seen the model.
-
-### State the grain
-
-Say what one row represents. This is the most important piece of context:
-
-```
-Grain: one row per customer per month
-```
-
-### Name key columns and their business meaning
-
-Do not list column names alone. Say what each one means:
-
-```
-customer_lifetime_value is the total revenue from all completed orders for this customer
-```
-
-### Describe filters and their purpose
-
-Say why you filter the data, not only what the filter does:
-
-```
-Filter to completed orders only (exclude cancelled, pending, refunded) because
-revenue should only count fulfilled transactions
-```
-
-### Explain aggregation logic precisely
-
-Give the formula for every calculated column:
-
-```
-Revenue is quantity * unit_price * (1 - discount_pct), aggregated per day per category
-```
-
-### Mention source models being joined
-
-```
-Join stg_orders with dim_products on product_id to get category information
-```
-
-### Good example
-
-```toml
-intent = """
-Calculate daily revenue by product category.
-Join stg_orders with dim_products on product_id.
-Filter to completed orders only (exclude cancelled, pending).
-Revenue = quantity * unit_price * (1 - discount_pct).
-Grain: one row per order_date per product_category.
-"""
-```
-
-### Bad example
-
-```toml
-intent = "Revenue model."
-```
-
-This is too vague. `ai-sync` cannot propose a sound update from it, and `ai-test` cannot derive a useful assertion.
-
-## 10. AI Commands Reference
-
-| Command | Description |
-|---|---|
-| `rocky ai "<intent>"` | Generate a model from a plain-English description |
-| `rocky ai "<intent>" --format sql` | Generate as standard SQL instead of Rocky DSL |
-| `rocky ai-explain <model>` | Generate intent for a single model |
-| `rocky ai-explain --all --save` | Generate and save intent for all models without intent |
-| `rocky ai-sync` | Preview schema change proposals |
-| `rocky ai-sync --apply` | Apply proposed schema changes |
-| `rocky ai-sync --model <name>` | Sync a specific model |
-| `rocky ai-sync --with-intent` | Only process models that have intent |
-| `rocky ai-test <model>` | Generate tests for a single model |
-| `rocky ai-test --all --save` | Generate and save tests for all models |
+The [VS Code extension](/guides/ide-setup/) shows a model's intent on hover (above the column list) and as the model's first child in the Outline panel.

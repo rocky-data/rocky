@@ -379,9 +379,13 @@ pub fn validate_contract_with(
                                 contract_col.name
                             ),
                         )
-                        // Name only remedies that change what the typechecker
-                        // infers. It does not read the WHERE clause, so a
-                        // `WHERE x IS NOT NULL` filter leaves `x` nullable.
+                        // `E012` is a compile-time proof (#2662). Name only
+                        // remedies that change what the typechecker infers.
+                        // It does not read the WHERE clause, so a `WHERE x
+                        // IS NOT NULL` filter leaves `x` nullable. When the
+                        // data, not the SQL, keeps the column non-null, the
+                        // check belongs in a `not_null` test, which runs
+                        // against the built table.
                         .with_suggestion(format!(
                             "COALESCE `{0}` with a value that is never NULL: a literal default, as in \
                              `COALESCE({0}, 0)` or `COALESCE({0}, '')`, or a NOT NULL column, as in \
@@ -389,9 +393,18 @@ pub fn validate_contract_with(
                              that type so Rocky can check the type too (`CAST(0 AS INT)` for an INT column, \
                              once the warehouse is known). Or read `{0}` from a column that is NOT NULL in a \
                              source schema Rocky has (`data/seed.sql`, or the schema cache that `rocky \
-                             discover --with-schemas` fills). Or relax `nullable = true` in the contract. A \
-                             `WHERE {0} IS NOT NULL` filter does not help: Rocky does not read the WHERE \
-                             clause when it infers nullability",
+                             discover --with-schemas` fills). If Rocky cannot prove `{0}` is never NULL, \
+                             check the data instead: set `nullable = true` in the contract and add a \
+                             `[[tests]]` block with `type = \"not_null\"` and `column = \"{0}\"` to the \
+                             model's sidecar. If a product spec generated the contract (its first line \
+                             says GENERATED), make the change in the spec, not in the contract file, \
+                             because the next lowering overwrites the contract. `[run] tests_on_run` \
+                             defaults to \"enforce\"; \"report\" and \"off\" turn that down. With \
+                             `rocky run --tests enforce`, or with the default setting, a NULL fails the model and its downstream models do not build; the \
+                             rows it wrote stay in the table. `rocky plan promote` refuses a branch when the \
+                             model's newest `rocky run --branch` evidence is that failure. A `WHERE {0} IS NOT NULL` filter does not clear `E012`: \
+                             Rocky does not read the WHERE clause when it infers nullability. Use the \
+                             `not_null` test for that case",
                             contract_col.name
                         )),
                     );

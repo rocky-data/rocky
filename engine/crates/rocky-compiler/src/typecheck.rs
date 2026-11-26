@@ -1284,6 +1284,10 @@ fn check_known_missing_upstream_refs(
                     .map(|c| c.name.as_str())
                     .chain(meta.iter().map(String::as_str))
                     .collect(),
+                merge: matches!(
+                    upstream_model.config.strategy,
+                    rocky_core::models::StrategyConfig::Merge { .. }
+                ),
             }
         })
         .collect();
@@ -6642,6 +6646,8 @@ mod tests {
     /// an `IS NULL` guard in a `CASE` leave the column nullable, so the help
     /// must not offer them. `COALESCE` to a NOT NULL column or to a literal
     /// makes it non-null, also when it is the model's only column (#2553).
+    /// When the SQL cannot prove it, the help points at a `not_null` test
+    /// (#2662).
     #[test]
     fn e012_help_names_only_remedies_that_change_inference() {
         let t: &[(&str, RockyType, bool)] = &[
@@ -6706,10 +6712,24 @@ mod tests {
         ] {
             assert!(help.contains(remedy), "{remedy}: {help}");
         }
-        assert!(
-            help.contains("`WHERE c IS NOT NULL` filter does not help"),
-            "{help}"
-        );
+        // #2662: a column the SQL cannot prove non-null is checked by a
+        // `not_null` test, which `rocky run --tests enforce` runs and
+        // `rocky plan promote` gates on.
+        for remedy in [
+            "`[[tests]]` block with `type = \"not_null\"` and `column = \"c\"`",
+            "rocky run --tests enforce",
+            "[run] tests_on_run",
+            "set `nullable = true` in the contract",
+            "the rows it wrote stay in the table",
+            "`[run] tests_on_run` defaults to \"enforce\"",
+            "If a product spec generated the contract",
+            "make the change in the spec, not in the contract file",
+            "`rocky plan promote` refuses a branch when the model's newest `rocky run --branch` evidence",
+            "`WHERE c IS NOT NULL` filter does not clear `E012`",
+        ] {
+            assert!(help.contains(remedy), "{remedy}: {help}");
+        }
+        assert!(!help.contains("does not help"), "{help}");
         assert!(!help.contains("filter out NULLs"), "{help}");
         assert!(!help.contains("another column"), "{help}");
     }
@@ -10202,6 +10222,79 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code.as_ref() == E039)
             .collect()
+    }
+
+    /// #2707: E039 over a `merge` upstream says its table may still hold the
+    /// column, since a merge does not drop columns. The message line stays
+    /// the same, and an upstream of any other strategy gets no such hint.
+    #[test]
+    fn e039_over_a_merge_upstream_hints_at_a_stale_table_column() {
+        let mut merge_up = make_model("mrg", "SELECT id, ts FROM raw.events");
+        merge_up.config.strategy = rocky_core::models::StrategyConfig::Merge {
+            unique_key: vec!["id".into()],
+            update_columns: None,
+        };
+        let result = compile_typechecks(vec![
+            merge_up,
+            make_model("reader", "SELECT legacy FROM mrg"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(
+            &*e039[0].message,
+            "column 'legacy' does not exist in complete upstream model 'mrg'"
+        );
+        let suggestion = e039[0].suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.ends_with(
+                ". Use a column the upstream model produces, or add the intended derivation \
+                 upstream. 'mrg' is a merge model: its table may still hold 'legacy' if the \
+                 model's SQL used to select it, because a merge does not drop columns. The \
+                 column is not in the model's output, so a read of it is refused"
+            ),
+            "{suggestion}"
+        );
+
+        let result = compile_typechecks(vec![
+            make_model("rebuilt", "SELECT id, ts FROM raw.events"),
+            make_model("reader", "SELECT legacy FROM rebuilt"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{:?}", result.diagnostics);
+        let suggestion = e039[0].suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.ends_with(
+                ". Use a column the upstream model produces, or add the intended derivation \
+                 upstream"
+            ),
+            "{suggestion}"
+        );
+        assert!(!suggestion.contains("merge"), "{suggestion}");
+
+        // Two merge upstreams in scope: the hint names both, in plural.
+        let merge = |name: &str| {
+            let mut model = make_model(name, "SELECT id, ts FROM raw.events");
+            model.config.strategy = rocky_core::models::StrategyConfig::Merge {
+                unique_key: vec!["id".into()],
+                update_columns: None,
+            };
+            model
+        };
+        let result = compile_typechecks(vec![
+            merge("m1"),
+            merge("m2"),
+            make_model("reader", "SELECT legacy FROM m1 JOIN m2 ON m1.id = m2.id"),
+        ]);
+        let e039 = e039_diagnostics(&result);
+        assert_eq!(e039.len(), 1, "{:?}", result.diagnostics);
+        let suggestion = e039[0].suggestion.as_deref().unwrap_or_default();
+        assert!(
+            suggestion.contains(
+                ". 'm1', 'm2' are merge models: their tables may still hold 'legacy' if the \
+                 model's SQL used to select it"
+            ),
+            "{suggestion}"
+        );
     }
 
     /// An upstream whose plain star expands over a complete model is complete
