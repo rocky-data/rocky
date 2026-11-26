@@ -2337,6 +2337,51 @@ async fn try_claim_idempotency(
     }
 }
 
+/// The prior run id when `key` holds completed work: the claim would answer
+/// `SkipCompleted`. Reads the key and claims nothing. `None` when the key is
+/// absent, in flight, stale, or cannot be read; a read error is logged, and
+/// the caller then refuses as it would have.
+async fn completed_idempotency_key(
+    state_cfg: &rocky_core::config::StateConfig,
+    state_path: &Path,
+    key: &str,
+) -> Option<String> {
+    use rocky_core::idempotency::{IdempotencyBackend, IdempotencyCheck};
+
+    let backend = IdempotencyBackend::from_state_config(state_cfg);
+    // Only the local backend reads redb; `tiered` reads its Valkey primary,
+    // as the claim does.
+    let state_store = match backend {
+        IdempotencyBackend::Local => match StateStore::open_read_only(state_path) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                warn!(
+                    idempotency_key = key,
+                    error = %error,
+                    "could not open the state store to read the idempotency key; refusing"
+                );
+                return None;
+            }
+        },
+        _ => None,
+    };
+    match backend
+        .peek(state_store.as_ref(), key, &state_cfg.idempotency)
+        .await
+    {
+        Ok(IdempotencyCheck::SkipCompleted { run_id }) => Some(run_id),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                idempotency_key = key,
+                error = %error,
+                "could not read the idempotency key; refusing"
+            );
+            None
+        }
+    }
+}
+
 /// Emit a short-circuit `RunOutput` (status = `skipped_*`) and exit. No
 /// state-store mutation, no hook fires, no pipeline-start event — the run
 /// never actually started.
@@ -3972,7 +4017,7 @@ pub(crate) async fn run_with_direct_gate(
     // again after discovery (below); this gate refuses it up front only when
     // no `run` rule could allow any table.
     let branch_run = shadow_config.is_some_and(|c| c.branch.is_some());
-    super::run_policy_gate::gate_pre_run(
+    if let Err(refusal) = super::run_policy_gate::gate_pre_run(
         direct_gate,
         &loaded.config,
         config_path,
@@ -3988,7 +4033,30 @@ pub(crate) async fn run_with_direct_gate(
         },
         branch_run,
     )
-    .await?;
+    .await
+    {
+        // Ruled 2026-11-26: a retry whose key already completed keeps
+        // reporting `skipped_idempotent` (exit 0), as before the run gate
+        // refused `require_review`. Skipping writes nothing. The key is read,
+        // never claimed, so a refused run still leaves no stamp. A `deny`,
+        // an unloadable policy, or any other error refuses as it did.
+        if let Some(key) = idempotency_key
+            && refusal
+                .downcast_ref::<super::run_policy_gate::ReviewRequired>()
+                .is_some()
+            && let Some(prior_run_id) =
+                completed_idempotency_key(&loaded.config.state, state_path, key).await
+        {
+            emit_skipped_run_output(
+                key,
+                &prior_run_id,
+                rocky_core::state::RunStatus::SkippedIdempotent,
+                output_json,
+            )?;
+            return Ok(RunTermination::SkippedIdempotent { prior_run_id });
+        }
+        return Err(refusal);
+    }
 
     // -------------------------------------------------------------------
     // Idempotency check + claim (before any state mutation / run_id mint).

@@ -419,6 +419,23 @@ pub(crate) fn enforce_replication_targets(
     enforce(verdict, &plan_id, branch)
 }
 
+/// The refusal of a run whose verdict is `require_review` (and nothing
+/// stricter: a `deny` anywhere in the run outranks it).
+///
+/// Typed so `rocky run` can tell it from a `deny`: a retry whose idempotency
+/// key already completed reports `skipped_idempotent` instead (ruled
+/// 2026-11-26), because skipping writes nothing. A `deny` still refuses.
+#[derive(Debug)]
+pub(crate) struct ReviewRequired(String);
+
+impl std::fmt::Display for ReviewRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReviewRequired {}
+
 /// Turn a recorded verdict into the run's outcome.
 fn enforce(verdict: PolicyGate, plan_id: &str, branch: bool) -> Result<()> {
     match verdict {
@@ -446,11 +463,12 @@ fn enforce(verdict: PolicyGate, plan_id: &str, branch: bool) -> Result<()> {
                      --approve`, `rocky apply <plan-id>`), or have a human run it"
                 }
             };
-            bail!(
+            Err(ReviewRequired(format!(
                 "policy requires review for agent `rocky run` ({plan_id}): model '{model}'{} — \
                  {reason}. A one-step run has no plan to review. {alternatives}.",
                 rule_suffix(rule_id)
-            )
+            ))
+            .into())
         }
         PolicyGate::Deny {
             model,

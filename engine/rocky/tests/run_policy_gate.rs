@@ -15,7 +15,10 @@
 //! ```
 //!
 //! `require_review` refuses too (a one-step run has no plan to review); an
-//! `apply` rule never matches a `run`.
+//! `apply` rule never matches a `run`. A retry whose idempotency key already
+//! completed still reports `skipped_idempotent` under `require_review` (not
+//! under `deny`), and a replication `--filter` that matches no table still
+//! refuses (both ruled 2026-11-26).
 //!
 //! End-to-end through the real binary: the gap was in the CLI wiring (the
 //! `Run` arm never resolved the principal), which no unit test of the
@@ -484,6 +487,142 @@ fn an_allow_default_beside_an_any_require_review_rule_refuses_before_its_claim()
         ["staging__orders.orders", "staging__orders.returns"],
         "the key was never claimed, so the retry runs rather than skips\n{}",
         describe(&retried)
+    );
+}
+
+/// Parse a run's `-o json` stdout.
+fn run_json(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("run stdout is not JSON ({e})\n{}", describe(out)))
+}
+
+/// Drop one built table, so a retry that re-ran would show by rebuilding it.
+fn drop_table(dir: &Path, table: &str) {
+    let conn = duckdb::Connection::open(dir.join("warehouse.duckdb")).expect("open duckdb");
+    conn.execute_batch(&format!("DROP TABLE {table}"))
+        .expect("drop table");
+}
+
+/// Ruled 2026-11-26: a retry whose idempotency key already completed keeps
+/// reporting `skipped_idempotent` with exit 0, under the `require_review`
+/// default. The run gate does not refuse it, and the retry writes nothing:
+/// a table dropped after the first run stays absent.
+#[test]
+fn a_completed_key_retry_skips_under_require_review() {
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(tmp.path(), "\n[policy]\nversion = 1\n");
+    let key = "k-done";
+    let first = rocky(tmp.path(), &["run", "--idempotency-key", key]);
+    assert!(first.status.success(), "{}", describe(&first));
+    drop_table(tmp.path(), "main.status_counts");
+
+    let retried = rocky(
+        tmp.path(),
+        &[
+            "--principal",
+            "agent",
+            "-o",
+            "json",
+            "run",
+            "--idempotency-key",
+            key,
+        ],
+    );
+    assert!(retried.status.success(), "{}", describe(&retried));
+    let json = run_json(&retried);
+    assert_eq!(
+        json["status"],
+        "SkippedIdempotent",
+        "{}",
+        describe(&retried)
+    );
+    assert_eq!(json["idempotency_key"], key);
+    assert!(
+        json["skipped_by_run_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("run-")),
+        "{}",
+        describe(&retried)
+    );
+    assert_eq!(
+        written_tables(tmp.path()),
+        ["main.customer_orders", "main.stg_orders"],
+        "the skipped retry must not rebuild the dropped table"
+    );
+}
+
+/// The control for the case above: a fresh key under the same policy still
+/// refuses, and stays unclaimed, so a human retry with it runs.
+#[test]
+fn a_fresh_key_still_refuses_under_require_review_and_stays_unclaimed() {
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(
+        tmp.path(),
+        "\n[state.idempotency]\ndedup_on = \"any\"\n\n[policy]\nversion = 1\n",
+    );
+    let key = "k-fresh";
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--idempotency-key", key],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("policy requires review"),
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(written_tables(tmp.path()), Vec::<String>::new());
+
+    let retried = rocky(tmp.path(), &["run", "--idempotency-key", key]);
+    assert!(retried.status.success(), "{}", describe(&retried));
+    assert_eq!(
+        written_tables(tmp.path()).len(),
+        3,
+        "{}",
+        describe(&retried)
+    );
+}
+
+/// A `deny` is not softened by a completed key: the run still refuses. Only
+/// `require_review` reports the skip.
+#[test]
+fn a_completed_key_retry_is_still_denied() {
+    let tmp = tempfile::tempdir().unwrap();
+    transformation_project(tmp.path(), DENY_POLICY);
+    let key = "k-done-deny";
+    let first = rocky(tmp.path(), &["run", "--idempotency-key", key]);
+    assert!(first.status.success(), "{}", describe(&first));
+    let before = written_tables(tmp.path());
+
+    let retried = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--idempotency-key", key],
+    );
+    let before: Vec<&str> = before.iter().map(String::as_str).collect();
+    assert_denied_from(tmp.path(), &retried, "completed-key retry", &before);
+}
+
+/// Ruled 2026-11-26: an agent replication run whose `--filter` matches no
+/// table still refuses under the `require_review` default, before
+/// discovery, and writes nothing.
+#[test]
+fn a_filter_that_matches_no_table_still_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    replication_project(tmp.path(), "\n[policy]\nversion = 1\n");
+    let out = rocky(
+        tmp.path(),
+        &["--principal", "agent", "run", "--filter", "source=nomatch"],
+    );
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("policy requires review"),
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(written_tables(tmp.path()), Vec::<String>::new());
+    assert_eq!(
+        run_decisions(tmp.path()),
+        [("ingest".to_string(), "require_review".to_string())]
     );
 }
 
