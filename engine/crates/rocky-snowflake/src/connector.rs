@@ -646,8 +646,9 @@ impl SnowflakeConnector {
                 // outcome, not a lost statement.
                 Err(err @ ConnectorError::ApiError { status: 422, .. }) => return Ok(Err(err)),
                 // A rate-limited poll: the statement may well still be running
-                // (Snowflake answers an unfinished statement with 202 or 429).
-                // It does not count as a failed poll; the deadline bounds it.
+                // (Snowflake answers a running statement with 202 and a rate
+                // limit with 429). It does not count as a failed poll; the
+                // deadline bounds it.
                 Err(err @ ConnectorError::ApiError { status: 429, .. }) => {
                     rate_limited = rate_limited.saturating_add(1);
                     let backoff_ms = compute_backoff(retry, rate_limited - 1);

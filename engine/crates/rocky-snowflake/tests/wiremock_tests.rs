@@ -2123,3 +2123,67 @@ async fn test_rate_limited_polls_do_not_abandon_the_statement() {
         "sf-busy"
     );
 }
+
+/// #2768: a multi-statement script goes through the asynchronous path too.
+/// The submit carries `MULTI_STATEMENT_COUNT` and `?async=true` and answers
+/// 202 (running); the poll then returns the script's result. One submit, one
+/// poll, no cancel, and nothing left in flight.
+#[tokio::test]
+async fn test_multi_statement_script_submits_async_and_polls_to_its_result() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(query_param("async", "true"))
+        .and(body_string_contains("MULTI_STATEMENT_COUNT"))
+        .respond_with(executing("sf-multi"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/sf-multi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-multi",
+            "statementHandles": ["sf-multi-1", "sf-multi-2", "sf-multi-3"],
+            "code": "090001",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "/api/v2/statements/sf-multi",
+            "resultSetMetaData": {
+                "numRows": 1,
+                "rowType": [
+                    {"name": "multiple statement execution", "type": "TEXT", "nullable": false}
+                ]
+            },
+            "data": [["Multiple statements executed successfully."]]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements/sf-multi/cancel"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    let handle = connector
+        .execute_statement("BEGIN;\nDELETE FROM t WHERE d = '2026-01-01';\nCOMMIT")
+        .await
+        .unwrap();
+
+    assert_eq!(handle, "sf-multi");
+    assert!(connector.in_flight().snapshot().is_empty());
+    let requests = server.received_requests().await.unwrap();
+    let submit = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("the submit");
+    let body: serde_json::Value = serde_json::from_slice(&submit.body).unwrap();
+    assert_eq!(body["parameters"]["MULTI_STATEMENT_COUNT"], "4");
+    assert!(
+        body["statement"]
+            .as_str()
+            .unwrap()
+            .starts_with("ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE;\n")
+    );
+}

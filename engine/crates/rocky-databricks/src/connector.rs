@@ -770,6 +770,8 @@ impl DatabricksConnector {
         result_format: ResultFormat,
         wait: StatementWait,
     ) -> Result<StatementResponse, ConnectorError> {
+        // One deadline for the whole statement, the submit included: a slow
+        // submit leaves the polls only what is left of `wait.timeout`.
         let deadline = tokio::time::Instant::now() + wait.timeout;
         let response = tokio::time::timeout_at(deadline, self.submit(sql, result_format))
             .await
@@ -879,9 +881,9 @@ impl DatabricksConnector {
                         return Ok(response);
                     }
                 }
-                // A rate-limited poll: the statement may well still be running
-                // (Snowflake answers an unfinished statement with 202 or 429).
-                // It does not count as a failed poll; the deadline bounds it.
+                // A rate-limited poll (429): the statement may well still be
+                // running. It does not count as a failed poll; the deadline
+                // bounds it.
                 Err(err @ ConnectorError::ApiError { status: 429, .. }) => {
                     rate_limited = rate_limited.saturating_add(1);
                     let backoff_ms = compute_backoff(&self.config.retry, rate_limited - 1);
