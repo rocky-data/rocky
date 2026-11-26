@@ -34,6 +34,7 @@ describe("GovernorScreen", () => {
     const tabs = within(screen.getByRole("navigation", { name: "Oversight screens" }));
     expect(tabs.getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Agent activity",
+      "Agents",
       "Trace",
       "Audit log",
     ]);

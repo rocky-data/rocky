@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { navigateTo, pathForLane, useSegments } from "../router";
+import { AgentsScreen } from "./AgentsScreen";
 import { AuditScreen } from "./AuditScreen";
 import { BriefScreen } from "./BriefScreen";
 import { CustodyScreen } from "./CustodyScreen";
@@ -23,12 +24,14 @@ import { GOVERNOR_TABS, governorAreaOf, governorTabFromSegment } from "./tabs";
 export function GovernorScreen({
   brief,
   scorecard,
+  agents,
   custody,
   audit,
   products,
 }: {
   brief?: ReactNode;
   scorecard?: ReactNode;
+  agents?: ReactNode;
   custody?: (subject: string | null) => ReactNode;
   audit?: (product: string | null) => ReactNode;
   products?: (name: string | null) => ReactNode;
@@ -48,6 +51,9 @@ export function GovernorScreen({
       break;
     case "scorecard":
       screen = scorecard ?? <ScorecardScreen />;
+      break;
+    case "agents":
+      screen = agents ?? <AgentsScreen />;
       break;
     case "custody":
       screen = custody ? custody(subject) : <CustodyScreen subject={subject} />;
