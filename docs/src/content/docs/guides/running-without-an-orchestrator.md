@@ -83,10 +83,10 @@ Exit `130` means an interrupt cut the run short, usually a deploy or a machine r
 | Snowflake | Yes, once the statement has a handle: after the first 45 seconds |
 | BigQuery, Trino | No. A later release adds it |
 | PostgreSQL, Redshift | No. The server statement timeout that Rocky sets from `timeout_secs` still stops it |
-| SQL Server, ClickHouse, Spark, process adapters | No. The statement runs on |
+| SQL Server, ClickHouse, Spark | No. The statement runs on |
 | DuckDB | Not needed. It runs inside the `rocky` process and ends with it |
 
-A Databricks or Snowflake statement younger than that limit has no id yet, so Rocky cannot cancel it. A statement Rocky stopped waiting on after its own client timeout also runs on. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
+A Databricks or Snowflake statement younger than that limit has no id yet, so Rocky cannot cancel it. Other adapters do not cancel: they list no statements, so Rocky prints nothing for them. Only a forced exit cancels. A fan-out abort inside the run, a client timeout and a poll error do not cancel yet. Rocky stops waiting on such a statement, and the warehouse runs it on. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
 
 A small wrapper makes the routing explicit, and it is reusable across every scheduler:
 
