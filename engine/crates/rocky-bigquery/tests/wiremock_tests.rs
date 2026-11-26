@@ -2323,25 +2323,107 @@ async fn poll_errors_that_persist_cancel_and_do_not_resubmit() {
     }
 }
 
-/// #2768: a `400` on the poll is the job's own failure. It has ended, so no
-/// cancel is sent and the error stays BigQuery's answer.
-#[tokio::test]
-async fn a_rejected_job_on_the_poll_is_its_outcome_not_an_abandon() {
-    let server = MockServer::start().await;
-    mount_submit_and_cancel(&server, "job-bad", 1, 0).await;
+/// Mount `jobs.get` for `job_id` answering `state`.
+async fn mount_job_state(server: &MockServer, job_id: &str, state: &str) {
     Mock::given(method("GET"))
-        .and(path(queries_path("job-bad")))
-        .respond_with(ResponseTemplate::new(400).set_body_string("invalidQuery"))
+        .and(path(format!("{JOBS_PATH}/{job_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": job_id},
+            "status": {"state": state}
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// #2768: an error on the poll of a job that has ended (`jobs.get` says
+/// `DONE`) is the job's own failure, whatever its status: no cancel is sent
+/// and the error stays BigQuery's answer, so `is_missing_object_error` and
+/// the `failure_kind` mapping still see it.
+#[tokio::test]
+async fn an_error_on_the_poll_of_an_ended_job_is_its_outcome_not_an_abandon() {
+    let missing_table = json!({"error": {"code": 404, "errors": [
+        {"reason": "notFound", "message": "Not found: Table test-project:raw.orders"}
+    ]}})
+    .to_string();
+    for (status, body, missing) in [
+        (400, "invalidQuery".to_string(), false),
+        (403, "accessDenied".to_string(), false),
+        (404, missing_table, true),
+    ] {
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, "job-bad", 1, 0).await;
+        Mock::given(method("GET"))
+            .and(path(queries_path("job-bad")))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_job_state(&server, "job-bad", "DONE").await;
+
+        let adapter = retrying_adapter(&server, 3);
+        let err = adapter.execute_statement("SELECT x").await.unwrap_err();
+        assert!(
+            matches!(as_bq_error(&err), BigQueryError::ApiError { status: s, .. } if s.starts_with(&status.to_string())),
+            "{status}: {err}"
+        );
+        assert_eq!(adapter.is_missing_object_error(&err), missing, "{status}");
+    }
+}
+
+/// #2768: the same error on the poll of a job that still runs is a lost
+/// poll: the job is cancelled and the error is `Abandoned`.
+#[tokio::test]
+async fn an_error_on_the_poll_of_a_running_job_cancels_it() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-404", 1, 1).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-404")))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_string("Not found: Job test-project:EU.job-404"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_job_state(&server, "job-404", "RUNNING").await;
+
+    let adapter = retrying_adapter(&server, 3);
+    let err = adapter.execute_statement("SELECT 1").await.unwrap_err();
+    assert!(
+        matches!(as_bq_error(&err), BigQueryError::Abandoned { .. }),
+        "{err}"
+    );
+}
+
+/// #2768: a rate-limited poll (429) does not count as a failed poll, even
+/// with no retries configured. It is polled again, never cancelled.
+#[tokio::test]
+async fn rate_limited_polls_do_not_abandon_the_job() {
+    let server = MockServer::start().await;
+    mount_submit_and_cancel(&server, "job-busy", 1, 0).await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-busy")))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .up_to_n_times(3)
+        .with_priority(1)
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(queries_path("job-busy")))
+        .respond_with(finished_job("job-busy"))
+        .with_priority(2)
         .expect(1)
         .mount(&server)
         .await;
 
-    let adapter = retrying_adapter(&server, 3);
-    let err = adapter.execute_statement("SELECT x").await.unwrap_err();
-    assert!(
-        matches!(as_bq_error(&err), BigQueryError::ApiError { status, .. } if status.starts_with("400")),
-        "{err}"
-    );
+    let auth = BigQueryAuth::Bearer(rocky_core::redacted::RedactedString::new(
+        "test-bq-token".into(),
+    ));
+    let adapter = BigQueryAdapter::new("test-project", "EU", auth)
+        .with_base_url(server.uri())
+        .with_retry(fast_retry(0));
+    adapter.execute_query("SELECT 1 AS n").await.unwrap();
 }
 
 /// #2768: a load job is listed and cancelled the same way: its deadline

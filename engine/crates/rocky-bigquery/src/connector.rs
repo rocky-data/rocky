@@ -582,14 +582,19 @@ impl BigQueryAdapter {
             } else if failed_polls < self.retry.max_retries && is_transient(&err) {
                 failed_polls += 1;
                 compute_backoff(&self.retry, failed_polls - 1)
-            } else if is_job_outcome(&err) {
+            } else if self.job_has_ended(&job_ref.job_id).await {
+                // `jobs.getQueryResults` reports a failed job's error as its
+                // HTTP status (a 400, a 403, a 404 for a missing table, a
+                // 5xx for an internal error). A job that has ended is
+                // reported as it came, not cancelled.
                 return Ok(Err(err));
             } else {
                 return Err(err);
             };
             warn!(
                 job_id = %job_ref.job_id,
-                attempt = failed_polls,
+                failed_polls,
+                rate_limited,
                 backoff_ms,
                 error = %err,
                 "BigQuery poll failed, polling the same job again"
@@ -627,6 +632,25 @@ impl BigQueryAdapter {
             });
         }
         Ok(resp.json().await?)
+    }
+
+    /// Whether job `job_id` has ended (`jobs.get` says `status.state ==
+    /// "DONE"`). Asked once, after a poll failed in a way polling again will
+    /// not fix, to tell the job's own failure from a lost poll. Bounded by
+    /// [`ABANDON_CANCEL_BUDGET`]; no answer, or any error, counts as not
+    /// ended, so the job is then cancelled.
+    async fn job_has_ended(&self, job_id: &str) -> bool {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/jobs/{job_id}",
+            self.base_url(),
+            self.project_id,
+        );
+        match tokio::time::timeout(ABANDON_CANCEL_BUDGET, self.get_job_once(&url)).await {
+            Ok(Ok(job)) => job
+                .status
+                .is_some_and(|status| status.state.as_deref() == Some("DONE")),
+            Ok(Err(_)) | Err(_) => false,
+        }
     }
 
     /// The jobs this adapter waits on now, by BigQuery job id.
@@ -1167,7 +1191,8 @@ impl BigQueryAdapter {
             };
             warn!(
                 job_id = %job_ref.job_id,
-                attempt = failed_polls,
+                failed_polls,
+                rate_limited,
                 backoff_ms,
                 error = %err,
                 "BigQuery load-job poll failed, polling the same job again"
@@ -2315,19 +2340,6 @@ fn api_status_code(err: &BigQueryError) -> Option<u16> {
         return None;
     };
     status.split_whitespace().next()?.parse().ok()
-}
-
-/// Whether a failed `jobs.getQueryResults` poll is the job's own outcome
-/// rather than a lost poll: a `400` (the job was rejected), or a `404` for a
-/// table or dataset the query names. Such a job has ended, so it is reported
-/// as it came, not cancelled. A `404` for the job itself (`Not found: Job`)
-/// is a lost poll: the job may still run.
-fn is_job_outcome(err: &BigQueryError) -> bool {
-    match (api_status_code(err), err) {
-        (Some(400), _) => true,
-        (Some(404), BigQueryError::ApiError { message, .. }) => !message.contains("Not found: Job"),
-        _ => false,
-    }
 }
 
 /// Classify a BigQuery [`AdapterError`] for the run loop's classified-retry

@@ -536,7 +536,8 @@ impl TrinoClient {
             };
             warn!(
                 error = %err,
-                attempt = failed_reads,
+                failed_reads,
+                rate_limited,
                 "reading the Trino query's next page failed, reading the same page again"
             );
             tokio::time::sleep_until((Instant::now() + wait).min(deadline)).await;
@@ -1404,6 +1405,41 @@ mod tests {
             .up_to_n_times(2)
             .with_priority(1)
             .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(page))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": QUERY_ID,
+                "stats": {"state": "FINISHED"},
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_secs(30));
+        client.execute("INSERT INTO t SELECT 1").await.unwrap();
+    }
+
+    /// #2768: a rate-limited read (429) does not count as a failed read: the
+    /// same page is read again more times than `MAX_POLL_REREADS`, with no
+    /// cancel.
+    #[tokio::test]
+    async fn rate_limited_reads_do_not_abandon_the_query() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, 1, 0).await;
+        let page = format!("/v1/statement/executing/{QUERY_ID}/x/1");
+        let limited = u64::from(MAX_POLL_REREADS) + 1;
+        Mock::given(method("GET"))
+            .and(path(page.clone()))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .up_to_n_times(limited)
+            .with_priority(1)
+            .expect(limited)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
