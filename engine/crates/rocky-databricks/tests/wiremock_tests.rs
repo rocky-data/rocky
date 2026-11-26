@@ -2681,3 +2681,119 @@ async fn test_observed_table_version_never_retries_or_spends_the_budget() {
     );
     // `.expect(1)` on the mock asserts exactly one request on drop.
 }
+
+/// Wait until `adapter` lists at least one in-flight statement.
+async fn wait_for_in_flight(
+    adapter: &rocky_databricks::adapter::DatabricksWarehouseAdapter,
+) -> Vec<rocky_core::statement_cancel::StatementHandle> {
+    use rocky_core::traits::WarehouseAdapter;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let listed = adapter.in_flight_statements();
+        if !listed.is_empty() {
+            return listed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the statement was never listed as in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A forced exit cancels a statement still polling: the adapter lists it
+/// while the poll runs, and `cancel_statement` sends the cancel request for
+/// exactly that id. The statement goes through one connector and the cancel
+/// through the adapter's own, sharing one in-flight list, as the registry
+/// wires them.
+#[tokio::test]
+async fn test_in_flight_statement_is_listed_and_cancelled() {
+    use rocky_core::statement_cancel::{CancelOutcome, InFlightStatements, StatementHandle};
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_databricks::adapter::DatabricksWarehouseAdapter;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-long",
+            "status": { "state": "PENDING" },
+            "manifest": null,
+            "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-long"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-long",
+            "status": { "state": "RUNNING" },
+            "manifest": null,
+            "result": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-long/cancel"))
+        .and(header("Authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let in_flight = InFlightStatements::new();
+    let running = test_connector(&server).with_in_flight(in_flight.clone());
+    let adapter =
+        DatabricksWarehouseAdapter::new(test_connector(&server).with_in_flight(in_flight));
+    assert!(adapter.in_flight_statements().is_empty());
+
+    let statement = tokio::spawn(async move { running.execute_statement("SELECT 1").await });
+    let listed = wait_for_in_flight(&adapter).await;
+    assert_eq!(listed, vec![StatementHandle::new("stmt-long")]);
+
+    let outcome = adapter.cancel_statement(&listed[0]).await.unwrap();
+    assert_eq!(outcome, CancelOutcome::Requested);
+
+    statement.abort();
+    let _ = statement.await;
+    assert!(
+        adapter.in_flight_statements().is_empty(),
+        "a statement nobody waits on must leave the list"
+    );
+    // `.expect(1)` on the cancel mock asserts the request on drop.
+}
+
+/// A statement that reaches a terminal state leaves the in-flight list, and
+/// one that completes inline is never listed.
+#[tokio::test]
+async fn test_finished_statement_leaves_in_flight_list() {
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_databricks::adapter::DatabricksWarehouseAdapter;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-poll",
+            "status": { "state": "PENDING" },
+            "manifest": null,
+            "result": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-poll",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null
+        })))
+        .mount(&server)
+        .await;
+
+    let adapter = DatabricksWarehouseAdapter::new(test_connector(&server));
+    adapter.execute_statement("SELECT 1").await.unwrap();
+    assert!(adapter.in_flight_statements().is_empty());
+}
