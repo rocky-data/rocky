@@ -72,7 +72,10 @@ Alert on any non-zero exit. Give exit `2` its own channel.
 Other adapters do not cancel: they list no statements, so Rocky prints nothing for them. On Databricks and Snowflake, Rocky also cancels on the other paths that stop waiting on a statement:
 
 - **A fan-out abort** (`fail_fast`, or the error-rate abort) cancels the copies still running, then drops them. It logs one warning per statement.
-- **The client deadline** (`timeout_secs`) and **a poll error that re-polling does not fix** cancel the statement before the error is returned. Rocky never submits that statement again, and the run does not retry it, because it may still run. A transient poll error polls the same statement again.
+- **The client deadline** (`timeout_secs`) and **a poll error that re-polling does not fix** cancel the statement before the error is returned. Rocky never submits that statement again, and the run does not retry it (`table_retries` skips the table too), because it may still run. A transient poll error polls the same statement again.
+- **A cancel during a source row count** (`[[product.source.volume]]`) cancels the `SELECT COUNT(*)` before Rocky drops it.
+
+One gap stays: a submit that times out, or that gets a `429`, `502`, `503` or `504` answer, is sent again. The warehouse may have accepted the first one, and with no id Rocky cannot cancel it.
 
 Each cancel waits at most 3 seconds for an answer. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
 
