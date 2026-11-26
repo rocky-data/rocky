@@ -1,6 +1,6 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { Clip, StatusCard, type Tone } from "./components";
+import { Clip, StatusCard, runStatusLabel, type Tone } from "./components";
 
 describe("Clip", () => {
   /// The marker is the screen's, not the value's. A cut renders it as its
@@ -61,5 +61,21 @@ describe("StatusCard", () => {
   it("keeps the label's own words for assistive technology", () => {
     const { getByText } = render(<StatusCard label="models compiled" value="3" />);
     expect(getByText("models compiled")).toBeInTheDocument();
+  });
+});
+
+describe("runStatusLabel", () => {
+  it("says a run's status in words", () => {
+    expect(runStatusLabel("Success")).toBe("Succeeded");
+    expect(runStatusLabel("success")).toBe("Succeeded");
+    expect(runStatusLabel("PartialFailure")).toBe("Partly failed");
+    expect(runStatusLabel("partial_failure")).toBe("Partly failed");
+    expect(runStatusLabel("Failure")).toBe("Failed");
+    expect(runStatusLabel("failure")).toBe("Failed");
+  });
+
+  it("passes a status it does not know through as the engine wrote it", () => {
+    expect(runStatusLabel("Cancelled")).toBe("Cancelled");
+    expect(runStatusLabel("")).toBe("");
   });
 });

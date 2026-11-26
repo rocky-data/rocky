@@ -1,5 +1,5 @@
 import type { HistoryOutput } from "@rocky-types/history";
-import { Clip, EmptyState, TABLE, ToneDot, runStatusTone, type Tone } from "../components";
+import { Clip, EmptyState, TABLE, ToneDot, runStatusLabel, runStatusTone, type Tone } from "../components";
 import { formatDuration, formatInstant, orNotRecorded } from "../format";
 
 const statusTone = runStatusTone;
@@ -57,7 +57,7 @@ export function RunsPanel({ history, now }: { history: HistoryOutput; now?: numb
               <td className={`${TABLE.td} font-medium ${TONE_TEXT[statusTone(run.status)]}`}>
                 <span className="inline-flex items-center gap-2">
                   <ToneDot tone={statusTone(run.status)} />
-                  {run.status}
+                  {runStatusLabel(run.status)}
                 </span>
               </td>
               <td className={TABLE.td}>{run.trigger}</td>

@@ -352,7 +352,7 @@ function UpstreamTable({ rows, partial }: { rows: AllocatedUpstreamCost[]; parti
   return (
     <Rows
       ariaLabel="What this product pays for tables it reads"
-      columns={["table", partial ? "charged (partial)" : "charged", "share", "split by", "notes"]}
+      columns={["table", partial ? "cost (partial)" : "cost", "share", "split by", "notes"]}
       rows={rows.map((row) => [
         <span key="t" className="font-mono text-xs">
           {row.table}
@@ -481,13 +481,13 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
       )}
       <div className="grid gap-2 sm:grid-cols-2">
         <StatusCard
-          label="charged, in USD"
+          label="total cost, in USD"
           value={<MoneyFigureText cost={cost} />}
           tone={cost.money_status === "priced" ? "muted" : "warn"}
           sub="Only figures the month measured and priced. AI tokens cover calls recorded in this state store. See the money by figure below."
         />
         <StatusCard
-          label="charged"
+          label="total cost"
           value={
             <AmountsText
               amounts={cost.charged}
@@ -495,10 +495,10 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
               partial={partial}
             />
           }
-          sub="Kept plus what it paid for tables it reads."
+          sub="Net cost plus its shared upstream cost: what it pays for tables it reads."
         />
         <StatusCard
-          label="kept"
+          label="net cost"
           value={<AmountsText amounts={cost.kept} partial={partial} />}
           sub={
             cost.owner_residual.length > 0
@@ -509,7 +509,7 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
           }
         />
         <StatusCard
-          label="built (memo, not summed)"
+          label="own build cost (memo, not summed)"
           value={<AmountsText amounts={cost.built} partial={partial} />}
           sub="What its own builds cost before any split."
         />
@@ -529,11 +529,11 @@ function CostBody({ name, report }: { name: string; report: ProductMonthCostOutp
       )}
       <div className="space-y-1">
         <h5 className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">
-          Allocated upstream
+          Shared upstream cost
         </h5>
         {cost.allocated_upstream.length === 0 ? (
           <p className="text-xs text-zinc-600 dark:text-zinc-300">
-            It was charged for no table it reads.
+            It pays for no table it reads.
           </p>
         ) : (
           <UpstreamTable rows={cost.allocated_upstream} partial={partial} />

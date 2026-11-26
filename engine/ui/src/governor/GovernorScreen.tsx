@@ -70,7 +70,7 @@ export function GovernorScreen({
       */}
       {tabs.length > 1 && (
         <nav
-          aria-label="Governor screens"
+          aria-label="Oversight screens"
           className="flex flex-wrap gap-x-4 gap-y-1 border-b border-zinc-200 text-sm dark:border-zinc-800"
         >
           {tabs.map((entry) => (

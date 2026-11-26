@@ -50,10 +50,10 @@ const SCORECARD: AuditScorecardOutput = {
 };
 
 describe("ScorecardScreen", () => {
-  it("renders the groups with their rates, the verify-after aggregate and the unavailable metrics", async () => {
+  it("renders the groups with their rates, the post-apply checks aggregate and the unavailable metrics", async () => {
     const load = vi.fn(async () => SCORECARD);
     render(<ScorecardScreen load={load} now={NOW} />);
-    const table = await screen.findByRole("table", { name: "Scorecard groups" });
+    const table = await screen.findByRole("table", { name: "Agent activity groups" });
     const agent = within(table).getByText("agent").closest("tr") as HTMLElement;
     expect(within(agent).getByText("50.0%")).toBeInTheDocument();
     expect(within(agent).getByText("37.5%")).toBeInTheDocument();
@@ -77,7 +77,7 @@ describe("ScorecardScreen", () => {
   it("changes the grouping and the window through the selectors", async () => {
     const load = vi.fn(async () => SCORECARD);
     render(<ScorecardScreen load={load} now={NOW} />);
-    await screen.findByRole("table", { name: "Scorecard groups" });
+    await screen.findByRole("table", { name: "Agent activity groups" });
     fireEvent.change(screen.getByLabelText("Group by"), { target: { value: "rule" } });
     await waitFor(() => expect(load).toHaveBeenCalledWith("rule", "all"));
     fireEvent.change(screen.getByLabelText("Window"), { target: { value: "30d" } });

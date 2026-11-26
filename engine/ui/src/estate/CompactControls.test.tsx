@@ -68,8 +68,8 @@ function typeTable(value: string) {
   fireEvent.change(screen.getByLabelText("Table"), { target: { value } });
 }
 
-describe("Compact from the browser", () => {
-  it("says archive is not here, and that the plan runs nothing", () => {
+describe("Optimize tables from the browser", () => {
+  it("says archive is not here, and that the change runs nothing", () => {
     const { client } = fakeJobs({});
     renderControls(client);
     const text = document.body.textContent ?? "";
@@ -78,11 +78,11 @@ describe("Compact from the browser", () => {
     expect(screen.queryByRole("button", { name: /archive/i })).toBeNull();
   });
 
-  it("draws Plan compact disabled on a read-only page and submits nothing", () => {
+  it("draws Plan optimize tables disabled on a read-only page and submits nothing", () => {
     const { client, submitted } = fakeJobs({});
     renderControls(client, READ_ONLY);
     typeTable("cat.sch.orders");
-    const button = screen.getByRole("button", { name: "Plan compact" });
+    const button = screen.getByRole("button", { name: "Plan optimize tables" });
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(submitted).toEqual([]);
@@ -91,7 +91,7 @@ describe("Compact from the browser", () => {
   it("will not plan with an empty table", () => {
     const { client, submitted } = fakeJobs({});
     renderControls(client);
-    const button = screen.getByRole("button", { name: "Plan compact" });
+    const button = screen.getByRole("button", { name: "Plan optimize tables" });
     expect(button).toBeDisabled();
     expect(screen.getByText("Type the full table name.")).toBeTruthy();
     fireEvent.click(button);
@@ -102,11 +102,11 @@ describe("Compact from the browser", () => {
     const { client, submitted } = fakeJobs({ compact: job("compact", "succeeded", { result: singleResult() }) });
     renderControls(client);
     typeTable("  cat.sch.orders  ");
-    fireEvent.click(screen.getByRole("button", { name: "Plan compact" }));
-    const list = await screen.findByLabelText("Tables this plan compacts", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
+    const list = await screen.findByLabelText("Tables this change optimizes", {}, { timeout: 3000 });
     expect(submitted).toEqual([{ kind: "compact", body: { table: "cat.sch.orders" } }]);
     expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["cat.sch.orders"]);
-    expect(screen.getByText(/Plan ready: 2 statements on 1 table, target file size 256 MB\. Nothing has run\./)).toBeTruthy();
+    expect(screen.getByText(/Change ready: 2 statements on 1 table, target file size 256 MB\. Nothing has run\./)).toBeTruthy();
     expect(document.body.textContent).toContain("OPTIMIZE cat.sch.orders WHERE true");
     expect(submitted.some((s) => s.kind === "apply")).toBe(false);
   });
@@ -116,8 +116,8 @@ describe("Compact from the browser", () => {
     renderControls(client);
     fireEvent.click(screen.getByLabelText("Every managed table in a catalog"));
     fireEvent.change(screen.getByLabelText("Catalog"), { target: { value: "cat" } });
-    fireEvent.click(screen.getByRole("button", { name: "Plan compact" }));
-    const list = await screen.findByLabelText("Tables this plan compacts", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
+    const list = await screen.findByLabelText("Tables this change optimizes", {}, { timeout: 3000 });
     expect(submitted).toEqual([{ kind: "compact", body: { catalog: "cat" } }]);
     expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
       "cat.raw.events",
@@ -135,9 +135,9 @@ describe("Compact from the browser", () => {
     renderControls(client);
     fireEvent.click(screen.getByLabelText("Every managed table in a catalog"));
     fireEvent.change(screen.getByLabelText("Catalog"), { target: { value: "cat" } });
-    fireEvent.click(screen.getByRole("button", { name: "Plan compact" }));
-    await screen.findByLabelText("Tables this plan compacts", {}, { timeout: 3000 });
-    fireEvent.click(screen.getByRole("button", { name: "Compact" }));
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
+    await screen.findByLabelText("Tables this change optimizes", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Optimize tables" }));
     const group = screen.getByRole("group", { name: /Run OPTIMIZE and VACUUM/ });
     for (const table of CATALOG_TABLES) expect(group.textContent).toContain(table);
     expect(group.textContent).toContain("OPTIMIZE and VACUUM");
@@ -145,13 +145,13 @@ describe("Compact from the browser", () => {
     expect(submitted.some((s) => s.kind === "apply")).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(submitted.some((s) => s.kind === "apply")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Compact" }));
-    fireEvent.click(screen.getByRole("button", { name: "Yes, compact these tables" }));
+    fireEvent.click(screen.getByRole("button", { name: "Optimize tables" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, optimize these tables" }));
     await waitFor(() => expect(submitted.at(-1)).toEqual({ kind: "apply", body: { plan_id: PLAN_ID } }));
     expect(submitted.filter((s) => s.kind === "compact")).toHaveLength(1);
-    await screen.findByText("Compact: done.", {}, { timeout: 3000 });
+    await screen.findByText("Optimize tables: done.", {}, { timeout: 3000 });
     // A compaction that ran does not offer the same apply again.
-    expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Optimize tables" })).toBeNull();
   });
 
   it("shows the cleaned reason when the apply fails, such as a non-Databricks warehouse", async () => {
@@ -163,12 +163,12 @@ describe("Compact from the browser", () => {
     });
     renderControls(client);
     typeTable("cat.sch.orders");
-    fireEvent.click(screen.getByRole("button", { name: "Plan compact" }));
-    await screen.findByLabelText("Tables this plan compacts", {}, { timeout: 3000 });
-    fireEvent.click(screen.getByRole("button", { name: "Compact" }));
-    fireEvent.click(screen.getByRole("button", { name: "Yes, compact these tables" }));
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
+    await screen.findByLabelText("Tables this change optimizes", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Optimize tables" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, optimize these tables" }));
     const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
-    expect(alert.textContent).toContain("Compact: failed.");
+    expect(alert.textContent).toContain("Optimize tables: failed.");
     expect(alert.textContent).toContain("OPTIMIZE is not supported");
   });
 
@@ -180,31 +180,31 @@ describe("Compact from the browser", () => {
     });
     renderControls(client);
     typeTable("cat.sch.orders");
-    fireEvent.click(screen.getByRole("button", { name: "Plan compact" }));
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
     const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
-    expect(alert.textContent).toContain("Plan compact: failed.");
-    expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
+    expect(alert.textContent).toContain("Plan optimize tables: failed.");
+    expect(screen.queryByRole("button", { name: "Optimize tables" })).toBeNull();
     expect(submitted.map((s) => s.kind)).toEqual(["compact"]);
   });
 
-  it("offers no apply, and says why, when the command could not save the plan", async () => {
+  it("offers no apply, and says why, when the command could not save the change", async () => {
     const { client } = fakeJobs({ compact: job("compact", "succeeded", { result: singleResult("cat.sch.orders", null) }) });
     renderControls(client);
     typeTable("cat.sch.orders");
-    fireEvent.click(screen.getByRole("button", { name: "Plan compact" }));
-    await screen.findByText(/could not save this plan/, {}, { timeout: 3000 });
-    expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
+    await screen.findByText(/could not save this change/, {}, { timeout: 3000 });
+    expect(screen.queryByRole("button", { name: "Optimize tables" })).toBeNull();
   });
 
-  it("drops the plan when the table typed no longer matches it", async () => {
+  it("drops the change when the table typed no longer matches it", async () => {
     const { client } = fakeJobs({ compact: job("compact", "succeeded", { result: singleResult() }) });
     renderControls(client);
     typeTable("cat.sch.orders");
-    fireEvent.click(screen.getByRole("button", { name: "Plan compact" }));
-    await screen.findByLabelText("Tables this plan compacts", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Plan optimize tables" }));
+    await screen.findByLabelText("Tables this change optimizes", {}, { timeout: 3000 });
     typeTable("cat.sch.other");
-    expect(screen.queryByLabelText("Tables this plan compacts")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
+    expect(screen.queryByLabelText("Tables this change optimizes")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Optimize tables" })).toBeNull();
   });
 });
 

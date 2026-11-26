@@ -79,16 +79,16 @@ function nameList(all: string[]): string {
  */
 function PreviewJobLine({ view, cancel }: { view: JobView; cancel: JobCancel }) {
   if (view.kind !== "done" || view.job.state !== "succeeded") {
-    return <JobLine label="Preview" view={view} cancel={cancel} />;
+    return <JobLine label="Create branch" view={view} cancel={cancel} />;
   }
   const s = previewSummary(view.job);
   const nothing = s.copied === 0 && s.changed.length === 0 && s.failed.length === 0 && s.planned.length === 0;
   const warn = nothing || s.failed.length > 0 || s.planned.length > 0;
   const headline = nothing
-    ? "Preview: branch registered, but nothing was copied."
+    ? "Create branch: registered, but nothing was copied."
     : warn
-      ? "Preview: branch registered, but not every model was copied."
-      : "Preview: done.";
+      ? "Create branch: registered, but not every model was copied."
+      : "Create branch: done.";
   const lines: string[] = [];
   if (s.branchSchema !== "") lines.push(`Warehouse schema: ${s.branchSchema}`);
   lines.push(`Copied from production: ${s.copied} model${s.copied === 1 ? "" : "s"}.`);
@@ -115,7 +115,7 @@ function PreviewJobLine({ view, cancel }: { view: JobView; cancel: JobCancel }) 
       >
         {headline}
       </p>
-      <ul aria-label="Preview result" className="list-disc space-y-0.5 pl-5">
+      <ul aria-label="Create branch result" className="list-disc space-y-0.5 pl-5">
         {lines.map((line, index) => (
           <li
             key={index}
@@ -183,9 +183,9 @@ export function PreviewControls({
           />
         </label>
         <ConfirmedWrite
-          label="Create preview"
-          question={`Create a preview against ${baseValue === "" ? "main" : baseValue}? This writes warehouse schema ${schema}: each unchanged model is copied into it. Depending on the warehouse, each copy is a metadata-only clone or a full copy of the table, which costs compute and storage. Production tables are only read.`}
-          confirmLabel="Confirm create preview"
+          label="Create branch"
+          question={`Create a branch against ${baseValue === "" ? "main" : baseValue}? This writes warehouse schema ${schema}: each unchanged model is copied into it. Depending on the warehouse, each copy is a metadata-only clone or a full copy of the table, which costs compute and storage. Production tables are only read.`}
+          confirmLabel="Confirm create branch"
           busy={jobBusy(preview.view)}
           onConfirm={() => preview.start(body)}
         />

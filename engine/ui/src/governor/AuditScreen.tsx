@@ -58,7 +58,7 @@ export function AuditScreen({
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
         <label className="text-xs text-zinc-600 dark:text-zinc-300" htmlFor="audit-product">
-          Product
+          Data product
         </label>
         <select
           id="audit-product"
@@ -79,7 +79,7 @@ export function AuditScreen({
         </select>
         {products.kind === "refused" && (
           <span className="text-xs text-amber-700 dark:text-amber-400">
-            product list refused: {products.error.envelope.code}
+            data product list refused: {products.error.envelope.code}
           </span>
         )}
         <button
@@ -93,7 +93,7 @@ export function AuditScreen({
           GET /api/v1/audit{product ? `?product=${product}` : ""}
         </code>
       </div>
-      {ledger.kind === "loading" && <p className="text-sm text-zinc-500">Loading the ledger…</p>}
+      {ledger.kind === "loading" && <p className="text-sm text-zinc-500">Loading the audit log…</p>}
       {ledger.kind === "refused" && (
         <StatusCard
           label={`refused (${ledger.error.status})`}
@@ -133,7 +133,7 @@ function LedgerBody({ ledger, now }: { ledger: AuditOutput; now?: number }) {
       )}
       <Rows
         ariaLabel="Policy decisions"
-        columns={["when", "principal", "capability", "model", "kind", "effect", "rule", "plan", "reason"]}
+        columns={["when", "actor", "action", "model", "kind", "outcome", "rule", "change", "reason"]}
         rows={ledger.decisions.map((entry) => [
           formatInstant(entry.timestamp, now),
           // `class(id)`: the id is self-asserted (`principal_id_verified` is
@@ -149,7 +149,7 @@ function LedgerBody({ ledger, now }: { ledger: AuditOutput; now?: number }) {
         ])}
       />
       <p className="text-xs text-zinc-500 dark:text-zinc-400">
-        {ledger.decisions.length} decision(s), oldest first, the whole ledger
+        {ledger.decisions.length} decision(s), oldest first, the whole audit log
       </p>
     </div>
   );

@@ -12,7 +12,7 @@ export const defaultScorecardLoader: ScorecardLoader = (by, window) =>
   apiGet<AuditScorecardOutput>(`audit/scorecard?by=${by}&window=${encodeURIComponent(window)}`);
 
 const DIMENSIONS: { id: ScorecardDimension; label: string }[] = [
-  { id: "principal", label: "principal (agent / human)" },
+  { id: "principal", label: "actor (agent / human)" },
   { id: "rule", label: "rule (the winning [[policy.rules]] entry)" },
   { id: "scope", label: "scope (the model decided on)" },
 ];
@@ -79,7 +79,7 @@ export function ScorecardScreen({ load = defaultScorecardLoader, now }: { load?:
           GET /api/v1/audit/scorecard?by={by}&window={window}
         </code>
       </div>
-      {scorecard.kind === "loading" && <p className="text-sm text-zinc-500">Loading the scorecard…</p>}
+      {scorecard.kind === "loading" && <p className="text-sm text-zinc-500">Loading agent activity…</p>}
       {scorecard.kind === "refused" && (
         <StatusCard
           label={`refused (${scorecard.error.status})`}
@@ -112,8 +112,8 @@ function ScorecardBody({ scorecard, now }: { scorecard: AuditScorecardOutput; no
         summary={`${scorecard.total_decisions} decision(s)`}
       >
         <Rows
-          ariaLabel="Scorecard groups"
-          columns={["group", "total", "allow", "require review", "deny", "acceptance", "review rate", "denial"]}
+          ariaLabel="Agent activity groups"
+          columns={["group", "total", "allowed", "needed approval", "blocked", "allowed rate", "approval rate", "blocked rate"]}
           rows={scorecard.groups.map((group) => [
             group.key,
             group.total,
@@ -128,7 +128,7 @@ function ScorecardBody({ scorecard, now }: { scorecard: AuditScorecardOutput; no
       </SectionCard>
       <div className="grid gap-3 sm:grid-cols-2">
         <StatusCard
-          label="verify-after pass rate"
+          label="post-apply checks pass rate"
           value={scorecard.verify_after ? percent(scorecard.verify_after.pass_rate) : NOT_RECORDED}
           tone={
             scorecard.verify_after
@@ -144,7 +144,7 @@ function ScorecardBody({ scorecard, now }: { scorecard: AuditScorecardOutput; no
           }
         />
         <StatusCard
-          label="metrics the ledger cannot support"
+          label="metrics the audit log cannot support"
           value={scorecard.unavailable_metrics.length}
           tone={scorecard.unavailable_metrics.length > 0 ? "pending" : "ok"}
           sub={orNotRecorded(scorecard.note)}

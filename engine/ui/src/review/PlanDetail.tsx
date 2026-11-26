@@ -230,31 +230,31 @@ function SpecDrift({
   if (approved === null) {
     return (
       <StatusCard
-        label="the spec it was planned against"
+        label="the spec this change was made against"
         value="no approval recorded"
-        sub="The product has no approval record, so the screen has no approved digest to compare this plan with."
+        sub="The product has no approval record, so the screen has no approved digest to compare this change with."
       />
     );
   }
   if (planned === null) {
     return (
       <StatusCard
-        label="the spec it was planned against"
+        label="the spec this change was made against"
         value="not recorded"
-        sub="The plan carries no spec digest, so the screen cannot say whether it matches the approval."
+        sub="The change carries no spec digest, so the screen cannot say whether it matches the approval."
       />
     );
   }
   if (planned === approved) {
     return (
       <StatusCard
-        label="the spec it was planned against"
+        label="the spec this change was made against"
         value="matches the approval"
         sub={
           <>
             Still <Clip value={planned} />.
             {product.spec_matches_approval === false
-              ? " The working spec has been edited since the approval; those edits are not approved."
+              ? " The current spec has been edited since the approval; those edits are not approved."
               : null}
           </>
         }
@@ -263,15 +263,15 @@ function SpecDrift({
   }
   return (
     <StatusCard
-      label="the spec it was planned against"
+      label="the spec this change was made against"
       value="the spec moved"
       tone="risk"
       sub={
         <>
-          Planned against <Clip value={planned} />; the approved spec is <Clip value={approved} />.
-          Apply compares the digest you pass with the one this plan carries, not with the spec
-          on disk. Passing the approved digest refuses this plan; passing the digest it was
-          planned against applies it, stale. Re-propose against the approved spec.
+          Made against <Clip value={planned} />; the approved spec is <Clip value={approved} />.
+          Apply compares the digest you pass with the one this change carries, not with the spec
+          on disk. Passing the approved digest refuses this change; passing the digest it was
+          made against applies it, stale. Re-propose against the approved spec.
         </>
       }
     />
@@ -285,33 +285,33 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
   // refused the request.
   if (lookup.kind === "unknown") {
     return (
-      <section aria-label="Why it needs a human" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
+      <section aria-label="Why it needs approval" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
         <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-          Why it needs a human
+          Why it needs approval
         </h3>
-        <ResourceState resource={lookup.queue} loadingLine="reading the review queue…" />
+        <ResourceState resource={lookup.queue} loadingLine="reading the approval queue…" />
       </section>
     );
   }
   if (lookup.kind === "absent") {
     return (
       <StatusCard
-        label="why it needs a human"
+        label="why it needs approval"
         value="not in the queue"
-        sub="No outstanding escalation names this plan. It may already be approved, or policy may never have escalated it. The custody chain has the whole story."
+        sub="No outstanding approval request names this change. It may already be approved, or policy may never have asked for approval. The trace has the whole story."
       />
     );
   }
   const { entries } = lookup;
   return (
-    <section aria-label="Why it needs a human" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-3">
+    <section aria-label="Why it needs approval" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-3">
       <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-        Why it needs a human
+        Why it needs approval
       </h3>
       {entries.length > 1 && (
         <p className="text-xs text-zinc-600 dark:text-zinc-300">
-          {entries.length} escalations name this plan, one per model policy stopped. Approving
-          the plan clears all of them.
+          {entries.length} approval requests name this change, one per model policy stopped.
+          Approving the change clears all of them.
         </p>
       )}
       {entries.map((entry) => (
@@ -323,11 +323,11 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
               <dd className="font-mono break-all">{entry.model}</dd>
             </div>
             <div>
-              <dt className="text-xs text-zinc-500 dark:text-zinc-400">capability</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">action</dt>
               <dd>{entry.capability}</dd>
             </div>
             <div>
-              <dt className="text-xs text-zinc-500 dark:text-zinc-400">principal</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">actor</dt>
               <dd>{entry.principal}</dd>
             </div>
             <div>
@@ -339,14 +339,14 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
               </dd>
             </div>
             <div>
-              <dt className="text-xs text-zinc-500 dark:text-zinc-400">blast radius</dt>
+              <dt className="text-xs text-zinc-500 dark:text-zinc-400">impact</dt>
               <dd>{entry.blast_radius ?? "not computed"}</dd>
             </div>
           </dl>
         </div>
       ))}
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        Every decision recorded about this plan: <CustodyLink subject={planId} />
+        Every decision recorded about this change: <CustodyLink subject={planId} />
       </p>
     </section>
   );
@@ -396,20 +396,20 @@ function PromoteBlocked({ planId, gate }: { planId: string; gate: PromoteGate })
   return (
     <div className="space-y-2">
       <WriteButton
-        label="Apply"
+        label="Apply to production"
         disabledReason={
           gate === "loading"
             ? "Reading the project config."
-            : "A promote plan is applied here only when rocky.toml sets [branch.approval] required = true."
+            : "A promote change is applied here only when rocky.toml sets [branch.approval] required = true."
         }
         onClick={() => undefined}
       />
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         {gate === null
           ? "The project config could not be read, so the page cannot say whether promote is allowed here. "
-          : "Promote replaces production tables. This page applies a promote plan only when rocky.toml sets "}
+          : "Promote replaces production tables. This page applies a promote change only when rocky.toml sets "}
         <code>[branch.approval] required = true</code>
-        {gate === null ? "." : ", and the server also checks that the plan holds the approvals the config needs."}{" "}
+        {gate === null ? "." : ", and the server also checks that the change holds the approvals the config needs."}{" "}
         Apply it in a terminal:
       </p>
       <CommandLine command={`rocky apply ${planId}`} />
@@ -427,8 +427,8 @@ function ArchiveTerminalOnly({ planId }: { planId: string }) {
   return (
     <div className="space-y-2">
       <WriteButton
-        label="Apply"
-        disabledReason="An archive plan is applied in a terminal, not from this page."
+        label="Apply to production"
+        disabledReason="An archive change is applied in a terminal, not from this page."
         onClick={() => undefined}
       />
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
@@ -494,16 +494,16 @@ function Approval({
       <Steps
         steps={[
           { label: "Proposed", state: "done" },
-          { label: "Approved", state: status.reviewed ? "done" : "current" },
+          { label: "Approve", state: status.reviewed ? "done" : "current" },
           {
-            label: "Applied",
+            label: "Apply to production",
             // The status route records approval, not apply. Applied is
             // known only when this page ran the apply and saw it succeed.
             // After approval it is unknown, not "next": a plan applied in a
             // terminal, or before a reload, looks exactly the same here.
             state: applied ? "done" : status.reviewed ? "unknown" : "later",
             note:
-              applied || !status.reviewed ? undefined : "The plan status does not record apply.",
+              applied || !status.reviewed ? undefined : "The change status does not record apply.",
           },
         ]}
       />
@@ -519,12 +519,12 @@ function Approval({
       ) : (
         <div className="space-y-2">
           <WriteButton
-            label="Approve"
+            label="Approve change"
             primary
             busy={jobBusy(approve.view)}
             onClick={() => approve.start({ plan_id: planId })}
           />
-          <JobLine label="Approve" view={approve.view} cancel={approve.cancel} />
+          <JobLine label="Approve change" view={approve.view} cancel={approve.cancel} />
           {access.kind === "operator" && (
             <p className="text-xs text-zinc-600 dark:text-zinc-300">
               Approving records this server's git identity as the approver, over the HTTP API.
@@ -532,7 +532,7 @@ function Approval({
           )}
           {entries.length > 1 && (
             <p className="text-xs text-zinc-600 dark:text-zinc-300">
-              Approving clears every one of the {entries.length} escalations above.
+              Approving clears every one of the {entries.length} approval requests above.
             </p>
           )}
         </div>
@@ -547,18 +547,18 @@ function Approval({
       ) : (
         <div className="space-y-2">
           <WriteButton
-            label="Apply"
+            label="Apply to production"
             primary={status.reviewed}
             busy={jobBusy(apply.view)}
-            disabledReason={status.reviewed ? undefined : "Approve the plan first."}
+            disabledReason={status.reviewed ? undefined : "Approve the change first."}
             onClick={() => apply.start({ plan_id: planId })}
           />
-          <JobLine label="Apply" view={apply.view} cancel={apply.cancel} />
+          <JobLine label="Apply to production" view={apply.view} cancel={apply.cancel} />
           {status.reviewed && (
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Apply runs the models on disk, and first checks they still match this plan. If
-              you edited them after the plan, apply refuses (plan_models_changed): plan and
-              approve again.
+              Apply runs the models on disk, and first checks they still match this change. If
+              you edited them after the change was made, apply refuses (plan_models_changed):
+              run <code>rocky plan</code> and approve again.
             </p>
           )}
         </div>
@@ -600,12 +600,12 @@ function ProductApply({
   const digest = typed.trim();
   const busy = jobBusy(apply);
   const inputId = "product-apply-digest";
-  const blocked = !reviewed ? "Approve the plan first." : digest === "" ? "Type the spec digest you approved." : null;
+  const blocked = !reviewed ? "Approve the change first." : digest === "" ? "Type the spec digest you approved." : null;
   return (
     <div className="space-y-2">
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        This plan is bound to a data product. To apply it, type the spec digest you approved.
-        It must come from you, not from the plan.
+        This change is bound to a data product. To apply it, type the spec digest you approved.
+        It must come from you, not from the change.
       </p>
       <label htmlFor={inputId} className="block text-xs font-medium text-zinc-700 dark:text-zinc-200">
         Spec digest you approved
@@ -623,26 +623,26 @@ function ProductApply({
       />
       {blocked === null ? (
         <ConfirmedWrite
-          label="Apply"
-          question={`Apply this plan to the warehouse, stating that you approved spec digest ${digest}?`}
+          label="Apply to production"
+          question={`Apply this change to the warehouse, stating that you approved spec digest ${digest}?`}
           confirmLabel="Yes, apply"
           busy={busy}
           onConfirm={() => start({ plan_id: planId, expect_spec_digest: digest })}
         />
       ) : (
-        <WriteButton label="Apply" busy={busy} disabledReason={blocked} onClick={() => undefined} />
+        <WriteButton label="Apply to production" busy={busy} disabledReason={blocked} onClick={() => undefined} />
       )}
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         The approved digest is on the <code className="font-mono">approval:</code> line of{" "}
         <code className="font-mono">rocky product status &lt;name&gt;</code> (
         <code className="font-mono">approval.spec_digest</code> with{" "}
         <code className="font-mono">--output json</code>), or in your approval record. Do not copy
-        the plan&apos;s own digest from the spec card: the check would then compare the plan with
+        the change&apos;s own digest from the spec card: the check would then compare the change with
         itself.
       </p>
-      <JobLine label="Apply" view={apply} cancel={cancel} />
+      <JobLine label="Apply to production" view={apply} cancel={cancel} />
       <p className="text-xs text-zinc-500 dark:text-zinc-400">
-        The engine compares your digest with the one the plan carries and refuses the apply if
+        The engine compares your digest with the one the change carries and refuses the apply if
         they differ. Or in a terminal:
       </p>
       <CommandLine command={productApplyCommand(planId)} />
@@ -763,7 +763,7 @@ function SampleFallback({
     </section>
   );
   if (lookup.kind === "unknown") {
-    return pending(lookup.queue, "reading the review queue…");
+    return pending(lookup.queue, "reading the approval queue…");
   }
   if (productId !== null && product.kind !== "ready") {
     return pending(product, "reading the product…");
@@ -778,14 +778,14 @@ function SampleFallback({
       // subject is not one (a replication target, a label), the model is
       // gone, or the compile could not name it. The screen does not guess
       // which.
-      sub = `The queue names no compiled model for this plan (${subjects}), so there is nothing to read rows from. Sample from the estate screen instead.`;
+      sub = `The queue names no compiled model for this change (${subjects}), so there is nothing to read rows from. Sample from the Project screen instead.`;
     } else if (named.length > 1) {
-      sub = `This plan touches ${named.length} models: ${named.join(", ")}. Sample each from the estate screen instead.`;
+      sub = `This change touches ${named.length} models: ${named.join(", ")}. Sample each from the Project screen instead.`;
     } else {
       // One model named, and no preview target offered for it: the samples
       // route would refuse it. The engine applied the route's own rules;
       // the screen repeats them rather than guessing which one bit.
-      sub = `The samples route would read none of the models this plan names (${named.join(", ")}): it reads one model at a time, in the current project, with no compile errors and not time-interval. Sample from the estate screen instead.`;
+      sub = `The samples route would read none of the models this change names (${named.join(", ")}): it reads one model at a time, in the current project, with no compile errors and not time-interval. Sample from the Project screen instead.`;
     }
     return <StatusCard label="sample rows" value="no single model to sample" sub={sub} />;
   }
@@ -795,8 +795,8 @@ function SampleFallback({
       value="no single model to sample"
       sub={
         productId !== null
-          ? "The plan is no longer in the review queue and its product names no output model, so there is nothing to read rows from."
-          : "Neither the review queue nor a product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
+          ? "The change is no longer in the approval queue and its data product names no output model, so there is nothing to read rows from."
+          : "Neither the approval queue nor a data product names a model for this change, so there is nothing to read rows from. A change that is not bound to a data product and no longer in the queue has no model on this screen."
       }
     />
   );
@@ -852,11 +852,11 @@ export function PlanDetail({
 
   if (status.kind !== "ready") {
     return (
-      <section aria-label="The plan" className="space-y-3">
+      <section aria-label="The change" className="space-y-3">
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          Plan <Clip value={planId} />
+          Change <Clip value={planId} />
         </h2>
-        <ResourceState resource={status} loadingLine="reading the plan…" />
+        <ResourceState resource={status} loadingLine="reading the change…" />
       </section>
     );
   }
@@ -892,7 +892,7 @@ export function PlanDetail({
 
   return (
     <div className="space-y-6">
-      <section aria-label="The plan" className="space-y-3">
+      <section aria-label="The change" className="space-y-3">
         <p className="text-sm text-zinc-500 dark:text-zinc-400">
           <a
             href={reviewPath()}
@@ -902,9 +902,9 @@ export function PlanDetail({
             }}
             className="text-sky-700 hover:underline dark:text-sky-400"
           >
-            Review queue
+            Changes
           </a>{" "}
-          <span aria-hidden="true">/</span> Plan
+          <span aria-hidden="true">/</span> Change
         </p>
         <h2 className="font-mono text-xl font-semibold text-zinc-900 dark:text-white">
           <Clip value={planId} />
@@ -912,11 +912,11 @@ export function PlanDetail({
         <dl className="flex flex-wrap gap-2 text-sm">
           <Fact label="kind" value={status.value.kind} />
           <Fact
-            label="review"
+            label="approval"
             tone={status.value.reviewed ? "ok" : "warn"}
-            value={status.value.reviewed ? "signed off" : "awaiting a human"}
+            value={status.value.reviewed ? "signed off" : "needs approval"}
           />
-          <Fact label="product" value={status.value.product_id ?? "not product-bound"} />
+          <Fact label="data product" value={status.value.product_id ?? "not tied to a data product"} />
         </dl>
       </section>
 
@@ -944,11 +944,11 @@ export function PlanDetail({
             (product.kind === "ready" ? (
               <SpecDrift status={status.value} product={product.value} />
             ) : (
-              <section aria-label="The spec it was planned against" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
+              <section aria-label="The spec this change was made against" className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900 space-y-2">
                 <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-                  The spec it was planned against
+                  The spec this change was made against
                 </h3>
-                <ResourceState resource={product} loadingLine="reading the product…" />
+                <ResourceState resource={product} loadingLine="reading the data product…" />
               </section>
             ))}
 

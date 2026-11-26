@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **ui:** the browser UI uses plain names for its screens and terms. The sidebar now reads Inbox (was Needs you), Project (Estate), Changes (Review), Data products (Products) and Oversight (Governance), whose tabs are Agent activity (Scorecard), Trace (Custody) and Audit log. In page text, a plan is a change, an escalation is an approval request, a principal is an actor and a capability is an action. Policy effects show as Allowed, Needs approval and Blocked, and a block is drawn blue, not red. Run statuses show as Succeeded, Partly failed and Failed. The Project panels are Lineage (DAG), Create branch (Preview), Promote branch and Optimize tables (Compact). Freeze is now change freeze, the tick lock is the scheduler lock, waiting demands are queued triggers, and the cost labels read total cost, net cost, own build cost and shared upstream cost. Routes, the `/api/v1` payloads and the CLI keep their names, and the commands the page shows to copy are unchanged.
 - The `E012` help now says that `[run] tests_on_run` defaults to `enforce`, and that a contract generated from a product spec is changed in the spec, not in the contract file. The `rocky ai-contract` retry prompt now tells the model not to add a `[[tests]]` block to a contract (#2734).
 
 ## [1.94.0] — 2026-11-23

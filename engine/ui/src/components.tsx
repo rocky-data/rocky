@@ -45,6 +45,24 @@ export function runStatusTone(status: string): Tone {
   }
 }
 
+/**
+ * A run's status in words, by the same reading as `runStatusTone`. A status
+ * this does not know is shown as the engine wrote it.
+ */
+export function runStatusLabel(status: string): string {
+  switch (status.toLowerCase()) {
+    case "success":
+      return "Succeeded";
+    case "partialfailure":
+    case "partial_failure":
+      return "Partly failed";
+    case "failure":
+      return "Failed";
+    default:
+      return status;
+  }
+}
+
 /** The dot alone, for a line of status outside a card. */
 export function ToneDot({ tone }: { tone: Tone }) {
   const dot = TONE_DOT[tone];

@@ -9,12 +9,12 @@
 
 export const GOVERNOR_TABS = [
   { id: "brief", label: "Brief", producer: "GET /api/v1/brief", area: "needs-you" },
-  { id: "scorecard", label: "Scorecard", producer: "GET /api/v1/audit/scorecard", area: "governance" },
-  { id: "custody", label: "Custody", producer: "GET /api/v1/custody/{subject}", area: "governance" },
-  { id: "audit", label: "Audit", producer: "GET /api/v1/audit", area: "governance" },
+  { id: "scorecard", label: "Agent activity", producer: "GET /api/v1/audit/scorecard", area: "governance" },
+  { id: "custody", label: "Trace", producer: "GET /api/v1/custody/{subject}", area: "governance" },
+  { id: "audit", label: "Audit log", producer: "GET /api/v1/audit", area: "governance" },
   {
     id: "products",
-    label: "Products",
+    label: "Data products",
     producer: "GET /api/v1/products/{name}/journal",
     area: "products",
   },

@@ -4,7 +4,7 @@ import { apiGet } from "../api";
 import { ArrowPathIcon, ArrowRightIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
 import { Clip, READ_BUTTON, ScreenHeader, StatusCard, ToneDot, runStatusTone } from "../components";
 import { useResource } from "../estate/useResource";
-import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded } from "../format";
+import { NOT_RECORDED, effectLabel, formatDuration, formatInstant, orNotRecorded } from "../format";
 import { reviewPath } from "../review/paths";
 import { navigateTo } from "../router";
 import { defaultJobClient, type JobClient } from "../operator";
@@ -62,7 +62,7 @@ export function BriefScreen({
 
   return (
     <div className="space-y-6">
-      <ScreenHeader title="Needs you" detail="What waits on a person, then what the estate did.">
+      <ScreenHeader title="Inbox" detail="What waits on a person, then what the project did.">
         <div className="flex flex-col items-start gap-1">
           <div className="flex items-center gap-2">
             <label className="text-sm text-zinc-600 dark:text-zinc-300" htmlFor="brief-since">
@@ -147,13 +147,13 @@ function BriefBody({
         title="Agent activity"
         availability={activity.availability}
         note={activity.note}
-        summary={`${activity.total} policy evaluations: ${activity.allow} allow, ${activity.require_review} require review, ${activity.deny} deny`}
+        summary={`${activity.total} policy evaluations: ${activity.allow} allowed, ${activity.require_review} needed approval, ${activity.deny} blocked`}
       >
         <div className="space-y-4">
           <EffectBar allow={activity.allow} review={activity.require_review} deny={activity.deny} />
           <Rows
-            ariaLabel="Activity by principal"
-            columns={["principal", "total", "allow", "require review", "deny"]}
+            ariaLabel="Activity by actor"
+            columns={["actor", "total", "allowed", "needed approval", "blocked"]}
             rows={activity.by_principal.map((row) => [
               row.principal,
               row.total,
@@ -164,7 +164,7 @@ function BriefBody({
           />
           <Rows
             ariaLabel="Decisions"
-            columns={["when", "principal", "capability", "model", "kind", "effect", "rule", "decision", "reason"]}
+            columns={["when", "actor", "action", "model", "kind", "outcome", "rule", "decision", "reason"]}
             rows={activity.decisions.map((entry) => [
               formatInstant(entry.timestamp, now),
               entry.principal,
@@ -174,7 +174,7 @@ function BriefBody({
               // unfreeze or verification row is listed with its kind so its
               // recorded effect never reads as a policy verdict.
               entry.kind,
-              entry.effect,
+              entry.kind === "evaluation" ? effectLabel(entry.effect) : entry.effect,
               entry.rule_id === null || entry.rule_id === undefined ? "default" : `rule ${entry.rule_id}`,
               entry.decision_ref,
               entry.reason,
@@ -187,7 +187,7 @@ function BriefBody({
         title="Runs"
         availability={runs.availability}
         note={runs.note}
-        summary={`${runs.total} runs: ${runs.succeeded} succeeded, ${runs.partial_failure} partial, ${runs.failed} failed`}
+        summary={`${runs.total} runs: ${runs.succeeded} succeeded, ${runs.partial_failure} partly failed, ${runs.failed} failed`}
       >
         {runs.attention.length === 0 ? (
           <p className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
@@ -203,11 +203,11 @@ function BriefBody({
       </SectionCard>
 
       <SectionCard
-        title="Autonomy"
+        title="Agent limits"
         availability={autonomy.availability}
         note={autonomy.note}
-        emptyLine="no rule is degraded and no freeze is in force"
-        summary={`${autonomy.degraded_rules.length} degraded rule(s), ${autonomy.active_freezes.length} freeze(s)`}
+        emptyLine="no rule is degraded and no change freeze is in force"
+        summary={`${autonomy.degraded_rules.length} degraded rule(s), ${autonomy.active_freezes.length} change freeze(s)`}
       >
         <div className="space-y-2">
           <Rows
@@ -221,8 +221,8 @@ function BriefBody({
             ])}
           />
           <Rows
-            ariaLabel="Active freezes"
-            columns={["scope", "principal", "frozen", "decision"]}
+            ariaLabel="Active change freezes"
+            columns={["scope", "actor", "frozen", "decision"]}
             rows={autonomy.active_freezes.map((freeze) => [
               freeze.scope,
               freeze.principal,
@@ -362,10 +362,10 @@ function StatusLine({ brief }: { brief: BriefOutput }) {
   if (escalations.availability === "available" && escalations.pending.length > 0) {
     const plans = new Set(escalations.pending.map((entry) => entry.plan_id)).size;
     act.push(
-      `${plural(plans, "plan")} ${plans === 1 ? "waits" : "wait"} on you (${plural(escalations.total, "decision")})`,
+      `${plural(plans, "change")} ${plans === 1 ? "waits" : "wait"} on you (${plural(escalations.total, "decision")})`,
     );
   } else if (escalations.availability === "unavailable") {
-    unread.push("escalations");
+    unread.push("approval requests");
   }
 
   if (runs.availability === "available") {
@@ -385,17 +385,20 @@ function StatusLine({ brief }: { brief: BriefOutput }) {
     const degraded = autonomy.degraded_rules.length;
     if (freezes + degraded > 0) {
       act.push(
-        [freezes > 0 ? `${plural(freezes, "freeze")} in force` : null, degraded > 0 ? plural(degraded, "degraded rule") : null]
+        [
+          freezes > 0 ? `${plural(freezes, "change freeze")} in force` : null,
+          degraded > 0 ? plural(degraded, "degraded rule") : null,
+        ]
           .filter((part) => part !== null)
           .join(", "),
       );
     } else {
-      fine.push("no freeze, no degraded rule");
+      fine.push("no change freeze, no degraded rule");
     }
   } else if (autonomy.availability === "no_data") {
-    fine.push("no freeze, no degraded rule");
+    fine.push("no change freeze, no degraded rule");
   } else {
-    unread.push("autonomy");
+    unread.push("agent limits");
   }
 
   const lead =
@@ -475,7 +478,7 @@ function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
 
       {escalations.availability === "unavailable" && (
         <p className="r-row text-sm text-warn-ink">
-          Escalations: {NOT_RECORDED}
+          Approval requests: {NOT_RECORDED}
           {escalations.note ? `: ${escalations.note}` : ""}
         </p>
       )}
@@ -517,7 +520,7 @@ function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
                   </p>
                   {shared === null && <p className="text-sm text-ink-2">{own.join(" · ")}</p>}
                   <p className="text-xs text-muted">
-                    plan <CustodyLink subject={group.plan} clip /> · {plural(group.entries.length, "decision")} ·{" "}
+                    change <CustodyLink subject={group.plan} clip /> · {plural(group.entries.length, "decision")} ·{" "}
                     {formatInstant(latest, now)} ·{" "}
                     {group.entries.map((entry, index) => (
                       <span key={entry.decision_ref}>
@@ -537,7 +540,7 @@ function WaitingCard({ brief, now }: { brief: BriefOutput; now?: number }) {
                   // the writes that change something.
                   className={`${READ_BUTTON} shrink-0`}
                 >
-                  Review plan
+                  Review change
                   <ArrowRightIcon aria-hidden="true" className="size-4" />
                 </a>
               </li>
@@ -588,9 +591,10 @@ function EffectBar({ allow, review, deny }: { allow: number; review: number; den
   const total = allow + review + deny;
   if (total === 0) return null;
   const parts = [
-    { label: "allowed", count: allow, color: "bg-emerald-500" },
-    { label: "needed review", count: review, color: "bg-amber-500" },
-    { label: "denied", count: deny, color: "bg-red-500" },
+    { label: "allowed", count: allow, color: "bg-ok" },
+    { label: "needed approval", count: review, color: "bg-warn" },
+    // Blue, not red: a block is a policy working, not an error.
+    { label: "blocked", count: deny, color: "bg-block" },
   ];
   return (
     <div>

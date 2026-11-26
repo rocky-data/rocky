@@ -152,7 +152,7 @@ describe("DagPanel", () => {
 
   it("still names every node for a screen reader", async () => {
     render(<DagPanel dag={captured} compiled="unknown" onSelect={vi.fn()} />);
-    const list = await screen.findByRole("list", { name: "Models in the DAG" });
+    const list = await screen.findByRole("list", { name: "Models in the lineage" });
     expect(list.querySelectorAll("li")).toHaveLength(captured.nodes.length);
   });
 });
@@ -187,7 +187,7 @@ describe("DagPanel on a project the server compiled only part of", () => {
     expect(card.getAttribute("title")).toContain(NOT_COMPILED);
     expect(nodeElement(INSIDE).firstElementChild).not.toHaveClass("border-dashed");
 
-    const list = screen.getByRole("list", { name: "Models in the DAG" });
+    const list = screen.getByRole("list", { name: "Models in the lineage" });
     const items = [...list.querySelectorAll("li")].map((li) => li.textContent ?? "");
     expect(items.filter((text) => text.includes(NOT_COMPILED))).toEqual([
       expect.stringMatching(/^weekly_revenue \(layer/),

@@ -72,7 +72,7 @@ export function ProjectActions({
     <div className="space-y-1">
       <div className="flex flex-wrap items-start gap-2">
         <WriteButton
-          label={model === undefined ? "Plan" : "Plan this model"}
+          label={model === undefined ? "Plan a change" : "Plan a change to this model"}
           busy={jobBusy(plan.view)}
           disabledReason={planDisabledReason}
           onClick={() => plan.start(body)}
@@ -92,10 +92,10 @@ export function ProjectActions({
           <WriteButton label="CI" busy={jobBusy(ci.view)} onClick={() => ci.start({})} />
         )}
       </div>
-      <JobLine label={`Plan ${scope}`} view={plan.view} cancel={plan.cancel} />
+      <JobLine label={`Plan a change to ${scope}`} view={plan.view} cancel={plan.cancel} />
       {planned !== null && (
         <p className="text-xs text-zinc-600 dark:text-zinc-300">
-          Plan written:{" "}
+          Change written:{" "}
           <a
             href={reviewPath(planned)}
             onClick={(event) => {

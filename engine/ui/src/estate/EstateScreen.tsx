@@ -135,7 +135,7 @@ export function EstateScreen({
 
   return (
     <div className="space-y-8">
-      <ScreenHeader title="Estate" detail="The project, its models, and what ran.">
+      <ScreenHeader title="Project" detail="Its models, their lineage, and what ran.">
         <ProjectActions jobs={jobs} onDone={refreshAll} planDisabledReason={planReason} />
         <button type="button" onClick={refreshAll} className={READ_BUTTON}>
           <ArrowPathIcon aria-hidden="true" className="size-4" />
@@ -143,11 +143,11 @@ export function EstateScreen({
         </button>
       </ScreenHeader>
 
-      <Panel title="Project" producer="GET /api/v1/project">
+      <Panel title="Overview" producer="GET /api/v1/project">
         <Loaded resource={project}>{(value) => <ProjectStrip project={value} now={now} />}</Loaded>
       </Panel>
 
-      <Panel title="DAG" producer="GET /api/v1/dag + GET /api/v1/models">
+      <Panel title="Lineage" producer="GET /api/v1/dag + GET /api/v1/models">
         <Loaded resource={dag}>
           {(value) => (
             <div className={shown ? "grid gap-4 lg:grid-cols-[1fr_360px]" : ""}>
@@ -176,11 +176,11 @@ export function EstateScreen({
         </Loaded>
       </Panel>
 
-      <Panel title="Preview" producer="POST /api/v1/jobs/preview">
+      <Panel title="Create branch" producer="POST /api/v1/jobs/preview">
         <PreviewControls jobs={jobs} onDone={refreshAll} />
       </Panel>
 
-      <Panel title="Promote" producer="GET /api/v1/branches + POST /api/v1/jobs/promote">
+      <Panel title="Promote branch" producer="GET /api/v1/branches + POST /api/v1/jobs/promote">
         <PromoteControls
           approvalRequired={
             project.kind === "loading" ? undefined : project.kind === "ready" ? (project.value.branch_approval_required ?? null) : null
@@ -190,7 +190,7 @@ export function EstateScreen({
         />
       </Panel>
 
-      <Panel title="Compact" producer="POST /api/v1/jobs/compact">
+      <Panel title="Optimize tables" producer="POST /api/v1/jobs/compact">
         <CompactControls jobs={jobs} onDone={refreshAll} />
       </Panel>
 

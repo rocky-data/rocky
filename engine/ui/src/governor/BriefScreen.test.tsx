@@ -159,7 +159,7 @@ describe("BriefScreen", () => {
     // evaluations only.
     const freeze = within(activity).getByText("decision:act-3").closest("tr") as HTMLElement;
     expect(within(freeze).getByText("freeze")).toBeInTheDocument();
-    expect(within(activity).getByText(/2 policy evaluations: 1 allow/)).toBeInTheDocument();
+    expect(within(activity).getByText(/2 policy evaluations: 1 allowed/)).toBeInTheDocument();
 
     // A run that needs attention is acted on from the waiting card; the Runs
     // section keeps the counts and points there.
@@ -185,7 +185,7 @@ describe("BriefScreen", () => {
     expect(within(cost).getByText("run-cost-1")).toBeInTheDocument();
     expect(within(cost).getAllByText(NOT_RECORDED).length).toBeGreaterThanOrEqual(2);
 
-    const autonomy = screen.getByRole("region", { name: "Autonomy" });
+    const autonomy = screen.getByRole("region", { name: "Agent limits" });
     expect(within(autonomy).getByText("freeze:global")).toBeInTheDocument();
     expect(within(autonomy).getByText("rule 2")).toBeInTheDocument();
 
@@ -196,17 +196,17 @@ describe("BriefScreen", () => {
     expect(load).toHaveBeenCalledWith("7d");
   });
 
-  it("leads with one status sentence, a card per plan and an effect bar", async () => {
+  it("leads with one status sentence, a card per change and an effect bar", async () => {
     render(<BriefScreen load={async () => BRIEF} now={NOW} />);
     const summary = await screen.findByRole("region", { name: "Summary" });
     expect(summary.textContent).toBe(
-      "1 plan waits on you (1 decision), 1 run needs attention, 1 freeze in force, 1 degraded rule.",
+      "1 change waits on you (1 decision), 1 run needs attention, 1 change freeze in force, 1 degraded rule.",
     );
 
     // The card opens the plan in Review, and still cites its custody chain:
     // the link shows a cut id and keeps the whole one as its name.
     const needs = screen.getByRole("region", { name: "Waiting on you" });
-    expect(within(needs).getByRole("link", { name: "Review plan" })).toHaveAttribute(
+    expect(within(needs).getByRole("link", { name: "Review change" })).toHaveAttribute(
       "href",
       `/ui/review/${PLAN}`,
     );
@@ -215,7 +215,7 @@ describe("BriefScreen", () => {
 
     const activity = screen.getByRole("region", { name: "Agent activity" });
     expect(within(activity).getByRole("img")).toHaveAccessibleName(
-      "1 allowed, 1 needed review, 0 denied",
+      "1 allowed, 1 needed approval, 0 blocked",
     );
   });
 
@@ -238,13 +238,13 @@ describe("BriefScreen", () => {
     expect(within(needs).getByText("Shared cause of all 3 decisions:")).toBeInTheDocument();
     expect(within(needs).getAllByText("no rule matched; default_agent_effect")).toHaveLength(1);
     // One plan is one row, whatever the number of models it touches.
-    expect(within(needs).getAllByRole("link", { name: "Review plan" })).toHaveLength(1);
+    expect(within(needs).getAllByRole("link", { name: "Review change" })).toHaveLength(1);
     expect(within(needs).getByText("2 items · 1 shared cause")).toBeInTheDocument();
     for (const ref of ["decision:esc-0", "decision:esc-1", "decision:esc-2"]) {
       expect(within(needs).getByText(ref)).toBeInTheDocument();
     }
     expect((await screen.findByRole("region", { name: "Summary" })).textContent).toMatch(
-      /^1 plan waits on you \(3 decisions\)/,
+      /^1 change waits on you \(3 decisions\)/,
     );
   });
 
@@ -257,7 +257,7 @@ describe("BriefScreen", () => {
     };
     const { unmount } = render(<BriefScreen load={async () => quiet} now={NOW} />);
     expect((await screen.findByRole("region", { name: "Summary" })).textContent).toBe(
-      "Nothing needs you. 3 of 3 runs succeeded, no freeze, no degraded rule.",
+      "Nothing needs you. 3 of 3 runs succeeded, no change freeze, no degraded rule.",
     );
     expect(
       within(screen.getByRole("region", { name: "Waiting on you" })).getByText("You're all caught up"),
@@ -287,9 +287,9 @@ describe("BriefScreen", () => {
     );
     const summary = await screen.findByRole("region", { name: "Summary" });
     expect(summary.textContent).not.toMatch(/waits on you|Nothing needs you/);
-    expect(summary.textContent).toMatch(/Escalations: not recorded\./);
+    expect(summary.textContent).toMatch(/Approval requests: not recorded\./);
     expect(
-      within(screen.getByRole("region", { name: "Waiting on you" })).getByText(/^Escalations: not recorded/),
+      within(screen.getByRole("region", { name: "Waiting on you" })).getByText(/^Approval requests: not recorded/),
     ).toBeInTheDocument();
   });
 
@@ -305,7 +305,7 @@ describe("BriefScreen", () => {
       />,
     );
     const summary = await screen.findByRole("region", { name: "Summary" });
-    expect(summary.textContent).toBe("1 freeze in force, 1 degraded rule. No runs in the window.");
+    expect(summary.textContent).toBe("1 change freeze in force, 1 degraded rule. No runs in the window.");
   });
 
   it("renders a hostile reason as text, never as markup", async () => {
@@ -349,7 +349,7 @@ function fakeJobs(statuses: JobStatus[] = [job("freeze", "succeeded")]) {
   return { client, submitted };
 }
 
-describe("Freeze and unfreeze on the brief", () => {
+describe("Change freeze and lift on the brief", () => {
   const FROZEN = { principal: "agent", scope: "model=fct_*" };
 
   function renderBrief(access: WriteAccess, client: JobClient, load = vi.fn(async () => BRIEF)) {
@@ -364,43 +364,43 @@ describe("Freeze and unfreeze on the brief", () => {
   it("are disabled with the reason on a read-only page, and submit nothing", async () => {
     const { client, submitted } = fakeJobs();
     renderBrief(READ_ONLY, client);
-    const freeze = await screen.findByRole("button", { name: "Freeze" });
-    const unfreeze = screen.getByRole("button", { name: "Unfreeze agent on model=fct_*" });
+    const freeze = await screen.findByRole("button", { name: "Start change freeze" });
+    const unfreeze = screen.getByRole("button", { name: "Lift change freeze: agent on model=fct_*" });
     for (const button of [freeze, unfreeze]) {
       expect(button).toBeDisabled();
       expect(button).toHaveAttribute("title", READ_ONLY_REASON);
       fireEvent.click(button);
     }
-    expect(screen.queryByRole("button", { name: "Confirm freeze" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Confirm change freeze" })).toBeNull();
     expect(submitted).toEqual([]);
   });
 
-  it("freeze asks first, then submits only the fields that were filled in", async () => {
+  it("start change freeze asks first, then submits only the fields that were filled in", async () => {
     const { client, submitted } = fakeJobs([job("freeze", "succeeded")]);
     const load = renderBrief(OPERATOR, client);
-    await screen.findByRole("button", { name: "Freeze" });
+    await screen.findByRole("button", { name: "Start change freeze" });
 
     // The first press asks; Back drops the question and submits nothing.
-    fireEvent.click(screen.getByRole("button", { name: "Freeze" }));
-    expect(screen.getByText(/Freeze agent and human on every model\?/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Start change freeze" }));
+    expect(screen.getByText(/Start a change freeze for agent and human on every model\?/)).toBeInTheDocument();
     expect(submitted).toEqual([]);
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
-    expect(screen.queryByRole("button", { name: "Confirm freeze" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Confirm change freeze" })).toBeNull();
     expect(submitted).toEqual([]);
 
     // Nothing filled in: an empty body, which freezes both principals on every model.
-    fireEvent.click(screen.getByRole("button", { name: "Freeze" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
-    await screen.findByText("Freeze: done.", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Start change freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm change freeze" }));
+    await screen.findByText("Start change freeze: done.", {}, { timeout: 3000 });
     expect(submitted).toEqual([{ kind: "freeze", body: {} }]);
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
 
-    fireEvent.change(screen.getByLabelText("Principal"), { target: { value: "agent" } });
+    fireEvent.change(screen.getByLabelText("Actor"), { target: { value: "agent" } });
     fireEvent.change(screen.getByLabelText("Scope"), { target: { value: "  layer=gold " } });
     fireEvent.change(screen.getByLabelText("Reason"), { target: { value: " incident 42 " } });
-    fireEvent.click(screen.getByRole("button", { name: "Freeze" }));
-    expect(screen.getByText(/Freeze agent on layer=gold\?/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start change freeze" }));
+    expect(screen.getByText(/Start a change freeze for agent on layer=gold\?/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm change freeze" }));
     await waitFor(() =>
       expect(submitted.at(-1)).toEqual({
         kind: "freeze",
@@ -409,37 +409,37 @@ describe("Freeze and unfreeze on the brief", () => {
     );
   });
 
-  it("unfreeze asks first, then names the exact principal and scope of the freeze", async () => {
+  it("lift asks first, then names the exact actor and scope of the change freeze", async () => {
     const { client, submitted } = fakeJobs([job("unfreeze", "succeeded")]);
     renderBrief(OPERATOR, client);
-    fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
-    expect(screen.getByText("Lift the freeze on agent on model=fct_*? Those actions can run again.")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Lift change freeze: agent on model=fct_*" }));
+    expect(screen.getByText("Lift the change freeze on agent on model=fct_*? Those actions can run again.")).toBeInTheDocument();
     expect(submitted).toEqual([]);
-    fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
-    await screen.findByText("Unfreeze agent on model=fct_*: done.", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm lift" }));
+    await screen.findByText("Lift change freeze: agent on model=fct_*: done.", {}, { timeout: 3000 });
     expect(submitted).toEqual([{ kind: "unfreeze", body: FROZEN }]);
   });
 
-  it("shows a freeze that binds nothing as a warning, not as plain done", async () => {
+  it("shows a change freeze that binds nothing as a warning, not as plain done", async () => {
     const note =
       "freeze recorded but NOT enforced: no [policy] block configured in <path> Every enforcement seam short-circuits.";
     const { client } = fakeJobs([job("freeze", "succeeded", { result: { notes: [note] } })]);
     renderBrief(OPERATOR, client);
-    fireEvent.click(await screen.findByRole("button", { name: "Freeze" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
-    const headline = await screen.findByText("Freeze: recorded, but NOT enforced.", {}, { timeout: 3000 });
+    fireEvent.click(await screen.findByRole("button", { name: "Start change freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm change freeze" }));
+    const headline = await screen.findByText("Start change freeze: recorded, but NOT enforced.", {}, { timeout: 3000 });
     expect(headline).toHaveAttribute("role", "alert");
     expect(screen.getByText(note)).toBeInTheDocument();
-    expect(screen.queryByText("Freeze: done.")).toBeNull();
+    expect(screen.queryByText("Start change freeze: done.")).toBeNull();
   });
 
-  it("shows an unfreeze note verbatim, without a warning", async () => {
+  it("shows a lift note verbatim, without a warning", async () => {
     const note = "no matching active freeze markers to lift";
     const { client } = fakeJobs([job("unfreeze", "succeeded", { result: { notes: [note] } })]);
     renderBrief(OPERATOR, client);
-    fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
-    const headline = await screen.findByText("Unfreeze agent on model=fct_*: done.", {}, { timeout: 3000 });
+    fireEvent.click(await screen.findByRole("button", { name: "Lift change freeze: agent on model=fct_*" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm lift" }));
+    const headline = await screen.findByText("Lift change freeze: agent on model=fct_*: done.", {}, { timeout: 3000 });
     expect(headline).not.toHaveAttribute("role", "alert");
     expect(screen.queryByText(/nothing was lifted/)).toBeNull();
     expect(screen.getByText(note)).toBeInTheDocument();
@@ -450,18 +450,18 @@ describe("Freeze and unfreeze on the brief", () => {
     const notes = [1, null, { a: 1 }, "n1", "n2", "n3", "n4", "n5", "n6", long];
     const { client } = fakeJobs([job("freeze", "succeeded", { result: { notes } })]);
     renderBrief(OPERATOR, client);
-    fireEvent.click(await screen.findByRole("button", { name: "Freeze" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
-    await screen.findByText("Freeze: done.", {}, { timeout: 3000 });
-    const items = within(screen.getByRole("list", { name: "Freeze notes" })).getAllByRole("listitem");
+    fireEvent.click(await screen.findByRole("button", { name: "Start change freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm change freeze" }));
+    await screen.findByText("Start change freeze: done.", {}, { timeout: 3000 });
+    const items = within(screen.getByRole("list", { name: "Start change freeze notes" })).getAllByRole("listitem");
     expect(items.map((item) => item.textContent)).toEqual(["n1", "n2", "n3", "n4", "n5"]);
     const capped = fakeJobs([job("freeze", "succeeded", { result: { notes: [long] } })]);
     cleanup();
     renderBrief(OPERATOR, capped.client);
-    fireEvent.click(await screen.findByRole("button", { name: "Freeze" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm freeze" }));
-    await screen.findByText("Freeze: done.", {}, { timeout: 3000 });
-    const [item] = within(screen.getByRole("list", { name: "Freeze notes" })).getAllByRole("listitem");
+    fireEvent.click(await screen.findByRole("button", { name: "Start change freeze" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm change freeze" }));
+    await screen.findByText("Start change freeze: done.", {}, { timeout: 3000 });
+    const [item] = within(screen.getByRole("list", { name: "Start change freeze notes" })).getAllByRole("listitem");
     expect(item.textContent).toBe(`${"x".repeat(300)}…`);
   });
 
@@ -485,16 +485,16 @@ describe("Freeze and unfreeze on the brief", () => {
     const { client, submitted } = fakeJobs([job("unfreeze", "succeeded")]);
     renderBrief(OPERATOR, client, vi.fn(async () => brief));
     const name = "unreadable marker (agent and human) on every model";
-    const buttons = await screen.findAllByRole("button", { name: `Unfreeze ${name}` });
+    const buttons = await screen.findAllByRole("button", { name: `Lift change freeze: ${name}` });
     expect(buttons).toHaveLength(1);
     fireEvent.click(buttons[0]);
     expect(
       screen.getByText(
-        "Lift every unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again.",
+        "Lift every unreadable marker and every change freeze on scope any, for both agent and human? Those actions can run again.",
       ),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
-    await screen.findByText(`Unfreeze ${name}: done.`, {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm lift" }));
+    await screen.findByText(`Lift change freeze: ${name}: done.`, {}, { timeout: 3000 });
     expect(submitted).toEqual([{ kind: "unfreeze", body: { scope: "any" } }]);
   });
 
@@ -510,8 +510,8 @@ describe("Freeze and unfreeze on the brief", () => {
       cancel: vi.fn(),
     };
     renderBrief(OPERATOR, busy);
-    fireEvent.click(await screen.findByRole("button", { name: "Unfreeze agent on model=fct_*" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm unfreeze" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Lift change freeze: agent on model=fct_*" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm lift" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Another run, apply, approve, freeze, unfreeze, preview or product approval is already in progress");
 
     const failed = job("freeze", "failed", {

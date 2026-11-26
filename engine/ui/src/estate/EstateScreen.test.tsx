@@ -92,7 +92,7 @@ function loaders(overrides: Partial<EstateLoaders> = {}): EstateLoaders {
 describe("EstateScreen", () => {
   it("renders the playground's captured DAG and its newest run", async () => {
     render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
-    const list = await screen.findByRole("list", { name: "Models in the DAG" });
+    const list = await screen.findByRole("list", { name: "Models in the lineage" });
     const items = within(list)
       .getAllByRole("listitem")
       .map((item) => item.textContent ?? "");
@@ -101,7 +101,7 @@ describe("EstateScreen", () => {
     }
     const runs = await screen.findByRole("table", { name: "Runs" });
     const newest = capturedHistory.runs[0];
-    expect(within(runs).getAllByText(newest.status).length).toBeGreaterThan(0);
+    expect(within(runs).getAllByText("Succeeded").length).toBeGreaterThan(0);
     expect(within(runs).getAllByTitle(newest.run_id).length).toBeGreaterThan(0);
     expect(screen.getByText(`${capturedHistory.count} run(s) in the newest 50`)).toBeInTheDocument();
     expect(screen.getByText("No schedules configured")).toBeInTheDocument();
@@ -109,14 +109,14 @@ describe("EstateScreen", () => {
 
   it("keeps each panel's producer route in a tooltip, not on the page", async () => {
     render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
-    await screen.findByRole("list", { name: "Models in the DAG" });
+    await screen.findByRole("list", { name: "Models in the lineage" });
 
     // The route answers "where does this come from" for the reader who asks,
     // and costs nothing for the reader who does not. This is the idiom the
     // governor tabs already use.
     for (const [heading, route] of [
-      ["Project", "GET /api/v1/project"],
-      ["DAG", "GET /api/v1/dag + GET /api/v1/models"],
+      ["Overview", "GET /api/v1/project"],
+      ["Lineage", "GET /api/v1/dag + GET /api/v1/models"],
       ["Runs", "GET /api/v1/runs"],
       ["Schedule", "GET /api/v1/schedule + GET /api/v1/schedule/spool"],
     ]) {
@@ -165,7 +165,7 @@ describe("EstateScreen", () => {
         now={NOW}
       />,
     );
-    const list = await screen.findByRole("list", { name: "Models in the DAG" });
+    const list = await screen.findByRole("list", { name: "Models in the lineage" });
     const items = within(list)
       .getAllByRole("listitem")
       .map((item) => item.textContent ?? "");
@@ -210,16 +210,16 @@ describe("EstateScreen", () => {
 
   // #1900: the claims snapshot cannot see a demand still in the spool, so the
   // panel reads the spool too and shows what is waiting.
-  it("shows the webhook demands waiting in the spool", async () => {
+  it("shows the webhook triggers queued in the spool", async () => {
     const spool: ScheduleSpoolOutput = {
       ...emptySpool,
       counts: { pending: 3, skipped: 1, corrupt: 2 },
     };
     render(<EstateScreen loaders={loaders({ spool: async () => spool })} refreshMs={0} now={NOW} />);
-    const group = await screen.findByRole("group", { name: "Waiting webhook demands" });
+    const group = await screen.findByRole("group", { name: "Queued webhook triggers" });
     for (const [label, value] of [
-      ["waiting demands", "3"],
-      ["unreadable demands", "1"],
+      ["queued triggers", "3"],
+      ["unreadable triggers", "1"],
       ["quarantined", "2"],
     ]) {
       const card = within(group).getByText(label).closest("[data-tone]") as HTMLElement;
@@ -247,8 +247,8 @@ describe("EstateScreen", () => {
       />,
     );
     expect(await screen.findByText("spool_unreadable")).toBeInTheDocument();
-    expect(screen.queryByRole("group", { name: "Waiting webhook demands" })).toBeNull();
-    expect(screen.queryByText("waiting demands")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Queued webhook triggers" })).toBeNull();
+    expect(screen.queryByText("queued triggers")).toBeNull();
     expect(await screen.findByText("No schedules configured")).toBeInTheDocument();
   });
 
@@ -277,7 +277,7 @@ describe("EstateScreen", () => {
   describe("which models open", () => {
     /** The DAG list's line for one label, once it has rendered. */
     async function lineFor(label: string): Promise<string> {
-      const list = await screen.findByRole("list", { name: "Models in the DAG" });
+      const list = await screen.findByRole("list", { name: "Models in the lineage" });
       const line = within(list)
         .getAllByRole("listitem")
         .map((item) => item.textContent ?? "")
@@ -339,7 +339,7 @@ describe("EstateScreen", () => {
 
       /** The DAG list's line for one label, read synchronously. */
       function line(label: string): string {
-        const list = screen.getByRole("list", { name: "Models in the DAG" });
+        const list = screen.getByRole("list", { name: "Models in the lineage" });
         const found = within(list)
           .getAllByRole("listitem")
           .map((item) => item.textContent ?? "")
@@ -562,7 +562,7 @@ describe("EstateScreen", () => {
 
   it("opens a model's detail under the name the route can serve", async () => {
     render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
-    await screen.findByRole("list", { name: "Models in the DAG" });
+    await screen.findByRole("list", { name: "Models in the lineage" });
     // What the panel sends is covered in DagPanel.test.tsx, which renders the
     // real canvas. This covers the other half: what the pane does with the
     // name it is handed. The loader here answers only for a name the real
@@ -603,15 +603,15 @@ describe("The Promote panel on the estate", () => {
         now={NOW}
       />,
     );
-    const panel = await screen.findByRole("region", { name: "Promote" });
-    await within(panel).findByText(/Promote is not offered here/);
+    const panel = await screen.findByRole("region", { name: "Promote branch" });
+    await within(panel).findByText(/Promote branch is not offered here/);
     expect(panel.textContent).toContain("[branch.approval] required = true");
     expect(within(panel).queryByRole("button")).toBeNull();
   });
 
   it("says the config could not be read when the project does not say", async () => {
     render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
-    const panel = await screen.findByRole("region", { name: "Promote" });
+    const panel = await screen.findByRole("region", { name: "Promote branch" });
     await within(panel).findByText(/could not be read/);
     expect(within(panel).queryByRole("button")).toBeNull();
   });
@@ -624,9 +624,9 @@ describe("The Promote panel on the estate", () => {
         now={NOW}
       />,
     );
-    const panel = await screen.findByRole("region", { name: "Promote" });
+    const panel = await screen.findByRole("region", { name: "Promote branch" });
     await waitFor(() => expect(panel.textContent).not.toContain("Loading"));
-    expect(panel.textContent).not.toContain("Promote is not offered here");
+    expect(panel.textContent).not.toContain("Promote branch is not offered here");
     expect(panel.textContent).not.toContain("could not be read");
   });
 });
@@ -638,7 +638,7 @@ describe("ProjectStrip", () => {
     expect(screen.getByText("default (duckdb)")).toBeInTheDocument();
     expect(screen.getByText("/tmp/playground/rocky.toml")).toBeInTheDocument();
     expect(screen.getByText("1 diagnostics, 1 warnings")).toBeInTheDocument();
-    expect(screen.getByText(/Success · Manual · 2 model\(s\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Succeeded · Manual · 2 model\(s\)/)).toBeInTheDocument();
   });
 
   it("renders a hostile project name as text and a config error in the card", async () => {

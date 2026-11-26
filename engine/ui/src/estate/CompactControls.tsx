@@ -108,14 +108,14 @@ export function CompactControls({
   return (
     <div className="space-y-3">
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        Compacts tables in two steps. First a plan is written: it lists each table and the statements it would
-        run, and runs none. Then you apply that exact plan, which runs <code>OPTIMIZE</code> (rewrites small
+        Optimizes tables in two steps. First a change is planned: it lists each table and the statements it would
+        run, and runs none. Then you apply that exact change, which runs <code>OPTIMIZE</code> (rewrites small
         files) and <code>VACUUM</code> (removes stale data files) on the warehouse. This works on Databricks
         only. Archiving is not offered here: it deletes rows, so it stays a terminal step.
       </p>
       <div className="flex flex-wrap items-end gap-3">
         <fieldset className="flex flex-col gap-1 text-xs text-zinc-600 dark:text-zinc-300">
-          <legend className="sr-only">What to compact</legend>
+          <legend className="sr-only">What to optimize</legend>
           <label className="flex items-center gap-1.5">
             <input
               type="radio"
@@ -163,7 +163,7 @@ export function CompactControls({
           </label>
         )}
         <WriteButton
-          label="Plan compact"
+          label="Plan optimize tables"
           busy={planBusy}
           disabledReason={blocked}
           onClick={() => {
@@ -172,15 +172,15 @@ export function CompactControls({
           }}
         />
       </div>
-      {shown && <JobLine label="Plan compact" view={plan.view} cancel={plan.cancel} />}
+      {shown && <JobLine label="Plan optimize tables" view={plan.view} cancel={plan.cancel} />}
       {summary !== null && (
         <div className="space-y-2">
           <p className="text-xs text-emerald-700 dark:text-emerald-300">
-            Plan ready: {plural(summary.statementCount, "statement", "statements")} on{" "}
+            Change ready: {plural(summary.statementCount, "statement", "statements")} on{" "}
             {plural(summary.tables.length, "table", "tables")}
             {summary.targetSizeMb === null ? "" : `, target file size ${summary.targetSizeMb} MB`}. Nothing has run.
           </p>
-          <ul aria-label="Tables this plan compacts" className="list-disc space-y-0.5 pl-5">
+          <ul aria-label="Tables this change optimizes" className="list-disc space-y-0.5 pl-5">
             {summary.tables.map((name) => (
               <li key={name} className="break-all font-mono text-xs text-zinc-700 dark:text-zinc-200">
                 {name}
@@ -197,17 +197,17 @@ export function CompactControls({
           )}
           {summary.planId === null ? (
             <p role="alert" className="text-xs text-amber-800 dark:text-amber-300">
-              The command could not save this plan, so it cannot be applied from here.
+              The command could not save this change, so it cannot be applied from here.
             </p>
           ) : summary.tables.length === 0 ? (
             <p className="text-xs text-amber-800 dark:text-amber-300">
-              The plan lists no tables, so there is nothing to apply.
+              The change lists no tables, so there is nothing to apply.
             </p>
           ) : applied ? null : (
             <ConfirmedWrite
-              label="Compact"
+              label="Optimize tables"
               question={`Run OPTIMIZE and VACUUM on ${plural(summary.tables.length, "table", "tables")}: ${summary.tables.join(", ")}? This rewrites small files and removes stale data files in the warehouse, with this server's credentials. Rocky cannot undo it.`}
-              confirmLabel="Yes, compact these tables"
+              confirmLabel="Yes, optimize these tables"
               busy={applyBusy}
               onConfirm={() => {
                 setApplyingPlan(summary.planId);
@@ -217,10 +217,10 @@ export function CompactControls({
           )}
           {summary.planId !== null && (
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Applies plan <code className="font-mono">{summary.planId}</code> as written; it is not planned again.
+              Applies change <code className="font-mono">{summary.planId}</code> as written; it is not planned again.
             </p>
           )}
-          {applyShown && <JobLine label="Compact" view={apply.view} cancel={apply.cancel} />}
+          {applyShown && <JobLine label="Optimize tables" view={apply.view} cancel={apply.cancel} />}
         </div>
       )}
     </div>

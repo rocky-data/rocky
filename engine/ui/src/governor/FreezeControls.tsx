@@ -143,18 +143,18 @@ function UnfreezeRow({
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm text-zinc-700 dark:text-zinc-200">{name}</span>
         <ConfirmedWrite
-          label={`Unfreeze ${name}`}
+          label={`Lift change freeze: ${name}`}
           question={
             unreadable
-              ? "Lift every unreadable marker and every freeze on scope any, for both agent and human? Those actions can run again."
-              : `Lift the freeze on ${name}? Those actions can run again.`
+              ? "Lift every unreadable marker and every change freeze on scope any, for both agent and human? Those actions can run again."
+              : `Lift the change freeze on ${name}? Those actions can run again.`
           }
-          confirmLabel="Confirm unfreeze"
+          confirmLabel="Confirm lift"
           busy={jobBusy(unfreeze.view)}
           onConfirm={() => unfreeze.start(unfreezeBody(freeze))}
         />
       </div>
-      <FreezeJobLine label={`Unfreeze ${name}`} view={unfreeze.view} cancel={unfreeze.cancel} />
+      <FreezeJobLine label={`Lift change freeze: ${name}`} view={unfreeze.view} cancel={unfreeze.cancel} />
     </li>
   );
 }
@@ -189,18 +189,18 @@ export function FreezeControls({
   const target = `${principalWords(principal)} on ${scopeWords(scopeValue === "" ? "any" : scopeValue)}`;
   return (
     <section
-      aria-label="Freeze controls"
+      aria-label="Change freeze controls"
       className="space-y-3 rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900"
     >
-      <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Freeze</h3>
+      <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Change freeze</h3>
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
-        A freeze denies the matching actions until you lift it. It runs{" "}
-        <code>rocky policy freeze</code> on this server and records the server&apos;s principal id. The
-        ledger does not record that the freeze came from the browser.
+        A change freeze blocks the matching actions until you lift it. It runs{" "}
+        <code>rocky policy freeze</code> on this server and records the server&apos;s actor id. The
+        audit log does not record that the change freeze came from the browser.
       </p>
       <div className="flex flex-wrap items-end gap-3">
         <label className="flex flex-col gap-1 text-xs text-zinc-600 dark:text-zinc-300">
-          Principal
+          Actor
           <select
             value={principal}
             onChange={(event) => setPrincipal(event.target.value as FreezePrincipal)}
@@ -230,16 +230,16 @@ export function FreezeControls({
           />
         </label>
         <ConfirmedWrite
-          label="Freeze"
-          question={`Freeze ${target}? Matching actions are denied until you lift it.`}
-          confirmLabel="Confirm freeze"
+          label="Start change freeze"
+          question={`Start a change freeze for ${target}? Matching actions are blocked until you lift it.`}
+          confirmLabel="Confirm change freeze"
           busy={jobBusy(freeze.view)}
           onConfirm={() => freeze.start(body)}
         />
       </div>
-      <FreezeJobLine label="Freeze" view={freeze.view} cancel={freeze.cancel} />
+      <FreezeJobLine label="Start change freeze" view={freeze.view} cancel={freeze.cancel} />
       {freezes.length > 0 && (
-        <ul aria-label="Lift a freeze" className="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
+        <ul aria-label="Lift a change freeze" className="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
           {listedFreezes(freezes).map((entry) => (
             <UnfreezeRow
               key={`${entry.principal}|${entry.scope}|${entry.plan_id}`}
