@@ -87,6 +87,12 @@ Read routes return the same payloads as the matching CLI command, byte for byte.
 | `GET /api/v1/compliance` (`?env=`, `?exceptions_only=true`) | `rocky compliance --output json` | - |
 | `GET /api/v1/runs/{id}/replay-check` (`id` may be `latest`; `?model=`) | `rocky replay <id> --check --output json` | An unknown run is `404 run_not_found`. A `model` the run did not execute is `404 model_not_found`. |
 | `GET /api/v1/recipes/{hash}/history` (`?since=`) | `rocky history --recipe <hash> --output json` | - |
+| `GET /api/v1/catalog` | `rocky catalog --output json` | `generated_at`, `duration_ms`. It uses the server's own compile and every pipeline's column descriptions, and writes no `.rocky/catalog` files. A busy store is `503 engine_busy`, not a catalog with unknown run fields. It works with no `rocky.toml`. |
+| `GET /api/v1/packages` | `rocky package list --output json` | `lockfile` is relative to the project root. |
+| `GET /api/v1/hooks` | `rocky hooks list --output json` | Same payload. `webhooks` lists each endpoint with its URL cut to scheme and host. Each command shows its program only (`curl …`): arguments are never served. `rocky hooks list` prints the full command. `total` counts webhooks too. |
+| `GET /api/v1/retention` (`?model=`) | `rocky retention-status --output json` | Declared retention only, never `--drift`. An unknown `model` is `404 model_not_found`. |
+| `GET /api/v1/gc/derivable` (`?min_age_days=`) | `rocky gc --derivable --dry-run --output json` | Never writes a plan. |
+| `GET /api/v1/lint` | `rocky lint --output json` | Never `--fix`. It lints every pipeline's models directory. File paths are relative to the project root. |
 | `GET /api/v1/policy` | `rocky policy show --output json` | See below |
 
 To approve a plan, use `POST /api/v1/jobs/approve` or `rocky review <plan-id> --approve`.

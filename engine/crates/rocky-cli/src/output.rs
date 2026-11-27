@@ -6078,6 +6078,31 @@ pub struct ImportDbtFailure {
 pub struct HooksListOutput {
     pub hooks: Vec<HookEntry>,
     pub total: usize,
+    /// Configured `[hook.webhooks]` endpoints. Each URL is cut to its scheme
+    /// and host, because a webhook URL often carries a token in its path or
+    /// query. Empty for a project with no webhooks.
+    pub webhooks: Vec<WebhookEntry>,
+}
+
+/// One configured webhook in [`HooksListOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WebhookEntry {
+    pub event: String,
+    /// The endpoint's scheme and host only (`https://hooks.example.com`).
+    /// Never the path, query, port or credentials. A URL that does not parse
+    /// prints as `<redacted>`.
+    pub url: String,
+    pub method: String,
+    pub timeout_ms: u64,
+    pub on_failure: String,
+    /// Whether the webhook is fire-and-forget.
+    pub async_mode: bool,
+    pub retry_count: u32,
+    /// Names of the headers the webhook sets. Never their values.
+    pub header_keys: Vec<String>,
+    /// The preset the webhook was built from, when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
