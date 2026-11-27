@@ -12454,7 +12454,8 @@ mod tests {
             .replace("{name}", "probe_model")
             .replace("{column}", "probe_column")
             .replace("{id}", "probe_job")
-            .replace("{pipeline}", "probe_pipeline");
+            .replace("{pipeline}", "probe_pipeline")
+            .replace("{hash}", "probe_hash");
         format!("{base}{path}")
     }
 
