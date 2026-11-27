@@ -38,7 +38,7 @@
 //! transaction; the assertion that the error is the *planted* one guards
 //! against false-passing on a pre-execution API rejection.)
 //!
-//! Schemas use the `hc_iop_*` prefix per Hugo's Databricks/Snowflake
+//! Schemas use the `hc_iop_*` prefix per the Rocky project's Databricks/Snowflake
 //! convention; the per-run microsecond suffix isolates parallel runs.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

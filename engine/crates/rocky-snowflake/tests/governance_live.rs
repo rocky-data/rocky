@@ -14,7 +14,7 @@
 //! It also pins the #2405 contract: the schema is created with the dialect's
 //! quoted `create_schema_sql`, and the quoted governance SQL must find it.
 //!
-//! Schemas use the `hc_gov_*` prefix per Hugo's Snowflake convention; the
+//! Schemas use the `hc_gov_*` prefix per the Rocky project's Snowflake convention; the
 //! per-run microsecond suffix isolates parallel runs.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

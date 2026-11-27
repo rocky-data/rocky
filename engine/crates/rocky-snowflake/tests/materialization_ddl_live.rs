@@ -13,7 +13,7 @@
 //! treats the edition error as a skip (the DDL syntax can't be exercised on
 //! that edition) rather than a failure. Dynamic tables are GA on Standard.
 //!
-//! Schemas use the `hc_mat_*` prefix per Hugo's Snowflake convention; the
+//! Schemas use the `hc_mat_*` prefix per the Rocky project's Snowflake convention; the
 //! per-run microsecond suffix isolates parallel runs.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

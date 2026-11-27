@@ -10,7 +10,7 @@
 //!
 //! ## Trust boundary (#1943)
 //!
-//! `.rocky/plans/` is a trusted input. Ruled 2026-09-17: anyone who can write
+//! `.rocky/plans/` is a trusted input. Anyone who can write
 //! that directory can already write the project's models and its config,
 //! which decide more than a plan does, so the plans directory gets no
 //! narrower a trust boundary than the rest of the project.

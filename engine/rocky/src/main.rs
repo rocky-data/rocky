@@ -460,7 +460,7 @@ impl From<PolicyCapabilityArg> for rocky_core::config::PolicyCapability {
 }
 
 /// Every top-level `rocky` verb. `rocky --help` lists them in the groups in
-/// [`HELP_GROUPS`], with the core verbs first (RV5-P3).
+/// [`HELP_GROUPS`], with the core verbs first .
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
@@ -3842,7 +3842,7 @@ fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelSc
 /// to stop.
 const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The groups `rocky --help` shows, in order (RV5-P3, ruled 2026-10-04).
+/// The groups `rocky --help` shows, in order.
 ///
 /// The first group is the core verb set. Clap cannot group subcommands under
 /// headings, so [`with_grouped_help`] renders this table into the root help
