@@ -46071,6 +46071,187 @@ auto_create_schemas = true
         );
     }
 
+    /// The strategy lines of an `incremental` model that re-reads one day.
+    #[cfg(feature = "duckdb")]
+    const LOOKBACK: &str = "unique_key = [\"id\"]\nlookback = \"1 day\"\n";
+
+    /// A late row below the source `MAX(ts)`: `MAX(ts)` does not move.
+    #[cfg(feature = "duckdb")]
+    const LATE_ROW_BELOW_MAX: &str =
+        "INSERT INTO main.events VALUES (100, TIMESTAMP '2026-04-01 00:05:30')";
+
+    /// Run an `incremental` model on `occurred_at` (10 source rows) twice
+    /// under `gate`, applying `mutation` to the source between the runs.
+    /// Returns the second run's output, and the target's row count and
+    /// `MAX(occurred_at)` after it.
+    #[cfg(feature = "duckdb")]
+    async fn incremental_gate_after(
+        strategy_extra: &str,
+        gate: SkipGateConfig,
+        mutation: &str,
+    ) -> (RunOutput, i64, String) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement(
+                "CREATE TABLE main.events AS SELECT i AS id, \
+                 TIMESTAMP '2026-04-01' + INTERVAL (i * 60) SECOND AS occurred_at \
+                 FROM range(1, 11) AS t(i)",
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(
+            models_dir.join("inc.sql"),
+            "SELECT id, occurred_at FROM main.events\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("inc.toml"),
+            format!(
+                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"occurred_at\"\n\
+                 {strategy_extra}\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"inc\"\n"
+            ),
+        )
+        .unwrap();
+
+        let out1 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            gate,
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(built(&out1, "inc"), "first run must build (no baseline)");
+        assert_eq!(count_rows(&db, "inc").await, 10);
+
+        {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("mutation open");
+            a.execute_statement(mutation).await.unwrap();
+        }
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            gate,
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        let rows = count_rows(&db, "inc").await;
+        let max_ts = DuckDbWarehouseAdapter::open(&db)
+            .expect("max open")
+            .execute_query("SELECT CAST(MAX(occurred_at) AS VARCHAR) FROM main.inc")
+            .await
+            .unwrap()
+            .rows[0][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (out2, rows, max_ts)
+    }
+
+    /// Control: a plain `incremental` model's build never reads below the
+    /// target's watermark, so a late row below `MAX(ts)` leaves its output
+    /// unchanged and the `MAX(ts)` signal may skip it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_incremental_without_lookback_skips_on_unchanged_max() {
+        let (out2, rows, _) =
+            incremental_gate_after("", active_gate(false, 0), LATE_ROW_BELOW_MAX).await;
+        assert!(!built(&out2, "inc"), "unchanged MAX(ts) must skip");
+        assert_eq!(out2.tables_skipped, 1);
+        assert_eq!(rows, 10);
+    }
+
+    /// B3a: an `incremental` model with a `lookback` re-reads the rows below
+    /// the watermark, so a late row inside the window changes its output
+    /// while the source `MAX(ts)` stays put. The gate must not skip it on
+    /// `MAX(ts)`: it builds, and the late row reaches the target.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_incremental_with_lookback_builds_on_late_row_below_max() {
+        let (out2, rows, _) =
+            incremental_gate_after(LOOKBACK, active_gate(false, 0), LATE_ROW_BELOW_MAX).await;
+        assert!(
+            built(&out2, "inc"),
+            "a lookback model must not skip on an unchanged MAX(ts)"
+        );
+        assert_eq!(out2.tables_skipped, 0);
+        assert_eq!(
+            decision_for(&out2, "inc"),
+            Some((
+                crate::output::ModelDecision::Build,
+                "upstream data may have changed since last build"
+            )),
+        );
+        assert_eq!(
+            rows, 11,
+            "the late row inside the lookback window must land"
+        );
+    }
+
+    /// The same lookback model with the rowcount fallback on: a late row
+    /// moves `COUNT(*)`, so it builds, and the row lands.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_incremental_with_lookback_and_rowcount_builds_on_late_row() {
+        let (out2, rows, _) =
+            incremental_gate_after(LOOKBACK, active_gate(true, 0), LATE_ROW_BELOW_MAX).await;
+        assert!(built(&out2, "inc"), "a moved COUNT(*) must rebuild");
+        assert_eq!(rows, 11);
+    }
+
+    /// A moved `MAX(ts)` still means build for a lookback model, even when
+    /// `COUNT(*)` is unchanged and the rowcount fallback is on: an in-place
+    /// `UPDATE` that advances a row's timestamp. Without this, dropping the
+    /// `MAX(ts)` signal for lookback models would let `COUNT(*)` alone skip it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_incremental_with_lookback_builds_when_max_moves_and_count_does_not() {
+        let (out2, rows, max_ts) = incremental_gate_after(
+            LOOKBACK,
+            active_gate(true, 0),
+            "UPDATE main.events SET occurred_at = TIMESTAMP '2026-04-01 01:00:00' WHERE id = 5",
+        )
+        .await;
+        assert!(
+            built(&out2, "inc"),
+            "a moved MAX(ts) must rebuild even when COUNT(*) is unchanged"
+        );
+        assert_eq!(rows, 10);
+        assert_eq!(
+            max_ts, "2026-04-01 01:00:00",
+            "the updated row reaches the target"
+        );
+    }
+
+    /// Control for the lookback tests: with nothing changed and the rowcount
+    /// fallback on, a lookback model still skips. The builds above come from
+    /// the moved signal, not from lookback models never skipping.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_incremental_with_lookback_and_rowcount_skips_when_nothing_changed() {
+        let (out2, rows, _) = incremental_gate_after(
+            LOOKBACK,
+            active_gate(true, 0),
+            "CREATE TABLE main.unrelated AS SELECT 1 AS x",
+        )
+        .await;
+        assert!(!built(&out2, "inc"), "unchanged MAX(ts) and COUNT(*) skip");
+        assert_eq!(out2.tables_skipped, 1);
+        assert_eq!(rows, 10);
+    }
+
     /// A model whose `FROM` is a subquery hides its real upstreams from the
     /// lineage extractor (it records the opaque `(subquery)` marker). The gate
     /// cannot enumerate the true sources, so it must BUILD even when the
