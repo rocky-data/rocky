@@ -3,7 +3,7 @@ import type { AuditDecisionEntry, AuditOutput, PolicyEffect, PrincipalIdSource }
 import { apiGet } from "../api";
 import { EmptyState, ScreenHeader, StatusCard, TABLE } from "../components";
 import { useResource } from "../estate/useResource";
-import { effectLabel, formatInstant } from "../format";
+import { formatInstant } from "../format";
 import { auditPath, navigateTo, pathForLane } from "../router";
 import { CustodyLink } from "./links";
 
@@ -46,7 +46,7 @@ interface Group {
   id: string | null;
   key: string;
   rows: AuditDecisionEntry[]; // newest first
-  /** Distinct change ids; a row with no plan id counts as one request. */
+  /** Distinct change ids; a row with no plan id, and each draft row, counts as one request. */
   requests: number;
   allow: number;
   review: number;
@@ -56,9 +56,22 @@ interface Group {
 /** A drift change that `rocky run` applied on its own files its decision under `autoapply:<run id>`. */
 const AUTO_APPLY_PREFIX = "autoapply:";
 
+/** Past tense: the row records what the policy decided, not what is pending. */
+const OUTCOME_WORDS: Record<PolicyEffect, string> = {
+  allow: "Allowed",
+  require_review: "Needed approval",
+  deny: "Blocked",
+};
+
 const EFFECT_RANK: Record<PolicyEffect, number> = { allow: 0, require_review: 1, deny: 2 };
 
-/** The rows of one change: one decision per model it touches. */
+/**
+ * The MCP draft gates write one plan id per model, such as `draft:<model>` or
+ * `draft-check:<model>`. The id names a model, not a change, so each such row is its own request.
+ */
+const DRAFT_ID = /^draft(-[a-z]+)?:/;
+
+/** The rows of one change: usually one decision per model it touches. */
 interface Request {
   planId: string | null;
   rows: AuditDecisionEntry[];
@@ -71,11 +84,12 @@ function requestsOf(rows: AuditDecisionEntry[]): Request[] {
   const out: Request[] = [];
   for (const row of rows) {
     const planId = row.plan_id ? row.plan_id : null;
-    let request = planId === null ? undefined : byPlan.get(planId);
+    const merges = planId !== null && !DRAFT_ID.test(planId);
+    let request = merges ? byPlan.get(planId) : undefined;
     if (!request) {
       request = { planId, rows: [], newest: row.timestamp, worst: row.effect };
       out.push(request);
-      if (planId !== null) byPlan.set(planId, request);
+      if (merges) byPlan.set(planId, request);
     }
     request.rows.push(row);
     if (Date.parse(row.timestamp) > Date.parse(request.newest)) request.newest = row.timestamp;
@@ -116,7 +130,9 @@ function buildGroups(rows: AuditDecisionEntry[]): Group[] {
       deny: sorted.filter((r) => r.effect === "deny").length,
     });
   }
-  return groups.sort((a, b) => b.rows.length - a.rows.length || idLabel(a).localeCompare(idLabel(b)));
+  return groups.sort(
+    (a, b) => b.requests - a.requests || b.rows.length - a.rows.length || idLabel(a).localeCompare(idLabel(b)),
+  );
 }
 
 function namedBy(group: Group): string | null {
@@ -135,9 +151,10 @@ function plural(n: number, one: string, many: string): string {
 }
 
 /**
- * The agents tab, from `GET /api/v1/audit?since=<N>d`: the callers that are not
- * people and asked to change something. Only an `evaluation` row of an `agent`
- * principal is a request with a policy verdict. A name is self-asserted.
+ * The agents tab, from `GET /api/v1/audit?since=<N>d`: the requests Rocky's policy
+ * gated as an agent. A person can appear here: backfill, gc and AI-authored plans
+ * are always gated as agents. Only an `evaluation` row of an `agent` principal is
+ * a request with a policy verdict. A name is a self-asserted label.
  */
 export function AgentsScreen({ load = defaultAgentsLoader, now }: { load?: AgentsLoader; now?: number }) {
   const [days, setDays] = useState(7);
@@ -148,7 +165,7 @@ export function AgentsScreen({ load = defaultAgentsLoader, now }: { load?: Agent
     <div className="space-y-4">
       <ScreenHeader
         title="Agents"
-        detail="Callers that are not people and asked to change something, from the audit log."
+        detail="Requests that Rocky's policy gated as an agent, from the audit log. A person can appear here: backfill, gc and AI-authored plans are always gated as agents."
       >
         <div className="flex items-center gap-2">
           <label className="text-sm text-ink-2" htmlFor="agents-window">
@@ -171,7 +188,8 @@ export function AgentsScreen({ load = defaultAgentsLoader, now }: { load?: Agent
       <div className="rounded-md border border-line bg-surface-2 px-4 py-3 text-sm text-ink-2">
         <strong className="font-semibold text-ink">Names are self-asserted.</strong> An agent names itself with{" "}
         <code>ROCKY_PRINCIPAL_ID</code>, a flag or its MCP profile. Rocky records the name but does not verify it
-        yet. Treat a name as a label, not a proof.
+        yet. Treat a name as a label, not a proof. Many agents can share one name: default MCP agents all use{" "}
+        <code>mcp-default</code>.
       </div>
       {audit.kind === "loading" && <p className="text-sm text-muted">Loading agents…</p>}
       {audit.kind === "refused" && (
@@ -224,7 +242,7 @@ function AgentsBody({ audit, days, now }: { audit: AuditOutput; days: number; no
           value={allRequests.length}
           sub={`${plural(requests.length, "gate decision", "gate decisions")}, one per model`}
         />
-        <Stat label="Needed approval" value={needed} sub="requests with a decision that needed approval" />
+        <Stat label="Needed approval" value={needed} sub="requests whose worst outcome was needing approval" />
         <Stat label="Rows with no name" value={nameless} sub={'named "unnamed", or written before names'} />
       </div>
       <div className={TABLE.scroller}>
@@ -252,15 +270,18 @@ function AgentsBody({ audit, days, now }: { audit: AuditOutput; days: number; no
         </table>
       </div>
       <p className="text-xs text-muted">
-        One request writes one decision per model it touches. A schema drift that <code>rocky run</code> applies on
-        its own is recorded as an agent decision too, under a plan id that starts with <code>autoapply:</code>.
+        One request usually writes one decision per model it touches. Drift decisions <code>rocky run</code> made on
+        its own, applied or refused, are recorded as agent decisions too, under a plan id that starts with{" "}
+        <code>autoapply:</code>.
         {autoApplied > 0
           ? ` This page leaves ${plural(autoApplied, "such decision", "such decisions")} out.`
           : " This page leaves those out."}
       </p>
       <p className="text-xs text-muted">
         Decisions about the same change, including retries, count as one request; it shows the worst outcome. A
-        change whose decisions carry two names counts under each name.
+        change whose decisions carry two names counts under each name. Draft plan ids name a model, not a change,
+        so each draft decision counts as its own request. An outcome is the policy decision at the time. A later
+        approval is not shown here: see Trace.
       </p>
       <AgentDetail key={selected.key} group={selected} days={days} now={now} />
       <p className="text-xs text-muted">
@@ -450,7 +471,7 @@ function AgentDetail({ group, days, now }: { group: Group; days: number; now?: n
                   <span className="font-mono">{models.join(", ")}</span>
                 </span>
                 <span className={`rounded-chip px-2 py-0.5 text-xs font-medium ${EFFECT_PILL[request.worst]}`}>
-                  {effectLabel(request.worst)}
+                  {OUTCOME_WORDS[request.worst]}
                 </span>
                 {request.planId !== null && <CustodyLink subject={request.planId} />}
               </li>

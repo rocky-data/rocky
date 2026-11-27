@@ -139,21 +139,23 @@ Oversight answers "what did the agents do, and was it allowed?" It has four tabs
 | Tab | Shows | Matches |
 |---|---|---|
 | Agent activity | Allowed, needed-approval and blocked rates for a window. Group by actor, rule or model decided on. Lists the metrics the audit log cannot support, with the reason. | `rocky audit --scorecard` |
-| Agents | Each agent that asked to change something, from the audit log: how it was named, its requests (one per change) and their outcomes. | `rocky audit` |
+| Agents | Requests that Rocky's policy gated as an agent, from the audit log: how each name was given, its requests (one per change) and their outcomes. A person can appear here too. | `rocky audit` |
 | Trace | Every recorded decision about a subject: a model, a run id, a change id, or another recorded id such as `freeze:global`. Shows its decisions, change, applying runs, post-apply checks and impact. | `rocky audit --for <subject>` |
 | Audit log | The whole policy decision log, oldest first. Filter to one data product. | `rocky audit`, `rocky audit --product <name>` |
 
 ### Agents
 
-The Agents tab lists each caller that is not a person and asked to change something. It reads the audit log for the last 1, 7 or 30 days. One row is one agent: how it was named, how many requests it made and how they ended (allowed, needed approval, blocked).
+The Agents tab lists the requests that Rocky's policy gated as an agent. It reads the audit log for the last 1, 7 or 30 days. A person can appear here: backfill, gc and AI-authored plans are always gated as agents, even when a person applies them. Each row is one name: how it was named, how many requests it made and how they ended (allowed, needed approval, blocked).
 
-A request is one change, found by its plan id. A change that touches several models writes one gate decision per model, so the Requests column shows both counts. The outcome bar counts decisions. Decisions about the same change, retries included, count as one request, which shows its worst outcome. A change whose decisions carry two names counts under each name. Under the table, the Audit log link opens the whole log. The detail panel shows the `rocky audit --actor <id> --since <N>d` command that lists one agent's rows.
+A request is one change, found by its plan id. A change that touches several models usually writes one gate decision per model, so the Requests column shows both counts. A draft plan id such as `draft:<model>` names a model, not a change, so each draft decision counts as its own request. The outcome bar counts decisions. Decisions about the same change, retries included, count as one request, which shows its worst outcome. A change whose decisions carry two names counts under each name. Under the table, the Audit log link opens the whole log. The detail panel shows the `rocky audit --actor <id> --since <N>d` command that lists one agent's rows.
 
-Names are self-asserted. An agent names itself with `ROCKY_PRINCIPAL_ID`, a flag or its MCP profile. Rocky records the name but does not verify it. Treat a name as a label, not a proof. Rows with no name show as `unnamed` or `unrecorded`.
+Names are self-asserted. An agent names itself with `ROCKY_PRINCIPAL_ID`, a flag or its MCP profile. Rocky records the name but does not verify it. Treat a name as a label, not a proof: many agents can share one name, and default MCP agents all use `mcp-default`. Rows with no name show as `unnamed` or `unrecorded`.
+
+An outcome is the policy decision when the request was made. A later approval is not shown here: see the Trace tab. The Needed approval count covers requests whose worst outcome was needing approval.
 
 The audit log does not record an agent's channel yet, so the Channel column shows a dash, with that reason as its tooltip. Rules and change freezes act on all agents as a class, never on one name.
 
-When `rocky run` applies a schema drift on its own, the audit log records it as an agent decision too, under a plan id that starts with `autoapply:`. The tab leaves those decisions out and says how many.
+The audit log also records the drift decisions `rocky run` made on its own, applied or refused, as agent decisions, under a plan id that starts with `autoapply:`. The tab leaves those decisions out and says how many.
 
 ![The Trace tab for the model revenue_daily: a table of twelve policy decisions, agent proposals and breaking-change evaluations and the human approvals that applied them](/ui-governor-custody.png)
 

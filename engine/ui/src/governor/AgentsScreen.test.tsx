@@ -50,7 +50,7 @@ describe("AgentsScreen", () => {
   it("counts only agent evaluation rows in the stat cards", async () => {
     render(<AgentsScreen load={async () => AUDIT} now={NOW} />);
     await screen.findByRole("table", { name: "Agents" });
-    const card = (label: string) => screen.getByText(label).parentElement as HTMLElement;
+    const card = (label: string) => screen.getByText(label, { selector: "div" }).parentElement as HTMLElement;
     expect(within(card("Distinct names")).getByText("2")).toBeInTheDocument();
     // 7 single-model requests plus plan-m1; autoapply, freeze and verify rows are out.
     const requests = card("Agent requests");
@@ -101,7 +101,13 @@ describe("AgentsScreen", () => {
     // plan-m1: one deny row and one allow row show the worst outcome.
     expect(within(merged[0]).getByText("Blocked")).toBeInTheDocument();
     const recent = within(first).getByRole("list", { name: "Recent requests" });
-    expect(within(recent).getByText("Needs approval")).toBeInTheDocument();
+    expect(within(recent).getByText("Needed approval")).toBeInTheDocument();
+    for (const pill of within(recent).getAllByText("Blocked")) {
+      expect(pill.className).toContain("bg-block-soft");
+      expect(pill.className).toContain("text-block-ink");
+      expect(pill.className).not.toMatch(/fail|red/);
+    }
+    expect(screen.getByText(/A later approval is not shown here/)).toBeInTheDocument();
     expect(within(recent).getAllByText("Allowed").length).toBeGreaterThan(0);
     expect(within(recent).getAllByText("Blocked")).toHaveLength(2);
     expect(within(recent).getByRole("link", { name: "plan-a2" })).toHaveAttribute(
@@ -130,6 +136,57 @@ describe("AgentsScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show all 7" }));
     expect(within(list).getAllByRole("listitem")).toHaveLength(7);
     expect(within(list).getByRole("link", { name: "plan-z0" })).toBeInTheDocument();
+  });
+
+  it("counts each draft row as its own request, with its own outcome", async () => {
+    const drafts = [
+      entry({ plan_id: "draft:orders", effect: "deny", timestamp: "2026-09-05T01:00:00Z" }),
+      entry({ plan_id: "draft:orders", effect: "allow", timestamp: "2026-09-05T02:00:00Z" }),
+    ];
+    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: drafts })} now={NOW} />);
+    const region = await screen.findByRole("region", { name: "Agent claude-dev" });
+    const items = within(within(region).getByRole("list", { name: "Recent requests" })).getAllByRole("listitem");
+    expect(items).toHaveLength(2);
+    expect(within(items[0]).getByText("Allowed")).toBeInTheDocument();
+    expect(within(items[1]).getByText("Blocked")).toBeInTheDocument();
+    const card = screen.getByText("Agent requests").parentElement as HTMLElement;
+    expect(within(card).getByText("2")).toBeInTheDocument();
+  });
+
+  it("says not verified when any row in the group is unverified", async () => {
+    const rows = [
+      entry({ plan_id: "plan-v1", principal_id_verified: true }),
+      entry({ plan_id: "plan-v2", principal_id_verified: false }),
+    ];
+    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: rows })} now={NOW} />);
+    const region = await screen.findByRole("region", { name: "Agent claude-dev" });
+    expect(within(region).getByText(/· not verified/)).toBeInTheDocument();
+  });
+
+  it("counts one plan under each of two names", async () => {
+    const rows = [
+      entry({ plan_id: "plan-s", principal_id: "alpha" }),
+      entry({ plan_id: "plan-s", principal_id: "beta", model: "customers" }),
+    ];
+    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: rows })} now={NOW} />);
+    const table = await screen.findByRole("table", { name: "Agents" });
+    const body = within(table).getAllByRole("row").slice(1);
+    expect(body).toHaveLength(2);
+    for (const row of body) expect(within(row).getAllByRole("cell")[3]).toHaveTextContent("1(1 decision)");
+  });
+
+  it("shows a request with a review row and a deny row as Blocked, not as needing approval", async () => {
+    const rows = [
+      entry({ plan_id: "plan-q", effect: "require_review", timestamp: "2026-09-05T01:00:00Z" }),
+      entry({ plan_id: "plan-q", effect: "deny", model: "customers", timestamp: "2026-09-05T02:00:00Z" }),
+    ];
+    render(<AgentsScreen load={async () => ({ ...AUDIT, decisions: rows })} now={NOW} />);
+    const region = await screen.findByRole("region", { name: "Agent claude-dev" });
+    const items = within(within(region).getByRole("list", { name: "Recent requests" })).getAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(within(items[0]).getByText("Blocked")).toBeInTheDocument();
+    const card = screen.getByText("Needed approval", { selector: "div" }).parentElement as HTMLElement;
+    expect(within(card).getByText("0")).toBeInTheDocument();
   });
 
   it("says what was left out when only drift auto-apply rows exist", async () => {
