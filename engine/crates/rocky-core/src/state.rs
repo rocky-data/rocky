@@ -9104,6 +9104,29 @@ impl StateStore {
         Ok(count)
     }
 
+    /// The [`Self::refcount_for_hash`] answer for every hash in the ledger,
+    /// in one pass over the table.
+    ///
+    /// A caller that needs the count for many hashes must use this: calling
+    /// `refcount_for_hash` per hash scans the whole table each time, so the
+    /// work grows with the square of the ledger.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::refcount_for_hash`]; callers in a VACUUM path
+    /// should treat them as "do not delete".
+    pub fn artifact_refcounts(&self) -> Result<std::collections::HashMap<String, u64>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+            *counts.entry(record.blake3_hash).or_default() += 1;
+        }
+        Ok(counts)
+    }
+
     // -----------------------------------------------------------------------
     // Branches (schema-prefix virtual branches)
     // -----------------------------------------------------------------------

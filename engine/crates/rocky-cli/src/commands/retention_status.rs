@@ -62,26 +62,27 @@ pub async fn run_retention_status(
     // exit 0 (#1428).
     check_model_filter(&compile.project.models, model_filter)?;
 
-    let mut rows: Vec<ModelRetentionStatus> = Vec::new();
-    for model in &compile.project.models {
-        if model_filter.is_some_and(|name| model.config.name != name) {
-            continue;
+    // The declaration-only path is the very function the HTTP route calls.
+    let mut rows: Vec<ModelRetentionStatus> = match probe_ctx.as_ref() {
+        None => retention_declared_output(&compile.project.models, model_filter)?.models,
+        Some(ctx) => {
+            let mut rows = Vec::new();
+            for model in &compile.project.models {
+                if model_filter.is_some_and(|name| model.config.name != name) {
+                    continue;
+                }
+                let configured = model.config.retention.map(|r| r.duration_days);
+                let warehouse_days = probe_model_retention(ctx, model).await;
+                rows.push(ModelRetentionStatus {
+                    model: model.config.name.clone(),
+                    configured_days: configured,
+                    warehouse_days,
+                    in_sync: compute_in_sync(configured, warehouse_days),
+                });
+            }
+            rows
         }
-        let configured = model.config.retention.map(|r| r.duration_days);
-
-        let warehouse_days = if let Some(ctx) = probe_ctx.as_ref() {
-            probe_model_retention(ctx, model).await
-        } else {
-            None
-        };
-
-        rows.push(ModelRetentionStatus {
-            model: model.config.name.clone(),
-            configured_days: configured,
-            warehouse_days,
-            in_sync: compute_in_sync(configured, warehouse_days),
-        });
-    }
+    };
 
     if drift {
         // Keep the existing UX of limiting --drift output to models with a

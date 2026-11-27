@@ -106,6 +106,44 @@ pub fn run_lint(config_path: &Path, paths: &[PathBuf], fix: bool, json: bool) ->
     Ok(())
 }
 
+/// The directories the server reads models from, absolute: every
+/// transformation pipeline's existing models directory, as the server's own
+/// compile reads them (#2011). An explicit `--models`, or a project with no
+/// such pipeline, gives `models_dir` alone.
+pub(crate) fn served_model_roots(
+    config: Option<&rocky_core::config::RockyConfig>,
+    config_path: Option<&Path>,
+    models_dir: &Path,
+    models_dir_is_explicit: bool,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let (false, Some(config), Some(config_path)) = (models_dir_is_explicit, config, config_path)
+    {
+        for tx in config
+            .pipelines
+            .values()
+            .filter_map(|pipeline| pipeline.as_transformation())
+        {
+            if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
+                crate::models_loader::locate_models_dir(&tx.models, config_path)
+            {
+                roots.push(dir);
+            }
+        }
+    }
+    if roots.is_empty() {
+        roots.push(models_dir.to_path_buf());
+    }
+    let mut absolute: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let root = std::path::absolute(&root).unwrap_or(root);
+        if !absolute.contains(&root) {
+            absolute.push(root);
+        }
+    }
+    absolute
+}
+
 /// The `rocky lint` report for `paths`, without `--fix`.
 ///
 /// Pure: it reads the `.sql` files under `paths` and rewrites nothing.

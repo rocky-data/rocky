@@ -273,7 +273,7 @@ pub(crate) fn classify_model(
 /// SQL parsing) and touches no store, so the HTTP route can run it after the
 /// store is dropped, and `rocky gc` can run it against the live store with
 /// the same verdicts.
-fn classify_model_from<'r>(
+pub(crate) fn classify_model_from<'r>(
     model_name: &str,
     provenance: Result<Option<ProvenanceRecord>, String>,
     run: &dyn Fn() -> Option<std::borrow::Cow<'r, RunRecord>>,

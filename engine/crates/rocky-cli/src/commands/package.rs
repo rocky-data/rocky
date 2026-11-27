@@ -1327,8 +1327,7 @@ fn run_dbt(
 /// # Errors
 ///
 /// An `E055` error when the lockfile cannot be read.
-pub(crate) fn compute_package_list(config_path: &Path) -> Result<PackageListOutput> {
-    let root = project_root(config_path);
+pub(crate) fn compute_package_list(root: &Path) -> Result<PackageListOutput> {
     let lock_path = root.join(LOCKFILE_NAME);
     let lock = PackagesLock::read(&lock_path).map_err(e055)?;
     let mut entries = Vec::new();
@@ -1378,8 +1377,9 @@ pub(crate) fn compute_package_list(config_path: &Path) -> Result<PackageListOutp
 
 /// Execute `rocky package list`.
 pub fn run_package_list(config_path: &Path, output_json: bool) -> Result<()> {
-    let lock_path = project_root(config_path).join(LOCKFILE_NAME);
-    let mut output = compute_package_list(config_path)?;
+    let root = project_root(config_path);
+    let lock_path = root.join(LOCKFILE_NAME);
+    let mut output = compute_package_list(&root)?;
     let entries = &output.packages;
     if output_json {
         output.lockfile = lock_path.display().to_string();

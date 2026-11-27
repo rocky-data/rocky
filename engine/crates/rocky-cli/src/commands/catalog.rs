@@ -205,8 +205,8 @@ pub fn compute_catalog_output(
     build_catalog_output(
         &result,
         rocky_cfg.as_ref(),
-        config_path,
-        models_dir,
+        Some(config_path),
+        std::slice::from_ref(&models_dir.to_path_buf()),
         facts.as_ref(),
         started,
     )
@@ -216,7 +216,10 @@ pub fn compute_catalog_output(
 /// the server already compiled, with the run history already read.
 ///
 /// Compiles nothing, reads no state store and writes nothing. It reads the
-/// config, the sidecar column docs and the config bytes (for the hash).
+/// config, the sidecar column docs of every model root and the config bytes
+/// (for the hash). With no `rocky.toml` the catalog still builds, as the CLI
+/// builds it: the project is called `unknown` and the config hash is
+/// `unknown`.
 /// Unlike the CLI, the route needs the run history to be there: a busy store
 /// is the caller's `503`, never a catalog with unknown run fields.
 ///
@@ -226,17 +229,29 @@ pub fn compute_catalog_output(
 /// [`rocky_core::config::ConfigError`].
 pub(crate) fn catalog_output_from_compiled(
     result: &CompileResult,
-    config_path: &Path,
+    config_path: Option<&Path>,
     models_dir: &Path,
+    models_dir_is_explicit: bool,
     facts: &CatalogRunFacts,
 ) -> Result<CatalogOutput> {
-    let rocky_cfg = rocky_core::config::load_optional_project_config(Some(config_path))
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let rocky_cfg =
+        rocky_core::config::load_optional_project_config(config_path).with_context(|| {
+            format!(
+                "failed to load config from {}",
+                config_path.unwrap_or(Path::new("rocky.toml")).display()
+            )
+        })?;
+    let roots = super::lint::served_model_roots(
+        rocky_cfg.as_ref(),
+        config_path,
+        models_dir,
+        models_dir_is_explicit,
+    );
     build_catalog_output(
         result,
         rocky_cfg.as_ref(),
         config_path,
-        models_dir,
+        &roots,
         Some(facts),
         Instant::now(),
     )
@@ -275,14 +290,22 @@ pub(crate) fn read_run_facts_request_scoped(state_path: &Path) -> Result<Catalog
 fn build_catalog_output(
     result: &CompileResult,
     rocky_cfg: Option<&rocky_core::config::RockyConfig>,
-    config_path: &Path,
-    models_dir: &Path,
+    config_path: Option<&Path>,
+    model_roots: &[PathBuf],
     run_facts: Option<&CatalogRunFacts>,
     started: Instant,
 ) -> Result<CatalogOutput> {
     // Per-column descriptions from sidecar `[columns]` tables (best-effort).
-    let column_docs =
-        rocky_core::models::load_column_docs_from_tree(models_dir).unwrap_or_default();
+    // Every model root contributes, so an asset from a second pipeline
+    // keeps its descriptions. The first root to name a model wins.
+    let mut column_docs: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for root in model_roots {
+        for (model, columns) in
+            rocky_core::models::load_column_docs_from_tree(root).unwrap_or_default()
+        {
+            column_docs.entry(model).or_insert(columns);
+        }
+    }
 
     // 3. Resolve project name from the config (first pipeline if multi).
     let project_name = match rocky_cfg {
@@ -473,7 +496,7 @@ fn build_catalog_output(
         duration_ms: started.elapsed().as_millis() as u64,
     };
 
-    let config_hash = config_fingerprint(config_path);
+    let config_hash = config_path.map_or_else(|| "unknown".to_string(), config_fingerprint);
 
     Ok(CatalogOutput {
         version: VERSION.to_string(),

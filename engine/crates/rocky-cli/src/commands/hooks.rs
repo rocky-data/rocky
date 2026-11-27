@@ -143,10 +143,12 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
 /// only, runs no hook and calls no endpoint.
 pub(crate) fn hooks_list_output(registry: &HookRegistry) -> HooksListOutput {
     let hooks = hook_entries(registry);
+    let webhooks = webhook_entries(registry);
     HooksListOutput {
-        total: hooks.len(),
+        // Shell hooks and webhooks together, as `rocky hooks list` counts.
+        total: hooks.len() + webhooks.len(),
         hooks,
-        webhooks: webhook_entries(registry),
+        webhooks,
     }
 }
 
@@ -157,11 +159,19 @@ fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
         for hook in registry.hooks_for(event) {
             entries.push(HookEntry {
                 event: event.config_key().to_string(),
-                // A resolved `${VAR}` value prints as `${NAME}` (#1919).
-                command: rocky_core::secret_registry::render_placeholders(&hook.command),
+                // A resolved `${VAR}` value prints as `${NAME}` (#1919). A
+                // literal URL is cut to scheme and host, and a bearer or
+                // token value is withheld: a command often carries one.
+                command: redact_command(&rocky_core::secret_registry::render_placeholders(
+                    &hook.command,
+                )),
                 timeout_ms: hook.timeout_ms,
                 on_failure: format!("{:?}", hook.on_failure),
-                env_keys: hook.env.keys().cloned().collect(),
+                env_keys: {
+                    let mut keys: Vec<String> = hook.env.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                },
             });
         }
     }
@@ -195,9 +205,11 @@ fn webhook_entries(registry: &HookRegistry) -> Vec<WebhookEntry> {
 /// Cut a webhook URL to `scheme://host`.
 ///
 /// Drops credentials (`user:pass@`), port, path, query and fragment: a
-/// webhook URL often carries its token in one of them. Anything without a
-/// `scheme://` prefix prints as `<redacted>`, because it cannot be told
-/// apart from a bare token.
+/// webhook URL often carries its token in one of them. The host must be an
+/// allow-list of host characters (or a `${NAME}` placeholder), so a URL with
+/// a stray separator cannot carry text through as the host. Anything that
+/// fails prints as `<redacted>`, because it cannot be told apart from a bare
+/// token.
 fn redact_webhook_url(url: &str) -> String {
     const REDACTED: &str = "<redacted>";
     let Some((scheme, rest)) = url.split_once("://") else {
@@ -210,18 +222,122 @@ fn redact_webhook_url(url: &str) -> String {
     if !scheme_ok {
         return REDACTED.to_string();
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = if host_port.starts_with('[') {
-        let inner = host_port.split_once(']').map_or(host_port, |(h, _)| h);
-        format!("{inner}]")
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        let Some((inner, _)) = inner.split_once(']') else {
+            return REDACTED.to_string();
+        };
+        if inner.is_empty()
+            || !inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return REDACTED.to_string();
+        }
+        format!("[{inner}]")
     } else {
-        host_port.split(':').next().unwrap_or_default().to_string()
+        let host = host_port.split(':').next().unwrap_or_default();
+        let host_ok = !host.is_empty()
+            && host.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '$' | '{' | '}')
+            });
+        if !host_ok {
+            return REDACTED.to_string();
+        }
+        host.to_string()
     };
-    if host.is_empty() {
-        return REDACTED.to_string();
-    }
     format!("{scheme}://{host}")
+}
+
+/// Whether `value` is only a variable reference (`${NAME}` or `$NAME`): the
+/// name is safe to show, the value never appears.
+fn is_variable_reference(value: &str) -> bool {
+    let name = value
+        .strip_prefix("${")
+        .and_then(|v| v.strip_suffix('}'))
+        .or_else(|| value.strip_prefix('$'));
+    name.is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Replace a secret-looking value with `<redacted>`, keeping any quotes
+/// around it and a bare variable reference as it is.
+fn redact_value(word: &str) -> String {
+    let quotes = |c: char| matches!(c, '"' | '\'');
+    let core = word.trim_matches(quotes);
+    if core.is_empty() || is_variable_reference(core) {
+        return word.to_string();
+    }
+    let lead = &word[..word.len() - word.trim_start_matches(quotes).len()];
+    let trail = &word[word.trim_end_matches(quotes).len()..];
+    format!("{lead}<redacted>{trail}")
+}
+
+/// Cut every URL inside `word` to `scheme://host`.
+fn redact_urls_in(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(at) = rest.find("://") {
+        let before = &rest[..at];
+        let scheme_start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |i| i + 1);
+        let after = &rest[at + 3..];
+        let end = after
+            .find(|c: char| matches!(c, '"' | '\'' | '<' | '>' | ')' | '`') || c.is_whitespace())
+            .unwrap_or(after.len());
+        out.push_str(&before[..scheme_start]);
+        out.push_str(&redact_webhook_url(&rest[scheme_start..at + 3 + end]));
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A shell hook's command with the secrets it may carry withheld.
+///
+/// A literal URL is cut to scheme and host. The value after `Bearer`,
+/// `--token` (or any `--*token` flag) or inside `token=` is replaced by
+/// `<redacted>`. A bare `${NAME}` or `$NAME` stays: it shows the variable's
+/// name, never its value.
+fn redact_command(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut redact_next = false;
+    let mut rest = command;
+    while !rest.is_empty() {
+        let space_len = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..space_len]);
+        rest = &rest[space_len..];
+        let word_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..word_len];
+        rest = &rest[word_len..];
+        if word.is_empty() {
+            continue;
+        }
+        if redact_next {
+            redact_next = false;
+            out.push_str(&redact_value(word));
+            continue;
+        }
+        let bare = word
+            .trim_matches(|c| matches!(c, '"' | '\''))
+            .to_ascii_lowercase();
+        if bare == "bearer"
+            || (bare.starts_with('-') && !bare.contains('=') && bare.ends_with("token"))
+        {
+            redact_next = true;
+            out.push_str(word);
+            continue;
+        }
+        if let Some(at) = word.to_ascii_lowercase().find("token=") {
+            let (key, value) = word.split_at(at + "token=".len());
+            out.push_str(key);
+            out.push_str(&redact_value(value));
+            continue;
+        }
+        out.push_str(&redact_urls_in(word));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -278,5 +394,90 @@ mod tests {
         ] {
             assert_eq!(redact_webhook_url(url), want, "{url}");
         }
+    }
+
+    #[test]
+    fn a_host_must_be_host_characters() {
+        for url in [
+            r"https://host\services\TOKEN",
+            "https://host name/x",
+            "https://ho st.example/x",
+            "https://host;rm -rf/x",
+            "https://[not-ipv6]/x",
+            "https://[::1/x",
+        ] {
+            let got = redact_webhook_url(url);
+            assert!(
+                !got.contains("TOKEN") && !got.contains("rm -rf") && !got.contains("not-ipv6"),
+                "{url} -> {got}"
+            );
+        }
+        assert_eq!(
+            redact_webhook_url(r"https://host\services\TOKEN"),
+            "https://host"
+        );
+        assert_eq!(redact_webhook_url("https://host name/x"), "<redacted>");
+    }
+
+    #[test]
+    fn a_command_loses_its_urls_and_tokens_but_keeps_variable_names() {
+        for (command, leaked) in [
+            (
+                "curl -H \"Authorization: Bearer abc123SECRET\" https://api.example.com/v1/x?key=URLSECRET",
+                ["abc123SECRET", "URLSECRET"],
+            ),
+            (
+                "notify.sh --token tok-SECRET1 --url https://h.example/p/PATHSECRET",
+                ["tok-SECRET1", "PATHSECRET"],
+            ),
+            (
+                "notify.sh --api-token=EQSECRET2 --x https://u:PW@h.example/p",
+                ["EQSECRET2", "PW@"],
+            ),
+            (
+                "run.sh TOKEN=ENVSECRET3 'https://h.example/a/QUOTEDSECRET'",
+                ["ENVSECRET3", "QUOTEDSECRET"],
+            ),
+        ] {
+            let got = redact_command(command);
+            for secret in leaked {
+                assert!(!got.contains(secret), "{secret} leaked in {got}");
+            }
+            assert!(got.contains("<redacted>") || got.contains("://"), "{got}");
+        }
+        assert_eq!(
+            redact_command("curl -sS https://api.example.com/v1/x?key=1 -d x"),
+            "curl -sS https://api.example.com -d x"
+        );
+        // A variable reference shows its name, never a value.
+        assert_eq!(
+            redact_command("notify.sh --token ${ROCKY_T} --x=$HOME Bearer ${B} token=${T2}"),
+            "notify.sh --token ${ROCKY_T} --x=$HOME Bearer ${B} token=${T2}"
+        );
+        assert_eq!(
+            redact_command("echo  hi\tthere"),
+            "echo  hi\tthere",
+            "whitespace is kept"
+        );
+    }
+
+    #[test]
+    fn the_listed_hooks_are_stable_and_counted_with_their_webhooks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter]\ntype = \"duckdb\"\npath = \":memory:\"\n\n\
+             [[hook.on_pipeline_start]]\ncommand = \"a.sh\"\n\
+             [hook.on_pipeline_start.env]\nZED = \"1\"\nALPHA = \"2\"\nMID = \"3\"\n\n\
+             [hook.webhooks.on_pipeline_complete]\nurl = \"https://h.example/x\"\n",
+        )
+        .unwrap();
+        let config = load_rocky_config(&path).unwrap();
+        let output = hooks_list_output(&HookRegistry::from_config(&config.hooks));
+        assert_eq!(output.hooks[0].env_keys, ["ALPHA", "MID", "ZED"]);
+        assert_eq!(output.hooks.len(), 1);
+        assert_eq!(output.webhooks.len(), 1);
+        assert_eq!(output.total, 2, "total counts shell hooks and webhooks");
     }
 }
