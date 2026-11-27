@@ -8,70 +8,24 @@
 
 ## What it shows
 
-The semantic breaking-change classifier in `rocky-core` diffs two compiled `ProjectIr` snapshots (base ref vs HEAD) and
-classifies each structural delta into `Info` / `Warning` / `Breaking`
-severities. Two CLI surfaces consume the classifier:
+A classifier in `rocky-core` diffs the compiled `ProjectIr` of a base ref and HEAD and rates each structural delta `Info`, `Warning` or `Breaking`. Two commands use it:
 
-1. **`rocky ci-diff --semantic`** — *informational*. The classifier
-   findings surface in `breaking_findings` next to the existing column
-   diff. Even a `Breaking` finding does not change the exit code; the
-   intent is to power PR comments and CI annotations without forcing a
-   merge block.
-2. **`rocky branch promote`** — *hard gate*. After the optional
-   approval gate, the promote command compiles the project at
-   `--base-ref` (default `main`) and HEAD, runs the classifier, and
-   fails fast (exit 1, `BreakingChangesBlocked` audit event) if any
-   `Breaking`-severity finding lands. The override is `--allow-breaking`,
-   which flips the failure to a `BreakingChangesAllowed` audit event so
-   the bypass is recorded.
+1. **`rocky ci-diff --semantic`** — *informational*. Findings appear in `breaking_findings` beside the column diff. A `Breaking` finding does not change the exit code.
+2. **`rocky branch promote`** — *hard gate*. After the optional approval gate, it compiles `--base-ref` (default `main`) and HEAD and fails (exit 1, `BreakingChangesBlocked` audit event) on any `Breaking` finding. `--allow-breaking` overrides and records `BreakingChangesAllowed`, with the findings.
 
-The classifier compiles only what's under the models directory passed
-to `--models` (default `models`). Replication-only branches with no
-transformation models compile to an empty IR; the diff is empty and the
-gate is a clean no-op.
+> **Note:** the direct `rocky branch promote <name>` path shown here (no `--plan`) is deprecated — the CLI prints a deprecation notice on stderr pointing at `rocky plan promote <name>` + `rocky apply <plan-id>`, which run the same gates but let you inspect findings before any production data is touched. This POC keeps the one-shot form to show the veto/override in a single command.
 
-> **Note:** the direct `rocky branch promote <name>` path shown here (no
-> `--plan`) is deprecated — the CLI prints a deprecation notice on stderr
-> pointing at `rocky plan promote <name>` + `rocky apply <plan-id>`, which
-> run the same gates but let you inspect findings before any production
-> data is touched. This POC keeps the one-shot form to demonstrate the
-> gate's veto/override behavior in a single command.
+## Limits
 
-## Why it's distinctive
-
-- **Typed-IR semantics, not text diff.** A column rename + retype is
-  more than two text edits; the classifier treats it as a structural
-  delta and tags it `Breaking` regardless of how the SQL was edited.
-- **Fail-open on stale base refs.** If the base ref doesn't compile
-  under today's Rocky (a parser change happened in between), the gate
-  records `BreakingChangesGateSkipped` with the reason and lets the
-  promote proceed. The approval gate already guards the trust boundary.
-- **Audit-event paper trail on both the block AND the override.**
-  `--allow-breaking` is a deliberate bypass, not a quiet silence. The
-  `breaking_changes` field on the audit event carries the full findings
-  list for the bypass too.
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        replication pipeline (promote targets) + transformation models
-├── run.sh            git init + 7-step demo
-├── data/seed.sql     raw__orders.orders bootstrap
-└── models/           orders_summary + raw_orders, with column drop applied mid-run
-    ├── _defaults.toml
-    ├── raw_orders.sql / .toml
-    └── orders_summary.sql / .toml
-```
+- Only models under `--models` (default `models`) are compiled. A replication-only branch compiles to an empty IR, so the gate is a no-op.
+- **The gate is fail-open:** if the base ref or HEAD doesn't compile (for example after a parser change), it records `BreakingChangesGateSkipped` with the reason and lets the promote proceed.
 
 ## Prerequisites
 
 - `rocky` on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
-- `git` (the POC initializes a throw-away repo *inside* this directory
-  so the gate has real `main` ↔ `HEAD` refs to diff)
-- `python3` for the JSON probes
+- `git` (the POC initializes a throw-away repo *inside* this directory)
+- `python3`
 
 ## Run
 
@@ -79,8 +33,7 @@ gate is a clean no-op.
 ./run.sh
 ```
 
-The script wipes any prior `.git/` and re-initializes from scratch, so
-it's safe to re-run.
+The script wipes any prior `.git/` in this directory and re-initializes it, so it is safe to re-run.
 
 ## Expected output
 
@@ -99,51 +52,24 @@ it's safe to re-run.
     success=True  audit kinds: ['breaking_changes_allowed', 'promote_started', 'promote_completed']
 ```
 
-## What happened
+## What to expect
 
-1. **Throw-away git repo.** `git init --initial-branch=main` inside the
-   POC dir, with a `.gitignore` so DuckDB / state files don't enter the
-   tracked tree. `commit.gpgsign = false` for portability.
-2. **Replication on main.** Seed `raw__orders.orders` and run
-   `rocky run --filter source=orders` so the prod target
-   `poc.prod__orders.orders` exists. (The breaking-change gate doesn't
-   need this; `branch promote` does.)
-3. **`branch create fix_orders` + `run --branch fix_orders`.** Creates
-   the shadow target `poc.prod__orders_rocky_shadow__fix_orders.orders`
-   that `promote` will copy from.
-4. **Feature branch + column drop.** `git checkout -b
-   feat/drop-total-amount`, edit `models/orders_summary.sql` to remove
-   `total_amount`, commit.
-5. **`rocky ci-diff --semantic`** — exit 0; the JSON output's
-   `breaking_findings` array now carries one `column_dropped`
-   (`severity = breaking`) and one `sql_body_changed`
-   (`severity = info`).
-6. **`rocky branch promote fix_orders`** — exit 1. The JSON output
-   (still emitted on stdout) reports `success = false`, an empty
-   `targets` array, and an audit log whose first entry is
-   `BreakingChangesBlocked` carrying the same finding from step 5.
-   `stderr` carries the human-readable error.
-7. **`rocky branch promote fix_orders --allow-breaking`** — exit 0.
-   The audit log carries `BreakingChangesAllowed` (with findings) ahead
-   of the routine `PromoteStarted` / `PromoteCompleted` events.
+The script makes a throw-away repo (`git -c init.defaultBranch=main init`, excludes in `.git/info/exclude`, `commit.gpgsign = false`), runs replication on `main` so `poc.prod__orders.orders` exists (`branch promote` needs it), creates the branch `fix_orders` and runs on it (`poc.prod__orders_rocky_shadow__fix_orders.orders`), then commits a change on `feat/drop-total-amount` that removes `total_amount` from `models/orders_summary.sql`.
+
+- `ci-diff --semantic` exits 0 with one `column_dropped` (`severity = breaking`) and one `sql_body_changed` (`severity = info`).
+- `branch promote` exits 1. Stdout JSON has `success = false`, an empty `targets` array and an audit log starting with `BreakingChangesBlocked`; stderr has the readable error.
+- With `--allow-breaking` it exits 0, logging `BreakingChangesAllowed` before `PromoteStarted` / `PromoteCompleted`.
 
 ## Audit event variants
 
-The promote output's `audit[]` array carries one or more of:
-
 | `kind` | Meaning |
 |---|---|
-| `breaking_changes_blocked` | Gate fired; promote refused. `breaking_changes` field on the event carries the findings. |
-| `breaking_changes_allowed` | Gate found Breaking findings, operator overrode with `--allow-breaking`. Findings still recorded. |
-| `breaking_changes_gate_skipped` | Base or HEAD failed to compile (models dir missing, stale parser, etc.). `reason` field carries the explanation; promote proceeds. |
+| `breaking_changes_blocked` | Gate fired; promote refused. `breaking_changes` carries the findings. |
+| `breaking_changes_allowed` | Overridden with `--allow-breaking`. Findings still recorded. |
+| `breaking_changes_gate_skipped` | Base or HEAD failed to compile (models dir missing, stale parser, etc.). `reason` explains; promote proceeds. |
 
 ## Related
 
-- Engine source: `engine/crates/rocky-cli/src/commands/branch.rs`,
-  `engine/crates/rocky-core/src/breaking_change.rs`
-- Sibling POC: [`00-foundations/08-branch-approve-promote`](../../00-foundations/08-branch-approve-promote/),
-  the approval-gate side of `branch promote`; this POC is the
-  semantic-gate counterpart.
-- Sibling POC: [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/),
-  preview-branch data diff; complementary to the structural diff this
-  POC exercises.
+- Engine source: `engine/crates/rocky-cli/src/commands/branch.rs`, `engine/crates/rocky-core/src/breaking_change.rs`
+- [`00-foundations/08-branch-approve-promote`](../../00-foundations/08-branch-approve-promote/): the approval gate.
+- [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/): preview-branch data diff.

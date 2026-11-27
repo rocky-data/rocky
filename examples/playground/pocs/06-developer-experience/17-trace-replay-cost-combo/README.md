@@ -7,9 +7,7 @@
 
 ## What it shows
 
-`rocky run` writes a single `RunRecord` to the state store. Three read
-commands (`rocky trace`, `rocky cost`, `rocky replay`) each project
-that record from a different angle:
+`rocky run` writes one `RunRecord` to the state store (`.rocky-state.redb`, with per-model SQL hashes, row counts and timings). Three read commands project the same `run_id`:
 
 | Command | Question it answers |
 |---|---|
@@ -17,35 +15,7 @@ that record from a different angle:
 | `rocky cost latest` | What did each model cost in the warehouse? |
 | `rocky replay latest` | What exactly executed, byte-for-byte? |
 
-All three target the same `run_id`. Causality, cost, and reproducibility
-are projections of one tree, not three separate telemetry domains
-stitched together in a UI.
-
-## Why it's distinctive
-
-- **One artefact, three projections.** A bundled stack (ingest + transform
-  + quality, each with its own observability surface) reconstructs the
-  cross-stage picture from N data sources: pipeline logs from one tool,
-  artifact metadata from another, warehouse query history from a third.
-  Rocky emits a single typed `RunRecord` and reads it three ways.
-- **Cost is a direct projection.** Per-model warehouse spend is
-  computed via the same formula `rocky run` uses for the live summary
-  (`compute_observed_cost_usd`), not pulled from a billing dashboard
-  after the fact.
-- **Replay handle on the same run.** `rocky replay latest` reads the
-  same `RunRecord` (same SQL hashes, same timings, same model graph).
-  This POC uses the inspection view only. `rocky replay` also has a
-  read-only audit (`--check`) and re-execution (`--execute [--verify]`).
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        DuckDB pipeline, 3 sources of varied size
-├── run.sh            seed → run → trace → cost → replay
-└── data/seed.sql     raw__orders (10k), raw__events (5k), raw__customers (200)
-```
+Cost is computed with the same formula `rocky run` uses for its live summary (`compute_observed_cost_usd`), not read from a billing dashboard. This POC uses only the inspection view of `rocky replay`, which also has a read-only audit (`--check`) and re-execution (`--execute [--verify]`).
 
 ## Prerequisites
 
@@ -58,10 +28,9 @@ stitched together in a UI.
 ./run.sh
 ```
 
-## Expected output
+The script seeds `raw__orders` (10k), `raw__events` (5k) and `raw__customers` (200). `rocky run` discovers them via the `schema_pattern` and runs them under adaptive concurrency (the default: it halves parallelism on a warehouse rate-limit signal). Then it runs the three commands.
 
-The full pipeline finishes in well under a second, then the three views
-project from the same `RunRecord`:
+## Expected output
 
 ```text
 ==> 4. 'rocky cost latest' — per-model warehouse spend over the SAME RunRecord
@@ -83,38 +52,11 @@ total_duration_ms: 35
 total_cost_usd: $0.000000
 ```
 
-(Run id, timestamps, and per-model durations vary per run; the shape is stable.)
-
-DuckDB doesn't publish per-statement byte/cost telemetry, so those
-columns are empty in this POC. The same command against a Databricks /
-Snowflake / BigQuery pipeline populates the real numbers. The
-*structure* (one RunRecord, one cost projection) is identical
-regardless of adapter.
-
-## What happened
-
-1. `data/seed.sql` materializes three `raw__<source>.<table>` tables.
-2. `rocky run` discovers all three via the `schema_pattern`, runs them
-   concurrently under adaptive concurrency (the default: it halves the
-   parallelism on a warehouse rate-limit signal), and writes one `RunRecord` to
-   `.rocky-state.redb` with per-model SQL hashes, row counts, and
-   timings.
-3. `rocky trace latest` reads that `RunRecord` and emits the timeline
-   shape: per-model offsets, durations, concurrency lanes.
-4. `rocky cost latest` reads the same record and re-derives per-model
-   cost via `compute_observed_cost_usd`, the projection a tracing UI
-   would hang cost annotations off span attributes from.
-5. `rocky replay latest` reads the same record as the reproducibility
-   artefact: the SQL that ran, the rows produced, the timings observed.
+Run id, timestamps and durations vary; the shape is stable. DuckDB doesn't publish per-statement byte/cost telemetry, so those columns are empty here. Databricks, Snowflake and BigQuery pipelines populate them.
 
 ## Related
 
-- Sibling POC: [`07-run-trace-gantt`](../07-run-trace-gantt/), the
-  Gantt-shape view of `rocky trace` in isolation.
-- Sibling POC: [`00-foundations/06-branches-replay-lineage`](../../00-foundations/06-branches-replay-lineage/),
-  the branches + replay primitives.
+- [`07-run-trace-gantt`](../07-run-trace-gantt/): `rocky trace` alone.
+- [`00-foundations/06-branches-replay-lineage`](../../00-foundations/06-branches-replay-lineage/): branches and replay.
 - Engine source: `engine/crates/rocky-cli/src/commands/{cost,trace,replay}.rs`
-- OpenTelemetry export: `engine/crates/rocky-cli/src/otel_guard.rs`
-  plus `engine/crates/rocky-observe/src/otel.rs` (gated behind the
-  `otel` feature; the same `RunRecord` flows as OTel spans/metrics to
-  any collector).
+- OpenTelemetry export: `engine/crates/rocky-cli/src/otel_guard.rs` plus `engine/crates/rocky-observe/src/otel.rs` (gated behind the `otel` feature).

@@ -7,38 +7,9 @@
 
 ## What it shows
 
-`rocky estimate` runs each compiled model's `SELECT` through the warehouse's
-native `EXPLAIN` and returns the planner's projection (estimated rows, scan
-strategy, join type, filter pushdown) **without materializing any table**.
-On DuckDB this is the real DuckDB query planner; on a cloud warehouse it is
-that engine's `EXPLAIN`. It answers "what will this model cost to build?"
-before you spend the compute to build it.
+`rocky estimate` runs each compiled model's `SELECT` through the warehouse's native `EXPLAIN` and returns the planner's projection (rows, scan strategy, join type, filter pushdown) without materializing any table, so you can run it in CI.
 
-The POC seeds 1000 order lines and 200 customers, compiles two models (a
-filtered staging model and a grouped join), then estimates both and confirms
-the target schema is still empty.
-
-## Why it's distinctive
-
-- The estimate comes from the **warehouse's own planner**, not a Rocky guess:
-  row counts, the `Hash Join` node, and the `status='completed'` filter pushdown
-  in the plan are exactly what the engine will execute.
-- It is a true dry-run: no table is created, so you can estimate the cost of a
-  change in CI on every PR without touching production compute.
-
-## Layout
-
-```
-.
-├── README.md                 this file
-├── rocky.toml                transformation pipeline config
-├── run.sh                    seed → compile → estimate → assert dry-run
-├── data/seed.sql             raw__sales.orders (1000) + raw__sales.customers (200)
-└── models/
-    ├── _defaults.toml        shared target catalog/schema
-    ├── stg_orders.sql/.toml  filtered staging model
-    └── revenue_by_tier.sql/.toml  grouped join over orders × customers
-```
+The POC seeds 1000 order lines and 200 customers, estimates a filtered staging model and a grouped join, and confirms the target schema is still empty.
 
 ## Prerequisites
 
@@ -75,19 +46,6 @@ Filters: status = 'completed' ~200 rows
     tables in target schema 'demo' : 0  (expected 0)
 ```
 
-## What happened
+The join plan expects ~500 completed orders after filter pushdown, a hash join against 200 customers, and ~414 joined rows. `run.sh` strips the plan's box-drawing frame with `sed`.
 
-1. The seed creates the two raw tables that the models read from.
-2. `rocky compile` type-checks both models without a warehouse.
-3. `rocky estimate` sends each model's `SELECT` to DuckDB's `EXPLAIN`. The join
-   model's plan shows the planner expects ~500 completed orders after filter
-   pushdown, a hash join against 200 customers, and ~414 joined rows. (`run.sh`
-   strips the plan's box-drawing frame with `sed`, so the printed lines are the
-   bare estimates rather than the boxed EXPLAIN nodes.)
-4. A direct DuckDB check confirms the target schema is empty; `estimate` never
-   wrote anything.
-
-## Related
-
-- Companion: [`02-performance/05-optimize-recommendations`](../05-optimize-recommendations), where `rocky optimize` recommends strategy changes from run history
-- Companion: [`02-performance/10-cost-budgets`](../10-cost-budgets), with `[budget]` blocks + per-run `cost_summary` after execution
+Related: [`05-optimize-recommendations`](../05-optimize-recommendations), [`10-cost-budgets`](../10-cost-budgets).

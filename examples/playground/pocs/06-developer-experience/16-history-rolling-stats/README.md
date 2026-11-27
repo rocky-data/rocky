@@ -7,49 +7,23 @@
 
 ## What it shows
 
-`rocky history --model <name>` returns the per-execution timeline for one
-model. Passing `--rolling-stats` adds a `rolling_stats` block containing
-mean / population std-dev / latest-execution z-score over the most recent
-`--window` (default 20) successful executions, plus a composite
-`health_score`. The health score is `1.0` when both `duration_ms` and
-`rows_affected` are within 2σ of the rolling mean; it decays linearly to
-`0.0` at 6σ or beyond.
+`rocky history --model <name>` returns one model's per-execution timeline. `--rolling-stats` adds a `rolling_stats` block over the most recent `--window` (default 20) successful executions: mean, population std-dev, latest-execution z-score and a `health_score`. It also reports the requested `window` and the `samples` actually available.
 
-The POC reseeds `raw__orders.orders` with five different row counts and
-runs the replication pipeline five times in a row to populate a window
-with real variance, then queries the rolling-stats block.
-
-## Why it's distinctive
-
-- **Per-model regression signal in a single JSON call.** No external
-  metrics pipeline; the history table is enough to flag runs whose
-  duration or row count drifts outside the rolling band.
-- **Window math is explicit.** The block reports the `window` requested,
-  the `samples` actually available (so a fresh project doesn't lie about
-  precision), and `latest_z_score` so the caller can decide its own
-  threshold rather than relying on the bundled `health_score`.
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        DuckDB replication pipeline
-├── run.sh            five varied seeds + rolling-stats query
-└── data/seed.sql     parametric raw__orders.orders bootstrap
-```
+`health_score` is `1.0` when `duration_ms` and `rows_affected` are within 2σ of the rolling mean, and decays linearly to `0.0` at 6σ or beyond.
 
 ## Prerequisites
 
 - `rocky` on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
-- `python3` for the JSON assertion
+- `python3`
 
 ## Run
 
 ```bash
 ./run.sh
 ```
+
+The script reseeds `raw__orders.orders` with `{5, 50, 200, 25, 12}` rows, running `rocky run --filter source=orders` after each, then queries the rolling stats. It also checks that `rolling_stats` is omitted without the flag.
 
 ## Expected output
 
@@ -63,7 +37,7 @@ with real variance, then queries the rolling-stats block.
     --rolling-stats: rolling_stats present (correct)
 ```
 
-The full `rolling_stats` JSON block looks like:
+The full `rolling_stats` block:
 
 ```json
 {
@@ -79,31 +53,9 @@ The full `rolling_stats` JSON block looks like:
 }
 ```
 
-The `duration_ms` figures are wall-clock timings, so the exact `mean`
-(and, to a lesser extent, `std_dev` / `latest_z_score`) vary by machine
-— the numbers above are illustrative from one run, not byte-stable
-goldens. Only `window`, `samples`, `health_score`, and the zero-valued
-`rows_affected` block are reproducible. `rows_affected` reads as zero on
-the playground's full-refresh replication path; the same block populates
-real values when the run records carry row counts (transformation
-pipelines, incremental strategies, etc.).
-
-## What happened
-
-1. **Reseed + run** — for each of `{5, 50, 200, 25, 12}` rows, the script
-   refreshes `raw__orders.orders` and invokes `rocky run --filter
-   source=orders`. Each run lands a row in the state store's
-   `run_history` table tagged with the model's execution duration.
-2. **Rolling-stats query** — `rocky history --model orders
-   --rolling-stats --window 5` pulls the most recent successful
-   executions (the fetch pool is widened to `max(window * 5, 100)` so
-   failures don't starve the window) and computes the rolling block.
-3. **Negative control** — re-running `rocky history --model orders`
-   *without* the flag confirms the `rolling_stats` field is omitted
-   entirely (the field uses `skip_serializing_if`).
+`duration_ms` figures are wall-clock timings and vary by machine; the numbers above are illustrative. Only `window`, `samples`, `health_score` and the zero-valued `rows_affected` block are reproducible. `rows_affected` is zero on the playground's full-refresh replication path; it has real values when run records carry row counts (transformation pipelines, incremental strategies, etc.). The fetch pool is `max(window * 5, 100)` so failures don't starve the window.
 
 ## Related
 
 - Engine source: `engine/crates/rocky-cli/src/commands/history.rs`
-- Sibling POC: [`13-run-watch-inner-loop`](../13-run-watch-inner-loop/) —
-  inner-loop ergonomics; this POC is the post-hoc analytics counterpart.
+- Sibling POC: [`13-run-watch-inner-loop`](../13-run-watch-inner-loop/)

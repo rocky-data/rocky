@@ -7,49 +7,18 @@
 
 ## What it shows
 
-Two pieces of `rocky import-dbt` coverage:
+1. **`data_tests:` as an alias for `tests:`** on column-level YAML tests (the dbt 1.7+ spelling). `schema.yml` uses `data_tests:` only, so the demo fails if the alias breaks.
+2. **`manifest.unit_tests` → Rocky `[[test]]` sidecars** (manifest path). Each entry becomes a `[[test]]` block on the matching model's sidecar, with `ref(...)` / `source(...)` wrappers on `given.input` stripped to bare references. CSV / SQL fixtures are out of scope and surface as `UnsupportedUnitTestFormat` warnings.
 
-1. **`data_tests:` accepted as an alias for `tests:`** on column-level YAML tests.
-   dbt 1.7+ renamed the column-test key from `tests:` to `data_tests:` (the legacy
-   spelling still works on the dbt side). This POC's `schema.yml` uses
-   `data_tests:` only, so the demo fails if the alias breaks.
-
-2. **`manifest.unit_tests` → Rocky `[[test]]` sidecars.** The manifest path walks
-   `manifest.unit_tests` and emits each entry as a `[[test]]` block on the matching
-   model's sidecar TOML. `ref('upstream')` / `source('a', 'b')` wrappers on
-   `given.input` are stripped to bare references. CSV / SQL fixtures are deliberately
-   out of scope and surface as `UnsupportedUnitTestFormat` warnings.
-
-## Why it's distinctive vs `03-import-dbt-validate/`
-
-POC 03 exercises the regex path (`--no-manifest`) and the canonical-four column-test
-mapping with the legacy `tests:` key. This POC exercises the **manifest** path on a
-deliberately dbt-1.8-shaped input: `data_tests:` for column tests + a `unit_tests`
-block in `target/manifest.json` covering happy path, source-wrapped input, and a
-deliberately unsupported CSV fixture.
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── run.sh            end-to-end demo (no creds, no toolchain — uses a hand-authored manifest)
-├── dbt_project/
-│   ├── dbt_project.yml
-│   ├── models/
-│   │   ├── stg_orders.sql
-│   │   ├── fct_revenue.sql
-│   │   └── schema.yml          # data_tests: alias (column tests)
-│   └── target/
-│       └── manifest.json       # nodes + unit_tests block (dbt-1.8 schema v12)
-└── imported/                   # output dir (regenerated each run, gitignored)
-```
+[`03-import-dbt-validate/`](../03-import-dbt-validate/) covers the regex path (`--no-manifest`) and the legacy `tests:` key.
 
 ## Run
 
 ```bash
 ./run.sh
 ```
+
+No credentials or dbt toolchain needed: the manifest is hand-authored (`dbt_project/target/manifest.json`, dbt-1.8 schema v12). Output goes to `imported/`.
 
 ## Expected output
 
@@ -92,24 +61,10 @@ status = "completed"
 ok  All assertions passed.
 ```
 
-## What happened
-
-1. `rocky import-dbt --manifest` reads `target/manifest.json`, walks `nodes` (models)
-   and `unit_tests`, and emits a Rocky repo under `imported/`.
-2. `apply_dbt_tests` (called from both the regex and manifest paths) reads
-   `dbt_project/models/schema.yml`, recognises `data_tests:` via a serde alias,
-   and emits canonical-four `[[tests]]` blocks on `stg_orders.toml`.
-3. `apply_dbt_unit_tests` walks `manifest.unit_tests`, strips `ref(...)` / `source(...)`
-   wrappers on `given.input`, and emits `[[test]]` blocks on the matching model
-   sidecar. The CSV-format fixture surfaces as an `UnsupportedUnitTestFormat`
-   warning and bumps `unit_tests_skipped` by one.
-4. The counters (`unit_tests_found / unit_tests_converted / unit_tests_skipped`) show
-   up on the `--output json` payload (`ImportDbtOutput`) and in `MIGRATION-NOTES.md`.
+The `unit_tests_found / unit_tests_converted / unit_tests_skipped` counters appear in the `--output json` payload (`ImportDbtOutput`) and in `MIGRATION-NOTES.md`. The CSV fixture bumps `unit_tests_skipped` by one.
 
 ## Related
 
 - Migration guide: [`/guides/migrate-from-dbt/`](https://rocky-data.dev/guides/migrate-from-dbt/) — Section 9 covers both features.
 - Source: `engine/crates/rocky-compiler/src/import/{dbt.rs, dbt_manifest.rs, dbt_tests.rs, dbt_sources.rs}`
-- Sibling POCs:
-  - [`03-import-dbt-validate/`](../03-import-dbt-validate/) — regex path, legacy `tests:` key
-  - [`14-import-dbt-failure-modes/`](../14-import-dbt-failure-modes/) — out-of-scope dbt features (Jinja, non-canonical tests)
+- [`14-import-dbt-failure-modes/`](../14-import-dbt-failure-modes/) — out-of-scope dbt features (Jinja, non-canonical tests)

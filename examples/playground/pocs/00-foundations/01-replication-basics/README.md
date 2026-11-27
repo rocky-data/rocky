@@ -7,44 +7,18 @@
 
 ## What it shows
 
-A **replication** pipeline: Rocky discovers source schemas matching a pattern
-(`raw__<source>`) and copies each source table to a templated target schema
-(`staging__<source>`). No transformation models run; replication moves data, it
-doesn't reshape it.
+A **replication** pipeline: Rocky discovers source schemas matching a pattern (`raw__<source>`) and copies each table to a templated target (`staging__<source>`) without reshaping it.
 
 ```
 raw__orders.orders   ──(replicate)──▶   staging__orders.orders
 (seeded source)                          (templated target)
 ```
 
-The `[pipeline.playground.source.schema_pattern]` parses `raw__orders` into
-`{source = "orders"}`, and `schema_template = "staging__{source}"` routes the copy
-to `staging__orders`. This is the pattern multi-tenant ingestion uses to fan many
-source schemas into a consistent target layout.
+`[pipeline.playground.source.schema_pattern]` parses `raw__orders` into `{source = "orders"}`, and `schema_template = "staging__{source}"` routes the copy to `staging__orders`.
 
-The folder also ships the three sample models (`raw_orders`, `customer_orders`,
-`revenue_summary`) so `rocky compile` / `rocky test` / `rocky lineage` have a model
-graph to exercise, but `rocky run` here replicates the *source*, it does not
-materialize those models. For a runnable, materializing model DAG see the companion
-[`00-playground-default`](../00-playground-default).
+The folder also ships three sample models (`raw_orders`, `customer_orders`, `revenue_summary`) and a contract for `rocky compile` / `rocky test` / `rocky lineage`. `rocky run` here does **not** materialize them; see [`00-playground-default`](../00-playground-default) for that.
 
-## Why it's distinctive
-
-- The catalog's reference **replication** example: schema-pattern discovery + `{source}` target templating, which the transformation playground doesn't show.
-- Backs the dagster integration's replication-shape test fixtures (stable `discover` / `plan` / `run` / `state` output).
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml
-├── data/
-│   └── seed.sql          # seeds raw__orders.orders
-├── models/               # sample graph for compile/test/lineage
-└── contracts/
-    └── revenue_summary.contract.toml
-```
+This POC also backs the dagster integration's replication-shape test fixtures.
 
 ## Prerequisites
 
@@ -72,5 +46,4 @@ run: raw__orders.orders → playground.staging__orders.orders
 
 ## Related
 
-- [`00-playground-default`](../00-playground-default) — the runnable transformation model DAG (this POC's companion).
-- [`04-governance/02-schema-patterns-multi-tenant`](../../04-governance/02-schema-patterns-multi-tenant) — schema patterns with multi-component tenant routing.
+- [`04-governance/02-schema-patterns-multi-tenant`](../../04-governance/02-schema-patterns-multi-tenant): multi-component tenant routing.

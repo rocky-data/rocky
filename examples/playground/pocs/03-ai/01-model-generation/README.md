@@ -9,36 +9,14 @@
 
 ## What it shows
 
-Generate a Rocky model from a natural language description. Rocky sends
-your intent to Claude, receives generated code, and **verifies it compiles**
-before writing it. If compile fails, Rocky retries with the error context
-(up to 3 attempts).
+`rocky ai` sends a natural-language intent to Claude and **verifies the generated code compiles** before writing it, retrying with the compiler errors (up to 3 attempts). It writes `models/<name>.rocky` and a `<name>.toml` sidecar with `[strategy]` (from `--materialization` + `--unique-key`) and `[target]` (from `--target`).
 
-The output is a pair of files under `models/`:
+The POC runs it twice:
 
-- `<name>.rocky` — the model body
-- `<name>.toml` — sidecar with `[strategy]` (from `--materialization` +
-  `--unique-key`) and `[target]` (from `--target`)
+1. Default `full_refresh`: `monthly_revenue.{rocky,toml}`.
+2. `--materialization merge --unique-key order_date`: `orders_daily.{rocky,toml}`.
 
-The POC runs `rocky ai` twice to cover both flag paths:
-
-1. **Default `full_refresh`** — `monthly_revenue.{rocky,toml}` lands with
-   `[strategy] type = "full_refresh"`.
-2. **`--materialization merge --unique-key order_date`** —
-   `orders_daily.{rocky,toml}` lands with `[strategy] type = "merge"`
-   and `unique_key = ["order_date"]`.
-
-## Why it's distinctive
-
-- **Self-correcting AI** — the compile-verify loop closes the gap between
-  "model that looks right" and "model that actually works".
-- **No copy-paste step** — body + sidecar land on disk, ready to `rocky run`.
-- **Materializations on one flag surface** — `full_refresh` and `merge`
-  (+ `--unique-key`). `incremental` is refused: on a transformation model it
-  re-inserts every row on each run (E037). `ephemeral` is refused too: a
-  generated model has no consumer yet to inline it into.
-- Different from `engine/examples/ai-intent` (which ships pre-generated tests).
-  This POC generates fresh models live.
+`incremental` is refused: on a transformation model it re-inserts every row on each run (E037). `ephemeral` is refused too: a generated model has no consumer to inline it into.
 
 ## Run
 

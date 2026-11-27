@@ -7,14 +7,7 @@
 
 ## What it shows
 
-One product goes from nothing to a live table, driven by one binary. You write no
-SQL and pre-create no spec. `rocky fulfill revenue_daily` drives the loop end to
-end — including one repair round, because the recorded first draft is wrong:
-
-Every `rocky` call in `run.sh` passes `--state-path .rocky/state.redb`.
-`rocky fulfill` refuses the default store, `models/.rocky-state.redb`, because
-the drafting worker may write `models/`
-([#2169](https://github.com/rocky-data/rocky/issues/2169)).
+`rocky fulfill revenue_daily` takes one product from nothing to a live table: you write no SQL and pre-create no spec.
 
 ```
 elicit spec ─▶ human approves spec ─▶ lower to contract ─▶ agent drafts SQL
@@ -29,116 +22,39 @@ elicit spec ─▶ human approves spec ─▶ lower to contract ─▶ agent dra
               ─▶ NEW plan ─▶ human approves AGAIN ─▶ digest-gated apply ─▶ observe
 ```
 
-Every step that could let an agent change the warehouse without a human is a real
-engine gate, and this POC drives each one and checks it holds. The default
-`./run.sh` uses a **recorded** worker session (no network, no key), so it runs in
-CI. `./run-live.sh` swaps in a **real** worker (`claude -p`) that writes the SQL
-itself. The recorded drafting round forgets the required `revenue_eur` column, so
-the runner's own verify bundle comes back red and the loop recovers through a
-recorded repair round (#1493, fixed — see below).
+Each step where an agent could change the warehouse without a human is an engine gate, which this POC drives and checks. `./run.sh` uses a **recorded** worker session (no network, no key, runs in CI); `./run-live.sh` uses a **real** `claude -p` worker. The recorded first draft omits `revenue_eur`, so verify goes red and a recorded repair round fixes it.
 
-The loop also recovers from a defect no compiler can catch. The checks a product
-declares about its *output* need a table to run against, so they cannot run at
-verify — they are reported deferred there and first evaluated after the apply.
-Assert 11 violates one in the materialised table: the loop records that in
-`observed_failing` (never a healthy-looking `observing`), confirms it on a fresh
-reading, spends one repair round, and comes back through a **second** human
-review. The bad data is already live at that point, so the loop repairs forward;
-it never rolls back, and it never re-applies on the strength of the approval the
-failing plan already had.
+Every `rocky` call in `run.sh` passes `--state-path .rocky/state.redb`: `rocky fulfill` refuses the default store, `models/.rocky-state.redb`, because the drafting worker may write `models/` ([#2169](https://github.com/rocky-data/rocky/issues/2169)).
 
-## Why it's distinctive
+Checks a product declares about its *output* need a table, so they are reported deferred at verify and first evaluated after apply. Assert 11 violates one: the loop records `observed_failing`, confirms it on a fresh reading, spends one repair round, and requires a **second** human review. The bad data is already live, so the loop repairs forward; it never rolls back and never re-applies on the earlier approval.
 
-- **A custody chain, not a pipeline.** The thing a human approves (the spec) is
-  hashed into an immutable snapshot; the plan carries that digest; `rocky apply`
-  refuses unless the digest still matches. An agent cannot smuggle a different
-  change past the sign-off — the engine compares, the runner does not.
-- **The agent is boxed in.** The worker talks to `rocky mcp --profile worker`,
-  which serves only drafting tools. Ask it to `propose` or `review` and the tool
-  is not there. The POC proves this by recording those calls and asserting they
-  come back "tool not found".
-- **Re-approval fences a waiting plan.** Edit the spec while a plan waits for
-  review and nothing moves. Re-approve the edit and the old plan is orphaned and a
-  fresh one takes its place — no half-approved state can apply.
+## Mechanisms exercised
+
+- **Custody chain.** The approved spec is hashed into an immutable snapshot; the plan carries that digest; `rocky apply` refuses unless it still matches. The engine compares, not the runner.
+- **Boxed-in agent.** The worker talks to `rocky mcp --profile worker`, which serves only drafting tools; recorded `propose` and `review` calls come back "tool not found".
+- **Re-approval fences a waiting plan.** Editing the spec alone moves nothing. Re-approving it orphans the old plan and produces a new one.
 
 ## What this POC does and does NOT prove (honesty rule)
 
-- `./run.sh` uses the **replay driver**. It proves the **machinery**: the gates,
-  the custody chain, the state machine, the privilege boundary. It does **not**
-  prove that an AI agent can author a correct model — the worker's output is
-  recorded, not generated.
-- `./run-live.sh` is the **capability** proof: a real `claude -p` worker authors
-  the model SQL end to end and the loop applies it. It is the required Phase-1
-  completion gate. Its precise scope — what is genuine authorship and what is
-  brief-provided grounding — is in "What the live lane proves" below; do not read
-  it as an agent designing the whole product spec unaided.
-- **Repair recovery IS exercised (replay lane) — #1493 is fixed.** When the
-  runner's verify goes red it dispatches a *repair* round, whose `draft_model`
-  legitimately rewrites the merged sidecar. The engine used to compare that
-  rewrite against Phase B's pre-repair hash and mis-classify the loop's own
-  work as `tampered`; it now **reopens the drafting window through the staged
-  commit** before dispatching repair (verify every recorded hash first — drift
-  there is still tamper — then demote the manifest to Phase A), so the repair
-  write is authorized exactly like the first draft's and out-of-band edits
-  between gates stay detected. The replay lane's recorded first draft is red
-  (E010: `revenue_eur` missing) and the recorded repair fixes it; assert 2
-  pins the round by KIND — the worker transcripts must be exactly
-  `elicitation`, `drafting`, `repair`, and the repaired SQL must survive. By
-  kind, not by count: three transcripts reading `elicitation, drafting,
-  drafting` would pass a count check while meaning the repair round was
-  dispatched as a plain draft. The **banked live evidence predates the fix** —
-  its first draft was green, so it exercised no repair round; the live lane
-  simply gains this recovery path now.
-- **The repair window is a narrowed residual, not a closed one.** Since 1.74.0
-  (#1821), `draft_model` also writes both files to the task outbox
-  (`.rocky/fulfillment/<product>/outbox/`). The runner refuses the round if the
-  files in `models/` differ from that copy. This gives no protection from a
-  process that runs as the same user: it can write the outbox as easily as
-  `models/`. That is the same access that can forge an approval marker. This
-  POC makes no claim to defend against it. See
-  [#1515](https://github.com/rocky-data/rocky/issues/1515) (closed).
-- **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting*
-  staleness (lag vs budget) after the data is aged. Staleness is a finding in the
-  loop's journal; it never blocks an apply, and it never routes into a repair
-  round either — staleness is usually a scheduling fact rather than a model
-  defect, and rewriting SQL cannot fix a job that did not run. Warning-severity
-  checks report the same way. Only a check that FAILED at `severity = "error"`
-  routes. This POC makes no claim that Rocky gates on freshness, and no claim
-  about any regulated use.
-- **The data-red lane repairs FORWARD; it does not undo.** Assert 11 injects the
-  violation directly into the materialised output, which is a stand-in for the
-  real case (a model that computes the wrong number and applies cleanly). By the
-  time the loop sees it the bad data is live, and F3 does not roll it back —
-  rollback needs a tested restore substrate that does not exist yet. What the
-  lane proves is that the failure is *recorded honestly* and *routed*, and that
-  the fix takes the same road as any other change: a new plan, a new plan id, a
-  refused bare apply, and a second human approval.
-- **A check the loop cannot EVALUATE is not a check that passed.** If a declared
-  check errors, the loop neither claims health nor spends a repair round: it
-  holds at `applied` and says so. That is a deliberate divergence from `rocky
-  test --declarative`, which exits non-zero on an errored check — the CLI reports
-  to a human who will read the error, while the loop is deciding whether to
-  rewrite a model, and "cannot tell" is not "the data is wrong".
-- **The data-repair ceiling is not exercised here.** Repeated data-reds exhaust a
-  bounded budget and land `blocked` naming the check, but reaching it needs four
-  laps through a human approval gate, which a scripted lane cannot honestly
-  stage. It is covered by the state machine's unit tests, not by this POC.
+- `./run.sh` (**replay driver**) proves the **machinery**: gates, custody chain, state machine, privilege boundary. It does **not** prove an AI agent can author a correct model; the worker output is recorded.
+- `./run-live.sh` is the **capability** proof and the required Phase-1 completion gate. See "What the live lane proves" below for its limits.
+- **Repair recovery is exercised in the replay lane (#1493, fixed).** A repair round rewrites the merged sidecar; the engine used to flag that as `tampered`. It now verifies every recorded hash (drift there is still tamper), then reopens the drafting window through the staged commit, so out-of-band edits stay detected. Assert 2 requires worker transcripts of kinds `elicitation`, `drafting`, `repair` (not merely three) and the repaired SQL to survive. The **banked live evidence predates the fix**: its first draft was green, so it exercised no repair round.
+- **The repair window is a narrowed residual, not a closed one.** Since 1.74.0 (#1821), `draft_model` also writes both files to the task outbox (`.rocky/fulfillment/<product>/outbox/`), and the runner refuses the round if `models/` differs from that copy. This gives no protection from a process running as the same user: it can write the outbox as easily as `models/`, the same access that can forge an approval marker. This POC makes no claim to defend against it. See [#1515](https://github.com/rocky-data/rocky/issues/1515) (closed).
+- **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting* staleness. It never blocks an apply or routes into a repair round (it is usually a scheduling fact that rewriting SQL cannot fix). Warning-severity checks report the same way; only a check that FAILED at `severity = "error"` routes. No claim is made that Rocky gates on freshness, or about any regulated use.
+- **The data-red lane repairs FORWARD; it does not undo.** Assert 11 injects the violation into the materialised output, standing in for a model that computes the wrong number. F3 does not roll it back; rollback needs a tested restore substrate that does not exist yet. The fix takes the normal road: new plan, new plan id, refused bare apply, second human approval.
+- **A check the loop cannot EVALUATE is not a pass.** If a declared check errors, the loop holds at `applied`, claims no health and spends no repair round. `rocky test --declarative`, by contrast, exits non-zero on an errored check.
+- **The data-repair ceiling is not exercised here.** Repeated data-reds exhaust a bounded budget and land `blocked` naming the check, but that needs four laps through a human gate. State-machine unit tests cover it.
 
 ## Binary provenance (read before running)
 
-The `rocky` on your `PATH` must carry the fulfillment verbs (`product`, `fulfill`,
-`review --approve`, `apply --expect-spec-digest`, `mcp --profile worker`). Engine
-1.74.0 carries all of them, and the replay lane passes on that released binary.
-`rocky product` and `rocky fulfill` first shipped in 1.72.0, and the checks
-assert 11 and assert 12 exercise landed in 1.74.0, so use 1.74.0 or newer.
+Use `rocky` 1.74.0 or newer on `PATH`. `rocky product` and `rocky fulfill` first shipped in 1.72.0; the features asserts 11 and 12 check landed in 1.74.0.
 
 ```bash
 rocky --version        # 1.74.0 or newer
 rocky product --help   # must succeed — run.sh fail-fasts if it does not
 ```
 
-To run the POC against unreleased engine changes, build from source and put that
-binary first on `PATH`:
+To run against unreleased engine changes, build from source and put that binary first on `PATH`:
 
 ```bash
 # from the monorepo root
@@ -146,76 +62,20 @@ cargo build --release -p rocky --manifest-path engine/Cargo.toml
 export PATH="$PWD/engine/target/release:$PATH"
 ```
 
-`run.sh` runs whatever `rocky` is on `PATH` and stops with a clear message if the
-binary is too old. Activation is ON MERGE, not release-gated: `run-all-duckdb.sh`
-globs every `pocs/*/*/run.sh` immediately, and the weekly CI job builds `rocky`
-from source before running the catalog — so a merged commit that carries these
-verbs is smoke-tested on the next weekly run regardless of any release.
+`run.sh` also needs `jq` and the `duckdb` CLI, and stops with a clear message if the binary is too old.
 
-## Layout
+## What the live lane proves — and what it does not
 
-```
-README.md                 # this file
-rocky.toml                # duckdb + one transformation pipeline + [policy] + [fulfill.driver]=replay
-models/_defaults.toml      # target catalog/schema for the lowered model (wh.out)
-data/seed.sql              # in-memory source for `rocky test` (ATTACH ':memory:' AS wh)
-data/warehouse_seed.sql    # the same rows, seeded into the persistent wh.duckdb before apply
-replay/candidate_spec.toml # the spec the recorded worker "proposed" (source of the session digest)
-replay/session.json        # the recorded worker session, replayed against `rocky mcp --profile worker`
-broken-specs/*.toml        # 6 one-fault specs for assert 3 (the negative lowering cases)
-briefs/elicitation.md      # live lane only: grounds the worker in the exact closed spec schema
-briefs/drafting.md         # live lane only: steers the worker to author SQL only (cooperative, not enforced)
-run.sh                     # the replay lane — 12 asserts, credential-free, exits 0
-run-live.sh                # the live lane — a real `claude -p` worker (needs ANTHROPIC_API_KEY)
-mutation-pass.sh           # disables one gate per assert and shows each assert FAIL (the ledger)
-expected/live/             # the banked live-run evidence bundle (committed)
-```
+It proves:
 
-### What the live lane proves — and what it does not
+- **The driver stack works with a real agent:** subprocess supervision (one process group, killed at task end), `env_clear` + `env_allow`, worker-profile MCP over stdio, the outbox hand-off and its digest verification, and every downstream gate.
+- **The worker authors the SQL itself.** The banked `worker_authored.sql` (`current_timestamp AS loaded_at`, `coalesce(is_refund, false) = false`, explicit NULL guards) differs from the recorded SQL and cleared compile, `rocky test --declarative` (2 tests passed, 0 failed, 0 errored), the product-bound plan, human review and the digest-gated apply.
 
-Be precise about this. The live run proves:
+It does **not** prove that an agent can design a product spec from data alone. `briefs/elicitation.md` hands the worker an *example spec* with the exact columns, grain, checks and freshness, so the banked candidate spec is that template with an `intent` sentence filled in. That grounding is why the loop converges.
 
-- **The whole driver stack works with a real agent.** Subprocess supervision
-  (one process group, killed at task end), `env_clear` + `env_allow`, the
-  worker-profile MCP over stdio, the outbox hand-off, the digest verification of
-  that hand-off, and every downstream gate — all of it runs against a live
-  `claude -p` worker, not a recording.
-- **The worker authors the SQL itself.** The banked `worker_authored.sql` is the
-  worker's own design (`current_timestamp AS loaded_at`, `coalesce(is_refund,
-  false) = false`, explicit NULL guards) — it differs from the recorded
-  `draft_model` SQL, so it is genuine authorship, and it cleared compile, the
-  declarative tests (`rocky test --declarative` — the banked run: 2 tests, all
-  pass, 0 failed, 0 errored), the product-bound plan, human review, and the
-  digest-gated apply.
+In the FIRST live attempt, with the *compiled* brief (no schema enumeration), the worker designed its own spec (`revenue_date`, `net_revenue_eur`, per-column classifications, ten grounded questions), which Phase A **rejected** on warehouse type names (`DATE`, `BIGINT`) and extra keys. A cold worker designs a plausible spec but not yet a schema-valid one.
 
-It does **not** prove that an agent can design a product spec from data alone.
-`briefs/elicitation.md` hands the worker an *example spec* — the exact columns,
-grain, checks and freshness for this data — so the banked candidate spec is that
-template with an `intent` sentence filled in, not a design. That grounding is
-why the loop converges, and it is honest only if labelled as grounding.
-
-The genuinely interesting spec-design evidence is the FIRST live attempt, with
-the *compiled* brief (no schema enumeration): the worker designed a real spec of
-its own (`revenue_date`, `net_revenue_eur`, per-column classifications, ten
-grounded questions) — which Phase A then **rejected** on warehouse type names
-(`DATE`, `BIGINT`) and extra keys. So: a cold worker will design a plausible
-spec, but not yet a schema-valid one; a project-level `briefs_dir` with the exact
-closed schema is the bridge. SQL authorship is solved; from-scratch spec design
-against the closed schema is not.
-
-There is a second override, `briefs/drafting.md`, that steers the worker to
-author only the model SQL — the spec's declared grain and checks already lower
-into the sidecar tests (a composite-unique test from the grain, an expression
-test per check), so hand-authored `[[tests]]` are redundant and easy to malform.
-Be precise about what this is: **cooperative prompt steering, not enforcement.**
-The worker still holds raw `Write`/`Edit`, and the lowering PRESERVES a
-worker-authored sidecar test — nothing in the engine discards it. The engine
-also drops `draft_check` from the worker MCP profile, which removes the easiest
-path to that mistake but does not architecturally prevent a determined worker
-from editing the sidecar (that is #1491's OS sandbox, not this). The
-digest-gated apply, the post-apply check-custody digest, and human review are
-the real gates; the drafting brief is only a nudge toward a clean,
-redundant-free sidecar.
+`briefs/drafting.md` steers the worker to author only the model SQL, since grain and checks already lower into sidecar tests. This is **cooperative prompt steering, not enforcement.** The worker still holds raw `Write`/`Edit`, and lowering PRESERVES a worker-authored sidecar test. Dropping `draft_check` from the worker MCP profile does not stop a determined worker editing the sidecar (that is #1491's OS sandbox). The real gates are the digest-gated apply, the post-apply check-custody digest and human review.
 
 ## Run
 
@@ -252,14 +112,14 @@ of the repaired plan).
 | # | Assert | Engine gate |
 |---|---|---|
 | 1 | Cold start writes the candidate | `Init` → elicit → confined candidate write → `needs_input(spec_approval)`; hand-off digest re-verified |
-| 2 | Red draft → repair round → converged; manifest total (merged, 0 rejects) | the verify bundle goes red (E010) → repair dispatch reopens the drafting window through the staged commit (#1493) → re-merge → green; `product compile` staged lowering + manifest totality |
-| 3 | 6 broken specs each refused by code | spec-schema gates (`unknown-key`, `type-not-rocky`, `freshness-missing-time-column`, `source-not-exact-triple`, `classification-unresolved`, `trust-not-propose-only`) |
-| 4 | Stripped `[policy]` → paste-ready block | posture verification (`product verify`), compared verbatim to the loop's stop |
+| 2 | Red draft → repair → converged; manifest total (merged, 0 rejects) | verify red (E010) → repair reopens the drafting window (#1493) → re-merge → green; manifest totality |
+| 3 | 6 broken specs each refused by code | `unknown-key`, `type-not-rocky`, `freshness-missing-time-column`, `source-not-exact-triple`, `classification-unresolved`, `trust-not-propose-only` |
+| 4 | Stripped `[policy]` → paste-ready block | `product verify`, compared verbatim to the loop's stop |
 | 5 | Plan carries product_id + spec_digest | governed propose writes `.rocky/plans/<id>.json` with the product binding |
-| 6 | Edit doesn't supersede; re-approval does | D2 fence: `approve-spec` re-enters `spec_approved`, orphaning the old plan |
+| 6 | Edit doesn't supersede; re-approval does | `approve-spec` re-enters `spec_approved`, orphaning the old plan |
 | 7 | Bare apply refuses; review → loop applies | require-review policy gate + `rocky review --approve` marker |
-| 8 | Wrong `--expect-spec-digest` refused | the engine's digest backstop (bypasses the loop; `rocky apply` direct) |
-| 9 | Composite-unique grain test RAN green (declarative) | `rocky test --declarative` executes the generated `[[tests]] type=composite kind=unique` on `[client_id, day]` against the warehouse (plain `rocky test` runs only the model) |
-| 10 | Staleness observed after backdating | the runner's observation phase (MAX(time_column) vs budget), reported not enforced |
-| 11 | A violated declared check → `observed_failing` (exit 4) → repair round → NEW plan → second human review → `observing` | the post-apply reading of the declared `[[tests]]` through the same typed core `rocky test --declarative` uses; the data-repair route, its own budget, and the plan-id/marker binding that stops a repair inheriting the failing plan's approval |
-| 12 | A post-apply re-route holds instead of certifying another warehouse | routing custody: the loop compares the configured warehouse with the one this generation applied under, stops with `applied` when they differ, and names both causes (an edited config, or a changed env value) |
+| 8 | Wrong `--expect-spec-digest` refused | engine digest backstop (`rocky apply` direct, bypassing the loop) |
+| 9 | Composite-unique grain test RAN green | `rocky test --declarative` runs the generated `[[tests]] type=composite kind=unique` on `[client_id, day]` (plain `rocky test` runs only the model) |
+| 10 | Staleness observed after backdating | MAX(time_column) vs budget, reported not enforced |
+| 11 | Violated check → `observed_failing` (exit 4) → repair → NEW plan → second review → `observing` | post-apply `[[tests]]` reading, separate repair budget, plan-id/marker binding so a repair cannot inherit approval |
+| 12 | Post-apply re-route holds | stops at `applied` when the configured warehouse differs from the one applied under, naming both causes (edited config or changed env value) |

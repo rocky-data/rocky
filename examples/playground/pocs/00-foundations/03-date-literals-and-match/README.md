@@ -7,31 +7,7 @@
 
 ## What it shows
 
-The Rocky DSL supports two ergonomic features that make business logic more readable than raw SQL:
-
-1. **Date literals**: `@2025-01-01` is a typed date constant. No `DATE '...'` cast.
-2. **`match` expressions**: A pattern-matching block that compiles to a SQL `CASE WHEN`.
-
-## Why it's distinctive
-
-- `match { > 500 => "premium", > 100 => "standard", _ => "budget" }` is much more legible than the equivalent `CASE WHEN amount > 500 THEN 'premium' WHEN amount > 100 THEN 'standard' ELSE 'budget' END`.
-- Date literals avoid the `'2025-01-01'::DATE` casting dance.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml
-├── run.sh
-├── models/
-│   ├── raw_orders.sql
-│   ├── raw_orders.toml
-│   ├── tiered_orders.rocky    Combines @date and match
-│   └── tiered_orders.toml
-└── data/
-    └── seed.sql
-```
+Two DSL features: typed date literals (`@2025-01-01`, no `DATE '...'` cast) and `match` blocks, which compile to SQL `CASE WHEN`.
 
 ## Run
 
@@ -41,7 +17,4 @@ The Rocky DSL supports two ergonomic features that make business logic more read
 
 ## What happened
 
-`tiered_orders.rocky` keeps orders on or after `@2025-06-01` with a non-NULL amount and tags
-each one with a tier using `match`. The compiled SQL contains a
-`DATE '2025-06-01'` literal for the date and a `CASE WHEN` cascade for the
-match expression.
+`tiered_orders.rocky` keeps orders on or after `@2025-06-01` with a non-NULL amount and tags each with a tier using `match`. The compiled SQL contains a `DATE '2025-06-01'` literal and a `CASE WHEN` cascade.
