@@ -130,6 +130,85 @@ describe("ComplianceScreen", () => {
     for (const node of [prod, none, red]) expect(node.className).not.toMatch(/zinc|red-|green-|amber-/);
   });
 
+  it("pins the env match: an exception in dev does not redden the same column's none in prod", async () => {
+    const out: ComplianceOutput = {
+      ...OUTPUT,
+      exceptions: [{ model: "m", column: "c", env: "dev", reason: "r" }],
+      per_column: [
+        {
+          model: "m",
+          column: "c",
+          classification: "pii",
+          envs: [
+            { env: "prod", enforced: true, masking_strategy: "none" },
+            { env: "dev", enforced: false, masking_strategy: "unresolved" },
+          ],
+        },
+      ],
+    };
+    render(<ComplianceScreen load={async () => out} />);
+    const list = await screen.findByRole("list", { name: "Masking of m.c" });
+    expect(within(list).getByText(/prod · none/)).toHaveAttribute("data-state", "on_purpose");
+    expect(within(list).getByText(/dev · unresolved/)).toHaveAttribute("data-state", "exception");
+  });
+
+  it("counts a column unmasked in two envs as one column in the banner, and says the card's unit", async () => {
+    const out: ComplianceOutput = {
+      ...OUTPUT,
+      exceptions: [
+        { model: "m", column: "c", env: "dev", reason: "r" },
+        { model: "m", column: "c", env: "qa", reason: "r" },
+      ],
+      per_column: [
+        {
+          model: "m",
+          column: "c",
+          classification: "pii",
+          envs: [
+            { env: "dev", enforced: false, masking_strategy: "unresolved" },
+            { env: "qa", enforced: false, masking_strategy: "unresolved" },
+          ],
+        },
+      ],
+    };
+    render(<ComplianceScreen load={async () => out} />);
+    const banner = await screen.findByRole("status");
+    expect(banner).toHaveTextContent("1 classified column has no masking strategy in at least one environment");
+    const exceptions = card("Exceptions");
+    expect(within(exceptions).getByText("2")).toBeInTheDocument();
+    expect(within(exceptions).getByText("column × environment pairs, in 1 column")).toBeInTheDocument();
+  });
+
+  it("shows a [mask.default] column once, with no duplicate keys", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const out: ComplianceOutput = {
+        ...OUTPUT,
+        exceptions: [],
+        per_column: [
+          {
+            model: "m",
+            column: "c",
+            classification: "pii",
+            envs: [
+              { env: "default", enforced: true, masking_strategy: "hash" },
+              { env: "default", enforced: false, masking_strategy: "unresolved" },
+            ],
+          },
+        ],
+      };
+      render(<ComplianceScreen load={async () => out} />);
+      const list = await screen.findByRole("list", { name: "Masking of m.c" });
+      expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+      // The worse of the two rows is kept.
+      expect(within(list).getByRole("listitem")).toHaveAttribute("data-state", "on_purpose");
+      expect(within(screen.getByLabelText("Environment")).getAllByRole("option")).toHaveLength(2);
+      expect(spy.mock.calls.flat().join(" ")).not.toMatch(/same key/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("turns the Exceptions card red above zero and green at zero", async () => {
     const { unmount } = render(<ComplianceScreen load={async () => OUTPUT} />);
     await screen.findByRole("table", { name: "Classified columns" });

@@ -171,6 +171,7 @@ export function EstateScreen({
                   key={generation}
                   name={shown}
                   load={loaders.detail}
+                  runs={runs}
                   replayCheck={loaders.replayCheck}
                   recipeHistory={loaders.recipeHistory}
                   onClose={() => setSelected(null)}

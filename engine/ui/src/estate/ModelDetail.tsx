@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { XMarkIcon } from "@heroicons/react/20/solid";
+import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
 import { StatusCard } from "../components";
 import { orNotRecorded } from "../format";
@@ -15,6 +16,7 @@ export function ModelDetail({
   load,
   onClose,
   actions,
+  runs,
   replayCheck,
   recipeHistory,
 }: {
@@ -23,6 +25,8 @@ export function ModelDetail({
   onClose: () => void;
   /** Run and Plan for this one model, drawn under its name. */
   actions?: ReactNode;
+  /** The runs list the screen holds: the rebuild check picks its run from it. */
+  runs: Resource<HistoryOutput>;
   /** The rebuild check's two reads. Left out, the panel reads the real routes. */
   replayCheck?: ReplayCheckLoader;
   recipeHistory?: RecipeHistoryLoader;
@@ -50,7 +54,7 @@ export function ModelDetail({
         </button>
       </div>
       {actions !== undefined && <div className="mb-4">{actions}</div>}
-      <DetailBody name={name} detail={detail} replayCheck={replayCheck} recipeHistory={recipeHistory} />
+      <DetailBody name={name} detail={detail} runs={runs} replayCheck={replayCheck} recipeHistory={recipeHistory} />
     </aside>
   );
 }
@@ -58,11 +62,13 @@ export function ModelDetail({
 function DetailBody({
   name,
   detail,
+  runs,
   replayCheck,
   recipeHistory,
 }: {
   name: string;
   detail: Resource<ModelDetailOutput>;
+  runs: Resource<HistoryOutput>;
   replayCheck?: ReplayCheckLoader;
   recipeHistory?: RecipeHistoryLoader;
 }) {
@@ -132,7 +138,7 @@ function DetailBody({
             {orNotRecorded(model.upstream.length)} upstream, {orNotRecorded(model.downstream.length)}{" "}
             downstream
           </p>
-          <RebuildCheck name={name} load={replayCheck} loadHistory={recipeHistory} />
+          <RebuildCheck name={name} runs={runs} load={replayCheck} loadHistory={recipeHistory} />
         </div>
       );
     }

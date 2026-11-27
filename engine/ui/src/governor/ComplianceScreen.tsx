@@ -92,7 +92,40 @@ function envsOf(output: ComplianceOutput): string[] {
   return seen;
 }
 
-function ComplianceBody({ output }: { output: ComplianceOutput }) {
+const STATE_RANK: Record<MaskState, number> = { masked: 0, on_purpose: 1, exception: 2 };
+
+/**
+ * `[mask.default]` makes the engine emit two rows labelled `default` for a
+ * column (the unscoped block, then the override). Show one row per env label,
+ * the worse of the two, so a masked row never hides an unmasked one. The
+ * exceptions list is deduplicated by its triple.
+ */
+function dedupe(output: ComplianceOutput): ComplianceOutput {
+  const per_column = output.per_column.map((column) => {
+    const byEnv = new Map<string, EnvMaskingStatus>();
+    for (const env of column.envs) {
+      const kept = byEnv.get(env.env);
+      if (
+        !kept ||
+        STATE_RANK[maskState(column, env, output.exceptions)] > STATE_RANK[maskState(column, kept, output.exceptions)]
+      ) {
+        byEnv.set(env.env, env);
+      }
+    }
+    return { ...column, envs: [...byEnv.values()] };
+  });
+  const seen = new Set<string>();
+  const exceptions = output.exceptions.filter((e) => {
+    const key = JSON.stringify([e.model, e.column, e.env]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return { ...output, per_column, exceptions };
+}
+
+function ComplianceBody({ output: raw }: { output: ComplianceOutput }) {
+  const output = dedupe(raw);
   const [picked, setPicked] = useState(ALL);
   const envs = envsOf(output);
   const env = envs.includes(picked) ? picked : ALL;
@@ -107,6 +140,8 @@ function ComplianceBody({ output }: { output: ComplianceOutput }) {
     row.envs.every((e) => maskState(row.column, e, output.exceptions) === "masked"),
   ).length;
   const models = new Set(rows.map((row) => row.column.model)).size;
+  // Cards and banner count different units; each says which.
+  const exceptionColumns = new Set(exceptions.map((e) => JSON.stringify([e.model, e.column]))).size;
 
   const picker = envs.length > 0 && (
     <div className="flex items-center gap-2">
@@ -157,7 +192,7 @@ function ComplianceBody({ output }: { output: ComplianceOutput }) {
         }`}
       >
         {exceptions.length > 0
-          ? `${plural(exceptions.length, "classified column has", "classified columns have")} no masking strategy in ${scope}, and the tag is not on the allow list.`
+          ? `${plural(exceptionColumns, "classified column has", "classified columns have")} no masking strategy in at least one environment${env === ALL ? "" : ` (${env})`}, and the tag is not on the allow list.`
           : `Every classified column is masked, or left unmasked on purpose, in ${scope}.`}
       </p>
 
@@ -201,13 +236,17 @@ function ComplianceBody({ output }: { output: ComplianceOutput }) {
         <Stat
           label="Unmasked on purpose"
           value={onPurpose}
-          sub="strategy none, or the tag is on the allow list"
+          sub="column × environment pairs: strategy none, or the tag is on the allow list"
           tone={onPurpose > 0 ? "warn" : "none"}
         />
         <Stat
           label="Exceptions"
           value={exceptions.length}
-          sub={exceptions.length === 0 ? "nothing to fix" : "not masked, and no allow-list entry"}
+          sub={
+            exceptions.length === 0
+              ? "nothing to fix"
+              : `column × environment pairs, in ${plural(exceptionColumns, "column", "columns")}`
+          }
           tone={exceptions.length > 0 ? "fail" : "ok"}
         />
       </div>

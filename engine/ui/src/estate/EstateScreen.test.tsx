@@ -597,7 +597,7 @@ describe("EstateScreen", () => {
 import { ModelDetail } from "./ModelDetail";
 
 function DetailHarness({ name, load }: { name: string; load: EstateLoaders["detail"] }) {
-  return <ModelDetail name={name} load={load} onClose={() => {}} />;
+  return <ModelDetail name={name} load={load} onClose={() => {}} runs={{ kind: "loading" }} />;
 }
 
 describe("The Promote panel on the estate", () => {
