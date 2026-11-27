@@ -7,50 +7,19 @@
 
 ## What it shows
 
-A model can compile cleanly and still produce the wrong answer, because the schema alone hides the two things that decide correctness: the literal values in a column and the units a number is stored in. This POC makes that gap concrete, then shows how grounding the model in real data via the `rocky mcp` tools closes it.
-
-It ships two transformation models over the same source:
-
-- `revenue_naive.sql` — the plausible schema-only guess: `WHERE status = 'completed'`, `SUM(amount_cents)` treated as dollars. It compiles. It returns the wrong number.
-- `revenue_correct.sql` — written after looking at the data: `WHERE status = 'COMPLETE'`, `SUM(amount_cents) / 100.0`. It reconciles to the true total and carries a typed assertion that locks the invariant in place.
-
-## Why it's distinctive
-
-- **"It compiled" is not "it's correct."** Both models pass `rocky compile`. Schema-only verification cannot tell them apart. Only the data can.
-- **The trap is realistic.** A `WHERE status = 'completed'` that silently matches zero rows, and an `amount_cents` summed as dollars (100x too large), are two of the most common reconcile bugs in real pipelines. They are exactly what an agent that reads column names but never samples rows gets wrong.
-- **The fix is a tool, not a prompt trick.** The Rocky MCP server hands an agent `sample_rows` and `profile_column`, so it sees `'COMPLETE'` and the cents scale before it writes a filter. The correctness it learns becomes a `[[tests]]` assertion, not a comment.
-- **Materialization stays gated on a review marker.** The agent can `propose` a plan. `rocky apply` then refuses it until `rocky review <plan-id> --approve` has written a marker naming that exact plan. The check is on the marker, not on who wrote it.
-
-## The engineered scenario
-
-`data/seed.sql` seeds eight orders:
+A model can compile cleanly and still be wrong, because the schema hides a column's literal values and a number's units. `data/seed.sql` seeds eight orders:
 
 | trap | reality | the schema-only guess |
 |---|---|---|
 | `status` | only ever `'COMPLETE'` (plus `'PENDING'`, `'CANCELLED'`) | `WHERE status = 'completed'` matches zero rows |
 | `amount_cents` | integer **cents** | summed as dollars, 100x too large |
 
-Five completed orders sum to `12500 + 7500 + 30000 + 5000 + 45000 = 100000` cents = **$1000.00**.
+Five completed orders sum to 100000 cents = **$1000.00**. Both models pass `rocky compile`:
 
-- `revenue_naive` produces `revenue_usd = NULL`, because the `'completed'` filter matches nothing, so `SUM` over zero rows is NULL. A confidently shipped zero.
-- `revenue_correct` produces `revenue_usd = 1000.00`.
+- `revenue_naive.sql`: `WHERE status = 'completed'`, `SUM(amount_cents)` as dollars. Returns `revenue_usd = NULL`.
+- `revenue_correct.sql`: `WHERE status = 'COMPLETE'`, `SUM(amount_cents) / 100.0`. Returns `1000.00`, locked by a `[[tests]]` assertion.
 
-## Layout
-
-```
-.
-├── README.md                 this file
-├── .mcp.json                 registers the Rocky MCP server for Claude Code
-├── rocky.toml                DuckDB pipeline (persistent poc.duckdb)
-├── run.sh                    deterministic, creds-free reconcile-gap proof
-├── data/seed.sql             the engineered traps (uppercase status + cents)
-└── models/
-    ├── _defaults.toml        catalog=poc, schema=demo
-    ├── revenue_naive.sql      schema-only guess — compiles, reconciles wrong
-    ├── revenue_naive.toml     full_refresh, no assertion (its author never looked)
-    ├── revenue_correct.sql    data-grounded — reconciles to $1000.00
-    └── revenue_correct.toml   full_refresh + [[tests]] aggregate SUM = 1000
-```
+The `rocky mcp` tools (`sample_rows`, `profile_column`) let an agent see the data before writing a filter. The agent can `propose` a plan, but `rocky apply` refuses it until `rocky review <plan-id> --approve` has written a marker naming that exact plan. The check is on the marker, not on who wrote it.
 
 ## Prerequisites
 
@@ -64,9 +33,9 @@ Five completed orders sum to `12500 + 7500 + 30000 + 5000 + 45000 = 100000` cent
 ./run.sh
 ```
 
-The script is deterministic and needs no credentials. It compiles both models (both pass), shows the source data so the traps are visible, materializes both models, reconciles them side by side, and runs `rocky test --declarative` so the grounded model's assertion goes green.
+The script compiles both models, shows the source data, materializes and reconciles both, and runs `rocky test --declarative`.
 
-> Note: the value assertion runs under `rocky test --declarative`, which executes the sidecar `[[tests]]` against the materialized target table. The default `rocky test` (no flag) only checks that a model's SQL executes; it does not evaluate `[[tests]]`. That is why `run.sh` materializes the tables first, then runs the declarative path.
+> The value assertion runs only under `rocky test --declarative`, which executes the sidecar `[[tests]]` against the materialized table (hence `run.sh` materializes first). Plain `rocky test` only checks that a model's SQL executes.
 
 ## Expected output
 
@@ -83,7 +52,7 @@ The script is deterministic and needs no credentials. It compiles both models (b
 
 ## The interactive MCP demo (Claude Code)
 
-`run.sh` proves the gap with no agent in the loop. This section layers the live demo on top: an agent driving the Rocky MCP tools to reach `revenue_correct` on its own.
+An agent uses the Rocky MCP tools to reach `revenue_correct` on its own. Run `./run.sh` once first: the tools read the **warehouse**, so `seeds.orders` must exist in `poc.duckdb`.
 
 `.mcp.json` registers the server:
 
@@ -91,34 +60,24 @@ The script is deterministic and needs no credentials. It compiles both models (b
 { "mcpServers": { "rocky": { "command": "rocky", "args": ["mcp", "--config", "rocky.toml"] } } }
 ```
 
-Open this directory in Claude Code (it picks up `.mcp.json`), confirm the `rocky` MCP server is connected, then give it the prompt:
+Open this directory in Claude Code, confirm the `rocky` MCP server is connected, then prompt:
 
 > Build a Rocky model for total completed-order revenue in USD from the orders source.
 
-### Prerequisite: seed the warehouse
-
-The MCP grounding tools read the **warehouse**, so the source data must exist in `poc.duckdb` first. Run `./run.sh` once (it seeds `poc.duckdb` with `seeds.orders`) before the interactive demo.
-
 ### Expected agent trajectory
 
-1. **`inspect_schema`** — lists `seeds.orders` under `sources` with its typed columns: `order_id`, `customer_id`, `status`, `amount_cents`, `ordered_at`. (Physical warehouse tables the project never declared as a Rocky source are discovered here too, so the agent can find what to ground against.)
-2. **`sample_rows`** on `seeds.orders` — sees real rows. The `status` values are `'COMPLETE'` (uppercase), never `'completed'`. With no `percent`, the first rows come back deterministically, the right default for a small table. This is the step a schema-only agent skips.
-3. **`profile_column`** on `seeds.orders` / `amount_cents` — sees the scale: values like 12500, 30000, 45000. Integer cents, not dollars. On `status`, the result's `top_values` lists the exact literals (`COMPLETE`, `PENDING`, `CANCELLED`) that a `min`/`max` pair would hide.
-4. **Writes the model** — `WHERE status = 'COMPLETE'`, `SUM(amount_cents) / 100.0 AS revenue_usd`. Equivalent to `revenue_correct.sql`.
-5. **`compile`** — type-checks clean. So would the naive model; compile is necessary, not sufficient.
-6. **`plan_preview`** — reads the SQL Rocky generates offline and confirms it matches intent. It is not the whole plan: a model it cannot render offline is skipped and is not named in the result. This model is a plain `full_refresh`, so it renders.
-7. **`propose`** — records an AI-authored plan and returns a `plan_id`. The agent stops here. It does not apply.
-8. **Human review** — you run `rocky review <plan-id>` to read the breaking-change report, then `rocky review <plan-id> --approve` to sign off, then `rocky apply <plan-id>` to materialize.
-9. **`rocky test --declarative`** — the `SUM(revenue_usd) = 1000` assertion reconciles green.
+1. **`inspect_schema`**: lists `seeds.orders` under `sources` with typed columns `order_id`, `customer_id`, `status`, `amount_cents`, `ordered_at`. Warehouse tables never declared as a Rocky source are discovered too.
+2. **`sample_rows`**: shows `status` is `'COMPLETE'`. With no `percent`, the first rows come back deterministically.
+3. **`profile_column`**: on `amount_cents`, shows integer cents (12500, 30000, 45000); on `status`, `top_values` lists the literals (`COMPLETE`, `PENDING`, `CANCELLED`) that `min`/`max` would hide.
+4. **Writes the model**: `WHERE status = 'COMPLETE'`, `SUM(amount_cents) / 100.0 AS revenue_usd`.
+5. **`compile`**: type-checks clean (necessary, not sufficient).
+6. **`plan_preview`**: shows the SQL Rocky generates offline. It is not the whole plan: a model it cannot render offline is skipped and not named in the result. This plain `full_refresh` model renders.
+7. **`propose`**: records an AI-authored plan and returns a `plan_id`. The agent stops; it does not apply.
+8. **Human review**: `rocky review <plan-id>` (breaking-change report), `rocky review <plan-id> --approve`, then `rocky apply <plan-id>`.
+9. **`rocky test --declarative`**: the `SUM(revenue_usd) = 1000` assertion passes.
 
-Both grounding tools accept either a compiled model name **or** a qualified `schema.table` source reference (like `seeds.orders`), so an agent can ground a raw source before it has authored any model.
-
-### Why a schema-only agent ships `revenue_naive`
-
-Without `sample_rows` and `profile_column`, the agent has only column names. `status` strongly implies a value like `'completed'`, and an agent in a hurry sees `amount_cents` and sums it. Both guesses are reasonable from the schema and both are wrong. The model compiles, so nothing flags it. The bug surfaces only when someone reconciles the number, by which point it has shipped. The MCP tools move that discovery to authoring time, and the `[[tests]]` assertion keeps it discovered.
+Both grounding tools accept a compiled model name **or** a `schema.table` source reference, so an agent can ground a raw source before authoring any model.
 
 ## Related
 
-- Agent workflow: the `rocky-ai-workflow` skill — the same text the MCP server ships as its `instructions`.
-- MCP server source: `engine/crates/rocky-mcp/`.
-- Sibling POCs: [`01-model-generation/`](../01-model-generation/), [`05-schema-grounded-validation/`](../05-schema-grounded-validation/).
+The `rocky-ai-workflow` skill (the same text the MCP server ships as its `instructions`); source in `engine/crates/rocky-mcp/`.

@@ -75,7 +75,7 @@ function loaders(overrides: Partial<AuditLoaders> = {}): AuditLoaders {
 }
 
 describe("AuditScreen", () => {
-  it("renders the whole ledger oldest first with plan links, and a hostile reason as text", async () => {
+  it("renders the whole audit log oldest first with plan links, and a hostile reason as text", async () => {
     const { container } = render(<AuditScreen loaders={loaders()} now={NOW} />);
     const table = await screen.findByRole("table", { name: "Policy decisions" });
     const rows = within(table).getAllByRole("row").slice(1);
@@ -87,7 +87,7 @@ describe("AuditScreen", () => {
     expect(screen.getByText("agent(alice)")).toBeInTheDocument();
     expect(screen.getByText("human(unrecorded)")).toBeInTheDocument();
     expect(container.querySelector("i")).toBeNull();
-    expect(screen.getByText("2 decision(s), oldest first, the whole ledger")).toBeInTheDocument();
+    expect(screen.getByText("2 decision(s), oldest first, the whole audit log")).toBeInTheDocument();
   });
 
   it("shows an approval row as an approval, not a policy allow, and an evaluation by its effect", async () => {
@@ -107,18 +107,18 @@ describe("AuditScreen", () => {
     const table = await screen.findByRole("table", { name: "Policy decisions" });
     const [evalRow, approvalRow] = within(table).getAllByRole("row").slice(1);
     expect(within(evalRow).getByText("evaluation")).toBeInTheDocument();
-    expect(within(evalRow).getByText("allow")).toBeInTheDocument();
+    expect(within(evalRow).getByText("Allowed")).toBeInTheDocument();
     expect(within(approvalRow).getByText("approval")).toBeInTheDocument();
     expect(within(approvalRow).getByText("approval (http_api) [effect allow]")).toBeInTheDocument();
-    expect(within(approvalRow).queryByText("allow")).toBeNull();
+    expect(within(approvalRow).queryByText("Allowed")).toBeNull();
   });
 
-  it("scopes the ledger through the product selector and shows the output model", async () => {
+  it("scopes the audit log through the product selector and shows the output model", async () => {
     const l = loaders();
     render(<AuditScreen loaders={l} now={NOW} />);
     await screen.findByRole("table", { name: "Policy decisions" });
     await waitFor(() => expect(screen.getByRole("option", { name: "revenue_daily" })).toBeInTheDocument());
-    fireEvent.change(screen.getByLabelText("Product"), { target: { value: "revenue_daily" } });
+    fireEvent.change(screen.getByLabelText("Data product"), { target: { value: "revenue_daily" } });
     await waitFor(() => expect(l.ledger).toHaveBeenCalledWith("revenue_daily"));
     expect(await screen.findByText(/Scoped to/)).toBeInTheDocument();
     expect(screen.getByText("GET /api/v1/audit?product=revenue_daily")).toBeInTheDocument();
@@ -147,7 +147,7 @@ describe("AuditScreen", () => {
     }
   });
 
-  it("explains an empty ledger, scoped or not", async () => {
+  it("explains an empty audit log, scoped or not", async () => {
     render(
       <AuditScreen
         loaders={loaders({

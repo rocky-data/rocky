@@ -19,7 +19,7 @@ sidebar:
 With the gate on, Rocky skips a transformation model only when **both** hold since its last *successful* build:
 
 1. **Logic unchanged (B2).** The model's cosmetic-invariant logic key (a hash of the normalised SQL plus its typed structural facts) matches the recorded one. Reformatting or re-commenting does not count as a change. Altering what the SQL computes does.
-2. **Upstream data unchanged (B3).** Every upstream is provably stable: a Rocky model that was *skipped* this run, or a raw source whose `MAX(<timestamp>)` matches the recorded signature. Only an `incremental` or `microbatch` model with a timestamp column has one to probe. Any other strategy (`full_refresh` included) with a raw source can skip only when `skip_rowcount_fallback` is on, which compares `COUNT(*)`.
+2. **Upstream data unchanged (B3).** Every upstream is provably stable: a Rocky model that was *skipped* this run, or a raw source whose `MAX(<timestamp>)` matches the recorded signature. Only an `incremental` model with a timestamp column has one to probe. For an `incremental` model with a `lookback` it is not enough: its build re-reads rows below the watermark, so a late row can change its output while `MAX(<timestamp>)` stays the same. Such a model also needs an unchanged `COUNT(*)`, so with the default settings it always builds when it reads a raw source. A model of any other strategy (`full_refresh` included) with a raw source can skip only when `skip_rowcount_fallback` is on, which compares `COUNT(*)`.
 
 If either is in doubt, the model builds.
 
@@ -93,7 +93,7 @@ skip_rowcount_fallback = false   # default: a non-watermarkable upstream is NOT 
 lag_tolerance_seconds = 0        # default: any MAX(ts) movement forces a rebuild
 ```
 
-- `skip_rowcount_fallback` allows a `COUNT(*)`-only stability signal when an upstream has no timestamp to probe. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE`, or a matched insert plus delete.
+- `skip_rowcount_fallback` allows a `COUNT(*)` stability signal: the only signal when an upstream has no timestamp to probe, and a second required one for an `incremental` model with a `lookback`. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE`, or a matched insert plus delete.
 - `lag_tolerance_seconds` (default `0`) is the largest forward move of a raw source's `MAX(ts)`, against the prior build, that still counts as unchanged. At `300`, a move from `10:00:00` to `10:03:00` can skip; a move to `10:06:00` rebuilds. A `MAX(ts)` that went backwards forces a rebuild whatever the value. It is not a wait-before-rebuild window like the `lag_tolerance` setting in other tools: Rocky never delays a build.
 
 The full `[run]` reference is in the [configuration reference](/reference/configuration/#run).

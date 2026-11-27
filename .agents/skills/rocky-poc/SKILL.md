@@ -60,7 +60,7 @@ This copies `scripts/_poc-template/` into `pocs/<category>/<id-name>/` and chmod
 Every POC MUST contain:
 
 ```
-README.md         # Structured: feature, why distinctive, layout, run, expected output
+README.md         # Short: what it shows, prerequisites, run, expected output, limitations
 rocky.toml        # Minimal POC-specific config (DuckDB by default)
 run.sh            # Executable end-to-end demo (chmod +x)
 models/           # .sql / .rocky files + .toml sidecars
@@ -156,13 +156,13 @@ bash scripts/update-poc-counts.sh   # from the monorepo root; rewrites examples/
 
 ## README structure
 
-Five sections, in this order:
+Keep it short. Sections, in this order:
 
-1. **Feature** — one-sentence description of what this POC demonstrates
-2. **Why it's distinctive** — why a user should care (what it proves about Rocky vs alternatives)
-3. **Layout** — tree of files with one-line descriptions
-4. **Run** — copy-pasteable commands to run it
-5. **Expected output** — what the user should see (snippet of `run.sh` output, not the full golden file)
+1. **What it shows** — 1-3 sentences
+2. **Prerequisites** — tools and credentials
+3. **Run** — copy-pasteable commands
+4. **Expected output** — a short snippet of `run.sh` output, not the full golden file
+5. **Limitations** — caveats a user needs, if any
 
 ## Commit style
 

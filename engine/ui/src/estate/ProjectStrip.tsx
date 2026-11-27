@@ -1,6 +1,6 @@
 import type { ProjectOutput } from "@rocky-types/project";
 import type { ReactNode } from "react";
-import { Clip, ToneDot, runStatusTone, type Tone } from "../components";
+import { Clip, ToneDot, runStatusLabel, runStatusTone, type Tone } from "../components";
 import { formatInstant, orNotRecorded } from "../format";
 
 /**
@@ -64,7 +64,7 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
         tone={project.last_run ? runStatusTone(project.last_run.status) : "pending"}
         sub={
           project.last_run
-            ? `${project.last_run.status} · ${project.last_run.trigger} · ${project.last_run.models_executed} model(s) · ${formatInstant(project.last_run.started_at, now)}`
+            ? `${runStatusLabel(project.last_run.status)} · ${project.last_run.trigger} · ${project.last_run.models_executed} model(s) · ${formatInstant(project.last_run.started_at, now)}`
             : "the state store holds no run yet"
         }
       />

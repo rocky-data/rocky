@@ -64,7 +64,7 @@ export type Area =
 export const AREAS: readonly Area[] = [
   {
     id: "needs-you",
-    label: "Needs you",
+    label: "Inbox",
     icon: BellAlertIcon,
     kind: "link",
     href: `${UI_BASE}/governor/brief`,
@@ -76,24 +76,24 @@ export const AREAS: readonly Area[] = [
     kind: "disabled",
     reason: "One project for now: the one this server runs.",
   },
-  { id: "estate", label: "Estate", icon: Squares2X2Icon, kind: "link", href: `${UI_BASE}/estate` },
+  { id: "estate", label: "Project", icon: Squares2X2Icon, kind: "link", href: `${UI_BASE}/estate` },
   {
     id: "runs",
     label: "Runs",
     icon: PlayCircleIcon,
     kind: "disabled",
-    reason: "No page of its own yet. The runs table is on Estate.",
+    reason: "No page of its own yet. The runs table is on Project.",
   },
   {
     id: "scheduler",
     label: "Scheduler",
     icon: CalendarDaysIcon,
     kind: "disabled",
-    reason: "No page of its own yet. The schedule status is on Estate.",
+    reason: "No page of its own yet. The schedule status is on Project.",
   },
   {
     id: "review",
-    label: "Review",
+    label: "Changes",
     icon: ClipboardDocumentCheckIcon,
     kind: "link",
     href: `${UI_BASE}/review`,
@@ -107,14 +107,14 @@ export const AREAS: readonly Area[] = [
   },
   {
     id: "products",
-    label: "Products",
+    label: "Data products",
     icon: CubeIcon,
     kind: "link",
     href: `${UI_BASE}/governor/products`,
   },
   {
     id: "governance",
-    label: "Governance",
+    label: "Oversight",
     icon: ScaleIcon,
     kind: "link",
     href: `${UI_BASE}/governor/scorecard`,
@@ -124,7 +124,7 @@ export const AREAS: readonly Area[] = [
     label: "Agents & Clusters",
     icon: CpuChipIcon,
     kind: "disabled",
-    reason: "No page yet. Agent activity is on Needs you.",
+    reason: "No page yet. Agent activity is on Oversight.",
   },
   {
     id: "settings",
@@ -136,7 +136,7 @@ export const AREAS: readonly Area[] = [
 ];
 
 /** The disclosure that folds the areas that open nothing yet. */
-export const NOT_YET_HEADING = "Coming later";
+export const NOT_YET_HEADING = "No page yet";
 
 /**
  * Whether an area's screen carries its own tab bar. Governance does: its

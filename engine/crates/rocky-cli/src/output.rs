@@ -901,7 +901,13 @@ impl From<&rocky_databricks::connector::ConnectorError> for FailureKind {
                 }
             }
             E::StatementFailed { .. } => FailureKind::QueryRejected,
-            E::Timeout { .. } => FailureKind::Transient,
+            // The submit did not answer by the deadline: the statement may
+            // have been accepted, with no id to cancel. Not `Transient`: a
+            // retry could run it twice (#2768).
+            E::Timeout { .. } => FailureKind::Unknown,
+            // The client stopped waiting while the statement may still run
+            // (a cancel was sent first). Not `Transient`, for the same reason.
+            E::Abandoned { .. } => FailureKind::Unknown,
             E::Canceled { .. } => FailureKind::Unknown,
             E::UnexpectedState { .. } => FailureKind::Unknown,
             E::ApiError { status, .. } => match status {
@@ -950,7 +956,8 @@ impl From<&rocky_snowflake::connector::ConnectorError> for FailureKind {
                 }
             }
             E::StatementFailed { .. } => FailureKind::QueryRejected,
-            E::Timeout { .. } => FailureKind::Transient,
+            // See the databricks branch above.
+            E::Timeout { .. } | E::Abandoned { .. } => FailureKind::Unknown,
             E::ApiError { status, .. } => match status {
                 401 | 403 => FailureKind::AuthFailed,
                 404 => FailureKind::NotFound,
@@ -992,7 +999,8 @@ impl From<&rocky_trino::connector::TrinoError> for FailureKind {
                 | "SERVER_SHUTTING_DOWN" => Self::Transient,
                 _ => Self::QueryRejected,
             },
-            E::Timeout { .. } => Self::Transient,
+            // See the databricks branch: the query may still run (#2768).
+            E::Timeout { .. } | E::Abandoned { .. } => Self::Unknown,
             E::MalformedResponse(_)
             | E::UntrustedNextUri { .. }
             | E::ArrowEncodingUnavailable
@@ -1047,7 +1055,12 @@ impl From<&rocky_bigquery::connector::BigQueryError> for FailureKind {
             },
             E::TableNotFound { .. } => Self::NotFound,
             E::JobError { .. } | E::LoadJobError { .. } => Self::QueryRejected,
-            E::Timeout { .. } => Self::Transient,
+            // See the databricks branch: the job may still run (#2768).
+            // `ResultLost`: the job succeeded but its result was lost, so its
+            // outcome is unknown to Rocky and it must not be retried.
+            E::Timeout { .. } | E::Abandoned { .. } | E::NoJobReference | E::ResultLost { .. } => {
+                Self::Unknown
+            }
             E::RetryBudgetExhausted { .. } => Self::QuotaExceeded,
             E::StorageRead(_) => Self::Unknown,
         }
@@ -1211,6 +1224,46 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
         }
     }
     (FailureKind::Unknown, None)
+}
+
+/// One chain link's answer to [`statement_may_still_run`]: `Some` when the
+/// link is a Databricks, Snowflake, BigQuery or Trino connector error, `None`
+/// otherwise.
+fn cause_may_still_run(cause: &(dyn std::error::Error + 'static)) -> Option<bool> {
+    if let Some(e) = cause.downcast_ref::<rocky_databricks::connector::ConnectorError>() {
+        return Some(e.may_still_run());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_snowflake::connector::ConnectorError>() {
+        return Some(e.may_still_run());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_bigquery::connector::BigQueryError>() {
+        return Some(e.may_still_run());
+    }
+    if let Some(e) = cause.downcast_ref::<rocky_trino::connector::TrinoError>() {
+        return Some(e.may_still_run());
+    }
+    None
+}
+
+/// Whether `err` carries a connector error that says its statement may still
+/// run on the warehouse (a Databricks, Snowflake, BigQuery or Trino `Timeout`
+/// or `Abandoned`, or a BigQuery `NoJobReference`), or that finished without
+/// Rocky reading its result (a BigQuery `ResultLost`).
+/// A caller must not resubmit that work: it could run twice (#2768).
+///
+/// Walks the chain the way [`classify_anyhow_error`] does, through both
+/// `AdapterError` wrappers. The first connector error found decides.
+/// `false` when the chain holds no connector error of those four adapters.
+pub fn statement_may_still_run(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(answer) = cause_may_still_run(cause) {
+            return answer;
+        }
+        if let Some(answer) = probe_wrapped_adapter_cause(cause, cause_may_still_run) {
+            return answer;
+        }
+    }
+    false
 }
 
 /// [`classify_anyhow_error_with_cooldown`] for a bare
@@ -6025,6 +6078,31 @@ pub struct ImportDbtFailure {
 pub struct HooksListOutput {
     pub hooks: Vec<HookEntry>,
     pub total: usize,
+    /// Configured `[hook.webhooks]` endpoints. Each URL is cut to its scheme
+    /// and host, because a webhook URL often carries a token in its path or
+    /// query. Empty for a project with no webhooks.
+    pub webhooks: Vec<WebhookEntry>,
+}
+
+/// One configured webhook in [`HooksListOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WebhookEntry {
+    pub event: String,
+    /// The endpoint's scheme and host only (`https://hooks.example.com`).
+    /// Never the path, query, port or credentials. A URL that does not parse
+    /// prints as `<redacted>`.
+    pub url: String,
+    pub method: String,
+    pub timeout_ms: u64,
+    pub on_failure: String,
+    /// Whether the webhook is fire-and-forget.
+    pub async_mode: bool,
+    pub retry_count: u32,
+    /// Names of the headers the webhook sets. Never their values.
+    pub header_keys: Vec<String>,
+    /// The preset the webhook was built from, when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -14619,7 +14697,8 @@ impl PreviewCostOutput {
 /// `state_needs_migration` (`409`: the state store lacks tables this server
 /// reads and a read never creates them; one read-write command — a
 /// `rocky run` — migrates it; not retryable), `model_not_found`,
-/// `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
+/// `run_not_found` (a run id, or `latest` on an empty store, names no
+/// recorded run), `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
 /// the mutation permit — carries [`running_job_id`](Self::running_job_id)),
 /// `job_not_running` (`409`: a cancel named a job that has finished),
 /// `job_not_cancellable` (`409`: a cancel named a job this server process
@@ -15526,12 +15605,24 @@ mod failure_kind_tests {
                 },
                 FailureKind::QueryRejected,
             ),
+            // #2768: a query that may still run is never `Transient`.
             (
                 TrE::Timeout {
                     timeout_secs: 30,
                     last_state: "RUNNING".into(),
                 },
-                FailureKind::Transient,
+                FailureKind::Unknown,
+            ),
+            (
+                TrE::Abandoned {
+                    id: "q1".into(),
+                    cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
+                    cause: Box::new(TrE::HttpStatus {
+                        status: 503,
+                        message: String::new(),
+                    }),
+                },
+                FailureKind::Unknown,
             ),
             (
                 TrE::MalformedResponse("missing rows".into()),
@@ -15589,7 +15680,24 @@ mod failure_kind_tests {
                 },
                 FailureKind::QueryRejected,
             ),
-            (BqE::Timeout { timeout_secs: 30 }, FailureKind::Transient),
+            // #2768: a job that may still run is never `Transient`.
+            (BqE::Timeout { timeout_secs: 30 }, FailureKind::Unknown),
+            (
+                BqE::Abandoned {
+                    job_id: "j1".into(),
+                    cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
+                    cause: Box::new(api("503 Service Unavailable")),
+                },
+                FailureKind::Unknown,
+            ),
+            (BqE::NoJobReference, FailureKind::Unknown),
+            (
+                BqE::ResultLost {
+                    job_id: "j2".into(),
+                    cause: Box::new(api("503 Service Unavailable")),
+                },
+                FailureKind::Unknown,
+            ),
             (
                 BqE::RetryBudgetExhausted { limit: 3 },
                 FailureKind::QuotaExceeded,
@@ -15656,13 +15764,39 @@ mod failure_kind_tests {
         assert_eq!(FailureKind::from(&e), FailureKind::QueryRejected);
     }
 
+    /// #2768: a statement that timed out may still run (or have been
+    /// accepted), so it is never reported as `Transient`.
     #[test]
-    fn databricks_timeout_maps_to_transient() {
+    fn databricks_timeout_maps_to_unknown() {
         let e = DbE::Timeout {
             id: "stmt-1".into(),
             seconds: 30,
         };
-        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
+    }
+
+    /// #2768: a statement the client stopped waiting on may still run, so it
+    /// is never reported as `Transient` (an orchestrator would retry it),
+    /// even when the poll error behind it was a 503 or a timeout.
+    #[test]
+    fn databricks_abandoned_maps_to_unknown() {
+        for cause in [
+            DbE::Timeout {
+                id: "stmt-1".into(),
+                seconds: 30,
+            },
+            DbE::ApiError {
+                status: 503,
+                body: "unavailable".into(),
+            },
+        ] {
+            let e = DbE::Abandoned {
+                id: "stmt-1".into(),
+                cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
+                cause: Box::new(cause),
+            };
+            assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
+        }
     }
 
     #[test]
@@ -15757,13 +15891,28 @@ mod failure_kind_tests {
         assert_eq!(FailureKind::from(&e), FailureKind::QueryRejected);
     }
 
+    /// #2768: see `databricks_timeout_maps_to_unknown`.
     #[test]
-    fn snowflake_timeout_maps_to_transient() {
+    fn snowflake_timeout_maps_to_unknown() {
         let e = SnE::Timeout {
             handle: "h-1".into(),
             seconds: 60,
         };
-        assert_eq!(FailureKind::from(&e), FailureKind::Transient);
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
+    }
+
+    /// #2768: see `databricks_abandoned_maps_to_unknown`.
+    #[test]
+    fn snowflake_abandoned_maps_to_unknown() {
+        let e = SnE::Abandoned {
+            handle: "h-1".into(),
+            cancel: rocky_core::statement_cancel::AbandonCancel::Requested,
+            cause: Box::new(SnE::Timeout {
+                handle: "h-1".into(),
+                seconds: 60,
+            }),
+        };
+        assert_eq!(FailureKind::from(&e), FailureKind::Unknown);
     }
 
     #[test]
@@ -15836,9 +15985,9 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_walks_chain_for_snowflake_connector_error() {
-        let err = anyhow::Error::new(SnE::Timeout {
-            handle: "h".into(),
-            seconds: 30,
+        let err = anyhow::Error::new(SnE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         })
         .context("running materialization");
         assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);
@@ -15929,9 +16078,9 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_with_cooldown_returns_none_for_non_breaker_failure() {
-        let conn_err = DbE::Timeout {
-            id: "s".into(),
-            seconds: 60,
+        let conn_err = DbE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         };
         let err = anyhow::Error::new(conn_err);
         assert_eq!(
@@ -15980,9 +16129,9 @@ mod failure_kind_tests {
     /// the classifier must keep unwrapping it too.
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_snowflake_connector() {
-        let conn_err = SnE::Timeout {
-            handle: "h".into(),
-            seconds: 30,
+        let conn_err = SnE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         };
         let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err).context("execute_statement failed");
@@ -16051,10 +16200,10 @@ mod failure_kind_tests {
     }
 
     #[test]
-    fn run_path_bare_wrap_preserves_snowflake_timeout() {
-        let result: rocky_adapter_sdk::AdapterResult<()> = Err(sn_adapter_err(SnE::Timeout {
-            handle: "h-1".into(),
-            seconds: 60,
+    fn run_path_bare_wrap_preserves_snowflake_transient() {
+        let result: rocky_adapter_sdk::AdapterResult<()> = Err(sn_adapter_err(SnE::ApiError {
+            status: 503,
+            body: "unavailable".into(),
         }));
         let err: anyhow::Error = result.map_err(anyhow::Error::from).unwrap_err();
         assert_eq!(classify_anyhow_error(&err), FailureKind::Transient);

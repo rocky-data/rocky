@@ -8112,7 +8112,8 @@ pub struct TransformationPipelineConfig {
     /// Target configuration (adapter + governance).
     pub target: TransformationTargetConfig,
 
-    /// Data quality checks run after model execution.
+    /// Data quality checks. A transformation run does not execute them, and
+    /// `rocky validate` warns (V034) about each one that is set.
     #[serde(default)]
     pub checks: ChecksConfig,
 

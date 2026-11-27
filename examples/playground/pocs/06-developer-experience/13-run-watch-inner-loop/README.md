@@ -7,41 +7,7 @@
 
 ## What it shows
 
-`rocky run --watch` wraps the existing `rocky run` path in a filesystem
-watcher, so an interactive editor session re-materialises the pipeline
-on every save. The POC runs non-interactively by:
-
-1. Launching `rocky run --watch` in the background, redirected to a log.
-2. Waiting for the first run to land (`[watch] run completed` in the log).
-3. Touching `rocky.toml`, the same shape as a `:w` from vim or a save in
-   VSCode.
-4. Waiting for the second run to land.
-5. Sending SIGINT; the watch loop completes the in-flight run and exits 0.
-
-The log under `expected/watch.log` carries one full `RunOutput` JSON per
-iteration (newline-delimited stream) plus stderr banner + `detected
-change` notices.
-
-## Why it's distinctive
-
-- **The compile-verify loop becomes interactive** — pair this with
-  `rocky lsp` for type-aware authoring + auto-materialise.
-- **Debounce window coalesces editor save bursts** — a quick burst
-  triggers exactly one re-run, not one per `notify` event.
-- **FSEvents-safe on macOS** — the watcher monitors the parent directory
-  with a filename filter, so atomic-rename saves (vim's
-  `set backupcopy=auto`, VSCode's default save) are caught where a
-  file-level watch would miss the new inode.
-
-## Layout
-
-```
-.
-├── README.md         this file
-├── rocky.toml        DuckDB replication pipeline
-├── run.sh            launch watch → touch → wait → SIGINT
-└── data/seed.sql     50-row synthetic orders table
-```
+`rocky run --watch` wraps `rocky run` in a filesystem watcher that re-materialises the pipeline on every save. A 200 ms debounce coalesces a burst of saves into one re-run. The watcher monitors the parent directory with a filename filter, so atomic-rename saves (vim's `set backupcopy=auto`, VSCode's default) are caught on macOS.
 
 ## Prerequisites
 
@@ -54,16 +20,14 @@ change` notices.
 ./run.sh
 ```
 
-## What happened
+## What to expect
 
-1. **Seed** `raw__orders.orders` into DuckDB (50 rows).
-2. **Launch watch** — `rocky -c rocky.toml run --watch --filter source=orders` runs in the background, prints a watching banner on stderr, runs the pipeline once on startup.
-3. **Touch `rocky.toml`** — fires a filesystem event; the 200 ms debounce window collects any related events; one re-run is dispatched.
-4. **Two `RunOutput` records** land in `expected/watch.log`, one per iteration, newline-delimited.
-5. **SIGINT** completes the in-flight run, then the watch loop exits 0.
+The script is non-interactive. It seeds `raw__orders.orders` (50 rows), starts `rocky -c rocky.toml run --watch --filter source=orders` in the background, waits for `[watch] run completed`, touches `rocky.toml`, waits for the second run, then sends SIGINT. The watch loop completes the in-flight run and exits 0.
+
+`expected/watch.log` holds one `RunOutput` JSON per iteration (newline-delimited) plus the stderr banner and `detected change` notices.
 
 ## Related
 
 - Engine source: `engine/crates/rocky-cli/src/commands/run_watch.rs`
 - CLI reference: [`rocky run --watch`](../../../../../docs/src/content/docs/reference/commands/core-pipeline.md#rocky-run)
-- Sibling POC: [`02-rocky-serve-api`](../02-rocky-serve-api/) — `rocky serve --watch` for HTTP-API authoring (different surface; same `--watch` philosophy).
+- Sibling POC: [`02-rocky-serve-api`](../02-rocky-serve-api/) — `rocky serve --watch`.

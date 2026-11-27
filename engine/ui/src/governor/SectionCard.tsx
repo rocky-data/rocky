@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { SectionAvailability } from "@rocky-types/brief";
-import { TABLE } from "../components";
+import { Missing, TABLE } from "../components";
 import { NOT_RECORDED } from "../format";
 
 /**
@@ -15,6 +15,7 @@ export function SectionCard({
   note,
   emptyLine = "nothing in the window",
   summary,
+  greyMissing = false,
   children,
 }: {
   title: string;
@@ -23,6 +24,12 @@ export function SectionCard({
   emptyLine?: string;
   /** A one-line total shown beside the title when the section is available. */
   summary?: ReactNode;
+  /**
+   * Draw an unavailable section as a grey "-" with the engine's note in
+   * `title`, the Inbox's reading of a missing value. Off, the amber text the
+   * other screens use.
+   */
+  greyMissing?: boolean;
   children: ReactNode;
 }) {
   let body: ReactNode;
@@ -39,7 +46,11 @@ export function SectionCard({
       );
       break;
     case "unavailable":
-      body = (
+      body = greyMissing ? (
+        <p className="text-sm text-muted">
+          <Missing reason={note ? `${NOT_RECORDED}: ${note}` : `${NOT_RECORDED}: the engine could not read this section`} />
+        </p>
+      ) : (
         <p className="text-sm text-amber-700 dark:text-amber-400">
           {NOT_RECORDED}
           {note ? `: ${note}` : ""}

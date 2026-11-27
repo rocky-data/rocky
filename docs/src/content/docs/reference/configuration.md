@@ -166,7 +166,7 @@ Two types have no page yet. They read these top-level fields:
 
 | `type` | Role | Fields |
 |--------|------|--------|
-| `"trino"` | Warehouse | `host` (coordinator URL, required). `token` for JWT bearer auth, else `username` + `password` for Basic auth. `username` also names the Trino user. `database` sets the default catalog. `timeout_secs` defaults to `300`. |
+| `"trino"` | Warehouse | `host` (coordinator URL, required). `token` for JWT bearer auth, else `username` + `password` for Basic auth. `username` also names the Trino user. `database` sets the default catalog. `timeout_secs` defaults to `300`; when it passes, Rocky cancels the query and does not retry it. |
 | `"iceberg"` | Discovery | `host` (REST catalog URL, required). `token` (optional bearer token). |
 
 
@@ -206,7 +206,7 @@ The adapter makes no network call and does not check that the tables exist. `roc
 
 ### `[adapter.NAME.retry]`
 
-Decide how hard this adapter tries again after a transient error: an HTTP 429 or 503, a rate limit, a timeout. Rocky backs off exponentially between attempts, with jitter by default.
+Decide how hard this adapter tries again after a transient error: an HTTP 429 or 503, a rate limit, a transport timeout. Rocky backs off exponentially between attempts, with jitter by default. A Databricks or Snowflake statement that passed its client deadline is never sent again: it may still run.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -474,7 +474,7 @@ Tune how many tables this pipeline processes at once, and when it gives up. The 
 | `concurrency` | string \| integer | `"adaptive"` | Max tables processed in parallel. `"adaptive"` (default) uses an AIMD throttle starting at 32 and adjusting to rate-limit signals — best for remote warehouses. A fixed integer (e.g. `8`) pins concurrency; `1` is serial. |
 | `fail_fast` | bool | `false` | Abort all remaining tables on first error. |
 | `error_rate_abort_pct` | integer | `50` | Abort if error rate exceeds this percentage (0–100). Set to 0 to disable. |
-| `table_retries` | integer | `1` | Times to retry failed tables after the initial parallel phase. Set to 0 to disable. |
+| `table_retries` | integer | `1` | Times to retry failed tables after the initial parallel phase. Set to 0 to disable. A table whose Databricks or Snowflake statement may still run (it passed its client deadline, or Rocky stopped waiting on it) is not retried. |
 
 ---
 
@@ -617,7 +617,7 @@ Skipping rests on two heuristics: a cosmetic-invariant IR hash for the logic, an
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `skip_unchanged` | bool | `false` | Master switch. `--skip-unchanged` turns the gate on for one invocation; `--force-rebuild` overrides both. |
-| `skip_rowcount_fallback` | bool | `false` | Allow a rowcount-only (`COUNT(*)`) stability signal when an upstream has no timestamp to probe. Only `incremental` and `microbatch` models with a timestamp column have one. Weaker than a watermark: it can miss a same-size in-place `UPDATE`. |
+| `skip_rowcount_fallback` | bool | `false` | Allow a `COUNT(*)` stability signal when an upstream has no timestamp to probe. Only an `incremental` model with a timestamp column has one. An `incremental` model with a `lookback` that reads a raw source needs `COUNT(*)` as well, so without this it never skips. Weaker than a watermark: it can miss a same-size in-place `UPDATE`. |
 | `lag_tolerance_seconds` | integer | `0` | The largest forward move of an upstream `MAX(ts)`, against the prior build, still treated as unchanged. `0`: any movement rebuilds. A `MAX(ts)` that went backwards always rebuilds. Not a wait-before-rebuild window like `lag_tolerance` in other tools. |
 | `strict_scheduling` | bool | `false` | Refuse a run instead of warning when Rocky cannot safely resolve the ordering edges it derives from the physical `schema.table` names a model reads: contradicting bare-read pairs, failed reference extraction, colliding targets, a `catalog.schema.table` read of a model with no catalog in its `[target]`, a by-name edge that `rocky run --dag` dropped because an exact read contradicted it, and, with `[resilience] contain_failures = true`, a bare-name read dropped because it would close a cycle (checked on every run, `--shadow` and `--branch` included, before any write). `false` reports warnings and exits `0`, so a consumer that ignores them can read a stale target. It lives on `[run]` because `rocky run --dag` derives ordering across pipelines. |
 | `tests_on_run` | `"off"`, `"report"`, `"enforce"` | `"enforce"` | Run each built model's sidecar `[[tests]]` during `rocky run`. `off` runs none. `report` records results under `test_results` and never fails a model. `enforce` fails a model whose error-severity test fails or cannot run, so its downstream models do not build (its table stays). A warning-severity test never fails a model. `rocky run --tests <mode>` overrides it. `rocky plan promote` refuses a branch whose newest test evidence has a failing error-severity test, or none. |

@@ -55,7 +55,7 @@ const CHAIN: AuditForOutput = {
   },
   verify_after: {
     availability: "unavailable",
-    note: "no verification row is recorded for this plan",
+    note: "no post-apply check is recorded for this change",
     total: 0,
     entries: [],
   },
@@ -86,10 +86,10 @@ describe("CustodyScreen", () => {
     const decisions = await screen.findByRole("region", { name: "Decisions" });
     const [evalRow, approvalRow] = within(decisions).getAllByRole("row").slice(1);
     expect(within(evalRow).getByText("evaluation")).toBeInTheDocument();
-    expect(within(evalRow).getByText("require_review")).toBeInTheDocument();
+    expect(within(evalRow).getByText("Needs approval")).toBeInTheDocument();
     expect(within(approvalRow).getByText("approval")).toBeInTheDocument();
     expect(within(approvalRow).getByText("approval (http_api) [effect allow]")).toBeInTheDocument();
-    expect(within(approvalRow).queryByText("allow")).toBeNull();
+    expect(within(approvalRow).queryByText("Allowed")).toBeNull();
   });
 
   it("renders the five links by availability with every id as text", async () => {
@@ -103,13 +103,16 @@ describe("CustodyScreen", () => {
     expect(within(decisions).getByText("rule 1")).toBeInTheDocument();
     const runs = screen.getByRole("region", { name: "Runs" });
     expect(within(runs).getByRole("link", { name: "run-custody-1" })).toBeInTheDocument();
+    // The engine's `Success`, in words.
+    expect(within(runs).getByText("Succeeded")).toBeInTheDocument();
+    expect(within(runs).queryByText("Success")).toBeNull();
     expect(within(runs).getByText(NOT_RECORDED)).toBeInTheDocument();
-    const verify = screen.getByRole("region", { name: "Verification after apply" });
+    const verify = screen.getByRole("region", { name: "Post-apply checks" });
     expect(
-      within(verify).getByText(`${NOT_RECORDED}: no verification row is recorded for this plan`),
+      within(verify).getByText(`${NOT_RECORDED}: no post-apply check is recorded for this change`),
     ).toBeInTheDocument();
     expect(within(verify).queryByRole("table")).toBeNull();
-    const blast = screen.getByRole("region", { name: "Blast radius" });
+    const blast = screen.getByRole("region", { name: "Impact" });
     expect(within(blast).getByText("Direct: mart_revenue")).toBeInTheDocument();
     expect(load).toHaveBeenCalledWith("fct_orders");
   });
@@ -131,7 +134,7 @@ describe("CustodyScreen", () => {
       />,
     );
     expect(
-      await screen.findByText(/nothing in the ledger, the run history, the plan files or the graph references it/),
+      await screen.findByText(/nothing in the audit log, the run history, the change files or the lineage references it/),
     ).toBeInTheDocument();
   });
 

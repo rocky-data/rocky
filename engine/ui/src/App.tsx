@@ -1,3 +1,4 @@
+import { JobTray, JobTrayProvider, RunningJobs } from "./jobs/JobTray";
 import {
   Component,
   useEffect,
@@ -80,19 +81,32 @@ type EngineState =
 const fetchMetaFromEngine = (): Promise<MetaOutput> => apiGet<MetaOutput>("meta");
 
 /**
- * How many decisions wait on a person: the brief's escalation count, the
- * number the Needs you screen lists. `/brief` compiles nothing and reads only
+ * What waits on a person, as two counts: approval decisions, and runs that
+ * need attention. The Inbox lists both, so its badge adds them; Changes lists
+ * decisions only. A section the engine could not read is `null`, never zero.
+ */
+export type Waiting = { decisions: number | null; runs: number | null };
+
+/**
+ * The brief's counts, read from `/brief`: it compiles nothing and reads only
  * the ledger, so it is cheap enough to poll; `/review/queue` compiles the
  * project on every call to rank by blast radius, under the store's one
  * permit, and is not. Escalations are a current-state projection that the
- * window does not cut, so the shortest window reads the least. A section the
- * engine could not read is no count at all, never zero. At module scope for
- * the same reason as `fetchMetaFromEngine`.
+ * window does not cut, so the shortest window reads the least. A runs section
+ * with no data is an empty window (zero); an unavailable one is `null`. At
+ * module scope for the same reason as `fetchMetaFromEngine`.
  */
-const fetchWaitingFromEngine = (): Promise<number | null> =>
-  apiGet<BriefOutput>("brief?since=24h").then(({ escalations }) =>
-    escalations.availability === "unavailable" ? null : escalations.total,
-  );
+const fetchWaitingFromEngine = (): Promise<Waiting> =>
+  apiGet<BriefOutput>("brief?since=24h").then(({ escalations, runs }) => ({
+    decisions: escalations.availability === "unavailable" ? null : escalations.total,
+    runs: runs.availability === "unavailable" ? null : runs.availability === "available" ? runs.attention.length : 0,
+  }));
+
+/** The Inbox badge: decisions plus attention runs, or `null` when either was not read. */
+export function inboxCount(waiting: Waiting | null): number | null {
+  if (waiting === null || waiting.decisions === null || waiting.runs === null) return null;
+  return waiting.decisions + waiting.runs;
+}
 
 /** How often the sidebar reads the waiting count again, while the page is open. */
 export const WAITING_REFRESH_MS = 30_000;
@@ -109,12 +123,12 @@ export const WAITING_REFRESH_MS = 30_000;
  * the session through `apiGet`'s own event.
  */
 export function useWaitingCount(
-  fetchWaiting: () => Promise<number | null>,
+  fetchWaiting: () => Promise<Waiting>,
   enabled: boolean,
   pathname: string,
   refreshMs: number = WAITING_REFRESH_MS,
-): number | null {
-  const [count, setCount] = useState<number | null>(null);
+): Waiting | null {
+  const [count, setCount] = useState<Waiting | null>(null);
   // Shared across effect runs, so a navigation does not stack a second read
   // on one still running.
   const inFlight = useRef(false);
@@ -156,8 +170,8 @@ export function useWaitingCount(
 }
 
 /** The words a waiting count is announced with. Exported so tests pin one string. */
-export function waitingLine(count: number): string {
-  return count === 1 ? "1 decision waits on you" : `${count} decisions wait on you`;
+export function waitingLine(count: number, noun: "decision" | "item" = "decision"): string {
+  return count === 1 ? `1 ${noun} waits on you` : `${count} ${noun}s wait on you`;
 }
 
 /**
@@ -359,11 +373,14 @@ function AreaLink({
   area,
   current,
   waiting,
+  noun,
 }: {
   area: Area & { kind: "link" };
   current: AreaId;
   /** What waits on a person in this area, when known and above zero. */
   waiting?: number;
+  /** What the count counts: the Inbox lists decisions and runs, Changes decisions. */
+  noun?: "decision" | "item";
 }) {
   const here = area.id === current;
   const Icon = area.icon;
@@ -423,7 +440,7 @@ function AreaLink({
           {waiting}
         </span>
         <span id={waitingId} hidden>
-          {waitingLine(waiting)}
+          {waitingLine(waiting, noun)}
         </span>
       </>
     )}
@@ -433,17 +450,25 @@ function AreaLink({
 
 /**
  * The eleven areas: first the five that open a screen, then the six that do
- * not, folded under one "Coming later" disclosure. Six disabled rows with a
+ * not, folded under one "No page yet" disclosure (`NOT_YET_HEADING`). Six disabled rows with a
  * sentence each filled half the rail and pushed the five real areas into a
  * minority of it; folded, they cost one row, and each reason is one click
  * away. A disabled entry is not a link — no tab stop — and says so to
  * assistive technology. The disclosure is a native `<details>`: keyboard and
  * screen-reader behaviour come from the browser, with no state here.
  */
-/** The areas whose badge shows the waiting count: both answer "what waits on me". */
-const WAITING_AREAS: ReadonlySet<AreaId> = new Set<AreaId>(["needs-you", "review"]);
+/**
+ * The badge an area shows: the Inbox adds attention runs to decisions because
+ * its Waiting card lists both; Changes counts decisions. `undefined` is no badge.
+ */
+function badgeFor(id: AreaId, waiting: Waiting | null): number | undefined {
+  if (waiting === null) return undefined;
+  if (id === "needs-you") return inboxCount(waiting) ?? undefined;
+  if (id === "review") return waiting.decisions ?? undefined;
+  return undefined;
+}
 
-function AreaNav({ current, waiting }: { current: AreaId; waiting: number | null }) {
+function AreaNav({ current, waiting }: { current: AreaId; waiting: Waiting | null }) {
   const open = AREAS.filter((area) => area.kind === "link");
   const notYet = AREAS.filter((area) => area.kind === "disabled");
   return (
@@ -456,7 +481,8 @@ function AreaNav({ current, waiting }: { current: AreaId; waiting: number | null
                 <AreaLink
                   area={area as Area & { kind: "link" }}
                   current={current}
-                  waiting={waiting !== null && WAITING_AREAS.has(area.id) ? waiting : undefined}
+                  waiting={badgeFor(area.id, waiting)}
+                  noun={area.id === "needs-you" ? "item" : "decision"}
                 />
               </li>
             ))}
@@ -509,7 +535,7 @@ function SidebarContents({
 }: {
   current: AreaId;
   engine: ReactNode;
-  waiting: number | null;
+  waiting: Waiting | null;
 }) {
   return (
     <div className="flex grow flex-col gap-y-5 overflow-y-auto border-r border-zinc-200 bg-white px-6 dark:border-white/10 dark:bg-zinc-900">
@@ -571,7 +597,7 @@ export function App({
   governor?: ReactNode;
   fetchMeta?: () => Promise<MetaOutput>;
   /** The sidebar's waiting count. Tests hand in a fake. */
-  fetchWaiting?: () => Promise<number | null>;
+  fetchWaiting?: () => Promise<Waiting>;
 }) {
   const pathname = usePathname();
   const lane: Lane = laneFromPath(pathname);
@@ -614,6 +640,7 @@ export function App({
           }
         }
       >
+      <JobTrayProvider>
       <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
         {/* The drawer, below `lg`. Mounted only while open. */}
         <Dialog
@@ -664,7 +691,7 @@ export function App({
           </div>
           <Wordmark className="flex" />
         </div>
-        {access !== null && !expired && <OperatorBanner access={access} />}
+        {access !== null && !expired && <OperatorBanner access={access} jobs={<RunningJobs />} />}
         </div>
 
         <main className="py-10 lg:pl-72">
@@ -681,7 +708,10 @@ export function App({
             )}
           </div>
         </main>
+        {/* A job outlives the page that started it; after expiry nothing can be read. */}
+        {!expired && <JobTray />}
       </div>
+      </JobTrayProvider>
       </WriteAccessProvider>
     </ErrorBoundary>
   );

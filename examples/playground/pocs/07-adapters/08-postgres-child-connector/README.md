@@ -1,88 +1,50 @@
 # 08-postgres-child-connector — Reference child connector for Postgres
 
-> **Category:** 07-adapters
-> **Credentials:** none (Docker daemon required for the live tour; the POC brings its own Postgres)
-> **Runtime:** ~20-40s on a warm Docker pull (`rocky validate` only, in <1s, when Docker is absent)
-> **Rocky features:** `rocky load --connector`, the child connector protocol, a timestamp cursor in connector state, declared secrets and log redaction
+> **Credentials:** none (Docker required for the live tour; the POC brings its own Postgres)
+> **Runtime:** ~20-40s on a warm Docker pull (`rocky validate` only, <1s, without Docker)
+
+## What it shows
+
+`rocky load --connector pg_events` runs `connector/main.py` once. It reads new rows of `public.events` through the `duckdb` CLI's `postgres` extension and writes one Parquet file. Rocky checks it, appends to `poc.main.events` in DuckDB, and saves the cursor.
+
+Support tier `reference`: maintained by the Rocky project. `rocky connector test pg_events` runs on each pull request that touches it (no Docker); `run.sh` runs against Docker weekly.
 
 ## Read this first: what this connector fits
 
 | Fact | What it means for you |
 |---|---|
 | The target only appends. | Use it for insert-only tables, such as events or logs. |
-| An updated row is a new row to Rocky only if its cursor value moves forward. | Then the row lands again, as a duplicate. An update that keeps the cursor value is never seen. Deletes are never seen. |
-| A row that commits late, with a cursor value below the saved cursor, is lost for good. | Use a cursor that the database sets at commit order, or leave a safety lag. |
+| An updated row is a new row to Rocky only if its cursor value moves forward. | Then it lands again, as a duplicate. An update that keeps the cursor value is never seen. Deletes are never seen. |
+| A row that commits late, with a cursor value below the saved cursor, is lost for good. | Use a cursor the database sets at commit order, or leave a safety lag. |
 | The newest rows wait until a newer row arrives. | Rows at the source maximum are held back so ties land together. A source that stops receiving rows keeps its last rows unloaded. |
 | Rows with a NULL cursor value are skipped for good. | Make the cursor column `NOT NULL`. |
 | Delivery is at least once. | A crash between the promote and the state commit loads a batch twice. Deduplicate downstream on a key. |
-| Each run scans the whole source table. | The bounds compare `epoch_us(...)` integers, so DuckDB does not push the filter to Postgres. Fine for a demo; add an index-friendly filter for large tables. |
-| Python 3.8 or newer, standard library only. | `main.py` imports nothing outside the standard library. It reads its settings from `options.json`, which Rocky writes from `[connector.pg_events.options]`. |
-| It needs the standalone `duckdb` CLI on `PATH`. | `main.py` runs all SQL through it, with the DuckDB `postgres` extension. |
-| Egress: `extensions.duckdb.org` and your Postgres host. | The manifest declares only `extensions.duckdb.org`, the one fixed host. Rocky does not enforce the list. |
-
-## Support tier
-
-The manifest sets `support_tier = "reference"`. The Rocky project maintains this connector. `rocky connector test pg_events` runs on each pull request that touches it, with no Docker. `run.sh` runs against Docker every week.
-
-## What it shows
-
-A complete child connector in about 240 lines of Python. `rocky load --connector pg_events` starts `connector/main.py` once. The program reads the new rows of `public.events` from Postgres and writes one Parquet file. Rocky checks the file, appends the rows to `poc.main.events` in DuckDB, and saves the cursor for the next run.
-
-```
-  rocky load ──▶ main.py ──▶ duckdb CLI ──(postgres ext, libpq)──▶ Postgres
-      ▲             │
-      │             └──▶ batch-0.parquet + _rocky_result.json {"cursor": ...}
-      └── check file, append to poc.main.events, save state (commit_seq + 1)
-```
+| Each run scans the whole source table. | The bounds compare `epoch_us(...)` integers, so DuckDB does not push the filter to Postgres. Add an index-friendly filter for large tables. |
+| Egress: `extensions.duckdb.org` and your Postgres host. | The manifest declares only `extensions.duckdb.org`. Rocky does not enforce the list. |
 
 ## The cursor contract
 
-The state is `{"cursor": "<ISO-8601 UTC, microseconds>" | null}`, with `state_schema_version = 1`.
+State is `{"cursor": "<ISO-8601 UTC, microseconds>" | null}`, `state_schema_version = 1`.
 
-```
-  source values:   t1  t2 ... t19  t20  ← t20 is the maximum M
-  run 1 extracts:  t1 .. t19           cursor = t19   (t20 waits)
-  insert t21..t25; M = t25
-  run 2 extracts:  t20 .. t24           cursor = t24   (t25 waits)
-  run 3 extracts:  nothing              cursor = t24   (state still commits)
-```
+1. With `TimeZone = 'UTC'`, the program reads `MAX(cursor_column)` once (M).
+2. It extracts rows with `cursor < value < M` (no lower bound on the first run).
+3. The new cursor is the maximum value extracted. With no rows, or an empty source, it does not change.
+4. With no rows, no Parquet file is written or listed; Rocky skips the load and still commits the state.
 
-1. The program sets `TimeZone = 'UTC'` and reads `MAX(cursor_column)` once. Call it M.
-2. It extracts the rows with `cursor < value < M`. The first run has no lower bound. NULL values are skipped.
-3. The new cursor is the maximum value it extracted. When it extracts no row, the cursor does not change.
-4. Rows at M wait until a newer row exists. So rows that tie at M are never split across two runs, and on a quiet source the newest rows wait until newer data arrives.
-5. An empty source table selects nothing and keeps the cursor.
-6. With no rows, the program writes no Parquet file and lists none. Rocky skips the load and still commits the state.
+## Secrets and settings
 
-## Secrets
+`rocky.toml` declares `secrets = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]`; Rocky hands only those to the program. libpq reads them (`ATTACH '' AS pg (TYPE postgres, READ_ONLY)`), so no connection string is in SQL, argv or output.
 
-`rocky.toml` declares `secrets = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]`. Rocky hands only those variables to the program. The program runs `ATTACH '' AS pg (TYPE postgres, READ_ONLY)`, so libpq reads them from the environment. No connection string is in the SQL, in argv or in the output. The program prints counts only.
+Rocky replaces secret values of 8 bytes or more with `${NAME}` in logs; **shorter values are not replaced**. The POC user is `rocky_reader` because a user named `postgres` (8 bytes) would turn every "postgres" in the logs into `${PGUSER}`. `run.sh` greps all outputs, debug logs, scratch dirs and state for the password. `keep_scratch = true` keeps scratch dirs for that; by default Rocky removes a successful run's scratch dir after the state commit.
 
-Rocky replaces a secret value of 8 bytes or more with `${NAME}` in its logs. Shorter values are not replaced, so the POC password is longer than 8 bytes. The POC user is `rocky_reader`, not `postgres`. A user named `postgres` (8 bytes) would turn every "postgres" in the logs, such as the extension name, into `${PGUSER}`. `run.sh` greps the password over every output, every debug log, the scratch directories and the state file, and expects 0 hits. The POC sets `keep_scratch = true` so the scratch directories are there to check; by default Rocky removes a successful run's scratch directory after the state commit.
-
-## Layout
-
-```
-.
-├── README.md              this file
-├── rocky.toml             DuckDB target + [connector.pg_events] with the PG* secrets and the options
-├── docker-compose.yml     postgres:16-alpine, seeded from seed.sql
-├── seed.sql               public.events, 20 rows, distinct created_at values
-├── run.sh                 validate → compose up → 3 loads with asserts → password grep → compose down
-└── connector/
-    ├── connector.toml     manifest: command = ["./main.py"], state_schema_version = 1
-    ├── main.py            the connector (Python 3.8+, stdlib only)
-    └── .gitignore         ignores .duckdb-extensions/, the extension cache
-```
-
-The settings are in `[connector.pg_events.options]` in `rocky.toml`: `schema`, `table`, `cursor_column` and an optional `extension_directory`. Rocky writes the table as JSON to `options.json` in the scratch directory and passes its path as `options_path` in the request. The options are not secrets: the file is on disk in clear. The DuckDB extension cache defaults to `connector/.duckdb-extensions/`, also next to `main.py`. The program's `HOME` is a new scratch directory on every run, so a cache there would download the extension every time.
+`[connector.pg_events.options]` holds `schema`, `table`, `cursor_column` and optional `extension_directory`. They reach the program in `options.json`, **on disk in clear**, so no secrets there. The extension cache defaults to `connector/.duckdb-extensions/`, because the program's `HOME` is a new scratch directory on every run.
 
 ## Prerequisites
 
 - `rocky` on `PATH`
 - `docker` with `docker compose` (live tour)
-- `python3` 3.8 or newer
-- the `duckdb` CLI on `PATH`
+- `python3` 3.8 or newer (the connector uses only the standard library)
+- the standalone `duckdb` CLI on `PATH`
 - network access to `extensions.duckdb.org` on the first run
 
 ## Run
@@ -91,33 +53,19 @@ The settings are in `[connector.pg_events.options]` in `rocky.toml`: `schema`, `
 ./run.sh
 ```
 
-When Docker is absent, `run.sh` runs `rocky validate` and exits 0 with a SKIP message. Set `REQUIRE_DOCKER=1` to make that a failure.
+Without Docker, `run.sh` runs `rocky validate` and exits 0 with a SKIP message. `REQUIRE_DOCKER=1` makes that a failure.
 
-To point the connector at your own Postgres, export `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE`, edit `[connector.pg_events.options]` in `rocky.toml`, and run `rocky load --connector pg_events`. Do not run `run.sh` against your own database: it inserts rows.
+For your own Postgres, export the five `PG*` variables, edit `[connector.pg_events.options]`, and run `rocky load --connector pg_events`. **Do not run `run.sh` against your own database: it inserts rows.**
 
 ## Expected output
 
-```text
-=== rocky validate (parse-only, no network) ===
-...
-=== docker compose up -d --wait (postgres:16-alpine, 20 seeded rows) ===
-=== load 1: rocky load --connector pg_events (expect 19 rows) ===
-    status=loaded total_rows=19 commit_seq 0 -> 1
-=== insert 5 rows with later timestamps (2026-10-01 00:21 to 00:25 UTC) ===
-=== load 2: rocky load --connector pg_events (expect 5 rows) ===
-    status=loaded total_rows=5 commit_seq 1 -> 2
-=== load 3: rocky load --connector pg_events (expect 0 rows) ===
-    status=loaded total_rows=0 commit_seq 2 -> 3
-=== target table poc.main.events ===
-    rows=24 distinct ids=24 (id 25, at the source maximum, waits until a newer row exists)
-=== password grep: JSON outputs, debug logs, kept scratch dirs, saved state ===
-    0 hits
+Three loads of 19, 5 and 0 rows (5 rows are inserted before load 2); `commit_seq` reaches 3. The target has 24 rows with distinct ids; id 25, at the source maximum, waits until a newer row exists. The password grep reports `0 hits`.
 
+```text
 POC complete: 3 loads, 24 rows, cursor held back at the source maximum, no password leak.
 ```
 
 ## Related
 
-- [Write a connector](../../../../../docs/src/content/docs/guides/write-a-connector.md): build your own from `rocky connector init`
-- [Child connectors guide](../../../../../docs/src/content/docs/guides/child-connectors.md): the protocol, the checks and the guarantees
-- [`07-trino-docker`](../07-trino-docker/): the same Docker skip pattern
+- [Write a connector](../../../../../docs/src/content/docs/guides/write-a-connector.md): start from `rocky connector init`
+- [Child connectors guide](../../../../../docs/src/content/docs/guides/child-connectors.md): protocol, checks, guarantees

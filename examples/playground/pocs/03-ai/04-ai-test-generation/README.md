@@ -7,15 +7,7 @@
 
 ## What it shows
 
-`rocky ai-test` reads each model's intent + output schema and asks Claude
-to generate SQL assertions (uniqueness, non-null, range checks, etc.).
-With `--save`, the assertions are written to a `tests/` directory.
-
-## Why it's distinctive
-
-- **Generation, not just hand-written tests.** Different from
-  `engine/examples/ai-intent` which ships *pre-generated* assertions;
-  this POC generates them live.
+`rocky ai-test` reads each model's intent and output schema and asks Claude for SQL assertions (uniqueness, non-null, range checks). With `--save`, they are written to `tests/`.
 
 ## Run
 

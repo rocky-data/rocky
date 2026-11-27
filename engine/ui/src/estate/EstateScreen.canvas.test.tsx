@@ -13,6 +13,7 @@ import type { ModelListOutput } from "@rocky-types/model_list";
 import type { ScheduleSpoolOutput } from "@rocky-types/schedule_spool";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import historyFixture from "@rocky-fixtures/history.json";
+import { ApiError } from "../api";
 import { installFlowCanvas, nodeElement } from "../test/flowCanvas";
 import staleDag from "../test/fixtures/dag-stale-compile.json";
 import staleModels from "../test/fixtures/model-list-stale-compile.json";
@@ -67,6 +68,12 @@ function loaders(models: () => Promise<ModelListOutput>, load: EstateLoaders["de
         version: "0",
       }) as ScheduleSpoolOutput,
     detail: load,
+    replayCheck: async () => {
+      throw new ApiError(404, { code: "run_not_found", message: "no run" });
+    },
+    recipeHistory: async () => {
+      throw new Error("no recipe hash, so no history read");
+    },
   };
 }
 

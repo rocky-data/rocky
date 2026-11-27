@@ -73,19 +73,19 @@ const TABLES = ["warehouse.main.orders", "warehouse.main.customers"];
 
 async function planThrough(client: JobClient) {
   renderControls({ approvalRequired: true, client });
-  await screen.findByRole("button", { name: "Plan promote" });
-  fireEvent.click(screen.getByRole("button", { name: "Plan promote" }));
-  await screen.findByLabelText("Production tables this plan replaces", {}, { timeout: 3000 });
+  await screen.findByRole("button", { name: "Plan promote branch" });
+  fireEvent.click(screen.getByRole("button", { name: "Plan promote branch" }));
+  await screen.findByLabelText("Production tables this change replaces", {}, { timeout: 3000 });
 }
 
-describe("Promote from the browser", () => {
+describe("Promote branch from the browser", () => {
   it("is absent when the config does not require a branch approval, and says why and which key", () => {
     const { client } = fakeJobs({});
     const { loadBranches } = renderControls({ approvalRequired: false, client });
     expect(screen.queryByRole("button", { name: /promote/i })).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
     const text = document.body.textContent ?? "";
-    expect(text).toContain("Promote is not offered here");
+    expect(text).toContain("Promote branch is not offered here");
     expect(text).toContain(PROMOTE_CONFIG_KEY);
     expect(text).toContain("rocky.toml");
     // Nothing is read for a panel that is not offered.
@@ -112,7 +112,7 @@ describe("Promote from the browser", () => {
     const { client } = fakeJobs({});
     renderControls({ approvalRequired: true, client, list: branches() });
     await screen.findByText(/There are no branches to promote/);
-    expect(screen.queryByRole("button", { name: "Plan promote" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Plan promote branch" })).toBeNull();
   });
 
   it("shows a refused branch list as that refusal", async () => {
@@ -124,10 +124,10 @@ describe("Promote from the browser", () => {
     await screen.findByText("engine_busy");
   });
 
-  it("draws Plan promote disabled on a read-only page and submits nothing", async () => {
+  it("draws Plan promote branch disabled on a read-only page and submits nothing", async () => {
     const { client, submitted } = fakeJobs({});
     renderControls({ approvalRequired: true, client }, READ_ONLY);
-    const button = await screen.findByRole("button", { name: "Plan promote" });
+    const button = await screen.findByRole("button", { name: "Plan promote branch" });
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(submitted).toEqual([]);
@@ -138,10 +138,10 @@ describe("Promote from the browser", () => {
       promote: job("promote", "succeeded", { result: planResult(TABLES) }),
     });
     renderControls({ approvalRequired: true, client });
-    await screen.findByRole("button", { name: "Plan promote" });
+    await screen.findByRole("button", { name: "Plan promote branch" });
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "other" } });
-    fireEvent.click(screen.getByRole("button", { name: "Plan promote" }));
-    const list = await screen.findByLabelText("Production tables this plan replaces", {}, { timeout: 3000 });
+    fireEvent.click(screen.getByRole("button", { name: "Plan promote branch" }));
+    const list = await screen.findByLabelText("Production tables this change replaces", {}, { timeout: 3000 });
     expect(submitted).toEqual([{ kind: "promote", body: { name: "other" } }]);
     expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual(TABLES);
     expect(screen.getByText(/replaces 2 production tables/)).toBeTruthy();
@@ -165,7 +165,7 @@ describe("Promote from the browser", () => {
       }),
     });
     await planThrough(client);
-    fireEvent.click(screen.getByRole("button", { name: "Promote" }));
+    fireEvent.click(screen.getByRole("button", { name: "Promote branch" }));
     const group = screen.getByRole("group");
     for (const table of TABLES) expect(group.textContent).toContain(table);
     expect(group.textContent).toContain("branch fix");
@@ -174,15 +174,15 @@ describe("Promote from the browser", () => {
     expect(submitted.some((s) => s.kind === "apply")).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(submitted.some((s) => s.kind === "apply")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Promote" }));
+    fireEvent.click(screen.getByRole("button", { name: "Promote branch" }));
     fireEvent.click(screen.getByRole("button", { name: "Yes, replace these tables" }));
     await waitFor(() => expect(submitted.at(-1)).toEqual({ kind: "apply", body: { plan_id: PLAN_ID } }));
     // The plan is applied by id: no re-plan happened.
     expect(submitted.filter((s) => s.kind === "promote")).toHaveLength(1);
-    const result = await screen.findByLabelText("Promote result", {}, { timeout: 3000 });
+    const result = await screen.findByLabelText("Promote branch result", {}, { timeout: 3000 });
     expect(result.textContent).toContain(`${TABLES[0]}: replaced`);
     // A promote that landed does not offer the same apply again.
-    expect(screen.queryByRole("button", { name: "Promote" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Promote branch" })).toBeNull();
   });
 
   it("shows which table was not replaced when the apply failed part way", async () => {
@@ -199,9 +199,9 @@ describe("Promote from the browser", () => {
       }),
     });
     await planThrough(client);
-    fireEvent.click(screen.getByRole("button", { name: "Promote" }));
+    fireEvent.click(screen.getByRole("button", { name: "Promote branch" }));
     fireEvent.click(screen.getByRole("button", { name: "Yes, replace these tables" }));
-    const result = await screen.findByLabelText("Promote result", {}, { timeout: 3000 });
+    const result = await screen.findByLabelText("Promote branch result", {}, { timeout: 3000 });
     expect(result.textContent).toContain(`${TABLES[0]}: replaced`);
     expect(result.textContent).toContain(`${TABLES[1]}: not replaced`);
     // The adapter's error text is not shown; only the cleaned job failure.
@@ -209,7 +209,7 @@ describe("Promote from the browser", () => {
     expect(document.body.textContent).toContain("promote failed for branch 'fix'");
   });
 
-  it("shows the cleaned reason when the plan is refused, such as a missing approval", async () => {
+  it("shows the cleaned reason when the change is refused, such as a missing approval", async () => {
     const { client, submitted } = fakeJobs({
       promote: job("promote", "failed", {
         error:
@@ -217,39 +217,39 @@ describe("Promote from the browser", () => {
       }),
     });
     renderControls({ approvalRequired: true, client });
-    fireEvent.click(await screen.findByRole("button", { name: "Plan promote" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Plan promote branch" }));
     const alert = await screen.findByRole("alert", {}, { timeout: 3000 });
-    expect(alert.textContent).toContain("Plan promote: failed.");
+    expect(alert.textContent).toContain("Plan promote branch: failed.");
     expect(alert.textContent).toContain("requires 1 approval(s)");
-    expect(screen.queryByRole("button", { name: "Promote" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Promote branch" })).toBeNull();
     expect(submitted.map((s) => s.kind)).toEqual(["promote"]);
   });
 
-  it("says so, and offers no apply, when a succeeded plan job names no usable plan id", async () => {
+  it("says so, and offers no apply, when a succeeded change job names no usable plan id", async () => {
     const { client } = fakeJobs({
       promote: job("promote", "succeeded", { result: planResult(TABLES, "not-a-plan-id") }),
     });
     renderControls({ approvalRequired: true, client });
-    fireEvent.click(await screen.findByRole("button", { name: "Plan promote" }));
-    await screen.findByText(/returned no plan id/, {}, { timeout: 3000 });
-    expect(screen.queryByRole("button", { name: "Promote" })).toBeNull();
+    fireEvent.click(await screen.findByRole("button", { name: "Plan promote branch" }));
+    await screen.findByText(/returned no change id/, {}, { timeout: 3000 });
+    expect(screen.queryByRole("button", { name: "Promote branch" })).toBeNull();
   });
 
-  it("offers no apply for a plan that lists no tables", async () => {
+  it("offers no apply for a change that lists no tables", async () => {
     const { client } = fakeJobs({ promote: job("promote", "succeeded", { result: planResult([]) }) });
     renderControls({ approvalRequired: true, client });
-    fireEvent.click(await screen.findByRole("button", { name: "Plan promote" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Plan promote branch" }));
     await screen.findByText(/lists no tables/, {}, { timeout: 3000 });
-    expect(screen.queryByRole("button", { name: "Promote" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Promote branch" })).toBeNull();
   });
 
-  it("drops a plan when another branch is chosen, so it cannot be applied under the wrong name", async () => {
+  it("drops a change when another branch is chosen, so it cannot be applied under the wrong name", async () => {
     const { client } = fakeJobs({ promote: job("promote", "succeeded", { result: planResult(TABLES) }) });
     await planThrough(client);
-    expect(screen.getByRole("button", { name: "Promote" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Promote branch" })).toBeTruthy();
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "other" } });
-    expect(screen.queryByLabelText("Production tables this plan replaces")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Promote" })).toBeNull();
+    expect(screen.queryByLabelText("Production tables this change replaces")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Promote branch" })).toBeNull();
   });
 });
 

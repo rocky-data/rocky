@@ -7,41 +7,10 @@
 
 ## What it shows
 
-`rocky ai` never emits a model you couldn't compile. Two gates make
-that real:
+`rocky ai` output is compiler-gated:
 
-1. **Schema grounding.** Before the LLM sees the prompt, Rocky
-   compiles the models directory and packs the result into a
-   `ValidationContext` (project models, source column schemas, and
-   column-level info). The LLM sees typed columns, not a blank page,
-   so it can't invent `order_total` when the real column is `amount`.
-2. **Compile-verify retry.** Each LLM response is fed through the
-   Rocky compiler; on failure the compiler errors are appended to the
-   prompt and the LLM is re-asked. Up to 3 attempts in total. A
-   successful return = at least one compile-clean output.
-
-## Why it's distinctive
-
-- **Hallucinated columns are caught before the file lands.** Non-grounded
-  AI SQL commonly invents plausible-but-nonexistent columns. The
-  `ValidationContext` shows the LLM the real columns, and the compile gate
-  refuses an output that does not compile.
-- **The compiler is the spec.** There's no separate "verify that the
-  AI output is valid" pass: if `rocky compile` passes, the model is
-  valid. The gate and the dev-loop use the same tool.
-
-## Layout
-
-```
-.
-├── README.md                this file
-├── rocky.toml               DuckDB pipeline
-├── run.sh                   compile → rocky ai → tee output to generation.log
-└── models/
-    ├── _defaults.toml       catalog=poc, schema=demo
-    ├── raw_orders.sql       seed model — typed schema passed to the LLM
-    └── raw_orders.toml      full_refresh sidecar
-```
+1. **Schema grounding.** Rocky compiles the models directory into a `ValidationContext` (project models, source column schemas, column-level info), so the LLM sees real typed columns.
+2. **Compile-verify retry.** Each response is compiled; on failure the errors are added to the prompt and the LLM is re-asked, up to 3 attempts in total.
 
 ## Prerequisites
 
@@ -55,25 +24,12 @@ export ANTHROPIC_API_KEY=sk-...
 ./run.sh
 ```
 
-## What happened
+## Output
 
-1. `rocky compile --models models` extracts the typed schema of
-   `raw_orders` from the project.
-2. `rocky ai` calls the Anthropic API with a prompt that embeds the
-   typed schema. The response is a candidate `.rocky` model.
-3. The candidate is compiled. On failure, the compiler errors are
-   added to the next prompt and the LLM is re-asked, up to 3 attempts in total.
-4. Rocky writes the clean model and its `.toml` sidecar into `models/`. The
-   console output goes to `expected/generation.log`.
+`rocky ai` writes the model and its `.toml` sidecar into `models/`; console output goes to `expected/generation.log`.
 
 `run.sh` does not delete the generated model, and it does not pass
 `--overwrite`. Delete the generated files under `models/` before a second run,
 or `rocky ai` refuses to overwrite them.
 
-## Related
-
-- Engine source: `engine/crates/rocky-ai/src/generate.rs`
-  (`ValidationContext`), `engine/crates/rocky-cli/src/commands/ai.rs`
-- Sibling POCs: [`01-model-generation/`](../01-model-generation/),
-  [`02-ai-explain-bootstrap/`](../02-ai-explain-bootstrap/),
-  [`04-ai-test-generation/`](../04-ai-test-generation/)
+Source: `engine/crates/rocky-ai/src/generate.rs`, `engine/crates/rocky-cli/src/commands/ai.rs`.

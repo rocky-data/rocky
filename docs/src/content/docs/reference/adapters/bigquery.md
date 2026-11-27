@@ -13,7 +13,7 @@ The BigQuery warehouse adapter runs your SQL through the BigQuery REST API.
 |-------|------|----------|-------------|
 | `project_id` | string | Yes | Google Cloud project ID that owns the datasets and is billed for query execution. |
 | `location` | string | No | BigQuery processing location (e.g., `"US"`, `"EU"`, `"us-central1"`). Default `"US"`. |
-| `timeout_secs` | integer | No | Statement timeout in seconds. Default `300`. |
+| `timeout_secs` | integer | No | Statement timeout in seconds. Default `300`. When it passes, Rocky cancels the job (`jobs.cancel`) and does not retry it. |
 
 ```toml
 [adapter.bq]

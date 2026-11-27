@@ -7,34 +7,9 @@
 
 ## What it shows
 
-Rocky models consuming tables produced by dbt packages (Fivetran facebook_ads, Fivetran stripe) without converting or managing those packages. Seed data simulates the staging tables that dbt packages create in the warehouse. Rocky references them as external sources via schema-qualified names (`dbt_fivetran.stg_facebook_ads__*`, `dbt_stripe.stg_stripe__*`), builds analytics on top, and traces lineage through the boundary.
+Rocky models read tables produced by dbt packages (Fivetran facebook_ads and stripe) without converting or managing those packages. Seed data simulates the Fivetran raw and dbt staging tables (`fivetran_facebook_ads.*`, `dbt_fivetran.*`, `dbt_stripe.*`).
 
-## Why it's distinctive
-
-- Demonstrates the migration path: keep existing dbt packages, write new business logic in Rocky.
-- Shows that Rocky's resolver automatically classifies two-part table references as external (no DAG dependency), while bare model references create proper DAG edges.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml
-├── run.sh
-├── data/
-│   └── seed.sql                           # Simulates Fivetran raw + dbt package staging tables
-├── models/
-│   ├── _defaults.toml
-│   ├── facebook_campaign_performance.sql   # Reads dbt_fivetran.stg_facebook_ads__*
-│   ├── facebook_campaign_performance.toml
-│   ├── facebook_daily_trends.sql           # Daily grain from same external sources
-│   ├── facebook_daily_trends.toml
-│   ├── stripe_revenue_daily.sql            # Reads dbt_stripe.stg_stripe__charges
-│   ├── stripe_revenue_daily.toml
-│   ├── combined_marketing_revenue.sql      # Joins Rocky models (DAG edges)
-│   └── combined_marketing_revenue.toml
-└── expected/
-```
+Schema-qualified names (`dbt_fivetran.stg_facebook_ads__*`, `dbt_stripe.stg_stripe__*`) are classified as external: they do **not** appear in `depends_on`, and Rocky does not build or refresh them. Bare model references create DAG edges.
 
 ## DAG
 
@@ -48,8 +23,6 @@ dbt_stripe.stg_stripe__charges   ─(external)─▶ stripe_revenue_daily
                                                          ▼
                                               combined_marketing_revenue
 ```
-
-External sources do **not** appear in `depends_on`; Rocky knows they exist but does not try to build or refresh them.
 
 ## Prerequisites
 
@@ -68,16 +41,9 @@ External sources do **not** appear in `depends_on`; Rocky knows they exist but d
 - `compile` type-checks all models (external source columns are `Unknown` type with no warehouse introspection in DuckDB mode)
 - `lineage` traces column-level edges from `stripe_revenue_daily` and `facebook_daily_trends` into `combined_marketing_revenue`
 
-## What happened
-
-1. Seed data creates schemas simulating what Fivetran connectors and dbt packages produce (`fivetran_facebook_ads.*`, `dbt_fivetran.*`, `dbt_stripe.*`).
-2. `rocky validate` confirms the transformation pipeline config is valid and the 4-model DAG has no cycles.
-3. `rocky compile` type-checks all Rocky models, resolving external source references without requiring them in the DAG.
-4. `rocky lineage` traces column-level lineage from `combined_marketing_revenue` back through Rocky models and into the external dbt package tables.
-
 ## Real-world workflow
 
-In production, the CI pipeline runs both tools:
+dbt owns the package-generated staging layer and Rocky the analytics layer. CI runs both:
 
 ```yaml
 - name: dbt run (packages)
@@ -86,8 +52,6 @@ In production, the CI pipeline runs both tools:
 - name: Rocky run (analytics)
   run: rocky -c rocky.toml run
 ```
-
-dbt owns the package-generated staging layer. Rocky owns the analytics layer on top. Each tool manages its own models, with no conversion needed.
 
 ## Related
 

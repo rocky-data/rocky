@@ -192,9 +192,27 @@ pub struct TestResult {
     pub models: TestSuiteCounts,
     /// The fixture `[[test]]` suite on its own.
     pub unit_tests: TestSuiteCounts,
+    /// One warning line when a fixture test's model targets a warehouse other
+    /// than DuckDB: the test ran on DuckDB, not on that warehouse (or was
+    /// refused by `strict_dialect`). Same text as the `rocky test` warning.
+    /// Absent for a DuckDB project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect_warning: Option<String>,
+    /// The dialect notice of each fixture test that has one, passing tests
+    /// included. Empty, and omitted, for a DuckDB project.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unit_dialects: Vec<UnitDialectLite>,
     /// Present when `test` was called with `declarative = true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declarative: Option<DeclarativeSuiteLite>,
+}
+
+/// The dialect notice of one fixture `[[test]]`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UnitDialectLite {
+    pub model: String,
+    pub test: String,
+    pub dialect: rocky_core::unit_test::UnitTestDialect,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

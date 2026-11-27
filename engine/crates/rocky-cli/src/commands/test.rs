@@ -14,7 +14,7 @@ use crate::output::{
 };
 use crate::registry::{self, AdapterRegistry};
 
-use super::declarative_test::execute_one_test;
+use super::declarative_test::{TestBatching, execute_model_tests};
 use super::{ModelNotFound, ModelScope};
 
 /// Map the engine test runner's `ModelTestResult` to the JsonSchema-derived
@@ -69,7 +69,7 @@ fn dialect_marker(dialect: &rocky_core::unit_test::UnitTestDialect) -> String {
 
 /// The one table-mode warning line for unit tests whose model is not
 /// DuckDB-only, or `None` when every unit test targets DuckDB.
-fn dialect_warning(results: &[rocky_core::unit_test::UnitTestResult]) -> Option<String> {
+pub fn dialect_warning(results: &[rocky_core::unit_test::UnitTestResult]) -> Option<String> {
     let marked: Vec<&rocky_core::unit_test::UnitTestDialect> =
         results.iter().filter_map(|r| r.dialect.as_ref()).collect();
     if marked.is_empty() {
@@ -144,6 +144,7 @@ pub fn test_output(
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
     config_path: &Path,
+    strict_dialect: bool,
 ) -> Result<TestOutput> {
     let project_config = rocky_core::config::load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
@@ -181,7 +182,7 @@ pub fn test_output(
         model_filter,
         &extensions,
         &unit_targets,
-        false,
+        strict_dialect,
     )?;
     if let Some(summary) = unit_summary(&unit_run) {
         output = output.with_unit_tests(summary);
@@ -859,11 +860,15 @@ impl LoadedCheckSet {
     /// only to name the directory in the empty-project refusal; it is
     /// never opened.
     pub(crate) async fn run(self) -> Result<DeclarativeRun> {
+        // Never batched: this is the custody path, and its digest
+        // (`check_set_digest`) pins what runs, not how it is grouped into
+        // queries. One query per test keeps it exactly as approved.
         execute_declarative(
             &self.models,
             &self.models_dir,
             &self.warehouse,
             Some(&self.model),
+            TestBatching::Off,
         )
         .await
     }
@@ -944,6 +949,7 @@ pub(crate) async fn declarative_run(
     models_dir: &Path,
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> Result<DeclarativeRun> {
     // 1. Load config + adapter registry.
     // The identity is for the custody comparison at observation; a plain
@@ -955,7 +961,14 @@ pub(crate) async fn declarative_run(
     // so a model that declares none of its own inherits it (#1435).
     let all_models = load_all_models(models_dir, Some(&project_freshness))?;
 
-    execute_declarative(&all_models, models_dir, &warehouse_adapter, model_filter).await
+    execute_declarative(
+        &all_models,
+        models_dir,
+        &warehouse_adapter,
+        model_filter,
+        batching,
+    )
+    .await
 }
 
 /// Resolve the warehouse adapter the declarative checks execute against.
@@ -1012,6 +1025,7 @@ async fn execute_declarative(
     models_dir: &Path,
     warehouse_adapter: &Arc<dyn WarehouseAdapter>,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> Result<DeclarativeRun> {
     // The loader is deliberately tolerant of a missing or empty directory
     // (`models_loader::load_project_models` returns an empty Vec, pinned by
@@ -1030,7 +1044,7 @@ async fn execute_declarative(
     // former must stay exit 0; only the latter is an error.
     reject_unknown_model(model_filter, &model_names(all_models))?;
 
-    Ok(execute_checks(all_models, warehouse_adapter, model_filter).await)
+    Ok(execute_checks(all_models, warehouse_adapter, model_filter, batching).await)
 }
 
 /// Execute the declarative checks of `models` against one warehouse, with
@@ -1040,6 +1054,7 @@ async fn execute_checks(
     all_models: &[rocky_core::models::Model],
     warehouse_adapter: &Arc<dyn WarehouseAdapter>,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> DeclarativeRun {
     // The declared count, on the NAME predicate alone — deliberately not
     // the has-tests closure below. A model the selection names but whose
@@ -1072,20 +1087,27 @@ async fn execute_checks(
 
     // 4. Execute each test.
     let mut results = Vec::new();
+    let mut queries = 0;
     for model in &models_with_tests {
         debug!(model = %model.config.name, tests = model.config.tests.len(), "running declarative tests");
 
-        for test_decl in &model.config.tests {
-            let result = execute_one_test(
-                test_decl,
-                &model.config.name,
-                &model.config.target,
-                warehouse_adapter.as_ref(),
-            )
-            .await;
-            results.push(result);
-        }
+        let run = execute_model_tests(
+            &model.config.tests,
+            &model.config.name,
+            &model.config.target,
+            warehouse_adapter.as_ref(),
+            batching,
+        )
+        .await;
+        queries += run.queries;
+        results.extend(run.results);
     }
+    debug!(
+        tests = results.len(),
+        queries,
+        ?batching,
+        "declarative test queries sent"
+    );
 
     DeclarativeRun { declared, results }
 }
@@ -1099,6 +1121,7 @@ async fn execute_checks(
 async fn whole_project_declarative_run(
     config_path: &Path,
     model_filter: Option<&str>,
+    batching: TestBatching,
 ) -> Result<Option<DeclarativeRun>> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
@@ -1146,7 +1169,7 @@ async fn whole_project_declarative_run(
             continue;
         }
         let warehouse = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
-        let pipeline_run = execute_checks(&models, &warehouse, model_filter).await;
+        let pipeline_run = execute_checks(&models, &warehouse, model_filter, batching).await;
         run.declared += pipeline_run.declared;
         run.results.extend(pipeline_run.results);
     }
@@ -1166,17 +1189,27 @@ pub async fn run_declarative_tests(
     scope: ModelScope,
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
+    batching: TestBatching,
     output_json: bool,
 ) -> Result<()> {
     let whole_project = match (scope, pipeline_name) {
         (ModelScope::WholeProject, None) => {
-            whole_project_declarative_run(config_path, model_filter).await?
+            whole_project_declarative_run(config_path, model_filter, batching).await?
         }
         (ModelScope::WholeProject, Some(_)) | (ModelScope::Dir, _) => None,
     };
     let run = match whole_project {
         Some(run) => run,
-        None => declarative_run(config_path, models_dir, pipeline_name, model_filter).await?,
+        None => {
+            declarative_run(
+                config_path,
+                models_dir,
+                pipeline_name,
+                model_filter,
+                batching,
+            )
+            .await?
+        }
     };
     let summary = summarize_declarative(run.results);
     let DeclarativeTestSummary {
@@ -1271,7 +1304,14 @@ pub async fn declarative_test_output(
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
 ) -> Result<DeclarativeTestSummary> {
-    let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
+    let run = declarative_run(
+        config_path,
+        models_dir,
+        pipeline_name,
+        model_filter,
+        TestBatching::Off,
+    )
+    .await?;
     Ok(summarize_declarative(run.results))
 }
 
@@ -1459,7 +1499,7 @@ mod tests {
         tmp: &tempfile::TempDir,
         models: &std::path::Path,
     ) -> Vec<rocky_core::unit_test::UnitTestResult> {
-        let output = super::test_output(models, None, None, &tmp.path().join("rocky.toml"))
+        let output = super::test_output(models, None, None, &tmp.path().join("rocky.toml"), false)
             .expect("test output");
         output.unit_tests.expect("unit tests ran").results
     }
@@ -1627,10 +1667,14 @@ mod tests {
     #[tokio::test]
     async fn declarative_tests_cover_every_transformation_pipeline() {
         let tmp = three_pipeline_project();
-        let run = whole_project_declarative_run(&tmp.path().join("rocky.toml"), None)
-            .await
-            .expect("run")
-            .expect("transformation pipelines");
+        let run = whole_project_declarative_run(
+            &tmp.path().join("rocky.toml"),
+            None,
+            super::TestBatching::Off,
+        )
+        .await
+        .expect("run")
+        .expect("transformation pipelines");
         let mut models: Vec<&str> = run.results.iter().map(|r| r.model.as_str()).collect();
         models.sort_unstable();
         assert_eq!(models, ["rep", "stg"], "{:?}", run.results);
@@ -1655,7 +1699,7 @@ mod tests {
             text.replace("models = \"reporting/**\"", "models = \"models/**\""),
         )
         .expect("write config");
-        let run = whole_project_declarative_run(&config, None)
+        let run = whole_project_declarative_run(&config, None, super::TestBatching::Off)
             .await
             .expect("run")
             .expect("transformation pipelines");
@@ -1670,14 +1714,16 @@ mod tests {
     async fn whole_project_declarative_run_scopes_and_refuses_unknown_models() {
         let tmp = three_pipeline_project();
         let config = tmp.path().join("rocky.toml");
-        let run = whole_project_declarative_run(&config, Some("rep"))
+        let run = whole_project_declarative_run(&config, Some("rep"), super::TestBatching::Off)
             .await
             .expect("run")
             .expect("transformation pipelines");
         assert_eq!(run.results.len(), 1);
         assert_eq!(run.results[0].model, "rep");
 
-        let Err(err) = whole_project_declarative_run(&config, Some("nope")).await else {
+        let Err(err) =
+            whole_project_declarative_run(&config, Some("nope"), super::TestBatching::Off).await
+        else {
             panic!("an unknown model must be refused");
         };
         assert!(err.to_string().contains("nope"), "{err:#}");

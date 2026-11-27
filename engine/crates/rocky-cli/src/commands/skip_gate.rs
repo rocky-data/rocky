@@ -425,12 +425,13 @@ impl<'a> SkipGate<'a> {
             .map(|s| (s.upstream_key.as_str(), s))
             .collect();
 
+        let max_ts_sufficient = max_ts_is_sufficient(&model.config.strategy);
         for cur in current_sigs {
             let Some(prev) = prior_by_key.get(cur.upstream_key.as_str()) else {
                 // An upstream with no prior signature can't be proven stable.
                 return false;
             };
-            if !self.sig_unchanged(prev, cur) {
+            if !self.sig_unchanged(prev, cur, max_ts_sufficient) {
                 return false;
             }
         }
@@ -447,10 +448,28 @@ impl<'a> SkipGate<'a> {
     ///
     /// A signature carrying neither a usable timestamp nor (when enabled) a
     /// rowcount is **unprovable** ⇒ `false` ⇒ build.
-    fn sig_unchanged(&self, prev: &UpstreamSig, cur: &UpstreamSig) -> bool {
+    ///
+    /// When `max_ts_sufficient` is `false` (see [`max_ts_is_sufficient`]),
+    /// both readings must be present and within tolerance, and then the
+    /// rowcount fallback decides. A missing reading means changed.
+    fn sig_unchanged(
+        &self,
+        prev: &UpstreamSig,
+        cur: &UpstreamSig,
+        max_ts_sufficient: bool,
+    ) -> bool {
         // Watermark first (the stronger signal).
         if let (Some(prev_ts), Some(cur_ts)) = (prev.max_ts, cur.max_ts) {
-            return watermark_within_tolerance(prev_ts, cur_ts, self.cfg.lag_tolerance_seconds);
+            if !watermark_within_tolerance(prev_ts, cur_ts, self.cfg.lag_tolerance_seconds) {
+                return false;
+            }
+            if max_ts_sufficient {
+                return true;
+            }
+        } else if !max_ts_sufficient {
+            // A model that needs both signals has no proof without both
+            // readings: a failed probe never hands the decision to COUNT.
+            return false;
         }
         // Rowcount fallback, only when explicitly enabled.
         if self.cfg.rowcount_fallback
@@ -484,7 +503,7 @@ impl<'a> SkipGate<'a> {
     /// bug the gate exists to prevent.
     ///
     /// For each raw source we read `MAX(<ts>)` when the model declares a
-    /// timestamp column (incremental / microbatch strategies) and `COUNT(*)`
+    /// timestamp column (the incremental strategy) and `COUNT(*)`
     /// when `skip_rowcount_fallback` is enabled. Read failures leave the
     /// corresponding field `None` (⇒ that upstream is later judged unprovable
     /// ⇒ build) — they never collapse to "stable".
@@ -587,6 +606,24 @@ fn watermark_within_tolerance(
         .is_none_or(|tolerance| gap <= tolerance)
 }
 
+/// Whether an unchanged `MAX(ts)` is enough to call a source unchanged for
+/// this strategy.
+///
+/// Not for an `incremental` model with a `lookback`. Its build re-reads the
+/// rows below the watermark, so a late row or an update inside the lookback
+/// window changes its output while the source `MAX(ts)` stays put. For it a
+/// moved `MAX(ts)` still means build, but an unchanged one only lets the
+/// rowcount fallback decide.
+fn max_ts_is_sufficient(strategy: &rocky_core::models::StrategyConfig) -> bool {
+    !matches!(
+        strategy,
+        rocky_core::models::StrategyConfig::Incremental {
+            lookback: Some(_),
+            ..
+        }
+    )
+}
+
 /// The timestamp column a strategy tracks, if any. Used to issue the B3
 /// `SELECT MAX(<col>)` watermark probe against raw sources.
 fn strategy_timestamp_column(strategy: &rocky_core::models::StrategyConfig) -> Option<&str> {
@@ -674,6 +711,7 @@ mod tests {
                 shadow_or_branch: false,
                 full_refresh: false,
                 tests_on_run: Default::default(),
+                test_batching: Default::default(),
             },
             &compiled.project,
         );
@@ -726,6 +764,7 @@ mod tests {
             shadow_or_branch: false,
             full_refresh: false,
             tests_on_run: Default::default(),
+            test_batching: Default::default(),
         };
         let gate = SkipGate::new(cfg, &project);
         assert!(
@@ -806,6 +845,7 @@ mod tests {
                 shadow_or_branch: false,
                 full_refresh: false,
                 tests_on_run: Default::default(),
+                test_batching: Default::default(),
             },
             &project,
         );
@@ -817,8 +857,71 @@ mod tests {
             .unwrap()
         };
         let prev = sig("2026-11-15T12:00:00.100Z");
-        assert!(gate.sig_unchanged(&prev, &sig("2026-11-15T12:00:00.100Z")));
-        assert!(!gate.sig_unchanged(&prev, &sig("2026-11-15T12:00:00.600Z")));
+        assert!(gate.sig_unchanged(&prev, &sig("2026-11-15T12:00:00.100Z"), true));
+        assert!(!gate.sig_unchanged(&prev, &sig("2026-11-15T12:00:00.600Z"), true));
+    }
+
+    /// B3a: for a lookback model an unchanged `MAX(ts)` is necessary, not
+    /// sufficient. Over every combination of a moved or unchanged `MAX(ts)`
+    /// and `COUNT(*)`, with the fallback on and off, the not-sufficient mode
+    /// skips only where the sufficient mode skips too, and only when
+    /// `COUNT(*)` also held.
+    #[test]
+    fn max_ts_not_sufficient_only_tightens() {
+        let project = rocky_compiler::project::Project::from_models(Vec::new()).unwrap();
+        let sig = |ts: &str, n: u64| -> UpstreamSig {
+            serde_json::from_value(serde_json::json!({
+                "upstream_key": "c.raw.events",
+                "max_ts": ts,
+                "row_count": n,
+            }))
+            .unwrap()
+        };
+        let prev = sig("2026-11-15T12:00:00Z", 10);
+        for rowcount_fallback in [false, true] {
+            let gate = SkipGate::new(
+                super::super::run::SkipGateConfig {
+                    feature_enabled: true,
+                    force_rebuild: false,
+                    rowcount_fallback,
+                    lag_tolerance_seconds: 0,
+                    shadow_or_branch: false,
+                    full_refresh: false,
+                    tests_on_run: Default::default(),
+                    test_batching: Default::default(),
+                },
+                &project,
+            );
+            // One-sided readings: a failed `MAX(ts)` probe on either side.
+            let no_ts: UpstreamSig = serde_json::from_value(serde_json::json!({
+                "upstream_key": "c.raw.events",
+                "row_count": 10,
+            }))
+            .unwrap();
+            assert!(!gate.sig_unchanged(&prev, &no_ts, false));
+            assert!(!gate.sig_unchanged(&no_ts, &prev, false));
+            for (ts, n) in [
+                ("2026-11-15T12:00:00Z", 10),
+                ("2026-11-15T12:00:00Z", 11),
+                ("2026-11-15T12:00:01Z", 10),
+                ("2026-11-15T12:00:01Z", 11),
+            ] {
+                let cur = sig(ts, n);
+                let strict = gate.sig_unchanged(&prev, &cur, false);
+                let loose = gate.sig_unchanged(&prev, &cur, true);
+                assert!(!strict || loose, "{ts} {n} fallback={rowcount_fallback}");
+                let expected = rowcount_fallback && ts == "2026-11-15T12:00:00Z" && n == 10;
+                assert_eq!(strict, expected, "{ts} {n} fallback={rowcount_fallback}");
+            }
+        }
+        let lookback: rocky_core::models::StrategyConfig = toml::from_str(
+            "type = \"incremental\"\ntimestamp_column = \"ts\"\nlookback = \"1 day\"\n",
+        )
+        .unwrap();
+        let plain: rocky_core::models::StrategyConfig =
+            toml::from_str("type = \"incremental\"\ntimestamp_column = \"ts\"\n").unwrap();
+        assert!(!max_ts_is_sufficient(&lookback));
+        assert!(max_ts_is_sufficient(&plain));
     }
 
     #[test]

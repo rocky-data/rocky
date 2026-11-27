@@ -6,15 +6,15 @@ import { reviewPath } from "./review/paths";
 describe("AREAS", () => {
   it("names the design brief's eleven areas, in its order", () => {
     expect(AREAS.map((area) => area.label)).toEqual([
-      "Needs you",
+      "Inbox",
       "Projects",
-      "Estate",
+      "Project",
       "Runs",
       "Scheduler",
-      "Review",
+      "Changes",
       "Policies",
-      "Products",
-      "Governance",
+      "Data products",
+      "Oversight",
       "Agents & Clusters",
       "Settings",
     ]);
@@ -46,13 +46,13 @@ describe("AREAS", () => {
 
 describe("areaFromPath", () => {
   it.each([
-    // The lane router's own fallbacks survive: the root and anything unknown are Estate.
+    // The lane router's own fallbacks survive: the root and anything unknown are Project.
     ["/ui/", "estate"],
     ["/ui", "estate"],
     ["/ui/nope", "estate"],
     ["/ui/estate", "estate"],
     ["/ui/review", "review"],
-    // A bare governor path opens the brief, so it is Needs you, not Governance.
+    // A bare governor path opens the brief, so it is Inbox, not Oversight.
     ["/ui/governor", "needs-you"],
     ["/ui/governor/brief", "needs-you"],
     // An unknown governor tab also opens the brief.

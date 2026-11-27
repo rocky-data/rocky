@@ -25,15 +25,19 @@
 //! ladder is identical to the Databricks / BigQuery shape: a fixed
 //! sequence for the first 5 polls, exponential growth capped at 5s after.
 
+use std::future::Future;
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use rocky_core::failure_class::{FailureClass, TransientKind};
+use rocky_core::statement_cancel::{
+    ABANDON_CANCEL_BUDGET, AbandonCancel, InFlightStatements, StatementHandle,
+};
 use rocky_core::traits::AdapterError;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::time::Instant;
-use tracing::{Instrument, debug, info_span};
+use tracing::{Instrument, debug, info_span, warn};
 
 use crate::auth::{AuthError, TrinoAuth};
 
@@ -46,6 +50,12 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const POLL_DELAY_STEPS_MS: [u64; 5] = [50, 100, 250, 500, 1000];
 /// Maximum polling delay after exponential growth.
 const MAX_POLL_DELAY_MS: u64 = 5000;
+/// How many failed `nextUri` reads in a row are read again before the
+/// client gives up on the query. A rate-limited read (`429`) does not count;
+/// the deadline bounds it.
+const MAX_POLL_REREADS: u32 = 3;
+/// `last_state` of a [`TrinoError::Timeout`] whose submit did not answer.
+const NOT_SUBMITTED: &str = "SUBMITTING";
 
 fn poll_delay(attempt: usize) -> Duration {
     let delay_ms = if attempt < POLL_DELAY_STEPS_MS.len() {
@@ -89,6 +99,20 @@ pub enum TrinoError {
         last_state: String,
     },
 
+    /// The client stopped waiting on query `id` while it may still run: its
+    /// deadline passed, or reading its next page failed and reading it again
+    /// did not help. A cancel was sent first; `cancel` says what came of it.
+    /// Never retried, by the client or the run loop: a resubmit could run
+    /// the query twice.
+    #[error("stopped waiting on Trino query {id} ({cancel}): {cause}")]
+    Abandoned {
+        id: String,
+        cancel: AbandonCancel,
+        /// Not `#[source]`: the message already ends with it, and a source
+        /// would print it twice in an `{:#}` chain.
+        cause: Box<TrinoError>,
+    },
+
     #[error("Trino response missing expected field: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     MalformedResponse(String),
 
@@ -110,6 +134,18 @@ pub enum TrinoError {
 
     #[error("Trino spooled Arrow decode error: {}", rocky_core::secret_registry::render_placeholders(&.0.to_string()))]
     ArrowDecode(String),
+}
+
+impl TrinoError {
+    /// Whether the query this error names may still run on the cluster: a
+    /// [`Self::Timeout`] (the deadline passed, or the submit did not answer
+    /// in time and may have been accepted) or an [`Self::Abandoned`] (the
+    /// client stopped waiting). No layer may resubmit such a query: it could
+    /// run twice.
+    #[must_use]
+    pub fn may_still_run(&self) -> bool {
+        matches!(self, Self::Timeout { .. } | Self::Abandoned { .. })
+    }
 }
 
 /// `Debug` prints the rendered `Display` text. A derived `Debug` would print
@@ -147,9 +183,10 @@ fn is_retryable_error_name(name: &str) -> bool {
 /// Classify a Trino [`AdapterError`] for the run loop's classified-retry layer,
 /// mirroring the Snowflake/BigQuery adapters.
 ///
-/// Downcasts to the typed [`TrinoError`]: a network / 5xx / timeout /
-/// cluster-blip failure ⇒ [`FailureClass::Transient`]; every other recognised
-/// failure (SQL/user errors, auth, the security refusals, decode errors) ⇒
+/// Downcasts to the typed [`TrinoError`]: a network / 5xx / transport
+/// timeout / cluster-blip failure ⇒ [`FailureClass::Transient`]; every other
+/// recognised failure (SQL/user errors, auth, the security refusals, decode
+/// errors, and a query that may still run: `Timeout`, `Abandoned`) ⇒
 /// [`FailureClass::Permanent`]; a non-[`TrinoError`] (e.g. the string-only
 /// "table not found" guard) ⇒ [`FailureClass::Unknown`] (fail closed).
 ///
@@ -163,7 +200,9 @@ pub(crate) fn classify_trino_failure(err: &AdapterError) -> FailureClass {
         return FailureClass::Unknown;
     };
     match trino_err {
-        TrinoError::Timeout { .. } => FailureClass::Transient(TransientKind::Timeout),
+        // The query may still run (or, for a submit that did not answer, may
+        // have been accepted). A retry could run it twice (#2768).
+        TrinoError::Timeout { .. } | TrinoError::Abandoned { .. } => FailureClass::Permanent,
         TrinoError::Http(e) if e.is_timeout() => FailureClass::Transient(TransientKind::Timeout),
         TrinoError::Http(e) if e.is_connect() => FailureClass::Transient(TransientKind::Network),
         TrinoError::Http(_) => FailureClass::Permanent,
@@ -303,6 +342,9 @@ pub struct TrinoClient {
     http: reqwest::Client,
     config: TrinoClientConfig,
     auth: TrinoAuth,
+    /// The queries this client waits on now, so a forced exit or a fan-out
+    /// abort can cancel them.
+    in_flight: InFlightStatements,
 }
 
 impl std::fmt::Debug for TrinoClient {
@@ -341,14 +383,187 @@ impl TrinoClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http, config, auth }
+        Self::with_http(config, auth, http)
     }
 
     /// Test-only constructor that takes an explicit `reqwest::Client` so
     /// integration tests can lower the default timeouts.
     #[doc(hidden)]
     pub fn with_http(config: TrinoClientConfig, auth: TrinoAuth, http: reqwest::Client) -> Self {
-        Self { http, config, auth }
+        Self {
+            http,
+            config,
+            auth,
+            in_flight: InFlightStatements::new(),
+        }
+    }
+
+    /// The queries this client waits on now, by Trino query id.
+    pub fn in_flight(&self) -> &InFlightStatements {
+        &self.in_flight
+    }
+
+    /// Ask the coordinator to cancel query `id`: `DELETE /v1/query/{id}`.
+    ///
+    /// The query id stays the same for the query's whole life, unlike its
+    /// `nextUri`, so a caller that holds only the id can cancel. The
+    /// coordinator lets a user cancel a query they own. It answers a query
+    /// that already ended the same way, so success does not prove the query
+    /// stopped.
+    ///
+    /// # Errors
+    ///
+    /// [`TrinoError::MalformedResponse`] when `id` is not a Trino query id
+    /// (only `[a-z0-9_]`), [`TrinoError::HttpStatus`] on a non-success
+    /// answer, and [`TrinoError::Http`] when the request fails.
+    pub async fn cancel_query(&self, id: &str) -> Result<(), TrinoError> {
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(TrinoError::MalformedResponse(format!(
+                "not a Trino query id: {id:?}"
+            )));
+        }
+        let url = format!("{}/v1/query/{id}", self.config.coordinator_url);
+        let resp = self
+            .http
+            .delete(&url)
+            .headers(self.build_headers()?)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(TrinoError::HttpStatus {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        Ok(())
+    }
+
+    /// POST `sql` to `/v1/statement` and parse the first page with `parse`.
+    /// Bounded by `deadline`: a submit that does not answer in time is a
+    /// [`TrinoError::Timeout`] with no query id, which is never retried
+    /// (the coordinator may have accepted it).
+    pub(crate) async fn submit<T, P, Fut>(
+        &self,
+        sql: &str,
+        headers: &HeaderMap,
+        deadline: Instant,
+        parse: P,
+    ) -> Result<T, TrinoError>
+    where
+        P: FnOnce(reqwest::Response) -> Fut,
+        Fut: Future<Output = Result<T, TrinoError>>,
+    {
+        let submit_url = format!("{}/v1/statement", self.config.coordinator_url);
+        tokio::time::timeout_at(deadline, async {
+            let resp = self
+                .http
+                .post(&submit_url)
+                .headers(headers.clone())
+                .body(sql.to_string())
+                .send()
+                .await?;
+            parse(resp).await
+        })
+        .await
+        .map_err(|_| TrinoError::Timeout {
+            timeout_secs: self.config.timeout.as_secs(),
+            last_state: NOT_SUBMITTED.to_string(),
+        })?
+    }
+
+    /// GET the query's `next` page and parse it with `parse`.
+    ///
+    /// A transient failure (a transport timeout or connect error, a `502`,
+    /// `503` or `504`) reads the same `nextUri` again, at most
+    /// [`MAX_POLL_REREADS`] times in a row. A `429` is read again too and
+    /// does not count. Every wait is bounded by `deadline`, which ends in a
+    /// [`TrinoError::Timeout`]. The query is never submitted again here. An
+    /// `Err` means the caller stops waiting on a query that may still run.
+    pub(crate) async fn next_page<T, P, Fut>(
+        &self,
+        next: &str,
+        headers: &HeaderMap,
+        deadline: Instant,
+        last_state: &str,
+        parse: P,
+    ) -> Result<T, TrinoError>
+    where
+        P: Fn(reqwest::Response) -> Fut,
+        Fut: Future<Output = Result<T, TrinoError>>,
+    {
+        if !same_origin(&self.config.coordinator_url, next) {
+            return Err(TrinoError::UntrustedNextUri {
+                coordinator: self.config.coordinator_url.clone(),
+                next: next.to_string(),
+            });
+        }
+        let timed_out = || TrinoError::Timeout {
+            timeout_secs: self.config.timeout.as_secs(),
+            last_state: last_state.to_string(),
+        };
+        let mut failed_reads: u32 = 0;
+        let mut rate_limited: u32 = 0;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(timed_out());
+            }
+            let read = tokio::time::timeout_at(deadline, async {
+                let resp = self.http.get(next).headers(headers.clone()).send().await?;
+                parse(resp).await
+            })
+            .await
+            .map_err(|_| timed_out())?;
+            let err = match read {
+                Ok(page) => return Ok(page),
+                Err(err) => err,
+            };
+            let wait = match &err {
+                TrinoError::HttpStatus { status: 429, .. } => {
+                    rate_limited = rate_limited.saturating_add(1);
+                    poll_delay(rate_limited as usize)
+                }
+                e if failed_reads < MAX_POLL_REREADS && is_transient_read_error(e) => {
+                    failed_reads += 1;
+                    poll_delay(failed_reads as usize)
+                }
+                _ => return Err(err),
+            };
+            warn!(
+                error = %err,
+                failed_reads,
+                rate_limited,
+                "reading the Trino query's next page failed, reading the same page again"
+            );
+            tokio::time::sleep_until((Instant::now() + wait).min(deadline)).await;
+        }
+    }
+
+    /// Ask the coordinator to cancel query `id`, which this client stops
+    /// waiting on because of `cause`, and return the error to report.
+    /// Best effort and bounded by [`ABANDON_CANCEL_BUDGET`].
+    pub(crate) async fn abandon(&self, id: String, cause: TrinoError) -> TrinoError {
+        let cancel = match tokio::time::timeout(ABANDON_CANCEL_BUDGET, self.cancel_query(&id)).await
+        {
+            Ok(Ok(())) => AbandonCancel::Requested,
+            Ok(Err(e)) => AbandonCancel::Failed(e.to_string()),
+            Err(_) => AbandonCancel::NoAnswer,
+        };
+        warn!(
+            query_id = %id,
+            cancel = %cancel,
+            "stopped waiting on a Trino query that may still run"
+        );
+        TrinoError::Abandoned {
+            id,
+            cancel,
+            cause: Box::new(cause),
+        }
     }
 
     /// Read-only access to the active config (mostly for tests).
@@ -454,25 +669,39 @@ impl TrinoClient {
             .await
     }
 
+    /// ```text
+    ///   POST ──▶ query id ──▶ register ──▶ GET nextUri ... ──▶ no nextUri ──▶ Ok / QueryFailed
+    ///                                         │
+    ///                   deadline, or a read that reading again did not fix,
+    ///                   or an untrusted nextUri ──▶ cancel (bounded) ──▶ Abandoned
+    /// ```
     async fn execute_inner(&self, sql: &str) -> Result<TrinoQueryRows, TrinoError> {
         let deadline = Instant::now() + self.config.timeout;
-        let submit_url = format!("{}/v1/statement", self.config.coordinator_url);
         debug!(coordinator = %self.config.coordinator_url, "submitting Trino statement");
 
         let headers = self.build_headers()?;
-        let resp = self
-            .http
-            .post(&submit_url)
-            .headers(headers.clone())
-            .body(sql.to_string())
-            .send()
-            .await?;
-        let mut current = parse_response(resp).await?;
+        let first = self.submit(sql, &headers, deadline, parse_response).await?;
+        let id = first.id.clone();
+        // Listed until this function returns, on every path, so a forced
+        // exit or a fan-out abort can cancel it.
+        let _in_flight = self.in_flight.register(StatementHandle::new(id.clone()));
+        match self.collect_rows(first, &headers, deadline).await {
+            Ok(outcome) => outcome,
+            Err(cause) => Err(self.abandon(id, cause).await),
+        }
+    }
 
+    /// Read pages from `current` on until the query ends, and return how it
+    /// ended (`Ok` holds the terminal outcome, which may be a failure). An
+    /// `Err` means the client stops waiting on a query that may still run.
+    async fn collect_rows(
+        &self,
+        mut current: QueryResults,
+        headers: &HeaderMap,
+        deadline: Instant,
+    ) -> Result<Result<TrinoQueryRows, TrinoError>, TrinoError> {
         let mut columns: Vec<TrinoColumnMeta> = Vec::new();
         let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut last_state: String;
-
         let mut attempt = 0_usize;
         loop {
             if let Some(cols) = current.columns.take()
@@ -483,38 +712,51 @@ impl TrinoClient {
             if let Some(data) = current.data.take() {
                 rows.extend(data);
             }
-            last_state = current.stats.state.clone();
+            let last_state = current.stats.state.clone();
 
             // Terminal-state detection: Trino sends `nextUri = None` only
             // when the query is in a terminal state. `state == "FINISHED"`
             // is the happy path; everything else (FAILED, CANCELED,
             // anything unexpected) maps to QueryFailed.
-            let Some(next) = current.next_uri.clone() else {
+            let Some(next) = current.next_uri.take() else {
                 if current.stats.state == "FINISHED" {
-                    return Ok(TrinoQueryRows { columns, rows });
+                    return Ok(Ok(TrinoQueryRows { columns, rows }));
                 }
-                return Err(query_failed(&current));
+                return Ok(Err(query_failed(&current)));
             };
 
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(TrinoError::Timeout {
                     timeout_secs: self.config.timeout.as_secs(),
                     last_state,
                 });
             }
-            if !same_origin(&self.config.coordinator_url, &next) {
-                return Err(TrinoError::UntrustedNextUri {
-                    coordinator: self.config.coordinator_url.clone(),
-                    next,
-                });
-            }
-
-            tokio::time::sleep(poll_delay(attempt)).await;
+            tokio::time::sleep_until((now + poll_delay(attempt)).min(deadline)).await;
             attempt += 1;
 
-            let resp = self.http.get(&next).headers(headers.clone()).send().await?;
-            current = parse_response(resp).await?;
+            current = self
+                .next_page(&next, headers, deadline, &last_state, parse_response)
+                .await?;
         }
+    }
+}
+
+/// Whether reading a page failed in a way that reading the same `nextUri`
+/// again can fix: a transport timeout or connect error, or a `502`, `503`
+/// or `504` (the client protocol asks the client to try again).
+fn is_transient_read_error(err: &TrinoError) -> bool {
+    match err {
+        TrinoError::Http(e) => e.is_timeout() || e.is_connect(),
+        TrinoError::HttpStatus { status, .. } => matches!(status, 502..=504),
+        TrinoError::Auth(_)
+        | TrinoError::QueryFailed { .. }
+        | TrinoError::Timeout { .. }
+        | TrinoError::Abandoned { .. }
+        | TrinoError::MalformedResponse(_)
+        | TrinoError::UntrustedNextUri { .. }
+        | TrinoError::ArrowEncodingUnavailable
+        | TrinoError::ArrowDecode(_) => false,
     }
 }
 
@@ -569,7 +811,6 @@ async fn parse_response(resp: reqwest::Response) -> Result<QueryResults, TrinoEr
 /// failure; no `nextUri` once the query is done).
 #[derive(Debug, Clone, Deserialize)]
 struct QueryResults {
-    #[allow(dead_code)]
     id: String,
     #[serde(rename = "nextUri")]
     next_uri: Option<String>,
@@ -712,13 +953,26 @@ mod tests {
             );
         }
 
-        // A query timeout is transient.
-        assert!(
-            classify_trino_failure(&AdapterError::new(TrinoError::Timeout {
-                timeout_secs: 30,
-                last_state: "RUNNING".into(),
-            }))
-            .is_retryable()
+        // A query that may still run is never retried (#2768): a retry could
+        // run it twice.
+        let timeout = || TrinoError::Timeout {
+            timeout_secs: 30,
+            last_state: "RUNNING".into(),
+        };
+        assert_eq!(
+            classify_trino_failure(&AdapterError::new(timeout())),
+            FailureClass::Permanent
+        );
+        assert_eq!(
+            classify_trino_failure(&AdapterError::new(TrinoError::Abandoned {
+                id: "q1".into(),
+                cancel: AbandonCancel::Requested,
+                cause: Box::new(TrinoError::HttpStatus {
+                    status: 503,
+                    message: String::new(),
+                }),
+            })),
+            FailureClass::Permanent
         );
 
         // Security refusal / capability / decode → Permanent (retry can't fix).
@@ -1007,7 +1261,10 @@ mod tests {
         let cfg = TrinoClientConfig::new(server.uri()).with_timeout(Duration::from_secs(1));
         let client = TrinoClient::new(cfg, auth);
         let err = client.execute("SELECT 1").await.unwrap_err();
-        match err {
+        let TrinoError::Abandoned { cause, .. } = err else {
+            panic!("expected Abandoned, got {err:?}");
+        };
+        match *cause {
             TrinoError::Timeout {
                 timeout_secs,
                 last_state,
@@ -1019,6 +1276,295 @@ mod tests {
                 assert!(last_state == "RUNNING" || last_state == "QUEUED");
             }
             other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    const QUERY_ID: &str = "20260101_000000_00001_abcde";
+
+    fn running_page(server: &wiremock::MockServer, page: u32) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": QUERY_ID,
+            "nextUri": format!("{}/v1/statement/executing/{QUERY_ID}/x/{page}", server.uri()),
+            "stats": {"state": "RUNNING"},
+        }))
+    }
+
+    /// Mount the submit (answered at once with page 1) and the cancel of
+    /// [`QUERY_ID`], each expected exactly `submits` and `cancels` times.
+    async fn mount_submit_and_cancel(server: &wiremock::MockServer, submits: u64, cancels: u64) {
+        use wiremock::Mock;
+        use wiremock::matchers::{method, path};
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(running_page(server, 1))
+            .expect(submits)
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/query/{QUERY_ID}")))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(cancels)
+            .mount(server)
+            .await;
+    }
+
+    fn client_for(server: &wiremock::MockServer, timeout: Duration) -> std::sync::Arc<TrinoClient> {
+        let cfg = TrinoClientConfig::new(server.uri()).with_timeout(timeout);
+        std::sync::Arc::new(TrinoClient::new(
+            cfg,
+            crate::test_helpers::test_basic_auth(),
+        ))
+    }
+
+    /// #2768: the query id comes back on the submit, so the query is listed
+    /// in flight while its first page read is still open, and unlisted once
+    /// it ends.
+    #[tokio::test]
+    async fn the_query_is_listed_before_the_first_read_ends() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, 1, 0).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/statement/executing/{QUERY_ID}/x/1")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "id": QUERY_ID,
+                        "stats": {"state": "FINISHED"},
+                    }))
+                    .set_delay(Duration::from_secs(1)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_secs(30));
+        let running = {
+            let client = client.clone();
+            tokio::spawn(async move { client.execute("INSERT INTO t SELECT 1").await })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.in_flight().snapshot().is_empty() {
+            assert!(Instant::now() < deadline, "never listed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            client.in_flight().snapshot(),
+            vec![StatementHandle::new(QUERY_ID)]
+        );
+        assert!(
+            !running.is_finished(),
+            "listed while the first read is open"
+        );
+        running.await.unwrap().unwrap();
+        assert!(client.in_flight().snapshot().is_empty());
+    }
+
+    /// #2768: the client deadline cancels the query and returns `Abandoned`.
+    /// The query is submitted once.
+    #[tokio::test]
+    async fn the_client_deadline_cancels_and_does_not_resubmit() {
+        use wiremock::MockServer;
+        use wiremock::matchers::{method, path_regex};
+
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, 1, 1).await;
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("^/v1/statement/executing/"))
+            .respond_with(running_page(&server, 1))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_millis(700));
+        let err = client.execute("INSERT INTO t SELECT 1").await.unwrap_err();
+        let TrinoError::Abandoned { id, cancel, cause } = &err else {
+            panic!("expected Abandoned, got {err}");
+        };
+        assert_eq!(id, QUERY_ID);
+        assert_eq!(*cancel, AbandonCancel::Requested);
+        assert!(matches!(**cause, TrinoError::Timeout { .. }), "{cause}");
+        assert!(err.may_still_run());
+        assert!(client.in_flight().snapshot().is_empty());
+    }
+
+    /// #2768: a transient read error reads the same `nextUri` again. The
+    /// query is neither submitted again nor cancelled.
+    #[tokio::test]
+    async fn a_transient_read_error_reads_the_same_page_again() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, 1, 0).await;
+        let page = format!("/v1/statement/executing/{QUERY_ID}/x/1");
+        Mock::given(method("GET"))
+            .and(path(page.clone()))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(page))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": QUERY_ID,
+                "stats": {"state": "FINISHED"},
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_secs(30));
+        client.execute("INSERT INTO t SELECT 1").await.unwrap();
+    }
+
+    /// #2768: a rate-limited read (429) does not count as a failed read: the
+    /// same page is read again more times than `MAX_POLL_REREADS`, with no
+    /// cancel.
+    #[tokio::test]
+    async fn rate_limited_reads_do_not_abandon_the_query() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, 1, 0).await;
+        let page = format!("/v1/statement/executing/{QUERY_ID}/x/1");
+        let limited = u64::from(MAX_POLL_REREADS) + 1;
+        Mock::given(method("GET"))
+            .and(path(page.clone()))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .up_to_n_times(limited)
+            .with_priority(1)
+            .expect(limited)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(page))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": QUERY_ID,
+                "stats": {"state": "FINISHED"},
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_secs(30));
+        client.execute("INSERT INTO t SELECT 1").await.unwrap();
+    }
+
+    /// #2768: a read error that reading again does not fix cancels the
+    /// query, and the run loop does not retry it.
+    #[tokio::test]
+    async fn read_errors_that_persist_cancel_and_are_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, 1, 1).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/statement/executing/{QUERY_ID}/x/1")))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(u64::from(MAX_POLL_REREADS) + 1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_secs(30));
+        let err = client.execute("INSERT INTO t SELECT 1").await.unwrap_err();
+        let TrinoError::Abandoned { cancel, cause, .. } = &err else {
+            panic!("expected Abandoned, got {err}");
+        };
+        assert_eq!(*cancel, AbandonCancel::Requested);
+        assert!(
+            matches!(**cause, TrinoError::HttpStatus { status: 503, .. }),
+            "{cause}"
+        );
+        assert_eq!(
+            classify_trino_failure(&AdapterError::new(err)),
+            FailureClass::Permanent
+        );
+    }
+
+    /// #2768: an untrusted `nextUri` stops the wait while the query runs, so
+    /// the query is cancelled.
+    #[tokio::test]
+    async fn an_untrusted_next_uri_cancels_the_query() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/statement"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": QUERY_ID,
+                "nextUri": "https://evil.example.org/v1/statement/x",
+                "stats": {"state": "QUEUED"},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/query/{QUERY_ID}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_secs(30));
+        let err = client.execute("SELECT 1").await.unwrap_err();
+        let TrinoError::Abandoned { cause, .. } = &err else {
+            panic!("expected Abandoned, got {err}");
+        };
+        assert!(
+            matches!(**cause, TrinoError::UntrustedNextUri { .. }),
+            "{cause}"
+        );
+    }
+
+    /// #2768: a query that fails on its own has ended, so nothing is
+    /// cancelled and the error stays the coordinator's answer.
+    #[tokio::test]
+    async fn a_failed_query_is_its_outcome_not_an_abandon() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_submit_and_cancel(&server, 1, 0).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/statement/executing/{QUERY_ID}/x/1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": QUERY_ID,
+                "stats": {"state": "FAILED"},
+                "error": {"message": "boom", "errorCode": 1, "errorName": "SYNTAX_ERROR"},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, Duration::from_secs(30));
+        let err = client.execute("SELECT x").await.unwrap_err();
+        assert!(matches!(err, TrinoError::QueryFailed { .. }), "{err}");
+    }
+
+    /// A handle that is not a Trino query id is refused before any request.
+    #[tokio::test]
+    async fn cancel_refuses_a_handle_that_is_not_a_query_id() {
+        let client = TrinoClient::new(
+            TrinoClientConfig::new("http://localhost:1"),
+            crate::test_helpers::test_basic_auth(),
+        );
+        for id in ["", "../v1/node", "a/b", "Q1"] {
+            assert!(
+                matches!(
+                    client.cancel_query(id).await,
+                    Err(TrinoError::MalformedResponse(_))
+                ),
+                "{id:?}"
+            );
         }
     }
 }
