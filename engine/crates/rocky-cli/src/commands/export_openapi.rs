@@ -1014,12 +1014,15 @@ fn route_table() -> Vec<Route> {
             summary: "Submit a model diff job",
             description: "Submit a `diff` job: `rocky ci-diff`, the structural model diff \
                  between a git ref and `HEAD`, with the column lineage it moves. The result \
-                 is the `ci-diff` output. It is read-only: it changes nothing under the project, \
-                 `.git` included. It reads `data/seed.sql` from `HEAD`, never from the \
-                 working tree. Its git commands set `GIT_OPTIONAL_LOCKS=0` and \
+                 is the `ci-diff` output. It is read-only: the job writes nothing itself, except \
+                 its job record, which the server keeps in its state store (by default \
+                 `models/.rocky-state.redb`, inside the project). It reads `data/seed.sql` \
+                 from `HEAD`, never from the working tree; a seed committed there runs as it \
+                 does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still \
+                 writes where it says. Its git commands set `GIT_OPTIONAL_LOCKS=0` and \
                  `GIT_NO_LAZY_FETCH=1`, so in a partial clone a missing object fails the job \
-                 with a message that names the partial clone, and nothing is fetched. The \
-                 server still records the job in its state store. It takes no mutation \
+                 with a message that names the partial clone, and nothing is fetched. It \
+                 takes no mutation \
                  permit, so it never blocks a run. At most one diff runs at a time: \
                  a second submission answers `409 mutation_in_progress` with the running \
                  job's id. Body fields, both optional: `base` (a git ref, default `main`, \

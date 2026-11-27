@@ -508,7 +508,7 @@ impl ApiError {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_invalid",
-            without_toml_source_snippet(message),
+            without_config_values(message),
             Some("fix the config and retry; `rocky validate` reports the specific error"),
         )
     }
@@ -2486,6 +2486,46 @@ struct ComplianceQuery {
 /// (`  |`), the source line (`L | text`), a caret line (`  |   ^`) and the
 /// reason. Only the source line can carry a literal secret, but the whole
 /// snippet goes: the header already gives the line and column.
+/// What an HTTP route may say about a config error: the line and column, the
+/// key path and a reason with no value in it.
+///
+/// `serde` and the config loader quote the offending value in the reason
+/// (``invalid type: integer `99887766` ``, ``unknown variant `X` ``,
+/// `unsupported pipeline type: 'X'`). A literal token placed in a typed field
+/// shows up there. This drops the TOML source snippet, then replaces every
+/// quoted span with `<value>`, except a span that names a key, field or table
+/// (``for key `adapter.default.token` ``). The CLI's own report is unchanged.
+fn without_config_values(message: &str) -> String {
+    let message = without_toml_source_snippet(message);
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let starts_span = matches!(c, '`' | '\'' | '"')
+            && (i == 0 || chars[i - 1].is_whitespace() || matches!(chars[i - 1], ':' | '(' | '['));
+        let close = starts_span
+            .then(|| (i + 1..chars.len()).find(|&k| chars[k] == c))
+            .flatten();
+        let Some(close) = close else {
+            out.push(c);
+            i += 1;
+            continue;
+        };
+        let before = out.trim_end().to_ascii_lowercase();
+        let names_a_key = ["key", "field", "table", "section"]
+            .iter()
+            .any(|word| before.ends_with(word));
+        if names_a_key {
+            out.extend(&chars[i..=close]);
+        } else {
+            out.push_str("`<value>`");
+        }
+        i = close + 1;
+    }
+    out
+}
+
 fn without_toml_source_snippet(message: &str) -> String {
     let is_snippet = |line: &str| {
         let rest = line
@@ -2924,6 +2964,7 @@ async fn doctor_local(
         .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
     let state_path = state_path_for(&state);
     let config_path_for_scrub = config_path.clone();
+    let state_path_for_scrub = state_path.clone();
     // The local checks await nothing that blocks, so the report is built on the
     // store's blocking thread, behind the same gate every store read takes.
     let output = store_read(&state, move || {
@@ -2939,6 +2980,7 @@ async fn doctor_local(
     Ok(PrettyJson(scrub_doctor_output(
         output,
         &config_path_for_scrub,
+        &state_path_for_scrub,
     )))
 }
 
@@ -2948,6 +2990,7 @@ async fn doctor_local(
 fn scrub_doctor_output(
     mut output: crate::commands::DoctorOutput,
     config_path: &std::path::Path,
+    state_path: &std::path::Path,
 ) -> crate::commands::DoctorOutput {
     let config = absolute_path(config_path);
     let root = config
@@ -2958,8 +3001,19 @@ fn scrub_doctor_output(
         || "rocky.toml".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
+    // The state store path: relative to the project root when inside it, else
+    // only the file name.
+    let state = absolute_path(state_path);
+    let state_shown = match state.strip_prefix(&root) {
+        Ok(relative) => relative.to_string_lossy().into_owned(),
+        Err(_) => state
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+    };
     let scrub = |text: &str| -> String {
-        let text = without_toml_source_snippet(text);
+        let text = without_config_values(text);
+        let text = text.replace(&state.to_string_lossy().into_owned(), &state_shown);
+        let text = text.replace(&state_path.to_string_lossy().into_owned(), &state_shown);
         let text = text.replace(&config.to_string_lossy().into_owned(), &config_name);
         let text = text.replace(&config_path.to_string_lossy().into_owned(), &config_name);
         let prefix = format!("{}/", root.to_string_lossy());
@@ -3414,8 +3468,10 @@ fn too_many_requests_response(retry_after: std::time::Duration) -> Response {
 // --- Job model (POST /api/v1/jobs/{run|plan|apply}, GET /api/v1/jobs/{id}) ---
 
 /// Optional JSON body for a job submission. Every field is optional; an empty
-/// body runs the verb with its defaults (all pipelines, no filter). Unknown
-/// fields are ignored so an embedder on a newer client stays forward-compatible.
+/// body runs the verb with its defaults (all pipelines, no filter). A field the
+/// body does not name here is refused `400 bad_request` for every job kind, so
+/// a typo never runs the job with its defaults. A `diff` job takes only `base`
+/// and `semantic`; any other field is `400` too.
 ///
 /// Derives `JsonSchema` (crate-visible) so the OpenAPI generator can emit the
 /// `POST /api/v1/jobs/{run|plan|apply}` request-body schema from this single
@@ -4023,10 +4079,10 @@ async fn submit_compact(
 /// `semantic` to `false`. Any other field is `400 bad_request`. It diffs the
 /// `HEAD` commit; uncommitted edits are not compared. The result is the command's `CiDiffOutput`. At most one diff
 /// runs at a time: a second submission is refused `409 mutation_in_progress`
-/// with the running job's id. The job changes nothing under the project,
-/// `.git` included. It reads the seed from `HEAD`, and its git commands never
-/// take the index lock or fetch from a partial clone's remote (a missing object
-/// fails the job and names the partial clone).
+/// with the running job's id. The job writes nothing itself, except its job
+/// record (in the server's state store). It reads the seed from `HEAD`, and its
+/// git commands never take the index lock or fetch from a partial clone's
+/// remote (a missing object fails the job and names the partial clone).
 async fn submit_diff(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -4319,6 +4375,42 @@ fn validate_base_field(request: &JobRequest) -> Result<(), ApiError> {
 fn validate_diff_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
     if kind != JobKind::Diff {
         return Ok(());
+    }
+    // Destructured without `..`, so a field added to `JobRequest` cannot pass
+    // here until someone decides whether the diff takes it.
+    let JobRequest {
+        filter,
+        pipeline,
+        model,
+        plan_id,
+        expect_spec_digest,
+        principal,
+        scope,
+        reason,
+        name,
+        table,
+        catalog,
+        base: _,
+        semantic: _,
+    } = request;
+    for (field, given) in [
+        ("filter", filter.is_some()),
+        ("pipeline", pipeline.is_some()),
+        ("model", model.is_some()),
+        ("plan_id", plan_id.is_some()),
+        ("expect_spec_digest", expect_spec_digest.is_some()),
+        ("principal", principal.is_some()),
+        ("scope", scope.is_some()),
+        ("reason", reason.is_some()),
+        ("name", name.is_some()),
+        ("table", table.is_some()),
+        ("catalog", catalog.is_some()),
+    ] {
+        if given {
+            return Err(ApiError::bad_request(format!(
+                "a diff job does not take `{field}`: it takes only `base` and `semantic`"
+            )));
+        }
     }
     validate_base_field(request)
 }
@@ -8001,7 +8093,9 @@ mod tests {
         assert_eq!(resp.status(), 500);
         let err: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(err.code, "config_invalid");
-        assert!(err.message.contains("S999"), "{}", err.message);
+        // The value the config wrote is not echoed; the section still is.
+        assert!(!err.message.contains("S999"), "{}", err.message);
+        assert!(err.message.contains("lint"), "{}", err.message);
     }
 
     // --- /review ---
@@ -16973,6 +17067,129 @@ adapter = "db"
             tree_snapshot(dir.path()).keys().collect::<Vec<_>>(),
             "the doctor route created a file"
         );
+    }
+
+    /// The diff job takes `base` and `semantic` only. Every other `JobRequest`
+    /// field is `400`, and the message names it, so a body meant for another
+    /// job never runs a whole-project diff.
+    #[tokio::test]
+    async fn diff_route_refuses_every_field_but_base_and_semantic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let base = spawn_router(state.clone()).await;
+        for field in [
+            "filter",
+            "pipeline",
+            "model",
+            "plan_id",
+            "expect_spec_digest",
+            "principal",
+            "scope",
+            "reason",
+            "name",
+            "table",
+            "catalog",
+        ] {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/api/v1/jobs/diff"))
+                .json(&serde_json::json!({ field: "x" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{field}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                envelope.message.contains(field),
+                "{field}: {}",
+                envelope.message
+            );
+        }
+        assert_eq!(state.diff_permit.running_job(), None);
+    }
+
+    /// A state store outside the project, held by another handle, is reported
+    /// by file name only: the absolute path is not served.
+    #[tokio::test]
+    async fn doctor_route_hides_a_state_path_outside_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, _inside) = promote_gate_project(dir.path(), "");
+        let outside_dir = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("outside-state.redb");
+        let state = pinned_server(root.join("models"), Some(config), &outside);
+        let base = spawn_router(state).await;
+        let holder = rocky_core::state::StateStore::open(&outside).expect("hold the store");
+        let body = reqwest::get(format!("{base}/api/v1/doctor"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("Cannot open state store"), "{body}");
+        assert!(body.contains("outside-state.redb"), "{body}");
+        assert!(!body.contains("elsewhere"), "{body}");
+        let canonical = std::fs::canonicalize(&outside_dir).unwrap();
+        assert!(
+            !body.contains(canonical.to_string_lossy().as_ref()),
+            "{body}"
+        );
+        drop(holder);
+    }
+
+    /// `without_config_values` keeps a key path and drops a quoted value.
+    #[test]
+    fn config_values_are_dropped_and_key_paths_kept() {
+        let cleaned = without_config_values(
+            "invalid type: integer `99887766`, expected a string for key `adapter.default.token`\n\
+             unknown variant `SECRETV`, expected one of `a`, `b`\n\
+             unsupported pipeline type: 'SECRETT'\n\
+             it doesn't leak",
+        );
+        assert!(!cleaned.contains("99887766"), "{cleaned}");
+        assert!(!cleaned.contains("SECRETV"), "{cleaned}");
+        assert!(!cleaned.contains("SECRETT"), "{cleaned}");
+        assert!(cleaned.contains("`adapter.default.token`"), "{cleaned}");
+        assert!(cleaned.contains("doesn't leak"), "{cleaned}");
+    }
+
+    /// Three error shapes that echo a config value (a wrong type, an unknown
+    /// variant, an unsupported pipeline type) reach neither the doctor route
+    /// nor the `config_invalid` body with the planted value in it.
+    #[tokio::test]
+    async fn config_value_echoes_never_reach_an_http_body() {
+        for (shape, text, token) in [
+            (
+                "invalid type",
+                "[adapter]\ntype = \"databricks\"\nhost = \"h\"\ntoken = 99887766\n",
+                "99887766",
+            ),
+            (
+                "unknown variant",
+                "[adapter]\ntype = \"duckdb\"\n\n[state]\nbackend = \"SECRETVARIANT7\"\n",
+                "SECRETVARIANT7",
+            ),
+            (
+                "unsupported type",
+                "[adapter]\ntype = \"duckdb\"\n\n[pipeline.p]\ntype = \"SECRETTYPE7\"\n",
+                "SECRETTYPE7",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (root, config, state_path) = promote_gate_project(dir.path(), "");
+            std::fs::write(&config, text).unwrap();
+            let state = pinned_server(root.join("models"), Some(config), &state_path);
+            let base = spawn_router(state).await;
+            for path in ["/api/v1/doctor", "/api/v1/hooks"] {
+                let body = reqwest::get(format!("{base}{path}"))
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                assert!(!body.contains(token), "{shape} {path}: {body}");
+            }
+        }
     }
 
     /// `GET /api/v1/doctor` runs the local set only: no `state_rw`,

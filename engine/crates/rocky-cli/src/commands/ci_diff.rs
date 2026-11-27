@@ -138,23 +138,82 @@ pub(crate) const GIT_OPTIONAL_LOCKS_ENV: &str = "GIT_OPTIONAL_LOCKS";
 /// `0`: skip every optional lock.
 pub(crate) const GIT_OPTIONAL_LOCKS_VALUE: &str = "0";
 
-/// The project's `data/seed.sql` as committed at `HEAD`, or `None` when the
-/// commit holds none or git cannot read it. Read with `git show`, never from
-/// the working tree. `./` makes the path relative to `project_root`, where
-/// `git_in` runs.
-fn committed_seed(project_root: &Path) -> Option<String> {
+/// The project's `data/seed.sql` as committed at `HEAD`: `Ok(None)` when the
+/// commit holds none (or git cannot list it), `Ok(Some(text))` when it does.
+/// Read with `git show`, never from the working tree. `./` makes the path
+/// relative to `project_root`, where `git_in` runs.
+///
+/// # Errors
+///
+/// The commit lists the seed but `git show` cannot read it, as when a sparse
+/// partial clone lacks the blob. The diff then fails: reading it as "no seed"
+/// would type every seeded column `Unknown` without saying so.
+fn committed_seed(project_root: &Path) -> Result<Option<String>> {
+    let listed = git_in(Some(project_root))
+        .args(["ls-tree", "HEAD", "--", "data/seed.sql"])
+        .output();
+    let Ok(listed) = listed else {
+        return Ok(None);
+    };
+    if !listed.status.success() || listed.stdout.trim_ascii().is_empty() {
+        debug!("no seed at HEAD");
+        return Ok(None);
+    }
     let output = git_in(Some(project_root))
         .args(["show", "HEAD:./data/seed.sql"])
         .output()
-        .ok()?;
+        .context("failed to run `git show` for data/seed.sql at HEAD")?;
     if !output.status.success() {
-        debug!(
-            "no seed at HEAD: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return None;
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if is_partial_clone(Some(project_root)) {
+            anyhow::bail!(
+                "this repository is a partial clone and 'data/seed.sql' at HEAD is not stored \
+                 locally ({detail}). The diff does not fetch from the remote when \
+                 GIT_NO_LAZY_FETCH=1, as in a `rocky serve` diff job. Fetch the objects \
+                 first, for example `git fetch`, then retry"
+            );
+        }
+        anyhow::bail!("could not read data/seed.sql at HEAD: {detail}");
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+/// The `(major, minor)` of `git --version` output such as `git version 2.45.1`
+/// or `git version 2.39.5 (Apple Git-154)`.
+fn parse_git_version(text: &str) -> Option<(u32, u32)> {
+    let version = text.trim().strip_prefix("git version ")?;
+    let mut parts = version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty());
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// `GIT_NO_LAZY_FETCH` exists from git 2.45. Older git ignores it and fetches
+/// a missing object from a partial clone's remote, which writes into the
+/// repository. When the caller asked for no lazy fetch and the repository is a
+/// partial clone, refuse an older git rather than fetch.
+fn ensure_no_lazy_fetch_is_honoured(repo_dir: Option<&Path>) -> Result<()> {
+    if std::env::var_os("GIT_NO_LAZY_FETCH").is_none() || !is_partial_clone(repo_dir) {
+        return Ok(());
+    }
+    let output = git_in(repo_dir)
+        .arg("--version")
+        .output()
+        .context("failed to run `git --version`")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    match parse_git_version(&text) {
+        Some(version) if version >= (2, 45) => Ok(()),
+        Some((major, minor)) => anyhow::bail!(
+            "this repository is a partial clone and git {major}.{minor} ignores GIT_NO_LAZY_FETCH \
+             (git 2.45 or newer honours it), so it would fetch missing objects from the remote. \
+             Upgrade git on the server, or fetch the repository fully"
+        ),
+        None => anyhow::bail!(
+            "this repository is a partial clone and the git version could not be read from \
+             {:?}, so the diff cannot tell whether git honours GIT_NO_LAZY_FETCH",
+            text.trim()
+        ),
+    }
 }
 
 /// Whether the repository is a partial clone (it has a promisor remote), whose
@@ -1679,6 +1738,7 @@ pub(crate) fn compute_ci_diff_seeded(
     repo_dir: Option<&Path>,
 ) -> Result<CiDiffData> {
     validate_base_ref(base_ref)?;
+    ensure_no_lazy_fetch_is_honoured(repo_dir)?;
 
     // Load cached source schemas once and seed both compiles (current
     // tree + base ref) with the same map so the resulting per-model
@@ -1787,7 +1847,7 @@ pub(crate) fn compute_ci_diff_seeded(
                 );
             }
             SeedRead::Head => {
-                if let Some(seed_sql) = committed_seed(project_root) {
+                if let Some(seed_sql) = committed_seed(project_root)? {
                     super::compile::fill_from_seed_text(
                         &seed_sql,
                         project_config.as_ref(),
@@ -4052,6 +4112,65 @@ mod tests {
             column_names(&wt, "orders"),
             vec![("dirty".to_string(), ColumnChangeType::Added)]
         );
+    }
+
+    /// The seed is read from the `HEAD` commit: an uncommitted one is not
+    /// there, a committed one is, and a committed one whose blob cannot be read
+    /// fails instead of reading as "no seed".
+    #[cfg(unix)]
+    #[test]
+    fn the_committed_seed_is_read_from_head_and_an_unreadable_one_fails() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init_repo(dir, &[("orders.sql", "SELECT 1 AS id\n")]);
+        assert_eq!(committed_seed(dir).unwrap(), None);
+
+        fs::create_dir_all(dir.join("data")).unwrap();
+        fs::write(dir.join("data/seed.sql"), "SELECT 1;\n").unwrap();
+        assert_eq!(committed_seed(dir).unwrap(), None, "uncommitted");
+
+        run_git(dir, &["add", "data/seed.sql"]);
+        run_git(dir, &["commit", "-q", "-m", "seed"]);
+        fs::write(dir.join("data/seed.sql"), "SELECT 2;\n").unwrap();
+        assert_eq!(
+            committed_seed(dir).unwrap().as_deref(),
+            Some("SELECT 1;\n"),
+            "HEAD's copy, not the disk's"
+        );
+
+        let sha = Command::new("git")
+            .args(["rev-parse", "HEAD:data/seed.sql"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+        let object = dir.join(".git/objects").join(&sha[..2]).join(&sha[2..]);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::remove_file(&object).unwrap();
+        let error = committed_seed(dir).unwrap_err().to_string();
+        assert!(error.contains("data/seed.sql"), "{error}");
+    }
+
+    #[test]
+    fn git_version_text_parses_to_major_and_minor() {
+        assert_eq!(parse_git_version("git version 2.45.1\n"), Some((2, 45)));
+        assert_eq!(
+            parse_git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert_eq!(parse_git_version("git version 2.56.1"), Some((2, 56)));
+        assert_eq!(parse_git_version("git version 2.7"), Some((2, 7)));
+        assert_eq!(
+            parse_git_version("git version 10.0.0.windows.1"),
+            Some((10, 0))
+        );
+        assert_eq!(parse_git_version("something else"), None);
+        assert_eq!(parse_git_version("git version x.y"), None);
+        assert!(parse_git_version("git version 2.44.9").unwrap() < (2, 45));
+        assert!(parse_git_version("git version 3.0.0").unwrap() >= (2, 45));
     }
 
     /// Every git command `ci-diff` starts carries `GIT_OPTIONAL_LOCKS=0`, set
