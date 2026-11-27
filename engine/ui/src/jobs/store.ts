@@ -35,7 +35,9 @@ export const defaultJobClient: JobClient = {
 /**
  * Where the latest cancel request of the running job stands. The engine
  * sends the job SIGTERM on the first request (which `rocky run` handles like
- * Ctrl-C) and SIGKILL on the next.
+ * Ctrl-C) and SIGTERM again on the second: the run's forced exit, which
+ * cancels its warehouse statements and exits. If the job is still running
+ * 15 s after that, the engine kills it. A third request kills it at once.
  */
 export type CancelView =
   | { kind: "idle" }
@@ -67,6 +69,12 @@ export interface JobRecord {
   cancel: CancelView;
   /** A stop was delivered to this job, so Cancel now offers a forced stop. */
   stopping: boolean;
+  /**
+   * How many terminates the engine delivered: 1 is the stop, 2 the forced
+   * stop. After the second the engine kills the job if it has not exited
+   * 15 s later, and one more press kills it at once.
+   */
+  terminates: number;
   /** The client the job was submitted with: its reads and cancel go there too. */
   client: JobClient | null;
   /** What the job was submitted with, so a page that comes back can show what it was for. */
@@ -94,6 +102,7 @@ export function idleRecord(key: string, kind: JobKind, label: string): JobRecord
     view: { kind: "idle" },
     cancel: { kind: "idle" },
     stopping: false,
+    terminates: 0,
     client: null,
     body: null,
     submittedAt: 0,
@@ -288,6 +297,7 @@ export class JobStore {
       view: { kind: "submitting" },
       cancel: { kind: "idle" },
       stopping: false,
+      terminates: 0,
       client,
       body,
       submittedAt: Date.now(),
@@ -372,6 +382,7 @@ export class JobStore {
         this.update(key, (r) => ({
           ...r,
           stopping: r.stopping || signal === "terminate",
+          terminates: r.terminates + (signal === "terminate" ? 1 : 0),
           cancel: { kind: "sent", signal },
         }));
       })
