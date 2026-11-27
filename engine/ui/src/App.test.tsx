@@ -12,7 +12,7 @@ import {
   waitingLine,
   type Waiting,
 } from "./App";
-import { NOT_YET_HEADING } from "./areas";
+import { AREAS, NOT_YET_HEADING, areaFromPath } from "./areas";
 import { GovernorScreen } from "./governor/GovernorScreen";
 import { OPERATOR_MODE_LABEL, READ_ONLY_REASON } from "./operator";
 
@@ -223,8 +223,8 @@ describe("App", () => {
     expect(later?.closest("details")).not.toHaveAttribute("open");
     expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Inbox",
-      "Project",
       "Changes",
+      "Project",
       "Data products",
       "Oversight",
     ]);
@@ -234,6 +234,76 @@ describe("App", () => {
     for (const entry of disabled) expect(entry.closest("a")).toBeNull();
     expect(within(nav).getByText("No page of its own yet. The runs table is on Project.")).toBeInTheDocument();
     expect(screen.getByText("engine slot")).toBeInTheDocument();
+  });
+
+  describe("the grouped sidebar", () => {
+    /** Each group: its heading, and the link names in its list, in order. */
+    function groups() {
+      return [...liveAreasNav().querySelectorAll("h2")].map((heading) => {
+        const list = document.getElementById(heading.id)?.nextElementSibling;
+        return {
+          heading: heading.textContent,
+          list: list?.getAttribute("aria-labelledby"),
+          links: [...(list?.querySelectorAll("a") ?? [])].map((a) => a.textContent),
+        };
+      });
+    }
+
+    it("groups the links as Work, Data and Govern, in that order", () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App fetchMeta={readyMeta} {...slots} />);
+      const found = groups();
+      expect(found.map(({ heading, links }) => [heading, links])).toEqual([
+        ["Work", ["Inbox", "Changes"]],
+        ["Data", ["Project", "Data products"]],
+        ["Govern", ["Oversight"]],
+      ]);
+      // Each list is named by its own heading.
+      for (const group of found) expect(group.list).toBeTruthy();
+      // No Settings group: it has no screen, so no link.
+      expect(within(liveAreasNav()).queryByRole("link", { name: "Settings" })).toBeNull();
+    });
+
+    it("links only to routes that exist", () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App fetchMeta={readyMeta} {...slots} />);
+      const hrefs = within(liveAreasNav())
+        .getAllByRole("link")
+        .map((link) => link.getAttribute("href"));
+      expect(hrefs).toEqual([
+        "/ui/governor/brief",
+        "/ui/review",
+        "/ui/estate",
+        "/ui/governor/products",
+        "/ui/governor/scorecard",
+      ]);
+      for (const href of hrefs) {
+        const area = AREAS.find((entry) => entry.kind === "link" && entry.href === href);
+        expect(area).toBeDefined();
+        expect(areaFromPath(href as string)).toBe(area?.id);
+      }
+    });
+
+    it("puts aria-current on the active item of its group, and on no other", () => {
+      window.history.pushState(null, "", "/ui/review");
+      render(<App fetchMeta={readyMeta} {...slots} />);
+      const current = liveAreasNav().querySelectorAll("[aria-current]");
+      expect([...current].map((node) => node.textContent)).toEqual(["Changes"]);
+      expect(areas().getByRole("link", { name: "Changes" })).toHaveAttribute("aria-current", "page");
+      expect(areas().getByRole("link", { name: "Changes" }).closest("ul")).toBe(
+        document.getElementById(
+          [...liveAreasNav().querySelectorAll("h2")].find((h) => h.textContent === "Work")?.id ?? "",
+        )?.nextElementSibling,
+      );
+    });
+
+    it("keeps each badge on its link inside the grouped lists", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App fetchMeta={readyMeta} {...slots} fetchWaiting={async () => w(2, 1)} />);
+      await waitFor(() => expect(badgeOf("Inbox")).toBe("3"));
+      expect(badgeOf("Changes")).toBe("2");
+      for (const name of ["Project", "Data products", "Oversight"]) expect(badgeOf(name)).toBeNull();
+    });
   });
 
   /** The badge's digit beside a link, or null when there is none. */

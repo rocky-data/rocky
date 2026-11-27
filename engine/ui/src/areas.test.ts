@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AREAS, areaFromPath } from "./areas";
+import { AREAS, AREA_GROUPS, areaFromPath } from "./areas";
 import { auditPath, custodyPath } from "./router";
 import { reviewPath } from "./review/paths";
 
@@ -29,6 +29,16 @@ describe("AREAS", () => {
       products: "/ui/governor/products",
       governance: "/ui/governor/scorecard",
     });
+  });
+
+  it("groups only areas that open a screen, each once", () => {
+    const grouped = AREA_GROUPS.flatMap((group) => group.areas);
+    expect(AREA_GROUPS.map((group) => group.label)).toEqual(["Work", "Data", "Govern"]);
+    expect(new Set(grouped).size).toBe(grouped.length);
+    for (const id of grouped) expect(AREAS.find((area) => area.id === id)?.kind).toBe("link");
+    // Every link is in a group, so none is lost.
+    const links = AREAS.filter((area) => area.kind === "link").map((area) => area.id);
+    expect([...grouped].sort()).toEqual([...links].sort());
   });
 
   it("gives every disabled area a reason", () => {
