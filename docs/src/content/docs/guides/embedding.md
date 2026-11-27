@@ -156,12 +156,12 @@ A mutating route does not block. You submit the work, get an id back, and poll f
 
 The polled result is the same payload the CLI would have produced. A submitted job becomes `running` right away. The schema also declares `queued`, but this server never uses it. Poll until the state is `succeeded`, `failed` or `cancelled`.
 
-The routes `/jobs/promote`, `/jobs/compact` and `/jobs/diff` are not in the diagram. They plan or read, and mutate nothing. Every route validates its body first and answers `400 bad_request` before the job starts, or before it takes the lock. All sit behind the same write gate as `run`: a read-only token gets `403`.
+The routes `/jobs/promote`, `/jobs/compact` and `/jobs/diff` are not in the diagram. They plan or read, and mutate nothing. Every route validates its body first and answers `400 bad_request` before the job starts, or before it takes the lock. A field no job takes answers `400` on every route; it is never ignored. All sit behind the same write gate as `run`: a read-only token gets `403`.
 
 | Route | Runs | Body | Lock |
 |---|---|---|---|
 | `/jobs/test` | `rocky test` in local DuckDB | optional `{"model": "<name>"}` | none |
-| `/jobs/ci` | `rocky ci` (compile and test, no warehouse credentials) | ignored | none |
+| `/jobs/ci` | `rocky ci` (compile and test, no warehouse credentials) | none: any field answers `400` | none |
 | `/jobs/freeze`, `/jobs/unfreeze` | `rocky policy freeze`, `rocky policy unfreeze` | optional `{"principal": "agent" \| "human", "scope": "<selector>", "reason": "<text>"}` | mutation |
 | `/jobs/preview` | `rocky preview create` | optional `{"name": "<branch>", "base": "<ref>"}` | mutation |
 | `/jobs/promote` | `rocky plan promote <name>` | `{"name": "<branch>", "base": "<ref>", "pipeline": "<name>"}`, `name` required | none |
@@ -171,7 +171,7 @@ The routes `/jobs/promote`, `/jobs/compact` and `/jobs/diff` are not in the diag
 | `/jobs/approve` | `rocky review <plan_id> --approve` | `{"plan_id": "<64 lowercase hex>"}` | mutation |
 | `/jobs/apply` | `rocky apply <plan_id>` | `plan_id`, optional `expect_spec_digest` | mutation |
 
-A `diff` job is read-only. It changes nothing under the project, `.git` included: no trace, state, cache or model file, and git's index and objects stay as they are. It reads `data/seed.sql` from the `HEAD` commit, never from the working tree, so an uncommitted seed does not run. Its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`: in a partial clone a missing object fails the job with a message that names the partial clone, and nothing is fetched. The server still records the job itself in its state store, as for every job. It does not take the mutation lock, so it never blocks a run. A second `diff` submitted while one runs answers `409 mutation_in_progress` with the running job's `running_job_id`. It diffs the `HEAD` commit, so uncommitted edits are not compared. A body field other than `base` and `semantic` is `400 bad_request`. The result is the `rocky ci-diff` output, including its lineage fields.
+A `diff` job is read-only. The job writes nothing itself, except its job record. The server stores that record in its state store, which by default is `models/.rocky-state.redb`, inside the project. A seed committed at `HEAD` runs as it does for `rocky ci-diff`, so a seed with `COPY ... TO` or `ATTACH` still writes where it says. It reads `data/seed.sql` from the `HEAD` commit, never from the working tree, so an uncommitted seed does not run. Its git commands set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`: in a partial clone a missing object fails the job with a message that names the partial clone, and nothing is fetched. Git older than 2.45 ignores `GIT_NO_LAZY_FETCH`, so the job refuses a partial clone on such a git. It does not take the mutation lock, so it never blocks a run. A second `diff` submitted while one runs answers `409 mutation_in_progress` with the running job's `running_job_id`. It diffs the `HEAD` commit, so uncommitted edits are not compared. Any other body field is `400 bad_request`, naming the field. The result is the `rocky ci-diff` output, including its lineage fields.
 
 Jobs that take the mutation lock answer `409 mutation_in_progress` while another one holds it. A run holds the local state store for its whole run, even on a remote `[state]` backend, so retry a refused freeze when that run ends. To stop a running job, cancel it.
 
