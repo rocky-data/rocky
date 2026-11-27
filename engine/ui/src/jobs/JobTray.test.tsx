@@ -92,15 +92,51 @@ describe("JobTray", () => {
     expect(screen.getByTestId("page-view")).toHaveTextContent("idle");
   });
 
-  it("cancels from the card in operator mode, and says Stopping… once the stop is sent", async () => {
+  it("walks the three cancel steps on the card: stop, forced stop, kill", async () => {
     const jobs = controlledJobs("run");
+    const signals = ["terminate", "terminate", "kill"] as const;
+    let press = 0;
+    jobs.client.cancel = vi.fn(async () => ({ job_id: "job_1", signal: signals[press++] }));
+    render(<Shell store={new JobStore(5, 60_000)} client={jobs.client} />);
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    const card = await screen.findByRole("article", { name: "Apply change abc" });
+
+    fireEvent.click(await within(card).findByRole("button", { name: "Cancel" }));
+    expect(jobs.client.cancel).toHaveBeenCalledWith("job_1");
+    await within(card).findByText("Stopping…");
+    expect(await within(card).findByRole("button", { name: "Force stop" })).toBeEnabled();
+    expect(card).toHaveTextContent("Asked the job to stop, as Ctrl-C does.");
+    expect(card).not.toHaveTextContent("Forced stop sent");
+
+    fireEvent.click(within(card).getByRole("button", { name: "Force stop" }));
+    expect(await within(card).findByRole("button", { name: "Kill now" })).toBeEnabled();
+    expect(card).toHaveTextContent(
+      "Forced stop sent. The run cancels its warehouse statements, then exits. If it is still running 15 s later, the engine kills it. Press again to kill it now.",
+    );
+    expect(card).not.toHaveTextContent("Asked the job to stop");
+
+    fireEvent.click(within(card).getByRole("button", { name: "Kill now" }));
+    await waitFor(() => expect(card).toHaveTextContent("Kill sent."));
+    const last = within(card).getByRole("button", { name: "Stopping…" });
+    expect(last).toBeDisabled();
+    expect(jobs.client.cancel).toHaveBeenCalledTimes(3);
+  });
+
+  it("shows no Cancel refused once the job has ended", async () => {
+    const { ApiError } = await import("../api");
+    const jobs = controlledJobs("run");
+    jobs.client.cancel = vi.fn(async () => {
+      throw new ApiError(409, { code: "job_not_running", message: "the job has ended" });
+    });
     render(<Shell store={new JobStore(5, 60_000)} client={jobs.client} />);
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     const card = await screen.findByRole("article", { name: "Apply change abc" });
     fireEvent.click(await within(card).findByRole("button", { name: "Cancel" }));
-    expect(jobs.client.cancel).toHaveBeenCalledWith("job_1");
-    await within(card).findByText("Stopping…");
-    expect(within(card).getByRole("button", { name: "Force stop" })).toBeEnabled();
+    expect(await within(card).findByRole("alert")).toHaveTextContent("Cancel refused. job_not_running");
+    jobs.finish("succeeded");
+    await waitFor(() => expect(card).toHaveTextContent("Done"));
+    expect(within(card).queryByRole("alert")).toBeNull();
+    expect(card).not.toHaveTextContent("Cancel refused");
   });
 
   it("shows a failed write's first line and its details, and offers no way to send it again", async () => {

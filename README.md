@@ -65,7 +65,7 @@ rocky serve --ui --token "$(openssl rand -hex 16)" --token-scope read-only
 With a read-only token, the page cannot run or approve anything. Plain `rocky serve --ui` on your own machine starts operator mode, where the page can approve and apply plans.
 
 <p align="center">
-  <img src="docs/public/demo-ui-tour.gif" alt="A tour of the Rocky browser UI: the estate with its DAG, the review queue, a plan awaiting a human, and a model's history" width="900" />
+  <img src="docs/public/demo-ui-tour.gif" alt="A tour of the Rocky browser UI: the Project screen with its lineage, the changes waiting for approval, an agent's breaking change that needs approval, the Inbox, a model's trace, and a data product's delivery and cost" width="900" />
 </p>
 
 **In VS Code.** The [Rocky extension](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky) shows errors as you type, column types on hover, and go-to-definition across models.

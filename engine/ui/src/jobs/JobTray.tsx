@@ -215,8 +215,28 @@ function Card({
   const failed = tone === "fail";
   const running = record.view.kind === "running";
   const cancel = record.cancel;
-  // Sending, or a forced stop already sent: nothing more a press can do.
-  const cancelSpent = cancel.kind === "sending" || (cancel.kind === "sent" && cancel.signal === "kill");
+  // The three presses: stop, forced stop, kill. Sending, or the kill already
+  // sent: nothing more a press can do.
+  const killed = cancel.kind === "sent" && cancel.signal === "kill";
+  const cancelSpent = cancel.kind === "sending" || killed;
+  const cancelLabel = cancelSpent
+    ? "Stopping…"
+    : record.terminates >= 2
+      ? "Kill now"
+      : record.stopping
+        ? "Force stop"
+        : "Cancel";
+  const cancelHint = !running
+    ? null
+    : killed
+      ? "Kill sent. The job should end now. The warehouse may still be running its statements."
+      : cancel.kind === "sending"
+        ? null
+        : record.terminates >= 2
+          ? "Forced stop sent. The run cancels its warehouse statements, then exits. If it is still running 15 s later, the engine kills it. Press again to kill it now."
+          : record.stopping
+            ? "Asked the job to stop, as Ctrl-C does. A run finishes the copies in flight first."
+            : null;
   const elsewhere = record.from !== "" && record.from !== pathname;
   return (
     <article
@@ -234,7 +254,8 @@ function Card({
             <span role={failed && elsewhere ? "alert" : "status"}>{line}</span>
             {time !== undefined && <span> · {time}</span>}
           </p>
-          {cancel.kind === "refused" && (
+          {cancelHint !== null && <p className="text-xs text-muted">{cancelHint}</p>}
+          {running && cancel.kind === "refused" && (
             <p role="alert" className="text-xs text-fail-ink">
               Cancel refused.{" "}
               {cancel.error instanceof ApiError
@@ -271,7 +292,7 @@ function Card({
               disabled={cancelSpent}
               onClick={() => store.cancel(record.key)}
             >
-              {cancelSpent ? "Stopping…" : record.stopping ? "Force stop" : "Cancel"}
+              {cancelLabel}
             </button>
           )}
           {failed && elsewhere && (

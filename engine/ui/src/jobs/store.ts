@@ -25,11 +25,37 @@ export interface JobClient {
   cancel: (jobId: string) => Promise<{ job_id: string; signal: CancelSignal }>;
 }
 
+/** How long a status read may take before it counts as a failed read. */
+export const JOB_STATUS_TIMEOUT_MS = 15_000;
+
+/** How long a cancel request may take before it counts as refused. */
+export const JOB_CANCEL_TIMEOUT_MS = 15_000;
+
+/**
+ * `fetch` with a deadline, for the job client only: other callers of the api
+ * module keep a request with no deadline. A request that passes it rejects.
+ */
+function fetchWithin(ms: number): typeof fetch {
+  return (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(ms) });
+}
+
+function isTimeout(error: unknown): boolean {
+  return error instanceof DOMException && (error.name === "TimeoutError" || error.name === "AbortError");
+}
+
 export const defaultJobClient: JobClient = {
   submit: (kind, body) => apiPost<{ job_id: string }>(`jobs/${kind}`, body),
-  status: (jobId) => apiGet<JobStatus>(`jobs/${encodeURIComponent(jobId)}`),
+  status: (jobId) =>
+    apiGet<JobStatus>(`jobs/${encodeURIComponent(jobId)}`, { fetch: fetchWithin(JOB_STATUS_TIMEOUT_MS) }),
   cancel: (jobId) =>
-    apiPost<{ job_id: string; signal: CancelSignal }>(`jobs/${encodeURIComponent(jobId)}/cancel`, {}),
+    apiPost<{ job_id: string; signal: CancelSignal }>(
+      `jobs/${encodeURIComponent(jobId)}/cancel`,
+      {},
+      { fetch: fetchWithin(JOB_CANCEL_TIMEOUT_MS) },
+    ).catch((error: unknown) => {
+      if (isTimeout(error)) throw new Error("The engine did not answer the cancel request in time.");
+      throw error;
+    }),
 };
 
 /**
@@ -342,14 +368,18 @@ export class JobStore {
             setTimeout(tick, wait);
             return;
           }
-          this.update(key, (record) => ({ ...record, view: { kind: "done", job } }));
+          this.update(key, (record) => ({ ...record, view: { kind: "done", job }, cancel: { kind: "idle" } }));
           if (job.state === "succeeded") this.closeLater(key);
           for (const listener of [...(this.doneListeners.get(key) ?? [])]) listener(job);
         })
         .catch((error: unknown) => {
           if (this.disposed) return;
           if (unreadable(error)) {
-            this.update(key, (record) => ({ ...record, view: { kind: "lost", jobId, error: asError(error) } }));
+            this.update(key, (record) => ({
+              ...record,
+              view: { kind: "lost", jobId, error: asError(error) },
+              cancel: { kind: "idle" },
+            }));
             return;
           }
           this.update(key, (record) => ({ ...record, failedReads: record.failedReads + 1 }));
@@ -379,6 +409,9 @@ export class JobStore {
       .cancel(jobId)
       .then(({ signal }) => {
         if (!current()) return;
+        // This counts the terminates whose answers arrived, not the engine's
+        // own count. A lost answer (a timeout, a dropped connection) can leave
+        // the engine one step ahead of the card. Not reconciled yet.
         this.update(key, (r) => ({
           ...r,
           stopping: r.stopping || signal === "terminate",
