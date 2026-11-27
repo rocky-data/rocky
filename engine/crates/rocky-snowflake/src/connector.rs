@@ -1145,6 +1145,67 @@ pub(crate) fn classify_connector_failure(err: &AdapterError) -> FailureClass {
 mod tests {
     use super::*;
 
+    /// #2774: every retried submit failure that leaves the outcome unknown
+    /// keeps the key and becomes a resend; a statement known to have failed
+    /// gets a new key and is not a resend.
+    #[tokio::test]
+    async fn submit_attempt_keeps_the_key_unless_the_statement_is_known_to_have_failed() {
+        let first = SubmitAttempt::first();
+        assert!(!first.resend);
+        assert_eq!(
+            first.query_params(),
+            vec![("requestId", first.request_id.as_str())]
+        );
+
+        // A real transport error: nothing listens on port 9 of localhost.
+        let http = reqwest::Client::new()
+            .post("http://127.0.0.1:9/api/v2/statements")
+            .send()
+            .await
+            .expect_err("nothing listens on port 9");
+        let unknown_outcomes = [
+            ConnectorError::ApiError {
+                status: 401,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 429,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 502,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 503,
+                body: String::new(),
+            },
+            ConnectorError::ApiError {
+                status: 504,
+                body: String::new(),
+            },
+            ConnectorError::Http(http),
+        ];
+        for err in &unknown_outcomes {
+            let next = first.clone().next(err);
+            assert_eq!(next.request_id, first.request_id, "{err}");
+            assert!(next.resend, "{err}");
+            assert_eq!(
+                next.query_params(),
+                vec![("requestId", first.request_id.as_str()), ("retry", "true")],
+                "{err}"
+            );
+        }
+
+        let failed = ConnectorError::StatementFailed {
+            handle: "h".into(),
+            message: "000625: Warehouse COMPUTE_WH is resuming".into(),
+        };
+        let next = first.clone().next(&failed);
+        assert_ne!(next.request_id, first.request_id);
+        assert!(!next.resend);
+    }
+
     #[test]
     fn error_debug_prints_a_resolved_value_as_its_name() {
         const SECRET: &str = "s3cr3t-value-123";
