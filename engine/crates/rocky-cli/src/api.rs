@@ -7245,18 +7245,29 @@ mod tests {
         let resp = reqwest::get(format!("{base}/api/v1/hooks")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
-        for secret in secrets {
-            assert!(!body.contains(secret), "{secret} leaked: {body}");
+        // Do not print the secret or the body in the failure message: the
+        // assertion text would then write the test secret to the log.
+        for (index, secret) in secrets.iter().enumerate() {
+            assert!(
+                !body.contains(secret),
+                "hook secret #{index} leaked into /api/v1/hooks response"
+            );
         }
-        for fragment in [
+        for (index, fragment) in [
             "Bearer",
             "--password",
             "-u ",
             "token=",
             "apikey=",
             "X-Api-Key",
-        ] {
-            assert!(!body.contains(fragment), "{fragment} leaked: {body}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !body.contains(fragment),
+                "hook secret marker #{index} leaked into /api/v1/hooks response"
+            );
         }
         assert!(body.contains("\"command\": \"curl …\""), "{body}");
     }
