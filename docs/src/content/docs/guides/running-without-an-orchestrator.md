@@ -62,14 +62,25 @@ Alert on any non-zero exit. Give exit `2` its own channel.
 
 | Adapter | Cancels on a forced exit |
 |---------|--------------------------|
-| Databricks | Yes, once the statement has an id: after the first 30 seconds |
-| Snowflake | Yes, once the statement has a handle: after the first 45 seconds |
-| BigQuery, Trino | No. A later release adds it |
+| Databricks | Yes, from the start: the submit returns the id at once |
+| Snowflake | Yes, from the start: the submit is asynchronous and returns the handle at once |
+| BigQuery | Yes, almost from the start: the submit waits at most 1 second, then returns the job id |
+| Trino | Yes, from the start: the submit returns the query id at once |
 | PostgreSQL, Redshift | No. The server statement timeout that Rocky sets from `timeout_secs` still stops it |
 | SQL Server, ClickHouse, Spark | No. The statement runs on |
 | DuckDB | Not needed. It runs inside the `rocky` process and ends with it |
 
-A Databricks or Snowflake statement younger than that limit has no id yet, so Rocky cannot cancel it. Other adapters do not cancel: they list no statements, so Rocky prints nothing for them. Only a forced exit cancels. A fan-out abort inside the run, a client timeout and a poll error do not cancel yet. Rocky stops waiting on such a statement, and the warehouse runs it on. An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
+Other adapters do not cancel: they list no statements, so Rocky prints nothing for them. On Databricks, Snowflake, BigQuery and Trino, Rocky also cancels on the other paths that stop waiting on a statement:
+
+- **A fan-out abort** (`fail_fast`, or the error-rate abort) cancels the copies still running, then drops them. It logs one warning per statement.
+- **The client deadline** (`timeout_secs`) and **a poll error that re-polling does not fix** cancel the statement before the error is returned. Rocky never submits that statement again, and the run does not retry it (`table_retries` skips the table too), because it may still run. Rocky never resends it within a run. A scheduler `retry.max` (default 0) still restarts a failed run; set it only for pipelines marked `retry_safe`. A transient poll error polls the same statement again.
+- **A cancel during a source row count** (`[[product.source.volume]]`) cancels the `SELECT COUNT(*)` before Rocky drops it.
+
+On BigQuery, a poll error that re-polling does not fix first asks `jobs.get` how the job ended (at most 3 more seconds). A job that failed returns its own error, with no cancel. A job that succeeded is not cancelled and not sent again: any changes it made are applied, but Rocky lost its result, so the table fails with an error that says so (`failure_kind: "unknown"`). Only a job that has not ended, or one `jobs.get` cannot answer for, is cancelled. A load job (`jobs.insert`) polls `jobs.get` directly and skips that extra check: it is cancelled when the client deadline passes, and is abandoned (not resent) when a poll error does not clear. A forced exit does not cancel a load job yet (#2787). Trino cancels through `DELETE /v1/query/{id}`, which the coordinator allows for a query you own. A Trino page read that fails with a `502`, `503` or `504`, or a transport error, reads the same page again.
+
+One gap stays: a submit that times out at the transport, or that gets a `429`, `502`, `503` or `504` answer, is sent again. The warehouse may have accepted the first one, and with no id Rocky cannot cancel it (#2774).
+
+Each cancel waits at most 3 seconds for an answer (on BigQuery, after the `jobs.get` wait above). An accepted cancel request does not prove the statement stopped. Check the warehouse's query history to confirm.
 
 One wrapper makes the routing reusable across every scheduler:
 

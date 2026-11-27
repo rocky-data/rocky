@@ -131,7 +131,7 @@
       ],
       "properties": {
         "effect": {
-          "description": "The decision: \"allow\", or \"require_review\" when the policy asked for review but the run path does not enforce it.",
+          "description": "The decision: \"allow\", or \"require_review\" when the policy asked for review. require_review is not an approval. An agent's rocky run refuses under require_review, as it does under deny, so Rocky writes no manifest for that run.",
           "type": "string",
           "enum": [
             "allow",
