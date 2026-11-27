@@ -706,7 +706,7 @@ mod tests {
         );
     }
 
-    /// The collision Hugo's floor ruling accepts, pinned so it is a decision
+    /// The collision the floor decision accepts, pinned so it is a decision
     /// and not a surprise: a non-secret value at or above the floor is
     /// rewritten inside a longer identifier too.
     #[test]
