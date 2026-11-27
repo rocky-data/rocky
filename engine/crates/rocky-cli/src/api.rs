@@ -5600,8 +5600,9 @@ mod tests {
     }
 
     fn test_state() -> Arc<ServerState> {
-        // Skip the spawned initial compile — tests hit the router directly
-        // and `recompile()` explicitly where a warmed graph is needed.
+        // No config. `ServerState::new` still spawns the initial compile, so
+        // a test that needs "no compile yet" must wait for it and clear
+        // `compile_result`; one that needs a warmed graph waits for it.
         ServerState::new(simple_project_models(), None, None)
     }
 
@@ -7487,7 +7488,13 @@ mod tests {
         let err: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(err.code, "model_not_found");
 
-        let bare = spawn_router(test_state()).await;
+        // `ServerState::new` always spawns the initial compile, so a fresh
+        // state can gain a compile while the requests run. Let that compile
+        // land, then clear it, so "no compile yet" holds for every request.
+        let bare_state = test_state();
+        wait_compiled(&bare_state).await;
+        *bare_state.compile_result.write().await = None;
+        let bare = spawn_router(bare_state).await;
         // Both need the server's compile.
         for path in ["/api/v1/catalog", "/api/v1/retention"] {
             let resp = reqwest::get(format!("{bare}{path}")).await.unwrap();
