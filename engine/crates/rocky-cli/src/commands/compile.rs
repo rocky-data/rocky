@@ -921,20 +921,36 @@ fn apply_operand_gates(
     // and a scan of the text of each seed file the gate can find, which
     // covers a seed that did not run and the entry points that never run
     // one (`rocky serve`, `rocky lsp`, `rocky emit-sql`).
-    let mut seed_names = result.seed_function_names.clone();
+    let mut seeds = rocky_compiler::function_check::SeedFunctions::from_names(
+        result.seed_function_names.clone(),
+    );
     for seed in reachable_seed_files(result, project_root) {
         match std::fs::read_to_string(&seed) {
-            Ok(sql) => seed_names.extend(
-                rocky_compiler::function_check::seed_function_names_in_text(&sql),
-            ),
-            // The file is there but does not read: its names are unknown, so
-            // a call to one of its macros can be refused. Say why.
-            Err(e) => tracing::warn!(
-                path = %seed.display(),
-                error = %e,
-                "could not read the seed file; calls to its functions and macros are judged \
-                 against DuckDB's built-ins (E057, E068)"
-            ),
+            Ok(sql) => {
+                seeds
+                    .names
+                    .extend(rocky_compiler::function_check::seed_function_names_in_text(
+                        &sql,
+                    ))
+            }
+            // The file is there but does not read: its names are unknown.
+            // Fail closed (#2753): a DuckDB call the check would refuse may
+            // be one of its macros, so it is refused with E073, which names
+            // this file and the read failure. It never skips the check.
+            Err(e) => {
+                tracing::warn!(
+                    path = %seed.display(),
+                    error = %e,
+                    "could not read the seed file; DuckDB calls the function check would refuse \
+                     are refused with E073"
+                );
+                seeds
+                    .unreadable
+                    .push(rocky_compiler::function_check::UnreadableSeed {
+                        path: seed.display().to_string(),
+                        error: e.to_string(),
+                    });
+            }
         }
     }
     let target_for =
@@ -957,7 +973,7 @@ fn apply_operand_gates(
         rocky_compiler::function_check::check_unknown_functions_with(
             &result.project.models,
             result.semantic_graph.functions(),
-            &seed_names,
+            &seeds,
             &target_for,
             written_for,
         ),
@@ -971,9 +987,10 @@ fn apply_operand_gates(
 /// The seed files a compile can have been typed from: `<root>/data/seed.sql`
 /// for `project_root`, and for each model, the first directory above its
 /// file that holds a `data/seed.sql` or a `rocky.toml` (a `--models`
-/// directory beside another project's seed). Every one found is read, since
-/// a name from a seed that is not the project's only loses a check. A path
-/// that is there but cannot be read is kept, so the caller reports it.
+/// directory beside another project's seed). Every one found is read: a
+/// name from a seed that is not the project's only loses a check. A path
+/// that is there but cannot be read is kept, so the caller fails the check
+/// closed on it (E073, #2753).
 fn reachable_seed_files(
     result: &compile::CompileResult,
     project_root: Option<&Path>,
@@ -1009,7 +1026,12 @@ fn reachable_seed_files(
 fn may_be_present(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        // A path under a file (`data` is a file) is absent too: no seed
+        // can be there, so it must not fail the check closed (E073).
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
     }
 }
 
@@ -2974,6 +2996,98 @@ schema_template = "s"
                 [("E068".to_string(), "control".to_string())],
                 "{form:?}"
             );
+            assert!(result.has_errors, "{form:?}");
+        }
+    }
+
+    /// A seed path under a file (`data` is a file, not a directory) is
+    /// absent, not unreadable: no seed can be there, so it must not fail the
+    /// function check closed with E073. A missing path is absent too.
+    #[test]
+    fn a_seed_path_under_a_file_is_absent() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("data"), "not a directory").unwrap();
+        assert!(!may_be_present(&seed_file(dir.path())));
+        assert!(!may_be_present(&dir.path().join("nope/seed.sql")));
+        fs::remove_file(dir.path().join("data")).unwrap();
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        fs::write(seed_file(dir.path()), "").unwrap();
+        assert!(may_be_present(&seed_file(dir.path())));
+    }
+
+    /// The gate `rocky serve` and `rocky lsp` install fails closed on a seed
+    /// file that is there but does not read (#2753): a call the check would
+    /// refuse may be one of its macros, so it is refused with `E073`, which
+    /// names the seed and the read failure. It never skips the check. A call
+    /// to a built-in with a count DuckDB takes is not affected.
+    #[test]
+    fn the_serve_and_lsp_gates_refuse_a_call_when_the_seed_does_not_read() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"warehouse.duckdb\"\n\n\
+             [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.main.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        // Not valid UTF-8: the file is there, but does not read as text.
+        fs::write(
+            root.join("data/seed.sql"),
+            b"CREATE MACRO my_fn(x) AS x; -- \xff\xfe\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        fs::create_dir_all(&models).unwrap();
+        for (name, sql) in [
+            ("uses_fn", "SELECT my_fn(status) AS x FROM orders"),
+            ("bad_count", "SELECT upper(status, status) AS x FROM orders"),
+            ("plain", "SELECT upper(status) AS x FROM orders"),
+        ] {
+            fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+            fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"warehouse\"\nschema = \"main\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let config_path = root.join("rocky.toml");
+        let config = rocky_config::load_optional_project_config(Some(&config_path))
+            .unwrap()
+            .expect("config");
+        for form in [ModelSqlForm::Authored, ModelSqlForm::Inlined] {
+            let mut result = compile::compile(&CompilerConfig {
+                models_dir: models.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            apply_model_target_gates(&mut result, &config, &config_path, form);
+            let calls: Vec<&Diagnostic> = result
+                .diagnostics
+                .iter()
+                .filter(|d| ["E057", "W057", "E068", "W068", "E073"].contains(&&*d.code))
+                .collect();
+            let mut found: Vec<(String, String)> = calls
+                .iter()
+                .map(|d| (d.code.to_string(), d.model.clone()))
+                .collect();
+            found.sort();
+            assert_eq!(
+                found,
+                [
+                    ("E073".to_string(), "bad_count".to_string()),
+                    ("E073".to_string(), "uses_fn".to_string()),
+                ],
+                "{form:?}"
+            );
+            for d in calls {
+                assert!(d.message.contains("seed.sql"), "{}", d.message);
+                assert!(d.message.contains("could not be read"), "{}", d.message);
+            }
             assert!(result.has_errors, "{form:?}");
         }
     }

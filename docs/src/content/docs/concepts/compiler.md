@@ -192,6 +192,25 @@ These calls are never reported:
   with `IMPORT DATABASE` or `ATTACH` is not in its text, so only the commands
   that run the seed (`rocky compile`, `rocky ci`, `rocky test`) skip it.
 
+#### A seed file that cannot be read (`E073`)
+
+When `data/seed.sql` is there but cannot be read (it is not valid UTF-8, it
+is a directory, or Rocky has no permission), Rocky cannot tell which
+functions and macros it creates. The check then fails closed. A DuckDB call
+that `E057` or `E068` would refuse may be one of the seed's macros, so Rocky
+refuses it with `E073`. The message names the seed file and the read failure:
+
+```
+E073: cannot check the call to `my_fn` on DuckDB: the seed file `data/seed.sql` could not be read (stream did not contain valid UTF-8), so Rocky cannot tell whether it creates `my_fn`
+```
+
+A call to a function DuckDB has, with a number of arguments it takes, is
+not affected. A `W068` call stays a warning. Other warehouses check the call
+as before. This holds for `rocky compile`, `rocky emit-sql`, `rocky serve`
+and `rocky lsp`. The commands that run the seed (`rocky compile --with-seed`,
+`rocky ci`, `rocky test`) refuse the whole run instead when the seed does not
+read, with a message that names the seed file.
+
 #### Calls with an argument count DuckDB refuses (`E068`, `W068`)
 
 When a model runs on DuckDB, Rocky reports a call to a DuckDB built-in with
@@ -497,6 +516,7 @@ Every finding carries a code, a severity, a source span and sometimes a suggeste
 | `E067` | A `GROUP BY` position names no output column (`GROUP BY 3` over two columns, or `GROUP BY 0`) |
 | `E068` / `W068` | A call to a DuckDB built-in passes a number of arguments it does not take, in a place tests show DuckDB checks. Only when the model runs on DuckDB. `W068` in a place DuckDB may skip, such as a CTE body, a named `WINDOW` or an argument of another call. See [Calls with an argument count DuckDB refuses](#calls-with-an-argument-count-duckdb-refuses-e068-w068) |
 | `E071` / `W071` | The branches of a `UNION`, `INTERSECT` or `EXCEPT` return different numbers of columns. `W071` in a place the warehouse may skip. See [Set operations](#set-operations-with-different-column-counts-e071-w071) |
+| `E073` | The project's `data/seed.sql` is there but cannot be read, and a DuckDB call would get `E057` or `E068`. The seed may create that name, so the call is refused. The message names the seed and the read failure. See [A seed file that cannot be read](#a-seed-file-that-cannot-be-read-e073) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | The output repeats a column name and the strategy rebuilds the relation (`full_refresh`, `view`, `materialized_view`, `dynamic_table`, `ephemeral`, `snapshot`, `content_addressed`): the warehouse may rename the repeat or refuse the table. Also emitted when a `SELECT *` reads an upstream with unknown schema |
 | `W004` | Classification tag with no matching `[mask]` strategy |
