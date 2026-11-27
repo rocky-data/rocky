@@ -7,34 +7,10 @@
 
 ## What it shows
 
-Demonstrates `dag_mode=True` on `RockyComponent`: Rocky reports the full unified DAG (source, load, transformation stages) via `rocky dag`, and dagster-rocky renders it as a single connected asset graph in the Dagster UI with zero hand-written asset definitions.
-
-## Why it's distinctive
-
-- `rocky.toml` + model sidecars + SQL files **are** the asset definition. No Python per-asset boilerplate.
-- The Dagster asset graph shows the full pipeline lineage: source → load → staging → gold.
-
-## Layout
-
-```
-.
-├── README.md              this file
-├── pyproject.toml         Dagster project config (deps + [tool.dg])
-├── src/rocky_dag_mode_poc/
-│   ├── definitions.py    Loads components via load_from_defs_folder
-│   └── defs/rocky/
-│       └── defs.yaml     RockyComponent with dag_mode: true
-├── rocky.toml             Pipeline config: ingest (replication) + transform
-├── run.sh                 Seeds data, runs pipeline, prints DAG
-├── data/
-│   └── seed.sql           200-row orders table
-└── models/
-    ├── _defaults.toml     Shared target defaults
-    ├── stg_orders.sql     Staging model (filters cancelled orders)
-    ├── stg_orders.toml    Target: staging schema
-    ├── fct_customer_revenue.sql   Gold model (customer aggregation)
-    └── fct_customer_revenue.toml  Target: gold schema, depends_on stg_orders
-```
+With `dag_mode: true` on `RockyComponent`
+(`src/rocky_dag_mode_poc/defs/rocky/defs.yaml`), dagster-rocky renders the
+`rocky dag` output (source, load, transformation) as one asset graph with no
+hand-written asset definitions.
 
 ## Prerequisites
 
@@ -55,20 +31,12 @@ uv sync && uv run dg dev
 Open http://localhost:3000 and verify:
 1. Asset graph shows `source:ingest` → `load:ingest` → `stg_orders` → `fct_customer_revenue`
 2. Click any node to see upstream/downstream dependencies
-3. Open `fct_customer_revenue` → the **Column lineage** tab shows per-column upstream edges back to `stg_orders` (surfaced via `surface_column_lineage: true` in `defs.yaml`)
+3. Open `fct_customer_revenue` → the **Column lineage** tab shows per-column upstream edges back to `stg_orders` (surfaced via `surface_column_lineage: true` in `defs.yaml`, which calls `rocky lineage` per model at component load)
 4. "Materialize all" executes the full pipeline
 
 ## Expected output
 
 ```text
-=== Dagster dag_mode — full lineage from Rocky's unified DAG ===
-
-1. Seeding DuckDB with sample data...
-   done (200 orders in raw__orders.orders)
-
-2. Running replication pipeline...
-   done (source tables replicated)
-
 3. Rocky DAG output:
    Nodes: 4
    Edges: 3
@@ -78,24 +46,10 @@ Open http://localhost:3000 and verify:
    [load            ] ingest (load) <- ['source:ingest']
    [transformation  ] fct_customer_revenue <- ['transformation:stg_orders']
    [transformation  ] stg_orders <- ['load:ingest']
-
-4. Compiling models...
-   Models: 2
-   Layers: 2
-   - fct_customer_revenue (full_refresh) depends_on=['stg_orders']
-   - stg_orders (full_refresh)
+...
 ```
-
-## What happened
-
-1. `run.sh` seeds a DuckDB file with 200 orders
-2. `rocky run` replicates the source table via the `ingest` pipeline
-3. `rocky dag` produces the full unified DAG: 4 nodes, 3 edges, 4 execution layers
-4. `rocky compile` verifies model dependencies (`fct_customer_revenue` depends on `stg_orders`)
-5. `defs.yaml` declares `RockyComponent` with `dag_mode: true` and `surface_column_lineage: true`; `definitions.py` loads it with `load_from_defs_folder`. Dagster reads the cached DAG and builds a connected asset graph automatically; at component-load time it also calls `rocky lineage` per derived model and merges `TableColumnLineage` into each `AssetSpec`'s `metadata["dagster/column_lineage"]` slot, so the Dagster UI's Column lineage tab renders without any hand-written wiring
 
 ## Related
 
 - dagster-rocky: [`integrations/dagster/`](https://github.com/rocky-data/rocky/tree/main/integrations/dagster)
-- DAG builder: [`integrations/dagster/src/dagster_rocky/dag_assets.py`](https://github.com/rocky-data/rocky/tree/main/integrations/dagster/src/dagster_rocky/dag_assets.py)
 - Basic Dagster example: [`engine/examples/dagster-integration/`](https://github.com/rocky-data/rocky/tree/main/engine/examples/dagster-integration)

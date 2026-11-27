@@ -7,41 +7,11 @@
 
 ## What it shows
 
-The `delete_insert` materialization strategy is an alternative to MERGE for partition-level updates. Instead of row-by-row matching (MERGE), delete+insert:
+The `delete_insert` strategy (`partition_by = ["region"]`) replaces whole partitions: delete the target rows matching the partition keys, then insert fresh data. It suits late-arriving data and daily or regional aggregates, without MERGE's row matching.
 
-1. Deletes all rows in the target matching the partition key(s)
-2. Inserts fresh data for those partitions
+**Limit:** on DuckDB the DELETE and the INSERT are two separate statements, not one transaction. The DELETE commits first, so a failed INSERT leaves the partition empty until the next run. Some adapters (PostgreSQL, Redshift) join them into one transaction.
 
-This is ideal for late-arriving data, daily/regional aggregates, and scenarios where MERGE's row-matching overhead isn't needed.
-
-**Limit:** on DuckDB the DELETE and the INSERT run as two separate
-statements, not one transaction. The DELETE commits first, so a failed INSERT
-leaves the partition empty until the next run. Some adapters (PostgreSQL,
-Redshift) join them into one transaction.
-
-`run.sh` only validates and compiles the model. It does not execute it.
-
-## Why it's distinctive
-
-- **No duplicate risk** — unlike incremental INSERT, delete+insert clears the partition first
-- **Simpler than MERGE** — no `WHEN MATCHED / WHEN NOT MATCHED` logic
-- **Partition-scoped** — only touches rows matching `partition_by` keys, not the entire table
-- **dbt comparison:** dbt's `incremental` with `delete+insert` strategy requires Jinja config blocks; Rocky uses `partition_by` in TOML
-
-## Layout
-
-```
-.
-├── README.md                this file
-├── rocky.toml               pipeline config
-├── run.sh                   end-to-end demo
-├── data/
-│   └── seed.sql             daily sales across 3 regions (300 rows)
-└── models/
-    ├── _defaults.toml       shared target (poc.analytics)
-    ├── regional_sales.sql   aggregated revenue by date + region
-    └── regional_sales.toml  strategy = "delete_insert", partition_by = ["region"]
-```
+`run.sh` does not execute the strategy against the warehouse: it validates, compiles, and runs a local `rocky test`.
 
 ## Prerequisites
 
@@ -68,25 +38,16 @@ Delete+Insert strategy:
 POC complete: delete_insert strategy parsed and compiled.
 ```
 
-> `rocky compile` also emits an `I002` info diagnostic (`4 column(s) have unknown types`)
-> because the model reads from a raw seed table with no declared source schema — the
-> aggregate still compiles cleanly (`has_errors: false`).
+> `rocky compile` also emits an `I002` info diagnostic (`4 column(s) have unknown types`) because the model reads a raw seed table with no declared source schema; `has_errors` is `false`.
 
-## What happened
+## SQL at execution time
 
-1. `rocky compile` parsed the model and recognized `delete_insert` strategy with `partition_by = ["region"]`
-2. At execution time, Rocky generates two statements (shape from
-   `SqlDialect::delete_partitions_sql` in `engine/crates/rocky-core/src/traits.rs`):
-   ```sql
-   DELETE FROM poc.analytics.regional_sales WHERE (region) IN (
-     SELECT DISTINCT region FROM (<model SQL>) AS _rocky_incoming);
-   INSERT INTO poc.analytics.regional_sales <model SQL>;
-   ```
-3. Only the regions present in the new output are deleted and re-inserted.
-   Other regions in the target stay as they are.
+Shape from `SqlDialect::delete_partitions_sql` in `engine/crates/rocky-core/src/traits.rs`:
 
-## Related
+```sql
+DELETE FROM poc.analytics.regional_sales WHERE (region) IN (
+  SELECT DISTINCT region FROM (<model SQL>) AS _rocky_incoming);
+INSERT INTO poc.analytics.regional_sales <model SQL>;
+```
 
-- Merge strategy: [`02-performance/02-merge-upsert`](../02-merge-upsert/)
-- Incremental watermark: [`02-performance/01-incremental-watermark`](../01-incremental-watermark/)
-- Time-interval partitioning: [`02-performance/03-partition-checksum`](../03-partition-checksum/)
+Only regions present in the new output are replaced; others stay as they are.

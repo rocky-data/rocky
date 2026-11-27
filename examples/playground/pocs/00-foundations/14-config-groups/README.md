@@ -7,19 +7,13 @@
 
 ## What it shows
 
-When many models share the same routing and materialization, you define a
-**config group** once and have each model opt in by name. The group lives in
-`models/groups/<name>.toml` (the file stem is the group name) and supplies:
+A **config group** (`models/groups/<name>.toml`; the file stem is the group name) defines shared routing and materialization that models opt into by name:
 
-- a **`schema_template`** like `mart_{region}` — each member fills the
-  `{region}` placeholder from its own `[args]`, so one definition fans out
-  across distinct target schemas;
-- a shared **`[strategy]`** — one materialization for the whole group;
-- a **`[tags]`** baseline — a governance attribute applied once on the group
-  lands on every member.
+- a **`schema_template`** like `mart_{region}`, filled from each member's `[args]`
+- a shared **`[strategy]`**
+- a **`[tags]`** baseline inherited by every member (`dagster-rocky` projects these onto each derived asset's Dagster tags)
 
-This POC has one group, `daily_marts`, and three members that each opt in
-with `group = "daily_marts"` and a different `[args] region`:
+Three members opt in with `group = "daily_marts"`:
 
 | Model | `[args] region` | Resolved schema |
 |---|---|---|
@@ -27,95 +21,16 @@ with `group = "daily_marts"` and a different `[args] region`:
 | `fct_orders_us_west` | `us_west` | `mart_us_west` |
 | `fct_orders_apac` | `apac` | `mart_apac` |
 
-`run.sh` compiles them with `rocky compile --output json` and asserts the
-members resolved to **three distinct target schemas** and **inherited the
-group's `[tags]`** (`domain = "sales"`). `fct_orders_us_west` also overrides
-one tag (`tier = "silver"`) to show the per-key merge: it keeps the
-inherited `domain` while pinning its own `tier`.
+`fct_orders_us_west` also overrides one tag (`tier = "silver"`) while keeping the inherited `domain = "sales"`.
 
 ## The two load-time guards
 
-A config group makes routing *easy* — and routing mistakes *loud*. Two
-deliberately-broken siblings under `broken/` show the guards that fail the
-load instead of silently misrouting a model. `run.sh` runs each and asserts
-the expected error.
+Two deliberately broken trees show them; `run.sh` asserts each error (full text under Expected output).
 
-### Guard A — misplaced `[args]` (`broken/misplaced-args/`)
+- **Guard A, misplaced `[args]`** (`broken/misplaced-args/`): a member supplies `[args]` but also pins `target.schema`. The pin wins, so the `[args]` are dead and the load fails. Either drop `[args]` or drop the pinned schema.
+- **Guard B, overriding an enforced group** (`broken/enforce-override/`): by default group fields are overridable. With `enforce = true`, a member that pins the target `schema` or `strategy` the group owns fails the load. Enforcement is opt-in.
 
-`[args]` exist only to fill a group's `schema_template`. If a member also
-pins its own `target.schema`, the pin wins (sidecar > group), the template is
-bypassed, and the `[args]` become dead — usually masking a routing mistake.
-Rocky fails the load:
-
-```
-model 'fct_orders_broken' supplies [args] for config group 'daily_marts's
-schema_template but also pins its own target.schema; the pin overrides the
-template, so the [args] are dead. ...
-```
-
-Fix it one way or the other: pin a schema (drop `[args]`), **or** route via
-`[args]` (drop the pinned schema). Not both.
-
-### Guard B — overriding an enforced group (`broken/enforce-override/`)
-
-By default a group is an overridable **default**: a member may pin its own
-schema or strategy to diverge. Set `enforce = true` to make the group's
-fields **binding** — a governance guarantee that the whole fan-out shares
-routing and materialization. A member that then pins a field the enforced
-group owns (its target `schema` or its `strategy`) fails the load:
-
-```
-model 'fct_ledger_broken' overrides 'target.schema', which its enforced
-group 'regulated' controls; remove the local override or set the group's
-enforce = false
-```
-
-Enforcement is strictly opt-in. Without `enforce`, the same pin is allowed.
-
-## Why it's distinctive
-
-- One group definition routes a fan-out across many schemas with no codegen
-  or templating step — the dbt analogue would be a macro + per-model config
-  sprawl.
-- Governance attributes (`[tags]`) declared once on the group land on every
-  member, and `dagster-rocky` projects them onto each derived asset's Dagster
-  tags, so the governed fan-out is visible to the orchestrator end-to-end.
-- `enforce = true` turns the group from a convenience default into a binding
-  contract: a regulated set of models *cannot* quietly route or materialize
-  itself differently from the rest. That's enforcement, not just a lint.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml                         pipeline + adapter (DuckDB)
-├── run.sh                             fan-out asserts + both broken-sibling asserts
-├── models/
-│   ├── groups/
-│   │   └── daily_marts.toml           the group: schema_template + [strategy] + [tags]
-│   ├── fct_orders_emea.sql + .toml    member, [args] region = "emea"
-│   ├── fct_orders_us_west.sql + .toml member, [args] region = "us_west" (+ tier override)
-│   └── fct_orders_apac.sql + .toml    member, [args] region = "apac"
-└── broken/
-    ├── misplaced-args/models/         Guard A: pins schema AND supplies [args]
-    │   ├── groups/daily_marts.toml              (non-enforced)
-    │   └── fct_orders_broken.sql + .toml
-    └── enforce-override/models/       Guard B: pins schema under an enforced group
-        ├── groups/regulated.toml               (enforce = true)
-        └── fct_ledger_broken.sql + .toml
-```
-
-> The broken siblings are plain `models/` trees, not standalone pipelines —
-> `run.sh` compiles each with `rocky compile --models broken/<case>/models`,
-> and the parent `rocky.toml` auto-loads from the POC dir. Each carries its
-> own copy of `models/groups/` because a group resolves relative to the
-> compiled models directory (`<models_dir>/groups/`). The model loader does
-> not recurse into subdirectories, so `models/groups/` is never mistaken for
-> model files. They live under `broken/` (not the main `models/` tree)
-> because a group guard is a *load* error that aborts the whole load — it
-> can't sit beside the good fan-out the way a per-model contract diagnostic
-> can.
+Each broken tree is compiled with `rocky compile --models broken/<case>/models` (the parent `rocky.toml` auto-loads). Each has its own `models/groups/`, because groups resolve from `<models_dir>/groups/`; the model loader does not recurse, so group files are never read as models. They sit outside the main `models/` because a group guard is a *load* error that aborts the whole load.
 
 ## Run
 
@@ -162,23 +77,14 @@ POC complete:
 
 Per-model sidecar **>** group **>** `_defaults.toml`:
 
-1. A member can still pin its own `schema` / `strategy` to override the group
-   (unless the group is enforced).
-2. Otherwise the group's `schema_template` (filled from `[args]`) and
-   `[strategy]` apply.
-3. Otherwise directory defaults from `_defaults.toml`.
+1. A member can pin its own `schema` / `strategy` (unless the group is enforced).
+2. Otherwise the group's `schema_template` and `[strategy]` apply.
+3. Otherwise `_defaults.toml`.
 
-Tags merge per key (sidecar wins per key, the rest of the group's tags stay).
-An unknown group name, an unfilled `schema_template` placeholder, a pinned
-schema alongside `[args]`, or overriding an enforced field all fail the load
-with a clear error rather than routing a model to the wrong place.
+Tags merge per key (the sidecar wins per key). An unknown group name, an unfilled placeholder, a pinned schema alongside `[args]`, or overriding an enforced field all fail the load.
 
 ## Related
 
-- Model format reference — Config groups:
-  `docs/src/content/docs/reference/model-format.md` (`#config-groups`).
-- The three-layer config + env-var story:
-  `examples/playground/pocs/00-foundations/07-config-layering/`.
-- The group loader + guards live at
-  `engine/crates/rocky-core/src/models.rs` (`load_groups_from_dir`,
-  `resolve_model_config`).
+- `docs/src/content/docs/reference/model-format.md` (`#config-groups`)
+- [`07-config-layering`](../07-config-layering/)
+- Source: `engine/crates/rocky-core/src/models.rs` (`load_groups_from_dir`, `resolve_model_config`)

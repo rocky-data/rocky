@@ -7,27 +7,10 @@
 
 ## What it shows
 
-Declarative webhook on a pipeline lifecycle event with a built-in `slack`
-preset that formats the JSON payload Slack expects (`text`, `blocks`, etc.)
-so you don't write the format yourself. This POC wires it to
-`on_pipeline_complete`; swap the event key to `on_pipeline_error` for a
-failure alert instead.
-
-## Why it's distinctive
-
-- **No middleware** — point at any webhook and Rocky formats the payload.
-- Built-in presets for Slack, PagerDuty, Datadog, Teams.
-- HMAC signing optional via the `secret` field.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml          [hook.webhooks.on_pipeline_complete] preset = "slack"
-├── data/seed.sql       raw__orders.orders (10 rows)
-└── run.sh              Doesn't actually POST (point at https://webhook.site/...)
-```
+A webhook on `on_pipeline_complete` whose built-in `slack` preset formats the
+Slack JSON payload (`text`, `blocks`, etc.). Swap the event key to
+`on_pipeline_error` for failure alerts. Presets also exist for PagerDuty, Datadog
+and Teams; HMAC signing is optional via `secret`.
 
 ## Run
 
@@ -35,12 +18,10 @@ failure alert instead.
 ./run.sh
 ```
 
-`run.sh` loads the seed, then runs `rocky validate` — which parses and
-confirms the `[hook.webhooks.on_pipeline_complete]` block, including the
-`slack` preset. The default `url` is
-`https://webhook.site/00000000-0000-0000-0000-000000000000`; replace it with
-your own webhook.site URL and run a real `rocky run` to see the POSTed
-payload.
+`run.sh` does not POST: it loads the seed and runs `rocky validate`, which
+checks the webhook block and preset. The default `url` is
+`https://webhook.site/00000000-0000-0000-0000-000000000000`. Replace it with
+your own webhook.site URL and run `rocky run` to see the payload.
 
 > **Note:** `rocky hooks list` currently surfaces shell-command hooks only —
 > configured webhooks are validated by `rocky validate` but do not appear in

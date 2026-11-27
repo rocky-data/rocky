@@ -7,19 +7,7 @@
 
 ## What it shows
 
-Define a data-quality assertion once, apply it to many models. A named test
-lives in `models/test_definitions.toml` carrying its type, parameters, and an
-optional default column. Any model references it by name with `[[use_test]]`
-and can override the column, severity, or filter at that call site. This is
-Rocky's equivalent of a dbt generic test.
-
-This POC ships two reusable definitions and exercises every way a model can
-apply them:
-
-- `positive_amount` — an `expression` test (`amount > 0`).
-- `known_status` — an `accepted_values` test with a default column of `status`.
-
-Across two marts (`orders_mart`, `shipments_mart`) the POC demonstrates:
+Define an assertion once in `models/test_definitions.toml` (type, parameters, optional default column) and apply it to many models with `[[use_test]]`, overriding column, severity or filter per use. It is Rocky's equivalent of a dbt generic test. Definitions: `positive_amount` (`expression`, `amount > 0`) and `known_status` (`accepted_values`, default column `status`).
 
 | Application | Where | What it shows |
 |---|---|---|
@@ -27,20 +15,6 @@ Across two marts (`orders_mart`, `shipments_mart`) the POC demonstrates:
 | Column-bind override | `shipments_mart` ← `known_status` | re-points the same test at `fulfilment_state` |
 | Severity override | `orders_mart` ← `positive_amount` | downgrades the default `error` to `warning` |
 | Inline coexistence | `orders_mart` | a one-off `[[tests]] not_null` sits beside the named tests |
-
-## Why it's distinctive
-
-- **One definition, many call sites.** Change the accepted status vocabulary
-  in `test_definitions.toml` once and every `[[use_test]]` reference picks it
-  up — no copy-paste drift across models.
-- **Per-use overrides.** The same named test binds to a different column on
-  one model and runs at a different severity on another, all without forking
-  the definition.
-- **Named and inline tests coexist.** Shared assertions go in
-  `test_definitions.toml`; a genuinely one-off check stays inline as
-  `[[tests]]` on the model.
-- **No warehouse required.** Everything runs against in-memory / file-backed
-  DuckDB.
 
 ## Mapping to dbt generic tests
 
@@ -53,37 +27,13 @@ Across two marts (`orders_mart`, `shipments_mart`) the POC demonstrates:
 | `where:` test config | `filter = "…"` on `[[use_test]]` |
 | A bespoke `tests/singular/*.sql` assertion | inline `[[tests]]` on the model |
 
-In dbt, a generic test is a SQL macro plus a `schema.yml` reference. In Rocky
-it's a declarative TOML definition plus a `[[use_test]]` reference — Rocky
-generates the assertion SQL for the active dialect.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml
-├── run.sh
-├── data/seed.sql
-└── models/
-    ├── test_definitions.toml   # the named tests
-    ├── orders_mart.sql / .toml # default-column + severity override + inline test
-    └── shipments_mart.sql / .toml  # column-bind override
-```
-
 ## Run
 
 ```bash
 ./run.sh
 ```
 
-`run.sh` needs `rocky`, the `duckdb` CLI and `jq` on `PATH`.
-
-The script materializes both marts on DuckDB, runs `rocky test --models models`
-(every model compiles + executes), then runs `rocky test --declarative` to
-execute and **name** each resolved assertion. It asserts all four applications
-landed with the right binding: default column, column override, severity
-override, and the coexisting inline test.
+`run.sh` needs `rocky`, the `duckdb` CLI and `jq` on `PATH`. It materializes both marts, runs `rocky test --models models`, then `rocky test --declarative`, and asserts all four applications bound correctly.
 
 ## Expected output
 
@@ -96,5 +46,4 @@ override, and the coexisting inline test.
   - shipments_mart: accepted_values(fulfilment_state) [error]  # known_status, re-bound
 ```
 
-All four pass (`declarative.total = 4, failed = 0`), and `rocky test` reports
-both models green.
+All four pass (`declarative.total = 4, failed = 0`), and `rocky test` reports both models green.

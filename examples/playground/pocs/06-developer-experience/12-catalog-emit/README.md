@@ -7,61 +7,19 @@
 
 ## What it shows
 
-`rocky catalog` walks the compiler's SemanticGraph and writes a
-self-contained, machine-consumable lineage artefact under
-`./.rocky/catalog/`:
+`rocky catalog` walks the compiler's SemanticGraph and writes lineage artefacts under `./.rocky/catalog/`:
 
-- `catalog.json` — the front door. Project metadata, project-level
-  `last_run_id`, an `assets[]` array (one per model with its columns +
-  upstream/downstream models), and an `edges[]` array of column-level
-  lineage edges including transform kind (`direct`, `aggregation: sum`,
-  …) and confidence. Each asset column carries a `description` field when
-  the model's sidecar documents it via a `[columns.<name>]` table.
-- `edges.parquet` — flat table of column-lineage edges. Any Parquet
-  reader (DuckDB, Polars, Spark, BigQuery external table, Athena…) can
-  query it without going through the engine.
-- `assets.parquet` — flat table of asset columns with `last_run_id` /
-  `last_materialized_at` enrichment populated when the state store has a
-  matching successful run.
+- `catalog.json` — project metadata, project-level `last_run_id`, an `assets[]` array (one per model: columns, upstream/downstream models) and an `edges[]` array of column-level edges with transform kind (`direct`, `aggregation: sum`, …) and confidence.
+- `edges.parquet` — flat table of column-lineage edges, readable by any Parquet reader without the engine.
+- `assets.parquet` — flat table of asset columns; `last_run_id` / `last_materialized_at` are populated when the state store has a matching successful run.
 
-## Why it's distinctive
-
-- **The catalog is a *queryable artefact*, not a JSON dump.** Rocky emits
-  a flat Parquet table you can query with `read_parquet('.../edges.parquet')`.
-- **Column-level lineage is compiler-derived, not regex-derived.**
-  Aggregations, joins, and DSL-based group-bys all carry through with
-  semantic transform kinds (`aggregation: sum`, `direct`, …) instead of
-  table-to-table edges only.
-- **No engine on the read path.** Once the catalog is written, lineage
-  consumers (Looker, Superset, custom dashboards) read Parquet directly.
-- **Per-column docs ride along.** A `[columns.<name>]` table in a model's
-  sidecar attaches a description to one *projected* output column, and it
-  surfaces as `CatalogColumn.description` in `rocky catalog --output json`.
-  A description keyed to a column the SELECT doesn't produce is silently
-  dropped, so the keys stay honest about the real output schema.
-
-## Layout
-
-```
-.
-├── README.md           this file
-├── rocky.toml          DuckDB transformation pipeline
-├── run.sh              compile → catalog → inspect
-├── data/seed.sql       small `raw__orders.orders` seed (200 rows)
-└── models/
-    ├── _defaults.toml      catalog=poc, schema=demo
-    ├── raw_orders.sql      SELECT … FROM raw__orders.orders
-    ├── stg_orders.sql      filter cancelled
-    ├── fct_revenue.sql     group by customer_id → SUM(amount), COUNT(order_id)
-    └── fct_revenue.toml    [columns.total] / [columns.orders] docs the SUM/COUNT outputs
-```
+A `[columns.<name>]` table in a model's sidecar documents a *projected* output column; it surfaces as `CatalogColumn.description` in `rocky catalog --output json`. A description keyed to a column the SELECT doesn't produce is silently dropped.
 
 ## Prerequisites
 
 - `rocky` on PATH
-- `duckdb` CLI (only used in the demo to read back the Parquet file)
-- `python3` (used to pretty-print the JSON in `run.sh`)
-- `jq` (used to filter the per-column descriptions out of `catalog.json`)
+- `duckdb` CLI (to read back the Parquet file)
+- `python3` and `jq`
 
 ## Run
 
@@ -69,30 +27,12 @@ self-contained, machine-consumable lineage artefact under
 ./run.sh
 ```
 
-## What happened
+## What to expect
 
-1. **Compile** — semantic graph for 3 models; column types propagate
-   from `raw_orders` → `stg_orders` → `fct_revenue`.
-2. **`rocky catalog --format both`** — walks the SemanticGraph and
-   writes the three artefacts under `.rocky/catalog/`.
-3. **Inspect** — the demo prints the first six column-lineage edges,
-   shows each asset's columns + upstream models, then queries
-   `edges.parquet` directly via DuckDB to prove the artefact is
-   tool-agnostic.
-4. **Per-column docs** — `fct_revenue.toml` carries `[columns.total]` and
-   `[columns.orders]` descriptions (keyed to the aggregated output columns,
-   not the raw inputs). The demo re-emits `catalog.json`, prints every
-   column with a description, then asserts `fct_revenue.total.description`
-   is populated in `rocky catalog --output json`.
+The script compiles 3 models, runs `rocky catalog --format both`, prints the first six column-lineage edges and each asset's columns and upstream models, queries `edges.parquet` with DuckDB, then prints the column descriptions from `fct_revenue.toml` (`[columns.total]`, `[columns.orders]`) and asserts `fct_revenue.total.description` is populated.
 
 ## Related
 
 - Engine source: `engine/crates/rocky-cli/src/commands/catalog.rs`
-- Sibling POC:
-  [`01-lineage-column-level/`](../01-lineage-column-level/), which runs `rocky
-  lineage` for interactive single-model lineage queries (the catalog is
-  the bulk-export equivalent).
-- Sibling POC:
-  [`11-lineage-diff/`](../11-lineage-diff/), which runs `rocky lineage-diff` for
-  PR-time blast radius (compares two refs at compile time, doesn't
-  persist).
+- [`01-lineage-column-level/`](../01-lineage-column-level/): interactive single-model queries with `rocky lineage`.
+- [`11-lineage-diff/`](../11-lineage-diff/): `rocky lineage-diff` compares two refs at compile time and doesn't persist.

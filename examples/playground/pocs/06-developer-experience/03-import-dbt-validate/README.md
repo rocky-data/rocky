@@ -7,45 +7,15 @@
 
 ## What it shows
 
-Two commands for migrating off dbt:
+- `rocky import-dbt --dbt-project <path>` converts a dbt project (refs, sources, configs) into Rocky models, from `manifest.json` or by regex.
+- `rocky validate-migration --dbt-project <path>` reports which dbt models map cleanly and which need manual attention, without running anything on a warehouse.
 
-1. `rocky import-dbt --dbt-project <path>` — converts a dbt project (with
-   refs, sources, configs) into Rocky models. Supports either manifest.json
-   or regex-based imports.
-2. `rocky validate-migration --dbt-project <path>` — without running anything
-   on a warehouse, reports which dbt models map cleanly and which need
-   manual attention.
-
-## Why it's distinctive vs `engine/examples/dbt-migration`
-
-That example shows hand-written before/after equivalents. This POC
-demonstrates the **automated** import path on a real (small) dbt project.
-
-`dbt_project/models/schema.yml` uses the legacy `tests:` key. The importer
-also accepts the dbt-1.7+ `data_tests:` spelling on the same column tests;
-swap one for the other and the import is identical.
-See sibling POC `19-import-dbt-unit-tests/` for the manifest path that also
-imports `manifest.unit_tests` entries onto Rocky `[[test]]` sidecars.
-
-## Layout
-
-```
-.
-├── README.md
-├── run.sh
-├── dbt_project/        Minimal dbt project
-│   ├── dbt_project.yml
-│   └── models/
-│       ├── stg_orders.sql
-│       ├── fct_revenue.sql
-│       ├── schema.yml       Column tests (canonical four + dbt_utils.accepted_range)
-│       └── sources.yml      raw.orders source
-├── expected/           Captured golden logs (gitignored, regenerated each run)
-└── imported/           Emitted Rocky repo (regenerated each run)
-```
+`dbt_project/models/schema.yml` uses the legacy `tests:` key. The importer also accepts the dbt-1.7+ `data_tests:` spelling on the same column tests, with an identical import. For the manifest path, which also imports `manifest.unit_tests`, see `19-import-dbt-unit-tests/`.
 
 ## Run
 
 ```bash
 ./run.sh
 ```
+
+The emitted Rocky repo goes to `imported/` and logs to `expected/`; both are regenerated each run.

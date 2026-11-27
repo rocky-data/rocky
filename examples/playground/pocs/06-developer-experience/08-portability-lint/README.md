@@ -7,45 +7,15 @@
 
 ## What it shows
 
-Compile-time rejection of dialect-divergent SQL. `rocky compile
---target-dialect bq` parses every model with `sqlparser-rs`, walks the
-AST, and emits error-severity **P001** diagnostics for any construct
-that the target warehouse doesn't support (NVL, QUALIFY, DATEADD, etc.,
-20 known constructs).
+`rocky compile --target-dialect bq` walks each model's parsed SQL (`sqlparser-rs` AST) and emits error-severity **P001** diagnostics for constructs the target warehouse doesn't support (NVL, QUALIFY, DATEADD, etc., 20 known constructs). `NVL` inside a string literal does not trip it.
 
 Three escape hatches:
 
-1. **Rewrite** — `NVL(x, y)` → `COALESCE(x, y)`. The diagnostic carries
-   a concrete `suggestion` string.
-2. **Per-file pragma** — `-- rocky-allow: NVL` at the top of a `.sql`
-   file suppresses that construct just in that file. Use when you
-   intentionally run only on the non-portable dialect.
-3. **Project-wide allowlist** — `[portability] allow = ["QUALIFY"]` in
-   `rocky.toml` suppresses across all models.
+1. **Rewrite** — `NVL(x, y)` → `COALESCE(x, y)`. The diagnostic carries a `suggestion` string.
+2. **Per-file pragma** — `-- rocky-allow: NVL` at the top of a `.sql` file suppresses that construct in that file.
+3. **Project-wide allowlist** — `[portability] allow = ["QUALIFY"]` in `rocky.toml`.
 
-## Why it's distinctive
-
-- **AST-based, not regex.** The lint walks the parsed SQL tree (the AST).
-  `NVL(x, y)` inside a string literal doesn't trip the lint; a real
-  function call does. The diagnostic reports a file-level span
-  (`line: 1`), because per-construct byte offsets aren't tracked yet.
-- **Polyglot correctness at compile time.** dbt packages you hope
-  travel; Rocky rejects the non-portable construct at compile-time
-  with a targeted suggestion, before the warehouse sees it.
-
-## Layout
-
-```
-.
-├── README.md                       this file
-├── rocky.toml                      [portability] target + QUALIFY allowlist
-├── run.sh                          compile with & without --target-dialect
-└── models/
-    ├── _defaults.toml              catalog=poc, schema=demo
-    ├── portable.sql                COALESCE only — portable under every dialect
-    ├── non_portable_nvl.sql        NVL — fires P001 under --target-dialect=bq
-    └── suppressed_via_pragma.sql   same NVL, suppressed via -- rocky-allow: NVL
-```
+Limitation: the diagnostic's span is file-level (`line: 1`); per-construct byte offsets aren't tracked yet.
 
 ## Run
 
@@ -53,27 +23,14 @@ Three escape hatches:
 ./run.sh
 ```
 
-## What happened
+## What to expect
 
-1. **Baseline compile** — no dialect flag. `rocky.toml` declares the SQL
-   as Snowflake SQL (`[portability] target_dialect = "snowflake"`), where
-   NVL is native, so there is no portability diagnostic and every model
-   type-checks. Without that line, `rocky compile` refuses NVL with
-   `E057`: the project's adapter is DuckDB, and DuckDB has no NVL.
-   Declaring the dialect tells Rocky not to judge the SQL's function
-   names against the DuckDB adapter.
-2. **`rocky compile --target-dialect bq`** — the flag overrides the
-   configured dialect for P001 and fires exactly one P001 on
-   `non_portable_nvl.sql`. `portable.sql` is clean (COALESCE works
-   everywhere); `suppressed_via_pragma.sql` is suppressed per-file.
-3. The diagnostic carries `severity: Error`, a file:line span, the
-   offending model name, and a human-readable `suggestion` (`replace
-   NVL(...) with IFNULL(...) or COALESCE(...)`).
+1. **Baseline compile** (no dialect flag): no portability diagnostic, because `rocky.toml` declares `[portability] target_dialect = "snowflake"`, where NVL is native. Without that line, `rocky compile` refuses NVL with `E057`, since the project's adapter is DuckDB and DuckDB has no NVL. Declaring the dialect tells Rocky not to judge function names against the DuckDB adapter.
+2. **`rocky compile --target-dialect bq`** overrides the configured dialect and fires exactly one P001, on `non_portable_nvl.sql`. `portable.sql` is clean; `suppressed_via_pragma.sql` is suppressed.
+3. The diagnostic carries `severity: Error`, a file:line span, the model name and a `suggestion` (`replace NVL(...) with IFNULL(...) or COALESCE(...)`).
 
 ## Related
 
-- Engine source: `engine/crates/rocky-sql/src/portability.rs`,
-  `engine/crates/rocky-sql/src/pragma.rs`
+- Engine source: `engine/crates/rocky-sql/src/portability.rs`, `engine/crates/rocky-sql/src/pragma.rs`
 - CLI surface: `rocky compile --target-dialect {dbx,sf,bq,duckdb}`
-- Companion POC: the P002 `SELECT *` blast-radius lint; see
-  [`09-sql-types-blast-radius/`](../09-sql-types-blast-radius/)
+- Companion POC (P002 `SELECT *` blast-radius lint): [`09-sql-types-blast-radius/`](../09-sql-types-blast-radius/)

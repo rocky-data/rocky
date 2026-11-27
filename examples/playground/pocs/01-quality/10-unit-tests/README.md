@@ -7,29 +7,12 @@
 
 ## What it shows
 
-A model unit test in the dbt 1.8 sense: hand-written input rows in, expected
-output rows out, no warehouse. `flag_orders` reads from `raw_orders` and flags
-each order with `amount >= 100`. Two `[[test]]` blocks in
-`models/flag_orders.toml` check its logic against mocked upstream rows:
+dbt 1.8-style model unit tests: hand-written input rows, expected output rows, no warehouse. `flag_orders` flags orders from `raw_orders` with `amount >= 100`. Two `[[test]]` blocks in `models/flag_orders.toml` mock the upstream:
 
-1. **Default multiset comparison.** `flags_orders_at_or_above_100` mocks
-   `raw_orders` with three rows and asserts the `is_high_value` flag on each.
-   Row order does not matter, and only the columns named in `expect.rows`
-   (`order_id`, `is_high_value`) are compared — `region` and `amount` are
-   ignored.
-2. **Ordered comparison (`ordered = true`).** `sorts_by_amount_descending`
-   pins the exact output order. The model ends in `ORDER BY amount DESC`, so
-   the expected rows are listed largest-amount first. Reorder them and the
-   test fails with `ordered output mismatch` — the regression a positional
-   assertion is meant to catch.
-
-`rocky test --models models` runs both, and `run.sh` parses the JSON
-`unit_tests` field to assert `passed == total` and `failed == 0`.
+1. `flags_orders_at_or_above_100` uses the default **multiset** comparison: row order is ignored, and only columns named in `expect.rows` (`order_id`, `is_high_value`) are compared.
+2. `sorts_by_amount_descending` uses `ordered = true` against the model's `ORDER BY amount DESC`. Reordered rows fail with `ordered output mismatch`.
 
 ## `[[test]]` (unit tests) vs `[[tests]]` (declarative assertions)
-
-These two blocks look alike but do different jobs. The singular/plural
-distinction is load-bearing — read the `s`.
 
 | | `[[test]]` (singular) | `[[tests]]` (plural) |
 |---|---|---|
@@ -40,27 +23,7 @@ distinction is load-bearing — read the `s`.
 | **Command** | `rocky test` (this POC, **default path**) | `rocky test --declarative` |
 | **Warehouse** | None — in-memory DuckDB | Runs against the configured adapter |
 
-Plural `[[tests]]` and the `--declarative` path are covered in
-[`09-named-tests`](../09-named-tests/).
-This one is purely the singular `[[test]]` unit-test surface.
-
-This mirrors dbt 1.8's `unit_tests:` (`given` / `expect`) for SQL-logic tests
-versus dbt's long-standing `tests:` for schema/data assertions — Rocky reaches
-the same parity with one `rocky test` invocation and no Jinja, no manifest, no
-seed-CSV scaffolding.
-
-## Layout
-
-```
-.
-├── README.md
-├── rocky.toml
-├── run.sh
-├── data/seed.sql          # backs the local model-execution pass
-└── models/
-    ├── raw_orders.sql/.toml    # mocked upstream
-    └── flag_orders.sql/.toml   # model under test + two [[test]] blocks
-```
+Plural `[[tests]]` is covered in [`09-named-tests`](../09-named-tests/).
 
 ## Run
 
@@ -68,7 +31,6 @@ seed-CSV scaffolding.
 ./run.sh
 ```
 
-`run.sh` needs `rocky` and `jq` on `PATH`.
+`run.sh` needs `rocky` and `jq` on `PATH`. It parses the JSON `unit_tests` field.
 
-Expected: `2/2 fixture-driven unit tests passed` and the captured
-`expected/test.json` carries `unit_tests.total = 2`, `passed = 2`, `failed = 0`.
+Expected: `2/2 fixture-driven unit tests passed` and the captured `expected/test.json` carries `unit_tests.total = 2`, `passed = 2`, `failed = 0`.
