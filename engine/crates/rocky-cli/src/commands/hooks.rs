@@ -6,7 +6,7 @@ use tracing::info;
 use rocky_core::config::load_rocky_config;
 use rocky_core::hooks::{HookContext, HookEvent, HookRegistry, HookResult};
 
-use crate::output::{HookEntry, HooksListOutput, HooksTestOutput};
+use crate::output::{HookEntry, HooksListOutput, HooksTestOutput, WebhookEntry};
 
 /// List all configured hooks from the pipeline config.
 pub fn run_hooks_list(config_path: &Path, json: bool) -> Result<()> {
@@ -16,11 +16,7 @@ pub fn run_hooks_list(config_path: &Path, json: bool) -> Result<()> {
     let registry = HookRegistry::from_config(&config.hooks);
 
     if json {
-        let entries = hook_entries(&registry);
-        let output = HooksListOutput {
-            total: entries.len(),
-            hooks: entries,
-        };
+        let output = hooks_list_output(&registry);
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let total = registry.total_hook_count();
@@ -143,6 +139,17 @@ pub async fn run_hooks_test(config_path: &Path, event_name: &str, json: bool) ->
     Ok(())
 }
 
+/// The `rocky hooks list --output json` payload. Pure: reads the registry
+/// only, runs no hook and calls no endpoint.
+pub(crate) fn hooks_list_output(registry: &HookRegistry) -> HooksListOutput {
+    let hooks = hook_entries(registry);
+    HooksListOutput {
+        total: hooks.len(),
+        hooks,
+        webhooks: webhook_entries(registry),
+    }
+}
+
 /// The `rocky hooks list --output json` rows.
 fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
     let mut entries: Vec<HookEntry> = Vec::new();
@@ -159,6 +166,62 @@ fn hook_entries(registry: &HookRegistry) -> Vec<HookEntry> {
         }
     }
     entries
+}
+
+/// The configured webhooks, in event order, each with a redacted URL.
+fn webhook_entries(registry: &HookRegistry) -> Vec<WebhookEntry> {
+    let mut entries: Vec<WebhookEntry> = Vec::new();
+    for event in HookEvent::all() {
+        for webhook in registry.webhooks_for(event) {
+            let mut header_keys: Vec<String> = webhook.headers.keys().cloned().collect();
+            header_keys.sort();
+            entries.push(WebhookEntry {
+                event: event.config_key().to_string(),
+                // `Display` prints a resolved `${VAR}` value as `${NAME}`.
+                url: redact_webhook_url(&webhook.url.to_string()),
+                method: webhook.method.clone(),
+                timeout_ms: webhook.timeout_ms,
+                on_failure: format!("{:?}", webhook.on_failure),
+                async_mode: webhook.async_mode,
+                retry_count: webhook.retry_count,
+                header_keys,
+                preset: webhook.preset.clone(),
+            });
+        }
+    }
+    entries
+}
+
+/// Cut a webhook URL to `scheme://host`.
+///
+/// Drops credentials (`user:pass@`), port, path, query and fragment: a
+/// webhook URL often carries its token in one of them. Anything without a
+/// `scheme://` prefix prints as `<redacted>`, because it cannot be told
+/// apart from a bare token.
+fn redact_webhook_url(url: &str) -> String {
+    const REDACTED: &str = "<redacted>";
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return REDACTED.to_string();
+    };
+    let scheme_ok = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !scheme_ok {
+        return REDACTED.to_string();
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if host_port.starts_with('[') {
+        let inner = host_port.split_once(']').map_or(host_port, |(h, _)| h);
+        format!("{inner}]")
+    } else {
+        host_port.split(':').next().unwrap_or_default().to_string()
+    };
+    if host.is_empty() {
+        return REDACTED.to_string();
+    }
+    format!("{scheme}://{host}")
 }
 
 #[cfg(test)]
@@ -189,5 +252,31 @@ mod tests {
         let json = serde_json::to_string(&entries).unwrap();
         assert!(!json.contains(SECRET), "leaked: {json}");
         assert!(json.contains("--token ${ROCKY_T1919_HOOK}"), "{json}");
+    }
+
+    #[test]
+    fn webhook_urls_are_cut_to_scheme_and_host() {
+        for (url, want) in [
+            (
+                "https://hooks.slack.com/services/T0/B0/TOKEN",
+                "https://hooks.slack.com",
+            ),
+            (
+                "http://user:pw@host.example:8080/p?q=1#f",
+                "http://host.example",
+            ),
+            ("https://host.example?key=secret", "https://host.example"),
+            ("https://[::1]:9000/x", "https://[::1]"),
+            (
+                "https://${WEBHOOK_HOST}/hook/${TOKEN}",
+                "https://${WEBHOOK_HOST}",
+            ),
+            ("${WEBHOOK_URL}", "<redacted>"),
+            ("not a url with a token", "<redacted>"),
+            ("://host/x", "<redacted>"),
+            ("https:///path-only", "<redacted>"),
+        ] {
+            assert_eq!(redact_webhook_url(url), want, "{url}");
+        }
     }
 }
